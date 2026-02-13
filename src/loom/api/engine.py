@@ -55,7 +55,7 @@ async def create_engine(config: Config) -> Engine:
     await database.initialize()
 
     # State manager
-    data_dir = Path(config.workspace.scratch_path).expanduser()
+    data_dir = Path(config.workspace.scratch_dir).expanduser()
     data_dir.mkdir(parents=True, exist_ok=True)
     state_manager = TaskStateManager(data_dir=data_dir)
 

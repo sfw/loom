@@ -435,7 +435,7 @@ async def get_config(request: Request):
                 "provider": m.provider,
                 "model": m.model,
                 "roles": m.roles,
-                "tier": m.tier,
+                "max_tokens": m.max_tokens,
             }
             for name, m in config.models.items()
         },
