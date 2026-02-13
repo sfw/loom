@@ -41,12 +41,16 @@ class Database:
     All access is non-blocking via aiosqlite.
     """
 
-    def __init__(self, db_path: Path):
-        self._db_path = db_path
+    def __init__(self, db_path: str | Path):
+        self._db_path = str(db_path)
+
+    async def close(self) -> None:
+        """Close database connections. No-op for aiosqlite (per-query connections)."""
+        pass
 
     async def initialize(self) -> None:
         """Create tables from schema.sql if they don't exist."""
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         schema_path = Path(__file__).parent / "schema.sql"
         schema = schema_path.read_text()
         async with aiosqlite.connect(self._db_path) as db:
