@@ -1,0 +1,1133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Loom Tutorial - Local Model Orchestration Engine</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --bg-card: #161822;
+    --bg-code: #1c1e2e;
+    --border: #2a2d3e;
+    --text: #e2e4f0;
+    --text-dim: #8b8fa3;
+    --accent: #7c6ff7;
+    --accent-glow: rgba(124, 111, 247, 0.15);
+    --green: #4ade80;
+    --yellow: #fbbf24;
+    --red: #f87171;
+    --cyan: #22d3ee;
+    --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.7;
+    font-size: 16px;
+  }
+
+  /* --- Navigation --- */
+  nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 260px;
+    height: 100vh;
+    background: var(--bg-card);
+    border-right: 1px solid var(--border);
+    padding: 24px 0;
+    overflow-y: auto;
+    z-index: 100;
+  }
+
+  nav .logo {
+    padding: 0 24px 20px;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+  }
+
+  nav a {
+    display: block;
+    padding: 8px 24px;
+    color: var(--text-dim);
+    text-decoration: none;
+    font-size: 14px;
+    transition: all 0.15s;
+    border-left: 3px solid transparent;
+  }
+
+  nav a:hover, nav a.active {
+    color: var(--text);
+    background: var(--accent-glow);
+    border-left-color: var(--accent);
+  }
+
+  nav .section-label {
+    padding: 16px 24px 6px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    font-weight: 600;
+  }
+
+  /* --- Main Content --- */
+  main {
+    margin-left: 260px;
+    max-width: 820px;
+    padding: 48px 48px 120px;
+  }
+
+  section {
+    margin-bottom: 64px;
+    scroll-margin-top: 24px;
+  }
+
+  h1 {
+    font-size: 36px;
+    font-weight: 800;
+    letter-spacing: -1px;
+    margin-bottom: 12px;
+    background: linear-gradient(135deg, var(--accent), var(--cyan));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  h2 {
+    font-size: 24px;
+    font-weight: 700;
+    margin-bottom: 16px;
+    padding-top: 8px;
+    color: var(--text);
+  }
+
+  h3 {
+    font-size: 18px;
+    font-weight: 600;
+    margin: 24px 0 12px;
+    color: var(--text);
+  }
+
+  p { margin-bottom: 16px; color: var(--text); }
+
+  .subtitle {
+    font-size: 18px;
+    color: var(--text-dim);
+    margin-bottom: 40px;
+  }
+
+  /* --- Code Blocks --- */
+  pre {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin: 16px 0 24px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13.5px;
+    line-height: 1.6;
+    position: relative;
+  }
+
+  pre .label {
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  code {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    background: var(--bg-code);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: var(--cyan);
+  }
+
+  pre code {
+    background: none;
+    padding: 0;
+    color: var(--text);
+  }
+
+  .cmd { color: var(--green); }
+  .flag { color: var(--yellow); }
+  .str { color: var(--cyan); }
+  .cmt { color: var(--text-dim); }
+  .key { color: var(--accent); }
+  .val { color: var(--green); }
+
+  /* --- Cards --- */
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 24px;
+    margin: 16px 0;
+  }
+
+  .card-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 16px 0;
+  }
+
+  .card h4 {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: var(--accent);
+  }
+
+  .card p { font-size: 14px; margin-bottom: 0; color: var(--text-dim); }
+
+  /* --- Steps --- */
+  .step {
+    display: flex;
+    gap: 20px;
+    margin: 24px 0;
+    padding: 20px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+
+  .step-number {
+    flex-shrink: 0;
+    width: 36px;
+    height: 36px;
+    background: var(--accent);
+    color: white;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 15px;
+  }
+
+  .step-content { flex: 1; }
+  .step-content h4 { font-size: 16px; margin-bottom: 6px; }
+  .step-content p { font-size: 14px; color: var(--text-dim); margin-bottom: 8px; }
+
+  /* --- Tables --- */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 24px;
+    font-size: 14px;
+  }
+
+  th {
+    text-align: left;
+    padding: 10px 14px;
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    font-weight: 600;
+    color: var(--text-dim);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  td {
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+
+  td code { font-size: 12.5px; }
+
+  /* --- Callouts --- */
+  .callout {
+    padding: 16px 20px;
+    border-radius: 8px;
+    margin: 16px 0;
+    font-size: 14px;
+    border-left: 4px solid;
+  }
+
+  .callout-info {
+    background: rgba(124, 111, 247, 0.08);
+    border-color: var(--accent);
+  }
+
+  .callout-warn {
+    background: rgba(251, 191, 36, 0.08);
+    border-color: var(--yellow);
+  }
+
+  .callout-success {
+    background: rgba(74, 222, 128, 0.08);
+    border-color: var(--green);
+  }
+
+  .callout strong { display: block; margin-bottom: 4px; }
+
+  /* --- Endpoint Row --- */
+  .endpoint {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin: 6px 0;
+    font-size: 14px;
+  }
+
+  .method {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    min-width: 60px;
+    text-align: center;
+  }
+
+  .method-post { background: rgba(74, 222, 128, 0.15); color: var(--green); }
+  .method-get { background: rgba(124, 111, 247, 0.15); color: var(--accent); }
+  .method-patch { background: rgba(251, 191, 36, 0.15); color: var(--yellow); }
+  .method-delete { background: rgba(248, 113, 113, 0.15); color: var(--red); }
+
+  .endpoint-path {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text);
+    flex: 1;
+  }
+
+  .endpoint-desc { color: var(--text-dim); font-size: 13px; }
+
+  /* --- Diagram --- */
+  .diagram {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 32px;
+    margin: 24px 0;
+    text-align: center;
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1.8;
+    color: var(--text-dim);
+    overflow-x: auto;
+  }
+
+  .diagram .highlight { color: var(--accent); font-weight: 600; }
+  .diagram .flow { color: var(--green); }
+  .diagram .dim { color: var(--text-dim); }
+
+  /* --- Accordion --- */
+  .accordion {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin: 12px 0;
+    overflow: hidden;
+  }
+
+  .accordion summary {
+    padding: 14px 20px;
+    background: var(--bg-card);
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 15px;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .accordion summary::before {
+    content: '\25B6';
+    font-size: 10px;
+    transition: transform 0.2s;
+    color: var(--text-dim);
+  }
+
+  .accordion[open] summary::before { transform: rotate(90deg); }
+
+  .accordion .inner {
+    padding: 16px 20px;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+  }
+
+  /* --- Progress Bar --- */
+  .progress-track {
+    display: flex;
+    gap: 4px;
+    margin: 32px 0 16px;
+  }
+
+  .progress-step {
+    flex: 1;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border);
+  }
+
+  .progress-step.done { background: var(--accent); }
+
+  /* --- Mobile --- */
+  @media (max-width: 900px) {
+    nav { display: none; }
+    main { margin-left: 0; padding: 24px 20px 80px; }
+    .card-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Navigation -->
+<nav>
+  <div class="logo">Loom</div>
+  <div class="section-label">Getting Started</div>
+  <a href="#intro">Introduction</a>
+  <a href="#install">Installation</a>
+  <a href="#setup-models">Model Setup</a>
+  <a href="#configure">Configuration</a>
+  <div class="section-label">Using Loom</div>
+  <a href="#start-server">Starting the Server</a>
+  <a href="#first-task">Your First Task</a>
+  <a href="#streaming">Streaming Events</a>
+  <a href="#steering">Steering Tasks</a>
+  <div class="section-label">API Reference</div>
+  <a href="#endpoints">Endpoints</a>
+  <a href="#sse">SSE Streaming</a>
+  <a href="#memory">Memory System</a>
+  <div class="section-label">Advanced</div>
+  <a href="#architecture">Architecture</a>
+  <a href="#config-ref">Config Reference</a>
+  <a href="#troubleshooting">Troubleshooting</a>
+</nav>
+
+<!-- Main Content -->
+<main>
+
+<!-- ======================== INTRO ======================== -->
+<section id="intro">
+  <h1>Loom Tutorial</h1>
+  <p class="subtitle">Build, run, and monitor tasks with local LLMs -- from installation to production.</p>
+
+  <div class="diagram">
+    <span class="highlight">Goal</span> <span class="flow">&rarr;</span> <span class="highlight">Planner</span> <span class="flow">&rarr;</span> <span class="dim">[</span><span class="highlight">Subtask 1</span><span class="dim">]</span> <span class="flow">&rarr;</span> <span class="dim">[</span><span class="highlight">Subtask 2</span><span class="dim">]</span> <span class="flow">&rarr;</span> <span class="dim">...</span> <span class="flow">&rarr;</span> <span class="highlight">Done</span>
+    <br>
+    <span class="dim">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&darr;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&darr;</span>
+    <br>
+    <span class="dim">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>Execute + Verify&nbsp;&nbsp;&nbsp;&nbsp;Execute + Verify
+  </div>
+
+  <p>Loom is a <strong>local model orchestration engine</strong>. Give it a goal in plain English, and it will:</p>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Decompose</h4>
+      <p>Break the goal into ordered subtasks with dependency graphs</p>
+    </div>
+    <div class="card">
+      <h4>Execute</h4>
+      <p>Run each subtask in a tool-calling loop (files, shell, search)</p>
+    </div>
+    <div class="card">
+      <h4>Verify</h4>
+      <p>Independently check each result against acceptance criteria</p>
+    </div>
+    <div class="card">
+      <h4>Learn</h4>
+      <p>Extract decisions and discoveries into structured memory</p>
+    </div>
+  </div>
+
+  <p>Everything runs locally. Your code never leaves your machine. Loom works with <strong>Ollama</strong>, <strong>LM Studio</strong>, or any <strong>OpenAI-compatible API</strong>.</p>
+</section>
+
+<!-- ======================== INSTALL ======================== -->
+<section id="install">
+  <h2>1. Installation</h2>
+
+  <div class="progress-track">
+    <div class="progress-step done"></div>
+    <div class="progress-step"></div>
+    <div class="progress-step"></div>
+    <div class="progress-step"></div>
+    <div class="progress-step"></div>
+  </div>
+
+  <h3>Prerequisites</h3>
+  <p>You need <strong>Python 3.11+</strong> and a local model backend.</p>
+
+  <pre><code><span class="cmt"># Check Python version</span>
+<span class="cmd">python3</span> <span class="flag">--version</span>
+<span class="cmt"># Python 3.11.x or higher required</span></code></pre>
+
+  <h3>Install from Source</h3>
+  <pre><code><span class="cmt"># Clone the repository</span>
+<span class="cmd">git clone</span> https://github.com/your-org/loom.git
+<span class="cmd">cd</span> loom
+
+<span class="cmt"># Create a virtual environment</span>
+<span class="cmd">python3</span> <span class="flag">-m</span> venv .venv
+<span class="cmd">source</span> .venv/bin/activate
+
+<span class="cmt"># Install with dev dependencies</span>
+<span class="cmd">pip install</span> <span class="flag">-e</span> <span class="str">".[dev]"</span>
+
+<span class="cmt"># Verify</span>
+<span class="cmd">loom</span> <span class="flag">--version</span>
+<span class="cmt"># loom, version 0.1.0</span></code></pre>
+
+  <div class="callout callout-info">
+    <strong>Using uv?</strong>
+    Replace <code>pip install</code> with <code>uv pip install</code> for faster installs.
+  </div>
+</section>
+
+<!-- ======================== SETUP MODELS ======================== -->
+<section id="setup-models">
+  <h2>2. Model Setup</h2>
+
+  <div class="progress-track">
+    <div class="progress-step done"></div>
+    <div class="progress-step done"></div>
+    <div class="progress-step"></div>
+    <div class="progress-step"></div>
+    <div class="progress-step"></div>
+  </div>
+
+  <p>Loom needs at least one LLM running locally. Choose your backend:</p>
+
+  <details class="accordion">
+    <summary>Ollama (Recommended)</summary>
+    <div class="inner">
+      <pre><code><span class="cmt"># Install Ollama</span>
+<span class="cmd">curl</span> <span class="flag">-fsSL</span> https://ollama.com/install.sh | sh
+
+<span class="cmt"># Pull models</span>
+<span class="cmd">ollama pull</span> qwen3:14b      <span class="cmt"># Primary (planning + execution)</span>
+<span class="cmd">ollama pull</span> qwen3:8b       <span class="cmt"># Utility (extraction + verification)</span>
+
+<span class="cmt"># Verify it's running</span>
+<span class="cmd">curl</span> http://localhost:11434/api/tags</code></pre>
+      <p>Ollama runs on port <code>11434</code> by default. Models are downloaded once and cached.</p>
+    </div>
+  </details>
+
+  <details class="accordion">
+    <summary>LM Studio</summary>
+    <div class="inner">
+      <div class="step">
+        <div class="step-number">1</div>
+        <div class="step-content">
+          <h4>Download LM Studio</h4>
+          <p>Get it from <strong>lmstudio.ai</strong></p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-number">2</div>
+        <div class="step-content">
+          <h4>Load a Model</h4>
+          <p>Search for and download a model (Qwen 2.5, Mistral, Llama, etc.)</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-number">3</div>
+        <div class="step-content">
+          <h4>Start the Server</h4>
+          <p>Click "Start Server" in the Local Server tab. Default port: <code>1234</code></p>
+        </div>
+      </div>
+    </div>
+  </details>
+
+  <details class="accordion">
+    <summary>vLLM / Other OpenAI-Compatible</summary>
+    <div class="inner">
+      <pre><code><span class="cmt"># Example: vLLM</span>
+<span class="cmd">pip install</span> vllm
+<span class="cmd">vllm serve</span> Qwen/Qwen2.5-14B-Instruct <span class="flag">--port</span> 8000</code></pre>
+      <p>Any server exposing <code>/v1/chat/completions</code> works.</p>
+    </div>
+  </details>
+</section>
+
+<!-- ======================== CONFIGURE ======================== -->
+<section id="configure">
+  <h2>3. Configuration</h2>
+
+  <div class="progress-track">
+    <div class="progress-step done"></div>
+    <div class="progress-step done"></div>
+    <div class="progress-step done"></div>
+    <div class="progress-step"></div>
+    <div class="progress-step"></div>
+  </div>
+
+  <p>Create <code>loom.toml</code> in your project directory or at <code>~/.loom/loom.toml</code>:</p>
+
+  <pre><code><span class="label">loom.toml</span>
+<span class="cmt"># Server settings</span>
+<span class="key">[server]</span>
+<span class="key">host</span> = <span class="str">"127.0.0.1"</span>
+<span class="key">port</span> = <span class="val">9000</span>
+
+<span class="cmt"># Primary model: handles planning and code execution</span>
+<span class="key">[models.primary]</span>
+<span class="key">provider</span> = <span class="str">"ollama"</span>
+<span class="key">base_url</span> = <span class="str">"http://localhost:11434"</span>
+<span class="key">model</span>    = <span class="str">"qwen3:14b"</span>
+<span class="key">max_tokens</span>   = <span class="val">4096</span>
+<span class="key">temperature</span>  = <span class="val">0.1</span>
+<span class="key">roles</span> = <span class="str">["planner", "executor"]</span>
+
+<span class="cmt"># Utility model: cheaper/faster for extraction and verification</span>
+<span class="key">[models.utility]</span>
+<span class="key">provider</span> = <span class="str">"ollama"</span>
+<span class="key">base_url</span> = <span class="str">"http://localhost:11434"</span>
+<span class="key">model</span>    = <span class="str">"qwen3:8b"</span>
+<span class="key">max_tokens</span>   = <span class="val">2048</span>
+<span class="key">temperature</span>  = <span class="val">0.0</span>
+<span class="key">roles</span> = <span class="str">["extractor", "verifier"]</span>
+
+<span class="cmt"># Workspace</span>
+<span class="key">[workspace]</span>
+<span class="key">default_path</span> = <span class="str">"~/projects"</span>
+<span class="key">scratch_dir</span>  = <span class="str">"~/.loom/scratch"</span>
+
+<span class="cmt"># Execution limits</span>
+<span class="key">[execution]</span>
+<span class="key">max_subtask_retries</span>  = <span class="val">3</span>
+<span class="key">max_loop_iterations</span> = <span class="val">50</span>
+
+<span class="cmt"># Memory storage</span>
+<span class="key">[memory]</span>
+<span class="key">database_path</span> = <span class="str">"~/.loom/loom.db"</span></code></pre>
+
+  <div class="callout callout-warn">
+    <strong>Single model?</strong>
+    If you only have one model, assign it all four roles: <code>["planner", "executor", "extractor", "verifier"]</code>
+  </div>
+
+  <h3>Model Roles Explained</h3>
+  <table>
+    <tr>
+      <th>Role</th>
+      <th>What it does</th>
+      <th>Ideal model</th>
+    </tr>
+    <tr>
+      <td><code>planner</code></td>
+      <td>Decomposes goal into subtasks with dependencies</td>
+      <td>Larger, slower, better reasoning (14B+)</td>
+    </tr>
+    <tr>
+      <td><code>executor</code></td>
+      <td>Runs tool-calling loops to complete subtasks</td>
+      <td>Good at code generation and tool use</td>
+    </tr>
+    <tr>
+      <td><code>extractor</code></td>
+      <td>Extracts decisions and discoveries into memory</td>
+      <td>Fast, follows JSON format well (8B)</td>
+    </tr>
+    <tr>
+      <td><code>verifier</code></td>
+      <td>Independently checks subtask results</td>
+      <td>Precise, low temperature (8B)</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ======================== START SERVER ======================== -->
+<section id="start-server">
+  <h2>4. Starting the Server</h2>
+
+  <div class="progress-track">
+    <div class="progress-step done"></div>
+    <div class="progress-step done"></div>
+    <div class="progress-step done"></div>
+    <div class="progress-step done"></div>
+    <div class="progress-step"></div>
+  </div>
+
+  <pre><code><span class="cmd">loom serve</span>
+<span class="cmt"># Starting Loom server on 127.0.0.1:9000</span></code></pre>
+
+  <p>The server binds to <code>127.0.0.1</code> (local only). Override with flags:</p>
+
+  <pre><code><span class="cmd">loom serve</span> <span class="flag">--host</span> 0.0.0.0 <span class="flag">--port</span> 8080</code></pre>
+
+  <h3>Verify it's running</h3>
+  <pre><code><span class="cmt"># In another terminal:</span>
+<span class="cmd">curl</span> http://localhost:9000/health
+<span class="cmt"># {"status":"ok","version":"0.1.0"}</span>
+
+<span class="cmt"># Check configured models:</span>
+<span class="cmd">curl</span> http://localhost:9000/models
+<span class="cmt"># [{"name":"primary","model":"qwen3:14b","tier":1,"roles":["planner","executor"]}, ...]</span>
+
+<span class="cmt"># Check available tools:</span>
+<span class="cmd">curl</span> http://localhost:9000/tools
+<span class="cmt"># [{"name":"read_file","description":"..."}, {"name":"write_file","description":"..."}, ...]</span></code></pre>
+
+  <div class="callout callout-success">
+    <strong>Interactive API docs</strong>
+    Open <code>http://localhost:9000/docs</code> in your browser for the auto-generated Swagger UI.
+  </div>
+</section>
+
+<!-- ======================== FIRST TASK ======================== -->
+<section id="first-task">
+  <h2>5. Your First Task</h2>
+
+  <div class="progress-track">
+    <div class="progress-step done"></div>
+    <div class="progress-step done"></div>
+    <div class="progress-step done"></div>
+    <div class="progress-step done"></div>
+    <div class="progress-step done"></div>
+  </div>
+
+  <h3>Step 1: Create a workspace</h3>
+  <pre><code><span class="cmd">mkdir</span> <span class="flag">-p</span> /tmp/loom-demo</code></pre>
+
+  <h3>Step 2: Submit a task</h3>
+  <pre><code><span class="cmd">curl</span> <span class="flag">-X POST</span> http://localhost:9000/tasks \
+  <span class="flag">-H</span> <span class="str">"Content-Type: application/json"</span> \
+  <span class="flag">-d</span> <span class="str">'{
+    "goal": "Create a Python script that generates random passwords with configurable length and complexity",
+    "workspace": "/tmp/loom-demo"
+  }'</span></code></pre>
+
+  <p>Response:</p>
+  <pre><code>{
+  <span class="key">"task_id"</span>: <span class="str">"a1b2c3d4-..."</span>,
+  <span class="key">"status"</span>: <span class="str">"pending"</span>,
+  <span class="key">"message"</span>: <span class="str">"Task created and execution started."</span>
+}</code></pre>
+
+  <h3>Step 3: Check progress</h3>
+  <pre><code><span class="cmd">curl</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span></code></pre>
+
+  <p>The response includes the full task state, plan, and progress:</p>
+  <pre><code>{
+  <span class="key">"task_id"</span>: <span class="str">"a1b2c3d4-..."</span>,
+  <span class="key">"goal"</span>: <span class="str">"Create a Python script..."</span>,
+  <span class="key">"status"</span>: <span class="str">"executing"</span>,
+  <span class="key">"plan"</span>: {
+    <span class="key">"version"</span>: <span class="val">1</span>,
+    <span class="key">"subtasks"</span>: [
+      {<span class="key">"id"</span>: <span class="str">"create-script"</span>, <span class="key">"status"</span>: <span class="str">"completed"</span>},
+      {<span class="key">"id"</span>: <span class="str">"add-cli-args"</span>,  <span class="key">"status"</span>: <span class="str">"running"</span>},
+      {<span class="key">"id"</span>: <span class="str">"write-tests"</span>,   <span class="key">"status"</span>: <span class="str">"pending"</span>}
+    ]
+  },
+  <span class="key">"progress"</span>: {
+    <span class="key">"total_subtasks"</span>: <span class="val">3</span>,
+    <span class="key">"completed"</span>: <span class="val">1</span>,
+    <span class="key">"percent_complete"</span>: <span class="val">33.3</span>
+  }
+}</code></pre>
+
+  <h3>Or use the CLI</h3>
+  <pre><code><span class="cmd">loom run</span> <span class="str">"Create a password generator script"</span> <span class="flag">--workspace</span> /tmp/loom-demo</code></pre>
+  <p>This submits the task and streams progress inline.</p>
+</section>
+
+<!-- ======================== STREAMING ======================== -->
+<section id="streaming">
+  <h2>Streaming Events</h2>
+
+  <p>Watch task execution in real-time via Server-Sent Events (SSE):</p>
+
+  <pre><code><span class="cmd">curl</span> <span class="flag">-N</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span>/stream</code></pre>
+
+  <p>Events arrive as they happen:</p>
+
+  <pre><code><span class="cmt">event:</span> subtask_started
+<span class="cmt">data:</span> {"task_id":"a1b2c3d4","subtask_id":"create-script","timestamp":"..."}
+
+<span class="cmt">event:</span> subtask_completed
+<span class="cmt">data:</span> {"task_id":"a1b2c3d4","subtask_id":"create-script","status":"success"}
+
+<span class="cmt">event:</span> subtask_started
+<span class="cmt">data:</span> {"task_id":"a1b2c3d4","subtask_id":"add-cli-args","timestamp":"..."}
+
+<span class="cmt">event:</span> task_completed
+<span class="cmt">data:</span> {"task_id":"a1b2c3d4","status":"completed"}</code></pre>
+
+  <h3>Event Types</h3>
+  <table>
+    <tr><th>Event</th><th>When</th></tr>
+    <tr><td><code>task_planning</code></td><td>Planner model is creating the plan</td></tr>
+    <tr><td><code>task_plan_ready</code></td><td>Plan created, execution starting</td></tr>
+    <tr><td><code>subtask_started</code></td><td>A subtask begins execution</td></tr>
+    <tr><td><code>subtask_completed</code></td><td>A subtask finished successfully</td></tr>
+    <tr><td><code>subtask_failed</code></td><td>A subtask failed (may retry)</td></tr>
+    <tr><td><code>tool_call_started</code></td><td>A tool is being invoked</td></tr>
+    <tr><td><code>tool_call_completed</code></td><td>A tool call returned</td></tr>
+    <tr><td><code>approval_requested</code></td><td>Waiting for human approval</td></tr>
+    <tr><td><code>task_completed</code></td><td>All subtasks done</td></tr>
+    <tr><td><code>task_failed</code></td><td>Task could not complete</td></tr>
+  </table>
+
+  <p>The stream terminates automatically when the task reaches a terminal state (<code>completed</code>, <code>failed</code>, or <code>cancelled</code>). If no events arrive for 30 seconds, a keepalive comment is sent to maintain the connection.</p>
+</section>
+
+<!-- ======================== STEERING ======================== -->
+<section id="steering">
+  <h2>Steering and Feedback</h2>
+
+  <p>Loom supports human-in-the-loop interaction while tasks are running.</p>
+
+  <h3>Inject instructions (steer)</h3>
+  <pre><code><span class="cmd">curl</span> <span class="flag">-X PATCH</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span> \
+  <span class="flag">-H</span> <span class="str">"Content-Type: application/json"</span> \
+  <span class="flag">-d</span> <span class="str">'{"instruction": "Use argparse instead of sys.argv for CLI arguments"}'</span></code></pre>
+  <p>The instruction is stored as a memory entry and injected into subsequent model prompts.</p>
+
+  <h3>Approve a gated step</h3>
+  <pre><code><span class="cmd">curl</span> <span class="flag">-X POST</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span>/approve \
+  <span class="flag">-H</span> <span class="str">"Content-Type: application/json"</span> \
+  <span class="flag">-d</span> <span class="str">'{"subtask_id": "deploy-prod", "approved": true, "reason": "Looks good"}'</span></code></pre>
+
+  <h3>Provide feedback</h3>
+  <pre><code><span class="cmd">curl</span> <span class="flag">-X POST</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span>/feedback \
+  <span class="flag">-H</span> <span class="str">"Content-Type: application/json"</span> \
+  <span class="flag">-d</span> <span class="str">'{"feedback": "The generated tests should use pytest, not unittest"}'</span></code></pre>
+
+  <h3>Cancel a task</h3>
+  <pre><code><span class="cmd">curl</span> <span class="flag">-X DELETE</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span></code></pre>
+</section>
+
+<!-- ======================== ENDPOINTS ======================== -->
+<section id="endpoints">
+  <h2>API Endpoints</h2>
+
+  <h3>Task Lifecycle</h3>
+  <div class="endpoint"><span class="method method-post">POST</span><span class="endpoint-path">/tasks</span><span class="endpoint-desc">Create and start a task</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks</span><span class="endpoint-desc">List all tasks (filter with ?status=)</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks/{id}</span><span class="endpoint-desc">Full task state, plan, and progress</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks/{id}/stream</span><span class="endpoint-desc">SSE event stream</span></div>
+  <div class="endpoint"><span class="method method-patch">PATCH</span><span class="endpoint-path">/tasks/{id}</span><span class="endpoint-desc">Inject instructions (steer)</span></div>
+  <div class="endpoint"><span class="method method-delete">DELETE</span><span class="endpoint-path">/tasks/{id}</span><span class="endpoint-desc">Cancel a running task</span></div>
+  <div class="endpoint"><span class="method method-post">POST</span><span class="endpoint-path">/tasks/{id}/approve</span><span class="endpoint-desc">Approve/reject a gated step</span></div>
+  <div class="endpoint"><span class="method method-post">POST</span><span class="endpoint-path">/tasks/{id}/feedback</span><span class="endpoint-desc">Provide mid-task feedback</span></div>
+
+  <h3>Subtasks</h3>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks/{id}/subtasks</span><span class="endpoint-desc">List all subtasks with status</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks/{id}/subtasks/{sub_id}</span><span class="endpoint-desc">Subtask detail</span></div>
+
+  <h3>Memory</h3>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks/{id}/memory</span><span class="endpoint-desc">Query task memory (?entry_type=)</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/memory/search</span><span class="endpoint-desc">Search memory (?q=&amp;task_id=)</span></div>
+
+  <h3>System</h3>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/models</span><span class="endpoint-desc">Available models and roles</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tools</span><span class="endpoint-desc">Available tools and schemas</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/health</span><span class="endpoint-desc">Health check</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/config</span><span class="endpoint-desc">Current configuration</span></div>
+
+  <div class="callout callout-info">
+    <strong>OpenAPI / Swagger</strong>
+    Interactive API docs with "Try it out" are available at <code>http://localhost:9000/docs</code> while the server is running.
+  </div>
+</section>
+
+<!-- ======================== SSE ======================== -->
+<section id="sse">
+  <h2>SSE Streaming Details</h2>
+
+  <p>The <code>/tasks/{id}/stream</code> endpoint uses <strong>Server-Sent Events</strong> (SSE), a standard HTTP streaming protocol supported by all browsers and most HTTP clients.</p>
+
+  <h3>JavaScript client</h3>
+  <pre><code><span class="cmt">// Browser or Node.js with EventSource</span>
+<span class="key">const</span> source = <span class="key">new</span> EventSource(<span class="str">`http://localhost:9000/tasks/${taskId}/stream`</span>);
+
+source.addEventListener(<span class="str">'subtask_started'</span>, (e) => {
+  <span class="key">const</span> data = JSON.parse(e.data);
+  console.log(<span class="str">`Started: ${data.subtask_id}`</span>);
+});
+
+source.addEventListener(<span class="str">'task_completed'</span>, (e) => {
+  console.log(<span class="str">'Task done!'</span>);
+  source.close();
+});
+
+source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
+  console.error(<span class="str">'Task failed'</span>, JSON.parse(e.data));
+  source.close();
+});</code></pre>
+
+  <h3>Python client</h3>
+  <pre><code><span class="key">import</span> httpx
+
+<span class="key">with</span> httpx.stream(<span class="str">"GET"</span>, <span class="str">f"http://localhost:9000/tasks/{task_id}/stream"</span>) <span class="key">as</span> r:
+    <span class="key">for</span> line <span class="key">in</span> r.iter_lines():
+        <span class="key">if</span> line.startswith(<span class="str">"data: "</span>):
+            print(line[<span class="val">6</span>:])</code></pre>
+
+  <h3>curl</h3>
+  <pre><code><span class="cmt"># -N disables output buffering for real-time display</span>
+<span class="cmd">curl</span> <span class="flag">-N</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span>/stream</code></pre>
+</section>
+
+<!-- ======================== MEMORY ======================== -->
+<section id="memory">
+  <h2>Memory System</h2>
+
+  <p>Loom maintains a three-layer memory architecture:</p>
+
+  <div class="step">
+    <div class="step-number">1</div>
+    <div class="step-content">
+      <h4>Always-in-Context (YAML State)</h4>
+      <p>Current task state, plan, and subtask status. Injected into every prompt.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">2</div>
+    <div class="step-content">
+      <h4>Structured Archive (SQLite)</h4>
+      <p>Extracted decisions, errors, discoveries, tool results. Queryable by task, subtask, type, and tags.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">3</div>
+    <div class="step-content">
+      <h4>Vector Search (Future)</h4>
+      <p>Semantic similarity search across all memory. Coming in a future release.</p>
+    </div>
+  </div>
+
+  <h3>Memory Entry Types</h3>
+  <table>
+    <tr><th>Type</th><th>Description</th></tr>
+    <tr><td><code>decision</code></td><td>Architectural or implementation choices made</td></tr>
+    <tr><td><code>error</code></td><td>Errors encountered and how they were resolved</td></tr>
+    <tr><td><code>tool_result</code></td><td>Important tool call outputs</td></tr>
+    <tr><td><code>user_instruction</code></td><td>Instructions injected via steer/feedback</td></tr>
+    <tr><td><code>discovery</code></td><td>New information discovered during execution</td></tr>
+    <tr><td><code>artifact</code></td><td>Files or outputs created</td></tr>
+    <tr><td><code>context</code></td><td>Background information for the task</td></tr>
+  </table>
+
+  <h3>Querying Memory</h3>
+  <pre><code><span class="cmt"># All memory for a task</span>
+<span class="cmd">curl</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span>/memory
+
+<span class="cmt"># Filter by type</span>
+<span class="cmd">curl</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span>/memory?entry_type=decision
+
+<span class="cmt"># Search across memory</span>
+<span class="cmd">curl</span> <span class="str">"http://localhost:9000/memory/search?q=database&task_id=TASK_ID"</span></code></pre>
+</section>
+
+<!-- ======================== ARCHITECTURE ======================== -->
+<section id="architecture">
+  <h2>Architecture</h2>
+
+  <div class="diagram" style="text-align: left; padding: 24px 32px;">
+<span class="dim">                     loom.toml</span>
+<span class="dim">                        |</span>
+<span class="dim">                    </span><span class="highlight">Config</span>
+<span class="dim">                        |</span>
+<span class="dim">          </span><span class="highlight">CLI</span><span class="dim"> ---------- </span><span class="highlight">API Server</span><span class="dim"> (FastAPI)</span>
+<span class="dim">                        |</span>
+<span class="dim">                    </span><span class="highlight">Engine</span>
+<span class="dim">                   /    |    \</span>
+<span class="dim">        </span><span class="highlight">Orchestrator</span><span class="dim">  </span><span class="highlight">EventBus</span><span class="dim">  </span><span class="highlight">StateManager</span>
+<span class="dim">           |</span>
+<span class="dim">     </span><span class="highlight">Scheduler</span><span class="dim"> -------- </span><span class="highlight">PromptAssembler</span>
+<span class="dim">           |                    |</span>
+<span class="dim">  </span><span class="highlight">ModelRouter</span><span class="dim">           </span><span class="highlight">Templates</span><span class="dim"> (YAML)</span>
+<span class="dim">      /        \</span>
+<span class="dim"> </span><span class="highlight">Ollama</span><span class="dim">    </span><span class="highlight">OpenAI</span>
+<span class="dim">             Compatible</span>
+  </div>
+
+  <h3>Source Layout</h3>
+  <pre><code>src/loom/
+  __main__.py          <span class="cmt"># CLI (Click)</span>
+  config.py            <span class="cmt"># TOML config loader</span>
+  api/
+    server.py          <span class="cmt"># FastAPI app + lifespan</span>
+    routes.py          <span class="cmt"># All REST endpoints</span>
+    schemas.py         <span class="cmt"># Pydantic models</span>
+    engine.py          <span class="cmt"># Component wiring</span>
+  engine/
+    orchestrator.py    <span class="cmt"># Plan -> execute -> finalize</span>
+    scheduler.py       <span class="cmt"># Dependency resolution</span>
+  events/
+    bus.py             <span class="cmt"># Pub/sub event bus</span>
+    types.py           <span class="cmt"># Event constants</span>
+  models/
+    base.py            <span class="cmt"># Provider ABC</span>
+    ollama_provider.py <span class="cmt"># Ollama client</span>
+    openai_provider.py <span class="cmt"># OpenAI-compatible client</span>
+    router.py          <span class="cmt"># Role + tier routing</span>
+  prompts/
+    assembler.py       <span class="cmt"># 7-section builder</span>
+    constraints.py     <span class="cmt"># Safety rules</span>
+    templates/         <span class="cmt"># YAML templates</span>
+  state/
+    task_state.py      <span class="cmt"># Task/Subtask dataclasses</span>
+    memory.py          <span class="cmt"># SQLite memory archive</span>
+    schema.sql         <span class="cmt"># DB schema</span>
+  tools/
+    registry.py        <span class="cmt"># Tool dispatch</span>
+    file_ops.py        <span class="cmt"># Read/write/edit</span>
+    shell.py           <span class="cmt"># Shell execution</span>
+    search.py          <span class="cmt"># File search</span>
+    workspace.py       <span class="cmt"># Changelog + revert</span></code></pre>
+</section>
+
+<!-- ======================== CONFIG REF ======================== -->
+<section id="config-ref">
+  <h2>Configuration Reference</h2>
+
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>server.host</code></td><td><code>127.0.0.1</code></td><td>Server bind address</td></tr>
+    <tr><td><code>server.port</code></td><td><code>9000</code></td><td>Server port</td></tr>
+    <tr><td><code>models.*.provider</code></td><td>--</td><td><code>ollama</code> or <code>openai_compatible</code></td></tr>
+    <tr><td><code>models.*.base_url</code></td><td>--</td><td>Model API endpoint URL</td></tr>
+    <tr><td><code>models.*.model</code></td><td>--</td><td>Model identifier string</td></tr>
+    <tr><td><code>models.*.max_tokens</code></td><td><code>4096</code></td><td>Max response tokens</td></tr>
+    <tr><td><code>models.*.temperature</code></td><td><code>0.1</code></td><td>Sampling temperature</td></tr>
+    <tr><td><code>models.*.roles</code></td><td><code>["executor"]</code></td><td>Assigned roles (planner, executor, extractor, verifier)</td></tr>
+    <tr><td><code>workspace.default_path</code></td><td><code>~/projects</code></td><td>Default workspace directory</td></tr>
+    <tr><td><code>workspace.scratch_dir</code></td><td><code>~/.loom/scratch</code></td><td>Temporary state storage</td></tr>
+    <tr><td><code>execution.max_subtask_retries</code></td><td><code>3</code></td><td>Max retries per failed subtask</td></tr>
+    <tr><td><code>execution.max_loop_iterations</code></td><td><code>50</code></td><td>Max tool-call loops per subtask</td></tr>
+    <tr><td><code>execution.auto_approve_confidence_threshold</code></td><td><code>0.8</code></td><td>Auto-approve if confidence above this</td></tr>
+    <tr><td><code>verification.tier1_enabled</code></td><td><code>true</code></td><td>Enable self-check verification</td></tr>
+    <tr><td><code>verification.tier2_enabled</code></td><td><code>true</code></td><td>Enable independent model verification</td></tr>
+    <tr><td><code>verification.tier3_enabled</code></td><td><code>false</code></td><td>Enable multi-vote verification</td></tr>
+    <tr><td><code>memory.database_path</code></td><td><code>~/.loom/loom.db</code></td><td>SQLite database location</td></tr>
+    <tr><td><code>logging.level</code></td><td><code>INFO</code></td><td>Log verbosity (DEBUG, INFO, WARN, ERROR)</td></tr>
+    <tr><td><code>logging.event_log_path</code></td><td><code>~/.loom/logs</code></td><td>Event log directory</td></tr>
+  </table>
+
+  <h3>Config Search Order</h3>
+  <p>Loom looks for configuration in this order:</p>
+  <ol style="padding-left: 24px; margin: 12px 0; color: var(--text-dim);">
+    <li><code>--config /explicit/path.toml</code> (CLI flag)</li>
+    <li><code>./loom.toml</code> (current directory)</li>
+    <li><code>~/.loom/loom.toml</code> (home directory)</li>
+    <li>Built-in defaults (no models configured)</li>
+  </ol>
+</section>
+
+<!-- ======================== TROUBLESHOOTING ======================== -->
+<section id="troubleshooting">
+  <h2>Troubleshooting</h2>
+
+  <details class="accordion">
+    <summary>"No models configured"</summary>
+    <div class="inner">
+      <p>Loom can't find your <code>loom.toml</code>. Place it in the current directory, at <code>~/.loom/loom.toml</code>, or pass it explicitly:</p>
+      <pre><code><span class="cmd">loom</span> <span class="flag">--config</span> /path/to/loom.toml serve</code></pre>
+    </div>
+  </details>
+
+  <details class="accordion">
+    <summary>Connection refused to model backend</summary>
+    <div class="inner">
+      <p>Make sure your model server is running:</p>
+      <pre><code><span class="cmt"># Ollama</span>
+<span class="cmd">ollama serve</span>
+<span class="cmt"># or: systemctl start ollama</span>
+
+<span class="cmt"># LM Studio: Open the app and start the server</span>
+
+<span class="cmt"># Test connectivity:</span>
+<span class="cmd">curl</span> http://localhost:11434/api/tags    <span class="cmt"># Ollama</span>
+<span class="cmd">curl</span> http://localhost:1234/v1/models     <span class="cmt"># LM Studio</span></code></pre>
+    </div>
+  </details>
+
+  <details class="accordion">
+    <summary>Task fails immediately</summary>
+    <div class="inner">
+      <p>Check the task details for error information:</p>
+      <pre><code><span class="cmd">curl</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span></code></pre>
+      <p>Common causes:</p>
+      <ul style="padding-left: 20px; color: var(--text-dim);">
+        <li>Model returned empty response (try a larger model)</li>
+        <li>Workspace path doesn't exist (create it first)</li>
+        <li>Model server went down mid-task</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="accordion">
+    <summary>Port already in use</summary>
+    <div class="inner">
+      <pre><code><span class="cmt"># Use a different port</span>
+<span class="cmd">loom serve</span> <span class="flag">--port</span> 9001
+
+<span class="cmt"># Or find what's using port 9000</span>
+<span class="cmd">lsof</span> <span class="flag">-i</span> :9000</code></pre>
+    </div>
+  </details>
+
+  <details class="accordion">
+    <summary>Tests failing</summary>
+    <div class="inner">
+      <pre><code><span class="cmt"># Make sure dev dependencies are installed</span>
+<span class="cmd">pip install</span> <span class="flag">-e</span> <span class="str">".[dev]"</span>
+
+<span class="cmt"># Run the full suite</span>
+<span class="cmd">pytest</span> <span class="flag">-v</span>
+
+<span class="cmt"># Run a specific test file</span>
+<span class="cmd">pytest</span> tests/test_api.py <span class="flag">-v</span></code></pre>
+    </div>
+  </details>
+</section>
+
+</main>
+
+<!-- Navigation active state -->
+<script>
+  const links = document.querySelectorAll('nav a');
+  const sections = document.querySelectorAll('section[id]');
+
+  function setActive() {
+    let current = '';
+    sections.forEach(s => {
+      if (window.scrollY >= s.offsetTop - 100) current = s.id;
+    });
+    links.forEach(a => {
+      a.classList.toggle('active', a.getAttribute('href') === '#' + current);
+    });
+  }
+
+  window.addEventListener('scroll', setActive);
+  setActive();
+</script>
+
+</body>
+</html>
