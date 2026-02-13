@@ -1,0 +1,41 @@
+[server]
+host = "127.0.0.1"
+port = 9000
+
+[models.primary]
+provider = "openai_compatible"
+base_url = "http://localhost:1234/v1"
+model = "minimax-m2.1"
+max_tokens = 4096
+temperature = 0.1
+roles = ["planner", "executor"]
+
+[models.utility]
+provider = "ollama"
+base_url = "http://localhost:11434"
+model = "qwen3:8b"
+max_tokens = 2048
+temperature = 0.0
+roles = ["extractor", "verifier"]
+
+[workspace]
+default_path = "~/projects"
+scratch_dir = "~/.loom/scratch"
+
+[execution]
+max_subtask_retries = 3
+max_loop_iterations = 50
+auto_approve_confidence_threshold = 0.8
+
+[verification]
+tier1_enabled = true
+tier2_enabled = true
+tier3_enabled = false
+tier3_vote_count = 3
+
+[memory]
+database_path = "~/.loom/loom.db"
+
+[logging]
+level = "INFO"
+event_log_path = "~/.loom/logs"
