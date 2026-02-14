@@ -22,9 +22,9 @@ sudo apt update && sudo apt install python3.12 python3.12-venv
 sudo dnf install python3.12
 ```
 
-### A Local Model Backend
+### A Model Backend
 
-Loom needs at least one local LLM backend running. Choose one:
+Loom needs at least one LLM backend. Choose one (or combine):
 
 #### Option A: Ollama (Recommended for beginners)
 
@@ -57,6 +57,20 @@ Any server that exposes the `/v1/chat/completions` endpoint works:
 # Example with vLLM
 pip install vllm
 vllm serve Qwen/Qwen2.5-14B-Instruct --port 8000
+```
+
+#### Option D: Anthropic/Claude (Cloud API)
+
+No local server needed. Set your API key and configure in `loom.toml`:
+
+```toml
+[models.claude]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+api_key = "sk-ant-..."               # or set ANTHROPIC_API_KEY env var
+max_tokens = 8192
+tier = 3
+roles = ["executor", "planner"]
 ```
 
 ---
@@ -107,6 +121,10 @@ loom --version
 # MCP server support (for agent integrations)
 uv sync --extra mcp
 # or: pip install -e ".[mcp]"
+
+# PDF text extraction in read_file tool
+uv sync --extra pdf
+# or: pip install -e ".[pdf]"
 ```
 
 ---
@@ -183,7 +201,7 @@ roles = ["planner", "executor", "extractor", "verifier"]
 |---------|-----|---------|-------------|
 | `server` | `host` | `127.0.0.1` | Bind address |
 | `server` | `port` | `9000` | Server port |
-| `models.<name>` | `provider` | -- | `ollama` or `openai_compatible` |
+| `models.<name>` | `provider` | -- | `ollama`, `openai_compatible`, or `anthropic` |
 | `models.<name>` | `base_url` | -- | Model API URL |
 | `models.<name>` | `model` | -- | Model identifier |
 | `models.<name>` | `max_tokens` | `4096` | Max response tokens |
@@ -230,7 +248,7 @@ curl http://localhost:1234/v1/models
 
 ```bash
 pytest
-# Should show 394 passed
+# Should show 612+ passed
 ```
 
 ### 4. Start the Server
@@ -250,7 +268,24 @@ curl http://localhost:9000/health
 
 ---
 
-## First Task
+## First Session
+
+### Interactive Cowork (Recommended)
+
+The fastest way to start — no server needed:
+
+```bash
+mkdir -p /tmp/loom-demo
+loom cowork -w /tmp/loom-demo
+```
+
+Or use the Textual TUI for a richer interface:
+
+```bash
+loom tui -w /tmp/loom-demo
+```
+
+### Autonomous Task Mode
 
 With the server running:
 

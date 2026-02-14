@@ -21,9 +21,9 @@ to scan the `loom.tools` package automatically.
 
 ---
 
-## Phase 2: Streaming Token Output
+## Phase 2: Streaming Token Output ✓ DONE
 
-Currently both providers hardcode `stream: False`. This blocks real-time feedback in the TUI.
+All providers support streaming. Cowork CLI uses streaming by default.
 
 ### 2a. Add streaming interface to `ModelProvider` ABC (`models/base.py`)
 - New method: `async def stream(messages, tools, ...) -> AsyncGenerator[StreamChunk, None]`
@@ -60,9 +60,10 @@ Currently both providers hardcode `stream: False`. This blocks real-time feedbac
 
 ---
 
-## Phase 3: TUI Enhancements
+## Phase 3: TUI Enhancements ✓ DONE
 
-Build on streaming + new tools to make the TUI a real workspace.
+TUI rewritten to use CoworkSession directly (no server needed).
+Streaming chat, tool approval modals, ask_user modals, all 16 tools.
 
 ### 3a. Enhanced task creation modal (`tui/app.py`)
 - Multi-field form: goal (required), workspace path (with autocomplete), approval_mode (select), context (optional textarea)
@@ -143,9 +144,9 @@ Currently retry just escalates model tiers. Smarter error handling = fewer waste
 
 ---
 
-## Phase 6: Interactive Conversation Mode (Stretch)
+## Phase 6: Interactive Conversation Mode ✓ DONE
 
-Currently Loom is fire-and-forget: submit task → wait → get result. An interactive mode would let users guide execution.
+Cowork mode is the primary interactive interface.
 
 ### 6a. Conversation endpoint (`api/routes.py`)
 - `POST /tasks/{id}/message` — send a message to the running task
@@ -167,13 +168,15 @@ Currently Loom is fire-and-forget: submit task → wait → get result. An inter
 
 ## Summary: Priority Order
 
-| Phase | Impact | Effort | Dependencies |
-|-------|--------|--------|-------------|
-| 1. New Tools | High | Low | None |
-| 2. Streaming | High | Medium | None |
-| 3. TUI Enhancements | High | Medium | Phases 1-2 |
-| 4. Smarter Planning | Medium | Medium | Phase 1 |
-| 5. Error Intelligence | Medium | Low | None |
-| 6. Interactive Mode | Medium | High | Phase 2 |
+| Phase | Impact | Effort | Status |
+|-------|--------|--------|--------|
+| 1. New Tools | High | Low | **DONE** |
+| 2. Streaming | High | Medium | **DONE** |
+| 3. TUI Enhancements | High | Medium | **DONE** |
+| 4. Smarter Planning | Medium | Medium | Phase 1 done (tree-sitter, web_fetch) |
+| 5. Error Intelligence | Medium | Low | Partial (error categorizer done) |
+| 6. Interactive Mode | Medium | High | **DONE** (cowork + TUI) |
 
-Phases 1, 2, and 5 can run in parallel. Phase 3 depends on 1+2. Phase 4 depends on 1. Phase 6 depends on 2.
+Additionally implemented (from gap analysis):
+- Anthropic/Claude provider, per-tool-call approval, web_search, ripgrep_search,
+  glob_find, ask_user, task_tracker, PDF/image support. 612+ tests passing.

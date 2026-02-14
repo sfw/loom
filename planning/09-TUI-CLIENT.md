@@ -2,171 +2,147 @@
 
 ## Overview
 
-The TUI is Loom's primary human interface for V1. Built with Python `textual`, it connects to the API server as a client and provides real-time task monitoring, approval controls, and steering. It is deliberately NOT a chat interface — it's a task monitor, closer to a CI/CD dashboard than a chatbot.
+The TUI is Loom's rich terminal interface for interactive cowork sessions. Built with Python `textual`, it runs CoworkSession directly — no server required. It provides a chat-based interface with streaming text, tool call visualization, approval modals, and ask_user modals.
+
+**Two interface options, same engine:**
+- `loom cowork` — lightweight CLI REPL with ANSI output
+- `loom tui` — Textual app with scrollable chat, modals, and widgets
 
 ## Launch
 
 ```bash
-loom tui                    # Connect to running server at configured host:port
-loom tui --server http://localhost:9000
+loom tui -w /path/to/project          # Textual UI with modals
+loom tui -w /path/to/project -m claude # Use a specific model
 ```
 
-The TUI is a client of the API. It does not embed the engine. The engine must be running separately via `loom serve`.
+The TUI runs the model client-side via CoworkSession. No `loom serve` needed.
 
 ## Layout
 
 ```
 ┌─ Loom ─────────────────────────────────────────────────────────────┐
-│ Tasks: 3 active │ Models: M2.1 ● Qwen3 ●  │ ↑↓:navigate  q:quit │
+│ Header (clock)                                                      │
 ├────────────────────────────────────────────────────────────────────┤
-│                                                                    │
-│  ┌─ Task List ─────────────────────────────────────────────────┐   │
-│  │ ● [running] Migrate Express to TypeScript    4/7  57%       │   │
-│  │ ● [waiting] Add test coverage for auth       0/5  ⏸ approval│   │
-│  │ ✓ [done]    Fix CORS headers                 3/3  100%      │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                    │
-│  ┌─ Plan ──────────────┐  ┌─ Live Output ─────────────────────┐   │
-│  │ ✓ Install deps      │  │ [schema-convert] Reading schema   │   │
-│  │ ✓ Rename .js → .ts  │  │ from src/models/...               │   │
-│  │ ✓ Add tsconfig.json │  │                                   │   │
-│  │ → Add type annot.   │  │ Tool: edit_file                   │   │
-│  │ ○ Fix type errors   │  │   path: src/models/User.ts        │   │
-│  │ ○ Run tests         │  │   +12 lines, -3 lines             │   │
-│  │ ○ Final validation  │  │                                   │   │
-│  │                     │  │ Tool: read_file                   │   │
-│  │                     │  │   path: src/routes/auth.ts        │   │
-│  └─────────────────────┘  └───────────────────────────────────┘   │
-│                                                                    │
-│  ┌─ Files Changed ────────────────────────────────────────────┐   │
-│  │ M src/models/User.ts (+12/-3)    A tsconfig.json           │   │
-│  │ M src/routes/auth.ts (+23/-8)    M package.json (+5/-1)    │   │
-│  └────────────────────────────────────────────────────────────┘   │
-│                                                                    │
-│  [d]iff  [r]evert  [a]pprove  [s]teer  [p]ause  [c]ancel        │
+│                                                                      │
+│  Chat Log (RichLog, scrollable)                                      │
+│                                                                      │
+│  > Fix the authentication bug in src/auth.py                         │
+│                                                                      │
+│    read_file src/auth.py                                             │
+│    ok 12ms 45 lines                                                  │
+│    ripgrep_search /validate_token/                                   │
+│    ok 3ms 2 results                                                  │
+│    edit_file src/auth.py                                             │
+│    ok 8ms                                                            │
+│                                                                      │
+│  I found and fixed the bug. The token validation was using...        │
+│                                                                      │
+│  [3 tool calls | 1,247 tokens | claude-sonnet-4-5]                  │
+│                                                                      │
+├────────────────────────────────────────────────────────────────────┤
+│  [>] Type a message... (Enter to send)                               │
+├────────────────────────────────────────────────────────────────────┤
+│  /path/to/project  |  Ready                                         │
+├────────────────────────────────────────────────────────────────────┤
+│  Ctrl+C Quit   Ctrl+L Clear                                         │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-## Views
+## Features
 
-### Dashboard View (Task List)
-- Shows all tasks with status, progress bar, and summary
-- Keyboard navigation: arrow keys to select, Enter to open detail view
-- Status indicators: `●` running, `⏸` waiting for approval, `✓` complete, `✗` failed
-- Auto-refreshes via SSE subscription to all events
+### Streaming Text Display
+- Model text tokens stream into the RichLog as they arrive
+- Tool calls show inline: tool name, args preview on start; ok/err, elapsed, output preview on completion
+- Turn summaries show tool count and token usage
 
-### Task Detail View
-- **Left panel: Plan tree** — Subtask list with status icons (✓ complete, → running, ○ pending, ✗ failed)
-- **Center panel: Live output** — Streaming model activity, tool calls, and results for the active subtask
-- **Bottom panel: Files changed** — Git-style summary (M modified, A added, D deleted) with line counts
-- **Status bar: Controls** — Keyboard shortcuts for actions
+### Tool Approval Modal
+When the model calls a write/execute tool (shell_execute, git_command, edit_file, etc.), a modal appears:
 
-### Diff View
-- Press `d` on a changed file to see the full diff
-- Shows before/after with standard unified diff coloring
-- Press `Esc` to return to task detail
+```
+┌─ Approve tool call? ──────────────────────┐
+│                                            │
+│  shell_execute  ls -la                     │
+│                                            │
+│  [y] Yes  [a] Always allow  [n] No  [Esc] │
+└────────────────────────────────────────────┘
+```
 
-### Approval Modal
-- When the engine requests approval, a modal overlay appears
-- Shows: what the engine wants to do, why it needs approval, risk level
-- Keys: `y` approve, `n` reject, `r` reject with reason
+- **[y] Yes** — approve this one call
+- **[a] Always** — approve all future calls to this tool for the session
+- **[n] No / Esc** — deny (model sees "denied by user" error)
+- Read-only tools (read_file, search, glob, web_search, etc.) are auto-approved
 
-### Steer Input
-- Press `s` to open a text input for mid-task instructions
-- Typed instruction is sent via PATCH /tasks/{id}
-- Shown as a system event in the live output
+### Ask User Modal
+When the model calls `ask_user`, a modal with an input field appears:
 
-## Textual Application Structure
+```
+┌─ Question: Which database should we use? ─┐
+│                                            │
+│   1. PostgreSQL                            │
+│   2. SQLite                                │
+│   3. MySQL                                 │
+│   Enter a number or type your answer       │
+│                                            │
+│   [>] Your answer...                       │
+└────────────────────────────────────────────┘
+```
+
+### Commands
+- `/quit`, `/exit`, `/q` — exit the TUI
+- `/clear` — clear the chat log
+
+## Architecture
 
 ```python
 # tui/app.py
-from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Header, Footer, Static, ListView
-
 class LoomApp(App):
-    CSS_PATH = "loom.tcss"
-    BINDINGS = [
-        ("q", "quit", "Quit"),
-        ("d", "show_diff", "Diff"),
-        ("a", "approve", "Approve"),
-        ("s", "steer", "Steer"),
-        ("p", "pause", "Pause"),
-        ("c", "cancel", "Cancel"),
-        ("r", "revert", "Revert"),
-        ("escape", "back", "Back"),
-    ]
+    """Uses CoworkSession directly — no server."""
 
-    def __init__(self, server_url: str):
-        super().__init__()
-        self.server_url = server_url
-        self.api_client = LoomAPIClient(server_url)
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield DashboardView()
-        yield Footer()
-
-    async def on_mount(self):
-        """Start SSE subscription for real-time updates."""
-        self.run_worker(self._subscribe_events())
-
-    async def _subscribe_events(self):
-        """Background worker consuming SSE stream."""
-        async for event in self.api_client.stream_all_events():
-            self.post_message(TaskEventMessage(event))
-```
-
-## API Client
-
-The TUI uses a thin async client wrapping the REST API:
-
-```python
-class LoomAPIClient:
-    def __init__(self, base_url: str):
-        self._client = httpx.AsyncClient(base_url=base_url)
-
-    async def list_tasks(self) -> list[dict]: ...
-    async def get_task(self, task_id: str) -> dict: ...
-    async def create_task(self, goal: str, workspace: str = None) -> dict: ...
-    async def cancel_task(self, task_id: str) -> dict: ...
-    async def approve(self, task_id: str, subtask_id: str) -> dict: ...
-    async def steer(self, task_id: str, instruction: str) -> dict: ...
-    async def get_diff(self, task_id: str, file_path: str) -> str: ...
-
-    async def stream_all_events(self) -> AsyncIterator[dict]:
-        """Subscribe to global SSE stream."""
+    def __init__(self, model: ModelProvider, tools: ToolRegistry, workspace: Path):
         ...
+        # Session created on mount with ToolApprover wired to modal callback
 
-    async def stream_task_events(self, task_id: str) -> AsyncIterator[dict]:
-        """Subscribe to task-specific SSE stream."""
-        ...
+    async def _approval_callback(self, tool_name, args) -> ApprovalDecision:
+        """Shows ToolApprovalScreen modal, waits for response."""
+
+    @work(exclusive=True)
+    async def _run_turn(self, user_message: str):
+        """Streams events from session.send_streaming() into the RichLog."""
 ```
 
-## Quick Run Mode
+### Key Components
 
-For quick tasks, bypass the TUI and run inline in the terminal:
+| Component | File | Description |
+|-----------|------|-------------|
+| `LoomApp` | `tui/app.py` | Main Textual application |
+| `ToolApprovalScreen` | `tui/app.py` | Modal for [y]es/[a]lways/[n]o approval |
+| `AskUserScreen` | `tui/app.py` | Modal for model questions with option input |
+| `ToolApprover` | `cowork/approval.py` | Tracks auto-approved and always-approved tools |
+| `CoworkSession` | `cowork/session.py` | Conversation-first execution engine |
+| `LoomAPIClient` | `tui/api_client.py` | Legacy REST client (still available for server mode) |
 
-```bash
-loom run "Fix all TypeScript errors in src/" --workspace ./my-project
-```
+## Tool Display Previews
 
-This:
-1. Starts the engine (if not running)
-2. Submits the task
-3. Streams progress inline (simple log output, not full TUI)
-4. Returns exit code 0 on success, 1 on failure
+Each tool call shows a compact preview in the chat log:
+
+| Tool | Start Preview | Completion Preview |
+|------|--------------|-------------------|
+| `read_file` | `src/auth.py` | `ok 12ms 45 lines` |
+| `shell_execute` | `pytest tests/ -x` | `ok 3200ms 12 passed` |
+| `ripgrep_search` | `/TODO/` | `ok 5ms 7 results` |
+| `glob_find` | `**/*.py` | `ok 2ms 23 results` |
+| `web_search` | `python asyncio tutorial` | `ok 800ms 3 results` |
+| `git_command` | `status` | `ok 15ms` |
 
 ## Acceptance Criteria
 
-- [ ] `loom tui` launches and connects to running server
-- [ ] Dashboard shows all tasks with real-time status updates
-- [ ] Task detail view shows plan tree, live output, and files changed
-- [ ] Approval modal appears when engine requests approval
-- [ ] Steer input sends instruction to running task
-- [ ] Diff view shows file changes with color highlighting
-- [ ] Cancel stops a running task
-- [ ] Keyboard shortcuts work from all views
-- [ ] TUI reconnects if SSE connection drops
-- [ ] `loom run` works for quick inline task execution
-- [ ] TUI does not embed the engine (pure API client)
+- [x] `loom tui` launches without a running server (uses CoworkSession directly)
+- [x] Chat log shows streaming text tokens in real time
+- [x] Tool calls display with args preview and completion status
+- [x] Approval modal appears for write/execute tools with [y]/[a]/[n] options
+- [x] "Always allow" remembers per-tool for the session
+- [x] Ask_user modal shows question, options, and input field
+- [x] All 16 tools are supported
+- [x] `/quit` and `/clear` commands work
+- [x] Status bar shows workspace path and current state
+- [x] Keyboard shortcuts (Ctrl+C quit, Ctrl+L clear) work

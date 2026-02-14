@@ -1,6 +1,12 @@
 # Connecting Agents to Loom
 
-This guide shows how to connect external agents (Claude Code, custom scripts, cron jobs, other AI agents) to Loom as clients. Loom handles task decomposition, execution, verification, and learning — your agent just says "do this" and gets verified results back.
+This guide shows how to connect external agents (Claude Code, custom scripts, cron jobs, other AI agents) to Loom as clients.
+
+**Two execution models:**
+- **Cowork mode** (`loom cowork` / `loom tui`) — interactive, conversation-first. The agent and developer collaborate in real time with 16 tools, streaming, and per-tool-call approval. No server needed.
+- **Task mode** (REST API / MCP) — autonomous, fire-and-forget. Loom decomposes the goal into subtasks, executes, verifies, and reports back.
+
+This document covers both modes.
 
 ## Architecture
 
@@ -242,9 +248,48 @@ Claude Code: "Done! I migrated all 47 files to TypeScript..."
 
 ## 3. Programmatic Python Integration
 
-For agents written in Python, you can use Loom's engine directly without the HTTP layer.
+For agents written in Python, you can use Loom's engines directly without the HTTP layer.
 
-### Direct Engine Usage
+### Cowork Session (Interactive)
+
+Use CoworkSession for conversation-first interactive work with all 16 tools:
+
+```python
+import asyncio
+from pathlib import Path
+
+from loom.config import load_config
+from loom.cowork.session import CoworkSession, CoworkTurn, ToolCallEvent, build_cowork_system_prompt
+from loom.models.router import ModelRouter
+from loom.tools import create_default_registry
+
+async def cowork():
+    config = load_config()
+    router = ModelRouter.from_config(config)
+    model = router.select(role="executor")
+    tools = create_default_registry()
+    workspace = Path("/projects/myapp")
+
+    session = CoworkSession(
+        model=model,
+        tools=tools,
+        workspace=workspace,
+        system_prompt=build_cowork_system_prompt(workspace),
+    )
+
+    # Send a message and process events
+    async for event in session.send_streaming("Fix the auth bug"):
+        if isinstance(event, str):
+            print(event, end="")  # streamed text token
+        elif isinstance(event, ToolCallEvent) and event.result:
+            print(f"  {event.name}: {'ok' if event.result.success else 'err'}")
+        elif isinstance(event, CoworkTurn):
+            print(f"\n[{len(event.tool_calls)} tools, {event.tokens_used} tokens]")
+
+asyncio.run(cowork())
+```
+
+### Direct Engine Usage (Autonomous Tasks)
 
 ```python
 import asyncio

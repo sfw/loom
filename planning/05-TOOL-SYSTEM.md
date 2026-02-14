@@ -79,17 +79,22 @@ class Tool(ABC):
 
 | Tool | Description | Timeout |
 |------|-------------|---------|
-| `read_file` | Read file contents, optional line range | 10s |
+| `read_file` | Read file contents (text, PDF via pypdf, image metadata), optional line range | 10s |
 | `write_file` | Write/create file, records changelog | 10s |
 | `edit_file` | Find-and-replace unique string in file, records changelog | 10s |
-| `shell_execute` | Run shell command in workspace directory | 60s |
+| `shell_execute` | Run shell command in workspace directory | 120s |
 | `search_files` | Grep for patterns across workspace files | 30s |
 | `list_directory` | List files and dirs up to 2 levels deep | 10s |
 | `delete_file` | Delete file or empty directory | 10s |
 | `move_file` | Move or rename a file within workspace | 10s |
-| `git_command` | Git operations (status, diff, log, add, commit, etc.) | 60s |
+| `git_command` | Git operations (status, diff, log, add, commit, push, etc.) | 60s |
 | `analyze_code` | Parse file structure (classes, functions, imports) | 15s |
 | `web_fetch` | Fetch URL content for documentation/specs | 45s |
+| `web_search` | Internet search via DuckDuckGo (no API key required) | 30s |
+| `ripgrep_search` | Fast content search via ripgrep with regex, context lines, type filters | 30s |
+| `glob_find` | Fast file discovery by glob pattern, sorted by mtime, skips junk dirs | 10s |
+| `ask_user` | Ask the developer questions mid-execution (free-text or multiple choice) | 300s |
+| `task_tracker` | In-memory progress tracking (add/update/list/clear tasks) | 10s |
 
 ### read_file
 - Parameters: `path` (required, string), `line_range` (optional, [start, end])

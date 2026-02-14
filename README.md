@@ -65,7 +65,7 @@ Goal -> Planner ->  │ [Subtask A]  [Subtask B] │  parallel batch
 
 - **Cowork mode** -- interactive conversation loop with streaming, real-time tool display, per-tool-call approval, and full context
 - **REST API** -- full task CRUD, SSE streaming, steer/approve/feedback
-- **Terminal UI** -- Textual-based dashboard with live streaming, steering, and approval modals
+- **Terminal UI** -- Textual-based cowork interface with streaming chat, tool approval modals ([y]es/[a]lways/[n]o), ask_user modals, and scrollable chat log. Runs standalone (no server required).
 - **MCP server** -- Model Context Protocol integration for use as an agent tool
 - **Learning system** -- pattern extraction from execution history (success patterns, retry hints, templates)
 
@@ -97,20 +97,20 @@ loom run "Create a Python CLI that converts CSV to JSON" --workspace /tmp/myproj
 # Or start an interactive cowork session
 loom cowork -w /tmp/myproject
 
-# Or launch the terminal UI
-loom tui
+# Or launch the Textual TUI (same features, richer interface)
+loom tui -w /tmp/myproject
 ```
 
 ## CLI Commands
 
 ```
 loom serve              Start the API server
-loom cowork             Start an interactive cowork session (pair programming)
+loom cowork             Start an interactive cowork session (pair programming, CLI)
+loom tui                Launch the Textual TUI (cowork with modals and scrollback)
 loom run GOAL           Submit a task and stream progress inline
 loom status ID          Check status of a task
 loom cancel ID          Cancel a running task
 loom models             List configured models
-loom tui                Launch the terminal UI dashboard
 loom mcp-serve          Start the MCP server (stdio transport)
 loom reset-learning     Clear all learned patterns
 ```
@@ -204,6 +204,7 @@ src/loom/
     engine.py            Component wiring and lifecycle
   cowork/
     session.py           Conversation-first interactive execution engine
+    approval.py          Per-tool-call approval (auto/approve/always/deny)
     display.py           Terminal display with ANSI colors for tool calls
   engine/
     orchestrator.py      Core loop: plan -> schedule -> dispatch -> finalize
@@ -251,8 +252,8 @@ src/loom/
     task_tracker.py      Progress tracking for multi-step tasks
     workspace.py         Changelog, diff, revert
   tui/
-    api_client.py        Async HTTP + SSE client for Loom API
-    app.py               Textual TUI (dashboard, detail views, modals)
+    app.py               Textual TUI (cowork chat, approval/ask_user modals)
+    api_client.py        Async HTTP + SSE client (legacy server-mode)
 ```
 
 ## Development
@@ -277,7 +278,7 @@ pytest --cov=loom --cov-report=term-missing
 ## Requirements
 
 - Python 3.11+
-- A local model backend: [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), or any OpenAI-compatible API
+- A model backend: [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), any OpenAI-compatible API, or [Anthropic/Claude](https://console.anthropic.com)
 
 ## License
 
