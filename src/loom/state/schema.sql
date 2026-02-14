@@ -65,3 +65,38 @@ CREATE TABLE IF NOT EXISTS learned_patterns (
 
 CREATE INDEX IF NOT EXISTS idx_patterns_type ON learned_patterns(pattern_type);
 CREATE INDEX IF NOT EXISTS idx_patterns_key ON learned_patterns(pattern_key);
+
+-- Cowork sessions
+CREATE TABLE IF NOT EXISTS cowork_sessions (
+    id TEXT PRIMARY KEY,
+    workspace_path TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    system_prompt TEXT,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_active_at TEXT NOT NULL DEFAULT (datetime('now')),
+    total_tokens INTEGER DEFAULT 0,
+    turn_count INTEGER DEFAULT 0,
+    session_state TEXT,                              -- JSON: structured session state
+    is_active INTEGER DEFAULT 1
+);
+
+-- Verbatim conversation turns (append-only, never compacted)
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    role TEXT NOT NULL,                              -- user | assistant | tool | system
+    content TEXT,                                    -- message text (verbatim, no truncation)
+    tool_calls TEXT,                                 -- JSON array of tool calls (nullable)
+    tool_call_id TEXT,                               -- for role=tool, the call this responds to
+    tool_name TEXT,                                  -- for role=tool, which tool was called
+    token_count INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(session_id, turn_number),
+    FOREIGN KEY (session_id) REFERENCES cowork_sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ct_session ON conversation_turns(session_id);
+CREATE INDEX IF NOT EXISTS idx_ct_session_turn ON conversation_turns(session_id, turn_number);
+CREATE INDEX IF NOT EXISTS idx_ct_role ON conversation_turns(session_id, role);
+CREATE INDEX IF NOT EXISTS idx_ct_tool_name ON conversation_turns(tool_name);

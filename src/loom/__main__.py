@@ -263,23 +263,29 @@ def mcp_serve(ctx: click.Context, server_url: str | None) -> None:
     help="Workspace directory. Defaults to current directory.",
 )
 @click.option("--model", "-m", default=None, help="Model name from config to use.")
+@click.option("--resume", "resume_session", default=None, help="Resume a previous session by ID.")
 @click.pass_context
-def cowork(ctx: click.Context, workspace: Path | None, model: str | None) -> None:
+def cowork(ctx: click.Context, workspace: Path | None, model: str | None, resume_session: str | None) -> None:
     """Start an interactive cowork session.
 
     Opens a conversation loop where you and the AI collaborate directly.
     No planning phase, no subtask decomposition — just a continuous
     tool-calling loop driven by natural conversation.
+
+    All conversation history is persisted to SQLite. Use --resume to
+    continue a previous session.
     """
     import asyncio
 
     config = ctx.obj["config"]
     ws = (workspace or Path.cwd()).resolve()
 
-    asyncio.run(_cowork_session(config, ws, model))
+    asyncio.run(_cowork_session(config, ws, model, resume_session))
 
 
-async def _cowork_session(config, workspace: Path, model_name: str | None) -> None:
+async def _cowork_session(
+    config, workspace: Path, model_name: str | None, resume_id: str | None = None,
+) -> None:
     """Run an interactive cowork session."""
     from loom.cowork.approval import ToolApprover, async_terminal_approval_prompt
     from loom.cowork.display import (
@@ -299,12 +305,13 @@ async def _cowork_session(config, workspace: Path, model_name: str | None) -> No
         build_cowork_system_prompt,
     )
     from loom.models.router import ModelRouter
+    from loom.state.conversation_store import ConversationStore
+    from loom.state.memory import Database
     from loom.tools import create_default_registry
 
     # Set up model
     router = ModelRouter.from_config(config)
     if model_name:
-        # Try to get the specific named provider
         provider = None
         for name, p in router._providers.items():
             if name == model_name:
@@ -320,19 +327,132 @@ async def _cowork_session(config, workspace: Path, model_name: str | None) -> No
             display_error(f"No model available: {e}")
             return
 
-    # Set up tools and approval
+    # Set up database and conversation store
+    db_path = Path(config.data_dir) / "loom.db" if hasattr(config, "data_dir") else Path.home() / ".loom" / "loom.db"
+    db = Database(db_path)
+    await db.initialize()
+    store = ConversationStore(db)
+
+    # Set up tools
     tools = create_default_registry()
+
+    # Register conversation_recall tool (needs binding after session creation)
+    from loom.tools.conversation_recall import ConversationRecallTool
+    recall_tool = ConversationRecallTool()
+    tools.register(recall_tool)
+
+    # Register delegate_task tool
+    from loom.tools.delegate_task import DelegateTaskTool
+    delegate_tool = DelegateTaskTool()
+    tools.register(delegate_tool)
+
     approver = ToolApprover(prompt_callback=async_terminal_approval_prompt)
 
     # Build session
     system_prompt = build_cowork_system_prompt(workspace)
-    session = CoworkSession(
-        model=provider,
-        tools=tools,
-        workspace=workspace,
-        system_prompt=system_prompt,
-        approver=approver,
-    )
+
+    if resume_id:
+        # Resume existing session
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            system_prompt=system_prompt,
+            approver=approver,
+            store=store,
+        )
+        try:
+            await session.resume(resume_id)
+            sys.stdout.write(
+                f"\033[2mResumed session {resume_id} "
+                f"({session.session_state.turn_count} turns in archive)\033[0m\n"
+            )
+        except (ValueError, RuntimeError) as e:
+            display_error(str(e))
+            return
+    else:
+        # Check for previous sessions in this workspace
+        previous = await store.list_sessions(workspace=str(workspace))
+        session_id = ""
+
+        if previous:
+            sys.stdout.write("\n\033[2mPrevious sessions for this workspace:\033[0m\n")
+            for i, s in enumerate(previous[:5], 1):
+                turns = s.get("turn_count", 0)
+                started = s.get("started_at", "?")[:16]
+                sid = s["id"]
+                sys.stdout.write(f"  \033[2m[{i}]\033[0m {started} — {turns} turns (id: {sid})\n")
+            sys.stdout.write(f"  \033[2m[n]\033[0m Start new session\n")
+            sys.stdout.flush()
+
+            try:
+                choice = input("\033[2mResume or new? \033[0m").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                display_goodbye()
+                return
+
+            if choice.isdigit() and 1 <= int(choice) <= len(previous[:5]):
+                session_id = previous[int(choice) - 1]["id"]
+            elif choice and choice != "n":
+                display_error(f"Invalid choice: {choice}")
+                return
+
+        if session_id:
+            # Resume selected session
+            session = CoworkSession(
+                model=provider,
+                tools=tools,
+                workspace=workspace,
+                system_prompt=system_prompt,
+                approver=approver,
+                store=store,
+            )
+            await session.resume(session_id)
+            sys.stdout.write(
+                f"\033[2mResumed session {session_id} "
+                f"({session.session_state.turn_count} turns in archive)\033[0m\n"
+            )
+        else:
+            # New session
+            session_id = await store.create_session(
+                workspace=str(workspace),
+                model_name=provider.name,
+                system_prompt=system_prompt,
+            )
+            session = CoworkSession(
+                model=provider,
+                tools=tools,
+                workspace=workspace,
+                system_prompt=system_prompt,
+                approver=approver,
+                store=store,
+                session_id=session_id,
+            )
+
+    # Bind tools that need session context
+    recall_tool.bind(store=store, session_id=session.session_id, session_state=session.session_state)
+
+    # Create orchestrator factory for delegate_task (lazy init)
+    async def _orchestrator_factory():
+        from loom.engine.orchestrator import Orchestrator
+        from loom.events.bus import EventBus
+        from loom.prompts.assembler import PromptAssembler
+        from loom.state.memory import MemoryManager
+        from loom.state.task_state import TaskStateManager
+        from loom.tools import create_default_registry as _create_tools
+
+        data_dir = Path(config.data_dir) if hasattr(config, "data_dir") else Path.home() / ".loom"
+        return Orchestrator(
+            model_router=router,
+            tool_registry=_create_tools(),
+            memory_manager=MemoryManager(db),
+            prompt_assembler=PromptAssembler(config),
+            state_manager=TaskStateManager(data_dir),
+            event_bus=EventBus(),
+            config=config,
+        )
+
+    delegate_tool.bind(_orchestrator_factory)
 
     display_welcome(workspace, provider.name)
 
@@ -353,8 +473,18 @@ async def _cowork_session(config, workspace: Path, model_name: str | None) -> No
 
         if user_input.strip().lower() == "/help":
             sys.stdout.write(
-                "Commands: /quit, /exit, /help\n"
+                "Commands: /quit, /exit, /help, /session\n"
                 "Type anything else to interact with the AI.\n"
+            )
+            continue
+
+        if user_input.strip().lower() == "/session":
+            state = session.session_state
+            sys.stdout.write(
+                f"Session: {session.session_id}\n"
+                f"Turns: {state.turn_count}\n"
+                f"Tokens: {state.total_tokens}\n"
+                f"Focus: {state.current_focus or '(none)'}\n"
             )
             continue
 
@@ -386,8 +516,6 @@ async def _cowork_session(config, workspace: Path, model_name: str | None) -> No
                                         display_text_chunk(follow_event)
 
                 elif isinstance(event, CoworkTurn):
-                    # Text was already streamed incrementally — only
-                    # display if no streaming occurred (fallback).
                     if event.text and not streamed_text:
                         sys.stdout.write(f"\n{event.text}\n")
                     display_turn_summary(event)

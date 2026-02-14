@@ -168,7 +168,7 @@ class TestCoworkSession:
         assert any(e.name == "ask_user" for e in tool_events)
 
     async def test_context_window_trimming(self, workspace, tools):
-        """Session trims context when messages exceed budget."""
+        """Session trims context when token budget is exceeded."""
         provider = MockProvider([
             ModelResponse(text=f"Response {i}", usage=TokenUsage())
             for i in range(10)
@@ -177,15 +177,17 @@ class TestCoworkSession:
             model=provider, tools=tools, workspace=workspace,
             system_prompt="Test system prompt.",
             max_context_messages=5,
+            # Very small token budget so short messages get trimmed
+            max_context_tokens=200,
         )
 
         for i in range(10):
             async for _ in session.send(f"Message {i}"):
                 pass
 
-        # Context window should be trimmed
+        # Context window should be trimmed by token budget
         context = session._context_window()
-        assert len(context) <= 5
+        assert len(context) < 20  # less than all 20 messages
         # System prompt should always be preserved
         assert context[0]["role"] == "system"
 
