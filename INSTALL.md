@@ -63,10 +63,26 @@ vllm serve Qwen/Qwen2.5-14B-Instruct --port 8000
 
 ## Install Loom
 
-### From Source (Development)
+### From Source (using uv -- recommended)
 
 ```bash
 # Clone the repository
+git clone https://github.com/your-org/loom.git
+cd loom
+
+# Install dependencies (creates .venv automatically)
+uv sync
+
+# Install with dev tools (pytest, ruff, coverage)
+uv sync --extra dev
+
+# Verify installation
+uv run loom --version
+```
+
+### From Source (using pip)
+
+```bash
 git clone https://github.com/your-org/loom.git
 cd loom
 
@@ -75,25 +91,22 @@ python3 -m venv .venv
 source .venv/bin/activate  # Linux/macOS
 # .venv\Scripts\activate   # Windows
 
-# Install in editable mode with dev dependencies
+# Install in editable mode
+pip install -e .
+
+# Or with dev dependencies
 pip install -e ".[dev]"
 
 # Verify installation
 loom --version
 ```
 
-### Using uv (Faster)
+### Optional Extras
 
 ```bash
-git clone https://github.com/your-org/loom.git
-cd loom
-
-# Install with uv
-uv venv
-source .venv/bin/activate
-uv pip install -e ".[dev]"
-
-loom --version
+# MCP server support (for agent integrations)
+uv sync --extra mcp
+# or: pip install -e ".[mcp]"
 ```
 
 ---
@@ -216,7 +229,7 @@ curl http://localhost:1234/v1/models
 
 ```bash
 pytest
-# Should show 290 passed
+# Should show 383 passed
 ```
 
 ### 4. Start the Server
@@ -313,5 +326,6 @@ loom serve --port 9001
 
 ```bash
 pip uninstall loom
+# or, if installed with uv: uv pip uninstall loom
 rm -rf ~/.loom          # Remove config and data
 ```
