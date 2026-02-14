@@ -235,12 +235,70 @@ def _build_system_prompt(self) -> str:
 
 ---
 
-## Component 3: `conversation_recall` Tool
+## Component 3: `conversation_recall` Tool + Context Awareness
 
-A tool the model can call to retrieve past conversation context from the
-archive. This is the key mechanism that replaces compaction: instead of
-keeping everything in context or losing it, the model queries for exactly
-what it needs.
+### The Retrieval Problem
+
+A passive tool alone isn't sufficient. The model has to *decide* to call
+`conversation_recall` — but if it's already forgotten the context (because
+it fell off the window), how does it know to look? Three scenarios:
+
+1. **Model knows it needs history** — User says "remember when we discussed
+   auth?" Model recognizes the reference, calls the tool. Works naturally.
+
+2. **Model doesn't realize it's missing context** — User says "now add tests
+   for that" and the relevant turns are gone. Model hallucinates or asks the
+   user to repeat themselves.
+
+3. **Model needs context it doesn't know exists** — User stated a constraint
+   200 turns ago ("never use ORM, raw SQL only"). Model doesn't know to look.
+
+### Three-Layer Solution
+
+**Layer A: Session state handles scenario 3.** Key decisions, constraints,
+and architectural choices are captured in the session state YAML that's
+*always* in context. "Never use ORM" gets recorded in `key_decisions` the
+turn it's stated and stays there permanently. The model doesn't need to
+recall it — it never leaves the prompt. This is not a lossy summary of
+conversation; it's a structured register of facts that matter.
+
+**Layer B: Dangling reference detection handles scenario 2.** When the
+user's message contains references to prior context that isn't in the
+recent window, the system injects a hint before the model responds:
+
+```python
+def _maybe_inject_recall_hint(self, user_message: str) -> str | None:
+    """If the user references something not in recent context, hint the model."""
+    indicators = [
+        "like we discussed", "as before", "remember when",
+        "go back to", "that file", "that error", "that function",
+        "what we did", "earlier", "the previous", "as I said",
+        "like I mentioned", "that thing", "we already",
+    ]
+    if any(phrase in user_message.lower() for phrase in indicators):
+        return (
+            "[System: The user may be referencing earlier conversation "
+            "that is no longer in your context window. Use the "
+            "conversation_recall tool to search for relevant context "
+            "before proceeding.]"
+        )
+    return None
+```
+
+This is a heuristic, but it fails safe — a spurious nudge costs one
+unnecessary tool call. The alternative (an LLM call to detect dangling
+references) adds latency to every single turn.
+
+**Layer C: System prompt handles scenario 1 and general awareness.** The
+model is instructed: "Your context window contains only recent turns. The
+full session history is in the archive. Use `conversation_recall` whenever
+you're unsure about prior context or when the user references earlier work."
+Good models are highly responsive to this instruction.
+
+### The Tool
+
+`conversation_recall` is the active retrieval mechanism for when the model
+knows (or is nudged) that it needs prior context.
 
 ### Tool Definition
 
@@ -534,26 +592,29 @@ async def resume(self, session_id: str) -> None:
 **Tests:**
 - `tests/test_session_state.py` — extraction from tool calls, YAML rendering, pruning
 
-### Phase 3: Conversation Recall Tool
+### Phase 3: Conversation Recall Tool + Context Awareness
 
 **Files to create:**
 - `src/loom/tools/conversation_recall.py` — ConversationRecallTool
 
 **Files to modify:**
 - `src/loom/tools/__init__.py` — register the tool in `create_default_registry`
-- `src/loom/cowork/session.py` — pass store to tool at session creation
+- `src/loom/cowork/session.py` — pass store to tool at session creation,
+  add `_maybe_inject_recall_hint()` to the message handling path
 - `src/loom/cowork/approval.py` — add `conversation_recall` to auto-approved list
 
 **Tests:**
 - `tests/test_conversation_recall.py` — all four actions, output formatting, budget limits
+- `tests/test_recall_hint.py` — dangling reference detection, false positive rate
 
 ### Phase 4: Context Window Rewrite
 
 **Files to modify:**
-- `src/loom/cowork/session.py` — replace `_context_window()` and `_maybe_trim()`
+- `src/loom/cowork/session.py` — replace `_context_window()` and `_maybe_trim()`,
+  integrate recall hint injection into `send()` / `send_streaming()`
 
 **Tests:**
-- `tests/test_cowork_context.py` — token budgeting, priority order, archive fallback
+- `tests/test_cowork_context.py` — token budgeting, priority order, hint injection
 
 ### Phase 5: Session Resumption + CLI
 
@@ -576,6 +637,8 @@ The system prompt needs to tell the model:
 - The session state block shows structured metadata about the session
 - It should use `conversation_recall` when it needs information from
   earlier in the session rather than asking the user to repeat themselves
+- When its context window doesn't contain enough information to act
+  confidently, it should search before guessing
 
 ---
 
