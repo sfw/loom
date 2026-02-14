@@ -1,19 +1,33 @@
-# Conversation Archive: Non-Lossy History for Cowork Mode
+# Cowork Mode: Non-Lossy History + Task Delegation
 
 ## Problem Statement
 
-CoworkSession stores conversation history as an in-memory `list[dict]`.
-When messages exceed 200, a sliding window drops old messages permanently.
-When the process exits, everything is lost. This is compaction — exactly
-what the project's core philosophy rejects:
+Two problems, one root cause: cowork mode is isolated from both its own
+history and from the task engine.
+
+**Problem 1: Lossy history.** CoworkSession stores conversation history as
+an in-memory `list[dict]`. When messages exceed 200, a sliding window drops
+old messages permanently. When the process exits, everything is lost. This
+is compaction — exactly what the project's core philosophy rejects:
 
 > "Structured state over conversation — No chat history rot. Deterministic
 > retrieval from SQLite, not lossy compaction of message logs."
 
-The existing Layer 2 memory system (SQLite `memory_entries` table) was
-designed for task mode's extracted summaries. Cowork mode needs something
-different: **verbatim conversation persistence** with **tool-based retrieval**
-so the model can access any prior exchange without filling the context window.
+**Problem 2: No task delegation.** Cowork and task mode are completely
+separate worlds. A user in cowork who says "migrate this to TypeScript"
+gets the model trying to do everything in a flat tool loop — no planning,
+no verification, no parallelism. To use task mode, the user has to quit
+cowork, switch modes, and lose the conversation.
+
+This is wrong. Look at how Claude Code actually works: the conversation IS
+the interface. Within that conversation, complex work happens via subagents
+(the Task tool). The user never leaves the conversation. They discuss, they
+say "do it," the agent decomposes and executes, results come back, they
+discuss the results. One continuous flow.
+
+Loom should work the same way: **cowork is the primary interface, and task
+mode is an execution capability that cowork can invoke when work requires
+planning, decomposition, verification, or parallelism.**
 
 ---
 
@@ -26,39 +40,53 @@ so the model can access any prior exchange without filling the context window.
 4. **Model-driven retrieval** — a tool the model calls to query the archive
    when it needs prior context ("what did the user say about auth?")
 5. **Session resumption** — close terminal, reopen, continue where you left off
-6. **Cowork-only scope** — task mode keeps its existing architecture unchanged
+6. **Cowork delegates to task mode** — the model can submit complex work to
+   the orchestrator, get results back, and continue the conversation
+7. **Single continuous experience** — no mode switching, no context loss
 
 ---
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  Context Window                      │
-│                                                      │
-│  ┌──────────────┐  ┌────────────┐  ┌──────────────┐ │
-│  │ System Prompt │  │  Session   │  │   Recent N   │ │
-│  │              │  │   State    │  │    Turns     │ │
-│  │  (static)    │  │  (YAML)   │  │  (sliding)   │ │
-│  └──────────────┘  └────────────┘  └──────────────┘ │
-│                                                      │
-│  ┌──────────────────────────────────────────────────┐│
-│  │         Retrieved Archive Context                ││
-│  │   (injected when conversation_recall is used)    ││
-│  └──────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────┘
-                         │
-                    reads/writes
-                         │
-                         ▼
-              ┌─────────────────────┐
-              │   SQLite Database   │
-              │                     │
-              │  conversation_turns │  ← verbatim messages
-              │  session_state      │  ← running session metadata
-              │  memory_entries     │  ← (existing, unchanged)
-              └─────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                   CoworkSession                           │
+│                                                           │
+│  Context Window                                           │
+│  ┌──────────────┐ ┌───────────┐ ┌───────────────────────┐│
+│  │ System Prompt │ │  Session  │ │   Recent N Turns      ││
+│  │   + recall   │ │   State   │ │   (token-budgeted)    ││
+│  │  guidelines  │ │  (YAML)   │ │                       ││
+│  └──────────────┘ └───────────┘ └───────────────────────┘│
+│                                                           │
+│  Tools                                                    │
+│  ┌──────────────────┐  ┌─────────────────────────────┐   │
+│  │ conversation_    │  │ delegate_task               │   │
+│  │ recall           │  │                             │   │
+│  │ (query archive)  │  │ (submit to orchestrator,    │   │
+│  │                  │  │  stream progress, return    │   │
+│  │                  │  │  results to conversation)   │   │
+│  └────────┬─────────┘  └──────────────┬──────────────┘   │
+│           │                           │                   │
+└───────────┼───────────────────────────┼───────────────────┘
+            │                           │
+       reads│                     submits task
+            │                           │
+            ▼                           ▼
+  ┌───────────────────┐   ┌──────────────────────────────┐
+  │  SQLite Database  │   │  Orchestrator (in-process)   │
+  │                   │   │                              │
+  │ conversation_turns│   │  plan → execute → verify     │
+  │ cowork_sessions   │   │  parallel subtasks           │
+  │ memory_entries    │   │  retry / escalation          │
+  │ events            │   │  learning                    │
+  └───────────────────┘   └──────────────────────────────┘
 ```
+
+The key insight: **cowork mode is not a separate mode — it's the primary
+interface.** Task mode's orchestrator is an execution engine that cowork
+can invoke, like how Claude Code's Task tool spawns subagents. The user
+never leaves the conversation.
 
 ---
 
@@ -567,6 +595,245 @@ async def resume(self, session_id: str) -> None:
 
 ---
 
+## Component 6: Task Delegation (`delegate_task` Tool)
+
+This is the bridge between cowork and task mode. When the model in cowork
+recognizes that work requires decomposition, verification, or parallelism,
+it delegates to the orchestrator — exactly like Claude Code's Task tool
+spawns subagents.
+
+### How It Works Today (Claude Code)
+
+```
+User: "Migrate this Express app to TypeScript"
+Claude Code (in conversation):
+  1. Spawns Task subagent: "Research migration approach"
+  2. Spawns Task subagent: "Find all .js files and categorize"
+  3. Gets results back into conversation
+  4. Discusses plan with user
+  5. Spawns Task subagent: "Execute migration for src/routes/"
+  6. Spawns Task subagent: "Execute migration for src/models/"
+  7. Gets results, runs tests, discusses with user
+```
+
+The user never leaves the conversation. The subagents are invisible
+plumbing. The conversation is continuous.
+
+### How It Should Work (Loom)
+
+```
+User: "Migrate this Express app to TypeScript"
+Loom cowork model:
+  1. Calls delegate_task(goal="Analyze all JS files, categorize by
+     migration complexity, identify shared types")
+     → Orchestrator plans, executes, verifies, returns results
+  2. Model discusses results with user in conversation
+  3. User says "looks good, do it"
+  4. Calls delegate_task(goal="Migrate src/routes/ to TypeScript,
+     preserve all existing tests", context={constraints from discussion})
+     → Orchestrator executes with parallel subtasks + verification
+  5. Results come back, model reports to user
+  6. User says "now run the tests"
+  7. Model runs shell_execute directly (simple, no delegation needed)
+```
+
+### The Tool
+
+New file: `src/loom/tools/delegate_task.py`
+
+```python
+class DelegateTaskTool(Tool):
+    """Delegate complex work to Loom's orchestration engine.
+
+    Use this when work requires:
+    - Breaking down into multiple steps with dependencies
+    - Verification of each step's output
+    - Parallel execution of independent steps
+    - Structured planning before execution
+
+    For simple operations (read a file, run a command, edit code),
+    use the direct tools instead. Delegation adds overhead — only
+    use it when the task is genuinely complex.
+    """
+
+    name = "delegate_task"
+    description = (
+        "Submit complex multi-step work to the task orchestrator. "
+        "The orchestrator will plan, decompose into subtasks, execute "
+        "with verification, and return results. Use for tasks that need "
+        "decomposition, parallel execution, or step-by-step verification. "
+        "Simple operations should use direct tools instead."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": (
+                    "What needs to be accomplished. Be specific — include "
+                    "file paths, constraints, and acceptance criteria."
+                ),
+            },
+            "context": {
+                "type": "object",
+                "description": (
+                    "Additional context from the conversation: constraints, "
+                    "decisions, preferences, files already discussed."
+                ),
+            },
+            "wait": {
+                "type": "boolean",
+                "description": (
+                    "If true (default), block until task completes and "
+                    "return full results. If false, return task_id for "
+                    "async monitoring."
+                ),
+                "default": True,
+            },
+        },
+        "required": ["goal"],
+    }
+```
+
+### In-Process vs HTTP
+
+The MCP server communicates with the orchestrator over HTTP (because it's
+designed for external agents in a separate process). Cowork doesn't need
+this indirection — the orchestrator can be instantiated and called directly
+in the same process.
+
+```python
+class DelegateTaskTool(Tool):
+    def __init__(self, orchestrator_factory):
+        """
+        orchestrator_factory: callable that returns a configured Orchestrator.
+        Lazy creation so we don't spin up the full engine until needed.
+        """
+        self._factory = orchestrator_factory
+        self._orchestrator = None
+
+    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        if self._orchestrator is None:
+            self._orchestrator = await self._factory()
+
+        task = create_task(
+            goal=args["goal"],
+            workspace=str(ctx.workspace),
+            context=args.get("context", {}),
+        )
+
+        if args.get("wait", True):
+            result = await self._orchestrator.execute_task(task)
+            return self._format_result(task, result)
+        else:
+            # Fire-and-forget, return task_id
+            asyncio.create_task(self._orchestrator.execute_task(task))
+            return ToolResult.ok(f"Task submitted: {task.id}")
+```
+
+### Context Passing
+
+The critical piece: the cowork model needs to pass conversational context
+to the orchestrator so subtasks have the benefit of what was discussed.
+The `context` parameter carries this:
+
+```python
+# Model calls:
+delegate_task(
+    goal="Add JWT refresh token rotation to src/auth.py",
+    context={
+        "constraints": [
+            "Use PyJWT library (already in requirements)",
+            "Refresh tokens expire after 7 days",
+            "Store refresh tokens in Redis, not SQLite",
+        ],
+        "files_relevant": ["src/auth.py", "src/config.py", "tests/test_auth.py"],
+        "decisions": ["Using RS256 algorithm per user preference"],
+    },
+)
+```
+
+This context gets injected into the orchestrator's planning prompt, so
+subtasks inherit the conversational decisions without needing access to
+the full conversation history.
+
+### Result Format
+
+When the task completes, the tool returns a structured summary that fits
+cleanly into the conversation:
+
+```
+Task completed: "Add JWT refresh token rotation"
+
+Subtasks:
+  [x] Analyze current auth implementation (src/auth.py)
+  [x] Add refresh token generation and validation
+  [x] Add Redis storage for refresh tokens
+  [x] Update login endpoint to return refresh + access tokens
+  [x] Add /auth/refresh endpoint
+  [x] Add tests for refresh token flow
+
+Files changed:
+  - src/auth.py (modified)
+  - src/auth/refresh.py (created)
+  - src/config.py (modified)
+  - tests/test_auth_refresh.py (created)
+
+Verification: All subtasks passed tier-1 verification.
+4 new tests passing.
+```
+
+If the task fails, the result includes what failed and why, so the model
+can discuss it with the user and decide how to proceed — retry, adjust
+the approach, or do it manually with direct tools.
+
+### When to Delegate vs Direct Execute
+
+The system prompt instructs the model on this:
+
+```
+WHEN TO USE delegate_task:
+- Multi-file refactoring (>3 files)
+- Tasks that benefit from a plan (migrations, new features)
+- Work that needs verification (changes with test requirements)
+- Independent steps that can run in parallel
+
+WHEN TO USE direct tools:
+- Reading/editing a single file
+- Running a command
+- Quick fixes (typos, small bugs)
+- Exploratory work (searching, reading, understanding)
+- Anything where the overhead of planning isn't worth it
+```
+
+The model makes this judgment naturally — the same way I (Claude Code)
+decide whether to use a Task subagent or just do something directly.
+
+### Event Streaming
+
+When `wait=True`, the tool should stream progress events back into the
+conversation so the user sees what's happening:
+
+```python
+async def execute(self, args, ctx):
+    # Subscribe to events for this task
+    progress_lines = []
+    def on_event(event):
+        if event.event_type == SUBTASK_COMPLETED:
+            progress_lines.append(f"  [x] {event.data.get('description', event.data.get('subtask_id'))}")
+        elif event.event_type == SUBTASK_FAILED:
+            progress_lines.append(f"  [!] {event.data.get('subtask_id')}: {event.data.get('error', 'failed')}")
+
+    self._orchestrator._events.subscribe_all(on_event)
+    result = await self._orchestrator.execute_task(task)
+    # Include progress in output
+```
+
+(The exact streaming mechanism depends on how we want to surface progress
+in the TUI — this can be refined during implementation.)
+
+---
+
 ## Implementation Plan
 
 ### Phase 1: Persistence Layer
@@ -616,7 +883,30 @@ async def resume(self, session_id: str) -> None:
 **Tests:**
 - `tests/test_cowork_context.py` — token budgeting, priority order, hint injection
 
-### Phase 5: Session Resumption + CLI
+### Phase 5: Task Delegation Tool
+
+**Files to create:**
+- `src/loom/tools/delegate_task.py` — DelegateTaskTool
+
+**Files to modify:**
+- `src/loom/tools/__init__.py` — register delegate_task (only in cowork context)
+- `src/loom/__main__.py` — create orchestrator factory, pass to tool at session setup
+- `src/loom/cowork/session.py` — wire up orchestrator factory
+- `src/loom/cowork/approval.py` — delegate_task requires explicit approval (not auto)
+
+**Key wiring:**
+- The tool takes an `orchestrator_factory` callable (lazy init)
+- Factory reuses the same Config, ModelRouter, ToolRegistry, etc. from
+  the cowork session — no separate server needed
+- Context parameter passes conversational decisions to the orchestrator's
+  planning prompt
+- Results formatted as structured text for the conversation
+
+**Tests:**
+- `tests/test_delegate_task.py` — delegation flow, context passing, result formatting
+- `tests/test_delegate_task_failure.py` — partial failure, retry suggestions
+
+### Phase 6: Session Resumption + CLI
 
 **Files to modify:**
 - `src/loom/__main__.py` — session selection on startup, `--resume` flag
@@ -626,30 +916,37 @@ async def resume(self, session_id: str) -> None:
 **Tests:**
 - `tests/test_session_resume.py` — resume flow, state reconstruction
 
-### Phase 6: System Prompt Update
+### Phase 7: System Prompt Update
 
 **Files to modify:**
 - `src/loom/cowork/session.py` — update `build_cowork_system_prompt()` to instruct
-  the model about `conversation_recall` and session state
+  the model about all new capabilities
 
 The system prompt needs to tell the model:
-- It has a `conversation_recall` tool for accessing prior conversation
+- It has `conversation_recall` for accessing prior conversation
 - The session state block shows structured metadata about the session
 - It should use `conversation_recall` when it needs information from
   earlier in the session rather than asking the user to repeat themselves
 - When its context window doesn't contain enough information to act
   confidently, it should search before guessing
+- It has `delegate_task` for complex multi-step work that benefits from
+  planning, decomposition, verification, or parallelism
+- When to delegate vs when to use direct tools (the heuristics from
+  Component 6)
+- The conversation is continuous — delegated task results come back into
+  the conversation for discussion
 
 ---
 
 ## What This Does NOT Change
 
-- **Task mode** — plan-execute-verify pipeline is untouched
+- **Task mode API** — REST endpoints, MCP server, external agent integration untouched
+- **Orchestrator internals** — plan-execute-verify pipeline unchanged;
+  `delegate_task` is a new consumer of the existing `Orchestrator.execute_task()`
 - **Memory entries** — existing `memory_entries` table and MemoryManager unchanged
-- **Event bus** — event system unchanged
-- **Tool execution** — tools work identically
+- **Event bus** — event system unchanged (delegate_task subscribes to it read-only)
+- **Tool execution** — all existing tools work identically
 - **Model providers** — no changes to API interaction
-- **TUI architecture** — session management only, not rendering
 
 ---
 
@@ -698,3 +995,29 @@ structured data extracted mechanically from tool results. It's deterministic,
 cheap (no LLM call), and can't hallucinate or lose important details. The model
 can always use `conversation_recall` to get the actual conversation if the
 session state isn't sufficient.
+
+### Why in-process delegation instead of HTTP?
+
+The MCP server uses HTTP to communicate with the orchestrator because it's
+designed for external agents (Claude Code, other tools) running in separate
+processes. Cowork doesn't need this indirection — it's already in the same
+process. In-process delegation via a lazy-initialized Orchestrator is:
+- Simpler (no HTTP server needed for `loom cowork`)
+- Faster (no serialization/deserialization overhead)
+- More reliable (no network failures on localhost)
+- Easier to stream events (direct EventBus subscription)
+
+The orchestrator's `execute_task()` interface is the same either way — the
+tool is just a new caller of an existing API.
+
+### Why cowork as primary, task as execution engine?
+
+This matches how every successful AI coding tool actually works. Claude Code,
+Cursor, Windsurf — the user is always in a conversation. Complex work happens
+*within* the conversation via subagents/background tasks. Nobody wants to
+switch modes.
+
+Loom's task mode is a genuinely powerful orchestrator (planning, parallel
+subtasks, verification, retry, learning). But it shouldn't require leaving
+the conversation to use. By making it callable from cowork, users get both:
+the natural conversation flow AND the structured execution when they need it.
