@@ -5,6 +5,26 @@ All notable changes to Loom are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Cowork mode** (`cowork/session.py`, `cowork/display.py`) -- conversation-first interactive execution. No planning phase, no subtask decomposition -- just a continuous tool-calling loop driven by natural conversation with the developer. Full conversation history maintained as context.
+- **`loom cowork` CLI command** -- interactive REPL with real-time tool call display, ANSI-colored output, and special commands (`/quit`, `/help`). Usage: `loom cowork -w /path/to/project`.
+- **`ask_user` tool** -- lets the model ask the developer questions mid-execution instead of guessing. Supports free-text and multiple-choice options. The cowork CLI intercepts these and prompts the user.
+- **`ripgrep_search` tool** -- fast content search that shells out to `rg` (ripgrep). Falls back to `grep`, then pure Python. Supports regex, file type filtering, context lines, case insensitivity, and files-only mode.
+- **`glob_find` tool** -- fast file discovery by glob pattern (`**/*.py`, `src/**/*.ts`). Results sorted by modification time, automatically skips `.git`, `node_modules`, `__pycache__`, etc.
+- **Anthropic/Claude model provider** (`models/anthropic_provider.py`) -- full Claude API support via the Messages API. Native tool use, message format conversion (OpenAI <-> Anthropic), and streaming via SSE. Configure with `provider = "anthropic"` in `loom.toml`.
+- **`api_key` and `tier` fields** in `ModelConfig` -- supports API-key-authenticated providers and explicit tier assignment.
+- **Gap analysis document** (`planning/gap-analysis-vs-claude-code.md`) -- 10-dimension comparison of Loom vs Claude Code's coworking model with prioritized implementation roadmap.
+
+### Changed
+- **Git tool** -- `push` and `remote` added to allowed subcommands (force push still blocked).
+- **Shell tool** -- timeout increased from 60s to 120s for longer-running commands.
+- **Tool output limit** -- increased from 10KB to 30KB for richer tool results.
+- **Model router** -- wired to support `"anthropic"` provider type alongside `"ollama"` and `"openai_compatible"`.
+
+---
+
+## [0.4.0] -- Plugin Auto-Discovery & Parallel Dispatch
+
+### Added
 - **Plugin auto-discovery for tools** -- `Tool` base class now uses `__init_subclass__` to automatically collect concrete subclasses. New `discover_tools()` function scans all modules in `loom.tools` via `pkgutil.walk_packages`. Adding a new tool is now just: create a file, subclass `Tool`, done.
 - **SubtaskRunner** (`engine/runner.py`) -- isolated subtask execution class that owns the tool-calling loop, response validation, verification gates, and memory extraction. The orchestrator no longer touches raw prompts or messages.
 - **Parallel subtask dispatch** -- independent subtasks (no unmet `depends_on`) now execute concurrently via `asyncio.gather()`, up to `max_parallel_subtasks` (default 3). Sequential dependency chains are unaffected.

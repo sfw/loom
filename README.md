@@ -2,7 +2,11 @@
 
 **Local model orchestration engine** -- task decomposition, execution, and verification using local LLMs.
 
-Loom takes a high-level goal, breaks it into subtasks, executes them with local models (Ollama, OpenAI-compatible APIs), verifies results, and learns from the process. The model never decides to "continue" -- the harness does.
+Loom takes a high-level goal, breaks it into subtasks, executes them with local models (Ollama, OpenAI-compatible APIs, or Claude), verifies results, and learns from the process. The model never decides to "continue" -- the harness does.
+
+**Two modes of operation:**
+- **Cowork mode** (`loom cowork`) -- interactive pair programming. You and the AI have a conversation, it uses tools in real time, you can interrupt and redirect. No planning overhead.
+- **Task mode** (`loom run`) -- autonomous execution. Submit a goal, Loom decomposes it into subtasks, executes, verifies, and reports back.
 
 ## How It Works
 
@@ -34,9 +38,9 @@ Goal -> Planner ->  │ [Subtask A]  [Subtask B] │  parallel batch
 - **Task decomposition** with dependency graphs and automatic scheduling
 - **Parallel subtask execution** -- independent subtasks run concurrently (configurable `max_parallel_subtasks`)
 - **Isolated execution** -- each subtask runs in a `SubtaskRunner` with its own context (no cross-contamination)
-- **Dual model backends** -- Ollama and OpenAI-compatible APIs (LM Studio, vLLM, etc.)
+- **Three model backends** -- Ollama, OpenAI-compatible APIs (LM Studio, vLLM, etc.), and Anthropic/Claude
 - **Role-based routing** -- planner, executor, extractor, verifier roles with tier selection
-- **Tool system** -- 11 built-in tools (file ops, shell, git, search, code analysis, web fetch) with plugin auto-discovery
+- **Tool system** -- 14 built-in tools (file ops, shell, git, ripgrep search, glob find, code analysis, web fetch, ask user) with plugin auto-discovery
 - **Workspace safety** -- path traversal prevention, destructive command blocking
 - **Full undo** -- changelog with before-snapshots, revert at file/subtask/task level
 - **Token budgeting** -- prompt assembly with 7-section ordering and trim-to-budget
@@ -59,6 +63,7 @@ Goal -> Planner ->  │ [Subtask A]  [Subtask B] │  parallel batch
 
 **Interfaces:**
 
+- **Cowork mode** -- interactive conversation loop with real-time tool display, mid-execution questions, and full context
 - **REST API** -- full task CRUD, SSE streaming, steer/approve/feedback
 - **Terminal UI** -- Textual-based dashboard with live streaming, steering, and approval modals
 - **MCP server** -- Model Context Protocol integration for use as an agent tool
@@ -89,6 +94,9 @@ curl -X POST http://localhost:9000/tasks \
 # Or use the CLI
 loom run "Create a Python CLI that converts CSV to JSON" --workspace /tmp/myproject
 
+# Or start an interactive cowork session
+loom cowork -w /tmp/myproject
+
 # Or launch the terminal UI
 loom tui
 ```
@@ -97,6 +105,7 @@ loom tui
 
 ```
 loom serve              Start the API server
+loom cowork             Start an interactive cowork session (pair programming)
 loom run GOAL           Submit a task and stream progress inline
 loom status ID          Check status of a task
 loom cancel ID          Cancel a running task
@@ -138,7 +147,7 @@ host = "127.0.0.1"
 port = 9000
 
 [models.primary]
-provider = "ollama"                    # or "openai_compatible"
+provider = "ollama"                    # or "openai_compatible" or "anthropic"
 base_url = "http://localhost:11434"
 model = "qwen3:14b"
 max_tokens = 4096
@@ -152,6 +161,15 @@ model = "qwen3:8b"
 max_tokens = 2048
 temperature = 0.0
 roles = ["extractor", "verifier"]
+
+# Optional: Anthropic/Claude for cowork mode or high-tier tasks
+# [models.claude]
+# provider = "anthropic"
+# model = "claude-sonnet-4-5-20250929"
+# api_key = "sk-ant-..."               # or set ANTHROPIC_API_KEY env var
+# max_tokens = 8192
+# tier = 3
+# roles = ["executor", "planner"]
 
 [workspace]
 default_path = "~/projects"
@@ -184,6 +202,9 @@ src/loom/
     routes.py            All REST endpoints
     schemas.py           Pydantic request/response models
     engine.py            Component wiring and lifecycle
+  cowork/
+    session.py           Conversation-first interactive execution engine
+    display.py           Terminal display with ANSI colors for tool calls
   engine/
     orchestrator.py      Core loop: plan -> schedule -> dispatch -> finalize
     runner.py            Isolated subtask execution (tool loop, verify, extract)
@@ -199,6 +220,7 @@ src/loom/
     manager.py           Pattern extraction and query from execution history
   models/
     base.py              Provider ABC, response types
+    anthropic_provider.py  Anthropic/Claude API client
     ollama_provider.py   Ollama API client
     openai_provider.py   OpenAI-compatible API client
     router.py            Role+tier model selection
@@ -218,8 +240,11 @@ src/loom/
     registry.py          Tool ABC with auto-discovery via __init_subclass__
     file_ops.py          Read, write, edit, delete, move files
     shell.py             Shell execution with safety
-    git.py               Git operations with allowlist
+    git.py               Git operations with allowlist (incl. push)
     search.py            File search and directory listing
+    ripgrep.py           Ripgrep-powered content search with fallbacks
+    glob_find.py         Fast file discovery by glob pattern
+    ask_user.py          Ask the developer questions mid-execution
     code_analysis.py     Code structure analysis (tree-sitter)
     web.py               Web fetch with URL safety
     workspace.py         Changelog, diff, revert
