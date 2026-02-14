@@ -140,60 +140,94 @@ class LoomMCPServer:
         if args.get("context"):
             payload["context"] = args["context"]
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{self.engine_url}/tasks", json=payload,
-            )
-            if response.status_code != 201:
-                return {"error": response.text, "status_code": response.status_code}
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.engine_url}/tasks", json=payload,
+                )
+                if response.status_code != 201:
+                    return {"error": response.text[:500], "status_code": response.status_code}
 
-            task = response.json()
-            task_id = task["task_id"]
+                try:
+                    task = response.json()
+                except (json.JSONDecodeError, ValueError):
+                    return {"error": "Invalid JSON in task creation response"}
 
-            if not args.get("wait", True):
-                return task
+                task_id = task.get("task_id", "")
+                if not task_id:
+                    return {"error": "Missing task_id in response"}
 
-            # Poll until completion
-            for _ in range(600):  # Max ~20 minutes at 2s intervals
-                status_resp = await client.get(f"{self.engine_url}/tasks/{task_id}")
-                if status_resp.status_code != 200:
-                    return {"error": "Failed to fetch task status", "task_id": task_id}
+                if not args.get("wait", True):
+                    return task
 
-                data = status_resp.json()
-                if data.get("status") in ("completed", "failed", "cancelled"):
-                    return data
+                # Poll until completion (~20 minutes max)
+                for _ in range(600):
+                    status_resp = await client.get(f"{self.engine_url}/tasks/{task_id}")
+                    if status_resp.status_code != 200:
+                        return {"error": "Failed to fetch task status", "task_id": task_id}
 
-                await asyncio.sleep(2)
+                    try:
+                        data = status_resp.json()
+                    except (json.JSONDecodeError, ValueError):
+                        return {"error": "Invalid JSON in status response", "task_id": task_id}
 
-            return {"error": "Task timed out", "task_id": task_id}
+                    if data.get("status") in ("completed", "failed", "cancelled"):
+                        return data
+
+                    await asyncio.sleep(2)
+
+                return {"error": "Task timed out after 20 minutes", "task_id": task_id}
+        except httpx.ConnectError:
+            return {"error": f"Cannot connect to Loom API at {self.engine_url}"}
+        except httpx.TimeoutException:
+            return {"error": "Request to Loom API timed out"}
 
     async def _task_status(self, args: dict) -> dict:
         """Check task status."""
-        task_id = args["task_id"]
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{self.engine_url}/tasks/{task_id}")
-            if response.status_code == 404:
-                return {"error": f"Task not found: {task_id}"}
-            response.raise_for_status()
-            return response.json()
+        task_id = args.get("task_id", "")
+        if not task_id:
+            return {"error": "task_id is required"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{self.engine_url}/tasks/{task_id}")
+                if response.status_code == 404:
+                    return {"error": f"Task not found: {task_id}"}
+                if response.status_code >= 400:
+                    return {"error": f"API error ({response.status_code})", "task_id": task_id}
+                try:
+                    return response.json()
+                except (json.JSONDecodeError, ValueError):
+                    return {"error": "Invalid JSON in response", "task_id": task_id}
+        except httpx.ConnectError:
+            return {"error": f"Cannot connect to Loom API at {self.engine_url}"}
+        except httpx.TimeoutException:
+            return {"error": "Request timed out"}
 
     async def _list_tasks(self, args: dict) -> dict:
         """List tasks with optional filtering."""
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{self.engine_url}/tasks")
-            response.raise_for_status()
-            tasks = response.json()
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{self.engine_url}/tasks")
+                if response.status_code >= 400:
+                    return {"error": f"API error ({response.status_code})", "tasks": []}
+                try:
+                    tasks = response.json()
+                except (json.JSONDecodeError, ValueError):
+                    return {"error": "Invalid JSON in response", "tasks": []}
+        except httpx.ConnectError:
+            return {"error": f"Cannot connect to Loom API at {self.engine_url}", "tasks": []}
+        except httpx.TimeoutException:
+            return {"error": "Request timed out", "tasks": []}
 
-            status_filter = args.get("status_filter", "all")
-            if status_filter != "all":
-                # Map "running" to include executing/planning
-                running_statuses = {"running", "executing", "planning", "waiting_approval"}
-                if status_filter == "running":
-                    tasks = [t for t in tasks if t.get("status") in running_statuses]
-                else:
-                    tasks = [t for t in tasks if t.get("status") == status_filter]
+        status_filter = args.get("status_filter", "all")
+        if status_filter != "all":
+            running_statuses = {"running", "executing", "planning", "waiting_approval"}
+            if status_filter == "running":
+                tasks = [t for t in tasks if t.get("status") in running_statuses]
+            else:
+                tasks = [t for t in tasks if t.get("status") == status_filter]
 
-            return {"tasks": tasks, "count": len(tasks)}
+        return {"tasks": tasks, "count": len(tasks)}
 
     async def run_stdio(self) -> None:
         """Run the MCP server on stdio transport.
@@ -240,8 +274,10 @@ class LoomMCPServer:
             if not line:
                 break
 
+            request_id = None
             try:
                 request = json.loads(line.strip())
+                request_id = request.get("id")
                 method = request.get("method", "")
 
                 if method == "tools/list":
@@ -259,16 +295,17 @@ class LoomMCPServer:
 
                 response = json.dumps({
                     "jsonrpc": "2.0",
-                    "id": request.get("id"),
+                    "id": request_id,
                     "result": result,
                 })
                 sys.stdout.write(response + "\n")
                 sys.stdout.flush()
 
             except Exception as e:
+                logger.exception("MCP stdio handler error")
                 error_response = json.dumps({
                     "jsonrpc": "2.0",
-                    "id": request.get("id") if "request" in dir() else None,
+                    "id": request_id,
                     "error": {"code": -1, "message": str(e)},
                 })
                 sys.stdout.write(error_response + "\n")

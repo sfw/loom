@@ -56,6 +56,21 @@ class EventBus:
         """Subscribe to all events."""
         self._global_handlers.append(handler)
 
+    def unsubscribe(self, event_type: str, handler: EventHandler) -> None:
+        """Remove a handler from a specific event type."""
+        handlers = self._handlers.get(event_type, [])
+        try:
+            handlers.remove(handler)
+        except ValueError:
+            pass
+
+    def unsubscribe_all(self, handler: EventHandler) -> None:
+        """Remove a handler from the global handlers list."""
+        try:
+            self._global_handlers.remove(handler)
+        except ValueError:
+            pass
+
     def emit(self, event: Event) -> None:
         """Emit an event to all matching handlers.
 

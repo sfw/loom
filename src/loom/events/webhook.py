@@ -30,7 +30,15 @@ class WebhookDelivery:
         self._callback_urls: dict[str, str] = {}  # task_id -> url
 
     def register(self, task_id: str, callback_url: str) -> None:
-        """Register a callback URL for a task."""
+        """Register a callback URL for a task.
+
+        Validates the URL to prevent SSRF attacks against internal networks.
+        """
+        from loom.tools.web import is_safe_url
+        safe, reason = is_safe_url(callback_url)
+        if not safe:
+            logger.warning("Rejected callback URL for task %s: %s", task_id, reason)
+            return
         self._callback_urls[task_id] = callback_url
 
     def unregister(self, task_id: str) -> None:

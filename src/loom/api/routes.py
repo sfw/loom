@@ -79,10 +79,18 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
 
 async def _execute_in_background(engine: Engine, task) -> None:
     """Run task execution without blocking the API response."""
+    import logging
+    _bg_logger = logging.getLogger(__name__)
     try:
         await engine.orchestrator.execute_task(task)
-    except Exception:
-        pass  # Errors are captured in the task state by the orchestrator
+    except Exception as e:
+        _bg_logger.exception("Task %s failed with uncaught exception: %s", task.id, e)
+        # Ensure task is marked failed even if orchestrator didn't catch it
+        try:
+            task.status = TaskStatus.FAILED
+            engine.state_manager.save(task)
+        except Exception:
+            _bg_logger.exception("Failed to save error state for task %s", task.id)
 
 
 @router.get("/tasks", response_model=list[TaskListItem])
@@ -202,6 +210,8 @@ async def stream_task_events(request: Request, task_id: str):
                     yield {"comment": "keepalive"}
         except asyncio.CancelledError:
             return
+        finally:
+            engine.event_bus.unsubscribe_all(handler)
 
     return EventSourceResponse(event_generator())
 
@@ -252,6 +262,9 @@ async def stream_task_tokens(request: Request, task_id: str):
                     yield {"comment": "keepalive"}
         except asyncio.CancelledError:
             return
+        finally:
+            engine.event_bus.unsubscribe("token_streamed", handler)
+            engine.event_bus.unsubscribe_all(terminal_handler)
 
     return EventSourceResponse(token_generator())
 

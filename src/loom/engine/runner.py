@@ -257,9 +257,13 @@ class SubtaskRunner:
         self, task_id: str, subtask_id: str, result: SubtaskResult,
     ) -> None:
         """Extract structured memory entries from subtask execution."""
+        import logging
+        _mem_logger = logging.getLogger(__name__)
+
         try:
             model = self._router.select(tier=1, role="extractor")
-        except Exception:
+        except Exception as e:
+            _mem_logger.debug("Memory extraction skipped (no extractor model): %s", e)
             return
 
         tool_lines = []
@@ -279,8 +283,8 @@ class SubtaskRunner:
             entries = self._parse_memory_entries(response, task_id, subtask_id)
             if entries:
                 await self._memory.store_many(entries)
-        except Exception:
-            pass
+        except Exception as e:
+            _mem_logger.debug("Memory extraction failed for subtask %s: %s", subtask_id, e)
 
     def _parse_memory_entries(
         self, response: ModelResponse, task_id: str, subtask_id: str,

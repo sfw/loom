@@ -158,7 +158,13 @@ class RipgrepSearchTool(Tool):
                 err = stderr.decode("utf-8", errors="replace")
                 return ToolResult(success=False, output=f"ripgrep error: {err}")
 
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
+            # Kill the subprocess on timeout to avoid resource leak
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
             return ToolResult(success=False, output="Search timed out after 30 seconds.")
         except Exception as e:
             return ToolResult(success=False, output=f"ripgrep error: {e}")

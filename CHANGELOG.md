@@ -5,6 +5,66 @@ All notable changes to Loom are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Session switching** (`__main__.py`) -- `/sessions`, `/new`, `/session` commands for mid-session switching between cowork sessions across workspaces.
+- **EventBus unsubscribe** (`events/bus.py`) -- `unsubscribe()` and `unsubscribe_all()` methods to prevent handler leaks on SSE disconnect.
+
+### Fixed
+
+#### Security
+- **SSRF via redirect** (`tools/web.py`) -- `follow_redirects=True` allowed redirects to private IPs, bypassing SSRF checks. Now validates each redirect target.
+- **Webhook SSRF** (`events/webhook.py`) -- callback URLs are now validated against private network blocklist before registration.
+- **Shell sandbox bypasses** (`tools/shell.py`) -- expanded blocked patterns to cover flag reordering (`rm -r -f /`), command substitution (`$(rm ...)`), and interpreter flags (`python -c`, `perl -e`).
+- **Git config removed** (`tools/git.py`) -- `config` subcommand removed to prevent arbitrary code execution via hooks/aliases.
+- **Approval gate defaults** (`cowork/approval.py`, `recovery/approval.py`) -- no-callback now denies by default; timeout denies instead of auto-approving.
+- **Delegate task approval** (`tools/delegate_task.py`) -- default changed from `"auto"` to `"confidence_threshold"`.
+- **Path traversal** (`tools/glob_find.py`, `tools/ripgrep.py`, `tools/workspace.py`) -- workspace containment checks, snapshot path validation.
+- **Prompt injection** (`prompts/assembler.py`) -- replaced `.format()` then `{→${` corruption with safe per-key replacement.
+- **Task ID validation** (`__main__.py`) -- regex validation prevents path traversal in URL interpolation.
+
+#### Critical Bugs
+- **SubtaskResult field mismatch** (`engine/orchestrator.py`) -- exception handler used non-existent `output`/`error` fields instead of `summary`. Would crash on any parallel subtask exception.
+- **VerificationResult empty instantiation** (`engine/orchestrator.py`) -- missing required `tier` and `passed` fields. Would crash on parallel exception handling.
+- **Attempt tracking off-by-one** (`engine/orchestrator.py`) -- stale variable caused wrong retry counts and escalation tier calculations.
+- **Iteration counter * batch size** (`engine/orchestrator.py`) -- `max_iterations` was effectively divided by parallelism.
+- **Verification gate bypass** (`engine/verification.py`) -- gates returned `passed=True` when disabled or verifier unavailable.
+- **Data loss in schema** (`state/schema.sql`) -- removed `UNIQUE(session_id, turn_number)` constraint that silently dropped messages.
+- **Text loss in send()** (`cowork/session.py`) -- only last iteration's text was kept in tool loop; now accumulates across iterations.
+- **Memory extractor format mismatch** (`engine/runner.py`) -- parser expected `{"entries": [...]}` but template asked for JSON arrays.
+
+#### High Severity
+- **MCP JSON parse crashes** (`integrations/mcp_server.py`) -- all `.json()` calls now wrapped in try-except; error handler fixed from `"request" in dir()` to proper local variable.
+- **Background task error loss** (`api/routes.py`) -- uncaught exceptions now logged and task marked failed instead of silently swallowed.
+- **SSE handler leak** (`api/routes.py`) -- event handlers now unsubscribed in `finally` blocks on client disconnect.
+- **Ripgrep process leak** (`tools/ripgrep.py`) -- subprocess now killed on timeout instead of left running.
+- **Shell output OOM** (`tools/shell.py`) -- bounded output buffer to 1MB to prevent memory exhaustion from `yes` etc.
+- **OpenAI/Ollama parsing** (`models/openai_provider.py`, `models/ollama_provider.py`) -- empty choices validated, `json.loads()` wrapped in try-except, defensive `.get()` for all dict access.
+- **Session lifecycle** (`__main__.py`) -- session marked inactive on `/quit` and Ctrl-C; `config.data_dir` replaced with `config.workspace.scratch_dir`.
+- **PromptAssembler init** (`__main__.py`) -- was passing `config` as `templates_dir`.
+
+#### Medium Severity
+- **Fire-and-forget persist** (`cowork/session.py`) -- `asyncio.ensure_future` replaced with awaited async call to prevent data loss.
+- **Transactional batch insert** (`state/memory.py`) -- `store_many()` now runs in a single transaction.
+- **LIKE wildcard injection** (`state/memory.py`, `state/conversation_store.py`) -- `%` and `_` in search queries escaped.
+- **Web fetch memory** (`tools/web.py`) -- Content-Length checked before downloading to prevent OOM.
+- **Memory extraction logging** (`engine/runner.py`) -- silent failures now logged at DEBUG level.
+- **SQLite WAL mode** (`state/memory.py`) -- enabled for concurrent read/write safety.
+- **SessionState resilience** (`cowork/session_state.py`) -- handles malformed JSON and `files_touched` entries.
+- **TaskTracker locking** (`tools/task_tracker.py`) -- async lock for concurrent safety.
+- **Fallback plan** (`engine/orchestrator.py`) -- includes actual goal text instead of generic description.
+
+#### Low Severity
+- **EditFileTool empty old_str** (`tools/file_ops.py`) -- rejected to prevent nonsensical replacements.
+- **WriteFileTool size limit** (`tools/file_ops.py`) -- 1MB content limit.
+- **_glob_match** (`tools/search.py`) -- replaced simplistic pattern with `fnmatch.fnmatch`.
+- **Anthropic unknown roles** (`models/anthropic_provider.py`) -- logged and preserved instead of silently dropped.
+- **Summary truncation** (`state/task_state.py`) -- increased from 100 to 200 chars with `...` indicator.
+- **Dead code removed** (`cowork/session.py`) -- unused `_is_safe_cut_point` method.
+- **Display bug** (`cowork/display.py`) -- operator precedence fix.
+- **Port 0 falsy** (`__main__.py`) -- `port if port is not None` instead of `port if port`.
+- **API key redaction** (`config.py`) -- `ModelConfig.__repr__` shows only last 4 chars.
+- **delegate_task files** (`tools/delegate_task.py`) -- reports change counts instead of returning timestamp as path.
+
+### Previously added
 - **Cowork mode** (`cowork/session.py`, `cowork/display.py`) -- conversation-first interactive execution. No planning phase, no subtask decomposition -- just a continuous tool-calling loop driven by natural conversation with the developer. Full conversation history maintained as context.
 - **`loom cowork` CLI command** -- interactive REPL with real-time tool call display, ANSI-colored output, and special commands (`/quit`, `/help`). Usage: `loom cowork -w /path/to/project`.
 - **`ask_user` tool** -- lets the model ask the developer questions mid-execution instead of guessing. Supports free-text and multiple-choice options. The cowork CLI intercepts these and prompts the user.

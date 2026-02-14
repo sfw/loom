@@ -89,16 +89,39 @@ class WebFetchTool(Tool):
 
         try:
             async with httpx.AsyncClient(
-                follow_redirects=True,
+                follow_redirects=False,
                 timeout=httpx.Timeout(FETCH_TIMEOUT),
             ) as client:
                 response = await client.get(url)
+
+                # Follow redirects manually to validate each target against SSRF
+                redirect_count = 0
+                while response.is_redirect and redirect_count < 5:
+                    redirect_count += 1
+                    location = response.headers.get("location", "")
+                    if not location:
+                        break
+                    from urllib.parse import urljoin
+                    location = urljoin(str(response.url), location)
+                    redir_safe, redir_reason = is_safe_url(location)
+                    if not redir_safe:
+                        return ToolResult.fail(f"Redirect blocked: {redir_reason}")
+                    response = await client.get(location)
+
                 response.raise_for_status()
+
+                # Check Content-Length before reading body to prevent OOM
+                content_length = response.headers.get("content-length")
+                if content_length and int(content_length) > MAX_RESPONSE_SIZE * 4:
+                    return ToolResult.fail(
+                        f"Response too large ({int(content_length)} bytes). Max: {MAX_RESPONSE_SIZE * 4}."
+                    )
 
                 content_type = response.headers.get("content-type", "")
                 content = response.text
 
-                # Truncate if too large
+                # Truncate if too large (even after Content-Length check, since
+                # Content-Length can be absent or wrong)
                 if len(content) > MAX_RESPONSE_SIZE:
                     content = content[:MAX_RESPONSE_SIZE]
                     content += "\n\n... (content truncated)"

@@ -180,16 +180,15 @@ class Orchestrator:
                         if isinstance(item, BaseException):
                             # Convert exception into a failed result
                             from loom.engine.runner import SubtaskResult
-                            from loom.recovery.confidence import (
-                                VerificationResult,
-                            )
 
                             failed = SubtaskResult(
                                 status="failed",
-                                output="",
-                                error=str(item),
+                                summary=str(item),
                             )
-                            no_verif = VerificationResult()
+                            no_verif = VerificationResult(
+                                tier=0, passed=False,
+                                feedback=f"Exception during execution: {item}",
+                            )
                             outcomes.append(
                                 (batch[i], failed, no_verif),
                             )
