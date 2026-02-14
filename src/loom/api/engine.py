@@ -6,7 +6,7 @@ from pathlib import Path
 
 from loom.config import Config
 from loom.engine.orchestrator import Orchestrator
-from loom.events.bus import EventBus
+from loom.events.bus import EventBus, EventPersister
 from loom.models.router import ModelRouter
 from loom.prompts.assembler import PromptAssembler
 from loom.state.memory import Database, MemoryManager
@@ -73,6 +73,10 @@ async def create_engine(config: Config) -> Engine:
 
     # Events
     event_bus = EventBus()
+
+    # Event persistence — subscribe to all events and write to SQLite
+    event_persister = EventPersister(database)
+    event_persister.attach(event_bus)
 
     # Orchestrator
     orchestrator = Orchestrator(

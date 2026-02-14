@@ -11,6 +11,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -48,6 +49,8 @@ class ToolContext:
 
     workspace: Path | None
     scratch_dir: Path | None = None
+    changelog: Any | None = None  # ChangeLog instance for tracking file modifications
+    subtask_id: str = ""
 
 
 class ToolSafetyError(Exception):
@@ -128,13 +131,20 @@ class ToolRegistry:
         arguments: dict,
         workspace: Path | None = None,
         scratch_dir: Path | None = None,
+        changelog: Any = None,
+        subtask_id: str = "",
     ) -> ToolResult:
         """Execute a tool by name with timeout and context."""
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult.fail(f"Unknown tool: {name}")
 
-        ctx = ToolContext(workspace=workspace, scratch_dir=scratch_dir)
+        ctx = ToolContext(
+            workspace=workspace,
+            scratch_dir=scratch_dir,
+            changelog=changelog,
+            subtask_id=subtask_id,
+        )
 
         try:
             result = await asyncio.wait_for(

@@ -295,7 +295,10 @@ class TestOrchestratorExecution:
         assert result.status == TaskStatus.COMPLETED
         # Tool was executed
         tools.execute.assert_called_once_with(
-            "read_file", {"path": "/tmp/x"}, workspace=None,
+            "read_file", {"path": "/tmp/x"},
+            workspace=None,
+            changelog=None,
+            subtask_id="s1",
         )
 
     @pytest.mark.asyncio

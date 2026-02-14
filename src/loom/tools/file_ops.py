@@ -82,12 +82,17 @@ class WriteFileTool(Tool):
             return ToolResult.fail("No workspace set")
 
         path = self._resolve_path(args["path"], ctx.workspace)
+        rel_path = str(path.relative_to(ctx.workspace.resolve()))
+
+        # Record in changelog before writing
+        if ctx.changelog is not None:
+            ctx.changelog.record_before_write(rel_path, subtask_id=ctx.subtask_id)
+
         path.parent.mkdir(parents=True, exist_ok=True)
 
         content = args["content"]
         path.write_text(content, encoding="utf-8")
 
-        rel_path = str(path.relative_to(ctx.workspace.resolve()))
         return ToolResult.ok(
             f"Wrote {len(content)} bytes to {rel_path}",
             files_changed=[rel_path],
@@ -145,10 +150,15 @@ class EditFileTool(Tool):
                 f"old_str appears {count} times in {args['path']}. Must be unique."
             )
 
+        rel_path = str(path.relative_to(ctx.workspace.resolve()))
+
+        # Record in changelog before writing
+        if ctx.changelog is not None:
+            ctx.changelog.record_before_write(rel_path, subtask_id=ctx.subtask_id)
+
         new_content = content.replace(old_str, new_str, 1)
         path.write_text(new_content, encoding="utf-8")
 
-        rel_path = str(path.relative_to(ctx.workspace.resolve()))
         lines_old = old_str.count("\n") + 1
         lines_new = new_str.count("\n") + 1
         return ToolResult.ok(

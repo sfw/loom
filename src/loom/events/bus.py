@@ -7,6 +7,7 @@ orchestrator and consumed by the API (SSE), logger, and other listeners.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -88,3 +89,30 @@ class EventBus:
         self._handlers.clear()
         self._global_handlers.clear()
         self._history.clear()
+
+
+class EventPersister:
+    """Subscribes to all events and persists them to the database.
+
+    Uses fire-and-forget async persistence so it doesn't slow the event bus.
+    """
+
+    def __init__(self, database: Any) -> None:
+        self._db = database
+
+    async def handle(self, event: Event) -> None:
+        """Persist a single event to the database."""
+        try:
+            correlation_id = str(uuid.uuid4().hex[:12])
+            await self._db.insert_event(
+                task_id=event.task_id,
+                correlation_id=correlation_id,
+                event_type=event.event_type,
+                data=event.data,
+            )
+        except Exception:
+            pass  # Event persistence is best-effort
+
+    def attach(self, event_bus: EventBus) -> None:
+        """Subscribe to all events on the given bus."""
+        event_bus.subscribe_all(self.handle)
