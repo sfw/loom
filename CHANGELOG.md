@@ -10,6 +10,7 @@ All notable changes to Loom are documented in this file.
 - **`ask_user` tool** -- lets the model ask the developer questions mid-execution instead of guessing. Supports free-text and multiple-choice options. The cowork CLI intercepts these and prompts the user.
 - **`ripgrep_search` tool** -- fast content search that shells out to `rg` (ripgrep). Falls back to `grep`, then pure Python. Supports regex, file type filtering, context lines, case insensitivity, and files-only mode.
 - **`glob_find` tool** -- fast file discovery by glob pattern (`**/*.py`, `src/**/*.ts`). Results sorted by modification time, automatically skips `.git`, `node_modules`, `__pycache__`, etc.
+- **`web_search` tool** -- internet search via DuckDuckGo (no API key required). Returns titles, URLs, and snippets. Use to find docs, solutions, package info, etc.
 - **Anthropic/Claude model provider** (`models/anthropic_provider.py`) -- full Claude API support via the Messages API. Native tool use, message format conversion (OpenAI <-> Anthropic), and streaming via SSE. Configure with `provider = "anthropic"` in `loom.toml`.
 - **`api_key` and `tier` fields** in `ModelConfig` -- supports API-key-authenticated providers and explicit tier assignment.
 - **Gap analysis document** (`planning/gap-analysis-vs-claude-code.md`) -- 10-dimension comparison of Loom vs Claude Code's coworking model with prioritized implementation roadmap.

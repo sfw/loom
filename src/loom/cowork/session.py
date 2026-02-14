@@ -358,6 +358,8 @@ GUIDELINES:
 TOOL USAGE:
 - Use glob_find to discover files by pattern (fast).
 - Use ripgrep_search for content search (much faster than search_files).
+- Use web_search to find documentation, solutions, or package information online.
+- Use web_fetch to read a specific URL's content.
 - Use shell_execute for running tests, builds, linters, etc.
-- Use git_command for version control operations.
+- Use git_command for version control operations (including push).
 - Use ask_user when you need the developer's input or decision."""
