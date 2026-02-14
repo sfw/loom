@@ -1,0 +1,190 @@
+# Loom: Up-to-Snuff Plan
+
+Prioritized by impact and dependency order. Each phase is independently shippable.
+
+---
+
+## Phase 1: New Tools (Foundation)
+
+Everything else depends on having a richer tool set.
+
+### 1a. `git_command` tool (`tools/git.py`)
+- Wraps git operations: `status`, `diff`, `add`, `commit`, `log`, `branch`, `checkout`, `stash`
+- Safety blocklist: block `push --force`, `reset --hard`, `clean -fd` (same pattern as shell.py)
+- Changelog integration: not needed (git is its own changelog)
+- Timeout: 60s
+- Parameters: `{"command": str, "args": list[str]}`
+
+### 1b. `delete_file` tool (add to `tools/file_ops.py`)
+- Deletes a file or empty directory
+- Changelog integration: calls `record_delete()` before removing
+- Safety: refuse to delete workspace root, `.git/`, etc.
+- Parameters: `{"path": str}`
+
+### 1c. `move_file` tool (add to `tools/file_ops.py`)
+- Move or rename a file/directory within workspace
+- Changelog integration: calls `record_rename()`
+- Parameters: `{"source": str, "destination": str}`
+
+### 1d. Register new tools in `create_default_registry()`
+
+**Tests:** Unit tests for each tool (safety blocklist, path validation, changelog integration)
+
+---
+
+## Phase 2: Streaming Token Output
+
+Currently both providers hardcode `stream: False`. This blocks real-time feedback in the TUI.
+
+### 2a. Add streaming interface to `ModelProvider` ABC (`models/base.py`)
+- New method: `async def stream(messages, tools, ...) -> AsyncGenerator[StreamChunk, None]`
+- New dataclass: `StreamChunk(text: str, done: bool, tool_calls: list[ToolCall] | None, usage: TokenUsage | None)`
+- Default implementation: call `complete()` and yield single chunk (backward compat)
+
+### 2b. Implement streaming in `OllamaProvider`
+- Set `stream: true` in payload
+- Parse chunked JSON lines from `/api/chat`
+- Buffer tool_calls (only available in final chunk)
+- Yield text tokens as they arrive
+
+### 2c. Implement streaming in `OpenAICompatibleProvider`
+- Add `stream: true` to payload
+- Parse SSE `data:` lines from `/chat/completions`
+- Buffer tool_calls deltas until complete
+- Yield text tokens from `delta.content`
+
+### 2d. New event type: `TOKEN_STREAMED` (`events/types.py`)
+- Emitted by SubtaskRunner during streaming execution
+- Data: `{"subtask_id": str, "token": str, "model": str}`
+
+### 2e. Wire streaming into `SubtaskRunner` (`engine/runner.py`)
+- When streaming enabled: use `model.stream()` instead of `model.complete()`
+- Emit `TOKEN_STREAMED` events as tokens arrive
+- Buffer full response for tool call parsing and verification
+- Config flag: `enable_streaming: bool = False` in `ExecutionConfig`
+
+### 2f. Add SSE streaming endpoint for tokens (`api/routes.py`)
+- `GET /tasks/{id}/tokens` — streams raw tokens for the active subtask
+- Bridges EventBus TOKEN_STREAMED events to SSE
+
+**Tests:** Unit tests for streaming providers (mock HTTP responses), integration test for token event emission
+
+---
+
+## Phase 3: TUI Enhancements
+
+Build on streaming + new tools to make the TUI a real workspace.
+
+### 3a. Enhanced task creation modal (`tui/app.py`)
+- Multi-field form: goal (required), workspace path (with autocomplete), approval_mode (select), context (optional textarea)
+- Replace current single-input modal with a proper form screen
+
+### 3b. Live SSE event listener
+- Background worker that connects to `stream_all_events()` or `stream_task_events()`
+- Auto-updates task table, plan tree, and live output
+- Triggers approval modals when `approval_requested` events arrive
+- Currently the TUI has SSE methods but never calls them
+
+### 3c. Streaming token display
+- Route `TOKEN_STREAMED` events to the `RichLog` widget (`#live-output`)
+- Show real-time model output as it generates
+
+### 3d. File changes viewer
+- New panel/screen showing `changelog.get_summary()` for the selected task
+- Show created/modified/deleted files
+- Drill into diff view using `DiffGenerator`
+
+### 3e. Memory/event inspector
+- New screen: query memory entries for a task (type filter, search)
+- Show decision log, discoveries, errors
+- Useful for debugging and understanding agent reasoning
+
+### 3f. Feedback submission
+- Modal for rating (1-5) + comment after task completion
+- Wire to existing `POST /tasks/{id}/feedback` endpoint
+
+**Tests:** Smoke tests for new TUI screens (Textual pilot testing)
+
+---
+
+## Phase 4: Smarter Planning Context
+
+The planner currently gets only a directory listing. Better context = better plans.
+
+### 4a. Tree-sitter code analysis tool (`tools/code_analysis.py`)
+- `analyze_code` tool: parse a file and return structure (classes, functions, imports)
+- Use tree-sitter for Python, JS/TS, Go, Rust (the common ones)
+- Returns structured JSON: `{classes: [...], functions: [...], imports: [...]}`
+- Graceful fallback: regex-based extraction if tree-sitter not installed
+
+### 4b. Planner context enhancement (`engine/orchestrator.py`)
+- Before planning, auto-run `analyze_code` on key files in focus_dirs
+- Inject code structure summary into planner prompt
+- Helps planner make better subtask breakdowns
+
+### 4c. `web_fetch` tool (`tools/web.py`)
+- Fetch a URL and return content (for documentation, API specs, etc.)
+- Safety: URL allowlist/blocklist in config, timeout, max response size
+- Parameters: `{"url": str, "extract_text": bool}`
+- Useful for reading docs, checking APIs
+
+**Tests:** Unit tests with mocked tree-sitter, mocked HTTP
+
+---
+
+## Phase 5: Error Intelligence
+
+Currently retry just escalates model tiers. Smarter error handling = fewer wasted retries.
+
+### 5a. Error categorizer (`recovery/errors.py`)
+- Classify errors into categories: syntax_error, runtime_error, tool_error, model_error, timeout, safety_violation
+- Each category gets different recovery strategy
+- e.g., syntax_error → retry with "fix the syntax error on line X", not just "try again"
+
+### 5b. Error-aware retry in SubtaskRunner
+- Pass categorized error info into retry context
+- Inject specific error feedback into the retry prompt
+- e.g., "Previous attempt failed with: FileNotFoundError on /path/to/file. The file doesn't exist yet — you need to create it first."
+
+### 5c. Failure pattern learning (`learning/manager.py`)
+- Track which error categories occur per tool, per model, per task type
+- Feed patterns into planner context: "This model tends to hallucinate file paths — verify existence first"
+
+**Tests:** Unit tests for error categorization, integration test for error-aware retry
+
+---
+
+## Phase 6: Interactive Conversation Mode (Stretch)
+
+Currently Loom is fire-and-forget: submit task → wait → get result. An interactive mode would let users guide execution.
+
+### 6a. Conversation endpoint (`api/routes.py`)
+- `POST /tasks/{id}/message` — send a message to the running task
+- Messages injected into the executor's context as user messages
+- Enables back-and-forth clarification during execution
+
+### 6b. Conversation TUI screen
+- Chat-like interface in the TUI
+- Shows model reasoning + tool calls + results
+- User can type messages that get injected
+
+### 6c. Conversation memory
+- Store conversation turns in memory system
+- Available for future task context
+
+**Tests:** Integration test for mid-task message injection
+
+---
+
+## Summary: Priority Order
+
+| Phase | Impact | Effort | Dependencies |
+|-------|--------|--------|-------------|
+| 1. New Tools | High | Low | None |
+| 2. Streaming | High | Medium | None |
+| 3. TUI Enhancements | High | Medium | Phases 1-2 |
+| 4. Smarter Planning | Medium | Medium | Phase 1 |
+| 5. Error Intelligence | Medium | Low | None |
+| 6. Interactive Mode | Medium | High | Phase 2 |
+
+Phases 1, 2, and 5 can run in parallel. Phase 3 depends on 1+2. Phase 4 depends on 1. Phase 6 depends on 2.
