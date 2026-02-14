@@ -85,6 +85,7 @@ class Task:
     errors_encountered: list[ErrorRecord] = field(default_factory=list)
     workspace_changes: WorkspaceChanges = field(default_factory=WorkspaceChanges)
     approval_mode: str = "auto"
+    callback_url: str = ""
     context: dict = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""

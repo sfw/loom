@@ -20,6 +20,7 @@ from loom.events.bus import Event, EventBus
 from loom.events.types import (
     SUBTASK_COMPLETED,
     SUBTASK_FAILED,
+    SUBTASK_RETRYING,
     SUBTASK_STARTED,
     TASK_CANCELLED,
     TASK_COMPLETED,
@@ -32,6 +33,9 @@ from loom.events.types import (
 from loom.models.base import ModelResponse
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
+from loom.recovery.approval import ApprovalDecision, ApprovalManager, ApprovalRequest
+from loom.recovery.confidence import ConfidenceScorer
+from loom.recovery.retry import AttemptRecord, RetryManager
 from loom.state.memory import MemoryManager
 from loom.state.task_state import (
     Plan,
@@ -83,6 +87,7 @@ class Orchestrator:
         state_manager: TaskStateManager,
         event_bus: EventBus,
         config: Config,
+        approval_manager: ApprovalManager | None = None,
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -97,6 +102,11 @@ class Orchestrator:
             model_router=model_router,
             prompt_assembler=prompt_assembler,
             config=config.verification,
+        )
+        self._confidence = ConfidenceScorer()
+        self._approval = approval_manager or ApprovalManager(event_bus)
+        self._retry = RetryManager(
+            max_retries=config.execution.max_subtask_retries,
         )
 
     async def execute_task(self, task: Task) -> Task:
@@ -119,6 +129,7 @@ class Orchestrator:
             self._emit(TASK_EXECUTING, task.id, {})
             iteration = 0
             max_iterations = self._config.execution.max_loop_iterations
+            attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
 
             while self._scheduler.has_pending(task.plan) and iteration < max_iterations:
                 iteration += 1
@@ -128,13 +139,36 @@ class Orchestrator:
 
                 subtask = self._scheduler.next_subtask(task.plan)
                 if subtask is None:
-                    # All remaining subtasks are blocked
                     break
 
-                result = await self._execute_subtask(task, subtask)
+                # Determine escalation tier based on retry count
+                attempts = attempts_by_subtask.get(subtask.id, [])
+                escalated_tier = self._retry.get_escalation_tier(
+                    attempt=len(attempts),
+                    original_tier=subtask.model_tier,
+                )
+                retry_context = self._retry.build_retry_context(attempts)
 
-                # Retry + re-planning on failure
+                result, verification = await self._execute_subtask(
+                    task, subtask,
+                    model_tier=escalated_tier,
+                    retry_context=retry_context,
+                )
+
                 if result.status == "failed":
+                    # Record the failed attempt
+                    attempts_by_subtask.setdefault(subtask.id, []).append(
+                        AttemptRecord(
+                            attempt=len(attempts) + 1,
+                            tier=escalated_tier,
+                            feedback=verification.feedback if verification else None,
+                            error=result.summary,
+                        )
+                    )
+
+                    # Memory extraction also runs on failure (for learning)
+                    await self._extract_memory(task, subtask, result)
+
                     if subtask.retry_count < subtask.max_retries:
                         subtask.retry_count += 1
                         subtask.status = SubtaskStatus.PENDING
@@ -144,11 +178,75 @@ class Orchestrator:
                             retry_count=subtask.retry_count,
                         )
                         self._state.save(task)
+                        self._emit(SUBTASK_RETRYING, task.id, {
+                            "subtask_id": subtask.id,
+                            "attempt": subtask.retry_count,
+                            "escalated_tier": self._retry.get_escalation_tier(
+                                subtask.retry_count, subtask.model_tier,
+                            ),
+                            "feedback": verification.feedback if verification else None,
+                        })
                     else:
                         # All retries exhausted — trigger re-planning
                         replanned = await self._replan_task(task)
                         if not replanned:
-                            break  # Re-planning failed, stop
+                            break
+                else:
+                    # Confidence scoring and approval check on success
+                    if verification:
+                        confidence = self._confidence.score(
+                            subtask, result, verification,
+                        )
+                        decision = self._approval.check_approval(
+                            approval_mode=task.approval_mode,
+                            confidence=confidence.score,
+                            result=result,
+                            confidence_threshold=self._config.execution.auto_approve_confidence_threshold,
+                        )
+
+                        if decision in (
+                            ApprovalDecision.WAIT,
+                            ApprovalDecision.WAIT_WITH_TIMEOUT,
+                        ):
+                            timeout = 10 if decision == ApprovalDecision.WAIT_WITH_TIMEOUT else None
+                            task.status = TaskStatus.WAITING_APPROVAL
+                            self._state.save(task)
+
+                            approved = await self._approval.request_approval(
+                                ApprovalRequest(
+                                    task_id=task.id,
+                                    subtask_id=subtask.id,
+                                    reason=f"Confidence {confidence.band} ({confidence.score:.2f})",
+                                    proposed_action=result.summary,
+                                    risk_level=confidence.band,
+                                    details=confidence.components,
+                                    auto_approve_timeout=timeout,
+                                )
+                            )
+
+                            task.status = TaskStatus.EXECUTING
+                            self._state.save(task)
+
+                            if not approved:
+                                # Rejection — mark subtask as failed
+                                subtask.status = SubtaskStatus.FAILED
+                                task.update_subtask(
+                                    subtask.id,
+                                    status=SubtaskStatus.FAILED,
+                                    summary="Rejected by human reviewer",
+                                )
+                                self._state.save(task)
+                                continue
+
+                        elif decision == ApprovalDecision.ABORT:
+                            subtask.status = SubtaskStatus.FAILED
+                            task.update_subtask(
+                                subtask.id,
+                                status=SubtaskStatus.FAILED,
+                                summary="Aborted: confidence too low",
+                            )
+                            self._state.save(task)
+                            continue
 
             # 3. Completion
             return self._finalize_task(task)
@@ -279,8 +377,17 @@ class Orchestrator:
         data_dir.mkdir(parents=True, exist_ok=True)
         return ChangeLog(task_id=task.id, workspace=workspace, data_dir=data_dir)
 
-    async def _execute_subtask(self, task: Task, subtask: Subtask) -> SubtaskResult:
-        """Execute a single subtask with tool-calling loop."""
+    async def _execute_subtask(
+        self,
+        task: Task,
+        subtask: Subtask,
+        model_tier: int | None = None,
+        retry_context: str = "",
+    ) -> tuple[SubtaskResult, object]:
+        """Execute a single subtask with tool-calling loop.
+
+        Returns (SubtaskResult, VerificationResult) tuple.
+        """
         subtask.status = SubtaskStatus.RUNNING
         self._state.save(task)
         self._emit(SUBTASK_STARTED, task.id, {"subtask_id": subtask.id})
@@ -299,8 +406,13 @@ class Orchestrator:
             available_tools=self._tools.all_schemas(),
         )
 
-        # Select model
-        model = self._router.select(tier=subtask.model_tier, role="executor")
+        # Inject retry context if this is a retry attempt
+        if retry_context:
+            prompt = prompt + "\n\n" + retry_context
+
+        # Select model (use escalated tier if provided)
+        effective_tier = model_tier if model_tier is not None else subtask.model_tier
+        model = self._router.select(tier=effective_tier, role="executor")
 
         # Inner tool-calling loop
         messages: list[dict] = [{"role": "user", "content": prompt}]
@@ -415,7 +527,7 @@ class Orchestrator:
                 "verification_tier": verification.tier,
                 "feedback": verification.feedback,
             })
-            return result
+            return result, verification
 
         # Update state
         subtask.status = SubtaskStatus.COMPLETED
@@ -442,7 +554,7 @@ class Orchestrator:
         # Extract structured memory entries from the subtask execution
         await self._extract_memory(task, subtask, result)
 
-        return result
+        return result, verification
 
     def _finalize_task(self, task: Task) -> Task:
         """Finalize task: set status, emit events."""
@@ -481,6 +593,7 @@ class Orchestrator:
 
         Uses a tier-1 extractor model to identify decisions, discoveries,
         errors, and artifacts from the tool calls and output.
+        Runs on both success and failure for learning.
         """
         try:
             model = self._router.select(tier=1, role="extractor")
@@ -566,6 +679,7 @@ def create_task(
     goal: str,
     workspace: str = "",
     approval_mode: str = "auto",
+    callback_url: str = "",
     context: dict | None = None,
 ) -> Task:
     """Factory for creating new tasks with a generated ID."""
@@ -574,6 +688,7 @@ def create_task(
         goal=goal,
         workspace=workspace,
         approval_mode=approval_mode,
+        callback_url=callback_url,
         context=context or {},
         created_at=datetime.now().isoformat(),
         updated_at=datetime.now().isoformat(),

@@ -56,10 +56,15 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         goal=body.goal,
         workspace=body.workspace or "",
         approval_mode=body.approval_mode,
+        callback_url=body.callback_url or "",
         context=body.context,
     )
 
     engine.state_manager.save(task)
+
+    # Register webhook if callback_url provided
+    if task.callback_url:
+        engine.webhook_delivery.register(task.id, task.callback_url)
 
     # Launch execution in background
     asyncio.create_task(_execute_in_background(engine, task))
@@ -249,6 +254,13 @@ async def approve_task(request: Request, task_id: str, body: ApprovalRequest):
     if not engine.state_manager.exists(task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
+    # Resolve pending approval via the approval manager
+    resolved = engine.approval_manager.resolve_approval(
+        task_id=task_id,
+        subtask_id=body.subtask_id,
+        approved=body.approved,
+    )
+
     # Store approval decision in memory
     content = f"{'Approved' if body.approved else 'Rejected'}: {body.reason or 'No reason given'}"
     await engine.memory_manager.store(MemoryEntry(
@@ -264,6 +276,7 @@ async def approve_task(request: Request, task_id: str, body: ApprovalRequest):
         "status": "ok",
         "approved": body.approved,
         "subtask_id": body.subtask_id,
+        "resolved_pending": resolved,
     }
 
 

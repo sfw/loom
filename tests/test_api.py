@@ -11,8 +11,10 @@ from loom.api.engine import Engine
 from loom.config import Config
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import EventBus
+from loom.events.webhook import WebhookDelivery
 from loom.models.router import ModelRouter
 from loom.prompts.assembler import PromptAssembler
+from loom.recovery.approval import ApprovalManager
 from loom.state.memory import Database, MemoryManager
 from loom.state.task_state import (
     Plan,
@@ -81,6 +83,8 @@ def engine(
         state_manager=state_manager,
         prompt_assembler=PromptAssembler(),
         database=database,
+        approval_manager=ApprovalManager(event_bus),
+        webhook_delivery=WebhookDelivery(),
     )
 
 

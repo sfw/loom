@@ -7,8 +7,10 @@ from pathlib import Path
 from loom.config import Config
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import EventBus, EventPersister
+from loom.events.webhook import WebhookDelivery
 from loom.models.router import ModelRouter
 from loom.prompts.assembler import PromptAssembler
+from loom.recovery.approval import ApprovalManager
 from loom.state.memory import Database, MemoryManager
 from loom.state.task_state import TaskStateManager
 from loom.tools import create_default_registry
@@ -29,6 +31,8 @@ class Engine:
         state_manager: TaskStateManager,
         prompt_assembler: PromptAssembler,
         database: Database,
+        approval_manager: ApprovalManager,
+        webhook_delivery: WebhookDelivery,
     ):
         self.config = config
         self.orchestrator = orchestrator
@@ -39,6 +43,8 @@ class Engine:
         self.state_manager = state_manager
         self.prompt_assembler = prompt_assembler
         self.database = database
+        self.approval_manager = approval_manager
+        self.webhook_delivery = webhook_delivery
 
     async def shutdown(self) -> None:
         """Graceful cleanup."""
@@ -78,6 +84,13 @@ async def create_engine(config: Config) -> Engine:
     event_persister = EventPersister(database)
     event_persister.attach(event_bus)
 
+    # Webhook delivery — subscribe to terminal events
+    webhook_delivery = WebhookDelivery()
+    webhook_delivery.attach(event_bus)
+
+    # Approval manager
+    approval_manager = ApprovalManager(event_bus)
+
     # Orchestrator
     orchestrator = Orchestrator(
         model_router=model_router,
@@ -87,6 +100,7 @@ async def create_engine(config: Config) -> Engine:
         state_manager=state_manager,
         event_bus=event_bus,
         config=config,
+        approval_manager=approval_manager,
     )
 
     return Engine(
@@ -99,4 +113,6 @@ async def create_engine(config: Config) -> Engine:
         state_manager=state_manager,
         prompt_assembler=prompt_assembler,
         database=database,
+        approval_manager=approval_manager,
+        webhook_delivery=webhook_delivery,
     )
