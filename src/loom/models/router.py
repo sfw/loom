@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from loom.config import Config, ModelConfig
 from loom.models.base import ModelNotAvailableError, ModelProvider, ModelResponse
+from loom.models.anthropic_provider import AnthropicProvider
 from loom.models.ollama_provider import OllamaProvider
 from loom.models.openai_provider import OpenAICompatibleProvider
 
@@ -186,4 +187,15 @@ def _create_provider(name: str, config: ModelConfig) -> ModelProvider:
         return OllamaProvider(config, provider_name=name)
     if config.provider in ("openai_compatible", "openai"):
         return OpenAICompatibleProvider(config, provider_name=name)
+    if config.provider == "anthropic":
+        return AnthropicProvider(
+            name=name,
+            model=config.model,
+            api_key=config.api_key,
+            base_url=config.base_url or "https://api.anthropic.com",
+            max_tokens=config.max_tokens,
+            temperature=config.temperature,
+            tier=config.tier,
+            roles=config.roles,
+        )
     raise ValueError(f"Unknown provider type: {config.provider}")

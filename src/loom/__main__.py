@@ -197,6 +197,148 @@ def mcp_serve(ctx: click.Context, server_url: str | None) -> None:
     asyncio.run(server.run_stdio())
 
 
+@cli.command()
+@click.option(
+    "--workspace", "-w",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Workspace directory. Defaults to current directory.",
+)
+@click.option("--model", "-m", default=None, help="Model name from config to use.")
+@click.pass_context
+def cowork(ctx: click.Context, workspace: Path | None, model: str | None) -> None:
+    """Start an interactive cowork session.
+
+    Opens a conversation loop where you and the AI collaborate directly.
+    No planning phase, no subtask decomposition — just a continuous
+    tool-calling loop driven by natural conversation.
+    """
+    import asyncio
+
+    config = ctx.obj["config"]
+    ws = (workspace or Path.cwd()).resolve()
+
+    asyncio.run(_cowork_session(config, ws, model))
+
+
+async def _cowork_session(config, workspace: Path, model_name: str | None) -> None:
+    """Run an interactive cowork session."""
+    from loom.cowork.display import (
+        display_ask_user,
+        display_error,
+        display_goodbye,
+        display_text_chunk,
+        display_tool_complete,
+        display_tool_start,
+        display_turn_summary,
+        display_welcome,
+    )
+    from loom.cowork.session import CoworkSession, CoworkTurn, ToolCallEvent, build_cowork_system_prompt
+    from loom.models.router import ModelRouter
+    from loom.tools import create_default_registry
+
+    # Set up model
+    router = ModelRouter.from_config(config)
+    if model_name:
+        # Try to get the specific named provider
+        provider = None
+        for name, p in router._providers.items():
+            if name == model_name:
+                provider = p
+                break
+        if provider is None:
+            display_error(f"Model '{model_name}' not found in config.")
+            return
+    else:
+        try:
+            provider = router.select(role="executor")
+        except Exception as e:
+            display_error(f"No model available: {e}")
+            return
+
+    # Set up tools
+    tools = create_default_registry()
+
+    # Build session
+    system_prompt = build_cowork_system_prompt(workspace)
+    session = CoworkSession(
+        model=provider,
+        tools=tools,
+        workspace=workspace,
+        system_prompt=system_prompt,
+    )
+
+    display_welcome(workspace, provider.name)
+
+    while True:
+        try:
+            user_input = input("\033[1m> \033[0m")
+        except (EOFError, KeyboardInterrupt):
+            display_goodbye()
+            break
+
+        if not user_input.strip():
+            continue
+
+        # Handle special commands
+        if user_input.strip().lower() in ("/quit", "/exit", "/q"):
+            display_goodbye()
+            break
+
+        if user_input.strip().lower() == "/help":
+            sys.stdout.write(
+                "Commands: /quit, /exit, /help\n"
+                "Type anything else to interact with the AI.\n"
+            )
+            continue
+
+        try:
+            sys.stdout.write("\n")
+
+            async for event in session.send(user_input):
+                if isinstance(event, ToolCallEvent):
+                    if event.result is None:
+                        # Tool starting
+                        display_tool_start(event)
+                    else:
+                        # Tool completed
+                        display_tool_complete(event)
+
+                        # Special handling for ask_user
+                        if event.name == "ask_user" and event.result:
+                            answer = display_ask_user(event)
+                            if answer:
+                                sys.stdout.write("\n")
+                                async for follow_event in session.send(answer):
+                                    if isinstance(follow_event, ToolCallEvent):
+                                        if follow_event.result is None:
+                                            display_tool_start(follow_event)
+                                        else:
+                                            display_tool_complete(follow_event)
+                                    elif isinstance(follow_event, CoworkTurn):
+                                        if follow_event.text:
+                                            sys.stdout.write(f"\n{follow_event.text}\n")
+                                        display_turn_summary(follow_event)
+                                    elif isinstance(follow_event, str):
+                                        display_text_chunk(follow_event)
+
+                elif isinstance(event, CoworkTurn):
+                    if event.text:
+                        sys.stdout.write(f"\n{event.text}\n")
+                    display_turn_summary(event)
+
+                elif isinstance(event, str):
+                    display_text_chunk(event)
+
+            sys.stdout.write("\n")
+
+        except KeyboardInterrupt:
+            sys.stdout.write("\n\033[2m(interrupted)\033[0m\n")
+            continue
+        except Exception as e:
+            display_error(str(e))
+
+
 @cli.command(name="reset-learning")
 @click.confirmation_option(prompt="Are you sure you want to clear all learned patterns?")
 @click.pass_context

@@ -21,12 +21,14 @@ class ServerConfig:
 class ModelConfig:
     """Configuration for a single model provider."""
 
-    provider: str  # "ollama" | "openai_compatible"
-    base_url: str
-    model: str
+    provider: str  # "ollama" | "openai_compatible" | "anthropic"
+    base_url: str = ""
+    model: str = ""
     max_tokens: int = 4096
     temperature: float = 0.1
     roles: list[str] = field(default_factory=lambda: ["executor"])
+    api_key: str = ""
+    tier: int = 0  # 0 = auto-detect from model name
 
 
 @dataclass(frozen=True)
@@ -95,11 +97,13 @@ def _parse_model_config(name: str, data: dict) -> ModelConfig:
         roles = [roles]
     return ModelConfig(
         provider=data["provider"],
-        base_url=data["base_url"],
-        model=data["model"],
+        base_url=data.get("base_url", ""),
+        model=data.get("model", ""),
         max_tokens=data.get("max_tokens", 4096),
         temperature=data.get("temperature", 0.1),
         roles=roles,
+        api_key=data.get("api_key", ""),
+        tier=data.get("tier", 0),
     )
 
 

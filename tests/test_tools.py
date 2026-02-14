@@ -66,9 +66,9 @@ class TestToolResult:
         assert "a.py" in j
 
     def test_output_truncation(self):
-        r = ToolResult.ok("x" * 20000)
+        r = ToolResult.ok("x" * 50000)
         j = r.to_json()
-        assert len(j) < 20000
+        assert len(j) < 50000
 
 
 # --- Registry ---
@@ -492,7 +492,7 @@ class TestGitCommand:
 
     async def test_git_blocked_subcommand(self, ctx: ToolContext):
         tool = GitCommandTool()
-        result = await tool.execute({"args": ["push", "origin", "main"]}, ctx)
+        result = await tool.execute({"args": ["clone", "https://example.com/repo"]}, ctx)
         assert not result.success
         assert "not allowed" in result.error
 

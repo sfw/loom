@@ -55,7 +55,7 @@ class ShellExecuteTool(Tool):
 
     @property
     def timeout_seconds(self) -> int:
-        return 60
+        return 120
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         command = args.get("command", "")

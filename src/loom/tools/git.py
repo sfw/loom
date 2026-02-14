@@ -13,7 +13,7 @@ ALLOWED_SUBCOMMANDS = frozenset({
     "add", "commit", "reset",
     "branch", "checkout", "switch", "merge", "rebase",
     "stash", "tag",
-    "fetch", "pull",
+    "fetch", "pull", "push", "remote",
     "ls-files", "rev-parse", "config",
 })
 
@@ -59,7 +59,8 @@ class GitCommandTool(Tool):
             "Execute a git command in the workspace. "
             "Supports: status, diff, log, show, blame, add, commit, "
             "branch, checkout, switch, merge, rebase, stash, tag, "
-            "fetch, pull, ls-files, rev-parse, config."
+            "fetch, pull, push, remote, ls-files, rev-parse, config. "
+            "Note: force push is blocked for safety."
         )
 
     @property

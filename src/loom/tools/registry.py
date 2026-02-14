@@ -24,7 +24,7 @@ class ToolResult:
     files_changed: list[str] = field(default_factory=list)
     error: str | None = None
 
-    MAX_OUTPUT_SIZE = 10240  # 10KB
+    MAX_OUTPUT_SIZE = 30720  # 30KB
 
     def to_json(self) -> str:
         return json.dumps({
