@@ -40,7 +40,7 @@ Goal -> Planner ->  │ [Subtask A]  [Subtask B] │  parallel batch
 - **Isolated execution** -- each subtask runs in a `SubtaskRunner` with its own context (no cross-contamination)
 - **Three model backends** -- Ollama, OpenAI-compatible APIs (LM Studio, vLLM, etc.), and Anthropic/Claude
 - **Role-based routing** -- planner, executor, extractor, verifier roles with tier selection
-- **Tool system** -- 15 built-in tools (file ops, shell, git, ripgrep search, glob find, web search, web fetch, code analysis, ask user) with plugin auto-discovery
+- **Tool system** -- 16 built-in tools (file ops, shell, git, ripgrep search, glob find, web search, web fetch, code analysis, task tracker, ask user) with plugin auto-discovery
 - **Workspace safety** -- path traversal prevention, destructive command blocking
 - **Full undo** -- changelog with before-snapshots, revert at file/subtask/task level
 - **Token budgeting** -- prompt assembly with 7-section ordering and trim-to-budget
@@ -63,7 +63,7 @@ Goal -> Planner ->  │ [Subtask A]  [Subtask B] │  parallel batch
 
 **Interfaces:**
 
-- **Cowork mode** -- interactive conversation loop with real-time tool display, mid-execution questions, and full context
+- **Cowork mode** -- interactive conversation loop with streaming, real-time tool display, per-tool-call approval, and full context
 - **REST API** -- full task CRUD, SSE streaming, steer/approve/feedback
 - **Terminal UI** -- Textual-based dashboard with live streaming, steering, and approval modals
 - **MCP server** -- Model Context Protocol integration for use as an agent tool
@@ -248,6 +248,7 @@ src/loom/
     code_analysis.py     Code structure analysis (tree-sitter)
     web.py               Web fetch with URL safety
     web_search.py        Internet search via DuckDuckGo (no API key)
+    task_tracker.py      Progress tracking for multi-step tasks
     workspace.py         Changelog, diff, revert
   tui/
     api_client.py        Async HTTP + SSE client for Loom API

@@ -16,8 +16,11 @@ All notable changes to Loom are documented in this file.
 - **Gap analysis document** (`planning/gap-analysis-vs-claude-code.md`) -- 10-dimension comparison of Loom vs Claude Code's coworking model with prioritized implementation roadmap.
 
 - **Per-tool-call approval** (`cowork/approval.py`) -- interactive approval system for cowork mode. Read-only tools (read_file, search, glob, web_search, etc.) auto-approved. Write/execute tools (shell, git, edit, delete) prompt with `[y]es / [n]o / [a]lways allow <tool>`. "Always" remembers per-tool for the session.
+- **`task_tracker` tool** -- in-memory progress tracking for multi-step tasks. Actions: add, update (pending/in_progress/completed), list, clear. Helps the model organize complex work and show progress.
+- **PDF/image file support** in `read_file` -- PDFs: extracts text page-by-page via `pypdf` (optional dep). Images: returns file metadata. Both fall back gracefully when libraries aren't installed.
 
 ### Changed
+- **Cowork CLI uses streaming by default** -- text tokens display incrementally as they arrive instead of waiting for the full response.
 - **Git tool** -- `push` and `remote` added to allowed subcommands (force push still blocked).
 - **Shell tool** -- timeout increased from 60s to 120s for longer-running commands.
 - **Tool output limit** -- increased from 10KB to 30KB for richer tool results.

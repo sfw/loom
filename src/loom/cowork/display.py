@@ -158,6 +158,17 @@ def _summarize_args(tool_name: str, args: dict) -> str:
         url = args.get("url", "")
         return _truncate(url, 60)
 
+    if tool_name == "web_search":
+        query = args.get("query", "")
+        return _truncate(query, 60)
+
+    if tool_name == "task_tracker":
+        action = args.get("action", "")
+        content = args.get("content", "")
+        if content:
+            return _truncate(f"{action}: {content}", 60)
+        return action
+
     if tool_name == "ask_user":
         question = args.get("question", "")
         return _truncate(question, 60)

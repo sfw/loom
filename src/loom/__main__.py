@@ -298,13 +298,12 @@ async def _cowork_session(config, workspace: Path, model_name: str | None) -> No
         try:
             sys.stdout.write("\n")
 
-            async for event in session.send(user_input):
+            streamed_text = False
+            async for event in session.send_streaming(user_input):
                 if isinstance(event, ToolCallEvent):
                     if event.result is None:
-                        # Tool starting
                         display_tool_start(event)
                     else:
-                        # Tool completed
                         display_tool_complete(event)
 
                         # Special handling for ask_user
@@ -312,25 +311,28 @@ async def _cowork_session(config, workspace: Path, model_name: str | None) -> No
                             answer = display_ask_user(event)
                             if answer:
                                 sys.stdout.write("\n")
-                                async for follow_event in session.send(answer):
+                                async for follow_event in session.send_streaming(answer):
                                     if isinstance(follow_event, ToolCallEvent):
                                         if follow_event.result is None:
                                             display_tool_start(follow_event)
                                         else:
                                             display_tool_complete(follow_event)
                                     elif isinstance(follow_event, CoworkTurn):
-                                        if follow_event.text:
-                                            sys.stdout.write(f"\n{follow_event.text}\n")
                                         display_turn_summary(follow_event)
                                     elif isinstance(follow_event, str):
                                         display_text_chunk(follow_event)
 
                 elif isinstance(event, CoworkTurn):
-                    if event.text:
+                    # Text was already streamed incrementally — only
+                    # display if no streaming occurred (fallback).
+                    if event.text and not streamed_text:
                         sys.stdout.write(f"\n{event.text}\n")
                     display_turn_summary(event)
 
                 elif isinstance(event, str):
+                    if not streamed_text:
+                        sys.stdout.write("\n")
+                        streamed_text = True
                     display_text_chunk(event)
 
             sys.stdout.write("\n")

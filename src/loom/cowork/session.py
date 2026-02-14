@@ -401,4 +401,5 @@ TOOL USAGE:
 - Use web_fetch to read a specific URL's content.
 - Use shell_execute for running tests, builds, linters, etc.
 - Use git_command for version control operations (including push).
+- Use task_tracker to organize multi-step work and show progress.
 - Use ask_user when you need the developer's input or decision."""

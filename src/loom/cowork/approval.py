@@ -32,6 +32,7 @@ AUTO_APPROVED_TOOLS: frozenset[str] = frozenset({
     "ask_user",
     "web_search",
     "web_fetch",
+    "task_tracker",
 })
 
 

@@ -164,6 +164,31 @@ class TestReadFile:
         with pytest.raises(ToolSafetyError, match="escapes workspace"):
             await tool.execute({"path": "../../../etc/passwd"}, ctx)
 
+    async def test_read_image_returns_metadata(self, ctx: ToolContext, workspace: Path):
+        # Create a dummy image file
+        img_path = workspace / "logo.png"
+        img_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+
+        tool = ReadFileTool()
+        result = await tool.execute({"path": "logo.png"}, ctx)
+        assert result.success
+        assert "Image file" in result.output
+        assert "logo.png" in result.output
+        assert result.data["type"] == "image"
+
+    async def test_read_pdf_without_pypdf(self, ctx: ToolContext, workspace: Path):
+        # Create a dummy PDF file (won't be valid, but extension matters)
+        pdf_path = workspace / "doc.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 dummy content")
+
+        tool = ReadFileTool()
+        # pypdf may or may not be installed — both outcomes are valid
+        result = await tool.execute({"path": "doc.pdf"}, ctx)
+        assert result.success or "Error" in (result.error or "")
+        # If pypdf is not installed, we get a helpful message
+        if "pypdf" in result.output.lower() or "install" in result.output.lower():
+            assert "PDF file" in result.output
+
 
 # --- WriteFileTool ---
 

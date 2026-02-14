@@ -5,6 +5,10 @@ from __future__ import annotations
 from loom.tools.registry import Tool, ToolContext, ToolResult, ToolSafetyError
 
 
+_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg"})
+_PDF_EXTENSION = ".pdf"
+
+
 class ReadFileTool(Tool):
     @property
     def name(self) -> str:
@@ -12,7 +16,11 @@ class ReadFileTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Read the contents of a file. Optionally specify a line range."
+        return (
+            "Read the contents of a file. Optionally specify a line range. "
+            "Supports text files, PDFs (extracts text if pypdf is installed), "
+            "and reports metadata for image files."
+        )
 
     @property
     def parameters(self) -> dict:
@@ -40,6 +48,17 @@ class ReadFileTool(Tool):
         if not path.is_file():
             return ToolResult.fail(f"Not a file: {args['path']}")
 
+        suffix = path.suffix.lower()
+
+        # PDF handling
+        if suffix == _PDF_EXTENSION:
+            return self._read_pdf(path)
+
+        # Image handling
+        if suffix in _IMAGE_EXTENSIONS:
+            return self._read_image(path)
+
+        # Text file
         content = path.read_text(encoding="utf-8", errors="replace")
 
         line_start = args.get("line_start")
@@ -51,6 +70,47 @@ class ReadFileTool(Tool):
             content = "".join(lines[start:end])
 
         return ToolResult.ok(content)
+
+    @staticmethod
+    def _read_pdf(path) -> ToolResult:
+        """Extract text from a PDF file."""
+        try:
+            import pypdf
+        except ImportError:
+            size = path.stat().st_size
+            return ToolResult.ok(
+                f"[PDF file: {path.name}, {size:,} bytes]\n"
+                "Install 'pypdf' to extract text: pip install pypdf",
+                data={"type": "pdf", "name": path.name, "size": size},
+            )
+
+        try:
+            reader = pypdf.PdfReader(path)
+            pages = []
+            for i, page in enumerate(reader.pages):
+                text = page.extract_text() or ""
+                if text.strip():
+                    pages.append(f"--- Page {i + 1} ---\n{text}")
+            if not pages:
+                return ToolResult.ok(
+                    f"[PDF: {path.name}, {len(reader.pages)} pages, no extractable text]",
+                    data={"type": "pdf", "pages": len(reader.pages)},
+                )
+            return ToolResult.ok(
+                "\n\n".join(pages),
+                data={"type": "pdf", "pages": len(reader.pages)},
+            )
+        except Exception as e:
+            return ToolResult.fail(f"Error reading PDF: {e}")
+
+    @staticmethod
+    def _read_image(path) -> ToolResult:
+        """Return metadata for an image file."""
+        size = path.stat().st_size
+        return ToolResult.ok(
+            f"[Image file: {path.name}, {size:,} bytes, type: {path.suffix}]",
+            data={"type": "image", "name": path.name, "size": size, "format": path.suffix},
+        )
 
 
 class WriteFileTool(Tool):
