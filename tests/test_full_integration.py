@@ -28,7 +28,6 @@ from loom.events.types import (
     SUBTASK_STARTED,
     TASK_COMPLETED,
     TASK_EXECUTING,
-    TASK_FAILED,
     TASK_PLAN_READY,
     TASK_PLANNING,
 )
@@ -40,7 +39,6 @@ from loom.recovery.approval import ApprovalManager
 from loom.state.memory import Database, MemoryManager
 from loom.state.task_state import SubtaskStatus, TaskStateManager, TaskStatus
 from loom.tools import create_default_registry
-
 
 # ---------------------------------------------------------------------------
 # Deterministic fake model provider
@@ -344,7 +342,7 @@ class TestFullLifecycleHappyPath:
         assert SUBTASK_COMPLETED in event_types
         assert TASK_COMPLETED in event_types
 
-        # Lifecycle order: planning → plan_ready → executing → subtask_started → subtask_completed → task_completed
+        # Lifecycle order: planning → plan_ready → executing → subtask → task
         planning_idx = event_types.index(TASK_PLANNING)
         plan_ready_idx = event_types.index(TASK_PLAN_READY)
         executing_idx = event_types.index(TASK_EXECUTING)
@@ -416,7 +414,11 @@ class TestMultiSubtaskWithDependencies:
                 # s2: write reader.py
                 _tool_call_response("write_file", {
                     "path": "reader.py",
-                    "content": "import json\nwith open('config.json') as f:\n    data = json.load(f)\n",
+                    "content": (
+                        "import json\n"
+                        "with open('config.json') as f:\n"
+                        "    data = json.load(f)\n"
+                    ),
                 }),
                 _text_response("Created reader.py that reads config.json."),
             ],
@@ -947,7 +949,8 @@ class TestEditFileWithChangelog:
         assert "y = 2" in content
 
         # Workspace changes tracked
-        assert result.workspace_changes.files_created >= 1 or result.workspace_changes.files_modified >= 1
+        changes = result.workspace_changes
+        assert changes.files_created >= 1 or changes.files_modified >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -1335,9 +1338,6 @@ class TestParallelSubtaskExecution:
 
         # With max_parallel=1, s1 should complete before s2 starts
         events = event_collector["events"]
-        started = [e for e in events if e.event_type == SUBTASK_STARTED]
-        completed = [e for e in events if e.event_type == SUBTASK_COMPLETED]
-
         # s1 completed before s2 started
         s1_complete_idx = next(
             i for i, e in enumerate(events)

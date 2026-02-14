@@ -7,7 +7,6 @@ Parses DuckDuckGo HTML results to extract titles, URLs, and snippets.
 from __future__ import annotations
 
 import re
-from urllib.parse import quote_plus, urljoin
 
 import httpx
 

@@ -29,7 +29,7 @@ class AskUserTool(Tool):
             "options": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional list of suggested options for the developer to choose from.",
+                "description": "Optional list of suggested options.",
             },
         },
         "required": ["question"],

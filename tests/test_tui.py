@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
 from loom.tui.api_client import LoomAPIClient
 from loom.tui.app import (
     AskUserScreen,
@@ -14,7 +12,6 @@ from loom.tui.app import (
     _tool_output_preview,
     _trunc,
 )
-
 
 # --- LoomAPIClient tests (unchanged from before) ---
 

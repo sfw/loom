@@ -7,7 +7,6 @@ import json
 import pytest
 
 from loom.models.anthropic_provider import AnthropicProvider
-from loom.models.base import TokenUsage, ToolCall
 
 
 @pytest.fixture
@@ -119,8 +118,10 @@ class TestMessageConversion:
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [
-                    {"id": "tc1", "type": "function", "function": {"name": "t1", "arguments": "{}"}},
-                    {"id": "tc2", "type": "function", "function": {"name": "t2", "arguments": "{}"}},
+                    {"id": "tc1", "type": "function",
+                     "function": {"name": "t1", "arguments": "{}"}},
+                    {"id": "tc2", "type": "function",
+                     "function": {"name": "t2", "arguments": "{}"}},
                 ],
             },
             {"role": "tool", "tool_call_id": "tc1", "content": "result1"},

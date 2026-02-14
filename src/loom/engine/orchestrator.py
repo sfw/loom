@@ -11,7 +11,6 @@ Subtask execution is delegated to SubtaskRunner.  Independent subtasks
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -50,7 +49,7 @@ from loom.state.task_state import (
     TaskStateManager,
     TaskStatus,
 )
-from loom.tools.registry import ToolRegistry, ToolResult
+from loom.tools.registry import ToolRegistry
 from loom.tools.workspace import ChangeLog
 
 # Re-export dataclasses that existing code imports from here

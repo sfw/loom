@@ -265,7 +265,12 @@ async def _cowork_session(config, workspace: Path, model_name: str | None) -> No
         display_turn_summary,
         display_welcome,
     )
-    from loom.cowork.session import CoworkSession, CoworkTurn, ToolCallEvent, build_cowork_system_prompt
+    from loom.cowork.session import (
+        CoworkSession,
+        CoworkTurn,
+        ToolCallEvent,
+        build_cowork_system_prompt,
+    )
     from loom.models.router import ModelRouter
     from loom.tools import create_default_registry
 

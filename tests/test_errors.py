@@ -41,7 +41,8 @@ class TestCategorizeError:
     def test_timeout(self):
         result = categorize_error("Tool 'shell_execute' timed out after 60s")
         assert result.category == ErrorCategory.TIMEOUT
-        assert "timeout" in result.recovery_hint.lower() or "simpler" in result.recovery_hint.lower()
+        hint = result.recovery_hint.lower()
+        assert "timeout" in hint or "simpler" in hint
 
     def test_tool_error(self):
         result = categorize_error("Unknown tool: foobar")

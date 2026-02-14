@@ -20,11 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from loom.cowork.approval import ApprovalDecision, ToolApprover
-from loom.config import Config
-from loom.models.base import ModelProvider, ModelResponse, StreamChunk, ToolCall
-from loom.models.router import ModelRouter
+from loom.models.base import ModelProvider, ToolCall
 from loom.tools.registry import ToolRegistry, ToolResult
-
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -104,7 +101,9 @@ class CoworkSession:
     # Public API
     # ------------------------------------------------------------------
 
-    async def send(self, user_message: str) -> AsyncGenerator[CoworkTurn | ToolCallEvent | str, None]:
+    async def send(
+        self, user_message: str,
+    ) -> AsyncGenerator[CoworkTurn | ToolCallEvent | str, None]:
         """Send a user message and yield events as the model responds.
 
         Yields:

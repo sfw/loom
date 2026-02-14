@@ -11,7 +11,6 @@ from __future__ import annotations
 import enum
 import sys
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
 
 
 class ApprovalDecision(enum.Enum):
@@ -107,27 +106,27 @@ def terminal_approval_prompt(tool_name: str, args: dict) -> ApprovalDecision:
     [y]es / [n]o / [a]lways allow <tool>
     """
     # ANSI codes
-    BOLD = "\033[1m"
-    YELLOW = "\033[33m"
-    CYAN = "\033[36m"
-    DIM = "\033[2m"
-    RESET = "\033[0m"
+    bold = "\033[1m"
+    yellow = "\033[33m"
+    cyan = "\033[36m"
+    dim = "\033[2m"
+    reset = "\033[0m"
 
     args_preview = _format_args_preview(tool_name, args)
 
     sys.stdout.write(
-        f"\n{YELLOW}{BOLD}Approve?{RESET} "
-        f"{CYAN}{tool_name}{RESET}"
+        f"\n{yellow}{bold}Approve?{reset} "
+        f"{cyan}{tool_name}{reset}"
     )
     if args_preview:
-        sys.stdout.write(f" {DIM}{args_preview}{RESET}")
+        sys.stdout.write(f" {dim}{args_preview}{reset}")
     sys.stdout.write(
-        f"\n  {DIM}[y]es  [n]o  [a]lways allow {tool_name}{RESET}\n"
+        f"\n  {dim}[y]es  [n]o  [a]lways allow {tool_name}{reset}\n"
     )
     sys.stdout.flush()
 
     try:
-        answer = input(f"{YELLOW}? {RESET}").strip().lower()
+        answer = input(f"{yellow}? {reset}").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return ApprovalDecision.DENY
 

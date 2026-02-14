@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import AsyncGenerator
 
 import httpx
-
-from collections.abc import AsyncGenerator
 
 from loom.config import ModelConfig
 from loom.models.base import ModelProvider, ModelResponse, StreamChunk, TokenUsage, ToolCall

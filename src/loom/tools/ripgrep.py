@@ -43,7 +43,10 @@ class RipgrepSearchTool(Tool):
             },
             "type": {
                 "type": "string",
-                "description": "File type filter (e.g. 'py', 'js', 'rust', 'go'). Efficient type filtering.",
+                "description": (
+                    "File type filter (e.g. 'py', 'js', 'rust', 'go')."
+                    " Efficient type filtering."
+                ),
             },
             "context": {
                 "type": "integer",
@@ -59,7 +62,10 @@ class RipgrepSearchTool(Tool):
             },
             "max_matches": {
                 "type": "integer",
-                "description": f"Maximum number of matches to return. Default {DEFAULT_MAX_MATCHES}.",
+                "description": (
+                    "Maximum matches to return."
+                    f" Default {DEFAULT_MAX_MATCHES}."
+                ),
             },
         },
         "required": ["pattern"],

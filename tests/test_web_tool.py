@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from loom.tools.web import _strip_html, is_safe_url
 
-
 # --- URL Safety ---
 
 

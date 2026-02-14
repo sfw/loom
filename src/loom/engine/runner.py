@@ -14,13 +14,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from collections.abc import Callable
-
 from loom.config import Config
 from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import EventBus
 from loom.events.types import TOKEN_STREAMED
-from loom.models.base import ModelResponse, StreamChunk
+from loom.models.base import ModelResponse
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.state.memory import MemoryEntry, MemoryManager

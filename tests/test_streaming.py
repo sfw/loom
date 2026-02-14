@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from loom.models.base import (
     ModelProvider,
     ModelResponse,

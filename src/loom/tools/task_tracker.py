@@ -7,8 +7,7 @@ memory for the session — no persistence needed.
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
 

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -16,8 +14,6 @@ from loom.cowork.session import (
 )
 from loom.models.base import ModelProvider, ModelResponse, TokenUsage, ToolCall
 from loom.tools import create_default_registry
-from loom.tools.registry import ToolContext, ToolRegistry, ToolResult
-
 
 # --- Fixtures ---
 
@@ -91,7 +87,10 @@ class TestCoworkSession:
             # First response: tool call
             ModelResponse(
                 text="",
-                tool_calls=[ToolCall(id="tc1", name="read_file", arguments={"path": "src/main.py"})],
+                tool_calls=[ToolCall(
+                    id="tc1", name="read_file",
+                    arguments={"path": "src/main.py"},
+                )],
                 usage=TokenUsage(total_tokens=20),
             ),
             # Second response: text after seeing tool result

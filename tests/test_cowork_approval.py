@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -14,10 +13,9 @@ from loom.cowork.approval import (
     ToolApprover,
     _format_args_preview,
 )
-from loom.cowork.session import CoworkSession, CoworkTurn, ToolCallEvent
+from loom.cowork.session import CoworkSession, ToolCallEvent
 from loom.models.base import ModelProvider, ModelResponse, TokenUsage, ToolCall
 from loom.tools import create_default_registry
-
 
 # --- Fixtures ---
 

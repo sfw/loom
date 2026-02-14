@@ -39,7 +39,6 @@ from loom.cowork.session import (
 from loom.models.base import ModelProvider
 from loom.tools.registry import ToolRegistry
 
-
 # ---------------------------------------------------------------------------
 # Modal screens
 # ---------------------------------------------------------------------------
@@ -77,7 +76,7 @@ class ToolApprovalScreen(ModalScreen[str]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Label(f"[bold yellow]Approve tool call?[/bold yellow]"),
+            Label("[bold yellow]Approve tool call?[/bold yellow]"),
             Label(f"[bold cyan]{self._tool_name}[/bold cyan]  [dim]{self._args_preview}[/dim]"),
             Label(""),
             Label("[y] Yes  [a] Always allow this tool  [n] No  [Esc] Cancel"),
@@ -221,7 +220,7 @@ class LoomApp(App):
         log = self.query_one("#chat-log", RichLog)
         log.write(f"[bold]Loom Cowork[/bold] [dim]({self._model.name})[/dim]")
         log.write(f"[dim]workspace: {self._workspace}[/dim]")
-        log.write(f"[dim]16 tools loaded. Type your request.[/dim]")
+        log.write("[dim]16 tools loaded. Type your request.[/dim]")
         log.write("")
 
         self._update_status("Ready")
@@ -407,7 +406,6 @@ class LoomApp(App):
 
     async def _handle_ask_user(self, event: ToolCallEvent) -> str:
         """Show an ask_user modal and return the answer."""
-        import json
 
         question = event.args.get("question", "")
         options = event.args.get("options", [])
@@ -492,7 +490,7 @@ def _tool_output_preview(tool_name: str, output: str) -> str:
     if tool_name == "shell_execute":
         return _trunc(output.strip().split("\n")[0], 60)
     if tool_name == "web_search":
-        lines = [l for l in output.strip().split("\n") if l.startswith(("1.", "2.", "3."))]
+        lines = [x for x in output.strip().split("\n") if x.startswith(("1.", "2.", "3."))]
         return f"{len(lines)} results" if lines else ""
     return ""
 

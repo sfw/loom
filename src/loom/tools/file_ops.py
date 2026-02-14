@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from loom.tools.registry import Tool, ToolContext, ToolResult, ToolSafetyError
-
+from loom.tools.registry import Tool, ToolContext, ToolResult
 
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg"})
 _PDF_EXTENSION = ".pdf"
@@ -234,7 +233,10 @@ class MoveFileTool(Tool):
             "type": "object",
             "properties": {
                 "source": {"type": "string", "description": "Source path relative to workspace"},
-                "destination": {"type": "string", "description": "Destination path relative to workspace"},
+                "destination": {
+                    "type": "string",
+                    "description": "Destination path relative to workspace",
+                },
             },
             "required": ["source", "destination"],
         }

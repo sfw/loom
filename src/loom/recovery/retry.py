@@ -9,10 +9,10 @@ Implements structured retry and escalation for failed subtasks:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
-from loom.recovery.errors import CategorizedError, ErrorCategory, categorize_error
+from loom.recovery.errors import ErrorCategory, categorize_error
 
 
 @dataclass

@@ -13,7 +13,6 @@ from pathlib import Path
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
-
 # --- Extractors per language ---
 
 @dataclass
@@ -104,7 +103,8 @@ def extract_javascript(source: str) -> CodeStructure:
         structure.functions.append(m.group(1))
 
     # Exports
-    for m in re.finditer(r"export\s+(?:default\s+)?(?:class|function|const|let|var)\s+(\w+)", source):
+    export_re = r"export\s+(?:default\s+)?(?:class|function|const|let|var)\s+(\w+)"
+    for m in re.finditer(export_re, source):
         structure.exports.append(m.group(1))
 
     return structure
@@ -205,7 +205,8 @@ def analyze_directory(
                 continue
             # Skip hidden dirs, node_modules, etc.
             parts = path.relative_to(workspace).parts
-            if any(p.startswith(".") or p in ("node_modules", "__pycache__", "venv", ".venv") for p in parts):
+            skip = ("node_modules", "__pycache__", "venv", ".venv")
+            if any(p.startswith(".") or p in skip for p in parts):
                 continue
 
             try:

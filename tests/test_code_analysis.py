@@ -19,7 +19,6 @@ from loom.tools.code_analysis import (
 )
 from loom.tools.registry import ToolContext
 
-
 # --- Language Detection ---
 
 
