@@ -223,6 +223,7 @@ def cowork(ctx: click.Context, workspace: Path | None, model: str | None) -> Non
 
 async def _cowork_session(config, workspace: Path, model_name: str | None) -> None:
     """Run an interactive cowork session."""
+    from loom.cowork.approval import ToolApprover, async_terminal_approval_prompt
     from loom.cowork.display import (
         display_ask_user,
         display_error,
@@ -256,8 +257,9 @@ async def _cowork_session(config, workspace: Path, model_name: str | None) -> No
             display_error(f"No model available: {e}")
             return
 
-    # Set up tools
+    # Set up tools and approval
     tools = create_default_registry()
+    approver = ToolApprover(prompt_callback=async_terminal_approval_prompt)
 
     # Build session
     system_prompt = build_cowork_system_prompt(workspace)
@@ -266,6 +268,7 @@ async def _cowork_session(config, workspace: Path, model_name: str | None) -> No
         tools=tools,
         workspace=workspace,
         system_prompt=system_prompt,
+        approver=approver,
     )
 
     display_welcome(workspace, provider.name)

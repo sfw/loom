@@ -19,6 +19,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from loom.cowork.approval import ApprovalDecision, ToolApprover
 from loom.config import Config
 from loom.models.base import ModelProvider, ModelResponse, StreamChunk, ToolCall
 from loom.models.router import ModelRouter
@@ -78,11 +79,13 @@ class CoworkSession:
         workspace: Path | None = None,
         system_prompt: str = "",
         max_context_messages: int = 200,
+        approver: ToolApprover | None = None,
     ):
         self._model = model
         self._tools = tools
         self._workspace = workspace
         self._max_context = max_context_messages
+        self._approver = approver
 
         self._messages: list[dict] = []
         if system_prompt:
@@ -153,6 +156,24 @@ class CoworkSession:
                 for tc in response.tool_calls:
                     event = ToolCallEvent(name=tc.name, args=tc.arguments)
                     yield event  # signal: tool call starting
+
+                    # Check approval before executing
+                    if self._approver is not None:
+                        decision = await self._approver.check(tc.name, tc.arguments)
+                        if decision == ApprovalDecision.DENY:
+                            result = ToolResult.fail(
+                                f"Tool call '{tc.name}' denied by user."
+                            )
+                            event.result = result
+                            event.elapsed_ms = 0
+                            all_tool_events.append(event)
+                            yield event
+                            self._messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": result.to_json(),
+                            })
+                            continue
 
                     start = time.monotonic()
                     result = await self._tools.execute(
@@ -255,6 +276,24 @@ class CoworkSession:
                 for tc in final_tool_calls:
                     event = ToolCallEvent(name=tc.name, args=tc.arguments)
                     yield event
+
+                    # Check approval before executing
+                    if self._approver is not None:
+                        decision = await self._approver.check(tc.name, tc.arguments)
+                        if decision == ApprovalDecision.DENY:
+                            result = ToolResult.fail(
+                                f"Tool call '{tc.name}' denied by user."
+                            )
+                            event.result = result
+                            event.elapsed_ms = 0
+                            all_tool_events.append(event)
+                            yield event
+                            self._messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": result.to_json(),
+                            })
+                            continue
 
                     start = time.monotonic()
                     result = await self._tools.execute(

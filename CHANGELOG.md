@@ -15,6 +15,8 @@ All notable changes to Loom are documented in this file.
 - **`api_key` and `tier` fields** in `ModelConfig` -- supports API-key-authenticated providers and explicit tier assignment.
 - **Gap analysis document** (`planning/gap-analysis-vs-claude-code.md`) -- 10-dimension comparison of Loom vs Claude Code's coworking model with prioritized implementation roadmap.
 
+- **Per-tool-call approval** (`cowork/approval.py`) -- interactive approval system for cowork mode. Read-only tools (read_file, search, glob, web_search, etc.) auto-approved. Write/execute tools (shell, git, edit, delete) prompt with `[y]es / [n]o / [a]lways allow <tool>`. "Always" remembers per-tool for the session.
+
 ### Changed
 - **Git tool** -- `push` and `remote` added to allowed subcommands (force push still blocked).
 - **Shell tool** -- timeout increased from 60s to 120s for longer-running commands.
