@@ -48,16 +48,47 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 
 
 @cli.command()
-@click.option("--server", "server_url", default=None, help="Server URL to connect to.")
+@click.option(
+    "--workspace", "-w",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Workspace directory. Defaults to current directory.",
+)
+@click.option("--model", "-m", default=None, help="Model name from config to use.")
 @click.pass_context
-def tui(ctx: click.Context, server_url: str | None) -> None:
-    """Launch the terminal UI."""
-    config = ctx.obj["config"]
-    url = server_url or f"http://{config.server.host}:{config.server.port}"
+def tui(ctx: click.Context, workspace: Path | None, model: str | None) -> None:
+    """Launch the Textual TUI for interactive cowork.
 
+    Same capabilities as 'loom cowork' but with a richer terminal interface:
+    modal dialogs for tool approval and ask_user, scrollable chat log, etc.
+    No server required — runs the model directly.
+    """
+    config = ctx.obj["config"]
+    ws = (workspace or Path.cwd()).resolve()
+
+    from loom.models.router import ModelRouter
+    from loom.tools import create_default_registry
     from loom.tui.app import LoomApp
 
-    app = LoomApp(server_url=url)
+    router = ModelRouter.from_config(config)
+    if model:
+        provider = None
+        for name, p in router._providers.items():
+            if name == model:
+                provider = p
+                break
+        if provider is None:
+            click.echo(f"Model '{model}' not found in config.", err=True)
+            sys.exit(1)
+    else:
+        try:
+            provider = router.select(role="executor")
+        except Exception as e:
+            click.echo(f"No model available: {e}", err=True)
+            sys.exit(1)
+
+    tools = create_default_registry()
+    app = LoomApp(model=provider, tools=tools, workspace=ws)
     app.run()
 
 

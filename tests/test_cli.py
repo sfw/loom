@@ -65,4 +65,5 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(cli, ["tui", "--help"])
         assert result.exit_code == 0
-        assert "--server" in result.output
+        assert "--workspace" in result.output
+        assert "--model" in result.output

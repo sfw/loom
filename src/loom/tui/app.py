@@ -1,757 +1,503 @@
-"""Loom TUI application built with Textual.
+"""Loom TUI — interactive cowork session in a Textual app.
 
-A task monitoring dashboard with live event streaming,
-token display, file viewer, memory inspector, and conversation mode.
+Replaces the old task-dashboard TUI with a conversation-first interface
+that uses CoworkSession directly. No server required.
+
+Layout:
+  ┌──────────────────────────────────────────┐
+  │ Header                                   │
+  ├──────────────────────────────────────────┤
+  │ Chat log (RichLog)                       │
+  │   streaming text, tool calls, results    │
+  │                                          │
+  ├──────────────────────────────────────────┤
+  │ [>] Input bar                            │
+  ├──────────────────────────────────────────┤
+  │ Footer (keybindings)                     │
+  └──────────────────────────────────────────┘
 """
 
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
-from textual.message import Message
+from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import (
-    DataTable,
-    Footer,
-    Header,
-    Input,
-    Label,
-    RichLog,
-    Select,
-    Static,
-    TextArea,
-    Tree,
+from textual.widgets import Footer, Header, Input, Label, RichLog, Static
+
+from loom.cowork.approval import ApprovalDecision, ToolApprover
+from loom.cowork.session import (
+    CoworkSession,
+    CoworkTurn,
+    ToolCallEvent,
+    build_cowork_system_prompt,
 )
-
-from loom.tui.api_client import LoomAPIClient
-
-# --- Custom Messages ---
+from loom.models.base import ModelProvider
+from loom.tools.registry import ToolRegistry
 
 
-class TaskEventMessage(Message):
-    """SSE event received from the server."""
-
-    def __init__(self, event: dict) -> None:
-        super().__init__()
-        self.event = event
+# ---------------------------------------------------------------------------
+# Modal screens
+# ---------------------------------------------------------------------------
 
 
-# --- Screens ---
+class ToolApprovalScreen(ModalScreen[str]):
+    """Prompt the user to approve a tool call.
 
-
-class SteerScreen(ModalScreen[str | None]):
-    """Modal for entering steering instructions."""
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("Enter instruction for the running task:", id="steer-label"),
-            Input(placeholder="e.g., Use TypeScript instead of JavaScript", id="steer-input"),
-            Label("Press Enter to send, Escape to cancel", id="steer-hint"),
-            id="steer-dialog",
-        )
-
-    def on_mount(self) -> None:
-        self.query_one("#steer-input", Input).focus()
-
-    @on(Input.Submitted)
-    def on_submit(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-
-class NewTaskScreen(ModalScreen[dict | None]):
-    """Multi-field form for creating a new task."""
+    Returns: "approve", "approve_all", or "deny"
+    """
 
     BINDINGS = [
-        Binding("escape", "cancel", "Cancel"),
-        Binding("ctrl+s", "submit", "Submit"),
+        Binding("y", "approve", "Yes"),
+        Binding("a", "approve_all", "Always"),
+        Binding("n", "deny", "No"),
+        Binding("escape", "deny", "Cancel"),
     ]
 
     CSS = """
-    #new-task-dialog {
+    #approval-dialog {
         align: center middle;
         width: 70;
         height: auto;
-        max-height: 24;
-        border: solid $primary;
+        max-height: 12;
+        border: solid $warning;
         padding: 1 2;
+        background: $surface;
     }
-    #goal-input { margin-bottom: 1; }
-    #workspace-input { margin-bottom: 1; }
-    #context-input { height: 4; margin-bottom: 1; }
     """
 
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("[bold]Create New Task[/bold]", id="new-task-title"),
-            Label("Goal (required):", id="goal-label"),
-            Input(placeholder="What should be accomplished?", id="goal-input"),
-            Label("Workspace path (optional):", id="workspace-label"),
-            Input(placeholder="/path/to/project", id="workspace-input"),
-            Label("Approval mode:", id="mode-label"),
-            Select(
-                [(label, val) for label, val in [
-                    ("Auto", "auto"), ("Gate all", "gate_all"),
-                    ("Gate critical", "gate_critical"),
-                ]],
-                value="auto",
-                id="mode-select",
-            ),
-            Label("Additional context (optional):", id="context-label"),
-            TextArea(id="context-input"),
-            Label("[Ctrl+S] Submit  [Esc] Cancel", id="new-task-hint"),
-            id="new-task-dialog",
-        )
-
-    def on_mount(self) -> None:
-        self.query_one("#goal-input", Input).focus()
-
-    def action_submit(self) -> None:
-        goal = self.query_one("#goal-input", Input).value.strip()
-        if not goal:
-            return
-        workspace = self.query_one("#workspace-input", Input).value.strip() or None
-        mode = self.query_one("#mode-select", Select).value
-        context_text = self.query_one("#context-input", TextArea).text.strip()
-        context = {"user_notes": context_text} if context_text else {}
-
-        self.dismiss({
-            "goal": goal,
-            "workspace": workspace,
-            "approval_mode": mode,
-            "context": context,
-        })
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-
-class ApprovalScreen(ModalScreen[bool]):
-    """Modal for approving or rejecting a subtask."""
-
-    BINDINGS = [
-        Binding("y", "approve", "Approve"),
-        Binding("n", "reject", "Reject"),
-        Binding("escape", "reject", "Cancel"),
-    ]
-
-    def __init__(self, task_id: str, subtask_id: str, reason: str, risk_level: str):
+    def __init__(self, tool_name: str, args_preview: str) -> None:
         super().__init__()
-        self.task_id = task_id
-        self.subtask_id = subtask_id
-        self.reason = reason
-        self.risk_level = risk_level
+        self._tool_name = tool_name
+        self._args_preview = args_preview
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Label(f"Approval Required — Risk: {self.risk_level}", id="approval-title"),
-            Label(f"Task: {self.task_id}", id="approval-task"),
-            Label(f"Subtask: {self.subtask_id}", id="approval-subtask"),
-            Label(f"Reason: {self.reason}", id="approval-reason"),
-            Label("[y] Approve  [n] Reject  [Esc] Cancel", id="approval-hint"),
+            Label(f"[bold yellow]Approve tool call?[/bold yellow]"),
+            Label(f"[bold cyan]{self._tool_name}[/bold cyan]  [dim]{self._args_preview}[/dim]"),
+            Label(""),
+            Label("[y] Yes  [a] Always allow this tool  [n] No  [Esc] Cancel"),
             id="approval-dialog",
         )
 
     def action_approve(self) -> None:
-        self.dismiss(True)
+        self.dismiss("approve")
 
-    def action_reject(self) -> None:
-        self.dismiss(False)
+    def action_approve_all(self) -> None:
+        self.dismiss("approve_all")
+
+    def action_deny(self) -> None:
+        self.dismiss("deny")
 
 
-class FeedbackScreen(ModalScreen[dict | None]):
-    """Modal for submitting feedback after task completion."""
+class AskUserScreen(ModalScreen[str]):
+    """Display a question from the model and collect the user's answer."""
 
-    BINDINGS = [
-        Binding("escape", "cancel", "Cancel"),
-        Binding("ctrl+s", "submit", "Submit"),
-    ]
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     CSS = """
-    #feedback-dialog {
+    #ask-user-dialog {
         align: center middle;
-        width: 60;
+        width: 70;
         height: auto;
-        border: solid $success;
-        padding: 1 2;
-    }
-    #feedback-input { height: 5; margin-bottom: 1; }
-    """
-
-    def __init__(self, task_id: str):
-        super().__init__()
-        self.task_id = task_id
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label(f"[bold]Feedback for {self.task_id}[/bold]"),
-            Label("Rating (1-5):"),
-            Select(
-                [(str(i), i) for i in range(1, 6)],
-                value=3,
-                id="rating-select",
-            ),
-            Label("Comments:"),
-            TextArea(id="feedback-input"),
-            Label("[Ctrl+S] Submit  [Esc] Cancel"),
-            id="feedback-dialog",
-        )
-
-    def action_submit(self) -> None:
-        rating = self.query_one("#rating-select", Select).value
-        comment = self.query_one("#feedback-input", TextArea).text.strip()
-        self.dismiss({"rating": rating, "comment": comment, "task_id": self.task_id})
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-
-class MemoryInspectorScreen(ModalScreen[None]):
-    """Screen for inspecting task memory entries."""
-
-    BINDINGS = [Binding("escape", "dismiss_screen", "Close")]
-
-    CSS = """
-    #memory-dialog {
-        align: center middle;
-        width: 80;
-        height: 20;
-        border: solid $accent;
-        padding: 1 2;
-    }
-    #memory-log {
-        height: 1fr;
-    }
-    """
-
-    def __init__(self, entries: list[dict]):
-        super().__init__()
-        self._entries = entries
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("[bold]Memory Inspector[/bold]"),
-            RichLog(id="memory-log", highlight=True, markup=True),
-            Label("[Esc] Close"),
-            id="memory-dialog",
-        )
-
-    def on_mount(self) -> None:
-        log = self.query_one("#memory-log", RichLog)
-        if not self._entries:
-            log.write("[dim]No memory entries found.[/dim]")
-            return
-        for entry in self._entries:
-            entry_type = entry.get("entry_type", "?")
-            summary = entry.get("summary", "")
-            detail = entry.get("detail", "")
-            tags = entry.get("tags", "")
-            ts = entry.get("timestamp", "")[:19]
-            log.write(f"[bold cyan][{entry_type}][/bold cyan] {summary}")
-            if detail and detail != summary:
-                log.write(f"  [dim]{detail[:200]}[/dim]")
-            if tags:
-                log.write(f"  [dim]tags: {tags}[/dim]")
-            if ts:
-                log.write(f"  [dim]{ts}[/dim]")
-            log.write("")
-
-    def action_dismiss_screen(self) -> None:
-        self.dismiss(None)
-
-
-class ConversationScreen(ModalScreen[str | None]):
-    """Chat-like interface for interactive conversation with a running task."""
-
-    BINDINGS = [Binding("escape", "cancel", "Close")]
-
-    CSS = """
-    #conversation-dialog {
-        align: center middle;
-        width: 80;
-        height: 22;
+        max-height: 16;
         border: solid $primary;
         padding: 1 2;
+        background: $surface;
     }
-    #conversation-log {
-        height: 1fr;
-        margin-bottom: 1;
-    }
+    #ask-user-input { margin-top: 1; }
     """
 
-    def __init__(self, task_id: str, history: list[dict]):
+    def __init__(self, question: str, options: list[str] | None = None) -> None:
         super().__init__()
-        self.task_id = task_id
-        self._history = history
+        self._question = question
+        self._options = options or []
 
     def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label(f"[bold]Conversation — {self.task_id}[/bold]"),
-            RichLog(id="conversation-log", highlight=True, markup=True),
-            Input(placeholder="Type a message... (Enter to send)", id="conversation-input"),
-            Label("[Enter] Send  [Esc] Close"),
-            id="conversation-dialog",
-        )
+        children = [
+            Label(f"[bold yellow]Question:[/bold yellow] {self._question}"),
+        ]
+        for i, opt in enumerate(self._options, 1):
+            children.append(Label(f"  [cyan]{i}.[/cyan] {opt}"))
+        if self._options:
+            children.append(Label("[dim]Enter a number or type your answer[/dim]"))
+        children.append(Input(placeholder="Your answer...", id="ask-user-input"))
+
+        yield Vertical(*children, id="ask-user-dialog")
 
     def on_mount(self) -> None:
-        log = self.query_one("#conversation-log", RichLog)
-        for entry in self._history:
-            msg = entry.get("message", "")
-            tags = entry.get("tags", "")
-            ts = entry.get("timestamp", "")[:19]
-            if "conversation" in tags or "steer" in tags:
-                label = "[bold yellow]You:[/bold yellow]"
-            else:
-                label = "[bold cyan]System:[/bold cyan]"
-            log.write(f"{label} {msg}  [dim]{ts}[/dim]")
-        self.query_one("#conversation-input", Input).focus()
+        self.query_one("#ask-user-input", Input).focus()
 
     @on(Input.Submitted)
     def on_submit(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        if text:
-            self.dismiss(text)
+        answer = event.value.strip()
+        if not answer:
+            return
+        # Map number to option
+        if self._options and answer.isdigit():
+            idx = int(answer) - 1
+            if 0 <= idx < len(self._options):
+                answer = self._options[idx]
+        self.dismiss(answer)
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self.dismiss("")
 
 
-# --- Main Application ---
+# ---------------------------------------------------------------------------
+# Main app
+# ---------------------------------------------------------------------------
 
 
 class LoomApp(App):
-    """Loom TUI — task monitoring dashboard."""
+    """Loom TUI — interactive cowork session."""
 
+    TITLE = "Loom"
     CSS = """
-    #task-table {
+    #chat-log {
         height: 1fr;
-        min-height: 8;
-    }
-    #detail-container {
-        height: 3fr;
-    }
-    #plan-tree {
-        width: 1fr;
-        min-width: 30;
         border: solid $primary;
-    }
-    #live-output {
-        width: 2fr;
-        border: solid $secondary;
-    }
-    #files-changed {
-        height: auto;
-        max-height: 6;
-        border: solid $accent;
-    }
-    #steer-dialog {
-        align: center middle;
-        width: 60;
-        height: auto;
-        border: solid $primary;
-        padding: 1 2;
-    }
-    #approval-dialog {
-        align: center middle;
-        width: 60;
-        height: auto;
-        border: solid $warning;
-        padding: 1 2;
+        scrollbar-size: 1 1;
     }
     #status-bar {
         height: 1;
         dock: bottom;
+        background: $surface;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    #user-input {
+        dock: bottom;
+        margin: 0 0 1 0;
     }
     """
 
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("r", "refresh", "Refresh"),
-        Binding("s", "steer", "Steer"),
-        Binding("a", "approve_action", "Approve"),
-        Binding("c", "cancel_task", "Cancel"),
-        Binding("n", "new_task", "New Task"),
-        Binding("m", "show_memory", "Memory"),
-        Binding("f", "show_feedback", "Feedback"),
-        Binding("t", "show_conversation", "Chat"),
+        Binding("ctrl+c", "quit", "Quit", show=True, priority=True),
+        Binding("ctrl+l", "clear_log", "Clear"),
     ]
 
-    def __init__(self, server_url: str = "http://localhost:9000"):
+    def __init__(
+        self,
+        model: ModelProvider,
+        tools: ToolRegistry,
+        workspace: Path,
+        *,
+        server_url: str | None = None,
+    ) -> None:
         super().__init__()
-        self.server_url = server_url
-        self.api = LoomAPIClient(server_url)
-        self.selected_task_id: str | None = None
-        self._pending_approval: dict | None = None
-        self._streaming_task: str | None = None
+        self._model = model
+        self._tools = tools
+        self._workspace = workspace
+        self._session: CoworkSession | None = None
+        self._busy = False
+
+        # Approval state — resolved via Textual modal
+        self._approval_event: asyncio.Event | None = None
+        self._approval_result: ApprovalDecision = ApprovalDecision.DENY
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Container(
-            DataTable(id="task-table"),
-            Horizontal(
-                Tree("Plan", id="plan-tree"),
-                RichLog(id="live-output", highlight=True, markup=True),
-                id="detail-container",
-            ),
-            Static("", id="files-changed"),
-            Static(f"Connected to {self.server_url}", id="status-bar"),
-        )
+        yield RichLog(id="chat-log", highlight=True, markup=True, wrap=True)
+        yield Input(placeholder="Type a message... (Enter to send)", id="user-input")
+        yield Static("", id="status-bar")
         yield Footer()
 
     async def on_mount(self) -> None:
-        """Initialize the task table and start background refresh."""
-        table = self.query_one("#task-table", DataTable)
-        table.add_columns("ID", "Status", "Goal", "Progress")
-        table.cursor_type = "row"
-        await self._refresh_tasks()
-
-    @work(exclusive=True)
-    async def _refresh_tasks(self) -> None:
-        """Fetch tasks from the API and update the table."""
-        try:
-            tasks = await self.api.list_tasks()
-            table = self.query_one("#task-table", DataTable)
-            table.clear()
-            for t in tasks:
-                status_icon = {
-                    "running": "●",
-                    "executing": "●",
-                    "completed": "✓",
-                    "failed": "✗",
-                    "waiting_approval": "⏸",
-                    "cancelled": "○",
-                    "pending": "○",
-                    "planning": "…",
-                }.get(t.get("status", ""), "?")
-                goal = t.get("goal", "")[:50]
-                progress = ""
-                if "progress" in t:
-                    p = t["progress"]
-                    pct = p.get("percent_complete", 0)
-                    progress = f"{p.get('completed', 0)}/{p.get('total_subtasks', 0)} {pct:.0f}%"
-                table.add_row(
-                    t.get("task_id", ""),
-                    f"{status_icon} {t.get('status', '')}",
-                    goal,
-                    progress,
-                    key=t.get("task_id", ""),
-                )
-            self.query_one("#status-bar", Static).update(
-                f"Connected to {self.server_url} — {len(tasks)} tasks"
-            )
-        except Exception as e:
-            self.query_one("#status-bar", Static).update(f"Error: {e}")
-
-    @on(DataTable.RowSelected)
-    async def on_row_selected(self, event: DataTable.RowSelected) -> None:
-        """When a task row is selected, show its details."""
-        if event.row_key and event.row_key.value:
-            self.selected_task_id = str(event.row_key.value)
-            await self._show_task_detail(self.selected_task_id)
-            self._start_event_stream(self.selected_task_id)
-
-    @work(exclusive=True)
-    async def _show_task_detail(self, task_id: str) -> None:
-        """Fetch and display task detail: plan tree, live output."""
-        try:
-            task = await self.api.get_task(task_id)
-            subtasks = await self.api.get_subtasks(task_id)
-        except Exception:
-            return
-
-        # Update plan tree
-        tree = self.query_one("#plan-tree", Tree)
-        tree.clear()
-        tree.root.label = f"Plan — {task.get('goal', '')[:40]}"
-        for s in subtasks:
-            icon = {
-                "completed": "✓",
-                "running": "→",
-                "failed": "✗",
-                "pending": "○",
-                "blocked": "⏸",
-                "skipped": "–",
-            }.get(s.get("status", ""), "?")
-            desc = s.get('description', '')[:40]
-            sid = s.get('id', '')
-            status = s.get('status', '')
-            tree.root.add_leaf(f"{icon} [{status}] {sid}: {desc}")
-        tree.root.expand()
-
-        # Update files changed
-        progress = task.get("progress", {})
-        done = progress.get('completed', 0)
-        total = progress.get('total_subtasks', 0)
-        files_info = f"Subtasks: {done}/{total} completed"
-        if progress.get("failed", 0):
-            files_info += f" | {progress['failed']} failed"
-        self.query_one("#files-changed", Static).update(files_info)
-
-    # --- Live SSE Event Streaming ---
-
-    @work(exclusive=True, group="event-stream")
-    async def _start_event_stream(self, task_id: str) -> None:
-        """Background worker that subscribes to task SSE events."""
-        self._streaming_task = task_id
-        log = self.query_one("#live-output", RichLog)
-        log.clear()
-        log.write(f"[dim]Streaming events for task {task_id}...[/dim]")
-
-        try:
-            async for event_data in self.api.stream_task_events(task_id):
-                event_type = event_data.get("event_type", event_data.get("type", ""))
-                await self._handle_sse_event(event_type, event_data)
-
-                # Auto-refresh on terminal events
-                if event_type in ("task_completed", "task_failed", "task_cancelled"):
-                    await self._refresh_tasks()
-                    break
-        except Exception as e:
-            log.write(f"[dim]Stream ended: {e}[/dim]")
-
-    async def _handle_sse_event(self, event_type: str, data: dict) -> None:
-        """Route SSE events to appropriate TUI updates."""
-        log = self.query_one("#live-output", RichLog)
-
-        if event_type == "token_streamed":
-            # Display streaming tokens inline
-            token = data.get("token", "")
-            if token:
-                log.write(token, shrink=False, scroll_end=True)
-            return
-
-        if event_type == "subtask_started":
-            sid = data.get("subtask_id", "")
-            log.write(f"\n[bold blue]▶ Started:[/bold blue] {sid}")
-        elif event_type == "subtask_completed":
-            sid = data.get("subtask_id", "")
-            summary = data.get("summary", "")[:80]
-            log.write(f"[bold green]✓ Completed:[/bold green] {sid} — {summary}")
-        elif event_type == "subtask_failed":
-            sid = data.get("subtask_id", "")
-            feedback = data.get("feedback", "")[:80]
-            log.write(f"[bold red]✗ Failed:[/bold red] {sid} — {feedback}")
-        elif event_type == "subtask_retrying":
-            sid = data.get("subtask_id", "")
-            attempt = data.get("attempt", "?")
-            log.write(f"[bold yellow]↻ Retrying:[/bold yellow] {sid} (attempt {attempt})")
-        elif event_type == "task_completed":
-            log.write("\n[bold green]Task completed successfully.[/bold green]")
-        elif event_type == "task_failed":
-            error = data.get("error", "Unknown error")
-            log.write(f"\n[bold red]Task failed:[/bold red] {error}")
-        elif event_type == "task_planning":
-            log.write("[dim]Planning...[/dim]")
-        elif event_type == "task_plan_ready":
-            count = data.get("subtask_count", "?")
-            log.write(f"[bold]Plan ready:[/bold] {count} subtasks")
-        elif event_type == "task_replanning":
-            log.write("[bold yellow]Re-planning...[/bold yellow]")
-        elif event_type == "approval_requested":
-            self.show_approval_modal(data)
-        elif event_type == "conversation_message":
-            role = data.get("role", "user")
-            msg = data.get("message", "")[:100]
-            log.write(f"[bold yellow]{role}:[/bold yellow] {msg}")
-        elif event_type == "tool_call_started":
-            tool = data.get("tool", "")
-            log.write(f"  [dim]→ {tool}[/dim]")
-        elif event_type == "tool_call_completed":
-            tool = data.get("tool", "")
-            success = data.get("success", True)
-            icon = "✓" if success else "✗"
-            log.write(f"  [dim]{icon} {tool}[/dim]")
-
-        # Refresh plan tree on subtask state changes
-        if event_type in ("subtask_started", "subtask_completed", "subtask_failed"):
-            if self.selected_task_id:
-                await self._show_task_detail(self.selected_task_id)
-
-    # --- Actions ---
-
-    async def action_refresh(self) -> None:
-        await self._refresh_tasks()
-
-    async def action_steer(self) -> None:
-        if not self.selected_task_id:
-            return
-
-        def handle_steer(instruction: str | None) -> None:
-            if instruction:
-                self._send_steer(self.selected_task_id, instruction)
-
-        self.push_screen(SteerScreen(), callback=handle_steer)
-
-    @work
-    async def _send_steer(self, task_id: str, instruction: str) -> None:
-        try:
-            await self.api.steer(task_id, instruction)
-            log = self.query_one("#live-output", RichLog)
-            log.write(f"[bold yellow]Steer:[/] {instruction}")
-        except Exception as e:
-            log = self.query_one("#live-output", RichLog)
-            log.write(f"[bold red]Steer failed:[/] {e}")
-
-    async def action_approve_action(self) -> None:
-        if self._pending_approval:
-            await self._handle_approval(True)
-
-    async def _handle_approval(self, approved: bool) -> None:
-        if not self._pending_approval:
-            return
-        info = self._pending_approval
-        try:
-            await self.api.approve(info["task_id"], info["subtask_id"], approved)
-            log = self.query_one("#live-output", RichLog)
-            verdict = 'Approved' if approved else 'Rejected'
-            log.write(f"[bold green]{verdict}[/] {info['subtask_id']}")
-        except Exception as e:
-            log = self.query_one("#live-output", RichLog)
-            log.write(f"[bold red]Approval failed:[/] {e}")
-        self._pending_approval = None
-
-    async def action_cancel_task(self) -> None:
-        if not self.selected_task_id:
-            return
-        try:
-            await self.api.cancel_task(self.selected_task_id)
-            log = self.query_one("#live-output", RichLog)
-            log.write(f"[bold red]Cancelled[/] task {self.selected_task_id}")
-            await self._refresh_tasks()
-        except Exception as e:
-            log = self.query_one("#live-output", RichLog)
-            log.write(f"[bold red]Cancel failed:[/] {e}")
-
-    async def action_new_task(self) -> None:
-        def handle_result(result: dict | None) -> None:
-            if result:
-                self._create_task_from_form(result)
-
-        self.push_screen(NewTaskScreen(), callback=handle_result)
-
-    @work
-    async def _create_task_from_form(self, form_data: dict) -> None:
-        try:
-            result = await self.api.create_task(
-                goal=form_data["goal"],
-                workspace=form_data.get("workspace"),
-                approval_mode=form_data.get("approval_mode", "auto"),
-            )
-            log = self.query_one("#live-output", RichLog)
-            tid = result.get("task_id", "")
-            log.write(f"[bold green]Created:[/] {tid}")
-            await self._refresh_tasks()
-            # Auto-select and start streaming
-            self.selected_task_id = tid
-            self._start_event_stream(tid)
-        except Exception as e:
-            log = self.query_one("#live-output", RichLog)
-            log.write(f"[bold red]Create failed:[/] {e}")
-
-    async def action_show_memory(self) -> None:
-        """Open memory inspector for the selected task."""
-        if not self.selected_task_id:
-            return
-        self._open_memory_inspector(self.selected_task_id)
-
-    @work
-    async def _open_memory_inspector(self, task_id: str) -> None:
-        try:
-            entries = await self.api.get_memory(task_id)
-            self.app.push_screen(MemoryInspectorScreen(entries))
-        except Exception as e:
-            log = self.query_one("#live-output", RichLog)
-            log.write(f"[bold red]Memory load failed:[/] {e}")
-
-    async def action_show_feedback(self) -> None:
-        """Open feedback modal for the selected task."""
-        if not self.selected_task_id:
-            return
-
-        def handle_feedback(result: dict | None) -> None:
-            if result:
-                self._submit_feedback(result)
-
-        self.push_screen(
-            FeedbackScreen(self.selected_task_id),
-            callback=handle_feedback,
+        approver = ToolApprover(prompt_callback=self._approval_callback)
+        system_prompt = build_cowork_system_prompt(self._workspace)
+        self._session = CoworkSession(
+            model=self._model,
+            tools=self._tools,
+            workspace=self._workspace,
+            system_prompt=system_prompt,
+            approver=approver,
         )
 
-    @work
-    async def _submit_feedback(self, feedback_data: dict) -> None:
-        try:
-            comment = f"Rating: {feedback_data['rating']}/5\n{feedback_data['comment']}"
-            await self.api.submit_feedback(feedback_data["task_id"], comment)
-            log = self.query_one("#live-output", RichLog)
-            log.write("[bold green]Feedback submitted.[/]")
-        except Exception as e:
-            log = self.query_one("#live-output", RichLog)
-            log.write(f"[bold red]Feedback failed:[/] {e}")
+        log = self.query_one("#chat-log", RichLog)
+        log.write(f"[bold]Loom Cowork[/bold] [dim]({self._model.name})[/dim]")
+        log.write(f"[dim]workspace: {self._workspace}[/dim]")
+        log.write(f"[dim]16 tools loaded. Type your request.[/dim]")
+        log.write("")
 
-    async def action_show_conversation(self) -> None:
-        """Open conversation mode for the selected task."""
-        if not self.selected_task_id:
-            return
-        self._open_conversation(self.selected_task_id)
+        self._update_status("Ready")
+        self.query_one("#user-input", Input).focus()
 
-    @work
-    async def _open_conversation(self, task_id: str) -> None:
-        try:
-            history = await self.api.get_conversation_history(task_id)
-        except Exception:
-            history = []
+    # ------------------------------------------------------------------
+    # Approval callback (bridged into Textual modal)
+    # ------------------------------------------------------------------
 
-        def handle_message(message: str | None) -> None:
-            if message:
-                self._send_conversation_message(task_id, message)
+    async def _approval_callback(self, tool_name: str, args: dict) -> ApprovalDecision:
+        """Called by ToolApprover when a tool needs user permission.
 
-        self.app.push_screen(
-            ConversationScreen(task_id, history),
-            callback=handle_message,
-        )
+        Shows a modal and waits for the user's response.
+        """
+        from loom.cowork.approval import _format_args_preview
 
-    @work
-    async def _send_conversation_message(self, task_id: str, message: str) -> None:
-        try:
-            await self.api.send_message(task_id, message)
-            log = self.query_one("#live-output", RichLog)
-            log.write(f"[bold yellow]You:[/] {message}")
-        except Exception as e:
-            log = self.query_one("#live-output", RichLog)
-            log.write(f"[bold red]Message failed:[/] {e}")
+        preview = _format_args_preview(tool_name, args)
 
-    def show_approval_modal(self, data: dict) -> None:
-        """Show an approval modal from an SSE event."""
-        self._pending_approval = data
+        # Set up an event to wait on
+        self._approval_event = asyncio.Event()
+        self._approval_result = ApprovalDecision.DENY
 
-        def handle_result(approved: bool) -> None:
-            self._resolve_approval(data, approved)
+        def handle_result(result: str) -> None:
+            if result == "approve":
+                self._approval_result = ApprovalDecision.APPROVE
+            elif result == "approve_all":
+                self._approval_result = ApprovalDecision.APPROVE_ALL
+            else:
+                self._approval_result = ApprovalDecision.DENY
+            if self._approval_event:
+                self._approval_event.set()
 
         self.push_screen(
-            ApprovalScreen(
-                task_id=data.get("task_id", ""),
-                subtask_id=data.get("subtask_id", ""),
-                reason=data.get("reason", ""),
-                risk_level=data.get("risk_level", "unknown"),
-            ),
+            ToolApprovalScreen(tool_name, preview),
             callback=handle_result,
         )
 
-    @work
-    async def _resolve_approval(self, data: dict, approved: bool) -> None:
-        try:
-            await self.api.approve(data["task_id"], data["subtask_id"], approved)
-        except Exception:
-            pass
-        self._pending_approval = None
+        # Wait for the modal to be dismissed
+        await self._approval_event.wait()
+        self._approval_event = None
+        return self._approval_result
 
-    async def on_unmount(self) -> None:
-        await self.api.close()
+    # ------------------------------------------------------------------
+    # User input
+    # ------------------------------------------------------------------
+
+    @on(Input.Submitted)
+    async def on_user_submit(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        if not text:
+            return
+
+        input_widget = self.query_one("#user-input", Input)
+        input_widget.value = ""
+
+        if text.lower() in ("/quit", "/exit", "/q"):
+            self.exit()
+            return
+
+        if text.lower() == "/clear":
+            self.query_one("#chat-log", RichLog).clear()
+            return
+
+        if self._busy:
+            return
+
+        self._run_turn(text)
+
+    # ------------------------------------------------------------------
+    # Turn execution
+    # ------------------------------------------------------------------
+
+    @work(exclusive=True)
+    async def _run_turn(self, user_message: str) -> None:
+        if self._session is None:
+            return
+
+        self._busy = True
+        log = self.query_one("#chat-log", RichLog)
+
+        # Show user message
+        log.write(f"[bold green]> {user_message}[/bold green]")
+        log.write("")
+
+        self._update_status("Thinking...")
+
+        streamed_text = False
+
+        try:
+            async for event in self._session.send_streaming(user_message):
+                if isinstance(event, str):
+                    # Streamed text token
+                    if not streamed_text:
+                        streamed_text = True
+                    log.write(event, shrink=False, scroll_end=True)
+
+                elif isinstance(event, ToolCallEvent):
+                    if event.result is None:
+                        # Tool starting
+                        args_preview = _tool_args_preview(event.name, event.args)
+                        log.write(
+                            f"  [dim]{event.name}[/dim] [dim]{args_preview}[/dim]",
+                        )
+                        self._update_status(f"Running {event.name}...")
+
+                        # Handle ask_user specially
+                        if event.name == "ask_user":
+                            pass  # will handle on completion
+                    else:
+                        # Tool completed
+                        if event.result.success:
+                            elapsed = f"{event.elapsed_ms}ms" if event.elapsed_ms else ""
+                            preview = _tool_output_preview(event.name, event.result.output)
+                            log.write(
+                                f"  [green]ok[/green] [dim]{elapsed} {preview}[/dim]",
+                            )
+                        else:
+                            error = event.result.error or ""
+                            log.write(f"  [red]err[/red] [dim]{error[:80]}[/dim]")
+
+                        # If ask_user completed, show question and get answer
+                        if event.name == "ask_user" and event.result and event.result.success:
+                            answer = await self._handle_ask_user(event)
+                            if answer:
+                                # Send answer as a follow-up turn
+                                await self._run_followup(answer)
+
+                elif isinstance(event, CoworkTurn):
+                    # Turn complete
+                    if event.text and not streamed_text:
+                        log.write(f"\n{event.text}")
+
+                    n = len(event.tool_calls)
+                    if n:
+                        log.write(
+                            f"\n[dim][{n} tool call{'s' if n != 1 else ''}"
+                            f" | {event.tokens_used} tokens"
+                            f" | {event.model}][/dim]"
+                        )
+                    log.write("")
+
+        except Exception as e:
+            log.write(f"[bold red]Error:[/bold red] {e}")
+
+        self._busy = False
+        self._update_status("Ready")
+
+    async def _run_followup(self, message: str) -> None:
+        """Run a follow-up turn (e.g. after ask_user answer)."""
+        if self._session is None:
+            return
+
+        log = self.query_one("#chat-log", RichLog)
+        streamed_text = False
+
+        async for event in self._session.send_streaming(message):
+            if isinstance(event, str):
+                if not streamed_text:
+                    streamed_text = True
+                log.write(event, shrink=False, scroll_end=True)
+            elif isinstance(event, ToolCallEvent):
+                if event.result is None:
+                    args_preview = _tool_args_preview(event.name, event.args)
+                    log.write(f"  [dim]{event.name}[/dim] [dim]{args_preview}[/dim]")
+                else:
+                    if event.result.success:
+                        elapsed = f"{event.elapsed_ms}ms" if event.elapsed_ms else ""
+                        preview = _tool_output_preview(event.name, event.result.output)
+                        log.write(f"  [green]ok[/green] [dim]{elapsed} {preview}[/dim]")
+                    else:
+                        error = event.result.error or ""
+                        log.write(f"  [red]err[/red] [dim]{error[:80]}[/dim]")
+            elif isinstance(event, CoworkTurn):
+                if event.text and not streamed_text:
+                    log.write(f"\n{event.text}")
+                if event.tool_calls:
+                    n = len(event.tool_calls)
+                    log.write(
+                        f"\n[dim][{n} tool call{'s' if n != 1 else ''}"
+                        f" | {event.tokens_used} tokens][/dim]"
+                    )
+                log.write("")
+
+    async def _handle_ask_user(self, event: ToolCallEvent) -> str:
+        """Show an ask_user modal and return the answer."""
+        import json
+
+        question = event.args.get("question", "")
+        options = event.args.get("options", [])
+
+        answer_event = asyncio.Event()
+        answer_holder: list[str] = []
+
+        def handle_answer(answer: str) -> None:
+            answer_holder.append(answer)
+            answer_event.set()
+
+        self.push_screen(
+            AskUserScreen(question, options),
+            callback=handle_answer,
+        )
+
+        await answer_event.wait()
+        answer = answer_holder[0] if answer_holder else ""
+
+        if answer:
+            log = self.query_one("#chat-log", RichLog)
+            log.write(f"[bold green]> {answer}[/bold green]")
+
+        return answer
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _update_status(self, text: str) -> None:
+        bar = self.query_one("#status-bar", Static)
+        bar.update(f"[dim]{self._workspace}  |  {text}[/dim]")
+
+    def action_clear_log(self) -> None:
+        self.query_one("#chat-log", RichLog).clear()
+
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+
+def _tool_args_preview(tool_name: str, args: dict) -> str:
+    """Short preview of tool arguments for the chat log."""
+    if tool_name in ("read_file", "write_file", "edit_file", "delete_file"):
+        return _trunc(args.get("path", args.get("file_path", "")), 60)
+    if tool_name == "shell_execute":
+        return _trunc(args.get("command", ""), 80)
+    if tool_name == "git_command":
+        return _trunc(" ".join(args.get("args", [])), 60)
+    if tool_name in ("ripgrep_search", "search_files"):
+        return _trunc(f"/{args.get('pattern', '')}/", 60)
+    if tool_name == "glob_find":
+        return _trunc(args.get("pattern", ""), 60)
+    if tool_name in ("web_fetch", "web_search"):
+        return _trunc(args.get("url", args.get("query", "")), 60)
+    if tool_name == "task_tracker":
+        action = args.get("action", "")
+        content = args.get("content", "")
+        return _trunc(f"{action}: {content}" if content else action, 60)
+    if tool_name == "ask_user":
+        return _trunc(args.get("question", ""), 60)
+    if tool_name == "analyze_code":
+        return _trunc(args.get("path", ""), 60)
+    for v in args.values():
+        if isinstance(v, str) and v:
+            return _trunc(v, 50)
+    return ""
+
+
+def _tool_output_preview(tool_name: str, output: str) -> str:
+    """Short preview of tool output for the chat log."""
+    if not output:
+        return ""
+    if tool_name in ("ripgrep_search", "search_files", "glob_find"):
+        lines = output.strip().split("\n")
+        if lines and ("No matches" in lines[0] or "No files" in lines[0]):
+            return lines[0]
+        return f"{len(lines)} results"
+    if tool_name == "read_file":
+        return f"{len(output.splitlines())} lines"
+    if tool_name == "shell_execute":
+        return _trunc(output.strip().split("\n")[0], 60)
+    if tool_name == "web_search":
+        lines = [l for l in output.strip().split("\n") if l.startswith(("1.", "2.", "3."))]
+        return f"{len(lines)} results" if lines else ""
+    return ""
+
+
+def _trunc(s: str, max_len: int) -> str:
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."

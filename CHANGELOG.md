@@ -20,6 +20,7 @@ All notable changes to Loom are documented in this file.
 - **PDF/image file support** in `read_file` -- PDFs: extracts text page-by-page via `pypdf` (optional dep). Images: returns file metadata. Both fall back gracefully when libraries aren't installed.
 
 ### Changed
+- **TUI rewritten for cowork mode** (`tui/app.py`) -- no longer requires a running `loom serve`. Uses `CoworkSession` directly with streaming text, tool approval modals (`[y]es / [a]lways / [n]o`), and `ask_user` modals. Same interface as `loom cowork` but with Textual widgets. Usage: `loom tui -w /path/to/project`.
 - **Cowork CLI uses streaming by default** -- text tokens display incrementally as they arrive instead of waiting for the full response.
 - **Git tool** -- `push` and `remote` added to allowed subcommands (force push still blocked).
 - **Shell tool** -- timeout increased from 60s to 120s for longer-running commands.
