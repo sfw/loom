@@ -618,6 +618,12 @@
 <span class="key">max_subtask_retries</span>  = <span class="val">3</span>
 <span class="key">max_loop_iterations</span> = <span class="val">50</span>
 
+<span class="cmt"># Verification gates</span>
+<span class="key">[verification]</span>
+<span class="key">tier1_enabled</span> = <span class="val">true</span>   <span class="cmt"># Deterministic checks (free, instant)</span>
+<span class="key">tier2_enabled</span> = <span class="val">true</span>   <span class="cmt"># Independent LLM verification</span>
+<span class="key">tier3_enabled</span> = <span class="val">false</span>  <span class="cmt"># Multi-vote (expensive, off by default)</span>
+
 <span class="cmt"># Memory storage</span>
 <span class="key">[memory]</span>
 <span class="key">database_path</span> = <span class="str">"~/.loom/loom.db"</span></code></pre>
@@ -782,7 +788,8 @@
     <tr><td><code>task_plan_ready</code></td><td>Plan created, execution starting</td></tr>
     <tr><td><code>subtask_started</code></td><td>A subtask begins execution</td></tr>
     <tr><td><code>subtask_completed</code></td><td>A subtask finished successfully</td></tr>
-    <tr><td><code>subtask_failed</code></td><td>A subtask failed (may retry)</td></tr>
+    <tr><td><code>subtask_failed</code></td><td>A subtask failed (may retry or trigger re-planning)</td></tr>
+    <tr><td><code>task_replanning</code></td><td>Re-planning triggered after subtask failures</td></tr>
     <tr><td><code>tool_call_started</code></td><td>A tool is being invoked</td></tr>
     <tr><td><code>tool_call_completed</code></td><td>A tool call returned</td></tr>
     <tr><td><code>approval_requested</code></td><td>Waiting for human approval</td></tr>
@@ -958,8 +965,8 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
 <span class="dim">                    </span><span class="highlight">Engine</span>
 <span class="dim">                   /    |    \</span>
 <span class="dim">        </span><span class="highlight">Orchestrator</span><span class="dim">  </span><span class="highlight">EventBus</span><span class="dim">  </span><span class="highlight">StateManager</span>
-<span class="dim">           |</span>
-<span class="dim">     </span><span class="highlight">Scheduler</span><span class="dim"> -------- </span><span class="highlight">PromptAssembler</span>
+<span class="dim">           |           |</span>
+<span class="dim">     </span><span class="highlight">Scheduler</span><span class="dim"> ---- </span><span class="highlight">Verification</span><span class="dim"> ---- </span><span class="highlight">PromptAssembler</span>
 <span class="dim">           |                    |</span>
 <span class="dim">  </span><span class="highlight">ModelRouter</span><span class="dim">           </span><span class="highlight">Templates</span><span class="dim"> (YAML)</span>
 <span class="dim">      /        \</span>
@@ -977,10 +984,11 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     schemas.py         <span class="cmt"># Pydantic models</span>
     engine.py          <span class="cmt"># Component wiring</span>
   engine/
-    orchestrator.py    <span class="cmt"># Plan -> execute -> finalize</span>
+    orchestrator.py    <span class="cmt"># Plan -> execute -> verify -> finalize</span>
     scheduler.py       <span class="cmt"># Dependency resolution</span>
+    verification.py    <span class="cmt"># Three-tier verification gates</span>
   events/
-    bus.py             <span class="cmt"># Pub/sub event bus</span>
+    bus.py             <span class="cmt"># Pub/sub event bus + persistence</span>
     types.py           <span class="cmt"># Event constants</span>
   models/
     base.py            <span class="cmt"># Provider ABC</span>
@@ -1022,9 +1030,10 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     <tr><td><code>execution.max_subtask_retries</code></td><td><code>3</code></td><td>Max retries per failed subtask</td></tr>
     <tr><td><code>execution.max_loop_iterations</code></td><td><code>50</code></td><td>Max tool-call loops per subtask</td></tr>
     <tr><td><code>execution.auto_approve_confidence_threshold</code></td><td><code>0.8</code></td><td>Auto-approve if confidence above this</td></tr>
-    <tr><td><code>verification.tier1_enabled</code></td><td><code>true</code></td><td>Enable self-check verification</td></tr>
-    <tr><td><code>verification.tier2_enabled</code></td><td><code>true</code></td><td>Enable independent model verification</td></tr>
-    <tr><td><code>verification.tier3_enabled</code></td><td><code>false</code></td><td>Enable multi-vote verification</td></tr>
+    <tr><td><code>verification.tier1_enabled</code></td><td><code>true</code></td><td>Deterministic checks (syntax, file existence, tool success)</td></tr>
+    <tr><td><code>verification.tier2_enabled</code></td><td><code>true</code></td><td>Independent LLM verification (different model, fresh context)</td></tr>
+    <tr><td><code>verification.tier3_enabled</code></td><td><code>false</code></td><td>Multi-vote verification (N checks, majority agreement)</td></tr>
+    <tr><td><code>verification.tier3_vote_count</code></td><td><code>3</code></td><td>Number of independent votes for tier 3</td></tr>
     <tr><td><code>memory.database_path</code></td><td><code>~/.loom/loom.db</code></td><td>SQLite database location</td></tr>
     <tr><td><code>logging.level</code></td><td><code>INFO</code></td><td>Log verbosity (DEBUG, INFO, WARN, ERROR)</td></tr>
     <tr><td><code>logging.event_log_path</code></td><td><code>~/.loom/logs</code></td><td>Event log directory</td></tr>

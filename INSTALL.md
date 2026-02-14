@@ -180,6 +180,10 @@ roles = ["planner", "executor", "extractor", "verifier"]
 | `workspace` | `scratch_dir` | `~/.loom/scratch` | Temp state storage |
 | `execution` | `max_subtask_retries` | `3` | Retries per subtask |
 | `execution` | `max_loop_iterations` | `50` | Max tool-call loops per subtask |
+| `verification` | `tier1_enabled` | `true` | Deterministic checks (syntax, file existence) |
+| `verification` | `tier2_enabled` | `true` | Independent LLM verification |
+| `verification` | `tier3_enabled` | `false` | Multi-vote verification |
+| `verification` | `tier3_vote_count` | `3` | Number of votes for tier 3 |
 | `memory` | `database_path` | `~/.loom/loom.db` | SQLite database location |
 | `logging` | `level` | `INFO` | Log verbosity |
 | `logging` | `event_log_path` | `~/.loom/logs` | Event log directory |
@@ -212,7 +216,7 @@ curl http://localhost:1234/v1/models
 
 ```bash
 pytest
-# Should show 262 passed
+# Should show 290 passed
 ```
 
 ### 4. Start the Server

@@ -28,8 +28,11 @@ Goal -> Planner -> [Subtask 1] -> [Subtask 2] -> ... -> Completed
 - **Tool system** -- file read/write/edit, shell execution (with safety blocklist), search
 - **Workspace safety** -- path traversal prevention, destructive command blocking
 - **Full undo** -- changelog with before-snapshots, revert at file/subtask/task level
+- **Three-tier verification** -- deterministic checks, independent LLM review, voting verification
 - **Structured memory** -- SQLite archive with task/subtask/type/tag queries
 - **Anti-amnesia** -- TODO reminders injected after every tool call
+- **Re-planning** -- automatic retry with escalation and re-planning on subtask failure
+- **Event persistence** -- all events persisted to SQLite for audit and replay
 - **REST API** -- full task CRUD, SSE streaming, steer/approve/feedback
 - **Event bus** -- pub/sub for real-time updates to any number of clients
 - **Token budgeting** -- prompt assembly with 7-section ordering and trim-to-budget
@@ -122,6 +125,11 @@ scratch_dir = "~/.loom/scratch"
 max_subtask_retries = 3
 max_loop_iterations = 50
 
+[verification]
+tier1_enabled = true    # Deterministic checks (syntax, file existence)
+tier2_enabled = true    # Independent LLM verification
+tier3_enabled = false   # Multi-vote verification (expensive)
+
 [memory]
 database_path = "~/.loom/loom.db"
 ```
@@ -140,10 +148,11 @@ src/loom/
     schemas.py         Pydantic request/response models
     engine.py          Component wiring and lifecycle
   engine/
-    orchestrator.py    Core loop: plan -> execute -> finalize
+    orchestrator.py    Core loop: plan -> execute -> verify -> finalize
     scheduler.py       Dependency-based subtask ordering
+    verification.py    Three-tier verification gates
   events/
-    bus.py             In-process pub/sub
+    bus.py             In-process pub/sub + event persistence
     types.py           Event type constants
   models/
     base.py            Provider ABC, response types
