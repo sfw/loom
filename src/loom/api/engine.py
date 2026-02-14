@@ -8,6 +8,7 @@ from loom.config import Config
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import EventBus, EventPersister
 from loom.events.webhook import WebhookDelivery
+from loom.learning.manager import LearningManager
 from loom.models.router import ModelRouter
 from loom.prompts.assembler import PromptAssembler
 from loom.recovery.approval import ApprovalManager
@@ -33,6 +34,7 @@ class Engine:
         database: Database,
         approval_manager: ApprovalManager,
         webhook_delivery: WebhookDelivery,
+        learning_manager: LearningManager,
     ):
         self.config = config
         self.orchestrator = orchestrator
@@ -45,6 +47,7 @@ class Engine:
         self.database = database
         self.approval_manager = approval_manager
         self.webhook_delivery = webhook_delivery
+        self.learning_manager = learning_manager
 
     async def shutdown(self) -> None:
         """Graceful cleanup."""
@@ -91,6 +94,9 @@ async def create_engine(config: Config) -> Engine:
     # Approval manager
     approval_manager = ApprovalManager(event_bus)
 
+    # Learning manager
+    learning_manager = LearningManager(database)
+
     # Orchestrator
     orchestrator = Orchestrator(
         model_router=model_router,
@@ -115,4 +121,5 @@ async def create_engine(config: Config) -> Engine:
         database=database,
         approval_manager=approval_manager,
         webhook_delivery=webhook_delivery,
+        learning_manager=learning_manager,
     )

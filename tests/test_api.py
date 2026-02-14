@@ -12,6 +12,7 @@ from loom.config import Config
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import EventBus
 from loom.events.webhook import WebhookDelivery
+from loom.learning.manager import LearningManager
 from loom.models.router import ModelRouter
 from loom.prompts.assembler import PromptAssembler
 from loom.recovery.approval import ApprovalManager
@@ -85,6 +86,7 @@ def engine(
         database=database,
         approval_manager=ApprovalManager(event_bus),
         webhook_delivery=WebhookDelivery(),
+        learning_manager=LearningManager(database),
     )
 
 

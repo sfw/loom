@@ -30,6 +30,7 @@ from loom.events.types import (
     TASK_PLANNING,
     TASK_REPLANNING,
 )
+from loom.learning.manager import LearningManager
 from loom.models.base import ModelResponse
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
@@ -88,6 +89,7 @@ class Orchestrator:
         event_bus: EventBus,
         config: Config,
         approval_manager: ApprovalManager | None = None,
+        learning_manager: LearningManager | None = None,
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -96,6 +98,7 @@ class Orchestrator:
         self._state = state_manager
         self._events = event_bus
         self._config = config
+        self._learning = learning_manager
         self._scheduler = Scheduler()
         self._validator = ResponseValidator()
         self._verification = VerificationGates(
@@ -249,13 +252,19 @@ class Orchestrator:
                             continue
 
             # 3. Completion
-            return self._finalize_task(task)
+            result_task = self._finalize_task(task)
+
+            # 4. Learn from execution (best-effort)
+            await self._learn_from_task(result_task)
+
+            return result_task
 
         except Exception as e:
             task.status = TaskStatus.FAILED
             task.add_error("orchestrator", str(e))
             self._state.save(task)
             self._emit(TASK_FAILED, task.id, {"error": str(e)})
+            await self._learn_from_task(task)
             return task
 
     async def _replan_task(self, task: Task) -> bool:
@@ -663,6 +672,15 @@ class Orchestrator:
             f"Do NOT move to the next subtask. Complete ONLY this one.\n"
             f"When finished, provide a summary of what you accomplished."
         )
+
+    async def _learn_from_task(self, task: Task) -> None:
+        """Run post-task learning extraction (best-effort)."""
+        if self._learning is None:
+            return
+        try:
+            await self._learning.learn_from_task(task)
+        except Exception:
+            pass  # Learning is best-effort
 
     def _emit(self, event_type: str, task_id: str, data: dict) -> None:
         self._events.emit(Event(

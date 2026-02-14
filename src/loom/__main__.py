@@ -54,9 +54,11 @@ def tui(ctx: click.Context, server_url: str | None) -> None:
     """Launch the terminal UI."""
     config = ctx.obj["config"]
     url = server_url or f"http://{config.server.host}:{config.server.port}"
-    click.echo(f"Connecting TUI to {url}")
-    # TUI implementation in Phase 2 (Spec 09)
-    click.echo("TUI not yet implemented. Use 'loom serve' and the REST API.")
+
+    from loom.tui.app import LoomApp
+
+    app = LoomApp(server_url=url)
+    app.run()
 
 
 @cli.command()
@@ -176,6 +178,45 @@ def models(ctx: click.Context, server_url: str | None) -> None:
         roles = ", ".join(model.roles)
         click.echo(f"  {name}: {model.model} ({model.provider}) [{roles}]")
         click.echo(f"    URL: {model.base_url}")
+
+
+@cli.command(name="mcp-serve")
+@click.option("--server", "server_url", default=None, help="Loom API server URL.")
+@click.pass_context
+def mcp_serve(ctx: click.Context, server_url: str | None) -> None:
+    """Start Loom as an MCP server (stdio transport)."""
+    config = ctx.obj["config"]
+    url = server_url or f"http://{config.server.host}:{config.server.port}"
+
+    import asyncio
+
+    from loom.integrations.mcp_server import LoomMCPServer
+
+    server = LoomMCPServer(engine_url=url)
+    click.echo(f"Starting Loom MCP server (engine: {url})", err=True)
+    asyncio.run(server.run_stdio())
+
+
+@cli.command(name="reset-learning")
+@click.confirmation_option(prompt="Are you sure you want to clear all learned patterns?")
+@click.pass_context
+def reset_learning(ctx: click.Context) -> None:
+    """Clear all learned patterns from the database."""
+    import asyncio
+
+    from loom.learning.manager import LearningManager
+    from loom.state.memory import Database
+
+    config = ctx.obj["config"]
+
+    async def _reset():
+        db = Database(str(Path(config.memory.database_path).expanduser()))
+        await db.initialize()
+        manager = LearningManager(db)
+        await manager.clear_all()
+        click.echo("Learning database cleared.")
+
+    asyncio.run(_reset())
 
 
 def main() -> None:
