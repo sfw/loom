@@ -14,9 +14,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from collections.abc import Callable
+
 from loom.config import Config
 from loom.engine.verification import VerificationGates, VerificationResult
-from loom.models.base import ModelResponse
+from loom.events.bus import EventBus
+from loom.events.types import TOKEN_STREAMED
+from loom.models.base import ModelResponse, StreamChunk
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.state.memory import MemoryEntry, MemoryManager
@@ -76,6 +80,7 @@ class SubtaskRunner:
         state_manager: TaskStateManager,
         verification: VerificationGates,
         config: Config,
+        event_bus: EventBus | None = None,
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -85,6 +90,7 @@ class SubtaskRunner:
         self._verification = verification
         self._config = config
         self._validator = ResponseValidator()
+        self._event_bus = event_bus
 
     async def run(
         self,
@@ -124,11 +130,18 @@ class SubtaskRunner:
         tool_calls_record: list[ToolCallRecord] = []
         total_tokens = 0
         response = None
+        streaming = self._config.execution.enable_streaming
 
         for _ in range(self.MAX_TOOL_ITERATIONS):
-            response = await model.complete(
-                messages, tools=self._tools.all_schemas()
-            )
+            if streaming:
+                response = await self._stream_completion(
+                    model, messages, self._tools.all_schemas(),
+                    task_id=task.id, subtask_id=subtask.id,
+                )
+            else:
+                response = await model.complete(
+                    messages, tools=self._tools.all_schemas()
+                )
             total_tokens += response.usage.total_tokens
 
             if response.has_tool_calls():
@@ -293,6 +306,55 @@ class SubtaskRunner:
                 tags=str(e.get("tags", "")),
             ))
         return entries
+
+    async def _stream_completion(
+        self,
+        model,
+        messages: list[dict],
+        tools: list[dict],
+        *,
+        task_id: str = "",
+        subtask_id: str = "",
+    ) -> ModelResponse:
+        """Stream a model completion, emitting TOKEN_STREAMED events.
+
+        Collects all chunks and returns a complete ModelResponse,
+        matching the interface of model.complete().
+        """
+        from loom.events.bus import Event
+
+        text_parts: list[str] = []
+        final_tool_calls = None
+        final_usage = None
+
+        async for chunk in model.stream(messages, tools=tools):
+            if chunk.text:
+                text_parts.append(chunk.text)
+                # Emit token event
+                if self._event_bus:
+                    self._event_bus.emit(Event(
+                        event_type=TOKEN_STREAMED,
+                        task_id=task_id,
+                        data={
+                            "subtask_id": subtask_id,
+                            "token": chunk.text,
+                            "model": model.name,
+                        },
+                    ))
+            if chunk.tool_calls is not None:
+                final_tool_calls = chunk.tool_calls
+            if chunk.usage is not None:
+                final_usage = chunk.usage
+
+        from loom.models.base import TokenUsage
+
+        return ModelResponse(
+            text="".join(text_parts),
+            tool_calls=final_tool_calls,
+            raw="",
+            usage=final_usage or TokenUsage(),
+            model=model.name,
+        )
 
     @staticmethod
     def _build_todo_reminder(task: Task, subtask: Subtask) -> str:

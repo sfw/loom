@@ -1,8 +1,8 @@
-"""File operation tools: read, write, edit files."""
+"""File operation tools: read, write, edit, delete, move files."""
 
 from __future__ import annotations
 
-from loom.tools.registry import Tool, ToolContext, ToolResult
+from loom.tools.registry import Tool, ToolContext, ToolResult, ToolSafetyError
 
 
 class ReadFileTool(Tool):
@@ -96,6 +96,119 @@ class WriteFileTool(Tool):
         return ToolResult.ok(
             f"Wrote {len(content)} bytes to {rel_path}",
             files_changed=[rel_path],
+        )
+
+
+class DeleteFileTool(Tool):
+    @property
+    def name(self) -> str:
+        return "delete_file"
+
+    @property
+    def description(self) -> str:
+        return "Delete a file or empty directory. Cannot delete workspace root or .git/."
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path relative to workspace"},
+            },
+            "required": ["path"],
+        }
+
+    @property
+    def timeout_seconds(self) -> int:
+        return 10
+
+    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        if ctx.workspace is None:
+            return ToolResult.fail("No workspace set")
+
+        path = self._resolve_path(args["path"], ctx.workspace)
+        rel_path = str(path.relative_to(ctx.workspace.resolve()))
+
+        # Safety: refuse to delete workspace root
+        if path.resolve() == ctx.workspace.resolve():
+            return ToolResult.fail("Cannot delete workspace root")
+
+        # Safety: refuse to delete .git directory
+        if ".git" in path.parts:
+            return ToolResult.fail("Cannot delete .git directory or its contents")
+
+        if not path.exists():
+            return ToolResult.fail(f"Path not found: {args['path']}")
+
+        # Record in changelog before deleting
+        if ctx.changelog is not None and path.is_file():
+            ctx.changelog.record_delete(rel_path, subtask_id=ctx.subtask_id)
+
+        if path.is_file():
+            path.unlink()
+            return ToolResult.ok(f"Deleted file: {rel_path}", files_changed=[rel_path])
+        elif path.is_dir():
+            try:
+                path.rmdir()  # Only removes empty directories
+                return ToolResult.ok(f"Deleted empty directory: {rel_path}")
+            except OSError:
+                return ToolResult.fail(
+                    f"Directory not empty: {rel_path}. Remove contents first."
+                )
+        else:
+            return ToolResult.fail(f"Unsupported path type: {rel_path}")
+
+
+class MoveFileTool(Tool):
+    @property
+    def name(self) -> str:
+        return "move_file"
+
+    @property
+    def description(self) -> str:
+        return "Move or rename a file or directory within the workspace."
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Source path relative to workspace"},
+                "destination": {"type": "string", "description": "Destination path relative to workspace"},
+            },
+            "required": ["source", "destination"],
+        }
+
+    @property
+    def timeout_seconds(self) -> int:
+        return 10
+
+    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        if ctx.workspace is None:
+            return ToolResult.fail("No workspace set")
+
+        source = self._resolve_path(args["source"], ctx.workspace)
+        destination = self._resolve_path(args["destination"], ctx.workspace)
+
+        if not source.exists():
+            return ToolResult.fail(f"Source not found: {args['source']}")
+
+        if destination.exists():
+            return ToolResult.fail(f"Destination already exists: {args['destination']}")
+
+        rel_source = str(source.relative_to(ctx.workspace.resolve()))
+        rel_dest = str(destination.relative_to(ctx.workspace.resolve()))
+
+        # Record in changelog before moving
+        if ctx.changelog is not None:
+            ctx.changelog.record_rename(rel_source, rel_dest, subtask_id=ctx.subtask_id)
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source.rename(destination)
+
+        return ToolResult.ok(
+            f"Moved {rel_source} -> {rel_dest}",
+            files_changed=[rel_source, rel_dest],
         )
 
 

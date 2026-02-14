@@ -41,6 +41,7 @@ class ExecutionConfig:
     max_loop_iterations: int = 50
     max_parallel_subtasks: int = 3
     auto_approve_confidence_threshold: float = 0.8
+    enable_streaming: bool = False
 
 
 @dataclass(frozen=True)

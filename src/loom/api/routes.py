@@ -205,6 +205,56 @@ async def stream_task_events(request: Request, task_id: str):
     return EventSourceResponse(event_generator())
 
 
+@router.get("/tasks/{task_id}/tokens")
+async def stream_task_tokens(request: Request, task_id: str):
+    """SSE stream of raw model tokens for the active subtask."""
+    engine = _get_engine(request)
+
+    if not engine.state_manager.exists(task_id):
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+
+    async def token_generator():
+        queue: asyncio.Queue[Event] = asyncio.Queue()
+
+        def handler(event: Event):
+            if event.task_id == task_id and event.event_type == "token_streamed":
+                queue.put_nowait(event)
+
+        # Also listen for terminal events to know when to stop
+        terminal_queue: asyncio.Queue[Event] = asyncio.Queue()
+
+        def terminal_handler(event: Event):
+            if event.task_id == task_id and event.event_type in (
+                "task_completed", "task_failed", "task_cancelled",
+            ):
+                terminal_queue.put_nowait(event)
+
+        engine.event_bus.subscribe("token_streamed", handler)
+        engine.event_bus.subscribe_all(terminal_handler)
+
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    yield {
+                        "event": "token",
+                        "data": json.dumps({
+                            "token": event.data.get("token", ""),
+                            "subtask_id": event.data.get("subtask_id", ""),
+                            "model": event.data.get("model", ""),
+                        }),
+                    }
+                except TimeoutError:
+                    # Check if task is done
+                    if not terminal_queue.empty():
+                        return
+                    yield {"comment": "keepalive"}
+        except asyncio.CancelledError:
+            return
+
+    return EventSourceResponse(token_generator())
+
+
 @router.patch("/tasks/{task_id}")
 async def steer_task(request: Request, task_id: str, body: TaskSteerRequest):
     """Inject instructions into a running task."""

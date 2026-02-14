@@ -11,8 +11,10 @@ import time
 
 import httpx
 
+from collections.abc import AsyncGenerator
+
 from loom.config import ModelConfig
-from loom.models.base import ModelProvider, ModelResponse, TokenUsage, ToolCall
+from loom.models.base import ModelProvider, ModelResponse, StreamChunk, TokenUsage, ToolCall
 
 
 class OllamaProvider(ModelProvider):
@@ -99,6 +101,83 @@ class OllamaProvider(ModelProvider):
             model=self._model,
             latency_ms=latency,
         )
+
+    async def stream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Stream a completion from Ollama, yielding text tokens as they arrive."""
+        payload: dict = {
+            "model": self._model,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": temperature if temperature is not None else self._temperature,
+                "num_predict": max_tokens or self._max_tokens,
+            },
+        }
+        if tools:
+            payload["tools"] = self._format_ollama_tools(tools)
+
+        async with self._client.stream("POST", "/api/chat", json=payload) as response:
+            response.raise_for_status()
+            accumulated_tool_calls: list[dict] = []
+
+            async for line in response.aiter_lines():
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                message = data.get("message", {})
+                text = message.get("content") or ""
+                done = data.get("done", False)
+
+                # Collect tool calls (only available in final message)
+                if message.get("tool_calls"):
+                    accumulated_tool_calls.extend(message["tool_calls"])
+
+                parsed_tools = None
+                usage = None
+
+                if done:
+                    # Parse accumulated tool calls
+                    if accumulated_tool_calls:
+                        parsed_tools = []
+                        for i, tc in enumerate(accumulated_tool_calls):
+                            func = tc.get("function", {})
+                            args = func.get("arguments", {})
+                            if isinstance(args, str):
+                                args = json.loads(args)
+                            parsed_tools.append(ToolCall(
+                                id=f"call_{i}",
+                                name=func.get("name", ""),
+                                arguments=args,
+                            ))
+
+                    usage = TokenUsage(
+                        input_tokens=data.get("prompt_eval_count", 0),
+                        output_tokens=data.get("eval_count", 0),
+                        total_tokens=(
+                            data.get("prompt_eval_count", 0)
+                            + data.get("eval_count", 0)
+                        ),
+                    )
+
+                yield StreamChunk(
+                    text=text,
+                    done=done,
+                    tool_calls=parsed_tools,
+                    usage=usage,
+                )
+
+                if done:
+                    return
 
     async def health_check(self) -> bool:
         try:

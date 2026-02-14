@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 
 from loom.tools import create_default_registry
-from loom.tools.file_ops import EditFileTool, ReadFileTool, WriteFileTool
+from loom.tools.file_ops import (
+    DeleteFileTool,
+    EditFileTool,
+    MoveFileTool,
+    ReadFileTool,
+    WriteFileTool,
+)
+from loom.tools.git import GitCommandTool, check_git_safety, parse_subcommand
 from loom.tools.registry import (
     ToolContext,
     ToolRegistry,
@@ -72,7 +79,10 @@ class TestRegistry:
         assert "read_file" in tools
         assert "write_file" in tools
         assert "edit_file" in tools
+        assert "delete_file" in tools
+        assert "move_file" in tools
         assert "shell_execute" in tools
+        assert "git_command" in tools
         assert "search_files" in tools
         assert "list_directory" in tools
 
@@ -84,7 +94,7 @@ class TestRegistry:
 
     def test_all_schemas(self, registry: ToolRegistry):
         schemas = registry.all_schemas()
-        assert len(schemas) == 6
+        assert len(schemas) == 9
         for s in schemas:
             assert "name" in s
             assert "description" in s
@@ -348,3 +358,162 @@ class TestListDirectory:
         tool = ListDirectoryTool()
         result = await tool.execute({}, ctx)
         assert ".git" not in result.output
+
+
+# --- DeleteFileTool ---
+
+class TestDeleteFile:
+    async def test_delete_existing_file(self, ctx: ToolContext, workspace: Path):
+        tool = DeleteFileTool()
+        result = await tool.execute({"path": "config.json"}, ctx)
+        assert result.success
+        assert not (workspace / "config.json").exists()
+        assert "config.json" in result.files_changed
+
+    async def test_delete_missing_file(self, ctx: ToolContext):
+        tool = DeleteFileTool()
+        result = await tool.execute({"path": "nope.txt"}, ctx)
+        assert not result.success
+        assert "not found" in result.error.lower()
+
+    async def test_delete_empty_directory(self, ctx: ToolContext, workspace: Path):
+        (workspace / "empty_dir").mkdir()
+        tool = DeleteFileTool()
+        result = await tool.execute({"path": "empty_dir"}, ctx)
+        assert result.success
+        assert not (workspace / "empty_dir").exists()
+
+    async def test_delete_non_empty_directory(self, ctx: ToolContext, workspace: Path):
+        tool = DeleteFileTool()
+        result = await tool.execute({"path": "src"}, ctx)
+        assert not result.success
+        assert "not empty" in result.error.lower()
+
+    async def test_delete_blocks_git_dir(self, ctx: ToolContext, workspace: Path):
+        (workspace / ".git").mkdir()
+        (workspace / ".git" / "config").write_text("x")
+        tool = DeleteFileTool()
+        result = await tool.execute({"path": ".git/config"}, ctx)
+        assert not result.success
+        assert ".git" in result.error
+
+    async def test_delete_no_workspace(self):
+        tool = DeleteFileTool()
+        result = await tool.execute({"path": "x.txt"}, ToolContext(workspace=None))
+        assert not result.success
+        assert "No workspace" in result.error
+
+
+# --- MoveFileTool ---
+
+class TestMoveFile:
+    async def test_move_file(self, ctx: ToolContext, workspace: Path):
+        tool = MoveFileTool()
+        result = await tool.execute(
+            {"source": "README.md", "destination": "docs/README.md"}, ctx
+        )
+        assert result.success
+        assert not (workspace / "README.md").exists()
+        assert (workspace / "docs" / "README.md").exists()
+        assert "README.md" in result.files_changed
+
+    async def test_move_missing_source(self, ctx: ToolContext):
+        tool = MoveFileTool()
+        result = await tool.execute(
+            {"source": "nope.txt", "destination": "dest.txt"}, ctx
+        )
+        assert not result.success
+        assert "not found" in result.error.lower()
+
+    async def test_move_destination_exists(self, ctx: ToolContext):
+        tool = MoveFileTool()
+        result = await tool.execute(
+            {"source": "README.md", "destination": "config.json"}, ctx
+        )
+        assert not result.success
+        assert "already exists" in result.error.lower()
+
+    async def test_rename_file(self, ctx: ToolContext, workspace: Path):
+        tool = MoveFileTool()
+        result = await tool.execute(
+            {"source": "README.md", "destination": "README.txt"}, ctx
+        )
+        assert result.success
+        assert (workspace / "README.txt").exists()
+
+    async def test_move_no_workspace(self):
+        tool = MoveFileTool()
+        result = await tool.execute(
+            {"source": "a.txt", "destination": "b.txt"},
+            ToolContext(workspace=None),
+        )
+        assert not result.success
+
+
+# --- GitCommandTool ---
+
+class TestGitCommand:
+    async def test_git_status(self, ctx: ToolContext, workspace: Path):
+        # Init a git repo in workspace
+        import subprocess
+        subprocess.run(["git", "init"], cwd=workspace, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=workspace, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=workspace, capture_output=True,
+        )
+
+        tool = GitCommandTool()
+        result = await tool.execute({"args": ["status"]}, ctx)
+        assert result.success
+        assert result.data["subcommand"] == "status"
+
+    async def test_git_blocked_subcommand(self, ctx: ToolContext):
+        tool = GitCommandTool()
+        result = await tool.execute({"args": ["push", "origin", "main"]}, ctx)
+        assert not result.success
+        assert "not allowed" in result.error
+
+    async def test_git_empty_args(self, ctx: ToolContext):
+        tool = GitCommandTool()
+        result = await tool.execute({"args": []}, ctx)
+        assert not result.success
+        assert "No git arguments" in result.error
+
+    async def test_git_no_workspace(self):
+        tool = GitCommandTool()
+        # git should still work without workspace (uses cwd)
+        result = await tool.execute(
+            {"args": ["status"]}, ToolContext(workspace=None)
+        )
+        # May succeed or fail depending on cwd being a git repo
+        assert isinstance(result, ToolResult)
+
+
+class TestGitSafety:
+    def test_blocks_force_push(self):
+        assert check_git_safety("push origin main --force") is not None
+
+    def test_blocks_hard_reset(self):
+        assert check_git_safety("reset --hard HEAD~1") is not None
+
+    def test_blocks_clean_f(self):
+        assert check_git_safety("clean -fd") is not None
+
+    def test_blocks_force_delete_branch(self):
+        assert check_git_safety("branch -D feature") is not None
+
+    def test_allows_normal_commands(self):
+        assert check_git_safety("status") is None
+        assert check_git_safety("diff --staged") is None
+        assert check_git_safety("log --oneline -10") is None
+        assert check_git_safety("commit -m 'fix bug'") is None
+        assert check_git_safety("branch -a") is None
+
+    def test_parse_subcommand(self):
+        assert parse_subcommand(["status"]) == "status"
+        assert parse_subcommand(["--global", "config", "user.name"]) == "config"
+        assert parse_subcommand(["-v"]) is None

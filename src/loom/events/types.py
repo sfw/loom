@@ -35,3 +35,6 @@ STEER_INSTRUCTION = "steer_instruction"
 
 # Retry events
 SUBTASK_RETRYING = "subtask_retrying"
+
+# Streaming events
+TOKEN_STREAMED = "token_streamed"

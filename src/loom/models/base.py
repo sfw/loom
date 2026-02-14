@@ -1,12 +1,13 @@
 """Abstract model interface.
 
 All model providers implement this interface, providing a unified
-API for completions, tool calling, and health checks.
+API for completions, tool calling, streaming, and health checks.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
 
@@ -43,6 +44,16 @@ class ModelResponse:
         return bool(self.tool_calls)
 
 
+@dataclass
+class StreamChunk:
+    """A single chunk from a streaming model response."""
+
+    text: str = ""
+    done: bool = False
+    tool_calls: list[ToolCall] | None = None
+    usage: TokenUsage | None = None
+
+
 class ModelProvider(ABC):
     """Abstract base class for all model providers."""
 
@@ -57,6 +68,28 @@ class ModelProvider(ABC):
     ) -> ModelResponse:
         """Send a completion request and return structured response."""
         ...
+
+    async def stream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Stream a completion response, yielding chunks as they arrive.
+
+        Default implementation: falls back to complete() and yields one chunk.
+        Providers should override this for true streaming support.
+        """
+        response = await self.complete(
+            messages, tools=tools, temperature=temperature, max_tokens=max_tokens,
+        )
+        yield StreamChunk(
+            text=response.text,
+            done=True,
+            tool_calls=response.tool_calls,
+            usage=response.usage,
+        )
 
     @abstractmethod
     async def health_check(self) -> bool:
