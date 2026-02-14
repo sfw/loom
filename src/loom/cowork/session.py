@@ -83,6 +83,7 @@ class CoworkSession:
         self._workspace = workspace
         self._max_context = max_context_messages
         self._approver = approver
+        self._total_tokens = 0
 
         self._messages: list[dict] = []
         if system_prompt:
@@ -96,6 +97,11 @@ class CoworkSession:
     @property
     def workspace(self) -> Path | None:
         return self._workspace
+
+    @property
+    def total_tokens(self) -> int:
+        """Cumulative token count across all turns in this session."""
+        return self._total_tokens
 
     # ------------------------------------------------------------------
     # Public API
@@ -207,6 +213,7 @@ class CoworkSession:
 
         # Trim conversation if it's getting too long
         self._maybe_trim()
+        self._total_tokens += total_tokens
 
         yield CoworkTurn(
             text=final_text,
@@ -323,6 +330,7 @@ class CoworkSession:
                 break
 
         self._maybe_trim()
+        self._total_tokens += total_tokens
 
         yield CoworkTurn(
             text=final_text,

@@ -5,12 +5,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 from loom.tui.api_client import LoomAPIClient
-from loom.tui.app import (
-    AskUserScreen,
-    ToolApprovalScreen,
-    _tool_args_preview,
-    _tool_output_preview,
+from loom.tui.screens.approval import ToolApprovalScreen
+from loom.tui.screens.ask_user import AskUserScreen
+from loom.tui.widgets.tool_call import (
     _trunc,
+    tool_args_preview,
+    tool_output_preview,
 )
 
 # --- LoomAPIClient tests (unchanged from before) ---
@@ -33,7 +33,9 @@ class TestLoomAPIClient:
         api = LoomAPIClient()
         mock_client = AsyncMock()
         mock_response = MagicMock()
-        mock_response.json.return_value = [{"task_id": "t1", "status": "running"}]
+        mock_response.json.return_value = [
+            {"task_id": "t1", "status": "running"},
+        ]
         mock_response.raise_for_status = MagicMock()
         mock_client.get = AsyncMock(return_value=mock_response)
         api._client = mock_client
@@ -47,12 +49,16 @@ class TestLoomAPIClient:
         api = LoomAPIClient()
         mock_client = AsyncMock()
         mock_response = MagicMock()
-        mock_response.json.return_value = {"task_id": "t1", "status": "pending"}
+        mock_response.json.return_value = {
+            "task_id": "t1", "status": "pending",
+        }
         mock_response.raise_for_status = MagicMock()
         mock_client.post = AsyncMock(return_value=mock_response)
         api._client = mock_client
 
-        result = await api.create_task("Build a CLI", workspace="/tmp/proj")
+        result = await api.create_task(
+            "Build a CLI", workspace="/tmp/proj",
+        )
         assert result["task_id"] == "t1"
 
     async def test_health(self):
@@ -73,69 +79,107 @@ class TestLoomAPIClient:
 
 class TestToolArgsPreview:
     def test_file_tool(self):
-        assert _tool_args_preview("read_file", {"path": "foo.py"}) == "foo.py"
+        assert tool_args_preview("read_file", {"path": "foo.py"}) == "foo.py"
 
     def test_shell(self):
-        assert _tool_args_preview("shell_execute", {"command": "ls -la"}) == "ls -la"
+        result = tool_args_preview(
+            "shell_execute", {"command": "ls -la"},
+        )
+        assert result == "ls -la"
 
     def test_git(self):
-        assert _tool_args_preview("git_command", {"args": ["push", "origin"]}) == "push origin"
+        result = tool_args_preview(
+            "git_command", {"args": ["push", "origin"]},
+        )
+        assert result == "push origin"
 
     def test_ripgrep(self):
-        assert _tool_args_preview("ripgrep_search", {"pattern": "TODO"}) == "/TODO/"
+        result = tool_args_preview(
+            "ripgrep_search", {"pattern": "TODO"},
+        )
+        assert result == "/TODO/"
 
     def test_glob(self):
-        assert _tool_args_preview("glob_find", {"pattern": "**/*.py"}) == "**/*.py"
+        result = tool_args_preview(
+            "glob_find", {"pattern": "**/*.py"},
+        )
+        assert result == "**/*.py"
 
     def test_web_search(self):
-        assert _tool_args_preview("web_search", {"query": "python docs"}) == "python docs"
+        result = tool_args_preview(
+            "web_search", {"query": "python docs"},
+        )
+        assert result == "python docs"
 
     def test_web_fetch(self):
-        assert _tool_args_preview("web_fetch", {"url": "https://example.com"}) == "https://example.com"
+        result = tool_args_preview(
+            "web_fetch", {"url": "https://example.com"},
+        )
+        assert result == "https://example.com"
 
     def test_task_tracker(self):
-        result = _tool_args_preview("task_tracker", {"action": "add", "content": "Fix bug"})
+        result = tool_args_preview(
+            "task_tracker", {"action": "add", "content": "Fix bug"},
+        )
         assert result == "add: Fix bug"
 
     def test_task_tracker_no_content(self):
-        assert _tool_args_preview("task_tracker", {"action": "list"}) == "list"
+        result = tool_args_preview("task_tracker", {"action": "list"})
+        assert result == "list"
 
     def test_ask_user(self):
-        assert _tool_args_preview("ask_user", {"question": "Which DB?"}) == "Which DB?"
+        result = tool_args_preview(
+            "ask_user", {"question": "Which DB?"},
+        )
+        assert result == "Which DB?"
 
     def test_analyze_code(self):
-        assert _tool_args_preview("analyze_code", {"path": "src/"}) == "src/"
+        result = tool_args_preview("analyze_code", {"path": "src/"})
+        assert result == "src/"
 
     def test_generic_fallback(self):
-        assert _tool_args_preview("unknown", {"x": "hello"}) == "hello"
+        assert tool_args_preview("unknown", {"x": "hello"}) == "hello"
 
     def test_empty(self):
-        assert _tool_args_preview("unknown", {}) == ""
+        assert tool_args_preview("unknown", {}) == ""
 
 
 class TestToolOutputPreview:
     def test_empty(self):
-        assert _tool_output_preview("read_file", "") == ""
+        assert tool_output_preview("read_file", "") == ""
 
     def test_read_file(self):
-        assert _tool_output_preview("read_file", "line1\nline2\nline3\n") == "3 lines"
+        result = tool_output_preview(
+            "read_file", "line1\nline2\nline3\n",
+        )
+        assert result == "3 lines"
 
     def test_search_no_matches(self):
-        assert _tool_output_preview("ripgrep_search", "No matches found.") == "No matches found."
+        result = tool_output_preview(
+            "ripgrep_search", "No matches found.",
+        )
+        assert result == "No matches found."
 
     def test_search_results(self):
         output = "file1.py:10:match\nfile2.py:20:match"
-        assert _tool_output_preview("ripgrep_search", output) == "2 results"
+        assert tool_output_preview("ripgrep_search", output) == "2 results"
 
     def test_shell(self):
-        assert _tool_output_preview("shell_execute", "hello world\nmore output") == "hello world"
+        result = tool_output_preview(
+            "shell_execute", "hello world\nmore output",
+        )
+        assert result == "hello world"
 
     def test_web_search(self):
-        output = "1. Result one\n   url\n2. Result two\n   url\n3. Result three\n   url"
-        assert "3 results" in _tool_output_preview("web_search", output)
+        output = (
+            "1. Result one\n   url\n"
+            "2. Result two\n   url\n"
+            "3. Result three\n   url"
+        )
+        assert "3 results" in tool_output_preview("web_search", output)
 
     def test_unknown_tool(self):
-        assert _tool_output_preview("unknown", "whatever") == ""
+        assert tool_output_preview("unknown", "whatever") == ""
 
 
 class TestTrunc:
@@ -169,3 +213,75 @@ class TestAskUserScreen:
         screen = AskUserScreen("Pick one:", ["Python", "Rust"])
         assert screen._question == "Pick one:"
         assert screen._options == ["Python", "Rust"]
+
+
+# --- Theme tests ---
+
+
+class TestTheme:
+    def test_loom_dark_theme(self):
+        from loom.tui.theme import LOOM_DARK
+        assert LOOM_DARK.name == "loom-dark"
+        assert LOOM_DARK.dark is True
+        assert LOOM_DARK.primary == "#7dcfff"
+
+    def test_color_constants(self):
+        from loom.tui.theme import (
+            ACCENT_CYAN,
+            TOOL_ERR,
+            TOOL_OK,
+            USER_MSG,
+        )
+        assert USER_MSG == "#73daca"
+        assert TOOL_OK == "#9ece6a"
+        assert TOOL_ERR == "#f7768e"
+        assert ACCENT_CYAN == "#7dcfff"
+
+
+# --- Widget tests ---
+
+
+class TestStatusBar:
+    def test_default_state(self):
+        from loom.tui.widgets.status_bar import StatusBar
+        bar = StatusBar()
+        assert bar.state == "Ready"
+        assert bar.total_tokens == 0
+
+
+class TestTaskProgressPanel:
+    def test_render_empty(self):
+        from loom.tui.widgets.sidebar import TaskProgressPanel
+        panel = TaskProgressPanel()
+        assert "No tasks tracked" in panel.render()
+
+    def test_render_with_tasks(self):
+        from loom.tui.widgets.sidebar import TaskProgressPanel
+        panel = TaskProgressPanel()
+        panel.tasks = [
+            {"content": "Read file", "status": "completed"},
+            {"content": "Fix bug", "status": "in_progress"},
+            {"content": "Run tests", "status": "pending"},
+        ]
+        rendered = panel.render()
+        assert "Read file" in rendered
+        assert "Fix bug" in rendered
+        assert "Run tests" in rendered
+
+
+# --- CoworkSession total_tokens tests ---
+
+
+class TestCoworkSessionTokens:
+    def test_initial_total_tokens(self):
+        from unittest.mock import MagicMock
+
+        from loom.cowork.session import CoworkSession
+
+        model = MagicMock()
+        model.name = "test-model"
+        tools = MagicMock()
+        tools.all_schemas.return_value = []
+
+        session = CoworkSession(model=model, tools=tools)
+        assert session.total_tokens == 0

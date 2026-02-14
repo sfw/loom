@@ -1,33 +1,42 @@
 """Loom TUI — interactive cowork session in a Textual app.
 
-Replaces the old task-dashboard TUI with a conversation-first interface
-that uses CoworkSession directly. No server required.
+Multi-panel command center with sidebar, tabbed content area, rich
+tool call rendering, and a polished dark theme. No server required —
+runs CoworkSession directly.
 
 Layout:
-  ┌──────────────────────────────────────────┐
-  │ Header                                   │
-  ├──────────────────────────────────────────┤
-  │ Chat log (RichLog)                       │
-  │   streaming text, tool calls, results    │
-  │                                          │
-  ├──────────────────────────────────────────┤
-  │ [>] Input bar                            │
-  ├──────────────────────────────────────────┤
-  │ Footer (keybindings)                     │
-  └──────────────────────────────────────────┘
+  +-----+----------------------------------------------+
+  | S   | [Chat]  [Files Changed]  [Events]            |
+  | I   |                                              |
+  | D   |  > user message                              |
+  | E   |  tool_call  args       ok 12ms 45 lines      |
+  | B   |  Model response text ...                     |
+  | A   |                                              |
+  | R   |  --- 3 tools | 1,247 tokens | model ---      |
+  +-----+----------------------------------------------+
+  | [>] Input bar                 Ready | ws | 3.2k    |
+  +-----+----------------------------------------------+
+  | ^B Sidebar  ^L Clear  ^P Commands   ^C Quit        |
+  +-----+----------------------------------------------+
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from pathlib import Path
 
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
-from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Input, Label, RichLog, Static
+from textual.containers import Horizontal, Vertical
+from textual.widgets import (
+    Footer,
+    Header,
+    Input,
+    TabbedContent,
+    TabPane,
+)
 
 from loom.cowork.approval import ApprovalDecision, ToolApprover
 from loom.cowork.session import (
@@ -38,146 +47,45 @@ from loom.cowork.session import (
 )
 from loom.models.base import ModelProvider
 from loom.tools.registry import ToolRegistry
-
-# ---------------------------------------------------------------------------
-# Modal screens
-# ---------------------------------------------------------------------------
-
-
-class ToolApprovalScreen(ModalScreen[str]):
-    """Prompt the user to approve a tool call.
-
-    Returns: "approve", "approve_all", or "deny"
-    """
-
-    BINDINGS = [
-        Binding("y", "approve", "Yes"),
-        Binding("a", "approve_all", "Always"),
-        Binding("n", "deny", "No"),
-        Binding("escape", "deny", "Cancel"),
-    ]
-
-    CSS = """
-    #approval-dialog {
-        align: center middle;
-        width: 70;
-        height: auto;
-        max-height: 12;
-        border: solid $warning;
-        padding: 1 2;
-        background: $surface;
-    }
-    """
-
-    def __init__(self, tool_name: str, args_preview: str) -> None:
-        super().__init__()
-        self._tool_name = tool_name
-        self._args_preview = args_preview
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("[bold yellow]Approve tool call?[/bold yellow]"),
-            Label(f"[bold cyan]{self._tool_name}[/bold cyan]  [dim]{self._args_preview}[/dim]"),
-            Label(""),
-            Label("[y] Yes  [a] Always allow this tool  [n] No  [Esc] Cancel"),
-            id="approval-dialog",
-        )
-
-    def action_approve(self) -> None:
-        self.dismiss("approve")
-
-    def action_approve_all(self) -> None:
-        self.dismiss("approve_all")
-
-    def action_deny(self) -> None:
-        self.dismiss("deny")
-
-
-class AskUserScreen(ModalScreen[str]):
-    """Display a question from the model and collect the user's answer."""
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    CSS = """
-    #ask-user-dialog {
-        align: center middle;
-        width: 70;
-        height: auto;
-        max-height: 16;
-        border: solid $primary;
-        padding: 1 2;
-        background: $surface;
-    }
-    #ask-user-input { margin-top: 1; }
-    """
-
-    def __init__(self, question: str, options: list[str] | None = None) -> None:
-        super().__init__()
-        self._question = question
-        self._options = options or []
-
-    def compose(self) -> ComposeResult:
-        children = [
-            Label(f"[bold yellow]Question:[/bold yellow] {self._question}"),
-        ]
-        for i, opt in enumerate(self._options, 1):
-            children.append(Label(f"  [cyan]{i}.[/cyan] {opt}"))
-        if self._options:
-            children.append(Label("[dim]Enter a number or type your answer[/dim]"))
-        children.append(Input(placeholder="Your answer...", id="ask-user-input"))
-
-        yield Vertical(*children, id="ask-user-dialog")
-
-    def on_mount(self) -> None:
-        self.query_one("#ask-user-input", Input).focus()
-
-    @on(Input.Submitted)
-    def on_submit(self, event: Input.Submitted) -> None:
-        answer = event.value.strip()
-        if not answer:
-            return
-        # Map number to option
-        if self._options and answer.isdigit():
-            idx = int(answer) - 1
-            if 0 <= idx < len(self._options):
-                answer = self._options[idx]
-        self.dismiss(answer)
-
-    def action_cancel(self) -> None:
-        self.dismiss("")
-
-
-# ---------------------------------------------------------------------------
-# Main app
-# ---------------------------------------------------------------------------
+from loom.tui.commands import LoomCommands
+from loom.tui.screens import AskUserScreen, ToolApprovalScreen
+from loom.tui.theme import LOOM_DARK
+from loom.tui.widgets import (
+    ChatLog,
+    EventPanel,
+    FilesChangedPanel,
+    Sidebar,
+    StatusBar,
+)
+from loom.tui.widgets.tool_call import tool_args_preview
 
 
 class LoomApp(App):
-    """Loom TUI — interactive cowork session."""
+    """Loom TUI — interactive cowork session as a command center."""
 
     TITLE = "Loom"
+    COMMANDS = {LoomCommands}
+
     CSS = """
-    #chat-log {
+    #main-layout {
         height: 1fr;
-        border: solid $primary;
-        scrollbar-size: 1 1;
     }
-    #status-bar {
-        height: 1;
-        dock: bottom;
-        background: $surface;
-        color: $text-muted;
-        padding: 0 1;
+    #main-area {
+        width: 1fr;
     }
     #user-input {
         dock: bottom;
-        margin: 0 0 1 0;
+        margin: 0;
     }
     """
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", show=True, priority=True),
-        Binding("ctrl+l", "clear_log", "Clear"),
+        Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True),
+        Binding("ctrl+l", "clear_chat", "Clear", show=True),
+        Binding("ctrl+1", "tab_chat", "Chat"),
+        Binding("ctrl+2", "tab_files", "Files"),
+        Binding("ctrl+3", "tab_events", "Events"),
     ]
 
     def __init__(
@@ -185,15 +93,15 @@ class LoomApp(App):
         model: ModelProvider,
         tools: ToolRegistry,
         workspace: Path,
-        *,
-        server_url: str | None = None,
+        **kwargs,
     ) -> None:
-        super().__init__()
+        super().__init__(**kwargs)
         self._model = model
         self._tools = tools
         self._workspace = workspace
         self._session: CoworkSession | None = None
         self._busy = False
+        self._total_tokens = 0
 
         # Approval state — resolved via Textual modal
         self._approval_event: asyncio.Event | None = None
@@ -201,12 +109,29 @@ class LoomApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield RichLog(id="chat-log", highlight=True, markup=True, wrap=True)
-        yield Input(placeholder="Type a message... (Enter to send)", id="user-input")
-        yield Static("", id="status-bar")
+        with Horizontal(id="main-layout"):
+            yield Sidebar(self._workspace, id="sidebar")
+            with Vertical(id="main-area"):
+                with TabbedContent(id="tabs"):
+                    with TabPane("Chat", id="tab-chat"):
+                        yield ChatLog(id="chat-log")
+                    with TabPane("Files", id="tab-files"):
+                        yield FilesChangedPanel(id="files-panel")
+                    with TabPane("Events", id="tab-events"):
+                        yield EventPanel(id="events-panel")
+        yield Input(
+            placeholder="Type a message... (Enter to send)",
+            id="user-input",
+        )
+        yield StatusBar(id="status-bar")
         yield Footer()
 
     async def on_mount(self) -> None:
+        # Register and activate theme
+        self.register_theme(LOOM_DARK)
+        self.theme = "loom-dark"
+
+        # Build session
         approver = ToolApprover(prompt_callback=self._approval_callback)
         system_prompt = build_cowork_system_prompt(self._workspace)
         self._session = CoworkSession(
@@ -217,29 +142,32 @@ class LoomApp(App):
             approver=approver,
         )
 
-        log = self.query_one("#chat-log", RichLog)
-        log.write(f"[bold]Loom Cowork[/bold] [dim]({self._model.name})[/dim]")
-        log.write(f"[dim]workspace: {self._workspace}[/dim]")
-        log.write("[dim]16 tools loaded. Type your request.[/dim]")
-        log.write("")
+        # Configure status bar
+        status = self.query_one("#status-bar", StatusBar)
+        status.workspace_name = self._workspace.name
+        status.model_name = self._model.name
 
-        self._update_status("Ready")
+        # Welcome message
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(
+            f"[bold]Loom Cowork[/bold]  [dim]({self._model.name})[/dim]"
+        )
+        chat.add_info(f"workspace: {self._workspace}")
+        tool_count = len(self._tools.list_tools())
+        chat.add_info(f"{tool_count} tools loaded. Type your request.")
+
         self.query_one("#user-input", Input).focus()
 
     # ------------------------------------------------------------------
-    # Approval callback (bridged into Textual modal)
+    # Approval callback
     # ------------------------------------------------------------------
 
-    async def _approval_callback(self, tool_name: str, args: dict) -> ApprovalDecision:
-        """Called by ToolApprover when a tool needs user permission.
+    async def _approval_callback(
+        self, tool_name: str, args: dict,
+    ) -> ApprovalDecision:
+        """Show approval modal and wait for result."""
+        preview = tool_args_preview(tool_name, args)
 
-        Shows a modal and waits for the user's response.
-        """
-        from loom.cowork.approval import _format_args_preview
-
-        preview = _format_args_preview(tool_name, args)
-
-        # Set up an event to wait on
         self._approval_event = asyncio.Event()
         self._approval_result = ApprovalDecision.DENY
 
@@ -258,7 +186,6 @@ class LoomApp(App):
             callback=handle_result,
         )
 
-        # Wait for the modal to be dismissed
         await self._approval_event.wait()
         self._approval_event = None
         return self._approval_result
@@ -276,18 +203,48 @@ class LoomApp(App):
         input_widget = self.query_one("#user-input", Input)
         input_widget.value = ""
 
-        if text.lower() in ("/quit", "/exit", "/q"):
-            self.exit()
-            return
-
-        if text.lower() == "/clear":
-            self.query_one("#chat-log", RichLog).clear()
-            return
+        # Handle slash commands
+        if text.startswith("/"):
+            handled = self._handle_slash_command(text)
+            if handled:
+                return
 
         if self._busy:
             return
 
         self._run_turn(text)
+
+    def _handle_slash_command(self, text: str) -> bool:
+        """Handle slash commands. Returns True if handled."""
+        cmd = text.strip().lower()
+        chat = self.query_one("#chat-log", ChatLog)
+
+        if cmd in ("/quit", "/exit", "/q"):
+            self.exit()
+            return True
+        if cmd == "/clear":
+            self.action_clear_chat()
+            return True
+        if cmd == "/help":
+            chat.add_info(
+                "Commands: /quit, /clear, /model, /tools, /tokens, /help\n"
+                "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette, "
+                "Ctrl+1/2/3 tabs"
+            )
+            return True
+        if cmd == "/model":
+            chat.add_info(f"Model: {self._model.name}")
+            return True
+        if cmd == "/tools":
+            tools = self._tools.list_tools()
+            chat.add_info(
+                f"{len(tools)} tools: " + ", ".join(tools)
+            )
+            return True
+        if cmd == "/tokens":
+            chat.add_info(f"Session tokens: {self._total_tokens:,}")
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Turn execution
@@ -299,114 +256,172 @@ class LoomApp(App):
             return
 
         self._busy = True
-        log = self.query_one("#chat-log", RichLog)
+        chat = self.query_one("#chat-log", ChatLog)
+        status = self.query_one("#status-bar", StatusBar)
+        events_panel = self.query_one("#events-panel", EventPanel)
 
-        # Show user message
-        log.write(f"[bold green]> {user_message}[/bold green]")
-        log.write("")
-
-        self._update_status("Thinking...")
+        chat.add_user_message(user_message)
+        status.state = "Thinking..."
 
         streamed_text = False
 
         try:
-            async for event in self._session.send_streaming(user_message):
+            async for event in self._session.send_streaming(
+                user_message,
+            ):
                 if isinstance(event, str):
-                    # Streamed text token
                     if not streamed_text:
                         streamed_text = True
-                    log.write(event, shrink=False, scroll_end=True)
+                    chat.add_streaming_text(event)
 
                 elif isinstance(event, ToolCallEvent):
                     if event.result is None:
                         # Tool starting
-                        args_preview = _tool_args_preview(event.name, event.args)
-                        log.write(
-                            f"  [dim]{event.name}[/dim] [dim]{args_preview}[/dim]",
+                        chat.add_tool_call(event.name, event.args)
+                        status.state = f"Running {event.name}..."
+                        events_panel.add_event(
+                            _now_str(), "tool_start",
+                            (
+                                f"{event.name} "
+                                f"{tool_args_preview(event.name, event.args)}"
+                            ),
                         )
-                        self._update_status(f"Running {event.name}...")
-
-                        # Handle ask_user specially
-                        if event.name == "ask_user":
-                            pass  # will handle on completion
                     else:
                         # Tool completed
+                        output = ""
                         if event.result.success:
-                            elapsed = f"{event.elapsed_ms}ms" if event.elapsed_ms else ""
-                            preview = _tool_output_preview(event.name, event.result.output)
-                            log.write(
-                                f"  [green]ok[/green] [dim]{elapsed} {preview}[/dim]",
-                            )
-                        else:
-                            error = event.result.error or ""
-                            log.write(f"  [red]err[/red] [dim]{error[:80]}[/dim]")
+                            output = event.result.output
+                        error = event.result.error or ""
+                        chat.add_tool_call(
+                            event.name, event.args,
+                            success=event.result.success,
+                            elapsed_ms=event.elapsed_ms,
+                            output=output,
+                            error=error,
+                        )
+                        etype = (
+                            "tool_ok"
+                            if event.result.success
+                            else "tool_err"
+                        )
+                        events_panel.add_event(
+                            _now_str(), etype,
+                            f"{event.name} {event.elapsed_ms}ms",
+                        )
 
-                        # If ask_user completed, show question and get answer
-                        if event.name == "ask_user" and event.result and event.result.success:
+                        # Update sidebar tasks if task_tracker
+                        if (
+                            event.name == "task_tracker"
+                            and event.result.data
+                        ):
+                            self._update_sidebar_tasks(event)
+
+                        # Handle ask_user
+                        if (
+                            event.name == "ask_user"
+                            and event.result
+                            and event.result.success
+                        ):
                             answer = await self._handle_ask_user(event)
                             if answer:
-                                # Send answer as a follow-up turn
                                 await self._run_followup(answer)
 
                 elif isinstance(event, CoworkTurn):
-                    # Turn complete
                     if event.text and not streamed_text:
-                        log.write(f"\n{event.text}")
+                        chat.add_model_text(event.text)
 
-                    n = len(event.tool_calls)
-                    if n:
-                        log.write(
-                            f"\n[dim][{n} tool call{'s' if n != 1 else ''}"
-                            f" | {event.tokens_used} tokens"
-                            f" | {event.model}][/dim]"
-                        )
-                    log.write("")
+                    self._total_tokens += event.tokens_used
+                    status.total_tokens = self._total_tokens
+
+                    chat.add_turn_separator(
+                        len(event.tool_calls),
+                        event.tokens_used,
+                        event.model,
+                    )
+                    events_panel.add_event(
+                        _now_str(), "turn",
+                        f"{event.tokens_used} tokens",
+                    )
+                    events_panel.record_turn_tokens(event.tokens_used)
+
+                    # Update files panel
+                    self._update_files_panel(event)
 
         except Exception as e:
-            log.write(f"[bold red]Error:[/bold red] {e}")
+            chat.add_model_text(f"[bold #f7768e]Error:[/] {e}")
+            self.notify(str(e), severity="error", timeout=5)
 
         self._busy = False
-        self._update_status("Ready")
+        status.state = "Ready"
 
     async def _run_followup(self, message: str) -> None:
         """Run a follow-up turn (e.g. after ask_user answer)."""
         if self._session is None:
             return
 
-        log = self.query_one("#chat-log", RichLog)
+        chat = self.query_one("#chat-log", ChatLog)
+        events_panel = self.query_one("#events-panel", EventPanel)
         streamed_text = False
 
         async for event in self._session.send_streaming(message):
             if isinstance(event, str):
                 if not streamed_text:
                     streamed_text = True
-                log.write(event, shrink=False, scroll_end=True)
+                chat.add_streaming_text(event)
+
             elif isinstance(event, ToolCallEvent):
                 if event.result is None:
-                    args_preview = _tool_args_preview(event.name, event.args)
-                    log.write(f"  [dim]{event.name}[/dim] [dim]{args_preview}[/dim]")
+                    chat.add_tool_call(event.name, event.args)
+                    events_panel.add_event(
+                        _now_str(), "tool_start",
+                        (
+                            f"{event.name} "
+                            f"{tool_args_preview(event.name, event.args)}"
+                        ),
+                    )
                 else:
+                    output = ""
                     if event.result.success:
-                        elapsed = f"{event.elapsed_ms}ms" if event.elapsed_ms else ""
-                        preview = _tool_output_preview(event.name, event.result.output)
-                        log.write(f"  [green]ok[/green] [dim]{elapsed} {preview}[/dim]")
-                    else:
-                        error = event.result.error or ""
-                        log.write(f"  [red]err[/red] [dim]{error[:80]}[/dim]")
+                        output = event.result.output
+                    error = event.result.error or ""
+                    chat.add_tool_call(
+                        event.name, event.args,
+                        success=event.result.success,
+                        elapsed_ms=event.elapsed_ms,
+                        output=output,
+                        error=error,
+                    )
+                    etype = (
+                        "tool_ok"
+                        if event.result.success
+                        else "tool_err"
+                    )
+                    events_panel.add_event(
+                        _now_str(), etype,
+                        f"{event.name} {event.elapsed_ms}ms",
+                    )
+                    if (
+                        event.name == "task_tracker"
+                        and event.result.data
+                    ):
+                        self._update_sidebar_tasks(event)
+
             elif isinstance(event, CoworkTurn):
                 if event.text and not streamed_text:
-                    log.write(f"\n{event.text}")
-                if event.tool_calls:
-                    n = len(event.tool_calls)
-                    log.write(
-                        f"\n[dim][{n} tool call{'s' if n != 1 else ''}"
-                        f" | {event.tokens_used} tokens][/dim]"
-                    )
-                log.write("")
+                    chat.add_model_text(event.text)
+                self._total_tokens += event.tokens_used
+                status = self.query_one("#status-bar", StatusBar)
+                status.total_tokens = self._total_tokens
+                chat.add_turn_separator(
+                    len(event.tool_calls),
+                    event.tokens_used,
+                    event.model,
+                )
+                events_panel.record_turn_tokens(event.tokens_used)
+                self._update_files_panel(event)
 
     async def _handle_ask_user(self, event: ToolCallEvent) -> str:
         """Show an ask_user modal and return the answer."""
-
         question = event.args.get("question", "")
         options = event.args.get("options", [])
 
@@ -426,76 +441,116 @@ class LoomApp(App):
         answer = answer_holder[0] if answer_holder else ""
 
         if answer:
-            log = self.query_one("#chat-log", RichLog)
-            log.write(f"[bold green]> {answer}[/bold green]")
+            chat = self.query_one("#chat-log", ChatLog)
+            chat.add_user_message(answer)
 
         return answer
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Data panel updates
     # ------------------------------------------------------------------
 
-    def _update_status(self, text: str) -> None:
-        bar = self.query_one("#status-bar", Static)
-        bar.update(f"[dim]{self._workspace}  |  {text}[/dim]")
+    def _update_sidebar_tasks(self, event: ToolCallEvent) -> None:
+        """Update sidebar task progress from task_tracker result."""
+        if not event.result or not event.result.data:
+            return
+        data = event.result.data
+        tasks = data.get("tasks", [])
+        if not tasks and "id" in data:
+            tasks = [data]
+        sidebar = self.query_one("#sidebar", Sidebar)
+        sidebar.update_tasks(tasks)
 
-    def action_clear_log(self) -> None:
-        self.query_one("#chat-log", RichLog).clear()
+    def _update_files_panel(self, turn: CoworkTurn) -> None:
+        """Update the Files Changed panel from tool call events."""
+        file_entries: list[dict] = []
+        for tc in turn.tool_calls:
+            if not tc.result or not tc.result.success:
+                continue
+            path = tc.args.get(
+                "path", tc.args.get("file_path", "?"),
+            )
+            if tc.name == "write_file":
+                file_entries.append({
+                    "operation": "create",
+                    "path": path,
+                    "timestamp": _now_str(),
+                })
+            elif tc.name == "edit_file":
+                file_entries.append({
+                    "operation": "modify",
+                    "path": path,
+                    "timestamp": _now_str(),
+                })
+            elif tc.name == "delete_file":
+                file_entries.append({
+                    "operation": "delete",
+                    "path": path,
+                    "timestamp": _now_str(),
+                })
+        if file_entries:
+            panel = self.query_one("#files-panel", FilesChangedPanel)
+            panel.update_files(file_entries)
+            count = len(file_entries)
+            s = "s" if count != 1 else ""
+            self.notify(
+                f"{count} file{s} changed", timeout=3,
+            )
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def action_toggle_sidebar(self) -> None:
+        self.query_one("#sidebar", Sidebar).toggle()
+
+    def action_clear_chat(self) -> None:
+        chat = self.query_one("#chat-log", ChatLog)
+        for child in list(chat.children):
+            child.remove()
+
+    def action_tab_chat(self) -> None:
+        tabs = self.query_one("#tabs", TabbedContent)
+        tabs.active = "tab-chat"
+
+    def action_tab_files(self) -> None:
+        tabs = self.query_one("#tabs", TabbedContent)
+        tabs.active = "tab-files"
+
+    def action_tab_events(self) -> None:
+        tabs = self.query_one("#tabs", TabbedContent)
+        tabs.active = "tab-events"
+
+    def action_loom_command(self, command: str) -> None:
+        """Dispatch command palette actions."""
+        actions = {
+            "clear_chat": self.action_clear_chat,
+            "toggle_sidebar": self.action_toggle_sidebar,
+            "tab_chat": self.action_tab_chat,
+            "tab_files": self.action_tab_files,
+            "tab_events": self.action_tab_events,
+            "list_tools": self._show_tools,
+            "model_info": self._show_model_info,
+            "token_info": self._show_token_info,
+        }
+        action_fn = actions.get(command)
+        if action_fn:
+            action_fn()
+
+    def _show_tools(self) -> None:
+        tools = self._tools.list_tools()
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(f"{len(tools)} tools: " + ", ".join(tools))
+
+    def _show_model_info(self) -> None:
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(f"Model: {self._model.name}")
+
+    def _show_token_info(self) -> None:
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(f"Session tokens: {self._total_tokens:,}")
 
 
-# ---------------------------------------------------------------------------
-# Display helpers
-# ---------------------------------------------------------------------------
-
-
-def _tool_args_preview(tool_name: str, args: dict) -> str:
-    """Short preview of tool arguments for the chat log."""
-    if tool_name in ("read_file", "write_file", "edit_file", "delete_file"):
-        return _trunc(args.get("path", args.get("file_path", "")), 60)
-    if tool_name == "shell_execute":
-        return _trunc(args.get("command", ""), 80)
-    if tool_name == "git_command":
-        return _trunc(" ".join(args.get("args", [])), 60)
-    if tool_name in ("ripgrep_search", "search_files"):
-        return _trunc(f"/{args.get('pattern', '')}/", 60)
-    if tool_name == "glob_find":
-        return _trunc(args.get("pattern", ""), 60)
-    if tool_name in ("web_fetch", "web_search"):
-        return _trunc(args.get("url", args.get("query", "")), 60)
-    if tool_name == "task_tracker":
-        action = args.get("action", "")
-        content = args.get("content", "")
-        return _trunc(f"{action}: {content}" if content else action, 60)
-    if tool_name == "ask_user":
-        return _trunc(args.get("question", ""), 60)
-    if tool_name == "analyze_code":
-        return _trunc(args.get("path", ""), 60)
-    for v in args.values():
-        if isinstance(v, str) and v:
-            return _trunc(v, 50)
-    return ""
-
-
-def _tool_output_preview(tool_name: str, output: str) -> str:
-    """Short preview of tool output for the chat log."""
-    if not output:
-        return ""
-    if tool_name in ("ripgrep_search", "search_files", "glob_find"):
-        lines = output.strip().split("\n")
-        if lines and ("No matches" in lines[0] or "No files" in lines[0]):
-            return lines[0]
-        return f"{len(lines)} results"
-    if tool_name == "read_file":
-        return f"{len(output.splitlines())} lines"
-    if tool_name == "shell_execute":
-        return _trunc(output.strip().split("\n")[0], 60)
-    if tool_name == "web_search":
-        lines = [x for x in output.strip().split("\n") if x.startswith(("1.", "2.", "3."))]
-        return f"{len(lines)} results" if lines else ""
-    return ""
-
-
-def _trunc(s: str, max_len: int) -> str:
-    if len(s) <= max_len:
-        return s
-    return s[: max_len - 3] + "..."
+def _now_str() -> str:
+    """Return current time as HH:MM:SS string."""
+    return datetime.now().strftime("%H:%M:%S")
