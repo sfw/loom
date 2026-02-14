@@ -400,6 +400,7 @@ class Orchestrator:
     async def _plan_task(self, task: Task) -> Plan:
         """Invoke the planner model to decompose the task into subtasks."""
         workspace_listing = ""
+        code_analysis = ""
         if task.workspace:
             workspace_path = Path(task.workspace)
             if workspace_path.exists():
@@ -409,15 +410,36 @@ class Orchestrator:
                 if listing_result.success:
                     workspace_listing = listing_result.output
 
+                # Auto-analyze code structure for better planning
+                code_analysis = await self._analyze_workspace(workspace_path)
+
         prompt = self._prompts.build_planner_prompt(
             task=task,
             workspace_listing=workspace_listing,
+            code_analysis=code_analysis,
         )
 
         model = self._router.select(tier=2, role="planner")
         response = await model.complete([{"role": "user", "content": prompt}])
 
         return self._parse_plan(response)
+
+    async def _analyze_workspace(self, workspace_path: Path) -> str:
+        """Run code analysis on workspace files for better planning context.
+
+        Returns a summary of code structure (classes, functions, imports)
+        for key source files. Best-effort — returns empty string on failure.
+        """
+        try:
+            from loom.tools.code_analysis import analyze_directory
+
+            structures = analyze_directory(workspace_path, max_files=20)
+            if not structures:
+                return ""
+            summaries = [s.to_summary() for s in structures]
+            return "\n\n".join(summaries)
+        except Exception:
+            return ""
 
     async def _replan_task(self, task: Task) -> bool:
         """Re-plan the task after subtask failures.

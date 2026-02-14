@@ -31,6 +31,11 @@ class FeedbackRequest(BaseModel):
     subtask_id: str | None = None
 
 
+class ConversationMessageRequest(BaseModel):
+    message: str
+    role: str = "user"
+
+
 # --- Response Schemas ---
 
 

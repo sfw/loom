@@ -38,3 +38,6 @@ SUBTASK_RETRYING = "subtask_retrying"
 
 # Streaming events
 TOKEN_STREAMED = "token_streamed"
+
+# Conversation events
+CONVERSATION_MESSAGE = "conversation_message"

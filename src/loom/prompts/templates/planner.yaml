@@ -20,6 +20,9 @@ instructions: |
   WORKSPACE CONTENTS:
   {workspace_listing}
 
+  CODE STRUCTURE ANALYSIS:
+  {code_analysis}
+
   Decompose this goal into subtasks. Respond with ONLY a JSON object:
   {{
     "subtasks": [

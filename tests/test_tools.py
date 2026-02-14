@@ -85,6 +85,8 @@ class TestRegistry:
         assert "git_command" in tools
         assert "search_files" in tools
         assert "list_directory" in tools
+        assert "analyze_code" in tools
+        assert "web_fetch" in tools
 
     def test_register_duplicate_raises(self):
         reg = ToolRegistry()
@@ -94,7 +96,7 @@ class TestRegistry:
 
     def test_all_schemas(self, registry: ToolRegistry):
         schemas = registry.all_schemas()
-        assert len(schemas) == 9
+        assert len(schemas) == 11
         for s in schemas:
             assert "name" in s
             assert "description" in s

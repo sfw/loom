@@ -1,5 +1,6 @@
 """Tool system: registration, dispatch, and built-in tools."""
 
+from loom.tools.code_analysis import AnalyzeCodeTool
 from loom.tools.file_ops import (
     DeleteFileTool,
     EditFileTool,
@@ -14,6 +15,7 @@ from loom.tools.registry import ToolRegistry
 from loom.tools.registry import ToolResult as ToolResult
 from loom.tools.search import ListDirectoryTool, SearchFilesTool
 from loom.tools.shell import ShellExecuteTool
+from loom.tools.web import WebFetchTool
 
 
 def create_default_registry() -> ToolRegistry:
@@ -28,4 +30,6 @@ def create_default_registry() -> ToolRegistry:
     registry.register(GitCommandTool())
     registry.register(SearchFilesTool())
     registry.register(ListDirectoryTool())
+    registry.register(AnalyzeCodeTool())
+    registry.register(WebFetchTool())
     return registry

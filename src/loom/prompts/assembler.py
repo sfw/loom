@@ -59,6 +59,7 @@ class PromptAssembler:
         self,
         task: Task,
         workspace_listing: str = "",
+        code_analysis: str = "",
     ) -> str:
         """Assemble prompt for task decomposition."""
         template = self.get_template("planner")
@@ -69,6 +70,7 @@ class PromptAssembler:
             workspace_path=task.workspace,
             user_context=json.dumps(task.context) if task.context else "None provided.",
             workspace_listing=workspace_listing or "Not yet inspected.",
+            code_analysis=code_analysis or "Not analyzed.",
         ).strip()
         constraints = template.get("constraints", "").strip()
 

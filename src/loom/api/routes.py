@@ -11,6 +11,7 @@ from sse_starlette.sse import EventSourceResponse
 from loom.api.engine import Engine
 from loom.api.schemas import (
     ApprovalRequest,
+    ConversationMessageRequest,
     FeedbackRequest,
     HealthResponse,
     ModelInfo,
@@ -348,6 +349,77 @@ async def submit_feedback(request: Request, task_id: str, body: FeedbackRequest)
     ))
 
     return {"status": "ok", "message": "Feedback recorded."}
+
+
+@router.post("/tasks/{task_id}/message")
+async def send_conversation_message(
+    request: Request, task_id: str, body: ConversationMessageRequest,
+):
+    """Send a conversational message to a running task.
+
+    Messages are injected into the executor's context as memory entries,
+    enabling back-and-forth clarification during execution.
+    """
+    engine = _get_engine(request)
+
+    if not engine.state_manager.exists(task_id):
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+
+    task = engine.state_manager.load(task_id)
+    if task.status not in (TaskStatus.EXECUTING, TaskStatus.PLANNING):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot send message to task in status: {task.status.value}",
+        )
+
+    # Store as conversation turn in memory
+    await engine.memory_manager.store(MemoryEntry(
+        task_id=task_id,
+        entry_type="user_instruction",
+        summary=body.message[:150],
+        detail=body.message,
+        tags="conversation",
+    ))
+
+    # Emit conversation event
+    engine.event_bus.emit(Event(
+        event_type="conversation_message",
+        task_id=task_id,
+        data={
+            "role": body.role,
+            "message": body.message,
+        },
+    ))
+
+    return {
+        "status": "ok",
+        "message": "Message delivered.",
+        "task_id": task_id,
+    }
+
+
+@router.get("/tasks/{task_id}/conversation")
+async def get_conversation_history(request: Request, task_id: str):
+    """Retrieve conversation history for a task."""
+    engine = _get_engine(request)
+
+    if not engine.state_manager.exists(task_id):
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+
+    entries = await engine.memory_manager.query(
+        task_id=task_id,
+        entry_type="user_instruction",
+    )
+    return [
+        {
+            "id": e.id,
+            "message": e.detail,
+            "summary": e.summary,
+            "tags": e.tags,
+            "timestamp": e.timestamp,
+        }
+        for e in entries
+    ]
 
 
 # --- Subtask Level ---

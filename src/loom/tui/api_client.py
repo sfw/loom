@@ -111,6 +111,44 @@ class LoomAPIClient:
                     except json.JSONDecodeError:
                         continue
 
+    # --- Memory & Feedback ---
+
+    async def get_memory(self, task_id: str) -> list[dict]:
+        """Fetch memory entries for a task."""
+        client = await self._get_client()
+        r = await client.get(f"/tasks/{task_id}/memory")
+        r.raise_for_status()
+        return r.json()
+
+    async def submit_feedback(self, task_id: str, feedback: str) -> dict:
+        """Submit feedback for a task."""
+        client = await self._get_client()
+        r = await client.post(
+            f"/tasks/{task_id}/feedback",
+            json={"feedback": feedback},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    # --- Conversation ---
+
+    async def get_conversation_history(self, task_id: str) -> list[dict]:
+        """Fetch conversation history for a task."""
+        client = await self._get_client()
+        r = await client.get(f"/tasks/{task_id}/conversation")
+        r.raise_for_status()
+        return r.json()
+
+    async def send_message(self, task_id: str, message: str) -> dict:
+        """Send a conversation message to a running task."""
+        client = await self._get_client()
+        r = await client.post(
+            f"/tasks/{task_id}/message",
+            json={"message": message},
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def stream_all_events(self) -> AsyncIterator[dict]:
         """Subscribe to global SSE event stream (all tasks)."""
         client = await self._get_client()
