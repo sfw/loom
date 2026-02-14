@@ -237,15 +237,16 @@ class TestLLMVerifier:
         assert result.feedback == "Add try/except blocks"
 
     @pytest.mark.asyncio
-    async def test_passes_with_low_confidence_on_no_verifier(self):
+    async def test_fails_safe_on_no_verifier(self):
         router = MagicMock(spec=ModelRouter)
         router.select = MagicMock(side_effect=Exception("No model"))
 
         prompts = MagicMock(spec=PromptAssembler)
         v = LLMVerifier(router, prompts, ResponseValidator())
         result = await v.verify(_make_subtask(), "output", [], None)
-        assert result.passed
-        assert result.confidence == 0.5
+        assert not result.passed
+        assert result.confidence == 0.0
+        assert "No verifier model configured" in result.feedback
 
 
 # --- VotingVerifier ---

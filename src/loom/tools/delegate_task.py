@@ -193,7 +193,13 @@ def _format_result(task: Task) -> str:
 
 
 def _collect_files_changed(task: Task) -> list[str]:
-    """Extract file paths from task changes for the ToolResult."""
-    if task.workspace_changes.last_change:
-        return [task.workspace_changes.last_change]
-    return []
+    """Report file change summary from task workspace changes."""
+    changes = task.workspace_changes
+    result: list[str] = []
+    if changes.files_created:
+        result.append(f"({changes.files_created} files created)")
+    if changes.files_modified:
+        result.append(f"({changes.files_modified} files modified)")
+    if changes.files_deleted:
+        result.append(f"({changes.files_deleted} files deleted)")
+    return result

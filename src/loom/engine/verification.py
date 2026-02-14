@@ -176,8 +176,11 @@ class LLMVerifier:
         try:
             model = self._router.select(tier=1, role="verifier")
         except Exception:
-            # No verifier model configured — pass by default
-            return VerificationResult(tier=2, passed=True, confidence=0.5)
+            # No verifier model configured — fail safe, don't silently pass
+            return VerificationResult(
+                tier=2, passed=False, confidence=0.0,
+                feedback="No verifier model configured — cannot verify output.",
+            )
 
         # Format tool calls
         tool_lines = []
@@ -299,7 +302,12 @@ class VerificationGates:
                 return t1
 
         if tier < 2 or not self._config.tier2_enabled:
-            return VerificationResult(tier=1, passed=True)
+            # Tier 1 either passed or was skipped; no higher-tier check requested
+            return VerificationResult(
+                tier=1,
+                passed=True,
+                confidence=0.7 if self._config.tier1_enabled else 0.5,
+            )
 
         # Tier 2: independent LLM check
         t2 = await self._tier2.verify(subtask, result_summary, tool_calls, workspace)

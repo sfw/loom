@@ -177,7 +177,6 @@ def _build_tree(
 
 
 def _glob_match(filename: str, pattern: str) -> bool:
-    """Simple glob matching for file patterns like '*.py'."""
-    if pattern.startswith("*."):
-        return filename.endswith(pattern[1:])
-    return filename == pattern
+    """Glob matching for file patterns like '*.py', 'test_*.py', '*.{js,ts}'."""
+    import fnmatch
+    return fnmatch.fnmatch(filename, pattern)

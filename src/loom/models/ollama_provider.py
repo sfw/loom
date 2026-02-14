@@ -105,7 +105,10 @@ class OllamaProvider(ModelProvider):
                 func = tc.get("function", {})
                 args = func.get("arguments", {})
                 if isinstance(args, str):
-                    args = json.loads(args)
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
                 tool_calls.append(ToolCall(
                     id=f"call_{i}",
                     name=func.get("name", ""),
@@ -202,7 +205,10 @@ class OllamaProvider(ModelProvider):
                             func = tc.get("function", {})
                             args = func.get("arguments", {})
                             if isinstance(args, str):
-                                args = json.loads(args)
+                                try:
+                                    args = json.loads(args)
+                                except json.JSONDecodeError:
+                                    args = {}
                             parsed_tools.append(ToolCall(
                                 id=f"call_{i}",
                                 name=func.get("name", ""),

@@ -194,7 +194,7 @@ class CoworkSession:
 
         total_tokens = 0
         all_tool_events: list[ToolCallEvent] = []
-        final_text = ""
+        text_parts: list[str] = []
 
         for _ in range(MAX_TOOL_ITERATIONS):
             # Call the model
@@ -204,9 +204,9 @@ class CoworkSession:
             )
             total_tokens += response.usage.total_tokens
 
-            # Accumulate text
+            # Accumulate text across iterations
             if response.text:
-                final_text = response.text
+                text_parts.append(response.text)
 
             if response.has_tool_calls():
                 tc_dicts = self._tool_calls_to_dicts(response.tool_calls)
@@ -235,7 +235,7 @@ class CoworkSession:
                             event.elapsed_ms = 0
                             all_tool_events.append(event)
                             yield event
-                            self._append_tool_result(tc.id, tc.name, result)
+                            await self._append_tool_result(tc.id, tc.name, result)
                             continue
 
                     start = time.monotonic()
@@ -247,7 +247,7 @@ class CoworkSession:
                     all_tool_events.append(event)
                     yield event
 
-                    self._append_tool_result(tc.id, tc.name, result)
+                    await self._append_tool_result(tc.id, tc.name, result)
 
                     if tc.name in _USER_INTERACTION_TOOLS:
                         ask_user_pending = True
@@ -275,7 +275,7 @@ class CoworkSession:
         await self._persist_session_metadata()
 
         yield CoworkTurn(
-            text=final_text,
+            text="\n\n".join(text_parts),
             tool_calls=all_tool_events,
             tokens_used=total_tokens,
             model=self._model.name,
@@ -303,10 +303,10 @@ class CoworkSession:
 
         total_tokens = 0
         all_tool_events: list[ToolCallEvent] = []
-        final_text = ""
+        all_text_parts: list[str] = []
 
         for _ in range(MAX_TOOL_ITERATIONS):
-            text_parts: list[str] = []
+            iter_text_parts: list[str] = []
             final_tool_calls: list[ToolCall] | None = None
             final_usage = None
 
@@ -315,7 +315,7 @@ class CoworkSession:
                 tools=self._tools.all_schemas() or None,
             ):
                 if chunk.text:
-                    text_parts.append(chunk.text)
+                    iter_text_parts.append(chunk.text)
                     yield chunk.text
                 if chunk.tool_calls is not None:
                     final_tool_calls = chunk.tool_calls
@@ -323,11 +323,11 @@ class CoworkSession:
                     final_usage = chunk.usage
 
             from loom.models.base import TokenUsage
-            response_text = "".join(text_parts)
+            response_text = "".join(iter_text_parts)
             total_tokens += (final_usage or TokenUsage()).total_tokens
 
             if response_text:
-                final_text = response_text
+                all_text_parts.append(response_text)
 
             if final_tool_calls:
                 tc_dicts = self._tool_calls_to_dicts(final_tool_calls)
@@ -355,7 +355,7 @@ class CoworkSession:
                             event.elapsed_ms = 0
                             all_tool_events.append(event)
                             yield event
-                            self._append_tool_result(tc.id, tc.name, result)
+                            await self._append_tool_result(tc.id, tc.name, result)
                             continue
 
                     start = time.monotonic()
@@ -367,7 +367,7 @@ class CoworkSession:
                     all_tool_events.append(event)
                     yield event
 
-                    self._append_tool_result(tc.id, tc.name, result)
+                    await self._append_tool_result(tc.id, tc.name, result)
 
                     if tc.name in _USER_INTERACTION_TOOLS:
                         ask_user_pending = True
@@ -392,7 +392,7 @@ class CoworkSession:
         await self._persist_session_metadata()
 
         yield CoworkTurn(
-            text=final_text,
+            text="\n\n".join(all_text_parts),
             tool_calls=all_tool_events,
             tokens_used=total_tokens,
             model=self._model.name,
@@ -429,20 +429,6 @@ class CoworkSession:
     # ------------------------------------------------------------------
     # Context management
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _is_safe_cut_point(messages: list[dict], idx: int) -> bool:
-        """Check if cutting before idx leaves a valid message sequence.
-
-        Invalid cuts: mid tool_calls→tool sequence, or starting with role=tool.
-        """
-        if idx >= len(messages):
-            return True
-        first = messages[idx]
-        # Never start on a tool result
-        if first.get("role") == "tool":
-            return False
-        return True
 
     def _context_window(self) -> list[dict]:
         """Return the messages to send to the model.
@@ -534,7 +520,7 @@ class CoworkSession:
         if self._messages and self._messages[0]["role"] == "system":
             self._messages[0]["content"] = self._build_system_content()
 
-    def _append_tool_result(self, tool_call_id: str, tool_name: str, result: ToolResult) -> None:
+    async def _append_tool_result(self, tool_call_id: str, tool_name: str, result: ToolResult) -> None:
         """Append a tool result message and persist it."""
         content = result.to_json()
         self._messages.append({
@@ -542,12 +528,10 @@ class CoworkSession:
             "tool_call_id": tool_call_id,
             "content": content,
         })
-        # Fire-and-forget persist (don't block the tool loop)
-        import asyncio
-        asyncio.ensure_future(self._persist_turn(
+        await self._persist_turn(
             "tool", content=content,
             tool_call_id=tool_call_id, tool_name=tool_name,
-        ))
+        )
 
     @staticmethod
     def _tool_calls_to_dicts(tool_calls: list[ToolCall]) -> list[dict]:

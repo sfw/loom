@@ -188,6 +188,15 @@ class AnthropicProvider(ModelProvider):
                     "content": msg.get("content", ""),
                 })
 
+            else:
+                # Unknown role — treat as user message to avoid silent data loss
+                import logging
+                logging.getLogger(__name__).warning("Unknown message role '%s', treating as user", role)
+                anthropic_messages.append({
+                    "role": "user",
+                    "content": msg.get("content", ""),
+                })
+
         return system_prompt, anthropic_messages
 
     def _convert_tools(self, tools: list[dict] | None) -> list[dict] | None:

@@ -325,6 +325,9 @@ class EditFileTool(Tool):
         old_str = args["old_str"]
         new_str = args["new_str"]
 
+        if not old_str:
+            return ToolResult.fail("old_str cannot be empty.")
+
         count = content.count(old_str)
         if count == 0:
             return ToolResult.fail(f"old_str not found in {args['path']}")

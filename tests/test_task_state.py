@@ -219,8 +219,10 @@ class TestTaskStateManager:
         mgr = TaskStateManager(tmp_path)
         task = _make_task()
         task.plan = Plan(subtasks=[
-            Subtask(id="s1", description="test", summary="x" * 200),
+            Subtask(id="s1", description="test", summary="x" * 300),
         ])
         yaml_str = mgr.to_yaml(task)
         data = yaml.safe_load(yaml_str)
-        assert len(data["subtasks"][0]["summary"]) == 100
+        # Truncated to 200 chars + "..."
+        assert len(data["subtasks"][0]["summary"]) == 203
+        assert data["subtasks"][0]["summary"].endswith("...")

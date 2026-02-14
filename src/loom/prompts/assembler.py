@@ -65,16 +65,20 @@ class PromptAssembler:
         template = self.get_template("planner")
 
         role = template.get("role", "").strip()
-        # Use safe_substitute to prevent KeyError from user-supplied {braces}
-        from string import Template as _StrTemplate
-        _tmpl = _StrTemplate(template.get("instructions", "").replace("{", "${"))
-        instructions = _tmpl.safe_substitute(
-            goal=task.goal,
-            workspace_path=task.workspace,
-            user_context=json.dumps(task.context) if task.context else "None provided.",
-            workspace_listing=workspace_listing or "Not yet inspected.",
-            code_analysis=code_analysis or "Not analyzed.",
-        ).strip()
+        # Use manual replacement to prevent KeyError from user-supplied {braces}
+        # while preserving literal braces in JSON, code, etc.
+        raw = template.get("instructions", "")
+        replacements = {
+            "goal": task.goal,
+            "workspace_path": task.workspace,
+            "user_context": json.dumps(task.context) if task.context else "None provided.",
+            "workspace_listing": workspace_listing or "Not yet inspected.",
+            "code_analysis": code_analysis or "Not analyzed.",
+        }
+        instructions = raw
+        for key, value in replacements.items():
+            instructions = instructions.replace("{" + key + "}", str(value))
+        instructions = instructions.strip()
         constraints = template.get("constraints", "").strip()
 
         sections = [role, instructions, constraints]

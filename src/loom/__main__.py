@@ -342,7 +342,9 @@ async def _cowork_session(
             return
 
     # Set up database and conversation store
-    db_path = Path(config.data_dir) / "loom.db" if hasattr(config, "data_dir") else Path.home() / ".loom" / "loom.db"
+    data_dir = Path(config.workspace.scratch_dir).expanduser() if hasattr(config, "workspace") else Path.home() / ".loom"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_path = data_dir / "loom.db"
     db = Database(db_path)
     await db.initialize()
     store = ConversationStore(db)
@@ -453,13 +455,12 @@ async def _cowork_session(
         from loom.state.task_state import TaskStateManager
         from loom.tools import create_default_registry as _create_tools
 
-        data_dir = Path(config.data_dir) if hasattr(config, "data_dir") else Path.home() / ".loom"
         return Orchestrator(
             model_router=router,
             tool_registry=_create_tools(),
             memory_manager=MemoryManager(db),
-            prompt_assembler=PromptAssembler(config),
-            state_manager=TaskStateManager(data_dir),
+            prompt_assembler=PromptAssembler(),
+            state_manager=TaskStateManager(data_dir),  # uses data_dir from outer scope
             event_bus=EventBus(),
             config=config,
         )
@@ -563,6 +564,7 @@ async def _cowork_session(
         try:
             user_input = input("\033[1m> \033[0m")
         except (EOFError, KeyboardInterrupt):
+            await store.update_session(session.session_id, is_active=False)
             display_goodbye()
             break
 
@@ -573,6 +575,7 @@ async def _cowork_session(
 
         # Handle special commands
         if cmd in ("/quit", "/exit", "/q"):
+            await store.update_session(session.session_id, is_active=False)
             display_goodbye()
             break
 

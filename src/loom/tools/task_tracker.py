@@ -7,6 +7,7 @@ memory for the session — no persistence needed.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
@@ -65,20 +66,22 @@ class TaskTrackerTool(Tool):
         super().__init__()
         self._tasks: list[_Task] = []
         self._next_id = 1
+        self._lock = asyncio.Lock()
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         action = args.get("action", "")
 
-        if action == "add":
-            return self._add(args.get("content", ""))
-        elif action == "update":
-            return self._update(args.get("task_id"), args.get("status", ""))
-        elif action == "list":
-            return self._list()
-        elif action == "clear":
-            return self._clear()
-        else:
-            return ToolResult.fail(f"Unknown action: {action}")
+        async with self._lock:
+            if action == "add":
+                return self._add(args.get("content", ""))
+            elif action == "update":
+                return self._update(args.get("task_id"), args.get("status", ""))
+            elif action == "list":
+                return self._list()
+            elif action == "clear":
+                return self._clear()
+            else:
+                return ToolResult.fail(f"Unknown action: {action}")
 
     def _add(self, content: str) -> ToolResult:
         if not content:

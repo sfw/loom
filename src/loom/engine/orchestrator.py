@@ -155,7 +155,7 @@ class Orchestrator:
 
                 # Cap to max_parallel_subtasks
                 batch = runnable[:max_parallel]
-                iteration += len(batch)
+                iteration += 1
 
                 # Dispatch batch
                 if len(batch) == 1:
@@ -277,12 +277,12 @@ class Orchestrator:
         attempts_by_subtask: dict[str, list[AttemptRecord]],
     ) -> None:
         """Process a failed subtask: record attempt, retry or replan."""
-        attempts = attempts_by_subtask.get(subtask.id, [])
-        attempts_by_subtask.setdefault(subtask.id, []).append(
+        attempt_list = attempts_by_subtask.setdefault(subtask.id, [])
+        attempt_list.append(
             AttemptRecord(
-                attempt=len(attempts) + 1,
+                attempt=len(attempt_list) + 1,
                 tier=self._retry.get_escalation_tier(
-                    len(attempts), subtask.model_tier,
+                    len(attempt_list), subtask.model_tier,
                 ),
                 feedback=verification.feedback if verification else None,
                 error=result.summary,
@@ -447,7 +447,7 @@ class Orchestrator:
         model = self._router.select(tier=2, role="planner")
         response = await model.complete([{"role": "user", "content": prompt}])
 
-        return self._parse_plan(response)
+        return self._parse_plan(response, goal=task.goal)
 
     async def _analyze_workspace(self, workspace_path: Path) -> str:
         """Run code analysis on workspace files for better planning context.
@@ -490,7 +490,7 @@ class Orchestrator:
 
             model = self._router.select(tier=2, role="planner")
             response = await model.complete([{"role": "user", "content": prompt}])
-            new_plan = self._parse_plan(response)
+            new_plan = self._parse_plan(response, goal=task.goal)
 
             # Preserve completed subtask state
             completed_ids = {
@@ -519,7 +519,7 @@ class Orchestrator:
             self._state.save(task)
             return False
 
-    def _parse_plan(self, response: ModelResponse) -> Plan:
+    def _parse_plan(self, response: ModelResponse, goal: str = "") -> Plan:
         """Parse a plan from the model's JSON response."""
         validation = self._validator.validate_json_response(
             response, expected_keys=["subtasks"]
@@ -529,7 +529,7 @@ class Orchestrator:
             return Plan(
                 subtasks=[Subtask(
                     id="execute-goal",
-                    description="Execute the task goal directly",
+                    description=goal or "Execute the task goal directly",
                     model_tier=2,
                 )],
                 version=1,

@@ -35,6 +35,11 @@ VALID_ENTRY_TYPES = frozenset(
 )
 
 
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcard characters (%, _, \\) for safe SQL LIKE queries."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class Database:
     """Async SQLite database wrapper for Loom.
 
@@ -71,6 +76,16 @@ class Database:
             cursor = await db.execute(sql, params)
             await db.commit()
             return cursor.lastrowid
+
+    async def execute_many_returning_ids(self, sql: str, params_list: list[tuple]) -> list[int]:
+        """Execute multiple inserts in a single transaction and return lastrowids."""
+        async with aiosqlite.connect(self._db_path) as db:
+            ids = []
+            for params in params_list:
+                cursor = await db.execute(sql, params)
+                ids.append(cursor.lastrowid)
+            await db.commit()
+            return ids
 
     async def query(self, sql: str, params: tuple = ()) -> list[dict]:
         """Execute a read query and return results as dicts."""
@@ -196,8 +211,8 @@ class Database:
         if tags:
             tag_conditions = []
             for tag in tags:
-                tag_conditions.append("tags LIKE ?")
-                params.append(f"%{tag}%")
+                tag_conditions.append("tags LIKE ? ESCAPE '\\'")
+                params.append(f"%{_escape_like(tag)}%")
             conditions.append(f"({' OR '.join(tag_conditions)})")
 
         where = " AND ".join(conditions)
@@ -226,24 +241,25 @@ class Database:
                WHERE task_id = ?
                AND (
                    subtask_id = ?
-                   OR relevance_to LIKE ?
+                   OR relevance_to LIKE ? ESCAPE '\\'
                    OR entry_type IN ('decision', 'error', 'user_instruction')
                )
                ORDER BY timestamp DESC
                LIMIT ?""",
-            (task_id, subtask_id, f"%{subtask_id}%", limit),
+            (task_id, subtask_id, f"%{_escape_like(subtask_id)}%", limit),
         )
         return [self._row_to_entry(r) for r in rows]
 
     async def search_memory(self, task_id: str, query: str, limit: int = 20) -> list[MemoryEntry]:
         """Full-text search across memory entries for a task."""
+        escaped = _escape_like(query)
         rows = await self.query(
             """SELECT * FROM memory_entries
                WHERE task_id = ?
-               AND (summary LIKE ? OR detail LIKE ? OR tags LIKE ?)
+               AND (summary LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')
                ORDER BY timestamp DESC
                LIMIT ?""",
-            (task_id, f"%{query}%", f"%{query}%", f"%{query}%", limit),
+            (task_id, f"%{escaped}%", f"%{escaped}%", f"%{escaped}%", limit),
         )
         return [self._row_to_entry(r) for r in rows]
 
@@ -315,12 +331,27 @@ class MemoryManager:
         return await self._db.insert_memory_entry(entry)
 
     async def store_many(self, entries: list[MemoryEntry]) -> list[int]:
-        """Store multiple memory entries."""
-        ids = []
+        """Store multiple memory entries atomically in a single transaction."""
         for entry in entries:
-            entry_id = await self.store(entry)
-            ids.append(entry_id)
-        return ids
+            if entry.entry_type not in VALID_ENTRY_TYPES:
+                raise ValueError(
+                    f"Invalid entry_type: {entry.entry_type}. Must be one of {VALID_ENTRY_TYPES}"
+                )
+        params_list = [
+            (
+                entry.task_id, entry.subtask_id,
+                entry.timestamp or datetime.now().isoformat(),
+                entry.entry_type, entry.summary, entry.detail,
+                entry.tags, entry.relevance_to,
+            )
+            for entry in entries
+        ]
+        return await self._db.execute_many_returning_ids(
+            """INSERT INTO memory_entries
+               (task_id, subtask_id, timestamp, entry_type, summary, detail, tags, relevance_to)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            params_list,
+        )
 
     async def query_relevant(self, task_id: str, subtask_id: str) -> list[MemoryEntry]:
         """Get memory entries relevant to a subtask."""

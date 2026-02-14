@@ -212,7 +212,10 @@ class TaskStateManager:
         for s in task.plan.subtasks:
             entry: dict = {"id": s.id, "status": s.status.value}
             if s.summary:
-                entry["summary"] = s.summary[:100]
+                summary = s.summary[:200]
+                if len(s.summary) > 200:
+                    summary += "..."
+                entry["summary"] = summary
             if s.active_issue:
                 entry["active_issue"] = s.active_issue
             if s.depends_on:

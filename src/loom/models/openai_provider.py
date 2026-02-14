@@ -95,9 +95,9 @@ class OpenAICompatibleProvider(ModelProvider):
 
         data = response.json()
         choices = data.get("choices")
-        if not choices or not isinstance(choices, list):
+        if not choices or not isinstance(choices, list) or len(choices) == 0:
             raise ModelConnectionError(
-                f"Malformed response from {self._model}: missing 'choices'"
+                f"Malformed response from {self._model}: missing or empty 'choices'"
             )
         choice = choices[0]
         message = choice.get("message", {})
@@ -106,12 +106,16 @@ class OpenAICompatibleProvider(ModelProvider):
         if message.get("tool_calls"):
             tool_calls = []
             for tc in message["tool_calls"]:
-                args = tc["function"]["arguments"]
+                func = tc.get("function", {})
+                args = func.get("arguments", {})
                 if isinstance(args, str):
-                    args = json.loads(args)
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
                 tool_calls.append(ToolCall(
                     id=tc.get("id", ""),
-                    name=tc["function"]["name"],
+                    name=func.get("name", ""),
                     arguments=args,
                 ))
 
