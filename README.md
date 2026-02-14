@@ -162,7 +162,7 @@ max_tokens = 2048
 temperature = 0.0
 roles = ["extractor", "verifier"]
 
-# Optional: Anthropic/Claude for cowork mode or high-tier tasks
+# Optional: Anthropic/Claude as an additional or alternative provider
 # [models.claude]
 # provider = "anthropic"
 # model = "claude-sonnet-4-5-20250929"

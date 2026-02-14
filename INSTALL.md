@@ -248,7 +248,7 @@ curl http://localhost:1234/v1/models
 
 ```bash
 pytest
-# Should show 612+ passed
+# Should show 633+ passed
 ```
 
 ### 4. Start the Server
