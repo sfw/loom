@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from loom.models.base import (
+    ModelConnectionError,
     ModelProvider,
     ModelResponse,
     StreamChunk,
@@ -279,8 +280,32 @@ class AnthropicProvider(ModelProvider):
         if temp > 0:
             body["temperature"] = temp
 
-        response = await client.post("/v1/messages", json=body)
-        response.raise_for_status()
+        try:
+            response = await client.post("/v1/messages", json=body)
+            response.raise_for_status()
+        except httpx.ConnectError as e:
+            raise ModelConnectionError(
+                f"Cannot connect to Anthropic API at "
+                f"{self._base_url}: {e}",
+                original=e,
+            ) from e
+        except httpx.TimeoutException as e:
+            raise ModelConnectionError(
+                f"Anthropic request timed out ({self._model}): {e}",
+                original=e,
+            ) from e
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            body_text = e.response.text[:200]
+            if status == 401:
+                msg = "Invalid Anthropic API key"
+            elif status == 429:
+                msg = "Anthropic rate limit exceeded"
+            else:
+                msg = f"Anthropic returned HTTP {status}"
+            raise ModelConnectionError(
+                f"{msg}: {body_text}", original=e,
+            ) from e
         return self._parse_response(response.json())
 
     async def stream(
@@ -318,8 +343,36 @@ class AnthropicProvider(ModelProvider):
         input_tokens = 0
         output_tokens = 0
 
-        async with client.stream("POST", "/v1/messages", json=body) as response:
+        try:
+            cm = client.stream("POST", "/v1/messages", json=body)
+            response = await cm.__aenter__()
             response.raise_for_status()
+        except httpx.ConnectError as e:
+            raise ModelConnectionError(
+                f"Cannot connect to Anthropic API at "
+                f"{self._base_url}: {e}",
+                original=e,
+            ) from e
+        except httpx.TimeoutException as e:
+            raise ModelConnectionError(
+                f"Anthropic streaming timed out "
+                f"({self._model}): {e}",
+                original=e,
+            ) from e
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            body_text = e.response.text[:200]
+            if status == 401:
+                msg = "Invalid Anthropic API key"
+            elif status == 429:
+                msg = "Anthropic rate limit exceeded"
+            else:
+                msg = f"Anthropic returned HTTP {status}"
+            raise ModelConnectionError(
+                f"{msg}: {body_text}", original=e,
+            ) from e
+
+        try:
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -372,12 +425,22 @@ class AnthropicProvider(ModelProvider):
                     usage_info = event.get("usage", {})
                     output_tokens = usage_info.get("output_tokens", 0)
 
-        # Yield final chunk with tool calls and usage
-        yield StreamChunk(
-            tool_calls=current_tool_calls if current_tool_calls else None,
-            usage=TokenUsage(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                total_tokens=input_tokens + output_tokens,
-            ),
-        )
+            # Yield final chunk with tool calls and usage
+            yield StreamChunk(
+                tool_calls=(
+                    current_tool_calls if current_tool_calls else None
+                ),
+                usage=TokenUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
+                ),
+            )
+        except httpx.ReadError as e:
+            raise ModelConnectionError(
+                f"Anthropic stream interrupted "
+                f"({self._model}): {e}",
+                original=e,
+            ) from e
+        finally:
+            await cm.__aexit__(None, None, None)

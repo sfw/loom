@@ -13,7 +13,14 @@ from collections.abc import AsyncGenerator
 import httpx
 
 from loom.config import ModelConfig
-from loom.models.base import ModelProvider, ModelResponse, StreamChunk, TokenUsage, ToolCall
+from loom.models.base import (
+    ModelConnectionError,
+    ModelProvider,
+    ModelResponse,
+    StreamChunk,
+    TokenUsage,
+    ToolCall,
+)
 
 
 class OpenAICompatibleProvider(ModelProvider):
@@ -61,8 +68,29 @@ class OpenAICompatibleProvider(ModelProvider):
             payload["response_format"] = response_format
 
         start = time.monotonic()
-        response = await self._client.post("/chat/completions", json=payload)
-        response.raise_for_status()
+        try:
+            response = await self._client.post(
+                "/chat/completions", json=payload,
+            )
+            response.raise_for_status()
+        except httpx.ConnectError as e:
+            raise ModelConnectionError(
+                f"Cannot connect to model server at "
+                f"{self._client.base_url}: {e}",
+                original=e,
+            ) from e
+        except httpx.TimeoutException as e:
+            raise ModelConnectionError(
+                f"Model request timed out ({self._model}): {e}",
+                original=e,
+            ) from e
+        except httpx.HTTPStatusError as e:
+            raise ModelConnectionError(
+                f"Model server returned HTTP "
+                f"{e.response.status_code}: "
+                f"{e.response.text[:200]}",
+                original=e,
+            ) from e
         latency = int((time.monotonic() - start) * 1000)
 
         data = response.json()
@@ -116,9 +144,32 @@ class OpenAICompatibleProvider(ModelProvider):
         if tools:
             payload["tools"] = self._format_tools(tools)
 
-        async with self._client.stream("POST", "/chat/completions", json=payload) as response:
+        try:
+            cm = self._client.stream(
+                "POST", "/chat/completions", json=payload,
+            )
+            response = await cm.__aenter__()
             response.raise_for_status()
+        except httpx.ConnectError as e:
+            raise ModelConnectionError(
+                f"Cannot connect to model server at "
+                f"{self._client.base_url}: {e}",
+                original=e,
+            ) from e
+        except httpx.TimeoutException as e:
+            raise ModelConnectionError(
+                f"Streaming request timed out ({self._model}): {e}",
+                original=e,
+            ) from e
+        except httpx.HTTPStatusError as e:
+            raise ModelConnectionError(
+                f"Model server returned HTTP "
+                f"{e.response.status_code}: "
+                f"{e.response.text[:200]}",
+                original=e,
+            ) from e
 
+        try:
             # Buffer tool call deltas until complete
             tool_call_buffers: dict[int, dict] = {}
 
@@ -136,7 +187,11 @@ class OpenAICompatibleProvider(ModelProvider):
                             buf = tool_call_buffers[idx]
                             args_str = buf.get("arguments", "")
                             try:
-                                args = json.loads(args_str) if args_str else {}
+                                args = (
+                                    json.loads(args_str)
+                                    if args_str
+                                    else {}
+                                )
                             except json.JSONDecodeError:
                                 args = {}
                             parsed_tools.append(ToolCall(
@@ -144,7 +199,10 @@ class OpenAICompatibleProvider(ModelProvider):
                                 name=buf.get("name", ""),
                                 arguments=args,
                             ))
-                    yield StreamChunk(text="", done=True, tool_calls=parsed_tools)
+                    yield StreamChunk(
+                        text="", done=True,
+                        tool_calls=parsed_tools,
+                    )
                     return
 
                 try:
@@ -162,7 +220,9 @@ class OpenAICompatibleProvider(ModelProvider):
                         idx = tc_delta.get("index", 0)
                         if idx not in tool_call_buffers:
                             tool_call_buffers[idx] = {
-                                "id": "", "name": "", "arguments": "",
+                                "id": "",
+                                "name": "",
+                                "arguments": "",
                             }
                         buf = tool_call_buffers[idx]
                         if tc_delta.get("id"):
@@ -178,13 +238,28 @@ class OpenAICompatibleProvider(ModelProvider):
                 if data.get("usage"):
                     u = data["usage"]
                     usage = TokenUsage(
-                        input_tokens=u.get("prompt_tokens", 0),
-                        output_tokens=u.get("completion_tokens", 0),
-                        total_tokens=u.get("total_tokens", 0),
+                        input_tokens=u.get(
+                            "prompt_tokens", 0,
+                        ),
+                        output_tokens=u.get(
+                            "completion_tokens", 0,
+                        ),
+                        total_tokens=u.get(
+                            "total_tokens", 0,
+                        ),
                     )
 
                 if text:
-                    yield StreamChunk(text=text, done=False, usage=usage)
+                    yield StreamChunk(
+                        text=text, done=False, usage=usage,
+                    )
+        except httpx.ReadError as e:
+            raise ModelConnectionError(
+                f"Stream interrupted ({self._model}): {e}",
+                original=e,
+            ) from e
+        finally:
+            await cm.__aexit__(None, None, None)
 
     async def health_check(self) -> bool:
         try:

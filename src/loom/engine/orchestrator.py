@@ -164,11 +164,37 @@ class Orchestrator:
                         task, batch[0], attempts_by_subtask,
                     )]
                 else:
-                    # Parallel dispatch
-                    outcomes = await asyncio.gather(*[
-                        self._dispatch_subtask(task, s, attempts_by_subtask)
-                        for s in batch
-                    ])
+                    # Parallel dispatch — use return_exceptions so one
+                    # failure doesn't abort the entire batch.
+                    raw_outcomes = await asyncio.gather(
+                        *[
+                            self._dispatch_subtask(
+                                task, s, attempts_by_subtask,
+                            )
+                            for s in batch
+                        ],
+                        return_exceptions=True,
+                    )
+                    outcomes = []
+                    for i, item in enumerate(raw_outcomes):
+                        if isinstance(item, BaseException):
+                            # Convert exception into a failed result
+                            from loom.engine.runner import SubtaskResult
+                            from loom.recovery.confidence import (
+                                VerificationResult,
+                            )
+
+                            failed = SubtaskResult(
+                                status="failed",
+                                output="",
+                                error=str(item),
+                            )
+                            no_verif = VerificationResult()
+                            outcomes.append(
+                                (batch[i], failed, no_verif),
+                            )
+                        else:
+                            outcomes.append(item)
 
                 # Process outcomes (retry / replan / approve)
                 for subtask, result, verification in outcomes:

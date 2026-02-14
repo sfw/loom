@@ -13,7 +13,14 @@ from collections.abc import AsyncGenerator
 import httpx
 
 from loom.config import ModelConfig
-from loom.models.base import ModelProvider, ModelResponse, StreamChunk, TokenUsage, ToolCall
+from loom.models.base import (
+    ModelConnectionError,
+    ModelProvider,
+    ModelResponse,
+    StreamChunk,
+    TokenUsage,
+    ToolCall,
+)
 
 
 class OllamaProvider(ModelProvider):
@@ -64,8 +71,28 @@ class OllamaProvider(ModelProvider):
             payload["format"] = response_format.get("type", "json")
 
         start = time.monotonic()
-        response = await self._client.post("/api/chat", json=payload)
-        response.raise_for_status()
+        try:
+            response = await self._client.post(
+                "/api/chat", json=payload,
+            )
+            response.raise_for_status()
+        except httpx.ConnectError as e:
+            raise ModelConnectionError(
+                f"Cannot connect to Ollama at "
+                f"{self._client.base_url}: {e}",
+                original=e,
+            ) from e
+        except httpx.TimeoutException as e:
+            raise ModelConnectionError(
+                f"Ollama request timed out ({self._model}): {e}",
+                original=e,
+            ) from e
+        except httpx.HTTPStatusError as e:
+            raise ModelConnectionError(
+                f"Ollama returned HTTP {e.response.status_code}: "
+                f"{e.response.text[:200]}",
+                original=e,
+            ) from e
         latency = int((time.monotonic() - start) * 1000)
 
         data = response.json()
@@ -121,8 +148,31 @@ class OllamaProvider(ModelProvider):
         if tools:
             payload["tools"] = self._format_ollama_tools(tools)
 
-        async with self._client.stream("POST", "/api/chat", json=payload) as response:
+        try:
+            cm = self._client.stream(
+                "POST", "/api/chat", json=payload,
+            )
+            response = await cm.__aenter__()
             response.raise_for_status()
+        except httpx.ConnectError as e:
+            raise ModelConnectionError(
+                f"Cannot connect to Ollama at "
+                f"{self._client.base_url}: {e}",
+                original=e,
+            ) from e
+        except httpx.TimeoutException as e:
+            raise ModelConnectionError(
+                f"Ollama streaming timed out ({self._model}): {e}",
+                original=e,
+            ) from e
+        except httpx.HTTPStatusError as e:
+            raise ModelConnectionError(
+                f"Ollama returned HTTP {e.response.status_code}: "
+                f"{e.response.text[:200]}",
+                original=e,
+            ) from e
+
+        try:
             accumulated_tool_calls: list[dict] = []
 
             async for line in response.aiter_lines():
@@ -177,6 +227,13 @@ class OllamaProvider(ModelProvider):
 
                 if done:
                     return
+        except httpx.ReadError as e:
+            raise ModelConnectionError(
+                f"Ollama stream interrupted ({self._model}): {e}",
+                original=e,
+            ) from e
+        finally:
+            await cm.__aexit__(None, None, None)
 
     async def health_check(self) -> bool:
         try:

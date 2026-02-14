@@ -21,9 +21,16 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        import logging
+
         from loom.api.engine import create_engine
 
-        engine = await create_engine(resolved_config)
+        logger = logging.getLogger("loom.server")
+        try:
+            engine = await create_engine(resolved_config)
+        except Exception as e:
+            logger.error("Failed to initialize engine: %s", e)
+            raise
         app.state.engine = engine
         yield
         await engine.shutdown()

@@ -117,3 +117,15 @@ class ModelProvider(ABC):
 
 class ModelNotAvailableError(Exception):
     """Raised when no suitable model is available for a request."""
+
+
+class ModelConnectionError(Exception):
+    """Raised when a model API call fails due to network or server issues.
+
+    Wraps the underlying httpx/transport error with a user-friendly
+    message and preserves the original exception for debugging.
+    """
+
+    def __init__(self, message: str, original: Exception | None = None):
+        super().__init__(message)
+        self.original = original

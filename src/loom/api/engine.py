@@ -57,15 +57,31 @@ class Engine:
 
 async def create_engine(config: Config) -> Engine:
     """Create and initialize all Loom components."""
+    import logging
+
+    logger = logging.getLogger("loom.engine")
+
     # Database
     db_path = Path(config.memory.database_path).expanduser()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    database = Database(str(db_path))
-    await database.initialize()
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        database = Database(str(db_path))
+        await database.initialize()
+    except Exception as e:
+        logger.error("Database initialization failed: %s", e)
+        raise RuntimeError(
+            f"Cannot initialize database at {db_path}: {e}"
+        ) from e
 
     # State manager
     data_dir = Path(config.workspace.scratch_dir).expanduser()
-    data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.error("Cannot create data directory: %s", e)
+        raise RuntimeError(
+            f"Cannot create data directory {data_dir}: {e}"
+        ) from e
     state_manager = TaskStateManager(data_dir=data_dir)
 
     # Memory

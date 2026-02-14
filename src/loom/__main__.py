@@ -43,8 +43,14 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 
     from loom.api.server import create_app
 
-    app = create_app(config)
-    uvicorn.run(app, host=actual_host, port=actual_port, log_level="info")
+    try:
+        app = create_app(config)
+        uvicorn.run(
+            app, host=actual_host, port=actual_port, log_level="info",
+        )
+    except Exception as e:
+        click.echo(f"Server failed to start: {e}", err=True)
+        sys.exit(1)
 
 
 @cli.command()
@@ -116,27 +122,34 @@ async def _run_task(server_url: str, goal: str, workspace: str | None) -> None:
     """Submit task and stream progress."""
     import httpx
 
-    async with httpx.AsyncClient(base_url=server_url, timeout=300) as client:
-        payload: dict = {"goal": goal}
-        if workspace:
-            payload["workspace"] = workspace
+    try:
+        async with httpx.AsyncClient(base_url=server_url, timeout=300) as client:
+            payload: dict = {"goal": goal}
+            if workspace:
+                payload["workspace"] = workspace
 
-        response = await client.post("/tasks", json=payload)
-        if response.status_code != 201:
-            click.echo(f"Error: {response.text}", err=True)
-            sys.exit(1)
+            response = await client.post("/tasks", json=payload)
+            if response.status_code != 201:
+                click.echo(f"Error: {response.text}", err=True)
+                sys.exit(1)
 
-        task = response.json()
-        task_id = task["task_id"]
-        click.echo(f"Task created: {task_id}")
+            task = response.json()
+            task_id = task["task_id"]
+            click.echo(f"Task created: {task_id}")
 
-        # Stream events
-        async with client.stream("GET", f"/tasks/{task_id}/stream") as stream:
-            async for line in stream.aiter_lines():
-                if not line.strip() or line.startswith(":"):
-                    continue
-                if line.startswith("data: "):
-                    click.echo(line[6:])
+            # Stream events
+            async with client.stream("GET", f"/tasks/{task_id}/stream") as stream:
+                async for line in stream.aiter_lines():
+                    if not line.strip() or line.startswith(":"):
+                        continue
+                    if line.startswith("data: "):
+                        click.echo(line[6:])
+    except httpx.ConnectError:
+        click.echo(f"Error: Cannot connect to server at {server_url}", err=True)
+        sys.exit(1)
+    except httpx.TimeoutException:
+        click.echo("Error: Request timed out", err=True)
+        sys.exit(1)
 
 
 @cli.command()
@@ -157,15 +170,22 @@ async def _check_status(server_url: str, task_id: str) -> None:
     """Fetch and display task status."""
     import httpx
 
-    async with httpx.AsyncClient(base_url=server_url) as client:
-        response = await client.get(f"/tasks/{task_id}")
-        if response.status_code == 404:
-            click.echo(f"Task not found: {task_id}", err=True)
-            sys.exit(1)
-        data = response.json()
-        click.echo(f"Task:   {data['task_id']}")
-        click.echo(f"Status: {data['status']}")
-        click.echo(f"Goal:   {data.get('goal', 'N/A')}")
+    try:
+        async with httpx.AsyncClient(base_url=server_url) as client:
+            response = await client.get(f"/tasks/{task_id}")
+            if response.status_code == 404:
+                click.echo(f"Task not found: {task_id}", err=True)
+                sys.exit(1)
+            data = response.json()
+            click.echo(f"Task:   {data['task_id']}")
+            click.echo(f"Status: {data['status']}")
+            click.echo(f"Goal:   {data.get('goal', 'N/A')}")
+    except httpx.ConnectError:
+        click.echo(
+            f"Error: Cannot connect to server at {server_url}",
+            err=True,
+        )
+        sys.exit(1)
 
 
 @cli.command()
@@ -186,12 +206,19 @@ async def _cancel_task(server_url: str, task_id: str) -> None:
     """Cancel a task."""
     import httpx
 
-    async with httpx.AsyncClient(base_url=server_url) as client:
-        response = await client.post(f"/tasks/{task_id}/cancel")
-        if response.status_code == 404:
-            click.echo(f"Task not found: {task_id}", err=True)
-            sys.exit(1)
-        click.echo(f"Task {task_id} cancelled.")
+    try:
+        async with httpx.AsyncClient(base_url=server_url) as client:
+            response = await client.post(f"/tasks/{task_id}/cancel")
+            if response.status_code == 404:
+                click.echo(f"Task not found: {task_id}", err=True)
+                sys.exit(1)
+            click.echo(f"Task {task_id} cancelled.")
+    except httpx.ConnectError:
+        click.echo(
+            f"Error: Cannot connect to server at {server_url}",
+            err=True,
+        )
+        sys.exit(1)
 
 
 @cli.command()

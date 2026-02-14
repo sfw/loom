@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+class ConfigError(Exception):
+    """Raised when configuration loading or validation fails."""
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     host: str = "127.0.0.1"
@@ -126,8 +130,13 @@ def load_config(path: Path | None = None) -> Config:
     if path is None or not path.exists():
         return Config()
 
-    with open(path, "rb") as f:
-        raw = tomllib.load(f)
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"Invalid TOML in {path}: {e}") from e
+    except OSError as e:
+        raise ConfigError(f"Cannot read config {path}: {e}") from e
 
     server_data = raw.get("server", {})
     server = ServerConfig(
