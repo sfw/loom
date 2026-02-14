@@ -2,20 +2,24 @@
 
 Drives task execution: plan -> execute subtasks -> verify -> complete.
 The model never decides to "continue" — the harness does.
+
+Subtask execution is delegated to SubtaskRunner.  Independent subtasks
+(no unmet dependencies) are dispatched in parallel up to
+``config.execution.max_parallel_subtasks``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-import time
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from loom.config import Config
+from loom.engine.runner import SubtaskResult, SubtaskRunner, ToolCallRecord
 from loom.engine.scheduler import Scheduler
-from loom.engine.verification import VerificationGates
+from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
     SUBTASK_COMPLETED,
@@ -49,35 +53,29 @@ from loom.state.task_state import (
 from loom.tools.registry import ToolRegistry, ToolResult
 from loom.tools.workspace import ChangeLog
 
-
-@dataclass
-class ToolCallRecord:
-    """Record of a single tool invocation during subtask execution."""
-
-    tool: str
-    args: dict
-    result: ToolResult
-    timestamp: str = ""
-
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = datetime.now().isoformat()
-
-
-@dataclass
-class SubtaskResult:
-    """Result of a subtask execution."""
-
-    status: str  # success, failed, blocked
-    summary: str
-    tool_calls: list[ToolCallRecord] = field(default_factory=list)
-    duration_seconds: float = 0.0
-    tokens_used: int = 0
-    model_used: str = ""
+# Re-export dataclasses that existing code imports from here
+__all__ = [
+    "Orchestrator",
+    "SubtaskResult",
+    "ToolCallRecord",
+    "create_task",
+]
 
 
 class Orchestrator:
-    """Core orchestrator loop."""
+    """Core orchestrator loop.
+
+    Responsibilities:
+    - Task lifecycle (planning, execution, finalization)
+    - Subtask scheduling and parallel dispatch
+    - Retry / escalation / re-planning decisions
+    - Approval gating (confidence-based)
+    - Event emission and state persistence
+    - Post-task learning
+
+    Subtask execution (tool loop, verification, memory extraction)
+    is delegated to SubtaskRunner.
+    """
 
     def __init__(
         self,
@@ -111,6 +109,18 @@ class Orchestrator:
         self._retry = RetryManager(
             max_retries=config.execution.max_subtask_retries,
         )
+        self._state_lock = asyncio.Lock()
+
+        # Runner handles the inner subtask execution
+        self._runner = SubtaskRunner(
+            model_router=model_router,
+            tool_registry=tool_registry,
+            memory_manager=memory_manager,
+            prompt_assembler=prompt_assembler,
+            state_manager=state_manager,
+            verification=self._verification,
+            config=config,
+        )
 
     async def execute_task(self, task: Task) -> Task:
         """Main entry point. Drives the full task lifecycle."""
@@ -128,128 +138,50 @@ class Orchestrator:
                 "subtask_ids": [s.id for s in plan.subtasks],
             })
 
-            # 2. Execution loop
+            # 2. Execution loop — parallel dispatch of independent subtasks
             self._emit(TASK_EXECUTING, task.id, {})
             iteration = 0
             max_iterations = self._config.execution.max_loop_iterations
+            max_parallel = self._config.execution.max_parallel_subtasks
             attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
 
             while self._scheduler.has_pending(task.plan) and iteration < max_iterations:
-                iteration += 1
-
                 if task.status == TaskStatus.CANCELLED:
                     break
 
-                subtask = self._scheduler.next_subtask(task.plan)
-                if subtask is None:
+                # Get all runnable subtasks (dependencies met)
+                runnable = self._scheduler.runnable_subtasks(task.plan)
+                if not runnable:
                     break
 
-                # Determine escalation tier based on retry count
-                attempts = attempts_by_subtask.get(subtask.id, [])
-                escalated_tier = self._retry.get_escalation_tier(
-                    attempt=len(attempts),
-                    original_tier=subtask.model_tier,
-                )
-                retry_context = self._retry.build_retry_context(attempts)
+                # Cap to max_parallel_subtasks
+                batch = runnable[:max_parallel]
+                iteration += len(batch)
 
-                result, verification = await self._execute_subtask(
-                    task, subtask,
-                    model_tier=escalated_tier,
-                    retry_context=retry_context,
-                )
-
-                if result.status == "failed":
-                    # Record the failed attempt
-                    attempts_by_subtask.setdefault(subtask.id, []).append(
-                        AttemptRecord(
-                            attempt=len(attempts) + 1,
-                            tier=escalated_tier,
-                            feedback=verification.feedback if verification else None,
-                            error=result.summary,
-                        )
-                    )
-
-                    # Memory extraction also runs on failure (for learning)
-                    await self._extract_memory(task, subtask, result)
-
-                    if subtask.retry_count < subtask.max_retries:
-                        subtask.retry_count += 1
-                        subtask.status = SubtaskStatus.PENDING
-                        task.update_subtask(
-                            subtask.id,
-                            status=SubtaskStatus.PENDING,
-                            retry_count=subtask.retry_count,
-                        )
-                        self._state.save(task)
-                        self._emit(SUBTASK_RETRYING, task.id, {
-                            "subtask_id": subtask.id,
-                            "attempt": subtask.retry_count,
-                            "escalated_tier": self._retry.get_escalation_tier(
-                                subtask.retry_count, subtask.model_tier,
-                            ),
-                            "feedback": verification.feedback if verification else None,
-                        })
-                    else:
-                        # All retries exhausted — trigger re-planning
-                        replanned = await self._replan_task(task)
-                        if not replanned:
-                            break
+                # Dispatch batch
+                if len(batch) == 1:
+                    # Single subtask — no gather overhead
+                    outcomes = [await self._dispatch_subtask(
+                        task, batch[0], attempts_by_subtask,
+                    )]
                 else:
-                    # Confidence scoring and approval check on success
-                    if verification:
-                        confidence = self._confidence.score(
-                            subtask, result, verification,
+                    # Parallel dispatch
+                    outcomes = await asyncio.gather(*[
+                        self._dispatch_subtask(task, s, attempts_by_subtask)
+                        for s in batch
+                    ])
+
+                # Process outcomes (retry / replan / approve)
+                for subtask, result, verification in outcomes:
+                    if result.status == "failed":
+                        await self._handle_failure(
+                            task, subtask, result, verification,
+                            attempts_by_subtask,
                         )
-                        decision = self._approval.check_approval(
-                            approval_mode=task.approval_mode,
-                            confidence=confidence.score,
-                            result=result,
-                            confidence_threshold=self._config.execution.auto_approve_confidence_threshold,
+                    else:
+                        await self._handle_success(
+                            task, subtask, result, verification,
                         )
-
-                        if decision in (
-                            ApprovalDecision.WAIT,
-                            ApprovalDecision.WAIT_WITH_TIMEOUT,
-                        ):
-                            timeout = 10 if decision == ApprovalDecision.WAIT_WITH_TIMEOUT else None
-                            task.status = TaskStatus.WAITING_APPROVAL
-                            self._state.save(task)
-
-                            approved = await self._approval.request_approval(
-                                ApprovalRequest(
-                                    task_id=task.id,
-                                    subtask_id=subtask.id,
-                                    reason=f"Confidence {confidence.band} ({confidence.score:.2f})",
-                                    proposed_action=result.summary,
-                                    risk_level=confidence.band,
-                                    details=confidence.components,
-                                    auto_approve_timeout=timeout,
-                                )
-                            )
-
-                            task.status = TaskStatus.EXECUTING
-                            self._state.save(task)
-
-                            if not approved:
-                                # Rejection — mark subtask as failed
-                                subtask.status = SubtaskStatus.FAILED
-                                task.update_subtask(
-                                    subtask.id,
-                                    status=SubtaskStatus.FAILED,
-                                    summary="Rejected by human reviewer",
-                                )
-                                self._state.save(task)
-                                continue
-
-                        elif decision == ApprovalDecision.ABORT:
-                            subtask.status = SubtaskStatus.FAILED
-                            task.update_subtask(
-                                subtask.id,
-                                status=SubtaskStatus.FAILED,
-                                summary="Aborted: confidence too low",
-                            )
-                            self._state.save(task)
-                            continue
 
             # 3. Completion
             result_task = self._finalize_task(task)
@@ -267,6 +199,226 @@ class Orchestrator:
             await self._learn_from_task(task)
             return task
 
+    # ------------------------------------------------------------------
+    # Subtask dispatch
+    # ------------------------------------------------------------------
+
+    async def _dispatch_subtask(
+        self,
+        task: Task,
+        subtask: Subtask,
+        attempts_by_subtask: dict[str, list[AttemptRecord]],
+    ) -> tuple[Subtask, SubtaskResult, VerificationResult]:
+        """Prepare and dispatch a subtask to the runner.
+
+        Handles pre-dispatch bookkeeping (status, events, escalation)
+        and returns (subtask, result, verification) for the orchestrator
+        to process.
+        """
+        # Mark running and emit event (under lock for parallel safety)
+        async with self._state_lock:
+            subtask.status = SubtaskStatus.RUNNING
+            self._state.save(task)
+        self._emit(SUBTASK_STARTED, task.id, {"subtask_id": subtask.id})
+
+        # Determine escalation tier
+        attempts = attempts_by_subtask.get(subtask.id, [])
+        escalated_tier = self._retry.get_escalation_tier(
+            attempt=len(attempts),
+            original_tier=subtask.model_tier,
+        )
+        retry_context = self._retry.build_retry_context(attempts)
+        changelog = self._get_changelog(task)
+
+        result, verification = await self._runner.run(
+            task, subtask,
+            model_tier=escalated_tier,
+            retry_context=retry_context,
+            changelog=changelog,
+        )
+
+        return subtask, result, verification
+
+    # ------------------------------------------------------------------
+    # Outcome handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_failure(
+        self,
+        task: Task,
+        subtask: Subtask,
+        result: SubtaskResult,
+        verification: VerificationResult,
+        attempts_by_subtask: dict[str, list[AttemptRecord]],
+    ) -> None:
+        """Process a failed subtask: record attempt, retry or replan."""
+        attempts = attempts_by_subtask.get(subtask.id, [])
+        attempts_by_subtask.setdefault(subtask.id, []).append(
+            AttemptRecord(
+                attempt=len(attempts) + 1,
+                tier=self._retry.get_escalation_tier(
+                    len(attempts), subtask.model_tier,
+                ),
+                feedback=verification.feedback if verification else None,
+                error=result.summary,
+            )
+        )
+
+        async with self._state_lock:
+            subtask.status = SubtaskStatus.FAILED
+            subtask.summary = verification.feedback or "Verification failed"
+            task.update_subtask(
+                subtask.id,
+                status=SubtaskStatus.FAILED,
+                summary=subtask.summary,
+            )
+            task.add_error(subtask.id, f"Verification failed (tier {verification.tier})")
+            self._state.save(task)
+
+        self._emit(SUBTASK_FAILED, task.id, {
+            "subtask_id": subtask.id,
+            "verification_tier": verification.tier,
+            "feedback": verification.feedback,
+        })
+
+        if subtask.retry_count < subtask.max_retries:
+            subtask.retry_count += 1
+            async with self._state_lock:
+                subtask.status = SubtaskStatus.PENDING
+                task.update_subtask(
+                    subtask.id,
+                    status=SubtaskStatus.PENDING,
+                    retry_count=subtask.retry_count,
+                )
+                self._state.save(task)
+
+            self._emit(SUBTASK_RETRYING, task.id, {
+                "subtask_id": subtask.id,
+                "attempt": subtask.retry_count,
+                "escalated_tier": self._retry.get_escalation_tier(
+                    subtask.retry_count, subtask.model_tier,
+                ),
+                "feedback": verification.feedback if verification else None,
+            })
+        else:
+            # All retries exhausted — trigger re-planning
+            await self._replan_task(task)
+
+    async def _handle_success(
+        self,
+        task: Task,
+        subtask: Subtask,
+        result: SubtaskResult,
+        verification: VerificationResult,
+    ) -> None:
+        """Process a successful subtask: update state, check approval."""
+        summary = result.summary
+
+        # Update state
+        async with self._state_lock:
+            subtask.status = SubtaskStatus.COMPLETED
+            subtask.summary = summary
+            task.update_subtask(subtask.id, status=SubtaskStatus.COMPLETED, summary=summary)
+
+            # Update workspace_changes from changelog
+            changelog = self._get_changelog(task)
+            if changelog:
+                change_summary = changelog.get_summary()
+                task.workspace_changes.files_created = len(change_summary["created"])
+                task.workspace_changes.files_modified = len(change_summary["modified"])
+                task.workspace_changes.files_deleted = len(change_summary["deleted"])
+                task.workspace_changes.last_change = datetime.now().isoformat()
+
+            self._state.save(task)
+
+        self._emit(SUBTASK_COMPLETED, task.id, {
+            "subtask_id": subtask.id,
+            "status": result.status,
+            "summary": summary,
+            "duration": result.duration_seconds,
+        })
+
+        # Confidence scoring and approval check
+        if verification:
+            confidence = self._confidence.score(subtask, result, verification)
+            decision = self._approval.check_approval(
+                approval_mode=task.approval_mode,
+                confidence=confidence.score,
+                result=result,
+                confidence_threshold=self._config.execution.auto_approve_confidence_threshold,
+            )
+
+            if decision in (
+                ApprovalDecision.WAIT,
+                ApprovalDecision.WAIT_WITH_TIMEOUT,
+            ):
+                timeout = 10 if decision == ApprovalDecision.WAIT_WITH_TIMEOUT else None
+                async with self._state_lock:
+                    task.status = TaskStatus.WAITING_APPROVAL
+                    self._state.save(task)
+
+                approved = await self._approval.request_approval(
+                    ApprovalRequest(
+                        task_id=task.id,
+                        subtask_id=subtask.id,
+                        reason=f"Confidence {confidence.band} ({confidence.score:.2f})",
+                        proposed_action=result.summary,
+                        risk_level=confidence.band,
+                        details=confidence.components,
+                        auto_approve_timeout=timeout,
+                    )
+                )
+
+                async with self._state_lock:
+                    task.status = TaskStatus.EXECUTING
+                    self._state.save(task)
+
+                if not approved:
+                    async with self._state_lock:
+                        subtask.status = SubtaskStatus.FAILED
+                        task.update_subtask(
+                            subtask.id,
+                            status=SubtaskStatus.FAILED,
+                            summary="Rejected by human reviewer",
+                        )
+                        self._state.save(task)
+
+            elif decision == ApprovalDecision.ABORT:
+                async with self._state_lock:
+                    subtask.status = SubtaskStatus.FAILED
+                    task.update_subtask(
+                        subtask.id,
+                        status=SubtaskStatus.FAILED,
+                        summary="Aborted: confidence too low",
+                    )
+                    self._state.save(task)
+
+    # ------------------------------------------------------------------
+    # Planning
+    # ------------------------------------------------------------------
+
+    async def _plan_task(self, task: Task) -> Plan:
+        """Invoke the planner model to decompose the task into subtasks."""
+        workspace_listing = ""
+        if task.workspace:
+            workspace_path = Path(task.workspace)
+            if workspace_path.exists():
+                listing_result = await self._tools.execute(
+                    "list_directory", {}, workspace=workspace_path
+                )
+                if listing_result.success:
+                    workspace_listing = listing_result.output
+
+        prompt = self._prompts.build_planner_prompt(
+            task=task,
+            workspace_listing=workspace_listing,
+        )
+
+        model = self._router.select(tier=2, role="planner")
+        response = await model.complete([{"role": "user", "content": prompt}])
+
+        return self._parse_plan(response)
+
     async def _replan_task(self, task: Task) -> bool:
         """Re-plan the task after subtask failures.
 
@@ -274,7 +426,6 @@ class Orchestrator:
         """
         self._emit(TASK_REPLANNING, task.id, {"reason": "subtask_failures"})
 
-        # Gather discoveries and errors for the replanner
         discoveries = [d for d in task.decisions_log]
         errors = [
             f"{e.subtask}: {e.error}" for e in task.errors_encountered
@@ -302,7 +453,6 @@ class Orchestrator:
             new_plan.version = task.plan.version + 1
             new_plan.last_replanned = datetime.now().isoformat()
 
-            # Mark any subtasks that were already completed
             for s in new_plan.subtasks:
                 if s.id in completed_ids:
                     s.status = SubtaskStatus.COMPLETED
@@ -322,29 +472,6 @@ class Orchestrator:
             self._state.save(task)
             return False
 
-    async def _plan_task(self, task: Task) -> Plan:
-        """Invoke the planner model to decompose the task into subtasks."""
-        # Build workspace listing if available
-        workspace_listing = ""
-        if task.workspace:
-            workspace_path = Path(task.workspace)
-            if workspace_path.exists():
-                listing_result = await self._tools.execute(
-                    "list_directory", {}, workspace=workspace_path
-                )
-                if listing_result.success:
-                    workspace_listing = listing_result.output
-
-        prompt = self._prompts.build_planner_prompt(
-            task=task,
-            workspace_listing=workspace_listing,
-        )
-
-        model = self._router.select(tier=2, role="planner")
-        response = await model.complete([{"role": "user", "content": prompt}])
-
-        return self._parse_plan(response)
-
     def _parse_plan(self, response: ModelResponse) -> Plan:
         """Parse a plan from the model's JSON response."""
         validation = self._validator.validate_json_response(
@@ -352,7 +479,6 @@ class Orchestrator:
         )
 
         if not validation.valid or validation.parsed is None:
-            # Fallback: create a single-step plan
             return Plan(
                 subtasks=[Subtask(
                     id="execute-goal",
@@ -377,6 +503,10 @@ class Orchestrator:
 
         return Plan(subtasks=subtasks, version=1)
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     def _get_changelog(self, task: Task) -> ChangeLog | None:
         """Get or create a ChangeLog for the task's workspace."""
         if not task.workspace:
@@ -386,192 +516,12 @@ class Orchestrator:
         data_dir.mkdir(parents=True, exist_ok=True)
         return ChangeLog(task_id=task.id, workspace=workspace, data_dir=data_dir)
 
-    async def _execute_subtask(
-        self,
-        task: Task,
-        subtask: Subtask,
-        model_tier: int | None = None,
-        retry_context: str = "",
-    ) -> tuple[SubtaskResult, object]:
-        """Execute a single subtask with tool-calling loop.
-
-        Returns (SubtaskResult, VerificationResult) tuple.
-        """
-        subtask.status = SubtaskStatus.RUNNING
-        self._state.save(task)
-        self._emit(SUBTASK_STARTED, task.id, {"subtask_id": subtask.id})
-
-        start_time = time.monotonic()
-        workspace = Path(task.workspace) if task.workspace else None
-        changelog = self._get_changelog(task)
-
-        # Assemble prompt
-        memory_entries = await self._memory.query_relevant(task.id, subtask.id)
-        prompt = self._prompts.build_executor_prompt(
-            task=task,
-            subtask=subtask,
-            state_manager=self._state,
-            memory_entries=memory_entries,
-            available_tools=self._tools.all_schemas(),
-        )
-
-        # Inject retry context if this is a retry attempt
-        if retry_context:
-            prompt = prompt + "\n\n" + retry_context
-
-        # Select model (use escalated tier if provided)
-        effective_tier = model_tier if model_tier is not None else subtask.model_tier
-        model = self._router.select(tier=effective_tier, role="executor")
-
-        # Inner tool-calling loop
-        messages: list[dict] = [{"role": "user", "content": prompt}]
-        tool_calls_record: list[ToolCallRecord] = []
-        max_tool_iterations = 20
-        total_tokens = 0
-
-        for _ in range(max_tool_iterations):
-            response = await model.complete(
-                messages, tools=self._tools.all_schemas()
-            )
-            total_tokens += response.usage.total_tokens
-
-            if response.has_tool_calls():
-                # Validate tool calls before execution
-                validation = self._validator.validate_tool_calls(
-                    response, self._tools.all_schemas()
-                )
-                if not validation.valid:
-                    # Invalid tool calls — inject error and retry
-                    messages.append({
-                        "role": "assistant",
-                        "content": response.text or None,
-                    })
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            f"TOOL CALL ERROR: {validation.error}\n"
-                            f"{validation.suggestion}\n"
-                            "Please retry with valid tool calls."
-                        ),
-                    })
-                    continue
-
-                # Process validated tool calls
-                messages.append({
-                    "role": "assistant",
-                    "content": response.text or None,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                        for tc in response.tool_calls
-                    ],
-                })
-
-                for tc in response.tool_calls:
-                    tool_result = await self._tools.execute(
-                        tc.name, tc.arguments,
-                        workspace=workspace,
-                        changelog=changelog,
-                        subtask_id=subtask.id,
-                    )
-                    tool_calls_record.append(ToolCallRecord(
-                        tool=tc.name, args=tc.arguments, result=tool_result,
-                    ))
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": tool_result.to_json(),
-                    })
-
-                # Anti-amnesia: inject TODO reminder
-                messages.append({
-                    "role": "system",
-                    "content": self._build_todo_reminder(task, subtask),
-                })
-            else:
-                # Text-only response — subtask complete
-                break
-
-        elapsed = time.monotonic() - start_time
-        summary = response.text[:200] if response.text else "No output"
-
-        result = SubtaskResult(
-            status="success",
-            summary=summary,
-            tool_calls=tool_calls_record,
-            duration_seconds=elapsed,
-            tokens_used=total_tokens,
-            model_used=model.name,
-        )
-
-        # Run verification gates
-        verification = await self._verification.verify(
-            subtask=subtask,
-            result_summary=summary,
-            tool_calls=tool_calls_record,
-            workspace=workspace,
-            tier=subtask.verification_tier,
-        )
-
-        if not verification.passed:
-            result.status = "failed"
-            subtask.status = SubtaskStatus.FAILED
-            subtask.summary = verification.feedback or "Verification failed"
-            task.update_subtask(
-                subtask.id,
-                status=SubtaskStatus.FAILED,
-                summary=subtask.summary,
-            )
-            task.add_error(subtask.id, f"Verification failed (tier {verification.tier})")
-            self._state.save(task)
-            self._emit(SUBTASK_FAILED, task.id, {
-                "subtask_id": subtask.id,
-                "verification_tier": verification.tier,
-                "feedback": verification.feedback,
-            })
-            return result, verification
-
-        # Update state
-        subtask.status = SubtaskStatus.COMPLETED
-        subtask.summary = summary
-        task.update_subtask(subtask.id, status=SubtaskStatus.COMPLETED, summary=summary)
-
-        # Update workspace_changes from changelog
-        if changelog:
-            change_summary = changelog.get_summary()
-            task.workspace_changes.files_created = len(change_summary["created"])
-            task.workspace_changes.files_modified = len(change_summary["modified"])
-            task.workspace_changes.files_deleted = len(change_summary["deleted"])
-            task.workspace_changes.last_change = datetime.now().isoformat()
-
-        self._state.save(task)
-
-        self._emit(SUBTASK_COMPLETED, task.id, {
-            "subtask_id": subtask.id,
-            "status": result.status,
-            "summary": summary,
-            "duration": elapsed,
-        })
-
-        # Extract structured memory entries from the subtask execution
-        await self._extract_memory(task, subtask, result)
-
-        return result, verification
-
     def _finalize_task(self, task: Task) -> Task:
         """Finalize task: set status, emit events."""
         completed, total = task.progress
         all_done = completed == total and total > 0
 
         if task.status == TaskStatus.CANCELLED:
-            # Skip remaining subtasks
             for s in task.plan.subtasks:
                 if s.status == SubtaskStatus.PENDING:
                     s.status = SubtaskStatus.SKIPPED
@@ -595,84 +545,6 @@ class Orchestrator:
         self._state.save(task)
         return task
 
-    async def _extract_memory(
-        self, task: Task, subtask: Subtask, result: SubtaskResult
-    ) -> None:
-        """Extract structured memory entries from subtask execution.
-
-        Uses a tier-1 extractor model to identify decisions, discoveries,
-        errors, and artifacts from the tool calls and output.
-        Runs on both success and failure for learning.
-        """
-        try:
-            model = self._router.select(tier=1, role="extractor")
-        except Exception:
-            # No extractor model configured — skip memory extraction
-            return
-
-        # Format tool calls for the prompt
-        tool_lines = []
-        for tc in result.tool_calls:
-            status = "OK" if tc.result.success else f"FAILED: {tc.result.error}"
-            tool_lines.append(f"- {tc.tool}({json.dumps(tc.args)}) → {status}")
-        tool_calls_formatted = "\n".join(tool_lines) if tool_lines else "No tool calls."
-
-        prompt = self._prompts.build_extractor_prompt(
-            subtask_id=subtask.id,
-            tool_calls_formatted=tool_calls_formatted,
-            model_output=result.summary,
-        )
-
-        try:
-            response = await model.complete([{"role": "user", "content": prompt}])
-            entries = self._parse_memory_entries(response, task.id, subtask.id)
-            if entries:
-                await self._memory.store_many(entries)
-        except Exception:
-            pass  # Memory extraction is best-effort
-
-    def _parse_memory_entries(
-        self, response: ModelResponse, task_id: str, subtask_id: str
-    ) -> list:
-        """Parse extractor model response into MemoryEntry objects."""
-        from loom.state.memory import MemoryEntry
-
-        validation = self._validator.validate_json_response(
-            response, expected_keys=["entries"]
-        )
-        if not validation.valid or validation.parsed is None:
-            return []
-
-        entries = []
-        for e in validation.parsed.get("entries", []):
-            entry_type = e.get("type", "discovery")
-            if entry_type not in (
-                "decision", "error", "tool_result", "discovery", "artifact", "context"
-            ):
-                entry_type = "discovery"
-            entries.append(MemoryEntry(
-                task_id=task_id,
-                subtask_id=subtask_id,
-                entry_type=entry_type,
-                summary=str(e.get("summary", ""))[:150],
-                detail=str(e.get("detail", "")),
-                tags=str(e.get("tags", "")),
-            ))
-        return entries
-
-    @staticmethod
-    def _build_todo_reminder(task: Task, subtask: Subtask) -> str:
-        """Anti-amnesia: remind the model what it should be doing."""
-        return (
-            f"CURRENT TASK STATE:\n"
-            f"Goal: {task.goal}\n"
-            f"Current subtask: {subtask.id} — {subtask.description}\n\n"
-            f"REMAINING WORK FOR THIS SUBTASK:\n"
-            f"Continue working on: {subtask.description}\n"
-            f"Do NOT move to the next subtask. Complete ONLY this one.\n"
-            f"When finished, provide a summary of what you accomplished."
-        )
-
     async def _learn_from_task(self, task: Task) -> None:
         """Run post-task learning extraction (best-effort)."""
         if self._learning is None:
@@ -680,7 +552,7 @@ class Orchestrator:
         try:
             await self._learning.learn_from_task(task)
         except Exception:
-            pass  # Learning is best-effort
+            pass
 
     def _emit(self, event_type: str, task_id: str, data: dict) -> None:
         self._events.emit(Event(

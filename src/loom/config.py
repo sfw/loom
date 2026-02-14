@@ -39,6 +39,7 @@ class WorkspaceConfig:
 class ExecutionConfig:
     max_subtask_retries: int = 3
     max_loop_iterations: int = 50
+    max_parallel_subtasks: int = 3
     auto_approve_confidence_threshold: float = 0.8
 
 
@@ -144,6 +145,7 @@ def load_config(path: Path | None = None) -> Config:
     execution = ExecutionConfig(
         max_subtask_retries=exec_data.get("max_subtask_retries", 3),
         max_loop_iterations=exec_data.get("max_loop_iterations", 50),
+        max_parallel_subtasks=exec_data.get("max_parallel_subtasks", 3),
         auto_approve_confidence_threshold=exec_data.get(
             "auto_approve_confidence_threshold", 0.8
         ),

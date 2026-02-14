@@ -306,8 +306,8 @@ class TestFullLifecycleHappyPath:
         )
         result = await orch.execute_task(task)
 
-        # Give async event handlers time to flush
-        await asyncio.sleep(0.2)
+        # Give async event handlers and fire-and-forget memory extraction time to flush
+        await asyncio.sleep(0.4)
 
         # -- Assert: Task completed -------------------------------------------
         assert result.status == TaskStatus.COMPLETED
@@ -1115,6 +1115,9 @@ class TestMemoryRoundtrip:
         task = create_task(goal="Discover something")
         result = await orch.execute_task(task)
 
+        # Memory extraction is fire-and-forget — give it time to flush
+        await asyncio.sleep(0.3)
+
         assert result.status == TaskStatus.COMPLETED
 
         # Query memory entries back
@@ -1132,3 +1135,216 @@ class TestMemoryRoundtrip:
         # Relevant query for the subtask
         relevant = await memory.query_relevant(result.id, "s1")
         assert len(relevant) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Test: Parallel subtask execution
+# ---------------------------------------------------------------------------
+
+class TestParallelSubtaskExecution:
+    """Independent subtasks run concurrently when max_parallel_subtasks > 1."""
+
+    @pytest.mark.asyncio
+    async def test_independent_subtasks_run_in_parallel(
+        self, tmp_path: Path, db: Database, workspace: Path, event_collector: dict,
+    ):
+        """Three independent subtasks (no depends_on) should all be dispatched
+        in a single batch and complete without sequential ordering."""
+
+        planner = FakeModelProvider(
+            name="fake-planner", tier=2,
+            roles=["planner"],
+            responses=[
+                _plan_response(
+                    {"id": "s1", "description": "Create file_a.txt"},
+                    {"id": "s2", "description": "Create file_b.txt"},
+                    {"id": "s3", "description": "Create file_c.txt"},
+                ),
+            ],
+        )
+
+        # Each subtask writes one file then responds with text
+        executor = FakeModelProvider(
+            name="fake-executor", tier=1,
+            roles=["executor"],
+            responses=[
+                _tool_call_response("write_file", {
+                    "path": "file_a.txt", "content": "aaa",
+                }),
+                _text_response("Created file_a.txt."),
+                _tool_call_response("write_file", {
+                    "path": "file_b.txt", "content": "bbb",
+                }),
+                _text_response("Created file_b.txt."),
+                _tool_call_response("write_file", {
+                    "path": "file_c.txt", "content": "ccc",
+                }),
+                _text_response("Created file_c.txt."),
+            ],
+        )
+
+        verifier = FakeModelProvider(
+            name="fake-verifier", tier=1,
+            roles=["verifier"],
+            responses=[
+                _verification_response(passed=True),
+                _verification_response(passed=True),
+                _verification_response(passed=True),
+            ],
+        )
+
+        extractor = FakeModelProvider(
+            name="fake-extractor", tier=1,
+            roles=["extractor"],
+            responses=[_extractor_response() for _ in range(3)],
+        )
+
+        router = ModelRouter(providers={
+            "planner": planner, "executor": executor,
+            "verifier": verifier, "extractor": extractor,
+        })
+
+        config = Config(
+            memory=MemoryConfig(database_path=str(tmp_path / "integration.db")),
+            execution=ExecutionConfig(
+                max_subtask_retries=1,
+                max_loop_iterations=10,
+                max_parallel_subtasks=3,  # Allow all 3 to run concurrently
+            ),
+            verification=VerificationConfig(tier1_enabled=True, tier2_enabled=True),
+        )
+
+        event_bus = EventBus()
+        event_bus.subscribe_all(event_collector["handler"])
+
+        orch = Orchestrator(
+            model_router=router,
+            tool_registry=create_default_registry(),
+            memory_manager=MemoryManager(db),
+            prompt_assembler=PromptAssembler(),
+            state_manager=TaskStateManager(data_dir=tmp_path / "state"),
+            event_bus=event_bus,
+            config=config,
+        )
+
+        task = create_task(
+            goal="Create three independent files",
+            workspace=str(workspace),
+        )
+        result = await orch.execute_task(task)
+        await asyncio.sleep(0.3)
+
+        # All subtasks completed
+        assert result.status == TaskStatus.COMPLETED
+        assert all(s.status == SubtaskStatus.COMPLETED for s in result.plan.subtasks)
+
+        # All files written
+        assert (workspace / "file_a.txt").exists()
+        assert (workspace / "file_b.txt").exists()
+        assert (workspace / "file_c.txt").exists()
+
+        # All three SUBTASK_STARTED events fired
+        events = event_collector["events"]
+        started = [e for e in events if e.event_type == SUBTASK_STARTED]
+        assert len(started) == 3
+
+        # All three SUBTASK_COMPLETED events fired
+        completed = [e for e in events if e.event_type == SUBTASK_COMPLETED]
+        assert len(completed) == 3
+
+    @pytest.mark.asyncio
+    async def test_max_parallel_subtasks_caps_batch_size(
+        self, tmp_path: Path, db: Database, workspace: Path, event_collector: dict,
+    ):
+        """With max_parallel_subtasks=1, independent subtasks still run sequentially."""
+
+        planner = FakeModelProvider(
+            name="fake-planner", tier=2,
+            roles=["planner"],
+            responses=[
+                _plan_response(
+                    {"id": "s1", "description": "Create x.txt"},
+                    {"id": "s2", "description": "Create y.txt"},
+                ),
+            ],
+        )
+
+        executor = FakeModelProvider(
+            name="fake-executor", tier=1,
+            roles=["executor"],
+            responses=[
+                _tool_call_response("write_file", {"path": "x.txt", "content": "x"}),
+                _text_response("Done s1."),
+                _tool_call_response("write_file", {"path": "y.txt", "content": "y"}),
+                _text_response("Done s2."),
+            ],
+        )
+
+        verifier = FakeModelProvider(
+            name="fake-verifier", tier=1,
+            roles=["verifier"],
+            responses=[
+                _verification_response(passed=True),
+                _verification_response(passed=True),
+            ],
+        )
+
+        extractor = FakeModelProvider(
+            name="fake-extractor", tier=1,
+            roles=["extractor"],
+            responses=[_extractor_response(), _extractor_response()],
+        )
+
+        router = ModelRouter(providers={
+            "planner": planner, "executor": executor,
+            "verifier": verifier, "extractor": extractor,
+        })
+
+        config = Config(
+            memory=MemoryConfig(database_path=str(tmp_path / "integration.db")),
+            execution=ExecutionConfig(
+                max_subtask_retries=1,
+                max_loop_iterations=10,
+                max_parallel_subtasks=1,  # Force sequential
+            ),
+            verification=VerificationConfig(tier1_enabled=True, tier2_enabled=True),
+        )
+
+        event_bus = EventBus()
+        event_bus.subscribe_all(event_collector["handler"])
+
+        orch = Orchestrator(
+            model_router=router,
+            tool_registry=create_default_registry(),
+            memory_manager=MemoryManager(db),
+            prompt_assembler=PromptAssembler(),
+            state_manager=TaskStateManager(data_dir=tmp_path / "state"),
+            event_bus=event_bus,
+            config=config,
+        )
+
+        task = create_task(
+            goal="Create two files sequentially",
+            workspace=str(workspace),
+        )
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert (workspace / "x.txt").exists()
+        assert (workspace / "y.txt").exists()
+
+        # With max_parallel=1, s1 should complete before s2 starts
+        events = event_collector["events"]
+        started = [e for e in events if e.event_type == SUBTASK_STARTED]
+        completed = [e for e in events if e.event_type == SUBTASK_COMPLETED]
+
+        # s1 completed before s2 started
+        s1_complete_idx = next(
+            i for i, e in enumerate(events)
+            if e.event_type == SUBTASK_COMPLETED and e.data["subtask_id"] == "s1"
+        )
+        s2_start_idx = next(
+            i for i, e in enumerate(events)
+            if e.event_type == SUBTASK_STARTED and e.data["subtask_id"] == "s2"
+        )
+        assert s1_complete_idx < s2_start_idx
