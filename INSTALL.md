@@ -192,7 +192,8 @@ roles = ["planner", "executor", "extractor", "verifier"]
 | `workspace` | `default_path` | `~/projects` | Default workspace |
 | `workspace` | `scratch_dir` | `~/.loom/scratch` | Temp state storage |
 | `execution` | `max_subtask_retries` | `3` | Retries per subtask |
-| `execution` | `max_loop_iterations` | `50` | Max tool-call loops per subtask |
+| `execution` | `max_loop_iterations` | `50` | Max orchestrator iterations per task |
+| `execution` | `max_parallel_subtasks` | `3` | Max independent subtasks to run concurrently |
 | `verification` | `tier1_enabled` | `true` | Deterministic checks (syntax, file existence) |
 | `verification` | `tier2_enabled` | `true` | Independent LLM verification |
 | `verification` | `tier3_enabled` | `false` | Multi-vote verification |
@@ -229,7 +230,7 @@ curl http://localhost:1234/v1/models
 
 ```bash
 pytest
-# Should show 383 passed
+# Should show 394 passed
 ```
 
 ### 4. Start the Server

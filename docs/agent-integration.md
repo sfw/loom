@@ -6,18 +6,22 @@ This guide shows how to connect external agents (Claude Code, custom scripts, cr
 
 ```
  Agent (client)          Loom Engine (server)
- ┌──────────┐           ┌──────────────────────────────┐
- │ Claude   │  REST/    │  API Server (FastAPI)        │
- │ Code,    │──SSE──────│    ↓                         │
- │ scripts, │  or MCP   │  Orchestrator                │
- │ cron     │           │    ├─ Planner (model tier 2) │
- │          │◄──────────│    ├─ Executor (model tier 1) │
- │          │  results  │    ├─ Verifier (independent)  │
- │          │           │    ├─ Tools (file, shell)     │
- │          │           │    ├─ Memory (SQLite)         │
- │          │           │    └─ Learning (patterns)     │
- └──────────┘           └──────────────────────────────┘
+ ┌──────────┐           ┌─────────────────────────────────────┐
+ │ Claude   │  REST/    │  API Server (FastAPI)               │
+ │ Code,    │──SSE──────│    ↓                                │
+ │ scripts, │  or MCP   │  Orchestrator (lifecycle, schedule) │
+ │ cron     │           │    ├─ Planner (model tier 2)        │
+ │          │◄──────────│    ├─ SubtaskRunner(s) ─ parallel   │
+ │          │  results  │    │   ├─ Executor (model tier 1)   │
+ │          │           │    │   ├─ Verifier (independent)    │
+ │          │           │    │   └─ Extractor (fire & forget) │
+ │          │           │    ├─ Tools (file, shell)           │
+ │          │           │    ├─ Memory (SQLite)               │
+ │          │           │    └─ Learning (patterns)           │
+ └──────────┘           └─────────────────────────────────────┘
 ```
+
+Independent subtasks (no unmet dependencies) are dispatched in parallel up to `max_parallel_subtasks`. Sequential tasks with dependencies execute in order automatically.
 
 Agents connect via three mechanisms:
 
@@ -497,6 +501,7 @@ max_tokens = 8192
 [execution]
 max_subtask_retries = 3
 max_loop_iterations = 50
+max_parallel_subtasks = 3     # Independent subtasks run concurrently
 auto_approve_confidence_threshold = 0.8
 
 [verification]

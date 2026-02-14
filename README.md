@@ -7,24 +7,33 @@ Loom takes a high-level goal, breaks it into subtasks, executes them with local 
 ## How It Works
 
 ```
-Goal -> Planner -> [Subtask 1] -> [Subtask 2] -> ... -> Completed
-                       |              |
-                    Execute         Execute
-                    Verify          Verify
-                    Extract         Extract
+                    ┌──────────────────────────┐
+Goal -> Planner ->  │ [Subtask A]  [Subtask B] │  parallel batch
+                    │     |             |       │  (if independent)
+                    │  Execute       Execute    │
+                    │  Verify        Verify     │
+                    │  Extract*      Extract*   │  * fire-and-forget
+                    └──────────────────────────┘
+                               |
+                         [Subtask C]  (depends on A+B)
+                              |
+                          Completed
 ```
 
-1. **Plan** -- A planner model decomposes the goal into ordered subtasks with dependencies
-2. **Execute** -- Each subtask runs in a tool-calling loop (read files, write files, run shell commands)
-3. **Verify** -- An independent verifier checks each result against acceptance criteria
-4. **Extract** -- Key decisions, errors, and discoveries are extracted into structured memory
-5. **Replan** -- If subtasks fail or new information emerges, the plan is revised
+1. **Plan** -- A planner model decomposes the goal into ordered subtasks with a dependency graph
+2. **Schedule** -- Independent subtasks are dispatched in parallel (up to `max_parallel_subtasks`)
+3. **Execute** -- Each subtask runs in an isolated `SubtaskRunner` with its own tool-calling loop
+4. **Verify** -- An independent verifier checks each result against acceptance criteria
+5. **Extract** -- Key decisions, errors, and discoveries are extracted into structured memory (fire-and-forget)
+6. **Replan** -- If subtasks fail or new information emerges, the plan is revised
 
 ## Features
 
 **Core orchestration:**
 
 - **Task decomposition** with dependency graphs and automatic scheduling
+- **Parallel subtask execution** -- independent subtasks run concurrently (configurable `max_parallel_subtasks`)
+- **Isolated execution** -- each subtask runs in a `SubtaskRunner` with its own context (no cross-contamination)
 - **Dual model backends** -- Ollama and OpenAI-compatible APIs (LM Studio, vLLM, etc.)
 - **Role-based routing** -- planner, executor, extractor, verifier roles with tier selection
 - **Tool system** -- file read/write/edit, shell execution (with safety blocklist), search
@@ -151,6 +160,7 @@ scratch_dir = "~/.loom/scratch"
 [execution]
 max_subtask_retries = 3
 max_loop_iterations = 50
+max_parallel_subtasks = 3    # Independent subtasks run concurrently
 
 [verification]
 tier1_enabled = true    # Deterministic checks (syntax, file existence)
@@ -175,8 +185,9 @@ src/loom/
     schemas.py           Pydantic request/response models
     engine.py            Component wiring and lifecycle
   engine/
-    orchestrator.py      Core loop: plan -> execute -> verify -> finalize
-    scheduler.py         Dependency-based subtask ordering
+    orchestrator.py      Core loop: plan -> schedule -> dispatch -> finalize
+    runner.py            Isolated subtask execution (tool loop, verify, extract)
+    scheduler.py         Dependency-based subtask ordering + parallel batch selection
     verification.py      Three-tier verification gates
   events/
     bus.py               In-process pub/sub + event persistence
