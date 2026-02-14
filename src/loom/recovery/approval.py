@@ -142,8 +142,8 @@ class ApprovalManager:
                 try:
                     await asyncio.wait_for(event.wait(), timeout=timeout)
                 except TimeoutError:
-                    # Auto-approve on timeout
-                    self._approval_results[key] = True
+                    # Deny on timeout — never auto-approve unattended
+                    self._approval_results[key] = False
             else:
                 await event.wait()
 

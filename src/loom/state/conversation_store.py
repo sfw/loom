@@ -39,7 +39,7 @@ class ConversationStore:
         system_prompt: str = "",
     ) -> str:
         """Create a new cowork session and return its ID."""
-        session_id = uuid.uuid4().hex[:12]
+        session_id = uuid.uuid4().hex  # full 128-bit entropy
         now = datetime.now().isoformat()
         await self._db.execute(
             """INSERT INTO cowork_sessions
@@ -190,12 +190,14 @@ class ConversationStore:
         limit: int = 10,
     ) -> list[dict]:
         """Full-text search across turn content."""
+        # Escape LIKE wildcards in user-supplied query to prevent injection
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return await self._db.query(
             """SELECT * FROM conversation_turns
-               WHERE session_id = ? AND content LIKE ?
+               WHERE session_id = ? AND content LIKE ? ESCAPE '\\'
                ORDER BY turn_number DESC
                LIMIT ?""",
-            (session_id, f"%{query}%", limit),
+            (session_id, f"%{escaped}%", limit),
         )
 
     async def search_tool_calls(

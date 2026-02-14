@@ -128,7 +128,7 @@ class DelegateTaskTool(Tool):
             return ToolResult.fail(f"Task execution failed: {e}")
 
 
-def _create_task(goal: str, workspace: str, context: dict) -> Task:
+def _create_task(goal: str, workspace: str, context: dict, approval_mode: str = "confidence_threshold") -> Task:
     """Create a Task object for the orchestrator."""
     from loom.state.task_state import Task, TaskStatus
 
@@ -139,7 +139,7 @@ def _create_task(goal: str, workspace: str, context: dict) -> Task:
         workspace=workspace,
         context=context,
         status=TaskStatus.PENDING,
-        approval_mode="auto",
+        approval_mode=approval_mode,
         created_at=datetime.now().isoformat(),
     )
 

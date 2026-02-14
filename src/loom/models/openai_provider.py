@@ -94,8 +94,13 @@ class OpenAICompatibleProvider(ModelProvider):
         latency = int((time.monotonic() - start) * 1000)
 
         data = response.json()
-        choice = data["choices"][0]
-        message = choice["message"]
+        choices = data.get("choices")
+        if not choices or not isinstance(choices, list):
+            raise ModelConnectionError(
+                f"Malformed response from {self._model}: missing 'choices'"
+            )
+        choice = choices[0]
+        message = choice.get("message", {})
 
         tool_calls = None
         if message.get("tool_calls"):

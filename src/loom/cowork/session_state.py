@@ -58,6 +58,13 @@ class SessionState:
         if len(self.key_decisions) > self.MAX_DECISIONS:
             self.key_decisions = self.key_decisions[-self.MAX_DECISIONS:]
 
+    def record_error(self, description: str, turn: int) -> None:
+        """Record an error (not yet resolved)."""
+        entry = f"[UNRESOLVED] {description} (turn {turn})"
+        self.errors_resolved.append(entry)
+        if len(self.errors_resolved) > self.MAX_ERRORS:
+            self.errors_resolved = self.errors_resolved[-self.MAX_ERRORS:]
+
     def record_error_resolved(self, description: str, turn: int) -> None:
         """Record an error that was resolved."""
         entry = f"{description} (turn {turn})"
@@ -129,9 +136,14 @@ class SessionState:
             errors_resolved=data.get("errors_resolved", []),
         )
         for f in data.get("files_touched", []):
-            state.files_touched.append(
-                FileTouch(path=f["path"], action=f["action"], turn=f["turn"])
-            )
+            if isinstance(f, dict) and "path" in f and "action" in f:
+                state.files_touched.append(
+                    FileTouch(
+                        path=f.get("path", ""),
+                        action=f.get("action", ""),
+                        turn=f.get("turn", 0),
+                    )
+                )
         return state
 
     @classmethod
@@ -139,7 +151,13 @@ class SessionState:
         """Reconstruct from a JSON string (from database)."""
         if not raw:
             return cls()
-        return cls.from_dict(json.loads(raw))
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return cls()
+        if not isinstance(data, dict):
+            return cls()
+        return cls.from_dict(data)
 
 
 def extract_state_from_tool_events(
@@ -188,6 +206,7 @@ def extract_state_from_tool_events(
         elif name == "shell_execute":
             if result and not result.success:
                 cmd = args.get("command", "")[:60]
-                state.record_error_resolved(
-                    f"Command failed: {cmd}", turn_number,
+                error_msg = (result.error or "")[:80]
+                state.record_error(
+                    f"Command failed: {cmd} — {error_msg}", turn_number,
                 )

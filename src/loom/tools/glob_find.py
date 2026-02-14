@@ -65,6 +65,16 @@ class GlobFindTool(Tool):
         if not search_path.is_dir():
             return ToolResult(success=False, output=f"Not a directory: {search_path}")
 
+        # Workspace containment check
+        if ctx.workspace:
+            try:
+                search_path.relative_to(ctx.workspace.resolve())
+            except ValueError:
+                return ToolResult(
+                    success=False,
+                    output=f"Path '{search_path}' is outside workspace '{ctx.workspace}'.",
+                )
+
         try:
             matches = []
             for p in search_path.glob(pattern):

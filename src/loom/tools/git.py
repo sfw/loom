@@ -14,7 +14,7 @@ ALLOWED_SUBCOMMANDS = frozenset({
     "branch", "checkout", "switch", "merge", "rebase",
     "stash", "tag",
     "fetch", "pull", "push", "remote",
-    "ls-files", "rev-parse", "config",
+    "ls-files", "rev-parse",
 })
 
 # Patterns that are destructive even within allowed subcommands
@@ -59,7 +59,7 @@ class GitCommandTool(Tool):
             "Execute a git command in the workspace. "
             "Supports: status, diff, log, show, blame, add, commit, "
             "branch, checkout, switch, merge, rebase, stash, tag, "
-            "fetch, pull, push, remote, ls-files, rev-parse, config. "
+            "fetch, pull, push, remote, ls-files, rev-parse. "
             "Note: force push is blocked for safety."
         )
 

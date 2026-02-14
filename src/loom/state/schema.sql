@@ -92,7 +92,6 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     tool_name TEXT,                                  -- for role=tool, which tool was called
     token_count INTEGER DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(session_id, turn_number),
     FOREIGN KEY (session_id) REFERENCES cowork_sessions(id)
 );
 

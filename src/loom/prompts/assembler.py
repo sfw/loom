@@ -65,7 +65,10 @@ class PromptAssembler:
         template = self.get_template("planner")
 
         role = template.get("role", "").strip()
-        instructions = template.get("instructions", "").format(
+        # Use safe_substitute to prevent KeyError from user-supplied {braces}
+        from string import Template as _StrTemplate
+        _tmpl = _StrTemplate(template.get("instructions", "").replace("{", "${"))
+        instructions = _tmpl.safe_substitute(
             goal=task.goal,
             workspace_path=task.workspace,
             user_context=json.dumps(task.context) if task.context else "None provided.",

@@ -113,13 +113,15 @@ class ReadFileTool(Tool):
 
 
 class WriteFileTool(Tool):
+    MAX_CONTENT_SIZE = 1_048_576  # 1 MB limit for written content
+
     @property
     def name(self) -> str:
         return "write_file"
 
     @property
     def description(self) -> str:
-        return "Write content to a file. Creates parent directories if needed."
+        return "Write content to a file. Creates parent directories if needed. Max 1 MB."
 
     @property
     def parameters(self) -> dict:
@@ -127,7 +129,7 @@ class WriteFileTool(Tool):
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path relative to workspace"},
-                "content": {"type": "string", "description": "Content to write"},
+                "content": {"type": "string", "description": "Content to write (max 1 MB)"},
             },
             "required": ["path", "content"],
         }
@@ -140,6 +142,13 @@ class WriteFileTool(Tool):
         if ctx.workspace is None:
             return ToolResult.fail("No workspace set")
 
+        content = args.get("content", "")
+        if len(content) > self.MAX_CONTENT_SIZE:
+            return ToolResult.fail(
+                f"Content too large ({len(content):,} bytes). "
+                f"Maximum is {self.MAX_CONTENT_SIZE:,} bytes."
+            )
+
         path = self._resolve_path(args["path"], ctx.workspace)
         rel_path = str(path.relative_to(ctx.workspace.resolve()))
 
@@ -149,7 +158,6 @@ class WriteFileTool(Tool):
 
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        content = args["content"]
         path.write_text(content, encoding="utf-8")
 
         return ToolResult.ok(

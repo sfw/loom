@@ -34,8 +34,8 @@ def cli(ctx: click.Context, config_path: Path | None) -> None:
 def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     """Start the Loom API server."""
     config = ctx.obj["config"]
-    actual_host = host or config.server.host
-    actual_port = port or config.server.port
+    actual_host = host if host is not None else config.server.host
+    actual_port = port if port is not None else config.server.port
 
     click.echo(f"Starting Loom server on {actual_host}:{actual_port}")
 
@@ -118,6 +118,15 @@ def run(ctx: click.Context, goal: str, workspace: Path | None, server_url: str |
     asyncio.run(_run_task(url, goal, ws))
 
 
+def _validate_task_id(task_id: str) -> str:
+    """Validate task_id contains only safe characters for URL interpolation."""
+    import re
+    if not re.match(r'^[a-zA-Z0-9_-]+$', task_id):
+        click.echo(f"Invalid task ID: {task_id}", err=True)
+        sys.exit(1)
+    return task_id
+
+
 async def _run_task(server_url: str, goal: str, workspace: str | None) -> None:
     """Submit task and stream progress."""
     import httpx
@@ -168,6 +177,7 @@ def status(ctx: click.Context, task_id: str, server_url: str | None) -> None:
 
 async def _check_status(server_url: str, task_id: str) -> None:
     """Fetch and display task status."""
+    task_id = _validate_task_id(task_id)
     import httpx
 
     try:
@@ -204,6 +214,7 @@ def cancel(ctx: click.Context, task_id: str, server_url: str | None) -> None:
 
 async def _cancel_task(server_url: str, task_id: str) -> None:
     """Cancel a task."""
+    task_id = _validate_task_id(task_id)
     import httpx
 
     try:
@@ -211,6 +222,9 @@ async def _cancel_task(server_url: str, task_id: str) -> None:
             response = await client.post(f"/tasks/{task_id}/cancel")
             if response.status_code == 404:
                 click.echo(f"Task not found: {task_id}", err=True)
+                sys.exit(1)
+            if response.status_code >= 400:
+                click.echo(f"Cancel failed ({response.status_code}): {response.text[:200]}", err=True)
                 sys.exit(1)
             click.echo(f"Task {task_id} cancelled.")
     except httpx.ConnectError:
@@ -568,7 +582,7 @@ async def _cowork_session(
                 "  /sessions  — list and switch between sessions\n"
                 "  /new       — start a new session (current workspace)\n"
                 "  /session   — show current session info\n"
-                "  /quit      — exit\n"
+                "  /quit      — exit (also /exit, /q)\n"
                 "  /help      — this message\n"
                 "Type anything else to interact with the AI.\n"
             )
@@ -590,16 +604,18 @@ async def _cowork_session(
             continue
 
         if cmd == "/sessions":
-            # Mark current session inactive before switching
+            # Mark current session inactive BEFORE switching to avoid inconsistency
+            old_session_id = session.session_id
             new_session = await _switch_session()
             if new_session is not None:
-                await store.update_session(session.session_id, is_active=False)
+                await store.update_session(old_session_id, is_active=False)
                 session = new_session
             continue
 
         if cmd == "/new":
             await store.update_session(session.session_id, is_active=False)
-            session = await _new_session(workspace)
+            # Use current session's workspace, not the original startup workspace
+            session = await _new_session(session.workspace or workspace)
             sys.stdout.write(f"\033[2mNew session: {session.session_id}\033[0m\n")
             continue
 

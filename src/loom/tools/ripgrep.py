@@ -84,6 +84,16 @@ class RipgrepSearchTool(Tool):
         if not search_path.exists():
             return ToolResult(success=False, output=f"Path not found: {search_path}")
 
+        # Workspace containment check
+        if ctx.workspace:
+            try:
+                search_path.relative_to(ctx.workspace.resolve())
+            except ValueError:
+                return ToolResult(
+                    success=False,
+                    output=f"Path '{search_path}' is outside workspace '{ctx.workspace}'.",
+                )
+
         # Try ripgrep first, fall back to grep
         rg_path = shutil.which("rg")
         if rg_path:

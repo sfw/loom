@@ -68,6 +68,7 @@ class SubtaskRunner:
     """
 
     MAX_TOOL_ITERATIONS = 20
+    MAX_SUBTASK_WALL_CLOCK = 600  # 10 minutes per subtask
 
     def __init__(
         self,
@@ -130,7 +131,10 @@ class SubtaskRunner:
         response = None
         streaming = self._config.execution.enable_streaming
 
-        for _ in range(self.MAX_TOOL_ITERATIONS):
+        for iteration in range(self.MAX_TOOL_ITERATIONS):
+            # Wall-clock timeout check
+            if time.monotonic() - start_time > self.MAX_SUBTASK_WALL_CLOCK:
+                break
             if streaming:
                 response = await self._stream_completion(
                     model, messages, self._tools.all_schemas(),
@@ -281,15 +285,36 @@ class SubtaskRunner:
     def _parse_memory_entries(
         self, response: ModelResponse, task_id: str, subtask_id: str,
     ) -> list[MemoryEntry]:
-        """Parse extractor model response into MemoryEntry objects."""
-        validation = self._validator.validate_json_response(
-            response, expected_keys=["entries"]
-        )
-        if not validation.valid or validation.parsed is None:
-            return []
+        """Parse extractor model response into MemoryEntry objects.
+
+        Accepts both formats:
+        - JSON array: [{...}, ...]          (what the template asks for)
+        - JSON object: {"entries": [...]}   (what validate_json_response expects)
+        """
+        raw_entries: list[dict] = []
+
+        # First try parsing as a raw JSON array (matches the template)
+        text = (response.text or "").strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    raw_entries = parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Fallback: try the {"entries": [...]} format via validator
+        if not raw_entries:
+            validation = self._validator.validate_json_response(
+                response, expected_keys=["entries"]
+            )
+            if validation.valid and validation.parsed is not None:
+                raw_entries = validation.parsed.get("entries", [])
 
         entries = []
-        for e in validation.parsed.get("entries", []):
+        for e in raw_entries:
+            if not isinstance(e, dict):
+                continue
             entry_type = e.get("type", "discovery")
             if entry_type not in (
                 "decision", "error", "tool_result", "discovery", "artifact", "context"

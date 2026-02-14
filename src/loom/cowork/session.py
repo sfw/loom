@@ -122,6 +122,7 @@ class CoworkSession:
         self._approver = approver
         self._total_tokens = 0
         self._turn_counter = 0
+        self._message_counter = 0  # monotonic per-message counter for DB persistence
 
         # Persistence
         self._store = store
@@ -414,6 +415,9 @@ class CoworkSession:
         self._total_tokens = session.get("total_tokens", 0)
         self._turn_counter = session.get("turn_count", 0)
 
+        # Restore message counter from DB to avoid collisions
+        self._message_counter = await self._store.get_turn_count(session_id)
+
         # Restore session state
         self._session_state = SessionState.from_json(session.get("session_state"))
         self._session_state.session_id = session_id
@@ -426,12 +430,26 @@ class CoworkSession:
     # Context management
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_safe_cut_point(messages: list[dict], idx: int) -> bool:
+        """Check if cutting before idx leaves a valid message sequence.
+
+        Invalid cuts: mid tool_calls→tool sequence, or starting with role=tool.
+        """
+        if idx >= len(messages):
+            return True
+        first = messages[idx]
+        # Never start on a tool result
+        if first.get("role") == "tool":
+            return False
+        return True
+
     def _context_window(self) -> list[dict]:
         """Return the messages to send to the model.
 
         Token-aware: walks backward from most recent messages, adding
         turns until the token budget is exhausted.  System prompt is
-        always included.
+        always included.  Ensures we never cut mid assistant→tool sequence.
         """
         if not self._messages:
             return []
@@ -456,6 +474,10 @@ class CoworkSession:
             selected.insert(0, msg)
             used += msg_tokens
 
+        # Ensure we don't start on an orphaned tool result
+        while selected and selected[0].get("role") == "tool":
+            selected.pop(0)
+
         return system + selected
 
     def _maybe_trim(self) -> None:
@@ -463,6 +485,7 @@ class CoworkSession:
 
         This does NOT lose data — all messages are persisted in the
         conversation store.  This just keeps RAM usage bounded.
+        Ensures trim doesn't break message sequences.
         """
         max_cache = self._max_context * 3
         if len(self._messages) <= max_cache:
@@ -472,7 +495,12 @@ class CoworkSession:
         if self._messages and self._messages[0]["role"] == "system":
             system = [self._messages[0]]
 
-        self._messages = system + self._messages[-(self._max_context * 2):]
+        kept = self._messages[-(self._max_context * 2):]
+        # Don't start on an orphaned tool result
+        while kept and kept[0].get("role") == "tool":
+            kept.pop(0)
+
+        self._messages = system + kept
 
     # ------------------------------------------------------------------
     # Dangling reference detection
@@ -548,17 +576,19 @@ class CoworkSession:
         if self._store is None or not self._session_id:
             return
         try:
+            self._message_counter += 1
             await self._store.append_turn(
                 session_id=self._session_id,
-                turn_number=self._turn_counter,
+                turn_number=self._message_counter,
                 role=role,
                 content=content,
                 tool_calls=tool_calls,
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
             )
-        except Exception:
-            pass  # Don't let persistence failures break the session
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Persist turn failed: %s", e)
 
     async def _persist_session_metadata(self) -> None:
         """Persist session state and token counts."""
@@ -571,8 +601,9 @@ class CoworkSession:
                 turn_count=self._turn_counter,
                 session_state=self._session_state.to_dict(),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Persist metadata failed: %s", e)
 
 
 def build_cowork_system_prompt(workspace: Path | None = None) -> str:

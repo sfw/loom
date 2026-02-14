@@ -34,6 +34,13 @@ class ModelConfig:
     api_key: str = ""
     tier: int = 0  # 0 = auto-detect from model name
 
+    def __repr__(self) -> str:
+        key_display = f"***{self.api_key[-4:]}" if self.api_key else ""
+        return (
+            f"ModelConfig(provider={self.provider!r}, model={self.model!r}, "
+            f"base_url={self.base_url!r}, api_key={key_display!r})"
+        )
+
 
 @dataclass(frozen=True)
 class WorkspaceConfig:

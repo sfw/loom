@@ -199,8 +199,11 @@ class LLMVerifier:
             )
 
             if not validation.valid or validation.parsed is None:
-                # Can't parse verifier output — pass with low confidence
-                return VerificationResult(tier=2, passed=True, confidence=0.3)
+                # Can't parse verifier output — fail to be safe
+                return VerificationResult(
+                    tier=2, passed=False, confidence=0.3,
+                    feedback="Verification inconclusive: could not parse verifier output.",
+                )
 
             assessment = validation.parsed
             return VerificationResult(
@@ -215,8 +218,11 @@ class LLMVerifier:
                 feedback=assessment.get("suggestion"),
             )
         except Exception:
-            # Verifier error — pass with low confidence
-            return VerificationResult(tier=2, passed=True, confidence=0.3)
+            # Verifier error — fail to be safe
+            return VerificationResult(
+                tier=2, passed=False, confidence=0.3,
+                feedback="Verification inconclusive: verifier raised an exception.",
+            )
 
 
 class VotingVerifier:

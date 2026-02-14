@@ -85,10 +85,11 @@ class TestToolApprover:
         assert decision == ApprovalDecision.APPROVE
         cb.assert_not_called()
 
-    async def test_no_callback_permissive(self):
+    async def test_no_callback_denies_by_default(self):
+        """Without a callback, non-auto-approved tools should be denied."""
         approver = ToolApprover()
         decision = await approver.check("shell_execute", {"command": "ls"})
-        assert decision == ApprovalDecision.APPROVE
+        assert decision == ApprovalDecision.DENY
 
     async def test_callback_approve(self):
         cb = AsyncMock(return_value=ApprovalDecision.APPROVE)

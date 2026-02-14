@@ -179,25 +179,39 @@ class ChangeLog:
             "renamed": renamed,
         }
 
+    def _verify_in_workspace(self, path: Path) -> None:
+        """Ensure resolved path stays within workspace."""
+        try:
+            path.resolve().relative_to(self._workspace)
+        except ValueError:
+            raise ValueError(f"Path '{path}' escapes workspace '{self._workspace}'")
+
     def revert_entry(self, entry_id: int) -> None:
         """Revert a single changelog entry."""
         entry = self._find_entry(entry_id)
         if entry is None:
             raise ValueError(f"Changelog entry not found: {entry_id}")
 
-        target = self._workspace / entry.path
+        target = (self._workspace / entry.path).resolve()
+        self._verify_in_workspace(target)
 
         if entry.operation == "create":
             target.unlink(missing_ok=True)
         elif entry.operation in ("modify", "delete"):
             if entry.before_snapshot:
-                snapshot = Path(entry.before_snapshot)
+                snapshot = Path(entry.before_snapshot).resolve()
+                # Snapshot must be within our data dir
+                try:
+                    snapshot.relative_to(self._data_dir.resolve())
+                except ValueError:
+                    raise ValueError(f"Snapshot path '{snapshot}' is not in data dir")
                 if snapshot.exists():
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(snapshot, target)
         elif entry.operation == "rename":
             if entry.new_path:
-                current = self._workspace / entry.new_path
+                current = (self._workspace / entry.new_path).resolve()
+                self._verify_in_workspace(current)
                 if current.exists():
                     target.parent.mkdir(parents=True, exist_ok=True)
                     current.rename(target)

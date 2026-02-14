@@ -193,7 +193,7 @@ def _output_preview(tool_name: str, output: str) -> str:
     # For search tools, show match count
     if tool_name in ("ripgrep_search", "search_files", "glob_find"):
         lines = output.strip().split("\n")
-        if lines and lines[0] == "No matches found." or lines[0] == "No files matched.":
+        if lines and (lines[0] == "No matches found." or lines[0] == "No files matched."):
             return lines[0]
         return f"{len(lines)} results"
 

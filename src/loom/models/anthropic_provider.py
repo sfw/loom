@@ -300,7 +300,8 @@ class AnthropicProvider(ModelProvider):
             if status == 401:
                 msg = "Invalid Anthropic API key"
             elif status == 429:
-                msg = "Anthropic rate limit exceeded"
+                retry_after = e.response.headers.get("retry-after", "")
+                msg = f"Anthropic rate limit exceeded (retry-after: {retry_after}s)" if retry_after else "Anthropic rate limit exceeded"
             else:
                 msg = f"Anthropic returned HTTP {status}"
             raise ModelConnectionError(

@@ -35,7 +35,7 @@ class ModelResponse:
 
     text: str
     tool_calls: list[ToolCall] | None = None
-    raw: str = ""
+    raw: str | dict = ""
     usage: TokenUsage = field(default_factory=TokenUsage)
     model: str = ""
     latency_ms: int = 0

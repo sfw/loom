@@ -231,7 +231,8 @@ class TestApprovalWorkflow:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_auto_approve_on_timeout(self):
+    async def test_deny_on_timeout(self):
+        """Unattended approvals should deny on timeout for safety."""
         bus = EventBus()
         mgr = ApprovalManager(bus)
 
@@ -245,7 +246,7 @@ class TestApprovalWorkflow:
         )
 
         result = await mgr.request_approval(request)
-        assert result is True
+        assert result is False
 
     def test_resolve_nonexistent_approval(self):
         bus = EventBus()

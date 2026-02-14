@@ -54,6 +54,8 @@ class Database:
         schema_path = Path(__file__).parent / "schema.sql"
         schema = schema_path.read_text()
         async with aiosqlite.connect(self._db_path) as db:
+            # Enable WAL mode for better concurrent read/write performance
+            await db.execute("PRAGMA journal_mode=WAL")
             await db.executescript(schema)
             await db.commit()
 

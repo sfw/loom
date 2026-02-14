@@ -87,9 +87,9 @@ class ToolApprover:
         if tool_name in self._always_approved:
             return ApprovalDecision.APPROVE
 
-        # No callback = permissive mode (e.g. non-interactive, testing)
+        # No callback = deny by default (safe fallback for headless/API deployments)
         if self._prompt_callback is None:
-            return ApprovalDecision.APPROVE
+            return ApprovalDecision.DENY
 
         decision = await self._prompt_callback(tool_name, args)
 
