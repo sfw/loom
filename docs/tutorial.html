@@ -411,6 +411,11 @@
   <a href="#first-task">Your First Task</a>
   <a href="#streaming">Streaming Events</a>
   <a href="#steering">Steering Tasks</a>
+  <a href="#tui">Terminal UI</a>
+  <div class="section-label">Features</div>
+  <a href="#approval">Approval Gates</a>
+  <a href="#learning">Learning System</a>
+  <a href="#mcp">MCP Server</a>
   <div class="section-label">API Reference</div>
   <a href="#endpoints">Endpoints</a>
   <a href="#sse">SSE Streaming</a>
@@ -480,25 +485,34 @@
 <span class="cmd">python3</span> <span class="flag">--version</span>
 <span class="cmt"># Python 3.11.x or higher required</span></code></pre>
 
-  <h3>Install from Source</h3>
+  <h3>Install with uv (Recommended)</h3>
   <pre><code><span class="cmt"># Clone the repository</span>
 <span class="cmd">git clone</span> https://github.com/your-org/loom.git
 <span class="cmd">cd</span> loom
 
-<span class="cmt"># Create a virtual environment</span>
-<span class="cmd">python3</span> <span class="flag">-m</span> venv .venv
-<span class="cmd">source</span> .venv/bin/activate
+<span class="cmt"># Install dependencies (creates .venv automatically)</span>
+<span class="cmd">uv sync</span>
 
-<span class="cmt"># Install with dev dependencies</span>
-<span class="cmd">pip install</span> <span class="flag">-e</span> <span class="str">".[dev]"</span>
+<span class="cmt"># Include dev tools (pytest, ruff, coverage)</span>
+<span class="cmd">uv sync</span> <span class="flag">--extra</span> dev
 
 <span class="cmt"># Verify</span>
-<span class="cmd">loom</span> <span class="flag">--version</span>
+<span class="cmd">uv run loom</span> <span class="flag">--version</span>
 <span class="cmt"># loom, version 0.1.0</span></code></pre>
 
+  <details class="accordion">
+    <summary>Alternative: Install with pip</summary>
+    <div class="inner">
+      <pre><code><span class="cmd">python3</span> <span class="flag">-m</span> venv .venv
+<span class="cmd">source</span> .venv/bin/activate
+<span class="cmd">pip install</span> <span class="flag">-e</span> <span class="str">".[dev]"</span>
+<span class="cmd">loom</span> <span class="flag">--version</span></code></pre>
+    </div>
+  </details>
+
   <div class="callout callout-info">
-    <strong>Using uv?</strong>
-    Replace <code>pip install</code> with <code>uv pip install</code> for faster installs.
+    <strong>Optional extras</strong>
+    Install MCP server support with <code>uv sync --extra mcp</code> or <code>pip install -e ".[mcp]"</code>.
   </div>
 </section>
 
@@ -789,10 +803,14 @@
     <tr><td><code>subtask_started</code></td><td>A subtask begins execution</td></tr>
     <tr><td><code>subtask_completed</code></td><td>A subtask finished successfully</td></tr>
     <tr><td><code>subtask_failed</code></td><td>A subtask failed (may retry or trigger re-planning)</td></tr>
+    <tr><td><code>subtask_retrying</code></td><td>A subtask is being retried (with tier escalation info)</td></tr>
     <tr><td><code>task_replanning</code></td><td>Re-planning triggered after subtask failures</td></tr>
     <tr><td><code>tool_call_started</code></td><td>A tool is being invoked</td></tr>
     <tr><td><code>tool_call_completed</code></td><td>A tool call returned</td></tr>
-    <tr><td><code>approval_requested</code></td><td>Waiting for human approval</td></tr>
+    <tr><td><code>verification_started</code></td><td>Verification check beginning</td></tr>
+    <tr><td><code>verification_passed</code></td><td>Verification check passed</td></tr>
+    <tr><td><code>verification_failed</code></td><td>Verification check failed</td></tr>
+    <tr><td><code>approval_requested</code></td><td>Waiting for human approval (with confidence score)</td></tr>
     <tr><td><code>task_completed</code></td><td>All subtasks done</td></tr>
     <tr><td><code>task_failed</code></td><td>Task could not complete</td></tr>
   </table>
@@ -824,6 +842,170 @@
 
   <h3>Cancel a task</h3>
   <pre><code><span class="cmd">curl</span> <span class="flag">-X DELETE</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span></code></pre>
+</section>
+
+<!-- ======================== TUI ======================== -->
+<section id="tui">
+  <h2>Terminal UI</h2>
+
+  <p>Loom includes a full terminal dashboard built with <strong>Textual</strong>. It connects to the API server as a client.</p>
+
+  <pre><code><span class="cmt"># Make sure the server is running first</span>
+<span class="cmd">loom serve</span> &amp;
+
+<span class="cmt"># Launch the TUI</span>
+<span class="cmd">loom tui</span>
+
+<span class="cmt"># Connect to a different server</span>
+<span class="cmd">loom tui</span> <span class="flag">--base-url</span> http://localhost:8080</code></pre>
+
+  <h3>Keyboard Shortcuts</h3>
+  <table>
+    <tr><th>Key</th><th>Action</th></tr>
+    <tr><td><code>n</code></td><td>Create a new task</td></tr>
+    <tr><td><code>r</code></td><td>Refresh the task list</td></tr>
+    <tr><td><code>s</code></td><td>Steer the selected task (inject instructions)</td></tr>
+    <tr><td><code>a</code></td><td>Approve/reject a gated step</td></tr>
+    <tr><td><code>c</code></td><td>Cancel the selected task</td></tr>
+    <tr><td><code>q</code></td><td>Quit</td></tr>
+  </table>
+
+  <p>The dashboard shows all tasks in a table view. Select a task to see its plan tree, live execution output, and subtask status. Events stream in real-time via SSE.</p>
+</section>
+
+<!-- ======================== APPROVAL ======================== -->
+<section id="approval">
+  <h2>Approval Gates</h2>
+
+  <p>Loom has a <strong>confidence scoring</strong> and <strong>approval gate</strong> system that controls when subtasks proceed automatically vs. waiting for human approval.</p>
+
+  <h3>Confidence Scoring</h3>
+  <p>After each subtask executes and is verified, Loom computes a confidence score (0.0 to 1.0) based on weighted factors:</p>
+
+  <table>
+    <tr><th>Factor</th><th>Weight</th><th>What it measures</th></tr>
+    <tr><td>Verification tier 1 passed</td><td>0.3</td><td>Deterministic checks (syntax, files exist)</td></tr>
+    <tr><td>Verification tier 2 passed</td><td>0.3</td><td>Independent LLM review agreed</td></tr>
+    <tr><td>No prior retries</td><td>0.2</td><td>Succeeded on first attempt</td></tr>
+    <tr><td>Non-destructive operation</td><td>0.1</td><td>No rm, sudo, DROP, etc.</td></tr>
+    <tr><td>All tool calls succeeded</td><td>0.1</td><td>No tool errors during execution</td></tr>
+  </table>
+
+  <p>Scores are classified into bands: <strong>high</strong> (&ge;0.8), <strong>medium</strong> (&ge;0.5), <strong>low</strong> (&ge;0.2), <strong>zero</strong> (&lt;0.2).</p>
+
+  <h3>Approval Modes</h3>
+  <div class="card-grid">
+    <div class="card">
+      <h4>Auto</h4>
+      <p>Proceeds if confidence is high (&ge;0.8). Pauses for human approval otherwise. Default mode.</p>
+    </div>
+    <div class="card">
+      <h4>Manual</h4>
+      <p>Always waits for human approval before proceeding to the next subtask.</p>
+    </div>
+    <div class="card">
+      <h4>Confidence Threshold</h4>
+      <p>You set a custom threshold. Proceeds automatically if confidence meets it.</p>
+    </div>
+    <div class="card">
+      <h4>Always-Gate</h4>
+      <p>Destructive operations (rm -rf, sudo, DROP TABLE, .env access) always require approval regardless of mode.</p>
+    </div>
+  </div>
+
+  <h3>Retry Escalation</h3>
+  <p>When a subtask fails, Loom automatically retries with an escalation ladder:</p>
+
+  <div class="step">
+    <div class="step-number">1</div>
+    <div class="step-content">
+      <h4>Attempts 0-1: Same tier</h4>
+      <p>Retry with the same model at the same tier level</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-number">2</div>
+    <div class="step-content">
+      <h4>Attempt 2: Escalate</h4>
+      <p>Promote to the next model tier (e.g., from 8B to 14B)</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-number">3</div>
+    <div class="step-content">
+      <h4>Attempt 3+: Max tier</h4>
+      <p>Use the highest available model tier</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-number">4</div>
+    <div class="step-content">
+      <h4>Max retries exceeded: Flag for human</h4>
+      <p>Stop and request human intervention</p>
+    </div>
+  </div>
+
+  <h3>Webhooks</h3>
+  <p>Get notified when tasks complete by providing a <code>callback_url</code> when creating a task:</p>
+  <pre><code><span class="cmd">curl</span> <span class="flag">-X POST</span> http://localhost:9000/tasks \
+  <span class="flag">-H</span> <span class="str">"Content-Type: application/json"</span> \
+  <span class="flag">-d</span> <span class="str">'{
+    "goal": "Run the test suite",
+    "workspace": "/tmp/project",
+    "callback_url": "https://your-server.com/webhook"
+  }'</span></code></pre>
+  <p>Loom will POST to the callback URL when the task reaches a terminal state (completed, failed, or cancelled), with automatic retry and exponential backoff on delivery failures.</p>
+</section>
+
+<!-- ======================== LEARNING ======================== -->
+<section id="learning">
+  <h2>Learning System</h2>
+
+  <p>Loom learns from task execution history to improve future runs. Patterns are extracted automatically after each task completes.</p>
+
+  <h3>Pattern Types</h3>
+  <table>
+    <tr><th>Type</th><th>What it captures</th><th>How it helps</th></tr>
+    <tr><td><code>subtask_success</code></td><td>Successful subtask tool sequences</td><td>Suggests proven approaches for similar subtasks</td></tr>
+    <tr><td><code>retry_pattern</code></td><td>How many retries common subtasks need</td><td>Sets better initial retry expectations</td></tr>
+    <tr><td><code>task_template</code></td><td>Full plan structures for completed tasks</td><td>Templates for similar future goals</td></tr>
+    <tr><td><code>model_failure</code></td><td>Which models failed on which tasks</td><td>Avoids repeating known bad model assignments</td></tr>
+  </table>
+
+  <h3>Querying Patterns</h3>
+  <p>The learning system is used internally by the orchestrator. You can also manage it via the CLI:</p>
+  <pre><code><span class="cmt"># Clear all learned patterns (start fresh)</span>
+<span class="cmd">loom reset-learning</span></code></pre>
+
+  <p>Patterns are pruned automatically after 90 days of inactivity.</p>
+</section>
+
+<!-- ======================== MCP ======================== -->
+<section id="mcp">
+  <h2>MCP Server</h2>
+
+  <p>Loom can act as a <strong>Model Context Protocol (MCP)</strong> tool server, letting other AI agents delegate tasks to Loom.</p>
+
+  <pre><code><span class="cmt"># Start the MCP server (stdio transport)</span>
+<span class="cmd">loom mcp-serve</span>
+
+<span class="cmt"># Connect to a different Loom API</span>
+<span class="cmd">loom mcp-serve</span> <span class="flag">--base-url</span> http://localhost:8080</code></pre>
+
+  <div class="callout callout-info">
+    <strong>Requires extra</strong>
+    Install with <code>uv sync --extra mcp</code> or <code>pip install -e ".[mcp]"</code>.
+  </div>
+
+  <h3>Exposed Tools</h3>
+  <table>
+    <tr><th>Tool</th><th>Description</th></tr>
+    <tr><td><code>loom_execute_task</code></td><td>Create and run a task. Supports <code>wait: true</code> to block until completion.</td></tr>
+    <tr><td><code>loom_task_status</code></td><td>Check current status of a task by ID</td></tr>
+    <tr><td><code>loom_list_tasks</code></td><td>List all tasks, optionally filtered by status</td></tr>
+  </table>
+
+  <p>Any MCP-compatible client (Claude Desktop, other agents) can connect to Loom over stdio and use these tools to orchestrate complex coding tasks.</p>
 </section>
 
 <!-- ======================== ENDPOINTS ======================== -->
@@ -956,59 +1138,68 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
   <h2>Architecture</h2>
 
   <div class="diagram" style="text-align: left; padding: 24px 32px;">
-<span class="dim">                     loom.toml</span>
-<span class="dim">                        |</span>
-<span class="dim">                    </span><span class="highlight">Config</span>
-<span class="dim">                        |</span>
-<span class="dim">          </span><span class="highlight">CLI</span><span class="dim"> ---------- </span><span class="highlight">API Server</span><span class="dim"> (FastAPI)</span>
-<span class="dim">                        |</span>
-<span class="dim">                    </span><span class="highlight">Engine</span>
-<span class="dim">                   /    |    \</span>
-<span class="dim">        </span><span class="highlight">Orchestrator</span><span class="dim">  </span><span class="highlight">EventBus</span><span class="dim">  </span><span class="highlight">StateManager</span>
-<span class="dim">           |           |</span>
-<span class="dim">     </span><span class="highlight">Scheduler</span><span class="dim"> ---- </span><span class="highlight">Verification</span><span class="dim"> ---- </span><span class="highlight">PromptAssembler</span>
-<span class="dim">           |                    |</span>
-<span class="dim">  </span><span class="highlight">ModelRouter</span><span class="dim">           </span><span class="highlight">Templates</span><span class="dim"> (YAML)</span>
-<span class="dim">      /        \</span>
-<span class="dim"> </span><span class="highlight">Ollama</span><span class="dim">    </span><span class="highlight">OpenAI</span>
-<span class="dim">             Compatible</span>
+<span class="dim">       </span><span class="highlight">TUI</span><span class="dim"> --- </span><span class="highlight">CLI</span><span class="dim"> --- </span><span class="highlight">MCP Server</span>
+<span class="dim">              \     |     /</span>
+<span class="dim">          </span><span class="highlight">API Server</span><span class="dim"> (FastAPI)</span>
+<span class="dim">                 |</span>
+<span class="dim">             </span><span class="highlight">Engine</span>
+<span class="dim">          /    |    \       \</span>
+<span class="dim"> </span><span class="highlight">Orchestrator</span><span class="dim"> </span><span class="highlight">EventBus</span><span class="dim"> </span><span class="highlight">StateManager</span><span class="dim"> </span><span class="highlight">Learning</span>
+<span class="dim">      |          |</span>
+<span class="dim"> </span><span class="highlight">Scheduler</span><span class="dim"> -- </span><span class="highlight">Verification</span><span class="dim"> -- </span><span class="highlight">PromptAssembler</span>
+<span class="dim">      |          |               |</span>
+<span class="dim"> </span><span class="highlight">ModelRouter</span><span class="dim">  </span><span class="highlight">Confidence</span><span class="dim">    </span><span class="highlight">Templates</span>
+<span class="dim">    /     \      |</span>
+<span class="dim"> </span><span class="highlight">Ollama</span><span class="dim">  </span><span class="highlight">OpenAI</span><span class="dim"> </span><span class="highlight">Approval</span><span class="dim"> + </span><span class="highlight">Retry</span><span class="dim"> + </span><span class="highlight">Webhook</span>
   </div>
 
   <h3>Source Layout</h3>
   <pre><code>src/loom/
-  __main__.py          <span class="cmt"># CLI (Click)</span>
-  config.py            <span class="cmt"># TOML config loader</span>
+  __main__.py            <span class="cmt"># CLI (Click)</span>
+  config.py              <span class="cmt"># TOML config loader</span>
   api/
-    server.py          <span class="cmt"># FastAPI app + lifespan</span>
-    routes.py          <span class="cmt"># All REST endpoints</span>
-    schemas.py         <span class="cmt"># Pydantic models</span>
-    engine.py          <span class="cmt"># Component wiring</span>
+    server.py            <span class="cmt"># FastAPI app + lifespan</span>
+    routes.py            <span class="cmt"># All REST endpoints</span>
+    schemas.py           <span class="cmt"># Pydantic models</span>
+    engine.py            <span class="cmt"># Component wiring</span>
   engine/
-    orchestrator.py    <span class="cmt"># Plan -> execute -> verify -> finalize</span>
-    scheduler.py       <span class="cmt"># Dependency resolution</span>
-    verification.py    <span class="cmt"># Three-tier verification gates</span>
+    orchestrator.py      <span class="cmt"># Plan -> execute -> verify -> finalize</span>
+    scheduler.py         <span class="cmt"># Dependency resolution</span>
+    verification.py      <span class="cmt"># Three-tier verification gates</span>
   events/
-    bus.py             <span class="cmt"># Pub/sub event bus + persistence</span>
-    types.py           <span class="cmt"># Event constants</span>
+    bus.py               <span class="cmt"># Pub/sub event bus + persistence</span>
+    types.py             <span class="cmt"># Event constants</span>
+    webhook.py           <span class="cmt"># Callback URL delivery + retry</span>
+  integrations/
+    mcp_server.py        <span class="cmt"># MCP server (3 tools)</span>
+  learning/
+    manager.py           <span class="cmt"># Pattern extraction + query</span>
   models/
-    base.py            <span class="cmt"># Provider ABC</span>
-    ollama_provider.py <span class="cmt"># Ollama client</span>
-    openai_provider.py <span class="cmt"># OpenAI-compatible client</span>
-    router.py          <span class="cmt"># Role + tier routing</span>
+    base.py              <span class="cmt"># Provider ABC</span>
+    ollama_provider.py   <span class="cmt"># Ollama client</span>
+    openai_provider.py   <span class="cmt"># OpenAI-compatible client</span>
+    router.py            <span class="cmt"># Role + tier routing</span>
   prompts/
-    assembler.py       <span class="cmt"># 7-section builder</span>
-    constraints.py     <span class="cmt"># Safety rules</span>
-    templates/         <span class="cmt"># YAML templates</span>
+    assembler.py         <span class="cmt"># 7-section builder</span>
+    constraints.py       <span class="cmt"># Safety rules</span>
+    templates/           <span class="cmt"># YAML templates</span>
+  recovery/
+    approval.py          <span class="cmt"># Approval gates</span>
+    confidence.py        <span class="cmt"># Weighted confidence scoring</span>
+    retry.py             <span class="cmt"># Retry escalation ladder</span>
   state/
-    task_state.py      <span class="cmt"># Task/Subtask dataclasses</span>
-    memory.py          <span class="cmt"># SQLite memory archive</span>
-    schema.sql         <span class="cmt"># DB schema</span>
+    task_state.py        <span class="cmt"># Task/Subtask dataclasses</span>
+    memory.py            <span class="cmt"># SQLite memory archive</span>
+    schema.sql           <span class="cmt"># DB schema</span>
   tools/
-    registry.py        <span class="cmt"># Tool dispatch</span>
-    file_ops.py        <span class="cmt"># Read/write/edit</span>
-    shell.py           <span class="cmt"># Shell execution</span>
-    search.py          <span class="cmt"># File search</span>
-    workspace.py       <span class="cmt"># Changelog + revert</span></code></pre>
+    registry.py          <span class="cmt"># Tool dispatch</span>
+    file_ops.py          <span class="cmt"># Read/write/edit</span>
+    shell.py             <span class="cmt"># Shell execution</span>
+    search.py            <span class="cmt"># File search</span>
+    workspace.py         <span class="cmt"># Changelog + revert</span>
+  tui/
+    api_client.py        <span class="cmt"># Async HTTP + SSE client</span>
+    app.py               <span class="cmt"># Textual dashboard</span></code></pre>
 </section>
 
 <!-- ======================== CONFIG REF ======================== -->
@@ -1106,7 +1297,8 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     <summary>Tests failing</summary>
     <div class="inner">
       <pre><code><span class="cmt"># Make sure dev dependencies are installed</span>
-<span class="cmd">pip install</span> <span class="flag">-e</span> <span class="str">".[dev]"</span>
+<span class="cmd">uv sync</span> <span class="flag">--extra</span> dev
+<span class="cmt"># or: pip install -e ".[dev]"</span>
 
 <span class="cmt"># Run the full suite</span>
 <span class="cmd">pytest</span> <span class="flag">-v</span>
