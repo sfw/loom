@@ -429,10 +429,8 @@ async def _cowork_session(
                 session_id=session_id,
             )
 
-    # Bind tools that need session context
-    recall_tool.bind(store=store, session_id=session.session_id, session_state=session.session_state)
+    # -- Helper: create or switch to a session --------------------------------
 
-    # Create orchestrator factory for delegate_task (lazy init)
     async def _orchestrator_factory():
         from loom.engine.orchestrator import Orchestrator
         from loom.events.bus import EventBus
@@ -452,9 +450,100 @@ async def _cowork_session(
             config=config,
         )
 
-    delegate_tool.bind(_orchestrator_factory)
+    def _bind_session_tools(s: CoworkSession) -> None:
+        """Rebind tools that hold a reference to the active session."""
+        recall_tool.bind(store=store, session_id=s.session_id, session_state=s.session_state)
+        delegate_tool.bind(_orchestrator_factory)
 
+    async def _new_session(ws: Path) -> CoworkSession:
+        """Create a fresh session for the given workspace."""
+        prompt = build_cowork_system_prompt(ws)
+        sid = await store.create_session(
+            workspace=str(ws), model_name=provider.name, system_prompt=prompt,
+        )
+        s = CoworkSession(
+            model=provider, tools=tools, workspace=ws,
+            system_prompt=prompt, approver=approver,
+            store=store, session_id=sid,
+        )
+        _bind_session_tools(s)
+        return s
+
+    async def _resume_session(sid: str) -> CoworkSession:
+        """Resume an existing session by ID."""
+        sess_row = await store.get_session(sid)
+        if sess_row is None:
+            raise ValueError(f"Session not found: {sid}")
+        ws = Path(sess_row["workspace_path"])
+        prompt = build_cowork_system_prompt(ws)
+        s = CoworkSession(
+            model=provider, tools=tools, workspace=ws,
+            system_prompt=prompt, approver=approver, store=store,
+        )
+        await s.resume(sid)
+        _bind_session_tools(s)
+        return s
+
+    async def _switch_session() -> CoworkSession | None:
+        """Interactive session picker. Returns new session or None on cancel."""
+        all_sessions = await store.list_sessions()
+
+        if not all_sessions:
+            sys.stdout.write("\033[2mNo previous sessions. Starting new.\033[0m\n")
+            return await _new_session(workspace)
+
+        # Group by workspace
+        by_ws: dict[str, list[dict]] = {}
+        for s in all_sessions:
+            ws_path = s.get("workspace_path", "?")
+            by_ws.setdefault(ws_path, []).append(s)
+
+        sys.stdout.write("\n\033[1mSessions:\033[0m\n")
+        flat: list[dict] = []
+        for ws_path, sessions in by_ws.items():
+            sys.stdout.write(f"  \033[36m{ws_path}\033[0m\n")
+            for s in sessions[:5]:
+                idx = len(flat) + 1
+                turns = s.get("turn_count", 0)
+                started = s.get("started_at", "?")[:16]
+                sid = s["id"]
+                active = " \033[32m(active)\033[0m" if s.get("is_active") else ""
+                sys.stdout.write(
+                    f"    \033[2m[{idx}]\033[0m {started} — {turns} turns ({sid}){active}\n"
+                )
+                flat.append(s)
+        sys.stdout.write(f"    \033[2m[n]\033[0m New session (current workspace)\n")
+        sys.stdout.write(f"    \033[2m[c]\033[0m Cancel\n")
+        sys.stdout.flush()
+
+        try:
+            choice = input("\033[2mChoice: \033[0m").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+        if choice == "c" or not choice:
+            return None
+        if choice == "n":
+            return await _new_session(workspace)
+        if choice.isdigit() and 1 <= int(choice) <= len(flat):
+            selected = flat[int(choice) - 1]
+            s = await _resume_session(selected["id"])
+            sys.stdout.write(
+                f"\033[2mSwitched to session {s.session_id} "
+                f"({s.session_state.turn_count} turns, "
+                f"workspace: {s.workspace})\033[0m\n"
+            )
+            return s
+
+        display_error(f"Invalid choice: {choice}")
+        return None
+
+    # -- Initialize first session -------------------------------------------
+
+    _bind_session_tools(session)
     display_welcome(workspace, provider.name)
+
+    # -- Main loop -----------------------------------------------------------
 
     while True:
         try:
@@ -466,26 +555,52 @@ async def _cowork_session(
         if not user_input.strip():
             continue
 
+        cmd = user_input.strip().lower()
+
         # Handle special commands
-        if user_input.strip().lower() in ("/quit", "/exit", "/q"):
+        if cmd in ("/quit", "/exit", "/q"):
             display_goodbye()
             break
 
-        if user_input.strip().lower() == "/help":
+        if cmd == "/help":
             sys.stdout.write(
-                "Commands: /quit, /exit, /help, /session\n"
+                "Commands:\n"
+                "  /sessions  — list and switch between sessions\n"
+                "  /new       — start a new session (current workspace)\n"
+                "  /session   — show current session info\n"
+                "  /quit      — exit\n"
+                "  /help      — this message\n"
                 "Type anything else to interact with the AI.\n"
             )
             continue
 
-        if user_input.strip().lower() == "/session":
+        if cmd == "/session":
             state = session.session_state
             sys.stdout.write(
                 f"Session: {session.session_id}\n"
+                f"Workspace: {session.workspace}\n"
                 f"Turns: {state.turn_count}\n"
                 f"Tokens: {state.total_tokens}\n"
                 f"Focus: {state.current_focus or '(none)'}\n"
             )
+            if state.key_decisions:
+                sys.stdout.write("Decisions:\n")
+                for d in state.key_decisions[-5:]:
+                    sys.stdout.write(f"  - {d}\n")
+            continue
+
+        if cmd == "/sessions":
+            # Mark current session inactive before switching
+            new_session = await _switch_session()
+            if new_session is not None:
+                await store.update_session(session.session_id, is_active=False)
+                session = new_session
+            continue
+
+        if cmd == "/new":
+            await store.update_session(session.session_id, is_active=False)
+            session = await _new_session(workspace)
+            sys.stdout.write(f"\033[2mNew session: {session.session_id}\033[0m\n")
             continue
 
         try:
