@@ -15,7 +15,7 @@ jobs:
         with:
           version: "latest"
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --extra dev
       - name: Lint with ruff
         run: uv run ruff check src/ tests/
 
@@ -34,7 +34,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --extra dev
       - name: Run tests
         run: uv run pytest -v --tb=short
       - name: Run tests with coverage
