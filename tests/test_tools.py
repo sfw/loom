@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from loom.tools import create_default_registry
+from loom.tools import create_default_registry, discover_tools
 from loom.tools.file_ops import (
     DeleteFileTool,
     EditFileTool,
@@ -96,11 +96,28 @@ class TestRegistry:
 
     def test_all_schemas(self, registry: ToolRegistry):
         schemas = registry.all_schemas()
-        assert len(schemas) == 11
+        discovered = discover_tools()
+        assert len(schemas) == len(discovered)
         for s in schemas:
             assert "name" in s
             assert "description" in s
             assert "parameters" in s
+
+    def test_discover_tools_finds_all_builtins(self):
+        classes = discover_tools()
+        names = {cls.__name__ for cls in classes}
+        expected = {
+            "ReadFileTool", "WriteFileTool", "EditFileTool",
+            "DeleteFileTool", "MoveFileTool", "ShellExecuteTool",
+            "GitCommandTool", "SearchFilesTool", "ListDirectoryTool",
+            "AnalyzeCodeTool", "WebFetchTool",
+        }
+        assert expected.issubset(names), f"Missing: {expected - names}"
+
+    def test_discover_tools_deterministic_order(self):
+        a = [cls.__name__ for cls in discover_tools()]
+        b = [cls.__name__ for cls in discover_tools()]
+        assert a == b
 
     async def test_execute_unknown_tool(self, registry: ToolRegistry):
         result = await registry.execute("nonexistent", {})

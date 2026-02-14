@@ -813,6 +813,7 @@
     <tr><td><code>approval_requested</code></td><td>Waiting for human approval (with confidence score)</td></tr>
     <tr><td><code>task_completed</code></td><td>All subtasks done</td></tr>
     <tr><td><code>task_failed</code></td><td>Task could not complete</td></tr>
+    <tr><td><code>token_streamed</code></td><td>A model token was generated (streaming mode)</td></tr>
   </table>
 
   <p>The stream terminates automatically when the task reaches a terminal state (<code>completed</code>, <code>failed</code>, or <code>cancelled</code>). If no events arrive for 30 seconds, a keepalive comment is sent to maintain the connection.</p>
@@ -1192,10 +1193,13 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     memory.py            <span class="cmt"># SQLite memory archive</span>
     schema.sql           <span class="cmt"># DB schema</span>
   tools/
-    registry.py          <span class="cmt"># Tool dispatch</span>
-    file_ops.py          <span class="cmt"># Read/write/edit</span>
+    registry.py          <span class="cmt"># Tool ABC + auto-discovery</span>
+    file_ops.py          <span class="cmt"># Read/write/edit/delete/move</span>
     shell.py             <span class="cmt"># Shell execution</span>
+    git.py               <span class="cmt"># Git operations</span>
     search.py            <span class="cmt"># File search</span>
+    code_analysis.py     <span class="cmt"># Code structure analysis</span>
+    web.py               <span class="cmt"># Web fetch</span>
     workspace.py         <span class="cmt"># Changelog + revert</span>
   tui/
     api_client.py        <span class="cmt"># Async HTTP + SSE client</span>

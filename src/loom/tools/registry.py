@@ -11,7 +11,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 
 @dataclass
@@ -58,7 +58,20 @@ class ToolSafetyError(Exception):
 
 
 class Tool(ABC):
-    """Abstract base class for all tools."""
+    """Abstract base class for all tools.
+
+    Concrete subclasses are auto-collected via ``__init_subclass__``.
+    Call ``discover_tools()`` (from ``loom.tools``) to import all tool
+    modules and retrieve the collected classes.
+    """
+
+    _registered_classes: ClassVar[set[type[Tool]]] = set()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        # Only collect concrete classes (no remaining abstract methods)
+        if not getattr(cls, "__abstractmethods__", None):
+            Tool._registered_classes.add(cls)
 
     @property
     @abstractmethod

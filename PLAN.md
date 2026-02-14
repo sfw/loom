@@ -4,29 +4,18 @@ Prioritized by impact and dependency order. Each phase is independently shippabl
 
 ---
 
-## Phase 1: New Tools (Foundation)
+## Phase 1: New Tools (Foundation) ✓ DONE
 
 Everything else depends on having a richer tool set.
 
-### 1a. `git_command` tool (`tools/git.py`)
-- Wraps git operations: `status`, `diff`, `add`, `commit`, `log`, `branch`, `checkout`, `stash`
-- Safety blocklist: block `push --force`, `reset --hard`, `clean -fd` (same pattern as shell.py)
-- Changelog integration: not needed (git is its own changelog)
-- Timeout: 60s
-- Parameters: `{"command": str, "args": list[str]}`
+All Phase 1 tools are implemented and auto-discovered via `Tool.__init_subclass__`.
+No manual registration needed — `create_default_registry()` uses `discover_tools()`
+to scan the `loom.tools` package automatically.
 
-### 1b. `delete_file` tool (add to `tools/file_ops.py`)
-- Deletes a file or empty directory
-- Changelog integration: calls `record_delete()` before removing
-- Safety: refuse to delete workspace root, `.git/`, etc.
-- Parameters: `{"path": str}`
-
-### 1c. `move_file` tool (add to `tools/file_ops.py`)
-- Move or rename a file/directory within workspace
-- Changelog integration: calls `record_rename()`
-- Parameters: `{"source": str, "destination": str}`
-
-### 1d. Register new tools in `create_default_registry()`
+### 1a. `git_command` tool (`tools/git.py`) ✓
+### 1b. `delete_file` tool (`tools/file_ops.py`) ✓
+### 1c. `move_file` tool (`tools/file_ops.py`) ✓
+### 1d. Auto-registration via plugin discovery ✓
 
 **Tests:** Unit tests for each tool (safety blocklist, path validation, changelog integration)
 

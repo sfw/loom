@@ -36,7 +36,7 @@ Goal -> Planner ->  │ [Subtask A]  [Subtask B] │  parallel batch
 - **Isolated execution** -- each subtask runs in a `SubtaskRunner` with its own context (no cross-contamination)
 - **Dual model backends** -- Ollama and OpenAI-compatible APIs (LM Studio, vLLM, etc.)
 - **Role-based routing** -- planner, executor, extractor, verifier roles with tier selection
-- **Tool system** -- file read/write/edit, shell execution (with safety blocklist), search
+- **Tool system** -- 11 built-in tools (file ops, shell, git, search, code analysis, web fetch) with plugin auto-discovery
 - **Workspace safety** -- path traversal prevention, destructive command blocking
 - **Full undo** -- changelog with before-snapshots, revert at file/subtask/task level
 - **Token budgeting** -- prompt assembly with 7-section ordering and trim-to-budget
@@ -215,10 +215,13 @@ src/loom/
     memory.py            SQLite memory archive
     schema.sql           Database schema
   tools/
-    registry.py          Tool dispatch with timeout
-    file_ops.py          Read, write, edit files
+    registry.py          Tool ABC with auto-discovery via __init_subclass__
+    file_ops.py          Read, write, edit, delete, move files
     shell.py             Shell execution with safety
+    git.py               Git operations with allowlist
     search.py            File search and directory listing
+    code_analysis.py     Code structure analysis (tree-sitter)
+    web.py               Web fetch with URL safety
     workspace.py         Changelog, diff, revert
   tui/
     api_client.py        Async HTTP + SSE client for Loom API

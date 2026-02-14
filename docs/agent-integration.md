@@ -412,6 +412,11 @@ class RunTestsTool(Tool):
 Register it:
 
 ```python
+# Option 1: Auto-discovery (recommended for built-in tools)
+# Place your tool in src/loom/tools/my_tool.py and subclass Tool.
+# It will be found automatically by discover_tools() on import.
+
+# Option 2: Manual registration (for tools outside the tools/ package)
 from loom.tools import create_default_registry
 
 registry = create_default_registry()
@@ -579,3 +584,4 @@ Events your agent can listen for via SSE or event bus subscription:
 | `subtask_retrying` | Subtask being retried with escalation |
 | `approval_requested` | Paused for human review |
 | `approval_received` | Human responded to approval request |
+| `token_streamed` | Model token generated (streaming mode) |
