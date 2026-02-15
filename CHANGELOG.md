@@ -6,6 +6,7 @@ All notable changes to Loom are documented in this file.
 
 ### Changed
 - **Unified TUI as default interface** (`tui/app.py`, `__main__.py`) -- `loom` with no subcommand now launches the Textual TUI with full cowork backend: session persistence (SQLite), conversation recall, task delegation, process definitions, and session management. The separate plain-text REPL is removed. `loom cowork` is an alias for the default TUI. New slash commands: `/sessions`, `/new`, `/session`, `/resume <id>`.
+- **Setup wizard moved into TUI** (`tui/screens/setup.py`, `__main__.py`) -- first-run configuration now launches as a multi-step modal inside the TUI instead of CLI prompts. Five-step keyboard-driven flow: provider selection, model details, role assignment, optional utility model, and confirmation. Reconfigure anytime with the `/setup` slash command. The `loom setup` CLI command is retained as a headless fallback.
 
 ### Added
 - **Process definition plugin architecture** (`processes/schema.py`) -- YAML-based domain specialization. Process definitions inject personas, phase blueprints, verification rules, tool guidance, and memory extraction types into the engine without code changes. Multi-path discovery (builtin → user-global → workspace-local), comprehensive validation with dependency cycle detection, and support for process packages that bundle tools.

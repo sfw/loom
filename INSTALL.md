@@ -131,17 +131,21 @@ uv sync --extra pdf
 
 ## Configuration
 
-### Create the Config File
+### Setup Wizard (Recommended)
+
+Just run `loom`. On first launch with no config, the TUI opens a guided setup wizard that walks you through provider selection, model configuration, and role assignment. It writes `~/.loom/loom.toml` and creates the `~/.loom/` directory structure for you.
+
+You can also run the wizard from the CLI: `loom setup`. Or reconfigure at any time from inside the TUI with the `/setup` slash command.
+
+### Manual Configuration
+
+If you prefer to write the config by hand:
 
 ```bash
-# Option 1: Copy the example config to your home directory
 mkdir -p ~/.loom
 cp loom.toml ~/.loom/loom.toml
-
-# Option 2: Keep it in your project directory (Loom checks ./loom.toml first)
+# Or keep it in your project directory (Loom checks ./loom.toml first)
 ```
-
-### Configure Your Models
 
 Edit `~/.loom/loom.toml` (or `./loom.toml`) to match your backend:
 
@@ -281,9 +285,10 @@ mkdir -p /tmp/loom-demo
 loom -w /tmp/loom-demo
 ```
 
-This launches the interactive TUI with full session persistence, conversation
-recall, and tool approval modals. All conversation history is saved to SQLite
-and survives restarts. Resume any session with `loom --resume <session-id>`.
+On first launch the setup wizard runs inside the TUI — pick a provider, enter
+your model details, and you're chatting in under a minute. All conversation
+history is saved to SQLite and survives restarts. Resume any session with
+`loom --resume <session-id>`.
 
 ### Autonomous Task Mode
 
@@ -321,9 +326,9 @@ loom run "Create a Python script that prints Fibonacci numbers up to 100" \
 
 ### "No models configured"
 
-Your `loom.toml` isn't being found. Either:
-- Place it in the current directory, or
-- Place it at `~/.loom/loom.toml`, or
+If you run `loom` with no config, the built-in setup wizard launches automatically. If you need to fix an existing config:
+- Run `/setup` from inside the TUI, or `loom setup` from the CLI
+- Place `loom.toml` in the current directory or at `~/.loom/loom.toml`
 - Pass it explicitly: `loom --config /path/to/loom.toml serve`
 
 ### Connection refused to model backend

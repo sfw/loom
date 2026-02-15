@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from textual import on, work
+from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -116,10 +114,10 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             with Vertical(id="step-provider", classes="step-container"):
                 yield Label("Loom Setup", classes="setup-heading")
                 yield Static("─" * 40, classes="setup-divider")
-                if self._adding_utility:
-                    yield Label("Utility model provider:")
-                else:
-                    yield Label("Choose your model provider:")
+                yield Label(
+                    "Choose your model provider:",
+                    id="provider-prompt",
+                )
                 yield Label("")
                 for i, (display, _key, _needs, _url) in enumerate(PROVIDERS, 1):
                     yield Label(
@@ -127,7 +125,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
                         classes="setup-option",
                     )
                 yield Label(
-                    "Press 1, 2, or 3 to select",
+                    f"Press 1-{len(PROVIDERS)} to select",
                     classes="setup-hint",
                 )
 
@@ -240,6 +238,17 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             except Exception:
                 pass
 
+        # Update dynamic labels
+        if step == _STEP_PROVIDER:
+            try:
+                prompt = self.query_one("#provider-prompt", Label)
+                if self._adding_utility:
+                    prompt.update("Utility model provider:")
+                else:
+                    prompt.update("Choose your model provider:")
+            except Exception:
+                pass
+
         # Focus the first input on the details step
         if step == _STEP_DETAILS:
             self._configure_details_step()
@@ -296,7 +305,12 @@ class SetupScreen(ModalScreen[list[dict] | None]):
     def on_key(self, event) -> None:
         key = event.character
 
-        if self._step == _STEP_PROVIDER and key in ("1", "2", "3"):
+        if (
+            self._step == _STEP_PROVIDER
+            and key
+            and key.isdigit()
+            and 1 <= int(key) <= len(PROVIDERS)
+        ):
             idx = int(key) - 1
             self._provider_idx = idx
             self._provider_key = PROVIDERS[idx][1]
@@ -337,7 +351,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             event.prevent_default()
             event.stop()
 
-        elif self._step == _STEP_CONFIRM and key == "enter":
+        elif self._step == _STEP_CONFIRM and event.key == "enter":
             self._save_and_dismiss()
             event.prevent_default()
             event.stop()

@@ -54,11 +54,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 # Install
 uv sync          # or: pip install -e .
 
-# Configure models
-cp loom.toml ~/.loom/loom.toml
-# Edit with your model endpoints (Ollama, LM Studio, vLLM, Claude, etc.)
-
-# Launch the interactive TUI (default)
+# Launch — the setup wizard runs automatically on first start
 loom -w /path/to/project
 
 # With a process definition
@@ -76,7 +72,9 @@ loom serve
 
 ## Configuration
 
-Loom reads `loom.toml` from the current directory or `~/.loom/loom.toml`:
+On first launch, Loom's built-in setup wizard walks you through provider selection, model configuration, and role assignment — all inside the TUI. The wizard writes `~/.loom/loom.toml` for you. Run `/setup` from inside the TUI at any time to reconfigure, or `loom setup` from the CLI.
+
+You can also create the config manually. Loom reads `loom.toml` from the current directory or `~/.loom/loom.toml`:
 
 ```toml
 [models.primary]
@@ -115,15 +113,16 @@ loom install user/repo                      # install from GitHub
 
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Full session persistence, conversation recall, task delegation, and session management (`/sessions`, `/new`, `/resume`).
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, and session management (`/sessions`, `/new`, `/resume`, `/setup`).
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
 ## CLI Commands
 
 ```
-loom                    Launch the interactive TUI (default)
+loom                    Launch the interactive TUI (default; setup wizard on first run)
 loom cowork             Alias for the interactive TUI
+loom setup              Run the configuration wizard (CLI fallback)
 loom run GOAL           Autonomous task execution with streaming progress
 loom serve              Start the API server
 loom status ID          Check task status

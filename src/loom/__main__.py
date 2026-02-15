@@ -9,7 +9,7 @@ from pathlib import Path
 import click
 
 from loom import __version__
-from loom.config import Config, load_config
+from loom.config import Config, ConfigError, load_config
 
 
 @click.group(invoke_without_command=True)
@@ -49,7 +49,15 @@ def cli(
     delegation.
     """
     ctx.ensure_object(dict)
-    ctx.obj["config"] = load_config(config_path)
+    try:
+        ctx.obj["config"] = load_config(config_path)
+    except ConfigError as e:
+        if ctx.invoked_subcommand == "setup":
+            # Let setup proceed even with broken/missing config
+            ctx.obj["config"] = Config()
+        else:
+            click.echo(f"Configuration error: {e}", err=True)
+            sys.exit(1)
 
     if ctx.invoked_subcommand is None:
         # Default: launch the TUI

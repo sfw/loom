@@ -44,6 +44,17 @@ loom cowork -w /path/to/project             # Alias
 
 ## Features
 
+### First-Run Setup Wizard
+
+When Loom launches with no configured models, the TUI pushes a `SetupScreen` modal — a five-step guided wizard that collects provider, model details, roles, an optional utility model, and writes `~/.loom/loom.toml`. The session initializes immediately after without restarting. Users can reconfigure at any time via the `/setup` slash command.
+
+**Steps:**
+1. **Provider** — Anthropic, OpenAI-compatible, or Ollama (number keys to select)
+2. **Details** — base URL, model name/selection, API key (provider-dependent fields)
+3. **Roles** — all roles, primary only (planner + executor), or utility only (extractor + verifier)
+4. **Utility model?** — if roles are incomplete, offer to add a second model
+5. **Confirm** — summary of all models and roles; Enter to save, Esc to go back
+
 ### Multi-Panel Layout
 - **Sidebar** — workspace file browser, task progress tracker
 - **Chat tab** — streaming conversation with rich tool call rendering
@@ -114,6 +125,7 @@ When the model calls `ask_user`, a modal with input field appears:
 | `/model` | Show current model |
 | `/tools` | List available tools |
 | `/tokens` | Show session token usage |
+| `/setup` | Open the configuration wizard |
 | `/clear` | Clear the chat display |
 | `/quit` | Exit Loom |
 
@@ -134,12 +146,16 @@ When the model calls `ask_user`, a modal with input field appears:
 class LoomApp(App):
     """Unified interactive interface with full cowork backend."""
 
-    def __init__(self, model, tools, workspace, *,
+    def __init__(self, model: ModelProvider | None, tools, workspace, *,
                  config=None, db=None, store=None,
                  resume_session=None, process_name=None):
         ...
 
     async def on_mount(self):
+        # If model is None → push SetupScreen modal, return
+        # Otherwise → _initialize_session()
+
+    async def _initialize_session(self):
         # Register conversation_recall + delegate_task tools
         # Load process definition
         # Create or resume session (with persistence)
@@ -165,6 +181,7 @@ class LoomApp(App):
 | `StatusBar` | `tui/widgets/status_bar.py` | Workspace, model, tokens, state |
 | `ToolApprovalScreen` | `tui/screens/` | Modal for [y]es/[a]lways/[n]o approval |
 | `AskUserScreen` | `tui/screens/` | Modal for model questions |
+| `SetupScreen` | `tui/screens/` | Multi-step first-run setup wizard |
 | `ToolApprover` | `cowork/approval.py` | Tracks auto-approved and always-approved tools |
 | `CoworkSession` | `cowork/session.py` | Conversation-first execution engine |
 | `ConversationStore` | `state/conversation_store.py` | SQLite session persistence |
@@ -186,3 +203,6 @@ class LoomApp(App):
 - [x] Multi-panel layout (sidebar, chat, files, events)
 - [x] Status bar shows workspace, model, token count, and state
 - [x] Keyboard shortcuts (Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette)
+- [x] First-run setup wizard inside TUI when no models configured
+- [x] `/setup` slash command for reconfiguration
+- [x] `loom setup` CLI fallback for headless environments

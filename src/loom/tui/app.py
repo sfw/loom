@@ -276,7 +276,10 @@ class LoomApp(App):
                 )
                 self._session = None
 
-        if self._session is None and self._store is not None:
+        if self._session is not None:
+            # Successfully resumed — keep it
+            pass
+        elif self._store is not None:
             # New persisted session
             session_id = await self._store.create_session(
                 workspace=str(self._workspace),
@@ -380,7 +383,7 @@ class LoomApp(App):
 
     async def _new_session(self) -> None:
         """Create a fresh session, replacing the current one."""
-        if self._store is None or self._session is None:
+        if self._store is None or self._session is None or self._model is None:
             return
 
         # Mark old session inactive
@@ -412,7 +415,7 @@ class LoomApp(App):
 
     async def _switch_to_session(self, session_id: str) -> None:
         """Resume a different session by ID."""
-        if self._store is None or self._session is None:
+        if self._store is None or self._session is None or self._model is None:
             return
 
         old_id = self._session.session_id
