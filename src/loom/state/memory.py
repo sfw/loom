@@ -256,7 +256,9 @@ class Database:
         rows = await self.query(
             """SELECT * FROM memory_entries
                WHERE task_id = ?
-               AND (summary LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')
+               AND (summary LIKE ? ESCAPE '\\'
+                    OR detail LIKE ? ESCAPE '\\'
+                    OR tags LIKE ? ESCAPE '\\')
                ORDER BY timestamp DESC
                LIMIT ?""",
             (task_id, f"%{escaped}%", f"%{escaped}%", f"%{escaped}%", limit),

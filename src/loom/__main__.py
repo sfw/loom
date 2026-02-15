@@ -224,7 +224,8 @@ async def _cancel_task(server_url: str, task_id: str) -> None:
                 click.echo(f"Task not found: {task_id}", err=True)
                 sys.exit(1)
             if response.status_code >= 400:
-                click.echo(f"Cancel failed ({response.status_code}): {response.text[:200]}", err=True)
+                msg = f"Cancel failed ({response.status_code}): {response.text[:200]}"
+                click.echo(msg, err=True)
                 sys.exit(1)
             click.echo(f"Task {task_id} cancelled.")
     except httpx.ConnectError:
@@ -279,7 +280,12 @@ def mcp_serve(ctx: click.Context, server_url: str | None) -> None:
 @click.option("--model", "-m", default=None, help="Model name from config to use.")
 @click.option("--resume", "resume_session", default=None, help="Resume a previous session by ID.")
 @click.pass_context
-def cowork(ctx: click.Context, workspace: Path | None, model: str | None, resume_session: str | None) -> None:
+def cowork(
+    ctx: click.Context,
+    workspace: Path | None,
+    model: str | None,
+    resume_session: str | None,
+) -> None:
     """Start an interactive cowork session.
 
     Opens a conversation loop where you and the AI collaborate directly.
@@ -342,7 +348,10 @@ async def _cowork_session(
             return
 
     # Set up database and conversation store
-    data_dir = Path(config.workspace.scratch_dir).expanduser() if hasattr(config, "workspace") else Path.home() / ".loom"
+    if hasattr(config, "workspace"):
+        data_dir = Path(config.workspace.scratch_dir).expanduser()
+    else:
+        data_dir = Path.home() / ".loom"
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = data_dir / "loom.db"
     db = Database(db_path)
@@ -398,7 +407,7 @@ async def _cowork_session(
                 started = s.get("started_at", "?")[:16]
                 sid = s["id"]
                 sys.stdout.write(f"  \033[2m[{i}]\033[0m {started} — {turns} turns (id: {sid})\n")
-            sys.stdout.write(f"  \033[2m[n]\033[0m Start new session\n")
+            sys.stdout.write("  \033[2m[n]\033[0m Start new session\n")
             sys.stdout.flush()
 
             try:
@@ -527,8 +536,8 @@ async def _cowork_session(
                     f"    \033[2m[{idx}]\033[0m {started} — {turns} turns ({sid}){active}\n"
                 )
                 flat.append(s)
-        sys.stdout.write(f"    \033[2m[n]\033[0m New session (current workspace)\n")
-        sys.stdout.write(f"    \033[2m[c]\033[0m Cancel\n")
+        sys.stdout.write("    \033[2m[n]\033[0m New session (current workspace)\n")
+        sys.stdout.write("    \033[2m[c]\033[0m Cancel\n")
         sys.stdout.flush()
 
         try:

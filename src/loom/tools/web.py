@@ -114,7 +114,8 @@ class WebFetchTool(Tool):
                 content_length = response.headers.get("content-length")
                 if content_length and int(content_length) > MAX_RESPONSE_SIZE * 4:
                     return ToolResult.fail(
-                        f"Response too large ({int(content_length)} bytes). Max: {MAX_RESPONSE_SIZE * 4}."
+                        f"Response too large ({int(content_length)} bytes). "
+                        f"Max: {MAX_RESPONSE_SIZE * 4}."
                     )
 
                 content_type = response.headers.get("content-type", "")

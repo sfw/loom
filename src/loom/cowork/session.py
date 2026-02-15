@@ -520,7 +520,9 @@ class CoworkSession:
         if self._messages and self._messages[0]["role"] == "system":
             self._messages[0]["content"] = self._build_system_content()
 
-    async def _append_tool_result(self, tool_call_id: str, tool_name: str, result: ToolResult) -> None:
+    async def _append_tool_result(
+        self, tool_call_id: str, tool_name: str, result: ToolResult,
+    ) -> None:
         """Append a tool result message and persist it."""
         content = result.to_json()
         self._messages.append({

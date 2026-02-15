@@ -11,7 +11,7 @@ import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
@@ -128,7 +128,10 @@ class DelegateTaskTool(Tool):
             return ToolResult.fail(f"Task execution failed: {e}")
 
 
-def _create_task(goal: str, workspace: str, context: dict, approval_mode: str = "confidence_threshold") -> Task:
+def _create_task(
+    goal: str, workspace: str, context: dict,
+    approval_mode: str = "confidence_threshold",
+) -> Task:
     """Create a Task object for the orchestrator."""
     from loom.state.task_state import Task, TaskStatus
 

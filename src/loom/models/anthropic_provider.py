@@ -191,7 +191,9 @@ class AnthropicProvider(ModelProvider):
             else:
                 # Unknown role — treat as user message to avoid silent data loss
                 import logging
-                logging.getLogger(__name__).warning("Unknown message role '%s', treating as user", role)
+                logging.getLogger(__name__).warning(
+                    "Unknown message role '%s', treating as user", role,
+                )
                 anthropic_messages.append({
                     "role": "user",
                     "content": msg.get("content", ""),
@@ -310,7 +312,10 @@ class AnthropicProvider(ModelProvider):
                 msg = "Invalid Anthropic API key"
             elif status == 429:
                 retry_after = e.response.headers.get("retry-after", "")
-                msg = f"Anthropic rate limit exceeded (retry-after: {retry_after}s)" if retry_after else "Anthropic rate limit exceeded"
+                if retry_after:
+                    msg = f"Anthropic rate limit exceeded (retry-after: {retry_after}s)"
+                else:
+                    msg = "Anthropic rate limit exceeded"
             else:
                 msg = f"Anthropic returned HTTP {status}"
             raise ModelConnectionError(
