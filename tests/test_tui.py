@@ -452,10 +452,8 @@ class TestCLIResumeNoDB:
         """If _init_persistence returns None, --resume should exit 1."""
         from click.testing import CliRunner
 
-        from loom.__main__ import cli
-
-        # Force _init_persistence to fail
         import loom.__main__ as main_mod
+        from loom.__main__ import cli
 
         monkeypatch.setattr(main_mod, "_init_persistence", lambda cfg: (None, None))
         # Mock model resolution so we don't need a real config

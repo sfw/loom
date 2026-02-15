@@ -293,7 +293,7 @@ def run_setup(*, reconfigure: bool = False) -> Path:
     click.echo()
     click.secho("  Setup complete!", bold=True)
     click.echo(f"  Config written to {CONFIG_PATH}")
-    click.echo(f"  Run `loom` to start, or `loom setup` to reconfigure.")
+    click.echo("  Run `loom` to start, or `loom setup` to reconfigure.")
     click.echo()
 
     return CONFIG_PATH
