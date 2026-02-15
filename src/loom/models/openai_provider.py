@@ -60,9 +60,10 @@ class OpenAICompatibleProvider(ModelProvider):
         max_tokens: int | None = None,
         response_format: dict | None = None,
     ) -> ModelResponse:
+        converted = self._build_openai_messages(messages)
         payload: dict = {
             "model": self._model,
-            "messages": messages,
+            "messages": converted,
             "max_tokens": max_tokens or self._max_tokens,
             "temperature": temperature if temperature is not None else self._temperature,
         }
@@ -147,9 +148,10 @@ class OpenAICompatibleProvider(ModelProvider):
         max_tokens: int | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """Stream a completion from OpenAI-compatible endpoint via SSE."""
+        converted = self._build_openai_messages(messages)
         payload: dict = {
             "model": self._model,
-            "messages": messages,
+            "messages": converted,
             "max_tokens": max_tokens or self._max_tokens,
             "temperature": temperature if temperature is not None else self._temperature,
             "stream": True,
@@ -311,19 +313,29 @@ class OpenAICompatibleProvider(ModelProvider):
     def _build_openai_messages(self, messages: list[dict]) -> list[dict]:
         """Convert messages to OpenAI format with multimodal content parts.
 
-        For tool results containing content blocks, converts images to
-        image_url parts and documents to file parts (where supported).
+        For tool results containing content blocks, the text output is kept
+        as the tool result (must be a string), and multimodal parts are
+        injected as a follow-up user message with image_url/file content.
         """
-        if not self._capabilities.vision:
+        if not self._capabilities or not self._capabilities.vision:
             return messages
 
         result = []
         for msg in messages:
             if msg.get("role") == "tool":
-                content = self._build_tool_result_content(msg.get("content", ""))
+                raw_content = msg.get("content", "")
+                text_content = self._build_tool_result_content(raw_content)
                 out = dict(msg)
-                out["content"] = content
+                out["content"] = text_content
                 result.append(out)
+
+                # Inject multimodal parts as a follow-up user message
+                parts = self._extract_multimodal_parts(raw_content)
+                if parts:
+                    result.append({
+                        "role": "user",
+                        "content": parts,
+                    })
             else:
                 result.append(msg)
         return result

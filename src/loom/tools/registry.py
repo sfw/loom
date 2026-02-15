@@ -43,6 +43,32 @@ class ToolResult:
         return json.dumps(payload)
 
     @classmethod
+    def from_json(cls, data: str) -> ToolResult:
+        """Reconstruct a ToolResult from its JSON representation."""
+        from loom.content import deserialize_block
+
+        try:
+            parsed = json.loads(data)
+        except (json.JSONDecodeError, TypeError):
+            return cls(success=False, output="", error="Invalid JSON")
+
+        if not isinstance(parsed, dict):
+            return cls(success=False, output=str(parsed), error="Invalid JSON structure")
+
+        blocks = None
+        raw_blocks = parsed.get("content_blocks")
+        if raw_blocks and isinstance(raw_blocks, list):
+            blocks = [deserialize_block(b) for b in raw_blocks if isinstance(b, dict)]
+
+        return cls(
+            success=parsed.get("success", False),
+            output=parsed.get("output", ""),
+            error=parsed.get("error"),
+            files_changed=parsed.get("files_changed", []),
+            content_blocks=blocks or None,
+        )
+
+    @classmethod
     def ok(cls, output: str, **kwargs) -> ToolResult:
         return cls(success=True, output=output, **kwargs)
 

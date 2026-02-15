@@ -17,7 +17,7 @@ from pathlib import Path
 from loom.config import Config
 from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import EventBus
-from loom.events.types import TOKEN_STREAMED
+from loom.events.types import TOKEN_STREAMED, TOOL_CALL_COMPLETED, TOOL_CALL_STARTED
 from loom.models.base import ModelResponse
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
@@ -184,6 +184,10 @@ class SubtaskRunner:
                 })
 
                 for tc in response.tool_calls:
+                    self._emit_tool_event(
+                        TOOL_CALL_STARTED, task.id, subtask.id,
+                        tc.name, tc.arguments,
+                    )
                     tool_result = await self._tools.execute(
                         tc.name, tc.arguments,
                         workspace=workspace,
@@ -193,6 +197,11 @@ class SubtaskRunner:
                     tool_calls_record.append(ToolCallRecord(
                         tool=tc.name, args=tc.arguments, result=tool_result,
                     ))
+                    self._emit_tool_event(
+                        TOOL_CALL_COMPLETED, task.id, subtask.id,
+                        tc.name, tc.arguments,
+                        result=tool_result,
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -269,7 +278,12 @@ class SubtaskRunner:
         tool_lines = []
         for tc in result.tool_calls:
             status = "OK" if tc.result.success else f"FAILED: {tc.result.error}"
-            tool_lines.append(f"- {tc.tool}({json.dumps(tc.args)}) → {status}")
+            line = f"- {tc.tool}({json.dumps(tc.args)}) → {status}"
+            # Note multimodal content in the tool result
+            if tc.result.content_blocks:
+                block_types = [getattr(b, "type", "?") for b in tc.result.content_blocks]
+                line += f" [content: {', '.join(block_types)}]"
+            tool_lines.append(line)
         tool_calls_formatted = "\n".join(tool_lines) if tool_lines else "No tool calls."
 
         prompt = self._prompts.build_extractor_prompt(
@@ -382,6 +396,38 @@ class SubtaskRunner:
             usage=final_usage or TokenUsage(),
             model=model.name,
         )
+
+    def _emit_tool_event(
+        self,
+        event_type: str,
+        task_id: str,
+        subtask_id: str,
+        tool_name: str,
+        tool_args: dict,
+        *,
+        result: ToolResult | None = None,
+    ) -> None:
+        """Emit a tool call event to the event bus."""
+        if not self._event_bus:
+            return
+        from loom.events.bus import Event
+
+        data: dict = {
+            "subtask_id": subtask_id,
+            "tool": tool_name,
+            "args": tool_args,
+        }
+        if result is not None:
+            data["success"] = result.success
+            data["error"] = result.error or ""
+            if result.content_blocks:
+                from loom.content import serialize_block
+                data["content_blocks"] = [
+                    serialize_block(b) for b in result.content_blocks
+                ]
+        self._event_bus.emit(Event(
+            event_type=event_type, task_id=task_id, data=data,
+        ))
 
     @staticmethod
     def _build_todo_reminder(task: Task, subtask: Subtask) -> str:
