@@ -143,7 +143,8 @@ class SpreadsheetTool(Tool):
             for row in rows:
                 writer.writerow(row)
 
-        rel = filepath.relative_to(ctx.workspace)  # type: ignore[arg-type]
+        assert ctx.workspace is not None
+        rel = filepath.relative_to(ctx.workspace)
         return ToolResult.ok(
             f"Created {rel} with {len(headers)} columns and {len(rows)} rows.",
             files_changed=[str(rel)],
@@ -193,7 +194,8 @@ class SpreadsheetTool(Tool):
             for row in rows:
                 writer.writerow(row)
 
-        rel = filepath.relative_to(ctx.workspace)  # type: ignore[arg-type]
+        assert ctx.workspace is not None
+        rel = filepath.relative_to(ctx.workspace)
         return ToolResult.ok(
             f"Added {len(rows)} rows to {rel}.",
             files_changed=[str(rel)],
@@ -238,7 +240,8 @@ class SpreadsheetTool(Tool):
             writer = csv.writer(f)
             writer.writerows(rows)
 
-        rel = filepath.relative_to(ctx.workspace)  # type: ignore[arg-type]
+        assert ctx.workspace is not None
+        rel = filepath.relative_to(ctx.workspace)
         return ToolResult.ok(
             f"Added column '{col_name}' to {rel}.",
             files_changed=[str(rel)],
@@ -292,7 +295,8 @@ class SpreadsheetTool(Tool):
             writer = csv.writer(f)
             writer.writerows(rows)
 
-        rel = filepath.relative_to(ctx.workspace)  # type: ignore[arg-type]
+        assert ctx.workspace is not None
+        rel = filepath.relative_to(ctx.workspace)
         return ToolResult.ok(
             f"Updated {rel}[{row_idx}, {col_name}]: "
             f"'{old_value}' -> '{value}'.",
