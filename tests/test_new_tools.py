@@ -1128,3 +1128,79 @@ class TestSafeEval:
     def test_bool_constants(self):
         assert _safe_eval("true") is True
         assert _safe_eval("false") is False
+
+
+class TestCalculatorExponentSafety:
+    """Test that large exponents are rejected."""
+
+    async def test_large_exponent_rejected(self, calc, ctx):
+        result = await calc.execute(
+            {"expression": "2 ** 100000000"},
+            ctx,
+        )
+        assert not result.success
+        assert "exponent" in result.error.lower() or "too large" in result.error.lower()
+
+    async def test_large_negative_exponent_rejected(self, calc, ctx):
+        result = await calc.execute(
+            {"expression": "10 ** -50000"},
+            ctx,
+        )
+        assert not result.success
+
+    async def test_safe_exponent_allowed(self, calc, ctx):
+        result = await calc.execute(
+            {"expression": "2 ** 100"},
+            ctx,
+        )
+        assert result.success
+        assert result.data["result"] == 2**100
+
+    async def test_pow_function_safe(self, calc, ctx):
+        """pow() function should still work for reasonable values."""
+        result = await calc.execute(
+            {"expression": "pow(2, 20)"},
+            ctx,
+        )
+        assert result.success
+        assert "= 1048576" in result.output
+
+    def test_safe_eval_exponent_limit(self):
+        """Direct test of the exponent limit in _safe_eval."""
+        with pytest.raises(ValueError, match="Exponent too large"):
+            _safe_eval("2 ** 20000")
+
+
+class TestSpreadsheetFileSizeGuards:
+    """Test that file size limits are enforced on modify operations."""
+
+    async def test_add_column_rejects_large_file(self, sheet, ctx, workspace):
+        large = workspace / "big.csv"
+        # Write a file slightly over 5MB
+        large.write_text("A\n" + "x\n" * (5 * 1024 * 1024 // 2))
+        result = await sheet.execute(
+            {
+                "operation": "add_column",
+                "path": "big.csv",
+                "column_name": "B",
+            },
+            ctx,
+        )
+        assert not result.success
+        assert "too large" in result.error.lower()
+
+    async def test_update_cell_rejects_large_file(self, sheet, ctx, workspace):
+        large = workspace / "big.csv"
+        large.write_text("A\n" + "x\n" * (5 * 1024 * 1024 // 2))
+        result = await sheet.execute(
+            {
+                "operation": "update_cell",
+                "path": "big.csv",
+                "column_name": "A",
+                "row_index": 0,
+                "value": "y",
+            },
+            ctx,
+        )
+        assert not result.success
+        assert "too large" in result.error.lower()

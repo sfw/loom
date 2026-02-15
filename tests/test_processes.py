@@ -1179,3 +1179,99 @@ class TestExceptions:
         err = ProcessValidationError(["single error"])
         assert "1 validation error" in str(err)
         assert "single error" in str(err)
+
+
+# ===================================================================
+# Bundled Tools Tests
+# ===================================================================
+
+
+class TestRegisterBundledTools:
+    """Tests for _register_bundled_tools."""
+
+    def test_skips_missing_tools_dir(self, tmp_path):
+        """No error when package has no tools/ directory."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "process.yaml").write_text("name: no-tools\nversion: '1.0'\n")
+        # Should not raise
+        ProcessLoader._register_bundled_tools(pkg)
+
+    def test_skips_underscore_files(self, tmp_path):
+        """Files starting with _ are skipped."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        tools_dir = pkg / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "_private.py").write_text("LOADED = True\n")
+        ProcessLoader._register_bundled_tools(pkg)
+        assert "loom.processes._bundled._private" not in __import__("sys").modules
+
+    def test_logs_warning_on_bad_tool(self, tmp_path, caplog):
+        """Bad tool files should log a warning, not crash."""
+        import logging
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        tools_dir = pkg / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "bad_tool.py").write_text("raise RuntimeError('boom')\n")
+        with caplog.at_level(logging.WARNING):
+            ProcessLoader._register_bundled_tools(pkg)
+        assert "Failed to load bundled tool" in caplog.text
+
+
+# ===================================================================
+# ProcessDefinition Edge Cases
+# ===================================================================
+
+
+class TestProcessDefinitionEdgeCases:
+    """Additional edge case tests for ProcessDefinition."""
+
+    def test_get_deliverables_no_separator(self):
+        """Deliverable with no em-dash separator returns full string."""
+        defn = ProcessDefinition(
+            name="test",
+            phases=[
+                PhaseTemplate(
+                    id="p1", description="Phase 1",
+                    deliverables=["report.md"],
+                ),
+            ],
+        )
+        deliverables = defn.get_deliverables()
+        assert deliverables["p1"] == ["report.md"]
+
+    def test_get_deliverables_whitespace_handling(self):
+        """Whitespace around filename is stripped."""
+        defn = ProcessDefinition(
+            name="test",
+            phases=[
+                PhaseTemplate(
+                    id="p1", description="Phase 1",
+                    deliverables=["  report.md  \u2014  Description  "],
+                ),
+            ],
+        )
+        deliverables = defn.get_deliverables()
+        assert deliverables["p1"] == ["report.md"]
+
+    def test_verification_rule_type_defaults(self):
+        """Verify default values for VerificationRule."""
+        rule = VerificationRule(
+            name="test", description="A test rule", check="pattern",
+        )
+        assert rule.severity == "warning"
+        assert rule.type == "llm"
+        assert rule.target == "output"
+
+    def test_phase_template_defaults(self):
+        """Verify default values for PhaseTemplate."""
+        phase = PhaseTemplate(id="p1", description="Phase 1")
+        assert phase.depends_on == []
+        assert phase.model_tier == 2
+        assert phase.verification_tier == 1
+        assert phase.is_critical_path is False
+        assert phase.is_synthesis is False
+        assert phase.acceptance_criteria == ""
+        assert phase.deliverables == []
