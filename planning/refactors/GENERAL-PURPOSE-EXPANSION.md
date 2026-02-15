@@ -1393,3 +1393,720 @@ These are deliberately excluded to keep scope manageable. Each could be a future
 | **Total** | **~3280** | | **Full general-purpose expansion** |
 
 The MVP (Batch A) is a clean, shippable increment that adds immediate value. Each subsequent batch adds incremental capability without blocking the prior batch from being useful.
+
+---
+
+## Refinement Round 4: Process Definition Plugin Architecture
+
+**Supersedes Phases 0, 1, and 8 from the original plan and Refinement Rounds 1-3.**
+
+Rounds 1-3 refined an architecture where domains are Python classes (`MarketingDomain`, `FinanceDomain`) with hardcoded template overrides. This round replaces that entire approach with something fundamentally better: **declarative process definition files** that turn Loom's engine into a generic orchestration machine that anyone can specialize without writing code.
+
+### R4.1 Core Insight: Separate Engine from Intelligence
+
+The current architecture tangles two concerns:
+
+1. **The engine** — plan decomposition, dependency scheduling, tool dispatch, verification, retry, memory. This is domain-agnostic and should stay in Python.
+2. **The intelligence** — *how* to decompose a marketing strategy, *what* makes a good financial model, *which* tools to use for competitive analysis, *what* to verify in a spreadsheet. This is domain knowledge and should NOT be in Python.
+
+The process definition file is where domain intelligence lives. The engine reads it and adapts its behavior accordingly. No Python classes per domain. No template overrides in code. Just YAML files that describe how to work.
+
+### R4.2 Process Definition File Format
+
+A process definition is a single YAML file that lives in any of:
+
+```
+~/.loom/processes/marketing-strategy.yaml      # User-global processes
+./loom-processes/investment-analysis.yaml       # Workspace-local processes
+~/.loom/processes/my-custom-workflow.yaml       # User-created processes
+```
+
+Here's the complete format:
+
+```yaml
+# ─── PROCESS DEFINITION ───
+# File: marketing-strategy.yaml
+
+# ── Metadata ──
+name: marketing-strategy
+version: "1.0"
+description: >
+  Full marketing strategy development from market research through
+  campaign planning. Follows standard STP (Segmentation, Targeting,
+  Positioning) methodology with parallel research phases feeding into
+  sequential strategy development.
+author: "Loom Team"
+tags: [marketing, strategy, research, go-to-market]
+
+# ── Persona ──
+# Injected as the role section of every prompt (planner, executor, verifier).
+# This is the single most impactful section — it shapes all model behavior.
+persona: |
+  You are a senior marketing strategist with deep expertise in market
+  research, competitive analysis, customer segmentation, and go-to-market
+  strategy. You follow evidence-based marketing principles and always
+  support claims with data and citations.
+
+  Your approach:
+  - Research before strategy. Never position without competitive context.
+  - Triangulate data. Cross-reference multiple sources for any key metric.
+  - Think in segments. One-size-fits-all strategies are lazy strategies.
+  - Quantify everything. Market sizes, growth rates, CAC targets — no vague claims.
+  - Cite sources. Every data point needs an origin.
+
+# ── Tool Guidance ──
+# Tells the model which tools to prefer and how to use them in this context.
+# Does NOT restrict tools — all registered tools remain available.
+tool_guidance: |
+  For this type of work, prioritize these tools:
+  - Use `web_search` and `web_fetch` for market research and competitive data.
+  - Use `calculator` for market sizing math, growth projections, and ROI estimates.
+  - Use `spreadsheet` for building comparison matrices, sizing models, and budgets.
+  - Use `document_write` for strategy briefs, positioning documents, and campaign plans.
+  - Use `read_file` to review any existing brand guidelines, prior research, or templates
+    in the workspace before starting new work.
+
+# ── Phase Templates ──
+# Pre-defined subtask structures that the planner should use as its blueprint.
+# The planner can adapt these (add/remove phases) based on the specific goal,
+# but this gives it the right starting structure and dependency graph.
+phases:
+  - id: market-sizing
+    description: >
+      Estimate the Total Addressable Market (TAM), Serviceable Addressable
+      Market (SAM), and Serviceable Obtainable Market (SOM). Use both
+      top-down (industry reports, analyst estimates) and bottom-up
+      (unit economics: customers × average revenue) approaches.
+      Triangulate and reconcile if they differ by more than 15%.
+    depends_on: []
+    model_tier: 2
+    verification_tier: 2
+    acceptance_criteria: >
+      TAM, SAM, and SOM are estimated with both methods. Sources are cited.
+      Top-down and bottom-up estimates are within 15% or discrepancy is explained.
+    deliverables:
+      - "market-sizing-model.csv — TAM/SAM/SOM with assumptions"
+      - "market-sizing-summary.md — narrative with methodology and sources"
+
+  - id: competitive-analysis
+    description: >
+      Identify and analyze 3-8 direct and indirect competitors. For each:
+      website traffic (if available via web search), pricing model, target
+      customer, key differentiators, strengths, and weaknesses. Build a
+      comparison matrix and identify white-space opportunities.
+    depends_on: []
+    model_tier: 2
+    verification_tier: 2
+    acceptance_criteria: >
+      At least 3 competitors analyzed. Comparison matrix created as spreadsheet.
+      Each competitor has pricing, positioning, and differentiator data.
+      White-space opportunities identified.
+    deliverables:
+      - "competitive-matrix.csv — structured comparison"
+      - "competitor-profiles.md — detailed profiles with SWOT"
+
+  - id: customer-segmentation
+    description: >
+      Define 2-5 customer segments using demographic, behavioral, and
+      psychographic variables. Size each segment using the market sizing
+      data. Create a persona document for each primary segment including
+      needs, pain points, media consumption, and buying triggers.
+    depends_on: [market-sizing]
+    model_tier: 2
+    verification_tier: 2
+    acceptance_criteria: >
+      2-5 segments defined with sizing. Primary persona document created.
+      Segments are mutually exclusive and collectively exhaustive (MECE).
+    deliverables:
+      - "customer-segments.csv — segment definitions with sizing"
+      - "personas.md — detailed persona documents"
+
+  - id: positioning
+    description: >
+      Craft the positioning statement, value proposition, and messaging
+      framework. The positioning must differentiate from identified
+      competitors and resonate with target segments. Include: positioning
+      statement (For [target], [brand] is the [category] that [benefit]
+      because [reason to believe]), messaging hierarchy, and 3-5 proof points.
+    depends_on: [market-sizing, competitive-analysis, customer-segmentation]
+    model_tier: 3
+    verification_tier: 2
+    is_synthesis: true
+    acceptance_criteria: >
+      Positioning statement follows standard format. Differentiates from
+      top 3 competitors. Maps to at least one target segment's needs.
+      Messaging framework has hierarchy (primary, secondary, tertiary).
+    deliverables:
+      - "positioning-strategy.md — positioning statement, messaging, proof points"
+
+  - id: channel-strategy
+    description: >
+      Recommend optimal marketing channels based on where target segments
+      are reachable and what the competitive landscape shows. Allocate
+      a hypothetical budget across channels with expected ROI ranges.
+      Include: channel selection rationale, budget split, KPI targets per channel.
+    depends_on: [positioning]
+    model_tier: 2
+    verification_tier: 1
+    acceptance_criteria: >
+      At least 3 channels recommended with rationale. Budget allocation
+      spreadsheet created. KPI targets set per channel.
+    deliverables:
+      - "channel-strategy.csv — channel budget allocation and KPIs"
+      - "channel-strategy.md — rationale and implementation notes"
+
+  - id: campaign-plan
+    description: >
+      Create a campaign plan for the first 90 days. Include campaign
+      themes, content calendar, key messages per channel, and measurement
+      plan. Tie each campaign element back to the positioning and target segments.
+    depends_on: [channel-strategy]
+    model_tier: 2
+    verification_tier: 1
+    acceptance_criteria: >
+      90-day campaign plan with at least 3 campaign themes. Each tied
+      to positioning and segments. Measurement plan with specific KPIs.
+    deliverables:
+      - "campaign-plan.md — full 90-day plan"
+      - "content-calendar.csv — week-by-week content plan"
+
+# ── Verification Rules ──
+# Domain-specific deterministic checks applied during Tier 1 verification.
+# These supplement (not replace) the engine's built-in checks.
+verification:
+  rules:
+    - name: sources-cited
+      description: "All data claims must cite a source"
+      check: "output contains at least one URL or source reference per data point"
+      severity: warning  # warning | error
+
+    - name: no-placeholders
+      description: "No placeholder text in deliverables"
+      check: "deliverables do not contain [TBD], [TODO], [INSERT], or [PLACEHOLDER]"
+      severity: error
+
+    - name: segments-mece
+      description: "Customer segments should be mutually exclusive and collectively exhaustive"
+      check: "segmentation covers the full market without overlap"
+      severity: warning
+
+# ── Memory Guidance ──
+# Tells the memory extractor what kinds of knowledge to extract and retain
+# between subtasks in this process.
+memory:
+  extract_types:
+    - type: market_insight
+      description: "Quantitative market data (sizes, growth rates, shares)"
+    - type: competitor_move
+      description: "Competitor actions, strategies, or positioning"
+    - type: audience_preference
+      description: "Target audience behaviors, preferences, or pain points"
+    - type: strategic_decision
+      description: "Strategic choices made and their rationale"
+    - type: assumption
+      description: "Assumptions that may need revisiting with new data"
+
+  extraction_guidance: |
+    Focus on extracting data points with their sources, strategic
+    decisions with rationale, and assumptions that downstream phases
+    depend on. Tag each entry with the relevant market segment when applicable.
+
+# ── Workspace Initialization ──
+# Guidance for analyzing an existing workspace before planning.
+workspace_analysis:
+  scan_for:
+    - "*.md — existing strategy documents, brand guidelines, briefs"
+    - "*.csv, *.xlsx — existing data, prior research, competitor data"
+    - "*.pdf — industry reports, analyst presentations"
+  guidance: |
+    Before planning, scan the workspace for existing materials. If brand
+    guidelines exist, the positioning phase must respect them. If prior
+    research exists, reference it rather than re-doing it.
+
+# ── Planner Examples ──
+# Few-shot examples showing the planner how to decompose goals in this domain.
+# These are injected into the planner prompt as examples.
+planner_examples:
+  - goal: "Create a go-to-market strategy for a B2B SaaS product"
+    subtasks:
+      - id: market-sizing
+        description: "Estimate TAM/SAM/SOM for the B2B SaaS vertical"
+        depends_on: []
+        model_tier: 2
+      - id: competitive-analysis
+        description: "Map 5-7 competitors: pricing, features, positioning"
+        depends_on: []
+        model_tier: 2
+      - id: customer-segmentation
+        description: "Define 3-4 ICP segments with firmographic and behavioral criteria"
+        depends_on: [market-sizing]
+        model_tier: 2
+      - id: positioning
+        description: "Craft positioning statement and messaging framework"
+        depends_on: [market-sizing, competitive-analysis, customer-segmentation]
+        model_tier: 3
+      - id: channel-strategy
+        description: "Select channels and allocate budget"
+        depends_on: [positioning]
+        model_tier: 2
+      - id: launch-plan
+        description: "Create 90-day launch plan with campaigns and KPIs"
+        depends_on: [channel-strategy]
+        model_tier: 2
+
+# ── Replanning Guidance ──
+# Domain-specific guidance for when and how to revise the plan.
+replanning:
+  triggers: |
+    Consider replanning if:
+    - Market sizing reveals the market is too small (TAM < stated minimum)
+    - Competitive analysis reveals an unexpected dominant player
+    - Customer research contradicts initial segment assumptions
+    - Stakeholder feedback changes the target market or positioning constraints
+  guidance: |
+    When replanning, preserve completed research phases. Revise strategy
+    phases (positioning, channels) based on new data. Do not re-do research
+    that already produced valid results.
+```
+
+### R4.3 How the Engine Consumes Process Definitions
+
+The engine doesn't need domain-specific Python code. It reads the process definition and wires it into existing extension points:
+
+```
+┌──────────────────────────────────────────────────┐
+│                 Process Definition                │
+│              (marketing-strategy.yaml)            │
+└───────┬──────┬──────┬──────┬──────┬──────┬───────┘
+        │      │      │      │      │      │
+        ▼      ▼      ▼      ▼      ▼      ▼
+   ┌────────┬──────┬───────┬──────┬──────┬────────┐
+   │Persona │Phases│Tool   │Verify│Memory│Planner │
+   │        │      │Guide  │Rules │Guide │Examples│
+   └───┬────┴──┬───┴───┬───┴──┬───┴──┬───┴───┬────┘
+       │       │       │      │      │       │
+       ▼       ▼       ▼      ▼      ▼       ▼
+   ┌────────────────────────────────────────────┐
+   │              Prompt Assembler               │
+   │  (injects sections into existing templates) │
+   └──────────────┬─────────────────────────────┘
+                  │
+                  ▼
+   ┌────────────────────────────────────────────┐
+   │          Orchestrator (unchanged)           │
+   │  plan → dispatch → verify → learn cycle    │
+   └────────────────────────────────────────────┘
+```
+
+**Key: the engine code doesn't change.** The process definition is loaded, parsed into a `ProcessDefinition` dataclass, and passed to the `PromptAssembler` which injects the relevant sections into prompts.
+
+### R4.4 ProcessDefinition Dataclass
+
+```python
+@dataclass
+class PhaseTemplate:
+    id: str
+    description: str
+    depends_on: list[str] = field(default_factory=list)
+    model_tier: int = 2
+    verification_tier: int = 1
+    is_critical_path: bool = False
+    is_synthesis: bool = False
+    acceptance_criteria: str = ""
+    deliverables: list[str] = field(default_factory=list)
+
+@dataclass
+class VerificationRule:
+    name: str
+    description: str
+    check: str             # Natural-language check description (LLM-evaluated)
+    severity: str = "warning"  # "warning" or "error"
+
+@dataclass
+class MemoryType:
+    type: str
+    description: str
+
+@dataclass
+class PlannerExample:
+    goal: str
+    subtasks: list[dict]   # Simplified subtask dicts for few-shot
+
+@dataclass
+class ProcessDefinition:
+    # Metadata
+    name: str
+    version: str = "1.0"
+    description: str = ""
+    author: str = ""
+    tags: list[str] = field(default_factory=list)
+
+    # Behavior
+    persona: str = ""                                    # Injected as role
+    tool_guidance: str = ""                              # Injected into executor
+    phases: list[PhaseTemplate] = field(default_factory=list)  # Blueprint for planner
+    verification: list[VerificationRule] = field(default_factory=list)
+    memory_types: list[MemoryType] = field(default_factory=list)
+    extraction_guidance: str = ""
+    workspace_scan: list[str] = field(default_factory=list)
+    workspace_guidance: str = ""
+    planner_examples: list[PlannerExample] = field(default_factory=list)
+    replanning_triggers: str = ""
+    replanning_guidance: str = ""
+```
+
+### R4.5 Loading & Discovery
+
+```python
+class ProcessLoader:
+    """Discovers and loads process definition files."""
+
+    SEARCH_PATHS = [
+        Path.cwd() / "loom-processes",      # Workspace-local
+        Path.cwd() / ".loom" / "processes",  # Workspace .loom dir
+        Path.home() / ".loom" / "processes", # User-global
+    ]
+
+    def discover(self) -> dict[str, Path]:
+        """Find all available process definitions. Returns {name: path}."""
+        processes = {}
+        # Later paths take precedence (user-global < workspace-local)
+        for search_dir in reversed(self.SEARCH_PATHS):
+            if search_dir.exists():
+                for yaml_file in search_dir.glob("*.yaml"):
+                    defn = self._quick_parse_name(yaml_file)
+                    if defn:
+                        processes[defn] = yaml_file
+        return processes
+
+    def load(self, name_or_path: str) -> ProcessDefinition:
+        """Load a process definition by name or file path."""
+        path = Path(name_or_path)
+        if not path.exists():
+            # Search by name
+            available = self.discover()
+            if name_or_path not in available:
+                raise ProcessNotFound(name_or_path, list(available.keys()))
+            path = available[name_or_path]
+        return self._parse(path)
+
+    def _parse(self, path: Path) -> ProcessDefinition:
+        """Parse YAML into ProcessDefinition."""
+        with open(path) as f:
+            raw = yaml.safe_load(f)
+        # ... validate and construct ProcessDefinition
+```
+
+### R4.6 PromptAssembler Integration
+
+The assembler gains one new parameter — an optional `ProcessDefinition`:
+
+```python
+class PromptAssembler:
+    def __init__(self, templates_dir=None, process: ProcessDefinition | None = None):
+        self._process = process
+        # ... existing init
+
+    def build_planner_prompt(self, task, workspace_listing="", workspace_analysis=""):
+        template = self.get_template("planner")
+        role = template.get("role", "").strip()
+
+        # INJECT: process persona overrides the generic role
+        if self._process and self._process.persona:
+            role = self._process.persona.strip()
+
+        # INJECT: phase templates as blueprint for the planner
+        phase_blueprint = ""
+        if self._process and self._process.phases:
+            phase_blueprint = self._format_phase_blueprint(self._process.phases)
+
+        # INJECT: few-shot examples
+        examples = ""
+        if self._process and self._process.planner_examples:
+            examples = self._format_planner_examples(self._process.planner_examples)
+
+        # Existing variable substitution + new sections
+        replacements = {
+            "goal": task.goal,
+            "workspace_path": task.workspace,
+            "workspace_analysis": workspace_analysis or "Not analyzed.",
+            "phase_blueprint": phase_blueprint,
+            "planner_examples": examples,
+            # ... existing vars
+        }
+        # ... assemble as before
+
+    def build_executor_prompt(self, task, subtask, state_manager, ...):
+        template = self.get_template("executor")
+        role = template.get("role", "").strip()
+
+        # INJECT: process persona
+        if self._process and self._process.persona:
+            role = self._process.persona.strip()
+
+        # INJECT: tool guidance as additional constraints
+        extra_constraints = ""
+        if self._process and self._process.tool_guidance:
+            extra_constraints = self._process.tool_guidance.strip()
+
+        # ... rest of existing assembly, append extra_constraints to constraints section
+```
+
+**The base templates (planner.yaml, executor.yaml, etc.) stay generic.** The process definition injects domain intelligence *into* them. If no process is loaded, everything works exactly as it does today.
+
+### R4.7 What Changes in the Planner Template
+
+Only one structural addition — placeholders for process-injected content:
+
+```yaml
+# planner.yaml (updated)
+role: |
+  You are a task planning assistant. Your job is to decompose a complex goal
+  into a sequence of concrete, independently executable subtasks.
+
+  Each subtask must be:
+  - Atomic: accomplishes one specific thing
+  - Verifiable: has clear success criteria
+  - Scoped: can be completed by a model with the available tools
+
+instructions: |
+  GOAL:
+  {goal}
+
+  WORKSPACE:
+  {workspace_path}
+
+  CONTEXT PROVIDED BY USER:
+  {user_context}
+
+  WORKSPACE CONTENTS:
+  {workspace_listing}
+
+  WORKSPACE ANALYSIS:
+  {workspace_analysis}
+
+  RECOMMENDED PHASE STRUCTURE:
+  {phase_blueprint}
+
+  EXAMPLE DECOMPOSITIONS:
+  {planner_examples}
+
+  Decompose this goal into subtasks. You may use the recommended phase
+  structure as a starting point, adapting it to the specific goal. Add,
+  remove, or modify phases as needed.
+
+  Respond with ONLY a JSON object:
+  ...
+```
+
+When no process is loaded, `{phase_blueprint}` and `{planner_examples}` resolve to empty strings, and the planner works exactly as before — fully generic decomposition.
+
+### R4.8 Verification Rule Execution
+
+Process verification rules are natural-language descriptions, not code. They're evaluated by the existing Tier 2 LLM verifier:
+
+```python
+# In verification.py, extend the verifier prompt:
+def _build_verification_prompt(self, subtask, result, process_rules):
+    base_prompt = self._prompts.build_verifier_prompt(subtask, result_summary, tool_calls)
+
+    if process_rules:
+        rules_text = "\n".join(
+            f"- [{r.severity.upper()}] {r.name}: {r.check}"
+            for r in process_rules
+        )
+        base_prompt += f"\n\nADDITIONAL DOMAIN-SPECIFIC CHECKS:\n{rules_text}"
+
+    return base_prompt
+```
+
+The LLM verifier already evaluates acceptance criteria. Process verification rules are just additional criteria injected into the same prompt. No new verification infrastructure needed.
+
+### R4.9 CLI & Config Integration
+
+```bash
+# Specify a process by name (discovered from search paths)
+loom run "Create a GTM strategy for our new API product" --process marketing-strategy
+
+# Specify a process by file path
+loom run "Analyze AAPL" --process ./my-processes/equity-analysis.yaml
+
+# Interactive mode with a process
+loom cowork -w ~/projects/acme --process marketing-strategy
+
+# List available processes
+loom processes
+#   marketing-strategy    v1.0  Full marketing strategy development
+#   investment-analysis   v1.0  Investment analysis and memo generation
+#   competitive-intel     v1.0  Quick competitive intelligence report
+
+# No process = current behavior (generic code-focused)
+loom cowork -w ~/code-project
+```
+
+Config in `loom.toml`:
+```toml
+[process]
+# Default process (used when --process not specified)
+# Empty = no process (current behavior)
+default = ""
+
+# Additional process search paths
+search_paths = ["~/my-processes"]
+```
+
+### R4.10 Example Process Definitions
+
+Beyond marketing strategy, here are other processes that would ship as built-in examples:
+
+**investment-analysis.yaml** — Screens a stock, analyzes fundamentals, builds a valuation model, assesses risks, produces an investment memo. Phases are heavily sequential. Verification checks financial statement linkage, terminal value reasonableness, ratio ranges.
+
+**competitive-intel.yaml** — Quick 3-phase process: identify competitors, research each, build comparison matrix. Lightweight version of the marketing strategy's competitive analysis phase. Good for ad-hoc requests.
+
+**research-report.yaml** — General research workflow: frame question, gather evidence from multiple sources, synthesize findings, write report with citations. Applies to any knowledge domain.
+
+**consulting-engagement.yaml** — McKinsey-style problem decomposition: define the issue tree (MECE), assign workstreams, gather evidence per workstream, synthesize recommendations. Includes red-team verification.
+
+**due-diligence.yaml** — Gated process with explicit go/no-go decisions after each phase. If early screening finds deal-breakers, later phases are skipped.
+
+Users create their own by copying and editing these examples.
+
+### R4.11 Why This Is Better Than Hardcoded Domains
+
+| Aspect | Hardcoded Domains (Old Plan) | Process Definitions (New Plan) |
+|--------|------------------------------|-------------------------------|
+| Adding a new domain | Write a Python class, edit registry, redeploy | Write a YAML file, drop it in a folder |
+| Customizing behavior | Fork the code or wait for upstream changes | Edit the YAML file |
+| Sharing expertise | Package as a Python module | Share a YAML file |
+| User learning curve | None (domains are hidden) | Low (read the YAML to understand the process) |
+| Engine complexity | N domain classes, override resolution, registry | 1 ProcessLoader, 1 ProcessDefinition dataclass |
+| Versioning | Tied to Loom releases | Independent — processes version separately |
+| Testing | Need Python tests per domain | Process definitions are data — validate schema only |
+| Community contribution | PR to main repo, Python knowledge required | Share YAML files, no programming needed |
+
+### R4.12 Revised Implementation Plan (Process-Based)
+
+This replaces the 4-batch plan from R3.2 with a cleaner approach:
+
+**Batch A: Process Engine (Ship First)**
+
+| Step | What | Lines |
+|------|------|-------|
+| A1 | `ProcessDefinition` dataclass + `ProcessLoader` | ~200 |
+| A2 | `PromptAssembler` gains `process` parameter, injects persona/phases/examples/tool_guidance | ~80 |
+| A3 | Planner template: add `{phase_blueprint}`, `{planner_examples}`, `{workspace_analysis}` | ~10 |
+| A4 | Orchestrator: load process, pass to assembler, use `workspace_analysis` | ~30 |
+| A5 | Verifier: inject process verification rules into LLM verifier prompt | ~20 |
+| A6 | Memory extractor: inject process memory guidance into extractor prompt | ~15 |
+| A7 | CLI: `--process` flag, `loom processes` command | ~40 |
+| A8 | Config: `[process]` section in loom.toml | ~15 |
+| A9 | Tests for A1-A8 | ~200 |
+| **Total** | | **~610** |
+
+**Batch B: New Tools (Ship Second)**
+
+| Step | What | Lines |
+|------|------|-------|
+| B1 | `calculator` tool — arithmetic + financial formulas | ~200 |
+| B2 | `spreadsheet` tool — CSV/XLSX create/read/edit (column-level) | ~300 |
+| B3 | `document_write` tool — structured Markdown generation | ~150 |
+| B4 | Tests for B1-B3 | ~200 |
+| **Total** | | **~850** |
+
+**Batch C: Built-In Process Definitions (Ship Third)**
+
+| Step | What | Lines |
+|------|------|-------|
+| C1 | `marketing-strategy.yaml` — full process definition as shown above | ~150 |
+| C2 | `investment-analysis.yaml` — finance process with sequential phases | ~140 |
+| C3 | `research-report.yaml` — general research workflow | ~80 |
+| C4 | `competitive-intel.yaml` — lightweight competitive analysis | ~70 |
+| C5 | `consulting-engagement.yaml` — McKinsey-style problem solving | ~100 |
+| C6 | Validation tests for all process definitions | ~100 |
+| **Total** | | **~640** |
+
+**Batch D: Polish (Ship Last)**
+
+| Step | What | Lines |
+|------|------|-------|
+| D1 | Schema migration system | ~120 |
+| D2 | Synthesis subtask support (`is_synthesis` flag in executor prompt) | ~40 |
+| D3 | Gate conditions for gated processes like due-diligence | ~80 |
+| D4 | Cowork mode process awareness (system prompt from persona) | ~30 |
+| D5 | `ToolResult.artifacts_changed` generalization | ~20 |
+| D6 | Tests for D1-D5 | ~150 |
+| **Total** | | **~440** |
+
+**Grand total: ~2540 lines.** Down from 3280 in R3, down from 7300 in the original plan.
+
+### R4.13 Final Architecture
+
+```
+~/.loom/
+├── processes/                      # User-global process definitions
+│   ├── marketing-strategy.yaml
+│   ├── investment-analysis.yaml
+│   ├── my-custom-process.yaml      # User-created
+│   └── ...
+├── loom.toml                       # Global config
+└── loom.db                         # SQLite database
+
+~/workspace/
+├── loom-processes/                  # Workspace-local processes (override global)
+│   └── our-team-workflow.yaml
+├── loom.toml                       # Workspace config (overrides global)
+└── ... (project files)
+
+src/loom/
+├── processes/
+│   ├── __init__.py                 # ProcessDefinition, ProcessLoader
+│   ├── schema.py                   # YAML schema validation
+│   └── builtin/                    # Ships with Loom
+│       ├── marketing-strategy.yaml
+│       ├── investment-analysis.yaml
+│       ├── research-report.yaml
+│       ├── competitive-intel.yaml
+│       └── consulting-engagement.yaml
+├── tools/
+│   ├── calculator.py               # NEW
+│   ├── spreadsheet.py              # NEW
+│   ├── document_write.py           # NEW
+│   └── ... (existing tools)
+├── prompts/
+│   ├── assembler.py                # MODIFIED: accepts ProcessDefinition
+│   └── templates/
+│       ├── planner.yaml            # MODIFIED: new placeholders
+│       └── ... (unchanged)
+├── engine/
+│   ├── orchestrator.py             # MODIFIED: loads process, passes to assembler
+│   └── verification.py             # MODIFIED: injects process verification rules
+└── config.py                       # MODIFIED: [process] section
+```
+
+The engine is fully domain-agnostic. All domain intelligence lives in YAML files that anyone can create, edit, share, and version independently of the Loom codebase.
+
+### R4.14 Future: Process Marketplace
+
+Once the process definition format stabilizes, a natural evolution is a community repository of process definitions:
+
+```bash
+# Future concept (not in scope for this plan)
+loom process install marketing-strategy
+loom process install financial-due-diligence
+loom process search "real estate"
+```
+
+This is just file discovery from a remote repository — no plugin system, no packaging, no dependencies. Just YAML files downloaded to `~/.loom/processes/`.
+
+### R4.15 Summary: What Changed from R3
+
+| R3 Architecture | R4 Architecture |
+|----------------|----------------|
+| `MarketingDomain` Python class | `marketing-strategy.yaml` process file |
+| Template override dicts in code | `persona` and `tool_guidance` in YAML |
+| `domains/` package with 5 Python files | `processes/` package with 1 loader + N YAML files |
+| Tools restricted by domain | All tools available; process guides model via `tool_guidance` |
+| Verification plugins in Python | Verification rules as natural-language checks in YAML |
+| Domain detected from workspace files | Process selected by user via `--process` flag |
+| 3280 LOC across 4 batches | **2540 LOC across 4 batches** |
+| New domain = new Python class | **New process = new YAML file** |
