@@ -61,9 +61,17 @@ class TestCLI:
         # If loom.toml exists in cwd, it should show configured models
         # This test is environment-dependent; just verify no crash
 
-    def test_tui_help(self):
+    def test_cowork_help(self):
         runner = CliRunner()
-        result = runner.invoke(cli, ["tui", "--help"])
+        result = runner.invoke(cli, ["cowork", "--help"])
+        assert result.exit_code == 0
+        assert "--workspace" in result.output
+        assert "--model" in result.output
+        assert "--resume" in result.output
+
+    def test_default_shows_help_with_workspace_and_model(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
         assert "--workspace" in result.output
         assert "--model" in result.output
