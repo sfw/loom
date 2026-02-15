@@ -16,9 +16,8 @@ persona: |
 phase_mode: strict
 
 tool_guidance: |
-  Structure outputs as slide-ready: action title, supporting evidence, and
-  "so what" implication. Use CSV for data exhibits. Format Markdown as
-  concise slide notes with exhibit references.
+  Structure as slide-ready: action title, evidence, "so what." CSV for
+  data exhibits. Markdown as concise slide notes with exhibit references.
 
 phases:
   - id: define-issue-tree
@@ -48,14 +47,13 @@ phases:
       - "workstream-plan.md — workstream definitions and analysis plans"
   - id: gather-evidence
     description: >
-      Execute workstreams: gather data, run analyses, test hypotheses. State
-      whether each hypothesis was confirmed, refuted, or modified.
+      Execute workstreams: gather data, test hypotheses, state verdicts.
     depends_on: [assign-workstreams]
     model_tier: 3
     verification_tier: 2
     acceptance_criteria: >
-      Each workstream has a hypothesis verdict with structured evidence.
-      Exhibits have source and date. Counter-evidence explicitly noted.
+      Each workstream has hypothesis verdict with evidence. Exhibits have
+      source and date. Counter-evidence noted.
     deliverables:
       - "workstream-findings.md — findings with hypothesis verdicts"
       - "evidence-exhibits.csv — data supporting each finding"
@@ -97,17 +95,15 @@ verification:
     - name: red-team
       description: "Recommendations must survive adversarial challenge"
       check: >
-        For each recommendation, identify the strongest counterargument.
-        Would it convince a skeptical CFO? Flag any relying on a single
-        data point or unvalidated assumption.
+        Identify strongest counterargument for each recommendation. Would
+        it convince a skeptical CFO? Flag single-source claims.
       severity: warning
       type: llm
     - name: action-titles
-      description: "Headings must be complete sentences stating conclusions"
+      description: "Headings must be conclusion sentences, not topic labels"
       check: >
-        Review all headings in presentation and recommendations. Each must
-        be a sentence with subject and verb stating a finding. Reject topic
-        labels like "Market Analysis."
+        Each heading must be a sentence with subject and verb stating a
+        finding. Reject labels like "Market Analysis."
       severity: warning
       type: llm
     - name: no-placeholders
@@ -127,9 +123,8 @@ memory:
     - type: stakeholder_concern
       description: "Anticipated objection from a key stakeholder role"
   extraction_guidance: |
-    Prioritize hypothesis verdicts — they drive the logic chain. Include
-    quantification and source for findings. Tag stakeholder concerns with
-    role (CEO, CFO, ops lead).
+    Prioritize hypothesis verdicts — they drive the logic chain. Tag
+    stakeholder concerns with role (CEO, CFO, ops lead).
 
 workspace_analysis:
   scan_for:
@@ -153,8 +148,6 @@ replanning:
     - Problem is fundamentally different than initially framed
     - Workstream uncovers a showstopper making other streams moot
     - Evidence contradicts majority of initial hypotheses
-    - Stakeholder priorities shift during engagement
   guidance: |
-    If reframed, return to issue tree with new framing rather than patching.
-    If showstopper found, fast-track to recommendations with pivot strategy.
-    Preserve all prior evidence for the revised direction.
+    If reframed, return to issue tree with new framing. If showstopper
+    found, fast-track to recommendations. Preserve prior evidence.

@@ -48,8 +48,7 @@ phases:
     model_tier: 3
     verification_tier: 2
     acceptance_criteria: >
-      Segments are MECE. Each has name, size, key needs, willingness to pay,
-      acquisition difficulty, and priority rank.
+      MECE segments with name, size, needs, willingness to pay, and rank.
     deliverables:
       - "customer-segments.md — segment definitions and prioritization"
       - "segment-profiles.csv — segment attributes and sizing"
@@ -83,8 +82,8 @@ phases:
     model_tier: 2
     verification_tier: 1
     acceptance_criteria: >
-      90-day plan with weekly milestones. Budget allocated by channel.
-      Each tactic has owner role, KPI target, and creative brief summary.
+      90-day plan with weekly milestones. Budget by channel. Each tactic
+      has owner role, KPI target, and creative brief.
     deliverables:
       - "campaign-plan.md — 90-day campaign plan with timeline"
       - "budget-allocation.csv — channel budget breakdown"
@@ -122,8 +121,7 @@ memory:
     - type: strategic_decision
       description: "Key positioning or channel choice with reasoning"
   extraction_guidance: |
-    Prioritize decision-changing insights. Include source and quantification.
-    Tag competitor moves with competitor name, preferences with segment name.
+    Prioritize decision-changing insights with source and quantification.
 
 workspace_analysis:
   scan_for:
@@ -147,8 +145,7 @@ replanning:
   triggers: |
     - Addressable market is smaller than expected
     - Dominant competitor changes the positioning thesis
-    - Segmentation suggests a different primary segment than assumed
     - Channel economics are unfavorable for planned motion
   guidance: |
-    If market is too small, broaden the category or pivot to adjacent segment.
-    If competitor invalidates positioning, loop back to competitive analysis.
+    If market too small, broaden category or pivot segment. If competitor
+    invalidates positioning, loop back to competitive analysis.

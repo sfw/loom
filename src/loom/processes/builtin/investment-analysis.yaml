@@ -16,9 +16,8 @@ persona: |
 phase_mode: strict
 
 tool_guidance: |
-  Use CSV for financial data and model outputs. Use Markdown for narrative.
-  Always state fiscal year, currency, and whether figures are reported or
-  adjusted. Prefer trailing twelve months (TTM) and note the date.
+  Use CSV for financial data and models. Markdown for narrative. Always
+  state fiscal year, currency, reported vs adjusted. Prefer TTM with date.
 
 phases:
   - id: company-screening
