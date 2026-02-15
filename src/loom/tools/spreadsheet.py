@@ -152,8 +152,9 @@ class SpreadsheetTool(Tool):
     async def _read(self, filepath: Path) -> ToolResult:
         if not filepath.exists():
             return ToolResult.fail(f"File not found: {filepath.name}")
-        if filepath.stat().st_size > self.MAX_FILE_SIZE:
-            return ToolResult.fail("File too large (max 5 MB)")
+        size_err = self._check_file_size(filepath)
+        if size_err:
+            return ToolResult.fail(size_err)
 
         content = filepath.read_text(encoding="utf-8")
         reader = csv.reader(io.StringIO(content))
@@ -198,11 +199,20 @@ class SpreadsheetTool(Tool):
             files_changed=[str(rel)],
         )
 
+    def _check_file_size(self, filepath: Path) -> str | None:
+        """Return error message if file exceeds size limit, else None."""
+        if filepath.stat().st_size > self.MAX_FILE_SIZE:
+            return "File too large (max 5 MB)"
+        return None
+
     async def _add_column(
         self, filepath: Path, args: dict, ctx: ToolContext,
     ) -> ToolResult:
         if not filepath.exists():
             return ToolResult.fail(f"File not found: {filepath.name}")
+        size_err = self._check_file_size(filepath)
+        if size_err:
+            return ToolResult.fail(size_err)
         col_name = args.get("column_name", "")
         if not col_name:
             return ToolResult.fail("'add_column' requires 'column_name'")
@@ -239,6 +249,9 @@ class SpreadsheetTool(Tool):
     ) -> ToolResult:
         if not filepath.exists():
             return ToolResult.fail(f"File not found: {filepath.name}")
+        size_err = self._check_file_size(filepath)
+        if size_err:
+            return ToolResult.fail(size_err)
         col_name = args.get("column_name", "")
         row_idx = args.get("row_index")
         value = args.get("value", "")

@@ -41,6 +41,18 @@ _SAFE_OPS: dict[str, Any] = {
 }
 
 
+_MAX_EXPONENT = 10000  # Prevent OOM from e.g. 2**10000000000
+
+
+def _safe_pow(base: float | int, exp: float | int) -> float | int:
+    """Power with exponent limit to prevent runaway computation."""
+    if isinstance(exp, (int, float)) and abs(exp) > _MAX_EXPONENT:
+        raise ValueError(
+            f"Exponent too large: {exp} (max {_MAX_EXPONENT})",
+        )
+    return operator.pow(base, exp)
+
+
 def _safe_eval(expr: str) -> float | int:
     """Evaluate a mathematical expression safely using AST."""
     import ast
@@ -86,7 +98,7 @@ def _eval_node(node: Any) -> Any:
             ast.Div: operator.truediv,
             ast.FloorDiv: operator.floordiv,
             ast.Mod: operator.mod,
-            ast.Pow: operator.pow,
+            ast.Pow: _safe_pow,
         }
         op_func = ops.get(type(node.op))
         if op_func is None:

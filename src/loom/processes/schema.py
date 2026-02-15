@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import logging
 import re
 import sys
 from dataclasses import dataclass, field
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -577,5 +580,7 @@ class ProcessLoader:
                     module = importlib.util.module_from_spec(spec)
                     sys.modules[module_name] = module
                     spec.loader.exec_module(module)
-            except Exception:
-                pass  # Best-effort — log but don't crash
+            except Exception as e:
+                logger.warning(
+                    "Failed to load bundled tool %s: %s", py_file, e,
+                )
