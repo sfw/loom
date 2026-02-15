@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from loom.setup import (
-    CONFIG_DIR,
-    CONFIG_PATH,
     ROLE_PRESETS,
     _generate_toml,
     needs_setup,
@@ -126,8 +123,6 @@ class TestGenerateToml:
 
     def test_generated_toml_loads_as_config(self):
         """Round-trip: generate TOML, write to disk, load with load_config."""
-        import tomllib
-
         from loom.config import load_config
 
         models = [{
@@ -234,7 +229,7 @@ class TestRunSetup:
         monkeypatch.setattr("click.prompt", mock_prompt)
         monkeypatch.setattr("click.confirm", mock_confirm)
 
-        result = run_setup()
+        run_setup()
 
         assert cfg_path.exists()
         content = cfg_path.read_text()
@@ -326,10 +321,7 @@ class TestSetupScreen:
 
     def test_collect_model_all_roles_skips_utility(self):
         """When all roles are covered, skip the utility prompt."""
-        from loom.tui.screens.setup import (
-            SetupScreen,
-            _STEP_CONFIRM,
-        )
+        from loom.tui.screens.setup import SetupScreen
 
         screen = SetupScreen()
         screen._provider_key = "ollama"
@@ -350,11 +342,12 @@ class TestSetupScreen:
 
     def test_collect_model_partial_roles_shows_utility(self):
         """When roles are incomplete, show the utility prompt."""
-        from loom.tui.screens.setup import (
-            SetupScreen,
-            _STEP_UTILITY,
-        )
         from unittest.mock import MagicMock
+
+        from loom.tui.screens.setup import (
+            _STEP_UTILITY,
+            SetupScreen,
+        )
 
         screen = SetupScreen()
         screen._provider_key = "anthropic"

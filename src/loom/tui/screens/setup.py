@@ -256,7 +256,6 @@ class SetupScreen(ModalScreen[list[dict] | None]):
     def _configure_details_step(self) -> None:
         """Show/hide detail fields based on selected provider."""
         is_anthropic = self._provider_key == "anthropic"
-        is_ollama = self._provider_key == "ollama"
         is_openai = self._provider_key == "openai_compatible"
 
         _, _, _, default_url = PROVIDERS[self._provider_idx]
