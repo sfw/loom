@@ -588,7 +588,11 @@ class TestEditFileFuzzyMatch:
         tool = EditFileTool()
         # Model omits trailing spaces
         result = await tool.execute(
-            {"path": "ws.py", "old_str": "def foo():\n    return 1", "new_str": "def foo():\n    return 2"},
+            {
+                "path": "ws.py",
+                "old_str": "def foo():\n    return 1",
+                "new_str": "def foo():\n    return 2",
+            },
             ctx,
         )
         assert result.success
@@ -601,7 +605,11 @@ class TestEditFileFuzzyMatch:
         tool = EditFileTool()
         # Model uses spaces instead of tabs
         result = await tool.execute(
-            {"path": "indent.py", "old_str": "def bar():\n    return 42", "new_str": "def bar():\n    return 99"},
+            {
+                "path": "indent.py",
+                "old_str": "def bar():\n    return 42",
+                "new_str": "def bar():\n    return 99",
+            },
             ctx,
         )
         assert result.success
@@ -855,7 +863,11 @@ class TestEditFileFuzzyAmbiguity:
         tool = EditFileTool()
         # Trailing whitespace difference only — clear unique match
         result = await tool.execute(
-            {"path": "clear.py", "old_str": "def unique_function():\n    return 42", "new_str": "def unique_function():\n    return 99"},
+            {
+                "path": "clear.py",
+                "old_str": "def unique_function():\n    return 42",
+                "new_str": "def unique_function():\n    return 99",
+            },
             ctx,
         )
         assert result.success
@@ -872,7 +884,11 @@ class TestEditFileCRLF:
         tool = EditFileTool()
         # Model sends LF-only old_str (common from local models)
         result = await tool.execute(
-            {"path": "crlf.py", "old_str": "def hello():\n    return 1", "new_str": "def hello():\n    return 2"},
+            {
+                "path": "crlf.py",
+                "old_str": "def hello():\n    return 1",
+                "new_str": "def hello():\n    return 2",
+            },
             ctx,
         )
         assert result.success
@@ -908,7 +924,11 @@ class TestEditFileInputValidation:
         (workspace / "fmsg.py").write_text("def foo():  \n    pass\n")
         tool = EditFileTool()
         result = await tool.execute(
-            {"path": "fmsg.py", "old_str": "def foo():\n    pass", "new_str": "def bar():\n    pass"},
+            {
+                "path": "fmsg.py",
+                "old_str": "def foo():\n    pass",
+                "new_str": "def bar():\n    pass",
+            },
             ctx,
         )
         assert result.success
@@ -919,7 +939,9 @@ class TestEditFileInputValidation:
     async def test_batch_fuzzy_message_with_indices(self, ctx: ToolContext, workspace: Path):
         """Batch fuzzy message should include which edit indices used fuzzy."""
         # Multi-line old_str where trailing whitespace prevents exact match
-        (workspace / "bfmsg.py").write_text("def aaa():  \n    return 1\ndef bbb():\n    return 2\n")
+        (workspace / "bfmsg.py").write_text(
+            "def aaa():  \n    return 1\ndef bbb():\n    return 2\n"
+        )
         tool = EditFileTool()
         result = await tool.execute(
             {

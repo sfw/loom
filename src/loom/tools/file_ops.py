@@ -365,7 +365,9 @@ class EditFileTool(Tool):
             edit_pairs = []
             for idx, e in enumerate(edits_raw):
                 if not isinstance(e, dict):
-                    return ToolResult.fail(f"edits[{idx}] must be an object with old_str and new_str.")
+                    return ToolResult.fail(
+                        f"edits[{idx}] must be an object with old_str and new_str."
+                    )
                 edit_pairs.append((e.get("old_str", ""), e.get("new_str", "")))
         elif "old_str" in args:
             edit_pairs = [(args["old_str"], args.get("new_str", ""))]
