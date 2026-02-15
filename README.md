@@ -36,7 +36,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 ## What Makes It Different
 
-**Built for local model weaknesses.** Cloud models reproduce strings precisely. Local models don't -- they drift on whitespace, swap tabs for spaces, drop trailing newlines. Loom's edit tool handles this with fuzzy matching: when an exact string match fails, it normalizes whitespace and finds the closest candidate above a similarity threshold. It also rejects ambiguous matches (two similar regions) so it won't silently edit the wrong place. This is the difference between a tool that works with Qwen 14B and one that fails 30% of the time.
+**Built for local model weaknesses.** Cloud models reproduce strings precisely. Local models don't -- they drift on whitespace, swap tabs for spaces, drop trailing newlines. Loom's edit tool handles this with fuzzy matching: when an exact string match fails, it normalizes whitespace and finds the closest candidate above a similarity threshold. It also rejects ambiguous matches (two similar regions) so it won't silently edit the wrong place. This is the difference between a tool that works with MiniMax and one that fails 30% of the time.
 
 **Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. Resume any previous session exactly where you left off with `--resume`. No compression pass, no lost details, no extra LLM calls.
 
@@ -86,7 +86,7 @@ You can also create the config manually. Loom reads `loom.toml` from the current
 [models.primary]
 provider = "ollama"                    # or "openai_compatible" or "anthropic"
 base_url = "http://localhost:11434"
-model = "qwen3:14b"
+model = "minimax:14b"
 max_tokens = 4096
 temperature = 0.1
 roles = ["planner", "executor"]
@@ -94,7 +94,7 @@ roles = ["planner", "executor"]
 [models.utility]
 provider = "ollama"
 base_url = "http://localhost:11434"
-model = "qwen3:8b"
+model = "minimax:8b"
 max_tokens = 2048
 temperature = 0.0
 roles = ["extractor", "verifier"]
