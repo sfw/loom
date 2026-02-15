@@ -94,15 +94,17 @@ def _estimate_message_tokens(msg: dict) -> int:
             for block in parsed.get("content_blocks", []):
                 btype = block.get("type", "")
                 if btype == "image":
-                    w = block.get("width", 1024)
-                    h = block.get("height", 1024)
-                    total += (w * h) // 750
+                    w = block.get("width", 0)
+                    h = block.get("height", 0)
+                    if w > 0 and h > 0:
+                        # Cap at reasonable bounds to avoid overflow
+                        total += min((w * h) // 750, 200_000)
                 elif btype == "document":
                     pages = block.get("page_count", 1)
                     pr = block.get("page_range")
-                    if pr and len(pr) == 2:
-                        pages = pr[1] - pr[0]
-                    total += pages * 1500
+                    if pr and isinstance(pr, list) and len(pr) == 2:
+                        pages = max(0, pr[1] - pr[0])
+                    total += min(pages * 1500, 200_000)
         except (json.JSONDecodeError, TypeError):
             pass
 

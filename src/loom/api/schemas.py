@@ -132,3 +132,6 @@ class ContentBlockResponse(BaseModel):
     page_count: int = 0
     page_range: list[int] | None = None
     text_fallback: str = ""
+    extracted_text: str = ""
+    thinking: str = ""
+    signature: str = ""

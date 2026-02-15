@@ -295,17 +295,22 @@ def _display_content_indicators(content_blocks: list) -> None:
     """Show inline indicators for multimodal content blocks in terminal."""
     from loom.content import DocumentBlock, ImageBlock
 
+    def _sanitize(text: str) -> str:
+        """Strip ANSI escape sequences from user-controlled text."""
+        return text.replace("\033", "")
+
     for block in content_blocks:
         if isinstance(block, ImageBlock):
             dims = f"{block.width}x{block.height}" if block.width else ""
-            name = block.source_path.rsplit("/", 1)[-1] if block.source_path else ""
-            parts = [p for p in [name, dims] if p]
+            size = f"{block.size_bytes:,} bytes" if block.size_bytes else ""
+            name = _sanitize(block.source_path.rsplit("/", 1)[-1]) if block.source_path else ""
+            parts = [p for p in [name, dims, size] if p]
             label = ", ".join(parts)
             sys.stdout.write(
                 f"  {_C.GRAY}    {_C.MAGENTA}[image: {label}]{_C.RESET}\n"
             )
         elif isinstance(block, DocumentBlock):
-            name = block.source_path.rsplit("/", 1)[-1] if block.source_path else ""
+            name = _sanitize(block.source_path.rsplit("/", 1)[-1]) if block.source_path else ""
             pr = ""
             if block.page_range:
                 pr = f" pages {block.page_range[0] + 1}-{block.page_range[1]}"

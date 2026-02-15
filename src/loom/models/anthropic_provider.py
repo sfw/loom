@@ -199,8 +199,7 @@ class AnthropicProvider(ModelProvider):
 
             else:
                 # Unknown role — treat as user message to avoid silent data loss
-                import logging
-                logging.getLogger(__name__).warning(
+                logger.warning(
                     "Unknown message role '%s', treating as user", role,
                 )
                 anthropic_messages.append({

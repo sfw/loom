@@ -124,7 +124,7 @@ def serialize_block(block: ContentBlock) -> dict:
             "text_fallback": block.text_fallback,
         }
     elif isinstance(block, DocumentBlock):
-        return {
+        d: dict = {
             "type": "document",
             "source_path": block.source_path,
             "media_type": block.media_type,
@@ -133,6 +133,9 @@ def serialize_block(block: ContentBlock) -> dict:
             "page_range": list(block.page_range) if block.page_range else None,
             "text_fallback": block.text_fallback,
         }
+        if block.extracted_text:
+            d["extracted_text"] = block.extracted_text
+        return d
     elif isinstance(block, ThinkingBlock):
         return {
             "type": "thinking",
@@ -158,12 +161,22 @@ def deserialize_block(data: dict) -> ContentBlock:
         )
     elif btype == "document":
         pr = data.get("page_range")
+        # Validate page_range is a 2-element list of ints
+        valid_pr = None
+        if pr and isinstance(pr, (list, tuple)) and len(pr) == 2:
+            try:
+                start, end = int(pr[0]), int(pr[1])
+                if 0 <= start <= end:
+                    valid_pr = (start, end)
+            except (ValueError, TypeError):
+                pass
         return DocumentBlock(
             source_path=data.get("source_path", ""),
             media_type=data.get("media_type", PDF_MEDIA_TYPE),
             page_count=data.get("page_count", 0),
             size_bytes=data.get("size_bytes", 0),
-            page_range=tuple(pr) if pr else None,
+            extracted_text=data.get("extracted_text", ""),
+            page_range=valid_pr,
             text_fallback=data.get("text_fallback", ""),
         )
     elif btype == "thinking":

@@ -124,11 +124,15 @@ class ChatLog(VerticalScroll):
         """
         from loom.content import DocumentBlock, ImageBlock
 
+        def _esc(text: str) -> str:
+            """Escape Rich markup in user-controlled text."""
+            return text.replace("[", "\\[")
+
         for block in content_blocks:
             if isinstance(block, ImageBlock):
                 dims = f"{block.width}x{block.height}" if block.width else ""
                 size = f"{block.size_bytes:,} bytes" if block.size_bytes else ""
-                name = block.source_path.rsplit("/", 1)[-1] if block.source_path else ""
+                name = _esc(block.source_path.rsplit("/", 1)[-1]) if block.source_path else ""
                 parts = [p for p in [name, dims, size] if p]
                 label = ", ".join(parts)
                 self.mount(Static(
@@ -136,7 +140,7 @@ class ChatLog(VerticalScroll):
                     classes="model-text",
                 ))
             elif isinstance(block, DocumentBlock):
-                name = block.source_path.rsplit("/", 1)[-1] if block.source_path else ""
+                name = _esc(block.source_path.rsplit("/", 1)[-1]) if block.source_path else ""
                 pr = ""
                 if block.page_range:
                     pr = f" pages {block.page_range[0] + 1}-{block.page_range[1]}"

@@ -260,3 +260,94 @@ class TestSerializeBlocks:
         data = json.dumps([{"type": "text", "text": "ok"}, 42, "bad"])
         blocks = deserialize_blocks(data)
         assert len(blocks) == 1
+
+
+class TestExtractedTextSerialization:
+    """Verify DocumentBlock.extracted_text survives round-trips."""
+
+    def test_extracted_text_serialized(self):
+        b = DocumentBlock(
+            source_path="/doc.pdf",
+            extracted_text="Page 1 content here",
+            text_fallback="[PDF]",
+        )
+        d = serialize_block(b)
+        assert d["extracted_text"] == "Page 1 content here"
+
+    def test_extracted_text_deserialized(self):
+        b = deserialize_block({
+            "type": "document",
+            "source_path": "/doc.pdf",
+            "extracted_text": "Hello from PDF",
+        })
+        assert isinstance(b, DocumentBlock)
+        assert b.extracted_text == "Hello from PDF"
+
+    def test_extracted_text_round_trip(self):
+        original = DocumentBlock(
+            source_path="/doc.pdf",
+            page_count=3,
+            extracted_text="Full text content",
+            text_fallback="[PDF]",
+        )
+        restored = deserialize_block(serialize_block(original))
+        assert isinstance(restored, DocumentBlock)
+        assert restored.extracted_text == "Full text content"
+
+    def test_empty_extracted_text_not_serialized(self):
+        b = DocumentBlock(source_path="/doc.pdf")
+        d = serialize_block(b)
+        assert "extracted_text" not in d
+
+
+class TestPageRangeValidation:
+    """Verify page_range is validated during deserialization."""
+
+    def test_valid_page_range(self):
+        b = deserialize_block({
+            "type": "document",
+            "page_range": [0, 20],
+        })
+        assert b.page_range == (0, 20)
+
+    def test_invalid_page_range_reversed(self):
+        b = deserialize_block({
+            "type": "document",
+            "page_range": [10, 5],
+        })
+        assert b.page_range is None
+
+    def test_invalid_page_range_negative(self):
+        b = deserialize_block({
+            "type": "document",
+            "page_range": [-5, 10],
+        })
+        assert b.page_range is None
+
+    def test_invalid_page_range_wrong_length(self):
+        b = deserialize_block({
+            "type": "document",
+            "page_range": [1],
+        })
+        assert b.page_range is None
+
+    def test_invalid_page_range_three_elements(self):
+        b = deserialize_block({
+            "type": "document",
+            "page_range": [0, 5, 10],
+        })
+        assert b.page_range is None
+
+    def test_page_range_zero_zero_valid(self):
+        b = deserialize_block({
+            "type": "document",
+            "page_range": [0, 0],
+        })
+        assert b.page_range == (0, 0)
+
+    def test_page_range_none(self):
+        b = deserialize_block({
+            "type": "document",
+            "page_range": None,
+        })
+        assert b.page_range is None
