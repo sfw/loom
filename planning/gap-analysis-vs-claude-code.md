@@ -95,7 +95,7 @@ Loom needs a **conversational execution mode** where:
 ### Loom Current State
 | Tool | Capability |
 |------|-----------|
-| read_file | Read text files (no images/PDFs/notebooks) |
+| read_file | Read text, images, PDFs, Word (.docx), PowerPoint (.pptx) (no notebooks) |
 | write_file | Create/overwrite files |
 | edit_file | String replacement (unique match required) |
 | search_files | Regex search (pure Python, slow on large codebases) |
@@ -114,7 +114,7 @@ Loom needs a **conversational execution mode** where:
 | **Web search** | Cannot search the internet for docs/solutions |
 | **Sub-agent spawning** | Cannot parallelize research tasks |
 | **User question tool** | Cannot ask the user for clarification mid-execution |
-| **Image/PDF reading** | Cannot process visual content |
+| ~~**Image/PDF reading**~~ | ~~Cannot process visual content~~ (DONE: images, PDFs, Word, PowerPoint) |
 | **Notebook editing** | Cannot work with Jupyter notebooks |
 | **git push** | Not in the allowed subcommands list |
 | **Progress tracking visible to user** | No equivalent of TodoWrite |

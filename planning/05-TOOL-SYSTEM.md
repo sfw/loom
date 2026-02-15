@@ -97,9 +97,9 @@ class Tool(ABC):
 | `task_tracker` | In-memory progress tracking (add/update/list/clear tasks) | 10s |
 
 ### read_file
-- Parameters: `path` (required, string), `line_range` (optional, [start, end])
+- Parameters: `path` (required, string), `line_range` (optional, [start, end]), `page_start`/`page_end` (optional, for PDFs)
 - Resolves path relative to workspace
-- Returns file content as text
+- Returns file content as text. Supports text files, PDFs (with pagination via pypdf), Word documents (.doc/.docx via python-docx), PowerPoint presentations (.ppt/.pptx via python-pptx), and images (as multimodal content blocks)
 
 ### write_file
 - Parameters: `path` (required), `content` (required)

@@ -4,6 +4,9 @@ All notable changes to Loom are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Word and PowerPoint document support** (`tools/file_ops.py`, `content_utils.py`) -- `read_file` now extracts text from `.docx`/`.doc` and `.pptx`/`.ppt` files using `python-docx` and `python-pptx`. Returns a `DocumentBlock` with extracted text for all model providers. Both libraries are required dependencies (not optional).
+
 ### Changed
 - **Unified TUI as default interface** (`tui/app.py`, `__main__.py`) -- `loom` with no subcommand now launches the Textual TUI with full cowork backend: session persistence (SQLite), conversation recall, task delegation, process definitions, and session management. The separate plain-text REPL is removed. `loom cowork` is an alias for the default TUI. New slash commands: `/sessions`, `/new`, `/session`, `/resume <id>`.
 - **Setup wizard moved into TUI** (`tui/screens/setup.py`, `__main__.py`) -- first-run configuration now launches as a multi-step modal inside the TUI instead of CLI prompts. Five-step keyboard-driven flow: provider selection, model details, role assignment, optional utility model, and confirmation. Reconfigure anytime with the `/setup` slash command. The `loom setup` CLI command is retained as a headless fallback.
@@ -93,7 +96,7 @@ All notable changes to Loom are documented in this file.
 
 - **Per-tool-call approval** (`cowork/approval.py`) -- interactive approval system for cowork mode. Read-only tools (read_file, search, glob, web_search, etc.) auto-approved. Write/execute tools (shell, git, edit, delete) prompt with `[y]es / [n]o / [a]lways allow <tool>`. "Always" remembers per-tool for the session.
 - **`task_tracker` tool** -- in-memory progress tracking for multi-step tasks. Actions: add, update (pending/in_progress/completed), list, clear. Helps the model organize complex work and show progress.
-- **PDF/image file support** in `read_file` -- PDFs: extracts text page-by-page via `pypdf` (optional dep). Images: returns file metadata. Both fall back gracefully when libraries aren't installed.
+- **PDF/image/office file support** in `read_file` -- PDFs: extracts text page-by-page via `pypdf` (optional dep). Images: returns multimodal content blocks. Word (.docx) and PowerPoint (.pptx): extracts text via `python-docx` and `python-pptx` (required deps). All fall back gracefully to text.
 
 ### Changed
 - **TUI is the unified interactive interface** (`tui/app.py`) -- runs `CoworkSession` directly with full persistence, streaming text, tool approval modals, `ask_user` modals, conversation recall, and task delegation. Launched as the default `loom` command.

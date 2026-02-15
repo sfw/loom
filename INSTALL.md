@@ -127,6 +127,8 @@ uv sync --extra pdf
 # or: pip install -e ".[pdf]"
 ```
 
+**Note:** Word document (.docx) and PowerPoint (.pptx) support is included out of the box — `python-docx` and `python-pptx` are required dependencies, no extras needed.
+
 ---
 
 ## Configuration

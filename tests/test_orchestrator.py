@@ -511,7 +511,7 @@ class TestWorkspaceDocumentScan:
         result = orch._scan_workspace_documents(workspace, max_per_category=5)
 
         # Should only list 5
-        md_lines = [l for l in result.splitlines() if "doc_" in l]
+        md_lines = [line for line in result.splitlines() if "doc_" in line]
         assert len(md_lines) == 5
 
     @pytest.mark.asyncio

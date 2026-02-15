@@ -1052,8 +1052,25 @@ What happens when a model doesn't support a content type:
   extraction only for Ollama, even with vision models. Anthropic/OpenAI use native PDF
   blocks and don't need rendering.
 
+**Required (newly added):**
+- `python-docx` — Word document (.docx) text extraction (required dependency)
+- `python-pptx` — PowerPoint (.pptx) text extraction (required dependency)
+
 **NOT required:**
-- No new hard dependencies. All multimodal features degrade gracefully.
+- No other new hard dependencies. Remaining multimodal features degrade gracefully.
+
+---
+
+## Implemented: Office Document Support
+
+Word (.docx/.doc) and PowerPoint (.pptx/.ppt) support has been implemented:
+
+- `content_utils.py` — `extract_docx_text()` and `extract_pptx_text()` functions
+- `file_ops.py` — `ReadFileTool._read_docx()` and `_read_pptx()` methods
+- Both return `DocumentBlock` with extracted text as `text_fallback`
+- 64MB file size limit for office documents
+- `python-docx` and `python-pptx` are required dependencies (not optional)
+- 16 tests covering extraction, integration, empty docs, corrupt files, and legacy extensions
 
 ---
 
