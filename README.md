@@ -2,154 +2,80 @@
 
 **Local model orchestration engine** -- task decomposition, execution, and verification using local LLMs.
 
-Loom takes a high-level goal, breaks it into subtasks, executes them with local models (Ollama, OpenAI-compatible APIs, or Claude), verifies results, and learns from the process. The model never decides to "continue" -- the harness does.
+Loom is what you get when you strip Claude Code down to its core ideas and rebuild them for models running on your own hardware. It gives Qwen, DeepSeek, Llama, and any other local model the same agentic workflow that makes Claude Code productive: tool calling, file editing, conversation memory, parallel execution, and verification -- without sending a single token to someone else's server.
 
-**Two modes of operation:**
-- **Cowork mode** (`loom cowork`) -- interactive pair programming. You and the AI have a conversation, it uses tools in real time, you can interrupt and redirect. No planning overhead.
-- **Task mode** (`loom run`) -- autonomous execution. Submit a goal, Loom decomposes it into subtasks, executes, verifies, and reports back.
+It also works with Claude and any OpenAI-compatible API, so you can mix local and cloud models in the same task.
 
-## How It Works
+## Why Loom Exists
+
+Cloud-hosted coding agents are good but come with constraints: token costs, rate limits, privacy concerns, and vendor lock-in. Local models are getting capable enough for real work, but they lack the scaffolding that makes cloud agents useful. A 14B model can write correct code, but it can't plan a multi-file refactor, verify its own output, recover from mistakes, or remember what it did three turns ago without help.
+
+Loom is that help. It's the harness that turns a local model into a working agent.
+
+## Two Ways to Work
+
+**Cowork mode** (`loom cowork` / `loom tui`) -- Interactive pair programming. You talk, the model responds and uses tools, you see what it's doing in real time. Like Claude Code, but running against whatever model you want. Streaming text, inline diffs after file edits, per-tool-call approval, and slash commands for control.
+
+**Task mode** (`loom run`) -- Autonomous execution. Give Loom a goal, walk away. It decomposes the work into subtasks with a dependency graph, runs independent subtasks in parallel, verifies each result with an independent model, and replans when things go wrong.
 
 ```
-                    ┌──────────────────────────┐
-Goal -> Planner ->  │ [Subtask A]  [Subtask B] │  parallel batch
-                    │     |             |       │  (if independent)
-                    │  Execute       Execute    │
-                    │  Verify        Verify     │
-                    │  Extract*      Extract*   │  * fire-and-forget
-                    └──────────────────────────┘
+                    +----------------------------+
+Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
+                    |     |             |         |  (if independent)
+                    |  Execute       Execute      |
+                    |  Verify        Verify       |
+                    |  Extract*      Extract*     |  * fire-and-forget
+                    +----------------------------+
                                |
                          [Subtask C]  (depends on A+B)
                               |
                           Completed
 ```
 
-1. **Plan** -- A planner model decomposes the goal into ordered subtasks with a dependency graph
-2. **Schedule** -- Independent subtasks are dispatched in parallel (up to `max_parallel_subtasks`)
-3. **Execute** -- Each subtask runs in an isolated `SubtaskRunner` with its own tool-calling loop
-4. **Verify** -- An independent verifier checks each result against acceptance criteria
-5. **Extract** -- Key decisions, errors, and discoveries are extracted into structured memory (fire-and-forget)
-6. **Replan** -- If subtasks fail or new information emerges, the plan is revised
+## What Makes It Different
 
-## Features
+**Built for local model weaknesses.** Cloud models reproduce code strings precisely. Local models don't -- they drift on whitespace, swap tabs for spaces, drop trailing newlines. Loom's edit tool handles this with fuzzy matching: when an exact string match fails, it normalizes whitespace and finds the closest candidate above a similarity threshold. It also rejects ambiguous matches (two similar regions) so it won't silently edit the wrong code. This is the difference between a tool that works with Qwen 14B and one that fails 30% of the time.
 
-**Core orchestration:**
+**Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. A dangling reference detector nudges the model to use recall when the user says "as I mentioned earlier." No compression pass, no lost details, no extra LLM calls.
 
-- **Task decomposition** with dependency graphs and automatic scheduling
-- **Parallel subtask execution** -- independent subtasks run concurrently (configurable `max_parallel_subtasks`)
-- **Isolated execution** -- each subtask runs in a `SubtaskRunner` with its own context (no cross-contamination)
-- **Three model backends** -- Ollama, OpenAI-compatible APIs (LM Studio, vLLM, etc.), and Anthropic/Claude
-- **Role-based routing** -- planner, executor, extractor, verifier roles with tier selection
-- **Tool system** -- 19 built-in tools (file ops, shell, git, ripgrep search, glob find, web search, web fetch, code analysis, task tracker, ask user, calculator, spreadsheet, document write) with plugin auto-discovery
-- **Process definitions** -- YAML-based domain specialization (investment analysis, marketing strategy, consulting, etc.) that inject personas, phase blueprints, verification rules, and tool guidance without changing engine code. Installable from GitHub repos (`loom install user/repo`) with automatic dependency management.
-- **Workspace safety** -- path traversal prevention, destructive command blocking
-- **Full undo** -- changelog with before-snapshots, revert at file/subtask/task level
-- **Token budgeting** -- prompt assembly with 7-section ordering and trim-to-budget
+**The harness drives, not the model.** The model is a reasoning engine called repeatedly with scoped prompts. The orchestrator decides what happens next: which subtasks to run, when to verify, when to replan, when to escalate. This means a weaker model in a strong harness outperforms a stronger model in a weak one.
 
-**Verification and recovery:**
+**Verification as a separate concern.** The model never checks its own work. An independent verifier (which can be a different, cheaper model) validates results at three tiers: deterministic checks (does the file exist? does the syntax parse?), independent LLM review, and multi-vote consensus for high-stakes changes.
 
-- **Three-tier verification** -- deterministic checks, independent LLM review, voting verification
-- **Confidence scoring** -- weighted scoring with band classification (high/medium/low/zero)
-- **Approval gates** -- auto, manual, or confidence-threshold modes with always-gate for destructive ops
-- **Retry escalation** -- automatic tier escalation ladder with human flagging after max attempts
-- **Re-planning** -- automatic re-planning when subtasks fail or new information emerges
+**Full undo.** Every file write is preceded by a snapshot. You can revert any individual change, all changes from a subtask, or the entire task. The changelog tracks creates, modifies, deletes, and renames with before-state snapshots.
 
-**State and events:**
+**21 built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move), shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch, web search (DuckDuckGo, no API key), code analysis (tree-sitter), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, and ask_user for mid-execution questions. All tools auto-discovered via `__init_subclass__`.
 
-- **Structured memory** -- SQLite archive with task/subtask/type/tag queries
-- **Anti-amnesia** -- TODO reminders injected after every tool call
-- **Event bus** -- pub/sub for real-time updates to any number of clients
-- **Event persistence** -- all events persisted to SQLite for audit and replay
-- **Webhook delivery** -- callback URLs notified on task completion/failure with retry
-
-**Interfaces:**
-
-- **Cowork mode** -- interactive conversation loop with streaming, real-time tool display, per-tool-call approval, and full context
-- **REST API** -- full task CRUD, SSE streaming, steer/approve/feedback
-- **Terminal UI** -- Textual-based cowork interface with streaming chat, tool approval modals ([y]es/[a]lways/[n]o), ask_user modals, and scrollable chat log. Runs standalone (no server required).
-- **MCP server** -- Model Context Protocol integration for use as an agent tool
-- **Learning system** -- pattern extraction from execution history (success patterns, retry hints, templates)
+**Inline diffs.** Every file edit produces a unified diff in the tool result. In cowork mode, diffs render with ANSI colors (green additions, red removals). In the TUI, diffs get Rich markup syntax highlighting. You always see exactly what changed.
 
 ## Quick Start
 
 ```bash
-# Install (using uv, recommended)
-uv sync
-
-# Or with pip
-pip install -e .
+# Install
+uv sync          # or: pip install -e .
 
 # Configure models
-mkdir -p ~/.loom
 cp loom.toml ~/.loom/loom.toml
-# Edit ~/.loom/loom.toml with your model endpoints
+# Edit with your model endpoints (Ollama, LM Studio, vLLM, Claude, etc.)
 
-# Start the server
+# Interactive pair programming
+loom cowork -w /path/to/project
+
+# Or with the richer Textual TUI
+loom tui -w /path/to/project
+
+# Autonomous task execution
+loom run "Refactor the auth module to use JWT" --workspace /path/to/project
+
+# Start the API server (for programmatic access)
 loom serve
-
-# Submit a task (in another terminal)
-curl -X POST http://localhost:9000/tasks \
-  -H "Content-Type: application/json" \
-  -d '{"goal": "Create a Python CLI that converts CSV to JSON", "workspace": "/tmp/myproject"}'
-
-# Or use the CLI
-loom run "Create a Python CLI that converts CSV to JSON" --workspace /tmp/myproject
-
-# Or start an interactive cowork session
-loom cowork -w /tmp/myproject
-
-# Or launch the Textual TUI (same features, richer interface)
-loom tui -w /tmp/myproject
 ```
-
-## CLI Commands
-
-```
-loom serve              Start the API server
-loom cowork             Start an interactive cowork session (pair programming, CLI)
-loom tui                Launch the Textual TUI (cowork with modals and scrollback)
-loom run GOAL           Submit a task and stream progress inline
-loom status ID          Check status of a task
-loom cancel ID          Cancel a running task
-loom models             List configured models
-loom processes          List available process definitions
-loom install SOURCE     Install a process package (GitHub URL, user/repo, or local path)
-loom uninstall NAME     Remove an installed process package
-loom mcp-serve          Start the MCP server (stdio transport)
-loom reset-learning     Clear all learned patterns
-```
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/tasks` | Create and start a task |
-| `GET` | `/tasks` | List all tasks |
-| `GET` | `/tasks/{id}` | Get full task state |
-| `GET` | `/tasks/{id}/stream` | SSE event stream |
-| `PATCH` | `/tasks/{id}` | Inject instructions (steer) |
-| `DELETE` | `/tasks/{id}` | Cancel a task |
-| `POST` | `/tasks/{id}/approve` | Approve a gated step |
-| `POST` | `/tasks/{id}/feedback` | Provide mid-task feedback |
-| `GET` | `/tasks/{id}/subtasks` | List subtasks |
-| `GET` | `/tasks/{id}/memory` | Query task memory |
-| `GET` | `/memory/search` | Search across all memory |
-| `GET` | `/models` | Available models |
-| `GET` | `/tools` | Available tools |
-| `GET` | `/health` | Health check |
-| `GET` | `/config` | Current configuration |
-
-Interactive API docs are available at `http://localhost:9000/docs` when the server is running.
 
 ## Configuration
 
 Loom reads `loom.toml` from the current directory or `~/.loom/loom.toml`:
 
 ```toml
-[server]
-host = "127.0.0.1"
-port = 9000
-
 [models.primary]
 provider = "ollama"                    # or "openai_compatible" or "anthropic"
 base_url = "http://localhost:11434"
@@ -166,144 +92,77 @@ max_tokens = 2048
 temperature = 0.0
 roles = ["extractor", "verifier"]
 
-# Optional: Anthropic/Claude as an additional or alternative provider
-# [models.claude]
-# provider = "anthropic"
-# model = "claude-sonnet-4-5-20250929"
-# api_key = "sk-ant-..."               # or set ANTHROPIC_API_KEY env var
-# max_tokens = 8192
-# tier = 3
-# roles = ["executor", "planner"]
-
-[workspace]
-default_path = "~/projects"
-scratch_dir = "~/.loom/scratch"
-
 [execution]
 max_subtask_retries = 3
 max_loop_iterations = 50
-max_parallel_subtasks = 3    # Independent subtasks run concurrently
-
-[verification]
-tier1_enabled = true    # Deterministic checks (syntax, file existence)
-tier2_enabled = true    # Independent LLM verification
-tier3_enabled = false   # Multi-vote verification (expensive)
-
-[memory]
-database_path = "~/.loom/loom.db"
-
-[process]
-default = ""                        # Default process for all tasks (empty = none)
-search_paths = ["~/.loom/processes"]  # Additional directories to search for process definitions
+max_parallel_subtasks = 3
 ```
 
-### Process Definitions
+Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor) so you can use a big model for planning and a small one for verification.
 
-Loom ships with 5 built-in process definitions that inject domain expertise:
+## Process Definitions
+
+YAML-based domain specialization. A process definition injects a persona, phase blueprint, verification rules, and tool guidance without changing engine code. Loom ships with 5 built-in processes (investment analysis, marketing strategy, research report, competitive intel, consulting engagement). You can create your own or install them from GitHub:
 
 ```bash
-# List available processes
-loom processes
-
-# Run a task with a specific process
-loom run "Analyze ACME Corp for investment" --workspace /tmp/acme --process investment-analysis
-
-# Or in cowork mode
+loom processes                              # list available
 loom cowork -w /tmp/acme --process consulting-engagement
+loom install user/repo                      # install from GitHub
 ```
 
-Built-in processes: `investment-analysis`, `marketing-strategy`, `research-report`, `competitive-intel`, `consulting-engagement`. You can create custom processes as YAML files in `~/.loom/processes/` or in your workspace's `.loom/processes/` directory.
+## Interfaces
 
-See [INSTALL.md](INSTALL.md) for detailed setup instructions.
+- **CLI cowork** -- streaming conversation with ANSI-colored tool output and inline diffs
+- **Textual TUI** -- rich terminal interface with chat panel, file changes panel with diff viewer, task progress sidebar, tool approval modals, event log with token sparkline
+- **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
+- **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
+
+## CLI Commands
+
+```
+loom serve              Start the API server
+loom cowork             Interactive pair programming (CLI)
+loom tui                Interactive pair programming (Textual TUI)
+loom run GOAL           Autonomous task execution with streaming progress
+loom status ID          Check task status
+loom cancel ID          Cancel a running task
+loom models             List configured models
+loom processes          List available process definitions
+loom install SOURCE     Install a process package
+loom uninstall NAME     Remove a process package
+loom mcp-serve          Start the MCP server (stdio transport)
+loom reset-learning     Clear learned patterns
+```
 
 ## Architecture
 
+16,000 lines of Python. 1,039 tests. No frameworks (no LangChain, no CrewAI).
+
 ```
 src/loom/
-  __main__.py            CLI entry point (Click)
+  __main__.py            CLI (Click), cowork loop, TUI launcher
   config.py              TOML config loader
-  api/
-    server.py            FastAPI app factory
-    routes.py            All REST endpoints
-    schemas.py           Pydantic request/response models
-    engine.py            Component wiring and lifecycle
-  cowork/
-    session.py           Conversation-first interactive execution engine
-    approval.py          Per-tool-call approval (auto/approve/always/deny)
-    display.py           Terminal display with ANSI colors for tool calls
-  engine/
-    orchestrator.py      Core loop: plan -> schedule -> dispatch -> finalize
-    runner.py            Isolated subtask execution (tool loop, verify, extract)
-    scheduler.py         Dependency-based subtask ordering + parallel batch selection
-    verification.py      Three-tier verification gates
-  events/
-    bus.py               In-process pub/sub + event persistence
-    types.py             Event type constants
-    webhook.py           Callback URL delivery with retry
-  integrations/
-    mcp_server.py        Model Context Protocol server (3 tools)
-  learning/
-    manager.py           Pattern extraction and query from execution history
-  models/
-    base.py              Provider ABC, response types
-    anthropic_provider.py  Anthropic/Claude API client
-    ollama_provider.py   Ollama API client
-    openai_provider.py   OpenAI-compatible API client
-    router.py            Role+tier model selection
-  processes/
-    schema.py            Process definition loader, validation, cycle detection
-    builtin/             5 built-in YAML process definitions
-  prompts/
-    assembler.py         7-section prompt builder with process injection
-    constraints.py       Safety and behavior constraints
-    templates/           YAML prompt templates
-  recovery/
-    approval.py          Approval gates (auto/manual/threshold)
-    confidence.py        Weighted confidence scoring with band classification
-    retry.py             Retry escalation ladder with tier promotion
-  state/
-    task_state.py        Task/Subtask dataclasses, YAML state manager
-    memory.py            SQLite memory archive
-    schema.sql           Database schema
-  tools/
-    registry.py          Tool ABC with auto-discovery via __init_subclass__
-    file_ops.py          Read, write, edit, delete, move files
-    shell.py             Shell execution with safety
-    git.py               Git operations with allowlist (incl. push)
-    search.py            File search and directory listing
-    ripgrep.py           Ripgrep-powered content search with fallbacks
-    glob_find.py         Fast file discovery by glob pattern
-    ask_user.py          Ask the developer questions mid-execution
-    code_analysis.py     Code structure analysis (tree-sitter)
-    web.py               Web fetch with URL safety
-    web_search.py        Internet search via DuckDuckGo (no API key)
-    task_tracker.py      Progress tracking for multi-step tasks
-    calculator.py        Safe math evaluation (AST-based, financial functions)
-    spreadsheet.py       CSV spreadsheet operations (create, read, modify)
-    document_write.py    Structured Markdown document generation
-    workspace.py         Changelog, diff, revert
-  tui/
-    app.py               Textual TUI (cowork chat, approval/ask_user modals)
-    api_client.py        Async HTTP + SSE client (legacy server-mode)
+  api/                   FastAPI server, REST routes, SSE streaming
+  cowork/                Conversation session, approval, terminal display
+  engine/                Orchestrator, subtask runner, scheduler, verification
+  events/                Pub/sub event bus, persistence, webhooks
+  integrations/          MCP server
+  learning/              Pattern extraction from execution history
+  models/                Provider ABC + Ollama, OpenAI, Anthropic backends
+  processes/             Process definition loader + 5 built-in YAML processes
+  prompts/               7-section prompt assembler with budget trimming
+  recovery/              Approval gates, confidence scoring, retry escalation
+  state/                 Task state, SQLite memory archive, conversation store
+  tools/                 21 tools with auto-discovery, safety, changelog
+  tui/                   Textual app, chat log, diff viewer, approval modals
 ```
 
 ## Development
 
 ```bash
-# Install with dev dependencies (using uv)
-uv sync --extra dev
-
-# Or with pip
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Run linter
-ruff check src/ tests/
-
-# Run tests with coverage
-pytest --cov=loom --cov-report=term-missing
+uv sync --extra dev     # or: pip install -e ".[dev]"
+pytest                  # 1,039 tests
+ruff check src/ tests/  # lint
 ```
 
 ## Requirements
