@@ -1,0 +1,267 @@
+name: google-analytics
+version: "1.0"
+description: >
+  End-to-end Google Analytics audit and optimization. Covers tracking audit,
+  data quality assessment, funnel analysis, audience segmentation, attribution
+  modeling, and actionable recommendations. Suitable for GA4 properties seeking
+  to improve measurement, identify drop-off points, and optimize conversion.
+author: "Loom Community"
+tags: [analytics, google-analytics, ga4, measurement, conversion, attribution]
+
+dependencies:
+  - pyyaml
+
+persona: |
+  You are a senior digital analytics consultant specializing in Google Analytics 4.
+  You think in event taxonomies, conversion funnels, and attribution models.
+  Recommendations must be actionable — specify exact GA4 configurations, GTM tags,
+  or data layer changes. Quantify impact where possible (e.g., "fixing this
+  tracking gap captures ~15% of currently unattributed conversions"). Distinguish
+  between quick wins and structural improvements.
+
+phase_mode: guided
+
+tool_guidance: |
+  Use CSV for all tabular data (event inventories, funnel metrics, segment
+  comparisons). Use Markdown for narrative analysis and recommendations.
+  Use the calculator for conversion rate lifts, attribution weighting, and
+  statistical significance checks. Always show your calculations.
+
+tools:
+  required:
+    - calculator
+    - spreadsheet
+    - document_write
+  excluded: []
+
+phases:
+  - id: tracking-audit
+    description: >
+      Audit the current GA4 implementation: event taxonomy, custom dimensions,
+      conversions, data streams, and tag configuration. Identify gaps,
+      redundancies, and misconfigurations.
+    depends_on: []
+    model_tier: 2
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Complete event inventory with name, parameters, trigger condition, and
+      status (firing/not firing/misconfigured). Data stream configuration
+      documented. Enhanced measurement settings reviewed. At least 3 tracking
+      gaps or issues identified with severity rating.
+    deliverables:
+      - "tracking-audit.md — GA4 implementation audit with findings"
+      - "event-inventory.csv — complete event taxonomy with status"
+
+  - id: data-quality
+    description: >
+      Assess data quality: sampling rates, data thresholds, consent mode impact,
+      cross-domain tracking, session stitching, and data freshness. Quantify
+      the gap between actual and reported metrics.
+    depends_on: [tracking-audit]
+    model_tier: 2
+    verification_tier: 2
+    acceptance_criteria: >
+      Data quality scorecard with metrics for completeness, accuracy,
+      timeliness, and consistency. Each dimension scored 1-5 with evidence.
+      Consent mode impact quantified (% data loss by region/category).
+    deliverables:
+      - "data-quality.md — data quality assessment and scorecard"
+      - "quality-metrics.csv — quality dimensions with scores and evidence"
+
+  - id: funnel-analysis
+    description: >
+      Map and analyze key conversion funnels: acquisition to activation,
+      activation to engagement, engagement to conversion, conversion to
+      retention. Calculate drop-off rates and identify friction points.
+    depends_on: [data-quality]
+    model_tier: 3
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      At least 2 funnels mapped with step-by-step conversion rates.
+      Drop-off points identified with hypothesized causes. Benchmarks
+      cited for comparison. Device and channel segmentation applied.
+    deliverables:
+      - "funnel-analysis.md — funnel maps with drop-off analysis"
+      - "funnel-metrics.csv — step-by-step conversion rates by segment"
+
+  - id: audience-segmentation
+    description: >
+      Define and analyze audience segments using behavioral signals: engagement
+      depth, purchase frequency, channel affinity, lifecycle stage. Build
+      GA4 audiences for activation.
+    depends_on: [funnel-analysis]
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      4+ segments defined with behavioral criteria, size estimate, and
+      value tier. Each segment has a GA4 audience definition (conditions
+      and sequences). Segment overlap analysis included.
+    deliverables:
+      - "audience-segments.md — segment definitions and activation plan"
+      - "segment-comparison.csv — segment metrics and value tiers"
+
+  - id: attribution-analysis
+    description: >
+      Evaluate attribution models: last-click, data-driven, and custom
+      position-based. Analyze channel contribution shifts across models.
+      Recommend the optimal model with justification.
+    depends_on: [funnel-analysis]
+    model_tier: 2
+    verification_tier: 1
+    acceptance_criteria: >
+      At least 3 attribution models compared. Channel credit shifts
+      quantified (% change from last-click baseline). Model recommendation
+      with rationale tied to business model and sales cycle.
+    deliverables:
+      - "attribution-analysis.md — model comparison and recommendation"
+      - "attribution-comparison.csv — channel credits by model"
+
+  - id: recommendations
+    description: >
+      Synthesize all findings into prioritized recommendations: tracking fixes,
+      configuration changes, new events to implement, audiences to activate,
+      and reporting improvements. Include implementation effort and expected impact.
+    depends_on: [tracking-audit, data-quality, funnel-analysis, audience-segmentation, attribution-analysis]
+    model_tier: 3
+    verification_tier: 2
+    is_synthesis: true
+    acceptance_criteria: >
+      15+ recommendations ranked by impact and effort (2x2 matrix).
+      Each recommendation has: description, GA4/GTM implementation steps,
+      estimated impact, effort level (hours), and priority tier (P0/P1/P2).
+      Quick wins (high impact, low effort) called out separately.
+    deliverables:
+      - "recommendations.md — prioritized recommendations with implementation guide"
+      - "recommendation-matrix.csv — impact vs effort scoring"
+      - "implementation-roadmap.md — phased rollout plan"
+
+verification:
+  rules:
+    - name: no-placeholders
+      description: "No placeholder text in deliverables"
+      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]|XX%|N/A"
+      severity: error
+      type: regex
+    - name: metrics-quantified
+      description: "All recommendations must include quantified expected impact"
+      check: >
+        Review each recommendation. Every recommendation must include a
+        quantified expected impact (percentage lift, absolute number, or
+        range). Flag any recommendation that says "improve" without a number.
+      severity: warning
+      type: llm
+    - name: ga4-specific
+      description: "Recommendations must reference specific GA4 features"
+      check: >
+        Verify that implementation steps reference actual GA4 or GTM
+        features (event parameters, custom dimensions, audiences, triggers,
+        data layer pushes). Flag generic advice that could apply to any tool.
+      severity: warning
+      type: llm
+    - name: funnel-math-check
+      description: "Funnel conversion rates must be mathematically consistent"
+      check: >
+        For each funnel, verify that step-to-step conversion rates multiply
+        to equal the overall funnel conversion rate. Flag any arithmetic
+        inconsistency greater than 1%.
+      severity: error
+      type: llm
+
+memory:
+  extract_types:
+    - type: tracking_gap
+      description: "Missing or misconfigured event, parameter, or conversion"
+    - type: data_quality_issue
+      description: "Data completeness, accuracy, or consistency problem with impact quantified"
+    - type: conversion_insight
+      description: "Funnel drop-off pattern or conversion rate anomaly with segment context"
+    - type: audience_signal
+      description: "Behavioral pattern that defines a high-value or at-risk segment"
+    - type: attribution_finding
+      description: "Channel contribution shift or attribution model insight"
+    - type: implementation_decision
+      description: "Chosen approach for a tracking or configuration change with rationale"
+  extraction_guidance: |
+    Prioritize findings that change measurement accuracy or reveal hidden
+    conversion opportunities. Always include the quantified impact and the
+    specific GA4 configuration involved.
+
+workspace_analysis:
+  scan_for:
+    - "*.csv — exported GA4 data, event logs, or audience exports"
+    - "*.json — GTM container exports or data layer schemas"
+    - "*.md — existing analytics documentation or briefs"
+  guidance: |
+    Look for existing GA4 exports, GTM container files, or analytics
+    documentation. Reference actual data rather than making assumptions.
+    If a GTM container export exists, parse it for tag and trigger inventory.
+
+planner_examples:
+  - goal: "Audit and optimize GA4 for a B2B SaaS with free trial funnel"
+    subtasks:
+      - id: tracking-audit
+        description: "Audit GA4 event taxonomy — map all events, check enhanced measurement, review custom dimensions for lead scoring"
+        depends_on: []
+        model_tier: 2
+      - id: data-quality
+        description: "Assess consent mode impact on EU traffic, check cross-domain tracking between marketing site and app"
+        depends_on: [tracking-audit]
+        model_tier: 2
+      - id: funnel-analysis
+        description: "Map visitor → trial signup → activation → paid conversion funnel, segment by channel and device"
+        depends_on: [data-quality]
+        model_tier: 3
+      - id: audience-segmentation
+        description: "Define segments: trial-not-activated, power-users, at-risk-churn, expansion-ready"
+        depends_on: [funnel-analysis]
+        model_tier: 3
+      - id: attribution-analysis
+        description: "Compare last-click vs data-driven attribution for trial signups across paid search, organic, and content channels"
+        depends_on: [funnel-analysis]
+        model_tier: 2
+      - id: recommendations
+        description: "Synthesize into tracking fixes, new events for product-qualified leads, audience activation plan, and attribution model recommendation"
+        depends_on: [tracking-audit, data-quality, funnel-analysis, audience-segmentation, attribution-analysis]
+        model_tier: 3
+
+  - goal: "Optimize GA4 for an e-commerce site with multi-step checkout"
+    subtasks:
+      - id: tracking-audit
+        description: "Audit e-commerce event implementation — verify purchase, add_to_cart, begin_checkout, view_item events and parameters"
+        depends_on: []
+        model_tier: 2
+      - id: data-quality
+        description: "Check transaction data accuracy vs backend, assess refund tracking, verify currency and tax handling"
+        depends_on: [tracking-audit]
+        model_tier: 2
+      - id: funnel-analysis
+        description: "Map product view → add to cart → checkout → purchase funnel, segment by product category and traffic source"
+        depends_on: [data-quality]
+        model_tier: 3
+      - id: audience-segmentation
+        description: "Define segments: cart-abandoners, repeat-purchasers, high-AOV, browse-only, category-loyal"
+        depends_on: [funnel-analysis]
+        model_tier: 3
+      - id: attribution-analysis
+        description: "Compare attribution models for purchase conversions, analyze assist vs last-click for email and social channels"
+        depends_on: [funnel-analysis]
+        model_tier: 2
+      - id: recommendations
+        description: "Prioritize checkout friction fixes, enhanced e-commerce events, remarketing audiences, and attribution model for ROAS optimization"
+        depends_on: [tracking-audit, data-quality, funnel-analysis, audience-segmentation, attribution-analysis]
+        model_tier: 3
+
+replanning:
+  triggers: |
+    - Tracking audit reveals fundamental implementation issues requiring rebuild
+    - Data quality is too low to trust funnel metrics
+    - Key conversion events are missing or misconfigured
+    - Business model doesn't fit standard funnel analysis
+  guidance: |
+    If tracking is fundamentally broken, prioritize a tracking fix plan before
+    attempting funnel or attribution analysis. If data quality is below 3/5,
+    expand the data quality phase to include remediation steps before proceeding.
+    If the business model is non-standard (e.g., marketplace, subscription with
+    long consideration), adapt funnel definitions accordingly.
