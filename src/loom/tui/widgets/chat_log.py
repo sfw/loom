@@ -116,6 +116,39 @@ class ChatLog(VerticalScroll):
         self.mount(Static(f"[dim]{text}[/dim]", classes="model-text"))
         self._scroll_to_end()
 
+    def add_content_indicator(self, content_blocks: list) -> None:
+        """Display inline indicators for multimodal content blocks.
+
+        Shows styled placeholders for images and documents that the model
+        is processing, since terminals cannot display actual images.
+        """
+        from loom.content import DocumentBlock, ImageBlock
+
+        for block in content_blocks:
+            if isinstance(block, ImageBlock):
+                dims = f"{block.width}x{block.height}" if block.width else ""
+                size = f"{block.size_bytes:,} bytes" if block.size_bytes else ""
+                name = block.source_path.rsplit("/", 1)[-1] if block.source_path else ""
+                parts = [p for p in [name, dims, size] if p]
+                label = ", ".join(parts)
+                self.mount(Static(
+                    f"  [#bb9af7]\\[image: {label}][/]",
+                    classes="model-text",
+                ))
+            elif isinstance(block, DocumentBlock):
+                name = block.source_path.rsplit("/", 1)[-1] if block.source_path else ""
+                pr = ""
+                if block.page_range:
+                    pr = f" pages {block.page_range[0] + 1}-{block.page_range[1]}"
+                total = f" of {block.page_count}" if block.page_count else ""
+                label = f"{name}{pr}{total}"
+                self.mount(Static(
+                    f"  [#7dcfff]\\[document: {label}][/]",
+                    classes="model-text",
+                ))
+        if content_blocks:
+            self._scroll_to_end()
+
     def _scroll_to_end(self) -> None:
         if self._auto_scroll:
             self.scroll_end(animate=False)

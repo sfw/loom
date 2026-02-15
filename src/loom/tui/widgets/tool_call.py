@@ -52,6 +52,16 @@ def tool_output_preview(tool_name: str, output: str) -> str:
             return lines[0]
         return f"{len(lines)} results"
     if tool_name == "read_file":
+        # Detect multimodal content from output format
+        stripped = output.strip()
+        if stripped.startswith("[Image:") or stripped.startswith("[Image too large"):
+            return _trunc(stripped.strip("[]"), 60)
+        if stripped.startswith("[PDF:"):
+            return _trunc(stripped.strip("[]"), 60)
+        if stripped.startswith("--- Page"):
+            # PDF with extracted text — show page info
+            page_lines = [ln for ln in stripped.split("\n") if ln.startswith("--- Page")]
+            return f"{len(page_lines)} pages"
         return f"{len(output.splitlines())} lines"
     if tool_name == "shell_execute":
         return _trunc(output.strip().split("\n")[0], 60)
@@ -65,6 +75,12 @@ def tool_output_preview(tool_name: str, output: str) -> str:
         ]
         return f"{len(hits)} results" if hits else ""
     return ""
+
+
+def _is_multimodal_output(output: str) -> bool:
+    """Check if tool output represents multimodal content (image/PDF)."""
+    stripped = output.strip()
+    return stripped.startswith(("[Image:", "[Image too large", "[PDF:"))
 
 
 def _style_diff_output(output: str) -> str:
@@ -93,6 +109,18 @@ def _style_diff_output(output: str) -> str:
             styled_lines.append(f"[dim]{_escape(line)}[/dim]")
 
     return "\n".join(styled_lines)
+
+
+def _style_multimodal_output(output: str) -> str:
+    """Style multimodal content indicators with distinct colors."""
+    escaped = _escape(output)
+    # Image indicators in magenta
+    if "Image:" in output or "Image too large" in output:
+        return f"[#bb9af7]{escaped}[/]"
+    # PDF/document indicators in blue
+    if "PDF:" in output or "Page " in output:
+        return f"[#7dcfff]{escaped}[/]"
+    return f"[dim]{escaped}[/dim]"
 
 
 def _escape(text: str) -> str:
@@ -157,6 +185,8 @@ class ToolCallWidget(Static):
                 # Apply diff highlighting for edit_file output
                 if self._tool_name == "edit_file":
                     styled = _style_diff_output(snippet)
+                elif _is_multimodal_output(self._output):
+                    styled = _style_multimodal_output(snippet)
                 else:
                     styled = f"[dim]{snippet}[/dim]"
                 yield Collapsible(

@@ -14,6 +14,7 @@ from loom.api.schemas import (
     ConversationMessageRequest,
     FeedbackRequest,
     HealthResponse,
+    ModelCapabilitiesResponse,
     ModelInfo,
     PlanResponse,
     ProgressResponse,
@@ -541,15 +542,27 @@ async def list_models(request: Request):
     """List available models and their health status."""
     engine = _get_engine(request)
     providers = engine.model_router.list_providers()
-    return [
-        ModelInfo(
+    result = []
+    for p in providers:
+        caps = p.get("capabilities")
+        caps_response = None
+        if caps:
+            caps_response = ModelCapabilitiesResponse(
+                vision=caps.get("vision", False),
+                native_pdf=caps.get("native_pdf", False),
+                thinking=caps.get("thinking", False),
+                citations=caps.get("citations", False),
+                audio_input=caps.get("audio_input", False),
+                audio_output=caps.get("audio_output", False),
+            )
+        result.append(ModelInfo(
             name=p["name"],
             model=p["model"],
             tier=p["tier"],
             roles=p["roles"],
-        )
-        for p in providers
-    ]
+            capabilities=caps_response,
+        ))
+    return result
 
 
 @router.get("/tools", response_model=list[ToolInfo])
@@ -576,6 +589,15 @@ async def get_config(request: Request):
     """Current configuration (redacted)."""
     engine = _get_engine(request)
     config = engine.config
+
+    def _caps_dict(m):
+        caps = m.resolved_capabilities
+        return {
+            "vision": caps.vision,
+            "native_pdf": caps.native_pdf,
+            "thinking": caps.thinking,
+        }
+
     return {
         "server": {"host": config.server.host, "port": config.server.port},
         "models": {
@@ -584,6 +606,7 @@ async def get_config(request: Request):
                 "model": m.model,
                 "roles": m.roles,
                 "max_tokens": m.max_tokens,
+                "capabilities": _caps_dict(m),
             }
             for name, m in config.models.items()
         },

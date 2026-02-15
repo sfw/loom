@@ -78,12 +78,24 @@ class ModelRouter:
         """List all registered providers with their metadata."""
         result = []
         for name, provider in self._providers.items():
-            result.append({
+            info: dict = {
                 "name": name,
                 "model": provider.name,
                 "tier": provider.tier,
                 "roles": provider.roles,
-            })
+            }
+            # Include capabilities if provider exposes them
+            caps = getattr(provider, "_capabilities", None)
+            if caps is not None:
+                info["capabilities"] = {
+                    "vision": caps.vision,
+                    "native_pdf": caps.native_pdf,
+                    "thinking": caps.thinking,
+                    "citations": caps.citations,
+                    "audio_input": caps.audio_input,
+                    "audio_output": caps.audio_output,
+                }
+            result.append(info)
         return result
 
     async def health(self) -> dict[str, bool]:
@@ -197,5 +209,6 @@ def _create_provider(name: str, config: ModelConfig) -> ModelProvider:
             temperature=config.temperature,
             tier=config.tier,
             roles=config.roles,
+            capabilities=config.resolved_capabilities,
         )
     raise ValueError(f"Unknown provider type: {config.provider}")

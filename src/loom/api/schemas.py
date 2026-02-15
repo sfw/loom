@@ -98,13 +98,37 @@ class HealthResponse(BaseModel):
     version: str
 
 
+class ModelCapabilitiesResponse(BaseModel):
+    vision: bool = False
+    native_pdf: bool = False
+    thinking: bool = False
+    citations: bool = False
+    audio_input: bool = False
+    audio_output: bool = False
+
+
 class ModelInfo(BaseModel):
     name: str
     model: str
     tier: int
     roles: list[str]
+    capabilities: ModelCapabilitiesResponse | None = None
 
 
 class ToolInfo(BaseModel):
     name: str
     description: str
+
+
+class ContentBlockResponse(BaseModel):
+    """A multimodal content block from a tool result."""
+
+    type: str
+    source_path: str = ""
+    media_type: str = ""
+    width: int = 0
+    height: int = 0
+    size_bytes: int = 0
+    page_count: int = 0
+    page_range: list[int] | None = None
+    text_fallback: str = ""

@@ -60,6 +60,11 @@ def display_tool_complete(event: ToolCallEvent) -> None:
         sys.stdout.write(
             f"  {_C.GRAY}  {icon} {_C.DIM}{elapsed}{_C.RESET}\n"
         )
+
+    # Show multimodal content indicators
+    if event.result.content_blocks and event.result.success:
+        _display_content_indicators(event.result.content_blocks)
+
     sys.stdout.flush()
 
 
@@ -260,8 +265,16 @@ def _output_preview(tool_name: str, output: str) -> str:
             return lines[0]
         return f"{len(lines)} results"
 
-    # For file reads, show line count
+    # For file reads, show line count or multimodal info
     if tool_name == "read_file":
+        stripped = output.strip()
+        if stripped.startswith("[Image:") or stripped.startswith("[Image too large"):
+            return _truncate(stripped.strip("[]"), 60)
+        if stripped.startswith("[PDF:"):
+            return _truncate(stripped.strip("[]"), 60)
+        if stripped.startswith("--- Page"):
+            page_lines = [ln for ln in stripped.split("\n") if ln.startswith("--- Page")]
+            return f"{len(page_lines)} pages"
         lines = output.split("\n")
         return f"{len(lines)} lines"
 
@@ -276,6 +289,31 @@ def _output_preview(tool_name: str, output: str) -> str:
         return _truncate(first, 80)
 
     return ""
+
+
+def _display_content_indicators(content_blocks: list) -> None:
+    """Show inline indicators for multimodal content blocks in terminal."""
+    from loom.content import DocumentBlock, ImageBlock
+
+    for block in content_blocks:
+        if isinstance(block, ImageBlock):
+            dims = f"{block.width}x{block.height}" if block.width else ""
+            name = block.source_path.rsplit("/", 1)[-1] if block.source_path else ""
+            parts = [p for p in [name, dims] if p]
+            label = ", ".join(parts)
+            sys.stdout.write(
+                f"  {_C.GRAY}    {_C.MAGENTA}[image: {label}]{_C.RESET}\n"
+            )
+        elif isinstance(block, DocumentBlock):
+            name = block.source_path.rsplit("/", 1)[-1] if block.source_path else ""
+            pr = ""
+            if block.page_range:
+                pr = f" pages {block.page_range[0] + 1}-{block.page_range[1]}"
+            total = f" of {block.page_count}" if block.page_count else ""
+            label = f"{name}{pr}{total}"
+            sys.stdout.write(
+                f"  {_C.GRAY}    {_C.CYAN}[document: {label}]{_C.RESET}\n"
+            )
 
 
 def _truncate(s: str, max_len: int) -> str:

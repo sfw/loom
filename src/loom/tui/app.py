@@ -299,6 +299,16 @@ class LoomApp(App):
                             output=output,
                             error=error,
                         )
+
+                        # Show multimodal content indicators
+                        if (
+                            event.result.content_blocks
+                            and event.result.success
+                        ):
+                            chat.add_content_indicator(
+                                event.result.content_blocks,
+                            )
+
                         etype = (
                             "tool_ok"
                             if event.result.success
@@ -392,6 +402,16 @@ class LoomApp(App):
                             output=output,
                             error=error,
                         )
+
+                        # Show multimodal content indicators
+                        if (
+                            event.result.content_blocks
+                            and event.result.success
+                        ):
+                            chat.add_content_indicator(
+                                event.result.content_blocks,
+                            )
+
                         etype = (
                             "tool_ok"
                             if event.result.success
