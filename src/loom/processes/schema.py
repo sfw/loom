@@ -262,11 +262,13 @@ class ProcessLoader:
                     "author": defn.author,
                     "path": str(path),
                 })
-            except Exception:
+            except Exception as e:
+                logger.warning("Failed to load process %s: %s", name, e)
                 result.append({
                     "name": name,
                     "version": "?",
                     "description": "(failed to load)",
+                    "author": "",
                     "path": str(path),
                 })
         return result
@@ -479,6 +481,15 @@ class ProcessLoader:
                         f"{seen_deliverables[fname]!r} and {phase.id!r}",
                     )
                 seen_deliverables[fname] = phase.id
+
+        # Tool requirements: required and excluded must not overlap
+        if defn.tools.required and defn.tools.excluded:
+            overlap = set(defn.tools.required) & set(defn.tools.excluded)
+            if overlap:
+                errors.append(
+                    f"Tool(s) both required and excluded: "
+                    f"{', '.join(sorted(overlap))}",
+                )
 
         # Verification rule validation
         for rule in defn.verification_rules:

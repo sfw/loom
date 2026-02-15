@@ -122,9 +122,11 @@ class DeterministicVerifier:
                 # Convention: the check description says what to look for
                 # as a violation, so finding it = failure.
                 passed = not found
+                # Warning-severity rules record the match but don't fail
+                is_failure = not passed and rule.severity == "error"
                 checks.append(Check(
                     name=f"process_rule_{rule.name}",
-                    passed=passed if rule.severity == "error" else True,
+                    passed=not is_failure,
                     detail=(
                         f"Rule '{rule.name}' matched: {rule.description}"
                         if found else None
@@ -132,13 +134,17 @@ class DeterministicVerifier:
                 ))
 
             # 5. Process deliverables check
+            # Collect all expected deliverables across all phases.
+            # Subtask IDs don't map to phase IDs, so we check the full set.
             deliverables = self._process.get_deliverables()
             if deliverables and workspace:
-                phase_deliverables = deliverables.get(subtask.id, [])
+                all_expected: list[str] = []
+                for phase_files in deliverables.values():
+                    all_expected.extend(phase_files)
                 files_created = set()
                 for tc in tool_calls:
                     files_created.update(tc.result.files_changed)
-                for expected in phase_deliverables:
+                for expected in all_expected:
                     found_file = (
                         expected in files_created
                         or (workspace / expected).exists()

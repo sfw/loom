@@ -108,8 +108,12 @@ def review_package(src_dir: Path, source: str, target_dir: Path) -> PackageRevie
     This reads the package contents but does NOT install anything.
     """
     manifest = src_dir / "process.yaml"
-    with open(manifest) as f:
-        raw = yaml.safe_load(f) or {}
+    try:
+        with open(manifest) as f:
+            raw = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        logger.warning("Failed to parse process.yaml for review: %s", e)
+        raw = {}
 
     name = raw.get("name", "unknown")
     deps = raw.get("dependencies", [])
@@ -192,6 +196,7 @@ def install_process(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve the source to a local directory
+    src_dir: Path | None = None
     cleanup_tmp = False
     try:
         src_dir, cleanup_tmp = _resolve_source(source)
@@ -226,7 +231,7 @@ def install_process(
         return dest
 
     finally:
-        if cleanup_tmp and "src_dir" in dir():
+        if cleanup_tmp and src_dir is not None:
             shutil.rmtree(src_dir, ignore_errors=True)
 
 

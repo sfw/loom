@@ -776,14 +776,10 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
 @cli.command(name="install")
 @click.argument("source")
 @click.option(
-    "--global", "install_global", is_flag=True, default=True,
-    help="Install to ~/.loom/processes/ (default).",
-)
-@click.option(
     "--workspace", "-w", "install_workspace",
     type=click.Path(exists=True, path_type=Path),
     default=None,
-    help="Install to <workspace>/loom-processes/ instead of global.",
+    help="Install to <workspace>/loom-processes/ instead of global ~/.loom/processes/.",
 )
 @click.option(
     "--skip-deps", is_flag=True, default=False,
@@ -797,7 +793,6 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
 def install(
     ctx: click.Context,
     source: str,
-    install_global: bool,
     install_workspace: Path | None,
     skip_deps: bool,
     yes: bool,
