@@ -789,6 +789,10 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
     "--skip-deps", is_flag=True, default=False,
     help="Skip installing Python dependencies.",
 )
+@click.option(
+    "--yes", "-y", is_flag=True, default=False,
+    help="Skip interactive review and approve automatically.",
+)
 @click.pass_context
 def install(
     ctx: click.Context,
@@ -796,6 +800,7 @@ def install(
     install_global: bool,
     install_workspace: Path | None,
     skip_deps: bool,
+    yes: bool,
 ) -> None:
     """Install a process package from a GitHub repo or local path.
 
@@ -810,6 +815,10 @@ def install(
     listed in the 'dependencies' field of process.yaml are automatically
     installed (use --skip-deps to disable).
 
+    Before installation, you'll see a full security review of the package
+    contents (dependencies, bundled code) and must confirm. Use -y to skip
+    this review (not recommended for untrusted sources).
+
     Examples:
 
     \b
@@ -818,19 +827,33 @@ def install(
       loom install ./my-local-process
       loom install ./my-local-process -w /path/to/project
     """
-    from loom.processes.installer import InstallError, install_process
+    from loom.processes.installer import (
+        InstallError,
+        format_review_for_terminal,
+        install_process,
+    )
 
     if install_workspace:
         target_dir = install_workspace.resolve() / "loom-processes"
     else:
         target_dir = Path.home() / ".loom" / "processes"
 
-    click.echo(f"Installing process from: {source}")
-    click.echo(f"Target: {target_dir}")
+    click.echo(f"Resolving source: {source}")
+
+    def _review_and_prompt(review) -> bool:
+        """Display review and ask user for confirmation."""
+        click.echo(format_review_for_terminal(review))
+        if yes:
+            click.echo("  --yes flag set: auto-approving.")
+            return True
+        return click.confirm("  Proceed with installation?", default=False)
 
     try:
         dest = install_process(
-            source, target_dir=target_dir, skip_deps=skip_deps,
+            source,
+            target_dir=target_dir,
+            skip_deps=skip_deps,
+            review_callback=_review_and_prompt,
         )
         click.echo(f"Installed to: {dest}")
         click.echo("Done. Use --process <name> with 'run' or 'cowork'.")

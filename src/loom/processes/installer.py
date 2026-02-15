@@ -1,8 +1,9 @@
 """Process package installer.
 
 Handles installing process packages from GitHub repositories, local paths,
-or archive URLs. Validates structure, installs Python dependencies, and
-places the package into the appropriate discovery directory.
+or archive URLs. Validates structure, presents a full security review of
+the package contents (dependencies, bundled code), and only proceeds
+after explicit user approval.
 
 Expected repository/package structure::
 
@@ -13,16 +14,20 @@ Expected repository/package structure::
     └── README.md             # Optional
 
 The ``dependencies`` list in ``process.yaml`` declares pip packages that
-are automatically installed during ``loom install``.
+are installed during ``loom install`` — but **only after the user reviews
+and approves** the full package contents.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
@@ -47,8 +52,101 @@ class UninstallError(Exception):
 
 BUILTIN_DIR = Path(__file__).parent / "builtin"
 
-# Files/directories that are copied from the source into the install target
-_PACKAGE_FILES = {"process.yaml", "tools", "README.md", "readme.md", "LICENSE"}
+
+# ---------------------------------------------------------------------------
+# Package review
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PackageReview:
+    """Full security review of a process package before installation.
+
+    Presented to the user so they can make an informed accept/reject decision
+    before any dependencies are installed or code is copied.
+    """
+
+    # Metadata
+    name: str
+    version: str
+    description: str
+    author: str
+    source: str  # Original source string (URL, path, shorthand)
+
+    # Dependencies that will be pip-installed
+    dependencies: list[str] = field(default_factory=list)
+    unpinned_deps: list[str] = field(default_factory=list)
+
+    # Bundled Python files that will be auto-executed on process load
+    bundled_tool_files: list[str] = field(default_factory=list)
+
+    # State
+    will_overwrite: bool = False
+    target_dir: str = ""
+
+    @property
+    def has_dependencies(self) -> bool:
+        return bool(self.dependencies)
+
+    @property
+    def has_bundled_code(self) -> bool:
+        return bool(self.bundled_tool_files)
+
+    @property
+    def risk_level(self) -> str:
+        """Rough risk classification for display."""
+        if self.has_bundled_code and self.has_dependencies:
+            return "HIGH"
+        if self.has_bundled_code or self.has_dependencies:
+            return "MEDIUM"
+        return "LOW"
+
+
+def review_package(src_dir: Path, source: str, target_dir: Path) -> PackageReview:
+    """Build a full security review of a package before installation.
+
+    This reads the package contents but does NOT install anything.
+    """
+    manifest = src_dir / "process.yaml"
+    with open(manifest) as f:
+        raw = yaml.safe_load(f) or {}
+
+    name = raw.get("name", "unknown")
+    deps = raw.get("dependencies", [])
+    if not isinstance(deps, list):
+        deps = []
+    deps = [d for d in deps if isinstance(d, str) and d.strip()]
+
+    # Identify unpinned dependencies (no version specifier)
+    unpinned = [
+        d for d in deps
+        if not any(op in d for op in (">=", "<=", "==", "!=", "~=", ">", "<"))
+    ]
+
+    # Find bundled Python tool files
+    tool_files: list[str] = []
+    tools_dir = src_dir / "tools"
+    if tools_dir.is_dir():
+        for py_file in sorted(tools_dir.glob("*.py")):
+            if not py_file.name.startswith("_"):
+                tool_files.append(py_file.name)
+
+    # Check for overwrite
+    dest = target_dir / name
+    will_overwrite = dest.exists()
+
+    return PackageReview(
+        name=name,
+        version=str(raw.get("version", "?")),
+        description=raw.get("description", ""),
+        author=raw.get("author", ""),
+        source=source,
+        dependencies=deps,
+        unpinned_deps=unpinned,
+        bundled_tool_files=tool_files,
+        will_overwrite=will_overwrite,
+        target_dir=str(target_dir),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +160,7 @@ def install_process(
     target_dir: Path | None = None,
     skip_deps: bool = False,
     python_cmd: str = "python3",
+    review_callback: Callable[[PackageReview], bool] | None = None,
 ) -> Path:
     """Install a process package from *source*.
 
@@ -78,6 +177,10 @@ def install_process(
         If True, skip installing Python dependencies.
     python_cmd:
         Python executable for ``pip install``.  Defaults to ``python3``.
+    review_callback:
+        Called with a :class:`PackageReview` before any installation happens.
+        Must return ``True`` to proceed. If ``None``, installation proceeds
+        without review (for tests / programmatic use only).
 
     Returns
     -------
@@ -101,7 +204,14 @@ def install_process(
                 f"Choose a different name in process.yaml."
             )
 
-        # Install dependencies
+        # --- Security review gate ---
+        review = review_package(src_dir, source, target_dir)
+
+        if review_callback is not None:
+            if not review_callback(review):
+                raise InstallError("Installation cancelled by user.")
+
+        # Install dependencies (only after review approval)
         if not skip_deps:
             _install_dependencies(src_dir, python_cmd)
 
@@ -168,6 +278,88 @@ def uninstall_process(
         f"Process {name!r} not found in: "
         + ", ".join(str(d) for d in search_dirs)
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI review display
+# ---------------------------------------------------------------------------
+
+
+def format_review_for_terminal(review: PackageReview) -> str:
+    """Format a PackageReview for terminal display with security warnings."""
+    lines: list[str] = []
+
+    lines.append("")
+    lines.append("=" * 60)
+    lines.append(f"  PACKAGE REVIEW — {review.name} v{review.version}")
+    lines.append("=" * 60)
+
+    # Metadata
+    if review.description:
+        lines.append(f"  Description: {review.description.strip()[:100]}")
+    if review.author:
+        lines.append(f"  Author:      {review.author}")
+    lines.append(f"  Source:      {review.source}")
+    lines.append(f"  Target:      {review.target_dir}")
+    if review.will_overwrite:
+        lines.append("  ** Will OVERWRITE existing installation **")
+
+    # Dependencies
+    lines.append("")
+    if review.has_dependencies:
+        lines.append(f"  DEPENDENCIES ({len(review.dependencies)} packages):")
+        for dep in review.dependencies:
+            marker = "  [!]" if dep in review.unpinned_deps else "     "
+            lines.append(f"  {marker} {dep}")
+        if review.unpinned_deps:
+            lines.append("")
+            lines.append("  WARNING: [!] marks unpinned dependencies (no version")
+            lines.append("  constraint). These could resolve to any version,")
+            lines.append("  including a compromised one.")
+        lines.append("")
+        lines.append("  These packages will be installed via pip into your")
+        lines.append("  current Python environment. Packages can execute")
+        lines.append("  arbitrary code during installation (setup.py).")
+    else:
+        lines.append("  DEPENDENCIES: None")
+
+    # Bundled code
+    lines.append("")
+    if review.has_bundled_code:
+        lines.append(
+            f"  BUNDLED CODE ({len(review.bundled_tool_files)} Python files):"
+        )
+        for f in review.bundled_tool_files:
+            lines.append(f"    tools/{f}")
+        lines.append("")
+        lines.append("  WARNING: These Python files will be automatically")
+        lines.append("  imported and executed when the process is loaded.")
+        lines.append("  Review the source code before proceeding.")
+    else:
+        lines.append("  BUNDLED CODE: None")
+
+    # Risk summary
+    lines.append("")
+    lines.append("-" * 60)
+    lines.append(f"  Risk level: {review.risk_level}")
+
+    if review.risk_level == "HIGH":
+        lines.append("  This package installs pip dependencies AND contains")
+        lines.append("  executable Python code. Only install from trusted sources.")
+    elif review.risk_level == "MEDIUM":
+        if review.has_dependencies:
+            lines.append("  This package installs pip dependencies.")
+            lines.append("  Verify the packages are legitimate before proceeding.")
+        else:
+            lines.append("  This package contains executable Python code.")
+            lines.append("  Review the source before proceeding.")
+    else:
+        lines.append("  YAML-only process definition. No code execution risk.")
+
+    lines.append("-" * 60)
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +467,6 @@ def _validate_package(src_dir: Path) -> str:
         raise InstallError("process.yaml is missing the 'name' field.")
 
     # Basic name validation (matches schema.py)
-    import re
     if not re.match(r"^[a-z0-9][a-z0-9-]*$", name):
         raise InstallError(
             f"Invalid process name {name!r}: must be lowercase "

@@ -3,6 +3,8 @@
 Covers:
 - Source resolution (local path, GitHub URL, shorthand)
 - Package validation (process.yaml, name format)
+- Security review (PackageReview, risk levels, formatting)
+- Review callback gate (approve, reject, cancellation)
 - Dependency installation (pip/uv)
 - Package copying (process.yaml, tools/, README)
 - Uninstall (directory package, single YAML, built-in protection)
@@ -19,6 +21,7 @@ import pytest
 
 from loom.processes.installer import (
     InstallError,
+    PackageReview,
     UninstallError,
     _clone_repo,
     _copy_package,
@@ -26,7 +29,9 @@ from loom.processes.installer import (
     _is_github_shorthand,
     _resolve_source,
     _validate_package,
+    format_review_for_terminal,
     install_process,
+    review_package,
     uninstall_process,
 )
 
@@ -45,6 +50,17 @@ dependencies:
   - pandas>=2.0
 """
 
+YAML_WITH_DEPS_AND_TOOLS = """\
+name: full-process
+version: '2.0'
+description: Full process with deps and tools
+author: Test Author
+dependencies:
+  - requests>=2.28.0
+  - pandas
+  - numpy
+"""
+
 YAML_BAD_NAME = "name: Invalid Name!\nversion: '1.0'\n"
 
 YAML_MISSING_NAME = "version: '1.0'\ndescription: No name\n"
@@ -58,9 +74,9 @@ def _make_package(tmp_path: Path, yaml_content: str = MINIMAL_YAML) -> Path:
     return pkg
 
 
-def _make_package_with_tools(tmp_path: Path) -> Path:
+def _make_package_with_tools(tmp_path: Path, yaml_content: str = MINIMAL_YAML) -> Path:
     """Create a process package with tools/ and README."""
-    pkg = _make_package(tmp_path)
+    pkg = _make_package(tmp_path, yaml_content)
     tools = pkg / "tools"
     tools.mkdir()
     (tools / "my_tool.py").write_text("# A tool\nLOADED = True\n")
@@ -184,6 +200,195 @@ class TestValidatePackage:
 
 
 # ===================================================================
+# PackageReview
+# ===================================================================
+
+
+class TestPackageReview:
+    """Tests for PackageReview dataclass and risk classification."""
+
+    def test_risk_level_low_yaml_only(self):
+        review = PackageReview(
+            name="simple", version="1.0", description="",
+            author="", source="./simple",
+        )
+        assert review.risk_level == "LOW"
+        assert not review.has_dependencies
+        assert not review.has_bundled_code
+
+    def test_risk_level_medium_deps_only(self):
+        review = PackageReview(
+            name="deps", version="1.0", description="",
+            author="", source="./deps",
+            dependencies=["requests>=2.28.0"],
+        )
+        assert review.risk_level == "MEDIUM"
+        assert review.has_dependencies
+        assert not review.has_bundled_code
+
+    def test_risk_level_medium_code_only(self):
+        review = PackageReview(
+            name="code", version="1.0", description="",
+            author="", source="./code",
+            bundled_tool_files=["my_tool.py"],
+        )
+        assert review.risk_level == "MEDIUM"
+        assert not review.has_dependencies
+        assert review.has_bundled_code
+
+    def test_risk_level_high_deps_and_code(self):
+        review = PackageReview(
+            name="full", version="1.0", description="",
+            author="", source="./full",
+            dependencies=["requests"],
+            bundled_tool_files=["my_tool.py"],
+        )
+        assert review.risk_level == "HIGH"
+        assert review.has_dependencies
+        assert review.has_bundled_code
+
+
+# ===================================================================
+# review_package
+# ===================================================================
+
+
+class TestReviewPackage:
+    """Tests for review_package() — pre-install security analysis."""
+
+    def test_review_minimal_yaml_only(self, tmp_path):
+        pkg = _make_package(tmp_path)
+        target = tmp_path / "target"
+        target.mkdir()
+        review = review_package(pkg, "./my-process", target)
+        assert review.name == "test-process"
+        assert review.version == "1.0"
+        assert review.dependencies == []
+        assert review.bundled_tool_files == []
+        assert review.risk_level == "LOW"
+        assert not review.will_overwrite
+
+    def test_review_with_deps(self, tmp_path):
+        pkg = _make_package(tmp_path, YAML_WITH_DEPS)
+        target = tmp_path / "target"
+        target.mkdir()
+        review = review_package(pkg, "user/repo", target)
+        assert review.name == "dep-process"
+        assert review.dependencies == ["requests>=2.28.0", "pandas>=2.0"]
+        assert review.unpinned_deps == []  # both have version specifiers
+        assert review.risk_level == "MEDIUM"
+
+    def test_review_detects_unpinned_deps(self, tmp_path):
+        pkg = _make_package(tmp_path, YAML_WITH_DEPS_AND_TOOLS)
+        target = tmp_path / "target"
+        target.mkdir()
+        review = review_package(pkg, "user/repo", target)
+        # "pandas" and "numpy" have no version specifier
+        assert "pandas" in review.unpinned_deps
+        assert "numpy" in review.unpinned_deps
+        assert "requests>=2.28.0" not in review.unpinned_deps
+
+    def test_review_with_tools(self, tmp_path):
+        pkg = _make_package_with_tools(tmp_path)
+        target = tmp_path / "target"
+        target.mkdir()
+        review = review_package(pkg, "./pkg", target)
+        assert review.bundled_tool_files == ["my_tool.py"]
+        # _private.py should be excluded (starts with _)
+        assert "_private.py" not in review.bundled_tool_files
+
+    def test_review_with_deps_and_tools(self, tmp_path):
+        pkg = _make_package_with_tools(tmp_path, YAML_WITH_DEPS_AND_TOOLS)
+        target = tmp_path / "target"
+        target.mkdir()
+        review = review_package(pkg, "user/repo", target)
+        assert review.risk_level == "HIGH"
+        assert review.has_dependencies
+        assert review.has_bundled_code
+
+    def test_review_detects_overwrite(self, tmp_path):
+        pkg = _make_package(tmp_path)
+        target = tmp_path / "target"
+        target.mkdir()
+        # Pre-create the install destination
+        (target / "test-process").mkdir()
+        review = review_package(pkg, "./pkg", target)
+        assert review.will_overwrite is True
+
+    def test_review_preserves_source_string(self, tmp_path):
+        pkg = _make_package(tmp_path)
+        target = tmp_path / "target"
+        target.mkdir()
+        review = review_package(pkg, "https://github.com/acme/loom-foo", target)
+        assert review.source == "https://github.com/acme/loom-foo"
+
+
+# ===================================================================
+# format_review_for_terminal
+# ===================================================================
+
+
+class TestFormatReviewForTerminal:
+    """Tests for the terminal display formatter."""
+
+    def test_low_risk_output(self):
+        review = PackageReview(
+            name="simple", version="1.0",
+            description="A simple process", author="Test",
+            source="./simple", target_dir="/tmp/target",
+        )
+        output = format_review_for_terminal(review)
+        assert "PACKAGE REVIEW" in output
+        assert "simple v1.0" in output
+        assert "DEPENDENCIES: None" in output
+        assert "BUNDLED CODE: None" in output
+        assert "Risk level: LOW" in output
+        assert "YAML-only" in output
+
+    def test_medium_risk_deps(self):
+        review = PackageReview(
+            name="deps", version="1.0",
+            description="With deps", author="",
+            source="user/repo", target_dir="/tmp/target",
+            dependencies=["requests>=2.28.0", "pandas"],
+            unpinned_deps=["pandas"],
+        )
+        output = format_review_for_terminal(review)
+        assert "DEPENDENCIES (2 packages)" in output
+        assert "requests>=2.28.0" in output
+        assert "[!]" in output  # unpinned warning marker
+        assert "WARNING" in output
+        assert "no version" in output
+        assert "Risk level: MEDIUM" in output
+
+    def test_high_risk_deps_and_code(self):
+        review = PackageReview(
+            name="full", version="1.0",
+            description="Full", author="",
+            source="user/repo", target_dir="/tmp/target",
+            dependencies=["requests"],
+            bundled_tool_files=["ga_connect.py", "ga_query.py"],
+        )
+        output = format_review_for_terminal(review)
+        assert "BUNDLED CODE (2 Python files)" in output
+        assert "tools/ga_connect.py" in output
+        assert "tools/ga_query.py" in output
+        assert "automatically" in output  # auto-executed warning
+        assert "Risk level: HIGH" in output
+        assert "trusted sources" in output
+
+    def test_overwrite_warning(self):
+        review = PackageReview(
+            name="existing", version="2.0",
+            description="", author="",
+            source="./pkg", target_dir="/tmp/target",
+            will_overwrite=True,
+        )
+        output = format_review_for_terminal(review)
+        assert "OVERWRITE" in output
+
+
+# ===================================================================
 # _install_dependencies
 # ===================================================================
 
@@ -298,6 +503,113 @@ class TestCopyPackage:
         _copy_package(src, dest)
         assert not (tools_dest / "old_tool.py").exists()
         assert (tools_dest / "my_tool.py").exists()
+
+
+# ===================================================================
+# install_process — review callback gate
+# ===================================================================
+
+
+class TestInstallProcessReviewGate:
+    """Tests for the review_callback security gate in install_process."""
+
+    def test_review_callback_approved_proceeds(self, tmp_path):
+        """When callback returns True, installation proceeds."""
+        src = _make_package(tmp_path)
+        target = tmp_path / "installed"
+        reviews_seen: list[PackageReview] = []
+
+        def approve(review: PackageReview) -> bool:
+            reviews_seen.append(review)
+            return True
+
+        dest = install_process(
+            str(src), target_dir=target, skip_deps=True,
+            review_callback=approve,
+        )
+        assert dest.exists()
+        assert len(reviews_seen) == 1
+        assert reviews_seen[0].name == "test-process"
+
+    def test_review_callback_rejected_aborts(self, tmp_path):
+        """When callback returns False, installation is cancelled."""
+        src = _make_package(tmp_path)
+        target = tmp_path / "installed"
+
+        def reject(review: PackageReview) -> bool:
+            return False
+
+        with pytest.raises(InstallError, match="cancelled by user"):
+            install_process(
+                str(src), target_dir=target, skip_deps=True,
+                review_callback=reject,
+            )
+        # Nothing should have been installed
+        assert not (target / "test-process").exists()
+
+    def test_no_callback_proceeds_without_review(self, tmp_path):
+        """When review_callback is None, installation proceeds (for tests)."""
+        src = _make_package(tmp_path)
+        target = tmp_path / "installed"
+        dest = install_process(
+            str(src), target_dir=target, skip_deps=True,
+            review_callback=None,
+        )
+        assert dest.exists()
+
+    def test_review_callback_sees_deps(self, tmp_path):
+        """Callback receives correct dependency information."""
+        src = _make_package(tmp_path, YAML_WITH_DEPS)
+        target = tmp_path / "installed"
+        reviews_seen: list[PackageReview] = []
+
+        def approve(review: PackageReview) -> bool:
+            reviews_seen.append(review)
+            return True
+
+        install_process(
+            str(src), target_dir=target, skip_deps=True,
+            review_callback=approve,
+        )
+        assert reviews_seen[0].dependencies == ["requests>=2.28.0", "pandas>=2.0"]
+
+    def test_review_callback_sees_tools(self, tmp_path):
+        """Callback receives bundled tool file information."""
+        src = _make_package_with_tools(tmp_path)
+        target = tmp_path / "installed"
+        reviews_seen: list[PackageReview] = []
+
+        def approve(review: PackageReview) -> bool:
+            reviews_seen.append(review)
+            return True
+
+        install_process(
+            str(src), target_dir=target, skip_deps=True,
+            review_callback=approve,
+        )
+        assert reviews_seen[0].bundled_tool_files == ["my_tool.py"]
+
+    @patch("loom.processes.installer._install_dependencies")
+    def test_deps_not_installed_before_review(self, mock_deps, tmp_path):
+        """Dependencies must NOT be installed before review approval."""
+        src = _make_package(tmp_path, YAML_WITH_DEPS)
+        target = tmp_path / "installed"
+        call_order: list[str] = []
+
+        def reject(review: PackageReview) -> bool:
+            call_order.append("review")
+            return False
+
+        mock_deps.side_effect = lambda *a, **kw: call_order.append("deps")
+
+        with pytest.raises(InstallError, match="cancelled"):
+            install_process(
+                str(src), target_dir=target,
+                review_callback=reject,
+            )
+        # Review was called, but deps were never touched
+        assert call_order == ["review"]
+        mock_deps.assert_not_called()
 
 
 # ===================================================================
