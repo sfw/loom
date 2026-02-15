@@ -2,19 +2,21 @@
 
 **Local model orchestration engine** -- task decomposition, execution, and verification using local LLMs.
 
-Loom is what you get when you strip Claude Code down to its core ideas and rebuild them for models running on your own hardware. It gives Qwen, DeepSeek, Llama, and any other local model the same agentic workflow that makes Claude Code productive: tool calling, file editing, conversation memory, parallel execution, and verification -- without sending a single token to someone else's server.
+Loom turns local models into working agents. Give Qwen, DeepSeek, Llama, or any other model the scaffolding it needs to actually get things done: tool calling, structured planning, parallel execution, verification, and persistent memory -- without sending a single token to someone else's server.
+
+It handles anything a capable assistant should: writing and editing code, researching topics, analyzing documents, generating reports, running multi-step business workflows, or any task you can define as a process. Ship a consulting engagement, an investment analysis, or a codebase refactor with the same engine.
 
 It also works with Claude and any OpenAI-compatible API, so you can mix local and cloud models in the same task.
 
 ## Why Loom Exists
 
-Cloud-hosted coding agents are good but come with constraints: token costs, rate limits, privacy concerns, and vendor lock-in. Local models are getting capable enough for real work, but they lack the scaffolding that makes cloud agents useful. A 14B model can write correct code, but it can't plan a multi-file refactor, verify its own output, recover from mistakes, or remember what it did three turns ago without help.
+Cloud-hosted agents are good but come with constraints: token costs, rate limits, privacy concerns, and vendor lock-in. Local models are getting capable enough for real work, but they lack the scaffolding that makes cloud agents useful. A 14B model can write correct code, draft a solid analysis, or answer complex questions -- but it can't plan multi-step work, verify its own output, recover from mistakes, or remember what it did three turns ago without help.
 
-Loom is that help. It's the harness that turns a local model into a working agent.
+Loom is that help. It's the harness that turns a local model into a working agent -- for code, research, analysis, or whatever process you define.
 
 ## Two Ways to Work
 
-**Interactive** (`loom`) -- Pair programming in a rich terminal UI. You talk, the model responds and uses tools, you see what it's doing in real time. Like Claude Code, but running against whatever model you want. Streaming text, inline diffs, per-tool-call approval, session persistence, conversation recall, and slash commands for control.
+**Interactive** (`loom`) -- Work with a model in a rich terminal UI. You talk, the model responds and uses tools, you see what it's doing in real time. Streaming text, inline diffs, per-tool-call approval, session persistence, conversation recall, and slash commands for control.
 
 **Autonomous** (`loom run`) -- Give Loom a goal, walk away. It decomposes the work into subtasks with a dependency graph, runs independent subtasks in parallel, verifies each result with an independent model, and replans when things go wrong.
 
@@ -34,19 +36,21 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 ## What Makes It Different
 
-**Built for local model weaknesses.** Cloud models reproduce code strings precisely. Local models don't -- they drift on whitespace, swap tabs for spaces, drop trailing newlines. Loom's edit tool handles this with fuzzy matching: when an exact string match fails, it normalizes whitespace and finds the closest candidate above a similarity threshold. It also rejects ambiguous matches (two similar regions) so it won't silently edit the wrong code. This is the difference between a tool that works with Qwen 14B and one that fails 30% of the time.
+**Built for local model weaknesses.** Cloud models reproduce strings precisely. Local models don't -- they drift on whitespace, swap tabs for spaces, drop trailing newlines. Loom's edit tool handles this with fuzzy matching: when an exact string match fails, it normalizes whitespace and finds the closest candidate above a similarity threshold. It also rejects ambiguous matches (two similar regions) so it won't silently edit the wrong place. This is the difference between a tool that works with Qwen 14B and one that fails 30% of the time.
 
 **Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. Resume any previous session exactly where you left off with `--resume`. No compression pass, no lost details, no extra LLM calls.
 
 **The harness drives, not the model.** The model is a reasoning engine called repeatedly with scoped prompts. The orchestrator decides what happens next: which subtasks to run, when to verify, when to replan, when to escalate. This means a weaker model in a strong harness outperforms a stronger model in a weak one.
 
-**Verification as a separate concern.** The model never checks its own work. An independent verifier (which can be a different, cheaper model) validates results at three tiers: deterministic checks (does the file exist? does the syntax parse?), independent LLM review, and multi-vote consensus for high-stakes changes.
+**Verification as a separate concern.** The model never checks its own work. An independent verifier (which can be a different, cheaper model) validates results at three tiers: deterministic checks (does the output exist? does it meet structural requirements?), independent LLM review, and multi-vote consensus for high-stakes changes.
 
 **Full undo.** Every file write is preceded by a snapshot. You can revert any individual change, all changes from a subtask, or the entire task. The changelog tracks creates, modifies, deletes, and renames with before-state snapshots.
 
 **21 built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move), shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch, web search (DuckDuckGo, no API key), code analysis (tree-sitter), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, and ask_user for mid-execution questions. All tools auto-discovered via `__init_subclass__`.
 
 **Inline diffs.** Every file edit produces a unified diff in the tool result. Diffs render with Rich markup syntax highlighting in the TUI -- green additions, red removals. You always see exactly what changed.
+
+**Process definitions.** YAML-based domain specialization lets you define personas, phase blueprints, verification rules, and tool guidance for any workflow. A process can represent a consulting methodology, an investment analysis framework, a research protocol, or a coding standard -- the engine doesn't care. Loom ships with 5 built-in processes and supports installing more from GitHub.
 
 ## Quick Start
 
@@ -55,16 +59,18 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 uv sync          # or: pip install -e .
 
 # Launch — the setup wizard runs automatically on first start
-loom -w /path/to/project
+loom -w /path/to/workspace
 
 # With a process definition
-loom -w /path/to/project --process consulting-engagement
+loom -w /path/to/workspace --process consulting-engagement
 
 # Resume a previous session
 loom --resume <session-id>
 
 # Autonomous task execution
 loom run "Refactor the auth module to use JWT" --workspace /path/to/project
+loom run "Research competitive landscape for X and produce a briefing" -w /tmp/research
+loom run "Analyze Q3 financials and flag anomalies" -w /tmp/analysis
 
 # Start the API server (for programmatic access)
 loom serve
@@ -103,7 +109,7 @@ Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-gene
 
 ## Process Definitions
 
-YAML-based domain specialization. A process definition injects a persona, phase blueprint, verification rules, and tool guidance without changing engine code. Loom ships with 5 built-in processes (investment analysis, marketing strategy, research report, competitive intel, consulting engagement). You can [create your own](docs/creating-packages.md) or install them from GitHub:
+A process definition injects a persona, phase blueprint, verification rules, and tool guidance without changing engine code. Loom ships with 5 built-in processes: investment analysis, marketing strategy, research report, competitive intelligence, and consulting engagement. You can [create your own](docs/creating-packages.md) or install them from GitHub:
 
 ```bash
 loom processes                              # list available
