@@ -2,7 +2,7 @@
 
 **Local model orchestration engine** -- task decomposition, execution, and verification using local LLMs.
 
-Loom turns local models into working agents. Give Qwen, DeepSeek, Llama, or any other model the scaffolding it needs to actually get things done: tool calling, structured planning, parallel execution, verification, and persistent memory -- without sending a single token to someone else's server.
+Loom turns local models into working agents. Give Kimi, Minimax, GLM, or any other model the scaffolding it needs to actually get things done: tool calling, structured planning, parallel execution, verification, and persistent memory -- without sending a single token to someone else's server.
 
 It handles anything a capable assistant should: writing and editing code, researching topics, analyzing documents (PDFs, Word docs, PowerPoint decks), generating reports, running multi-step business workflows, or any task you can define as a process. Ship a consulting engagement, an investment analysis, or a codebase refactor with the same engine.
 
