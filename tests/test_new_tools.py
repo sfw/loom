@@ -13,10 +13,9 @@ import io
 from pathlib import Path
 
 import pytest
+import yaml
 
 from loom.tools.calculator import CalculatorTool, _safe_eval, cagr, npv, pmt, wacc
-
-import yaml
 from loom.tools.document_write import DocumentWriteTool
 from loom.tools.registry import ToolContext
 from loom.tools.spreadsheet import SpreadsheetTool
