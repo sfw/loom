@@ -1275,3 +1275,77 @@ class TestProcessDefinitionEdgeCases:
         assert phase.is_synthesis is False
         assert phase.acceptance_criteria == ""
         assert phase.deliverables == []
+
+
+class TestToolOverlapValidation:
+    """Tests for tool required/excluded overlap detection."""
+
+    def _load_yaml_str(self, tmp_path, content):
+        """Helper: write YAML and load."""
+        f = tmp_path / "test.yaml"
+        f.write_text(content)
+        loader = ProcessLoader()
+        return loader.load(str(f))
+
+    def test_overlap_raises(self, tmp_path):
+        """Tools in both required and excluded should fail validation."""
+        yaml_content = """\
+name: overlap-test
+version: '1.0'
+tools:
+  required:
+    - read_file
+    - shell_execute
+  excluded:
+    - shell_execute
+    - dangerous_tool
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any(
+            "both required and excluded" in e
+            for e in exc_info.value.errors
+        )
+        assert any("shell_execute" in e for e in exc_info.value.errors)
+
+    def test_no_overlap_passes(self, tmp_path):
+        """Disjoint required/excluded sets should pass validation."""
+        yaml_content = """\
+name: no-overlap
+version: '1.0'
+tools:
+  required:
+    - read_file
+    - write_file
+  excluded:
+    - shell_execute
+"""
+        defn = self._load_yaml_str(tmp_path, yaml_content)
+        assert defn.tools.required == ["read_file", "write_file"]
+        assert defn.tools.excluded == ["shell_execute"]
+
+    def test_only_required_passes(self, tmp_path):
+        """Having only required (no excluded) should pass."""
+        yaml_content = """\
+name: only-required
+version: '1.0'
+tools:
+  required:
+    - read_file
+"""
+        defn = self._load_yaml_str(tmp_path, yaml_content)
+        assert defn.tools.required == ["read_file"]
+        assert defn.tools.excluded == []
+
+    def test_only_excluded_passes(self, tmp_path):
+        """Having only excluded (no required) should pass."""
+        yaml_content = """\
+name: only-excluded
+version: '1.0'
+tools:
+  excluded:
+    - shell_execute
+"""
+        defn = self._load_yaml_str(tmp_path, yaml_content)
+        assert defn.tools.required == []
+        assert defn.tools.excluded == ["shell_execute"]

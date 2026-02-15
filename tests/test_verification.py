@@ -314,3 +314,164 @@ class TestVerificationGates:
         result = await gates.verify(_make_subtask(), "output", [tc], None, tier=2)
         assert not result.passed
         assert result.tier == 1  # Failed at tier 1, never reached tier 2
+
+
+# --- DeterministicVerifier with process definitions ---
+
+
+def _make_process(
+    deliverables: dict[str, list[str]] | None = None,
+    regex_rules: list | None = None,
+):
+    """Build a mock ProcessDefinition for verification tests."""
+    from loom.processes.schema import (
+        PhaseTemplate,
+        ProcessDefinition,
+        VerificationRule,
+    )
+
+    phases = []
+    if deliverables:
+        for phase_id, files in deliverables.items():
+            phases.append(PhaseTemplate(
+                id=phase_id,
+                description=f"Phase {phase_id}",
+                deliverables=[f"{f} — desc" for f in files],
+            ))
+
+    rules = []
+    if regex_rules:
+        for r in regex_rules:
+            rules.append(VerificationRule(**r))
+
+    return ProcessDefinition(
+        name="test-proc",
+        phases=phases,
+        verification_rules=rules,
+    )
+
+
+class TestDeterministicVerifierDeliverables:
+    """Tests for deliverable checking — verifies the flattening fix."""
+
+    @pytest.mark.asyncio
+    async def test_deliverables_found_in_workspace(self, tmp_path):
+        """Deliverables that exist on disk should pass."""
+        (tmp_path / "report.md").write_text("Report content")
+        (tmp_path / "data.csv").write_text("a,b\n1,2")
+
+        process = _make_process(deliverables={
+            "research": ["report.md"],
+            "analysis": ["data.csv"],
+        })
+        v = DeterministicVerifier(process=process)
+        result = await v.verify(_make_subtask(), "output", [], tmp_path)
+        assert result.passed
+
+    @pytest.mark.asyncio
+    async def test_deliverables_found_in_tool_calls(self, tmp_path):
+        """Deliverables reported in tool call files_changed should pass."""
+        process = _make_process(deliverables={
+            "phase1": ["output.txt"],
+        })
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "output.txt"},
+            result=ToolResult.ok("ok", files_changed=["output.txt"]),
+        )
+        v = DeterministicVerifier(process=process)
+        result = await v.verify(_make_subtask(), "output", [tc], tmp_path)
+        assert result.passed
+
+    @pytest.mark.asyncio
+    async def test_deliverables_missing_fails(self, tmp_path):
+        """Missing deliverables should cause verification to fail."""
+        process = _make_process(deliverables={
+            "phase1": ["missing.txt"],
+        })
+        v = DeterministicVerifier(process=process)
+        result = await v.verify(_make_subtask(), "output", [], tmp_path)
+        assert not result.passed
+        failed = [c for c in result.checks if not c.passed]
+        assert any("missing.txt" in (c.detail or "") for c in failed)
+
+    @pytest.mark.asyncio
+    async def test_deliverables_flattened_across_phases(self, tmp_path):
+        """All phases' deliverables are checked, not just the subtask's phase."""
+        (tmp_path / "file_a.md").write_text("content")
+        # file_b.md is NOT created — should fail
+        process = _make_process(deliverables={
+            "phase_a": ["file_a.md"],
+            "phase_b": ["file_b.md"],
+        })
+        v = DeterministicVerifier(process=process)
+        # Use subtask_id that doesn't match any phase_id
+        result = await v.verify(
+            _make_subtask(subtask_id="unrelated-id"),
+            "output", [], tmp_path,
+        )
+        assert not result.passed
+        # file_a.md should pass, file_b.md should fail
+        check_names = {c.name: c.passed for c in result.checks}
+        assert check_names.get("deliverable_file_a.md") is True
+        assert check_names.get("deliverable_file_b.md") is False
+
+
+class TestDeterministicVerifierRegexRules:
+    """Tests for regex rule severity handling."""
+
+    @pytest.mark.asyncio
+    async def test_error_severity_rule_fails_on_match(self):
+        """Error-severity regex rules should fail verification when matched."""
+        process = _make_process(regex_rules=[{
+            "name": "no-tbd",
+            "description": "No TBD markers allowed",
+            "check": "TBD",
+            "severity": "error",
+            "type": "regex",
+            "target": "output",
+        }])
+        v = DeterministicVerifier(process=process)
+        result = await v.verify(
+            _make_subtask(), "This has TBD in it", [], None,
+        )
+        assert not result.passed
+
+    @pytest.mark.asyncio
+    async def test_warning_severity_rule_passes_on_match(self):
+        """Warning-severity regex rules should NOT fail verification when matched."""
+        process = _make_process(regex_rules=[{
+            "name": "no-todo",
+            "description": "TODO comments found",
+            "check": "TODO",
+            "severity": "warning",
+            "type": "regex",
+            "target": "output",
+        }])
+        v = DeterministicVerifier(process=process)
+        result = await v.verify(
+            _make_subtask(), "There is a TODO here", [], None,
+        )
+        # Warning rules record the match but don't fail
+        assert result.passed
+        assert any("no-todo" in c.name for c in result.checks)
+        # Detail should still record that it matched
+        matched_check = [c for c in result.checks if "no-todo" in c.name][0]
+        assert matched_check.detail is not None
+
+    @pytest.mark.asyncio
+    async def test_error_severity_rule_passes_on_no_match(self):
+        """Error-severity regex rules should pass when pattern is NOT found."""
+        process = _make_process(regex_rules=[{
+            "name": "no-tbd",
+            "description": "No TBD markers allowed",
+            "check": "TBD",
+            "severity": "error",
+            "type": "regex",
+            "target": "output",
+        }])
+        v = DeterministicVerifier(process=process)
+        result = await v.verify(
+            _make_subtask(), "Clean output with no markers", [], None,
+        )
+        assert result.passed

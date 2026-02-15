@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 
 from loom.tools.calculator import CalculatorTool, _safe_eval, cagr, npv, pmt, wacc
+
+import yaml
 from loom.tools.document_write import DocumentWriteTool
 from loom.tools.registry import ToolContext
 from loom.tools.spreadsheet import SpreadsheetTool
@@ -1205,3 +1207,114 @@ class TestSpreadsheetFileSizeGuards:
         )
         assert not result.success
         assert "too large" in result.error.lower()
+
+
+# ===================================================================
+# Financial function input validation (Round 2 safety fixes)
+# ===================================================================
+
+
+class TestFinancialFunctionValidation:
+    """Tests for input validation in financial functions."""
+
+    def test_npv_rejects_rate_leq_neg1(self):
+        with pytest.raises(ValueError, match="greater than -1"):
+            npv(-1.0, [100, 200])
+        with pytest.raises(ValueError, match="greater than -1"):
+            npv(-2.0, [100, 200])
+
+    def test_npv_accepts_valid_rate(self):
+        assert npv(0.1, [100, 200]) > 0
+        assert npv(0.0, [100, 200]) == 300.0
+
+    def test_cagr_rejects_negative_ending_value(self):
+        with pytest.raises(ValueError, match="negative"):
+            cagr(100, -50, 5)
+
+    def test_cagr_accepts_zero_ending(self):
+        result = cagr(100, 0, 5)
+        assert result == -1.0
+
+    def test_pmt_rejects_nonpositive_nper(self):
+        with pytest.raises(ValueError, match="positive"):
+            pmt(0.05, 0, 1000)
+        with pytest.raises(ValueError, match="positive"):
+            pmt(0.05, -5, 1000)
+
+    def test_pmt_accepts_valid_nper(self):
+        result = pmt(0.05, 12, 1000)
+        assert isinstance(result, float)
+
+
+# ===================================================================
+# Document metadata YAML safety (Round 2 safety fix)
+# ===================================================================
+
+
+class TestDocumentMetadataYamlSafety:
+    """Test that metadata frontmatter is safely serialized."""
+
+    @pytest.fixture
+    def doc(self):
+        return DocumentWriteTool()
+
+    @pytest.fixture
+    def ctx(self, workspace):
+        return ToolContext(workspace=workspace, subtask_id="s1")
+
+    async def test_metadata_with_colons_is_safe(self, doc, ctx, workspace):
+        """Values with colons should not break YAML structure."""
+        result = await doc.execute(
+            {
+                "path": "doc.md",
+                "title": "Test",
+                "metadata": {"description": "a: b: c"},
+            },
+            ctx,
+        )
+        assert result.success
+        content = (workspace / "doc.md").read_text()
+        parts = content.split("---")
+        assert len(parts) >= 3
+        parsed = yaml.safe_load(parts[1])
+        assert parsed["description"] == "a: b: c"
+
+    async def test_metadata_with_newlines_is_safe(self, doc, ctx, workspace):
+        """Newlines in values should not escape the frontmatter block."""
+        result = await doc.execute(
+            {
+                "path": "doc.md",
+                "title": "Test",
+                "metadata": {"note": "line1\nline2"},
+            },
+            ctx,
+        )
+        assert result.success
+        content = (workspace / "doc.md").read_text()
+        parts = content.split("---")
+        assert len(parts) >= 3
+        parsed = yaml.safe_load(parts[1])
+        assert parsed["note"] == "line1\nline2"
+
+    async def test_section_validation_rejects_missing_body(self, doc, ctx, workspace):
+        """Sections missing required keys should be rejected."""
+        result = await doc.execute(
+            {
+                "path": "doc.md",
+                "sections": [{"heading": "Test"}],
+            },
+            ctx,
+        )
+        assert not result.success
+        assert "body" in result.error.lower()
+
+    async def test_section_validation_rejects_non_dict(self, doc, ctx, workspace):
+        result = await doc.execute(
+            {
+                "path": "doc.md",
+                "sections": ["not a dict"],
+            },
+            ctx,
+        )
+        assert not result.success
+        assert "dict" in result.error.lower()
