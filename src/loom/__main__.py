@@ -49,6 +49,24 @@ def cli(
     delegation.
     """
     ctx.ensure_object(dict)
+
+    # First-run detection: if no config exists and user isn't already
+    # running a subcommand that doesn't need one, trigger setup wizard.
+    if config_path is None and ctx.invoked_subcommand not in ("setup",):
+        from loom.setup import needs_setup
+
+        if needs_setup():
+            click.echo("No configuration found.")
+            if click.confirm("Run first-time setup?", default=True):
+                from loom.setup import run_setup
+
+                run_setup()
+            else:
+                click.echo(
+                    "Create ~/.loom/loom.toml manually, or run `loom setup`.",
+                )
+                sys.exit(0)
+
     ctx.obj["config"] = load_config(config_path)
 
     if ctx.invoked_subcommand is None:
@@ -566,6 +584,19 @@ def reset_learning(ctx: click.Context) -> None:
         click.echo("Learning database cleared.")
 
     asyncio.run(_reset())
+
+
+@cli.command()
+def setup() -> None:
+    """Run the interactive configuration wizard.
+
+    Creates or overwrites ~/.loom/loom.toml with provider settings
+    collected via guided prompts.  Automatically triggered on first
+    run if no configuration file exists.
+    """
+    from loom.setup import run_setup
+
+    run_setup(reconfigure=True)
 
 
 def main() -> None:
