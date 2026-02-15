@@ -11,13 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loom.config import VerificationConfig
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.state.task_state import Subtask
+
+if TYPE_CHECKING:
+    from loom.processes.schema import ProcessDefinition
 
 
 @dataclass
@@ -48,7 +53,15 @@ class DeterministicVerifier:
     - Were expected files created/modified?
     - Are output files non-empty?
     - Is file syntax valid (Python, JSON, YAML)?
+    - Process regex rules (if a process definition is loaded)
+    - Process deliverables (if phases define expected deliverables)
     """
+
+    def __init__(
+        self,
+        process: ProcessDefinition | None = None,
+    ):
+        self._process = process
 
     async def verify(
         self,
@@ -88,6 +101,56 @@ class DeterministicVerifier:
                         syntax_check = await self._check_syntax(fpath)
                         if syntax_check:
                             checks.append(syntax_check)
+
+        # 4. Process regex rules
+        if self._process:
+            for rule in self._process.regex_rules():
+                target_text = result_summary
+                if rule.target == "deliverables" and workspace:
+                    # Check against deliverable file contents
+                    target_text = self._read_deliverable_text(
+                        workspace, tool_calls,
+                    )
+                try:
+                    found = bool(re.search(rule.check, target_text))
+                except re.error:
+                    found = False
+                # For regex rules, a match means the pattern was found.
+                # If severity is "error", finding the pattern = failure
+                # (e.g., finding [TBD] is bad).
+                # Convention: the check description says what to look for
+                # as a violation, so finding it = failure.
+                passed = not found
+                checks.append(Check(
+                    name=f"process_rule_{rule.name}",
+                    passed=passed if rule.severity == "error" else True,
+                    detail=(
+                        f"Rule '{rule.name}' matched: {rule.description}"
+                        if found else None
+                    ),
+                ))
+
+            # 5. Process deliverables check
+            deliverables = self._process.get_deliverables()
+            if deliverables and workspace:
+                phase_deliverables = deliverables.get(subtask.id, [])
+                files_created = set()
+                for tc in tool_calls:
+                    files_created.update(tc.result.files_changed)
+                for expected in phase_deliverables:
+                    found_file = (
+                        expected in files_created
+                        or (workspace / expected).exists()
+                    )
+                    checks.append(Check(
+                        name=f"deliverable_{expected}",
+                        passed=found_file,
+                        detail=(
+                            f"Expected deliverable '{expected}' "
+                            f"not found"
+                            if not found_file else None
+                        ),
+                    ))
 
         all_passed = all(c.passed for c in checks) if checks else True
         return VerificationResult(
@@ -137,6 +200,24 @@ class DeterministicVerifier:
                 )
 
         return None
+
+    @staticmethod
+    def _read_deliverable_text(
+        workspace: Path, tool_calls: list,
+    ) -> str:
+        """Read text content from all deliverable files."""
+        texts = []
+        for tc in tool_calls:
+            for f in tc.result.files_changed:
+                fpath = workspace / f
+                if fpath.exists() and fpath.stat().st_size < 1024 * 1024:
+                    try:
+                        texts.append(
+                            fpath.read_text(encoding="utf-8", errors="replace"),
+                        )
+                    except Exception:
+                        pass
+        return "\n".join(texts)
 
     @staticmethod
     def _build_feedback(checks: list[Check]) -> str:
@@ -276,10 +357,11 @@ class VerificationGates:
         model_router: ModelRouter,
         prompt_assembler: PromptAssembler,
         config: VerificationConfig,
+        process: ProcessDefinition | None = None,
     ):
         self._config = config
         validator = ResponseValidator()
-        self._tier1 = DeterministicVerifier()
+        self._tier1 = DeterministicVerifier(process=process)
         self._tier2 = LLMVerifier(model_router, prompt_assembler, validator)
         self._tier3 = VotingVerifier(self._tier2, config.tier3_vote_count)
 

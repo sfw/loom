@@ -77,6 +77,14 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class ProcessConfig:
+    """Configuration for the process definition system."""
+
+    default: str = ""  # Default process name (empty = no process)
+    search_paths: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class Config:
     """Top-level Loom configuration."""
 
@@ -87,6 +95,7 @@ class Config:
     verification: VerificationConfig = field(default_factory=VerificationConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    process: ProcessConfig = field(default_factory=ProcessConfig)
 
     @property
     def database_path(self) -> Path:
@@ -191,6 +200,12 @@ def load_config(path: Path | None = None) -> Config:
         event_log_path=log_data.get("event_log_path", "~/.loom/logs"),
     )
 
+    proc_data = raw.get("process", {})
+    process = ProcessConfig(
+        default=proc_data.get("default", ""),
+        search_paths=proc_data.get("search_paths", []),
+    )
+
     return Config(
         server=server,
         models=models,
@@ -199,4 +214,5 @@ def load_config(path: Path | None = None) -> Config:
         verification=verification,
         memory=memory,
         logging=logging_cfg,
+        process=process,
     )

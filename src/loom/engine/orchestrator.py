@@ -72,6 +72,10 @@ class Orchestrator:
     - Event emission and state persistence
     - Post-task learning
 
+    When a process definition is provided, domain intelligence is injected
+    into all prompts (persona, phases, tool guidance, verification rules,
+    memory guidance) without changing the engine's control flow.
+
     Subtask execution (tool loop, verification, memory extraction)
     is delegated to SubtaskRunner.
     """
@@ -87,6 +91,7 @@ class Orchestrator:
         config: Config,
         approval_manager: ApprovalManager | None = None,
         learning_manager: LearningManager | None = None,
+        process: object | None = None,
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -96,12 +101,14 @@ class Orchestrator:
         self._events = event_bus
         self._config = config
         self._learning = learning_manager
+        self._process = process
         self._scheduler = Scheduler()
         self._validator = ResponseValidator()
         self._verification = VerificationGates(
             model_router=model_router,
             prompt_assembler=prompt_assembler,
             config=config.verification,
+            process=process,
         )
         self._confidence = ConfidenceScorer()
         self._approval = approval_manager or ApprovalManager(event_bus)
@@ -109,6 +116,16 @@ class Orchestrator:
             max_retries=config.execution.max_subtask_retries,
         )
         self._state_lock = asyncio.Lock()
+
+        # Inject process into prompt assembler
+        if process is not None:
+            self._prompts.process = process
+
+        # Apply tool exclusions from process definition
+        if process and process.tools.excluded:
+            for tool_name in process.tools.excluded:
+                if tool_name in self._tools._tools:
+                    del self._tools._tools[tool_name]
 
         # Runner handles the inner subtask execution
         self._runner = SubtaskRunner(
@@ -425,22 +442,31 @@ class Orchestrator:
         """Invoke the planner model to decompose the task into subtasks."""
         workspace_listing = ""
         code_analysis = ""
+        workspace_analysis = ""
         if task.workspace:
             workspace_path = Path(task.workspace)
             if workspace_path.exists():
                 listing_result = await self._tools.execute(
-                    "list_directory", {}, workspace=workspace_path
+                    "list_directory", {}, workspace=workspace_path,
                 )
                 if listing_result.success:
                     workspace_listing = listing_result.output
 
-                # Auto-analyze code structure for better planning
-                code_analysis = await self._analyze_workspace(workspace_path)
+                # Workspace analysis: process-aware or code-focused
+                if self._process and self._process.workspace_scan:
+                    workspace_analysis = await self._analyze_workspace_for_process(
+                        workspace_path,
+                    )
+                else:
+                    code_analysis = await self._analyze_workspace(
+                        workspace_path,
+                    )
 
         prompt = self._prompts.build_planner_prompt(
             task=task,
             workspace_listing=workspace_listing,
             code_analysis=code_analysis,
+            workspace_analysis=workspace_analysis,
         )
 
         model = self._router.select(tier=2, role="planner")
@@ -462,6 +488,42 @@ class Orchestrator:
                 return ""
             summaries = [s.to_summary() for s in structures]
             return "\n\n".join(summaries)
+        except Exception:
+            return ""
+
+    async def _analyze_workspace_for_process(
+        self, workspace_path: Path,
+    ) -> str:
+        """Analyze workspace using process-specific scan guidance.
+
+        Instead of code analysis, scans for file types specified
+        in the process definition's workspace_analysis.scan_for.
+        """
+        try:
+            found_files: dict[str, list[str]] = {}
+            for pattern in self._process.workspace_scan:  # type: ignore[union-attr]
+                # Pattern format: "*.md — description"
+                glob_pattern = pattern.split("—")[0].split(" — ")[0].strip()
+                # Handle comma-separated patterns like "*.csv, *.xlsx"
+                for sub_pattern in glob_pattern.split(","):
+                    sub_pattern = sub_pattern.strip()
+                    if sub_pattern:
+                        matches = list(workspace_path.glob(sub_pattern))
+                        if matches:
+                            found_files[sub_pattern] = [
+                                str(m.relative_to(workspace_path))
+                                for m in matches[:20]
+                            ]
+
+            if not found_files:
+                return "No relevant existing files found in workspace."
+
+            lines = ["Existing workspace files:"]
+            for pattern, files in found_files.items():
+                lines.append(f"\n{pattern}:")
+                for f in files:
+                    lines.append(f"  - {f}")
+            return "\n".join(lines)
         except Exception:
             return ""
 

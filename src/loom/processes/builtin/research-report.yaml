@@ -1,0 +1,142 @@
+name: research-report
+version: "1.0"
+description: >
+  General-purpose research workflow for investigating a question, gathering
+  evidence, synthesizing findings, and producing a structured report.
+  Suitable for market research, policy analysis, or technology assessments.
+author: "Loom Team"
+tags: [research, analysis, writing, report, evidence-based]
+
+persona: |
+  You are a methodical researcher who values evidence over opinion. Frame
+  clear questions before gathering data, distinguish primary from secondary
+  sources, and flag confidence levels on all claims. Write in clear, direct
+  prose and avoid jargon unless the audience requires it.
+
+phase_mode: guided
+
+tool_guidance: |
+  Use Markdown for narrative. Cite sources inline using [Author, Year] or
+  [Source Name] and collect full references at the end. Use tables for
+  comparisons. When evidence conflicts, present both sides.
+
+phases:
+  - id: frame-question
+    description: >
+      Define the research question, sub-questions, scope boundaries, key
+      term definitions, and intended audience.
+    depends_on: []
+    model_tier: 2
+    verification_tier: 1
+    acceptance_criteria: >
+      Primary question stated. 3+ sub-questions identified. Scope explicit
+      (time, geography, industry). Key terms defined. Audience named.
+    deliverables:
+      - "research-brief.md — question framework, scope, and definitions"
+  - id: gather-evidence
+    description: >
+      Collect evidence organized by sub-question. Rate each source on
+      credibility and relevance. Identify evidence gaps.
+    depends_on: [frame-question]
+    model_tier: 2
+    verification_tier: 1
+    acceptance_criteria: >
+      3+ sources per sub-question. Each rated for credibility (high/med/low).
+      Evidence organized by sub-question with attributions. Gaps noted.
+    deliverables:
+      - "evidence-log.csv — sources, credibility ratings, key findings"
+      - "evidence-notes.md — detailed notes by sub-question"
+  - id: synthesize-findings
+    description: >
+      Analyze evidence to answer each sub-question. Identify patterns,
+      contradictions, and confidence levels. Form cohesive primary answer.
+    depends_on: [gather-evidence]
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      Each sub-question answered with confidence level. Contradictions
+      acknowledged and reconciled. Primary question clearly answered.
+    deliverables:
+      - "synthesis.md — findings by sub-question with confidence levels"
+  - id: write-report
+    description: >
+      Produce final report with executive summary, methodology, findings,
+      conclusions, recommendations, and references.
+    depends_on: [synthesize-findings]
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      Executive summary under 300 words. Methodology section present.
+      Findings by sub-question. Conclusions answer primary question.
+      Actionable recommendations. Full references section.
+    deliverables:
+      - "research-report.md — final report with all sections"
+      - "references.csv — structured reference list with URLs"
+
+verification:
+  rules:
+    - name: citations-present
+      description: "All factual claims must have inline citations"
+      check: >
+        Scan for factual claims (statistics, dates, quotes). Each must
+        have an inline citation mapping to the references section. Flag
+        any unsupported claims.
+      severity: warning
+      type: llm
+    - name: no-placeholders
+      description: "No placeholder text in deliverables"
+      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
+      severity: error
+      type: regex
+
+memory:
+  extract_types:
+    - type: evidence_finding
+      description: "Specific fact or data point with source and credibility"
+    - type: research_gap
+      description: "Area where evidence is insufficient or conflicting"
+    - type: synthesis_conclusion
+      description: "Synthesized answer to a sub-question with confidence"
+  extraction_guidance: |
+    Prioritize findings that answer the question or change direction.
+    Always include source attribution. For gaps, note what evidence
+    would resolve them.
+
+workspace_analysis:
+  scan_for:
+    - "*.md — existing research notes or prior reports"
+    - "*.csv — data files with relevant evidence"
+    - "*.txt — raw notes or interview transcripts"
+  guidance: |
+    Reuse validated findings from prior research. Look for data files
+    that provide primary evidence.
+
+planner_examples:
+  - goal: "Research solid-state battery outlook for electric vehicles"
+    subtasks:
+      - id: frame-question
+        description: "Scope: solid-state vs lithium-ion for EVs — energy density, cost, manufacturability, timeline"
+        depends_on: []
+        model_tier: 2
+      - id: gather-evidence
+        description: "Collect from industry reports, patents, company announcements (Toyota, QuantumScape, Solid Power)"
+        depends_on: [frame-question]
+        model_tier: 2
+      - id: synthesize-findings
+        description: "Compare approaches (sulfide, oxide, polymer), assess timelines, identify likely path to mass production"
+        depends_on: [gather-evidence]
+        model_tier: 3
+      - id: write-report
+        description: "Report with tech comparison table, timeline estimates, key players, investment implications"
+        depends_on: [synthesize-findings]
+        model_tier: 3
+
+replanning:
+  triggers: |
+    - Research question is too broad to answer meaningfully
+    - Critical sub-question has no available evidence
+    - Early findings suggest the question should be reframed
+  guidance: |
+    If too broad, narrow scope and restart evidence gathering. If evidence
+    is unavailable, note as limitation and adjust conclusions rather than
+    speculating.

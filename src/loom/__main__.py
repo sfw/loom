@@ -102,8 +102,15 @@ def tui(ctx: click.Context, workspace: Path | None, model: str | None) -> None:
 @click.argument("goal")
 @click.option("--workspace", type=click.Path(exists=True, path_type=Path), default=None)
 @click.option("--server", "server_url", default=None, help="Server URL.")
+@click.option(
+    "--process", "process_name", default=None,
+    help="Process definition name or path.",
+)
 @click.pass_context
-def run(ctx: click.Context, goal: str, workspace: Path | None, server_url: str | None) -> None:
+def run(
+    ctx: click.Context, goal: str, workspace: Path | None,
+    server_url: str | None, process_name: str | None,
+) -> None:
     """Submit a task and stream progress inline."""
     config = ctx.obj["config"]
     url = server_url or f"http://{config.server.host}:{config.server.port}"
@@ -279,12 +286,17 @@ def mcp_serve(ctx: click.Context, server_url: str | None) -> None:
 )
 @click.option("--model", "-m", default=None, help="Model name from config to use.")
 @click.option("--resume", "resume_session", default=None, help="Resume a previous session by ID.")
+@click.option(
+    "--process", "process_name", default=None,
+    help="Process definition name or path.",
+)
 @click.pass_context
 def cowork(
     ctx: click.Context,
     workspace: Path | None,
     model: str | None,
     resume_session: str | None,
+    process_name: str | None,
 ) -> None:
     """Start an interactive cowork session.
 
@@ -676,6 +688,46 @@ async def _cowork_session(
             continue
         except Exception as e:
             display_error(str(e))
+
+
+@cli.command()
+@click.option(
+    "--workspace", "-w",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Workspace to search for local process definitions.",
+)
+@click.pass_context
+def processes(ctx: click.Context, workspace: Path | None) -> None:
+    """List available process definitions."""
+    from loom.processes.schema import ProcessLoader
+
+    config = ctx.obj["config"]
+    ws = (workspace or Path.cwd()).resolve()
+    extra = [Path(p) for p in config.process.search_paths]
+    loader = ProcessLoader(workspace=ws, extra_search_paths=extra)
+    available = loader.list_available()
+
+    if not available:
+        click.echo("No process definitions found.")
+        click.echo("  Built-in: src/loom/processes/builtin/")
+        click.echo("  User:     ~/.loom/processes/")
+        click.echo("  Local:    ./loom-processes/")
+        return
+
+    click.echo("Available processes:\n")
+    for proc in available:
+        name = proc["name"]
+        ver = proc["version"]
+        desc = proc.get("description", "")
+        # Truncate description to one line
+        if desc:
+            desc = desc.strip().split("\n")[0][:60]
+        click.echo(f"  {name:30s} v{ver:6s} {desc}")
+    click.echo(
+        f"\n{len(available)} process(es) found. "
+        f"Use --process <name> with 'run' or 'cowork'.",
+    )
 
 
 @cli.command(name="reset-learning")

@@ -23,7 +23,19 @@ instructions: |
   CODE STRUCTURE ANALYSIS:
   {code_analysis}
 
-  Decompose this goal into subtasks. Respond with ONLY a JSON object:
+  WORKSPACE ANALYSIS:
+  {workspace_analysis}
+
+  RECOMMENDED PHASE STRUCTURE:
+  {phase_blueprint}
+
+  {planner_examples}
+
+  Decompose this goal into subtasks. You may use the recommended phase
+  structure as a starting point, adapting it to the specific goal. Add,
+  remove, or modify phases as needed based on the phase mode specified.
+
+  Respond with ONLY a JSON object:
   {{
     "subtasks": [
       {{

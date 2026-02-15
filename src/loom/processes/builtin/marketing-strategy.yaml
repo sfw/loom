@@ -1,0 +1,154 @@
+name: marketing-strategy
+version: "1.0"
+description: >
+  Full marketing strategy from research through campaign planning. Covers
+  sizing, competitive landscape, segmentation, positioning, channels, and
+  campaign design. For launches, market entry, or strategy refreshes.
+author: "Loom Team"
+tags: [marketing, strategy, research, go-to-market, campaigns]
+
+persona: |
+  You are a senior marketing strategist. You think in addressable markets,
+  jobs-to-be-done, and defensible positioning. Back recommendations with data
+  or stated assumptions. Be specific — named competitors, quantified segments.
+
+phase_mode: guided
+
+tool_guidance: |
+  Use CSV for sortable data, Markdown for narrative. Cite sources inline.
+
+phases:
+  - id: market-sizing
+    description: "Estimate TAM/SAM/SOM. Identify growth drivers and market maturity."
+    depends_on: []
+    model_tier: 2
+    verification_tier: 2
+    acceptance_criteria: >
+      TAM/SAM/SOM with units and methodology. Two triangulation approaches.
+      Growth rate and time horizon specified.
+    deliverables:
+      - "market-sizing.md — TAM/SAM/SOM analysis with methodology"
+      - "market-data.csv — supporting data points with sources"
+  - id: competitive-analysis
+    description: >
+      Map competitive landscape: direct, indirect, and emerging competitors.
+    depends_on: []
+    model_tier: 2
+    verification_tier: 2
+    acceptance_criteria: >
+      5+ competitors profiled with product, pricing, share, strengths,
+      weaknesses. Positioning map with two labeled axes.
+    deliverables:
+      - "competitive-landscape.md — profiles and positioning map"
+      - "competitor-matrix.csv — feature comparison grid"
+  - id: customer-segmentation
+    description: >
+      Define segments using behavioral and needs-based criteria. Size and prioritize.
+    depends_on: [market-sizing]
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      Segments are MECE. Each has name, size, key needs, willingness to pay,
+      acquisition difficulty, and priority rank.
+    deliverables:
+      - "customer-segments.md — segment definitions and prioritization"
+      - "segment-profiles.csv — segment attributes and sizing"
+  - id: positioning
+    description: >
+      Synthesize into positioning statement, value prop, and messaging pillars.
+    depends_on: [market-sizing, competitive-analysis, customer-segmentation]
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      Positioning follows: For [target], [brand] is the [category] that
+      [benefit] because [reason to believe]. Pillars tied to customer needs.
+    deliverables:
+      - "positioning.md — positioning statement and messaging framework"
+  - id: channel-strategy
+    description: >
+      Evaluate channels by reach, cost, and competitive intensity.
+    depends_on: [positioning]
+    model_tier: 2
+    verification_tier: 1
+    acceptance_criteria: >
+      At least 6 channels evaluated with CAC, reach, and suitability score.
+      Top 3 recommended with rationale.
+    deliverables:
+      - "channel-strategy.md — channel evaluation and recommendations"
+      - "channel-economics.csv — CAC and reach estimates per channel"
+  - id: campaign-plan
+    description: >
+      Design 90-day campaign with tactics, budget, KPIs, and weekly timeline.
+    depends_on: [channel-strategy]
+    model_tier: 2
+    verification_tier: 1
+    acceptance_criteria: >
+      90-day plan with weekly milestones. Budget allocated by channel.
+      Each tactic has owner role, KPI target, and creative brief summary.
+    deliverables:
+      - "campaign-plan.md — 90-day campaign plan with timeline"
+      - "budget-allocation.csv — channel budget breakdown"
+
+verification:
+  rules:
+    - name: sources-cited
+      description: "All quantitative claims must reference a source"
+      check: >
+        Review every numerical claim. Each must cite a named source.
+        Flag any orphaned numbers.
+      severity: warning
+      type: llm
+    - name: no-placeholders
+      description: "No placeholder text in deliverables"
+      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
+      severity: error
+      type: regex
+    - name: segments-mece
+      description: "Customer segments must be MECE"
+      check: >
+        Verify no customer belongs to two segments and segments cover
+        the full addressable market without gaps.
+      severity: warning
+      type: llm
+
+memory:
+  extract_types:
+    - type: market_insight
+      description: "Quantified market fact — size, growth rate, or trend"
+    - type: competitor_move
+      description: "Competitor action — launch, pivot, pricing change, acquisition"
+    - type: audience_preference
+      description: "Validated customer need, behavior, or willingness-to-pay signal"
+    - type: strategic_decision
+      description: "Key positioning or channel choice with reasoning"
+  extraction_guidance: |
+    Prioritize decision-changing insights. Include source and quantification.
+    Tag competitor moves with competitor name, preferences with segment name.
+
+workspace_analysis:
+  scan_for:
+    - "*.csv — market data, customer lists, or survey results"
+    - "*.md — prior strategy documents or briefs"
+  guidance: |
+    Reference existing research rather than duplicating. Use customer data
+    to ground segmentation in reality.
+
+planner_examples:
+  - goal: "GTM strategy for B2B SaaS analytics platform entering mid-market"
+    subtasks:
+      - { id: market-sizing, description: "TAM/SAM/SOM via industry reports and bottom-up modeling", depends_on: [], model_tier: 2 }
+      - { id: competitive-analysis, description: "Profile Tableau, Looker, Power BI, Metabase on ease-of-use vs enterprise axes", depends_on: [], model_tier: 2 }
+      - { id: customer-segmentation, description: "Segment by data maturity and use case", depends_on: [market-sizing], model_tier: 3 }
+      - { id: positioning, description: "Position in gap between enterprise complexity and SMB limitations", depends_on: [market-sizing, competitive-analysis, customer-segmentation], model_tier: 3 }
+      - { id: channel-strategy, description: "Evaluate content, PLG, outbound, partnerships — estimate CAC", depends_on: [positioning], model_tier: 2 }
+      - { id: campaign-plan, description: "90-day launch: trial funnel, 3 content pillars, SDR sequence", depends_on: [channel-strategy], model_tier: 2 }
+
+replanning:
+  triggers: |
+    - Addressable market is smaller than expected
+    - Dominant competitor changes the positioning thesis
+    - Segmentation suggests a different primary segment than assumed
+    - Channel economics are unfavorable for planned motion
+  guidance: |
+    If market is too small, broaden the category or pivot to adjacent segment.
+    If competitor invalidates positioning, loop back to competitive analysis.

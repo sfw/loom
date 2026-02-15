@@ -97,9 +97,18 @@ class TestConversationStore:
     async def test_search_tool_calls(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")
 
-        await store.append_turn(sid, 1, "tool", "file content", tool_name="read_file", tool_call_id="c1")
-        await store.append_turn(sid, 2, "tool", "success", tool_name="write_file", tool_call_id="c2")
-        await store.append_turn(sid, 3, "tool", "more content", tool_name="read_file", tool_call_id="c3")
+        await store.append_turn(
+            sid, 1, "tool", "file content",
+            tool_name="read_file", tool_call_id="c1",
+        )
+        await store.append_turn(
+            sid, 2, "tool", "success",
+            tool_name="write_file", tool_call_id="c2",
+        )
+        await store.append_turn(
+            sid, 3, "tool", "more content",
+            tool_name="read_file", tool_call_id="c3",
+        )
 
         results = await store.search_tool_calls(sid, "read_file")
         assert len(results) == 2
@@ -156,7 +165,8 @@ class TestConversationStore:
     async def test_tool_calls_persisted(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")
 
-        tc = [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]
+        tc = [{"id": "c1", "type": "function",
+              "function": {"name": "read_file", "arguments": "{}"}}]
         await store.append_turn(sid, 1, "assistant", "Reading...", tool_calls=tc)
 
         turns = await store.get_turns(sid)

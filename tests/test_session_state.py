@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import yaml
 
+from loom.cowork.session import ToolCallEvent
 from loom.cowork.session_state import (
-    FileTouch,
     SessionState,
     extract_state_from_tool_events,
 )
-from loom.cowork.session import ToolCallEvent
 from loom.tools.registry import ToolResult
 
 

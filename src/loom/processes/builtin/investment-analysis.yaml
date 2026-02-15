@@ -1,0 +1,151 @@
+name: investment-analysis
+version: "1.0"
+description: >
+  Structured financial analysis for evaluating public equities or private
+  companies. Covers screening, fundamentals, valuation, risk assessment,
+  and investment memo generation. Buy-side research quality output.
+author: "Loom Team"
+tags: [finance, investing, valuation, equities, due-diligence]
+
+persona: |
+  You are a senior equity research analyst. Think in unit economics, moats,
+  and normalized earnings power. Cross-check management claims against
+  financials. Distinguish facts from estimates. Never present a valuation
+  without a sensitivity range.
+
+phase_mode: strict
+
+tool_guidance: |
+  Use CSV for financial data and model outputs. Use Markdown for narrative.
+  Always state fiscal year, currency, and whether figures are reported or
+  adjusted. Prefer trailing twelve months (TTM) and note the date.
+
+phases:
+  - id: company-screening
+    description: >
+      Establish the thesis to test. Gather business model, revenue segments,
+      geographic mix, management tenure, share structure, and recent events.
+    depends_on: []
+    model_tier: 2
+    verification_tier: 1
+    acceptance_criteria: >
+      Covers business description, revenue by segment and geography, key
+      management, share count, insider ownership, and one-sentence thesis.
+    deliverables:
+      - "company-overview.md — business description and thesis"
+      - "revenue-segments.csv — revenue by segment and geography"
+  - id: financial-analysis
+    description: >
+      Analyze 3-5 years of historicals. Compute growth, margins, ROIC, FCF
+      conversion, and leverage. Identify trends and red flags.
+    depends_on: [company-screening]
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      Income statement, balance sheet, and cash flow for 3+ years. Key
+      ratios calculated and trended. Accounting adjustments noted.
+    deliverables:
+      - "financial-summary.csv — 3-5 year historical financials"
+      - "ratio-analysis.md — key ratios, trends, and commentary"
+  - id: valuation-model
+    description: >
+      Build DCF with explicit assumptions. Cross-check with comparable
+      multiples (EV/EBITDA, P/E, EV/Revenue). Provide bear/base/bull range.
+    depends_on: [financial-analysis]
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      DCF with 5-year forecast plus terminal value. Terminal value under
+      65% of EV (or justified). WACC stated. 3+ public comparables used.
+    deliverables:
+      - "dcf-model.csv — DCF with assumptions and sensitivity table"
+      - "comparable-multiples.csv — peer trading multiples"
+      - "valuation-summary.md — methodology, range, and key drivers"
+  - id: risk-assessment
+    description: >
+      Identify and rank material risks across business, competitive,
+      regulatory, financial, and macro categories with impact estimates.
+    depends_on: [valuation-model]
+    model_tier: 2
+    verification_tier: 2
+    acceptance_criteria: >
+      8+ risks identified. Each has likelihood (low/med/high), valuation
+      impact in percentage terms, and a mitigant or monitoring signal.
+    deliverables:
+      - "risk-matrix.md — categorized risks with likelihood and impact"
+      - "risk-register.csv — structured risk data"
+  - id: investment-memo
+    description: >
+      Synthesize into a concise memo with recommendation, target price
+      range, catalysts, and monitoring triggers.
+    depends_on: [risk-assessment]
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      Under 2000 words. Includes executive summary, thesis, valuation range,
+      top 3 risks, catalysts with timing, and position sizing guidance.
+    deliverables:
+      - "investment-memo.md — final recommendation with analysis"
+
+verification:
+  rules:
+    - name: financial-linkage
+      description: "Financial statements must be internally consistent"
+      check: >
+        Verify net income ties to retained earnings change. Verify
+        depreciation in cash flow matches accumulated depreciation change.
+      severity: error
+      type: llm
+    - name: terminal-value-check
+      description: "Terminal value should not dominate the DCF"
+      check: >
+        If terminal value exceeds 65% of enterprise value, flag it and
+        check whether terminal growth rate exceeds long-run GDP growth.
+      severity: warning
+      type: llm
+    - name: no-placeholders
+      description: "No placeholder text in deliverables"
+      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
+      severity: error
+      type: regex
+
+memory:
+  extract_types:
+    - type: financial_metric
+      description: "Key financial data point with year and source"
+    - type: valuation_assumption
+      description: "Model assumption — discount rate, growth, margin target"
+    - type: risk_factor
+      description: "Identified risk with likelihood and estimated value impact"
+    - type: market_condition
+      description: "Macro or sector condition affecting the thesis"
+  extraction_guidance: |
+    Tag metrics with fiscal year. Tag assumptions with bear/base/bull case.
+    Tag risks with category. Prioritize facts that change the recommendation.
+
+workspace_analysis:
+  scan_for:
+    - "*.csv — financial data, price history, or peer comparisons"
+    - "*.md — prior research notes or analyst reports"
+  guidance: |
+    Use existing financial data as starting point. Check for models with
+    assumptions worth reviewing or updating.
+
+planner_examples:
+  - goal: "Analyze whether Cloudflare (NET) is compelling at current prices"
+    subtasks:
+      - { id: company-screening, description: "Profile CDN/security/edge segments, revenue mix, retention rates", depends_on: [], model_tier: 2 }
+      - { id: financial-analysis, description: "FY2021-2025: growth durability, margin expansion, profitability path", depends_on: [company-screening], model_tier: 3 }
+      - { id: valuation-model, description: "5-year DCF, 25% op margin target, cross-check vs Datadog/Zscaler", depends_on: [financial-analysis], model_tier: 3 }
+      - { id: risk-assessment, description: "AWS/GCP bundling, concentration, SBC dilution, macro sensitivity", depends_on: [valuation-model], model_tier: 2 }
+      - { id: investment-memo, description: "Buy/hold/avoid with 12-month target and key catalysts", depends_on: [risk-assessment], model_tier: 3 }
+
+replanning:
+  triggers: |
+    - Company is pre-revenue or has unusual accounting making DCF inappropriate
+    - Major corporate event (acquisition, restructuring) changes the thesis
+    - Thesis-breaking risk discovered in assessment phase
+  guidance: |
+    For pre-revenue, substitute DCF with scenario-based valuation using
+    revenue milestones. If thesis breaks, fast-track to memo with avoid
+    recommendation rather than completing remaining phases.

@@ -31,14 +31,20 @@ async def populated_store(store: ConversationStore) -> tuple[ConversationStore, 
 
     await store.append_turn(sid, 1, "user", "Let's add JWT authentication")
     await store.append_turn(sid, 2, "assistant", "I'll implement JWT support using PyJWT")
-    await store.append_turn(sid, 3, "tool", "file content here", tool_name="read_file", tool_call_id="c1")
+    await store.append_turn(
+        sid, 3, "tool", "file content here",
+        tool_name="read_file", tool_call_id="c1",
+    )
     await store.append_turn(sid, 4, "assistant", "I see the current auth module uses basic tokens")
     await store.append_turn(sid, 5, "user", "Use RS256 algorithm")
     await store.append_turn(sid, 6, "assistant", "Updating to RS256 algorithm")
     await store.append_turn(sid, 7, "tool", "success", tool_name="edit_file", tool_call_id="c2")
     await store.append_turn(sid, 8, "assistant", "Done! The auth module now uses RS256")
     await store.append_turn(sid, 9, "user", "Now fix the database migration")
-    await store.append_turn(sid, 10, "tool", "migration output", tool_name="shell_execute", tool_call_id="c3")
+    await store.append_turn(
+        sid, 10, "tool", "migration output",
+        tool_name="shell_execute", tool_call_id="c3",
+    )
 
     return store, sid
 
@@ -172,9 +178,9 @@ class TestRecallHint:
 
     def test_hint_triggered(self):
         from loom.cowork.session import CoworkSession
-        from tests.test_cowork import MockProvider
         from loom.models.base import ModelResponse, TokenUsage
         from loom.tools import create_default_registry
+        from tests.test_cowork import MockProvider
 
         provider = MockProvider([ModelResponse(text="ok", usage=TokenUsage())])
         session = CoworkSession(
@@ -189,9 +195,9 @@ class TestRecallHint:
 
     def test_hint_not_triggered(self):
         from loom.cowork.session import CoworkSession
-        from tests.test_cowork import MockProvider
         from loom.models.base import ModelResponse, TokenUsage
         from loom.tools import create_default_registry
+        from tests.test_cowork import MockProvider
 
         provider = MockProvider([ModelResponse(text="ok", usage=TokenUsage())])
         session = CoworkSession(
