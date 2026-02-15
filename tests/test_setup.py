@@ -273,3 +273,117 @@ class TestRolePresets:
     def test_primary_and_utility_cover_all(self):
         combined = set(ROLE_PRESETS["primary"]) | set(ROLE_PRESETS["utility"])
         assert combined == set(ROLE_PRESETS["all"])
+
+
+class TestSetupScreen:
+    """Test the TUI setup wizard screen."""
+
+    def test_init(self):
+        from loom.tui.screens.setup import SetupScreen
+        screen = SetupScreen()
+        assert screen._provider_key == ""
+        assert screen._models == []
+        assert screen._adding_utility is False
+
+    def test_save_writes_config(self, tmp_path: Path, monkeypatch):
+        """_save_and_dismiss writes config and creates dirs."""
+        from loom.tui.screens import setup as setup_mod
+
+        cfg_dir = tmp_path / ".loom"
+        cfg_path = cfg_dir / "loom.toml"
+        monkeypatch.setattr(setup_mod, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(setup_mod, "CONFIG_PATH", cfg_path)
+
+        screen = setup_mod.SetupScreen()
+        screen._models = [{
+            "name": "primary",
+            "provider": "ollama",
+            "base_url": "http://localhost:11434",
+            "model": "qwen3:14b",
+            "api_key": "",
+            "roles": ["planner", "executor", "extractor", "verifier"],
+            "max_tokens": 4096,
+            "temperature": 0.1,
+        }]
+
+        # Stub dismiss to capture result
+        dismissed = []
+        screen.dismiss = lambda val: dismissed.append(val)
+
+        screen._save_and_dismiss()
+
+        assert cfg_path.exists()
+        assert len(dismissed) == 1
+        assert dismissed[0] == screen._models
+        assert (cfg_dir / "scratch").is_dir()
+        assert (cfg_dir / "logs").is_dir()
+        assert (cfg_dir / "processes").is_dir()
+
+        # Verify generated TOML is valid
+        import tomllib
+        parsed = tomllib.loads(cfg_path.read_text())
+        assert parsed["models"]["primary"]["provider"] == "ollama"
+
+    def test_collect_model_all_roles_skips_utility(self):
+        """When all roles are covered, skip the utility prompt."""
+        from loom.tui.screens.setup import (
+            SetupScreen,
+            _STEP_CONFIRM,
+        )
+
+        screen = SetupScreen()
+        screen._provider_key = "ollama"
+        screen._base_url = "http://localhost:11434"
+        screen._model_name = "qwen3:14b"
+        screen._api_key = ""
+        screen._roles = ["planner", "executor", "extractor", "verifier"]
+
+        # Stub _prepare_confirm to track call
+        called = []
+        screen._prepare_confirm = lambda: called.append(True)
+
+        screen._collect_model()
+
+        assert len(screen._models) == 1
+        assert screen._models[0]["name"] == "primary"
+        assert called  # went directly to confirm, skipping utility
+
+    def test_collect_model_partial_roles_shows_utility(self):
+        """When roles are incomplete, show the utility prompt."""
+        from loom.tui.screens.setup import (
+            SetupScreen,
+            _STEP_UTILITY,
+        )
+        from unittest.mock import MagicMock
+
+        screen = SetupScreen()
+        screen._provider_key = "anthropic"
+        screen._base_url = "https://api.anthropic.com"
+        screen._model_name = "claude-sonnet-4-5-20250929"
+        screen._api_key = "sk-ant-test"
+        screen._roles = ["planner", "executor"]
+
+        # Mock query_one for the missing roles label
+        mock_label = MagicMock()
+        screen.query_one = MagicMock(return_value=mock_label)
+
+        screen._collect_model()
+
+        assert len(screen._models) == 1
+        assert screen._step == _STEP_UTILITY
+
+
+class TestLoomAppNoModel:
+    """Test that LoomApp accepts model=None for setup flow."""
+
+    def test_init_with_none_model(self):
+        from unittest.mock import MagicMock
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=None,
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        assert app._model is None

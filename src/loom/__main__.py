@@ -49,24 +49,6 @@ def cli(
     delegation.
     """
     ctx.ensure_object(dict)
-
-    # First-run detection: if no config exists and user isn't already
-    # running a subcommand that doesn't need one, trigger setup wizard.
-    if config_path is None and ctx.invoked_subcommand not in ("setup",):
-        from loom.setup import needs_setup
-
-        if needs_setup():
-            click.echo("No configuration found.")
-            if click.confirm("Run first-time setup?", default=True):
-                from loom.setup import run_setup
-
-                run_setup()
-            else:
-                click.echo(
-                    "Create ~/.loom/loom.toml manually, or run `loom setup`.",
-                )
-                sys.exit(0)
-
     ctx.obj["config"] = load_config(config_path)
 
     if ctx.invoked_subcommand is None:
@@ -107,8 +89,12 @@ def _launch_tui(
     from loom.tui.app import LoomApp
 
     ws = (workspace or Path.cwd()).resolve()
-    provider = _resolve_model(config, model_name)
     tools = create_default_registry()
+
+    # Resolve model — None triggers the TUI setup wizard
+    provider = None
+    if config.models:
+        provider = _resolve_model(config, model_name)
 
     # Initialize database and conversation store (fall back to ephemeral)
     db, store = _init_persistence(config)

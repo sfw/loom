@@ -52,7 +52,7 @@ from loom.cowork.session import (
 from loom.models.base import ModelProvider
 from loom.tools.registry import ToolRegistry
 from loom.tui.commands import LoomCommands
-from loom.tui.screens import AskUserScreen, ToolApprovalScreen
+from loom.tui.screens import AskUserScreen, SetupScreen, ToolApprovalScreen
 from loom.tui.theme import LOOM_DARK
 from loom.tui.widgets import (
     ChatLog,
@@ -99,7 +99,7 @@ class LoomApp(App):
 
     def __init__(
         self,
-        model: ModelProvider,
+        model: ModelProvider | None,
         tools: ToolRegistry,
         workspace: Path,
         *,
@@ -155,10 +155,52 @@ class LoomApp(App):
         self.register_theme(LOOM_DARK)
         self.theme = "loom-dark"
 
+        if self._model is None:
+            # No model configured — launch the setup wizard
+            self.push_screen(
+                SetupScreen(), callback=self._on_setup_complete,
+            )
+            return
+
+        await self._initialize_session()
+
+    def _on_setup_complete(self, result: list[dict] | None) -> None:
+        """Handle setup wizard dismissal."""
+        if result is None:
+            self.exit()
+            return
+        self._finalize_setup()
+
+    @work
+    async def _finalize_setup(self) -> None:
+        """Reload config and initialize after setup wizard completes."""
+        from loom.config import load_config
+        from loom.models.router import ModelRouter
+
+        self._config = load_config()
+        router = ModelRouter.from_config(self._config)
+        try:
+            self._model = router.select(role="executor")
+        except Exception as e:
+            chat = self.query_one("#chat-log", ChatLog)
+            chat.add_info(
+                f"[bold #f7768e]Setup error: {e}[/]\n"
+                f"Edit ~/.loom/loom.toml or run /setup to try again."
+            )
+            return
+
+        await self._initialize_session()
+
+    async def _initialize_session(self) -> None:
+        """Initialize tools, session, and welcome message.
+
+        Called from on_mount (normal start) or _finalize_setup (post-wizard).
+        Requires self._model to be set.
+        """
         chat = self.query_one("#chat-log", ChatLog)
 
         # Register extra tools if persistence is available
-        if self._store is not None:
+        if self._store is not None and self._recall_tool is None:
             from loom.tools.conversation_recall import ConversationRecallTool
             from loom.tools.delegate_task import DelegateTaskTool
 
@@ -473,7 +515,8 @@ class LoomApp(App):
             return True
         if cmd == "/help":
             lines = [
-                "Commands: /quit, /clear, /model, /tools, /tokens, /help",
+                "Commands: /quit, /clear, /model, /tools, /tokens, "
+                "/setup, /help",
                 "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette, "
                 "Ctrl+1/2/3 tabs",
             ]
@@ -484,7 +527,13 @@ class LoomApp(App):
             chat.add_info("\n".join(lines))
             return True
         if cmd == "/model":
-            chat.add_info(f"Model: {self._model.name}")
+            name = self._model.name if self._model else "(not configured)"
+            chat.add_info(f"Model: {name}")
+            return True
+        if cmd == "/setup":
+            self.push_screen(
+                SetupScreen(), callback=self._on_setup_complete,
+            )
             return True
         if cmd == "/tools":
             tools = self._tools.list_tools()
@@ -924,7 +973,8 @@ class LoomApp(App):
 
     def _show_model_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)
-        chat.add_info(f"Model: {self._model.name}")
+        name = self._model.name if self._model else "(not configured)"
+        chat.add_info(f"Model: {name}")
 
     def _show_token_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)
