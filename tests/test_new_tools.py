@@ -912,7 +912,8 @@ class TestDocumentMetadata:
         content = (workspace / "doc.md").read_text()
         assert content.startswith("---\n")
         assert "author: Test User" in content
-        assert "date: 2025-01-15" in content
+        # yaml.dump may quote date-like strings for safety
+        assert "date:" in content and "2025-01-15" in content
         assert "status: draft" in content
         # Frontmatter should be closed
         parts = content.split("---")

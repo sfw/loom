@@ -435,10 +435,14 @@ def _clone_repo(url: str) -> Path:
     # If the repo has a single subdirectory with process.yaml, use that
     # (supports repos where the process is in a subdirectory)
     candidates = [clone_dir]
-    for child in clone_dir.iterdir():
-        if child.is_dir() and (child / "process.yaml").exists():
-            candidates.insert(0, child)
-            break
+    try:
+        for child in clone_dir.iterdir():
+            if child.is_dir() and (child / "process.yaml").exists():
+                candidates.insert(0, child)
+                break
+    except OSError as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise InstallError(f"Failed to inspect cloned repo: {e}")
 
     for candidate in candidates:
         if (candidate / "process.yaml").exists():

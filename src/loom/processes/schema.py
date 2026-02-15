@@ -592,7 +592,9 @@ class ProcessLoader:
         for py_file in tools_dir.glob("*.py"):
             if py_file.name.startswith("_"):
                 continue
-            module_name = f"loom.processes._bundled.{py_file.stem}"
+            # Include package name to avoid collisions between processes
+            safe_pkg = package_dir.name.replace("-", "_")
+            module_name = f"loom.processes._bundled.{safe_pkg}.{py_file.stem}"
             try:
                 spec = importlib.util.spec_from_file_location(
                     module_name, py_file,

@@ -125,6 +125,8 @@ def _eval_node(node: Any) -> Any:
 
 def npv(rate: float, cashflows: list[float]) -> float:
     """Net Present Value."""
+    if rate <= -1:
+        raise ValueError("Rate must be greater than -1")
     return sum(cf / (1 + rate) ** i for i, cf in enumerate(cashflows))
 
 
@@ -134,6 +136,8 @@ def cagr(
     """Compound Annual Growth Rate."""
     if beginning_value <= 0 or years <= 0:
         raise ValueError("Beginning value and years must be positive")
+    if ending_value < 0:
+        raise ValueError("Ending value cannot be negative")
     return (ending_value / beginning_value) ** (1 / years) - 1
 
 
@@ -154,6 +158,8 @@ def wacc(
 
 def pmt(rate: float, nper: int, pv: float) -> float:
     """Payment for a loan with constant payments and interest rate."""
+    if nper <= 0:
+        raise ValueError("Number of periods (nper) must be positive")
     if rate == 0:
         return -pv / nper
     return -pv * rate * (1 + rate) ** nper / ((1 + rate) ** nper - 1)

@@ -121,11 +121,15 @@ class DocumentWriteTool(Tool):
         # Build document
         parts: list[str] = []
 
-        # Metadata frontmatter
+        # Metadata frontmatter (use yaml.dump for safe serialization)
         if metadata and isinstance(metadata, dict) and not append:
+            import yaml as _yaml
             parts.append("---")
-            for key, value in metadata.items():
-                parts.append(f"{key}: {value}")
+            # yaml.dump handles quoting, escaping, and multiline values
+            rendered = _yaml.dump(
+                metadata, default_flow_style=False, allow_unicode=True,
+            ).rstrip("\n")
+            parts.append(rendered)
             parts.append("---")
             parts.append("")
 
@@ -138,10 +142,18 @@ class DocumentWriteTool(Tool):
         if content:
             parts.append(content)
         elif sections:
-            for section in sections:
-                heading = section.get("heading", "")
+            for i, section in enumerate(sections):
+                if not isinstance(section, dict):
+                    return ToolResult.fail(
+                        f"Section {i} must be a dict with 'heading' and 'body'",
+                    )
+                if "heading" not in section or "body" not in section:
+                    return ToolResult.fail(
+                        f"Section {i} missing required 'heading' or 'body' key",
+                    )
+                heading = section["heading"]
                 level = min(max(section.get("level", 2), 2), 4)
-                body = section.get("body", "")
+                body = section["body"]
                 prefix = "#" * level
                 parts.append(f"{prefix} {heading}")
                 parts.append("")
