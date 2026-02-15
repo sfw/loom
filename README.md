@@ -103,7 +103,7 @@ Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-gene
 
 ## Process Definitions
 
-YAML-based domain specialization. A process definition injects a persona, phase blueprint, verification rules, and tool guidance without changing engine code. Loom ships with 5 built-in processes (investment analysis, marketing strategy, research report, competitive intel, consulting engagement). You can create your own or install them from GitHub:
+YAML-based domain specialization. A process definition injects a persona, phase blueprint, verification rules, and tool guidance without changing engine code. Loom ships with 5 built-in processes (investment analysis, marketing strategy, research report, competitive intel, consulting engagement). You can [create your own](docs/creating-packages.md) or install them from GitHub:
 
 ```bash
 loom processes                              # list available
