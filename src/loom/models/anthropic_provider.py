@@ -1,7 +1,7 @@
 """Anthropic/Claude model provider.
 
 Supports the Anthropic Messages API for Claude models with native
-tool use, streaming, and extended thinking.
+tool use, streaming, multimodal content, and extended thinking.
 """
 
 from __future__ import annotations
@@ -9,10 +9,14 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any
 
 import httpx
 
+from loom.config import ModelCapabilities
+from loom.content import ThinkingBlock
+from loom.content_utils import encode_file_base64, encode_image_base64
 from loom.models.base import (
     ModelConnectionError,
     ModelProvider,
@@ -47,6 +51,7 @@ class AnthropicProvider(ModelProvider):
         temperature: float = 0.0,
         tier: int = 2,
         roles: list[str] | None = None,
+        capabilities: ModelCapabilities | None = None,
     ):
         self._name = name
         self._model = model
@@ -56,6 +61,9 @@ class AnthropicProvider(ModelProvider):
         self._temperature = temperature
         self._tier = tier
         self._roles = roles or ["executor"]
+        self._capabilities = capabilities or ModelCapabilities.auto_detect(
+            "anthropic", model,
+        )
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -158,6 +166,7 @@ class AnthropicProvider(ModelProvider):
                 # Anthropic expects tool results as user messages with tool_result blocks
                 tool_call_id = msg.get("tool_call_id", "")
                 content = msg.get("content", "")
+                tool_content = self._build_tool_result_content(content)
 
                 # Check if the previous message is already a user message with tool results
                 if (
@@ -170,7 +179,7 @@ class AnthropicProvider(ModelProvider):
                     anthropic_messages[-1]["content"].append({
                         "type": "tool_result",
                         "tool_use_id": tool_call_id,
-                        "content": content,
+                        "content": tool_content,
                     })
                 else:
                     anthropic_messages.append({
@@ -178,7 +187,7 @@ class AnthropicProvider(ModelProvider):
                         "content": [{
                             "type": "tool_result",
                             "tool_use_id": tool_call_id,
-                            "content": content,
+                            "content": tool_content,
                         }],
                     })
 
@@ -233,15 +242,27 @@ class AnthropicProvider(ModelProvider):
         """Parse an Anthropic API response into Loom's ModelResponse."""
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
+        thinking_blocks: list[ThinkingBlock] = []
 
         for block in data.get("content", []):
-            if block.get("type") == "text":
+            btype = block.get("type", "")
+            if btype == "text":
                 text_parts.append(block.get("text", ""))
-            elif block.get("type") == "tool_use":
+            elif btype == "tool_use":
                 tool_calls.append(ToolCall(
                     id=block.get("id", ""),
                     name=block.get("name", ""),
                     arguments=block.get("input", {}),
+                ))
+            elif btype == "thinking":
+                thinking_blocks.append(ThinkingBlock(
+                    thinking=block.get("thinking", ""),
+                    signature=block.get("signature", ""),
+                ))
+            elif btype == "redacted_thinking":
+                thinking_blocks.append(ThinkingBlock(
+                    thinking="[redacted]",
+                    signature=block.get("data", ""),
                 ))
 
         usage_data = data.get("usage", {})
@@ -256,9 +277,87 @@ class AnthropicProvider(ModelProvider):
         return ModelResponse(
             text="\n".join(text_parts) if text_parts else "",
             tool_calls=tool_calls,
+            thinking=thinking_blocks if thinking_blocks else None,
             usage=usage,
             raw=data,
         )
+
+    # ------------------------------------------------------------------
+    # Multimodal content conversion
+    # ------------------------------------------------------------------
+
+    def _build_tool_result_content(self, result_json: str) -> str | list[dict]:
+        """Convert a tool result with possible content blocks to Anthropic format."""
+        try:
+            parsed = json.loads(result_json)
+        except (json.JSONDecodeError, TypeError):
+            return result_json
+
+        blocks = parsed.get("content_blocks")
+        if not blocks:
+            return parsed.get("output", result_json)
+
+        caps = self._capabilities
+        anthropic_blocks: list[dict] = []
+        text_output = parsed.get("output", "")
+
+        for block in blocks:
+            btype = block.get("type", "")
+
+            if btype == "text":
+                anthropic_blocks.append({"type": "text", "text": block.get("text", "")})
+
+            elif btype == "image" and caps.vision:
+                source_path = block.get("source_path", "")
+                image_data = encode_image_base64(Path(source_path)) if source_path else None
+                if image_data:
+                    anthropic_blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": block.get("media_type", "image/png"),
+                            "data": image_data,
+                        },
+                    })
+                else:
+                    anthropic_blocks.append({
+                        "type": "text",
+                        "text": block.get("text_fallback", ""),
+                    })
+
+            elif btype == "document" and caps.native_pdf:
+                source_path = block.get("source_path", "")
+                doc_data = encode_file_base64(Path(source_path)) if source_path else None
+                if doc_data:
+                    anthropic_blocks.append({
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": doc_data,
+                        },
+                    })
+                else:
+                    anthropic_blocks.append({
+                        "type": "text",
+                        "text": block.get("text_fallback", ""),
+                    })
+
+            else:
+                fb = block.get("text_fallback", "")
+                if fb:
+                    anthropic_blocks.append({"type": "text", "text": fb})
+
+        if anthropic_blocks:
+            # Prepend the text output if it exists and no text block already covers it
+            if text_output and not any(
+                b.get("type") == "text" and b.get("text") == text_output
+                for b in anthropic_blocks
+            ):
+                anthropic_blocks.insert(0, {"type": "text", "text": text_output})
+            return anthropic_blocks
+
+        return text_output
 
     # ------------------------------------------------------------------
     # ModelProvider interface

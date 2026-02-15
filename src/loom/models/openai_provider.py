@@ -2,6 +2,7 @@
 
 Connects to any OpenAI-compatible API endpoint:
 MLX server, LM Studio, vLLM, llama.cpp server, etc.
+Supports multimodal content (images, documents) via content parts.
 """
 
 from __future__ import annotations
@@ -9,10 +10,12 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import httpx
 
 from loom.config import ModelConfig
+from loom.content_utils import encode_file_base64, encode_image_base64
 from loom.models.base import (
     ModelConnectionError,
     ModelProvider,
@@ -38,6 +41,7 @@ class OpenAICompatibleProvider(ModelProvider):
         self._provider_name = provider_name or config.model
         self._roles = list(config.roles)
         self._tier = tier_override or self._infer_tier()
+        self._capabilities = config.resolved_capabilities
 
     def _infer_tier(self) -> int:
         """Infer tier from model name if not explicitly set."""
@@ -303,6 +307,103 @@ class OpenAICompatibleProvider(ModelProvider):
                 },
             })
         return formatted
+
+    def _build_openai_messages(self, messages: list[dict]) -> list[dict]:
+        """Convert messages to OpenAI format with multimodal content parts.
+
+        For tool results containing content blocks, converts images to
+        image_url parts and documents to file parts (where supported).
+        """
+        if not self._capabilities.vision:
+            return messages
+
+        result = []
+        for msg in messages:
+            if msg.get("role") == "tool":
+                content = self._build_tool_result_content(msg.get("content", ""))
+                out = dict(msg)
+                out["content"] = content
+                result.append(out)
+            else:
+                result.append(msg)
+        return result
+
+    def _build_tool_result_content(self, result_json: str) -> str:
+        """Convert tool result with content blocks to OpenAI format.
+
+        OpenAI tool results must be strings, so we extract image data
+        and include it as a user follow-up message if needed. For now,
+        just return the text output — images are handled by converting
+        tool result messages into multipart user messages when needed.
+        """
+        try:
+            parsed = json.loads(result_json)
+        except (json.JSONDecodeError, TypeError):
+            return result_json
+
+        # For OpenAI, tool results must be strings. Return text output.
+        # Content blocks are handled at the message-building level.
+        return parsed.get("output", result_json)
+
+    def _extract_multimodal_parts(self, content: str) -> list[dict] | None:
+        """Extract multimodal parts from a tool result JSON string.
+
+        Returns a list of OpenAI content parts, or None if no multimodal
+        content is present.
+        """
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        blocks = parsed.get("content_blocks", [])
+        if not blocks:
+            return None
+
+        caps = self._capabilities
+        parts: list[dict] = []
+
+        for block in blocks:
+            btype = block.get("type", "")
+
+            if btype == "text":
+                parts.append({"type": "text", "text": block.get("text", "")})
+
+            elif btype == "image" and caps.vision:
+                source_path = block.get("source_path", "")
+                data = encode_image_base64(Path(source_path)) if source_path else None
+                if data:
+                    media = block.get("media_type", "image/png")
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media};base64,{data}",
+                            "detail": "high",
+                        },
+                    })
+                else:
+                    parts.append({"type": "text", "text": block.get("text_fallback", "")})
+
+            elif btype == "document" and caps.native_pdf:
+                source_path = block.get("source_path", "")
+                data = encode_file_base64(Path(source_path)) if source_path else None
+                if data:
+                    parts.append({
+                        "type": "file",
+                        "file": {
+                            "filename": Path(source_path).name,
+                            "file_data": f"data:application/pdf;base64,{data}",
+                        },
+                    })
+                else:
+                    parts.append({"type": "text", "text": block.get("text_fallback", "")})
+
+            else:
+                fb = block.get("text_fallback", "")
+                if fb:
+                    parts.append({"type": "text", "text": fb})
+
+        return parts if parts else None
 
     async def close(self) -> None:
         await self._client.aclose()

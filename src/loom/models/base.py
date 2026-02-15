@@ -35,6 +35,7 @@ class ModelResponse:
 
     text: str
     tool_calls: list[ToolCall] | None = None
+    thinking: list | None = None  # list[ThinkingBlock] from loom.content
     raw: str | dict = ""
     usage: TokenUsage = field(default_factory=TokenUsage)
     model: str = ""

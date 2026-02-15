@@ -20,6 +20,7 @@ class ToolResult:
 
     success: bool
     output: str
+    content_blocks: list | None = None  # list[ContentBlock] — rich content
     data: dict | None = None
     files_changed: list[str] = field(default_factory=list)
     error: str | None = None
@@ -27,12 +28,19 @@ class ToolResult:
     MAX_OUTPUT_SIZE = 30720  # 30KB
 
     def to_json(self) -> str:
-        return json.dumps({
+        from loom.content import serialize_block
+
+        payload: dict = {
             "success": self.success,
             "output": self.output[:self.MAX_OUTPUT_SIZE],
             "error": self.error,
             "files_changed": self.files_changed,
-        })
+        }
+        if self.content_blocks:
+            payload["content_blocks"] = [
+                serialize_block(b) for b in self.content_blocks
+            ]
+        return json.dumps(payload)
 
     @classmethod
     def ok(cls, output: str, **kwargs) -> ToolResult:
@@ -41,6 +49,13 @@ class ToolResult:
     @classmethod
     def fail(cls, error: str) -> ToolResult:
         return cls(success=False, output="", error=error)
+
+    @classmethod
+    def multimodal(
+        cls, output: str, blocks: list, **kwargs,
+    ) -> ToolResult:
+        """Create a result with both text and content blocks."""
+        return cls(success=True, output=output, content_blocks=blocks, **kwargs)
 
 
 @dataclass

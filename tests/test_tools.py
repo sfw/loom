@@ -175,9 +175,13 @@ class TestReadFile:
         tool = ReadFileTool()
         result = await tool.execute({"path": "logo.png"}, ctx)
         assert result.success
-        assert "Image file" in result.output
+        assert "Image" in result.output
         assert "logo.png" in result.output
         assert result.data["type"] == "image"
+        # Multimodal: should have content blocks
+        assert result.content_blocks is not None
+        assert len(result.content_blocks) == 1
+        assert result.content_blocks[0].type == "image"
 
     async def test_read_pdf_without_pypdf(self, ctx: ToolContext, workspace: Path):
         # Create a dummy PDF file (won't be valid, but extension matters)

@@ -1,7 +1,7 @@
 """Ollama model provider.
 
-Connects to Ollama's native API with support for tool calling
-and thinking mode switching for Qwen3 models.
+Connects to Ollama's native API with support for tool calling,
+multimodal content (images), and thinking mode switching for Qwen3 models.
 """
 
 from __future__ import annotations
@@ -9,10 +9,13 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import httpx
 
 from loom.config import ModelConfig
+from loom.content import ThinkingBlock
+from loom.content_utils import encode_image_base64, pdf_pages_to_images
 from loom.models.base import (
     ModelConnectionError,
     ModelProvider,
@@ -38,6 +41,7 @@ class OllamaProvider(ModelProvider):
         self._provider_name = provider_name or config.model
         self._roles = list(config.roles)
         self._tier = tier_override or self._infer_tier()
+        self._capabilities = config.resolved_capabilities
 
     def _infer_tier(self) -> int:
         """Infer tier from model name."""
@@ -56,9 +60,10 @@ class OllamaProvider(ModelProvider):
         max_tokens: int | None = None,
         response_format: dict | None = None,
     ) -> ModelResponse:
+        ollama_messages = self._build_ollama_messages(messages)
         payload: dict = {
             "model": self._model,
-            "messages": messages,
+            "messages": ollama_messages,
             "stream": False,
             "options": {
                 "temperature": temperature if temperature is not None else self._temperature,
@@ -122,9 +127,16 @@ class OllamaProvider(ModelProvider):
             total_tokens=data.get("prompt_eval_count", 0) + data.get("eval_count", 0),
         )
 
+        # Capture thinking if present
+        thinking_blocks = None
+        thinking_text = message.get("thinking", "")
+        if thinking_text:
+            thinking_blocks = [ThinkingBlock(thinking=thinking_text)]
+
         return ModelResponse(
             text=message.get("content") or "",
             tool_calls=tool_calls,
+            thinking=thinking_blocks,
             raw=json.dumps(message),
             usage=usage,
             model=self._model,
@@ -139,9 +151,10 @@ class OllamaProvider(ModelProvider):
         max_tokens: int | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """Stream a completion from Ollama, yielding text tokens as they arrive."""
+        ollama_messages = self._build_ollama_messages(messages)
         payload: dict = {
             "model": self._model,
-            "messages": messages,
+            "messages": ollama_messages,
             "stream": True,
             "options": {
                 "temperature": temperature if temperature is not None else self._temperature,
@@ -274,6 +287,62 @@ class OllamaProvider(ModelProvider):
                 },
             })
         return formatted
+
+    def _build_ollama_messages(self, messages: list[dict]) -> list[dict]:
+        """Convert messages to Ollama format with multimodal support.
+
+        Ollama puts images in a separate 'images' field on the message,
+        not in the content. Extracts image content blocks from tool results.
+        """
+        if not self._capabilities.vision:
+            return messages
+
+        result = []
+        for msg in messages:
+            out = {"role": msg.get("role", "user"), "content": msg.get("content", "")}
+
+            # Copy tool_calls if present
+            if msg.get("tool_calls"):
+                out["tool_calls"] = msg["tool_calls"]
+            if msg.get("tool_call_id"):
+                out["tool_call_id"] = msg["tool_call_id"]
+
+            # Extract images from tool result content blocks
+            if msg.get("role") == "tool":
+                images = self._extract_images_from_tool_result(msg.get("content", ""))
+                if images:
+                    out["images"] = images
+
+            result.append(out)
+        return result
+
+    def _extract_images_from_tool_result(self, content: str) -> list[str]:
+        """Extract base64 images from a tool result JSON string."""
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+        blocks = parsed.get("content_blocks", [])
+        images: list[str] = []
+        for block in blocks:
+            btype = block.get("type", "")
+            if btype == "image":
+                source_path = block.get("source_path", "")
+                if source_path:
+                    data = encode_image_base64(Path(source_path))
+                    if data:
+                        images.append(data)
+            elif btype == "document":
+                source_path = block.get("source_path", "")
+                pr = block.get("page_range")
+                if source_path:
+                    page_images = pdf_pages_to_images(
+                        Path(source_path),
+                        tuple(pr) if pr else None,
+                    )
+                    images.extend(page_images)
+        return images
 
     async def close(self) -> None:
         await self._client.aclose()

@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import difflib
+from pathlib import Path
 
+from loom.content import (
+    IMAGE_MEDIA_TYPES,
+    DocumentBlock,
+    ImageBlock,
+)
+from loom.content_utils import get_image_dimensions
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg"})
 _PDF_EXTENSION = ".pdf"
+
+MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5MB
+MAX_PDF_BYTES = 32 * 1024 * 1024  # 32MB
+MAX_PDF_PAGES_PER_READ = 20
 
 
 class ReadFileTool(Tool):
@@ -19,8 +30,8 @@ class ReadFileTool(Tool):
     def description(self) -> str:
         return (
             "Read the contents of a file. Optionally specify a line range. "
-            "Supports text files, PDFs (extracts text if pypdf is installed), "
-            "and reports metadata for image files."
+            "Supports text files, PDFs (with pagination), and image files "
+            "(returned as multimodal content for vision-capable models)."
         )
 
     @property
@@ -31,6 +42,14 @@ class ReadFileTool(Tool):
                 "path": {"type": "string", "description": "File path relative to workspace"},
                 "line_start": {"type": "integer", "description": "Start line (1-based, optional)"},
                 "line_end": {"type": "integer", "description": "End line (inclusive, optional)"},
+                "page_start": {
+                    "type": "integer",
+                    "description": "PDF: first page (0-indexed)",
+                },
+                "page_end": {
+                    "type": "integer",
+                    "description": "PDF: last page (exclusive)",
+                },
             },
             "required": ["path"],
         }
@@ -53,7 +72,11 @@ class ReadFileTool(Tool):
 
         # PDF handling
         if suffix == _PDF_EXTENSION:
-            return self._read_pdf(path)
+            return self._read_pdf(
+                path,
+                page_start=args.get("page_start", 0),
+                page_end=args.get("page_end"),
+            )
 
         # Image handling
         if suffix in _IMAGE_EXTENSIONS:
@@ -73,12 +96,23 @@ class ReadFileTool(Tool):
         return ToolResult.ok(content)
 
     @staticmethod
-    def _read_pdf(path) -> ToolResult:
-        """Extract text from a PDF file."""
+    def _read_pdf(
+        path: Path,
+        page_start: int = 0,
+        page_end: int | None = None,
+    ) -> ToolResult:
+        """Read PDF with pagination and multimodal output."""
+        size = path.stat().st_size
+
+        if size > MAX_PDF_BYTES:
+            return ToolResult.fail(
+                f"PDF too large: {size:,} bytes "
+                f"(limit: {MAX_PDF_BYTES:,} bytes)"
+            )
+
         try:
             import pypdf
         except ImportError:
-            size = path.stat().st_size
             return ToolResult.ok(
                 f"[PDF file: {path.name}, {size:,} bytes]\n"
                 "Install 'pypdf' to extract text: pip install pypdf",
@@ -87,30 +121,97 @@ class ReadFileTool(Tool):
 
         try:
             reader = pypdf.PdfReader(path)
-            pages = []
-            for i, page in enumerate(reader.pages):
-                text = page.extract_text() or ""
-                if text.strip():
-                    pages.append(f"--- Page {i + 1} ---\n{text}")
-            if not pages:
-                return ToolResult.ok(
-                    f"[PDF: {path.name}, {len(reader.pages)} pages, no extractable text]",
-                    data={"type": "pdf", "pages": len(reader.pages)},
-                )
-            return ToolResult.ok(
-                "\n\n".join(pages),
-                data={"type": "pdf", "pages": len(reader.pages)},
-            )
         except Exception as e:
             return ToolResult.fail(f"Error reading PDF: {e}")
 
+        total_pages = len(reader.pages)
+
+        if page_end is None:
+            page_end = min(page_start + MAX_PDF_PAGES_PER_READ, total_pages)
+        page_end = min(page_end, total_pages)
+        page_start = max(0, page_start)
+
+        pages_text = []
+        for i in range(page_start, page_end):
+            try:
+                text = reader.pages[i].extract_text() or ""
+            except Exception:
+                text = ""
+            if text.strip():
+                pages_text.append(f"--- Page {i + 1} ---\n{text}")
+
+        extracted = "\n\n".join(pages_text) if pages_text else ""
+        pagination_note = ""
+        if page_end < total_pages:
+            pagination_note = (
+                f"\n\n[Showing pages {page_start + 1}-{page_end} of "
+                f"{total_pages}. Use page_start={page_end} to continue.]"
+            )
+
+        text_fallback = extracted + pagination_note if extracted else (
+            f"[PDF: {path.name}, {total_pages} pages, no extractable text]"
+            + pagination_note
+        )
+
+        block = DocumentBlock(
+            source_path=str(path),
+            page_count=total_pages,
+            size_bytes=size,
+            extracted_text=extracted,
+            page_range=(page_start, page_end),
+            text_fallback=text_fallback,
+        )
+
+        return ToolResult.multimodal(
+            output=text_fallback,
+            blocks=[block],
+            data={"type": "pdf", "pages": total_pages,
+                  "page_range": [page_start, page_end]},
+        )
+
     @staticmethod
-    def _read_image(path) -> ToolResult:
-        """Return metadata for an image file."""
+    def _read_image(path: Path) -> ToolResult:
+        """Return image as a content block with text fallback."""
         size = path.stat().st_size
-        return ToolResult.ok(
-            f"[Image file: {path.name}, {size:,} bytes, type: {path.suffix}]",
-            data={"type": "image", "name": path.name, "size": size, "format": path.suffix},
+
+        if size > MAX_IMAGE_BYTES:
+            return ToolResult.ok(
+                f"[Image too large: {path.name}, {size:,} bytes, "
+                f"limit is {MAX_IMAGE_BYTES:,} bytes. "
+                f"Consider resizing or converting to JPEG.]"
+            )
+
+        suffix = path.suffix.lower()
+        media_type = IMAGE_MEDIA_TYPES.get(suffix)
+        if not media_type:
+            # SVG and other unsupported formats get text fallback only
+            return ToolResult.ok(
+                f"[Image file: {path.name}, {size:,} bytes, type: {suffix}]",
+                data={"type": "image", "name": path.name,
+                      "size": size, "format": suffix},
+            )
+
+        width, height = get_image_dimensions(path)
+
+        text_fallback = (
+            f"[Image: {path.name}, {width}x{height}, "
+            f"{size:,} bytes, {suffix}]"
+        )
+
+        block = ImageBlock(
+            source_path=str(path),
+            media_type=media_type,
+            width=width,
+            height=height,
+            size_bytes=size,
+            text_fallback=text_fallback,
+        )
+
+        return ToolResult.multimodal(
+            output=text_fallback,
+            blocks=[block],
+            data={"type": "image", "name": path.name,
+                  "size": size, "format": suffix},
         )
 
 

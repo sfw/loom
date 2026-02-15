@@ -22,6 +22,54 @@ class ServerConfig:
 
 
 @dataclass(frozen=True)
+class ModelCapabilities:
+    """What content types this model can handle."""
+
+    vision: bool = False
+    native_pdf: bool = False
+    thinking: bool = False
+    citations: bool = False
+    audio_input: bool = False
+    audio_output: bool = False
+
+    @classmethod
+    def auto_detect(cls, provider: str, model: str) -> ModelCapabilities:
+        """Infer capabilities from provider and model name."""
+        model_lower = model.lower()
+
+        if provider == "anthropic":
+            return cls(
+                vision=True,
+                native_pdf=True,
+                thinking="opus" in model_lower or "sonnet" in model_lower,
+                citations=True,
+            )
+
+        if provider == "ollama":
+            vision_models = {
+                "llava", "bakllava", "gemma3", "smolvlm",
+                "llama3.2-vision", "moondream", "minicpm-v",
+            }
+            has_vision = any(v in model_lower for v in vision_models)
+            return cls(
+                vision=has_vision,
+                thinking="deepseek" in model_lower or "qwq" in model_lower,
+            )
+
+        if provider == "openai_compatible":
+            has_vision = any(v in model_lower for v in [
+                "gpt-4o", "gpt-4-vision", "gpt-4-turbo",
+                "gemini", "pixtral", "internvl",
+            ])
+            return cls(
+                vision=has_vision,
+                native_pdf="gpt-4o" in model_lower,
+            )
+
+        return cls()
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     """Configuration for a single model provider."""
 
@@ -33,6 +81,13 @@ class ModelConfig:
     roles: list[str] = field(default_factory=lambda: ["executor"])
     api_key: str = ""
     tier: int = 0  # 0 = auto-detect from model name
+    capabilities: ModelCapabilities | None = None  # None = auto-detect
+
+    @property
+    def resolved_capabilities(self) -> ModelCapabilities:
+        if self.capabilities is not None:
+            return self.capabilities
+        return ModelCapabilities.auto_detect(self.provider, self.model)
 
     def __repr__(self) -> str:
         key_display = f"***{self.api_key[-4:]}" if self.api_key else ""
@@ -115,6 +170,19 @@ def _parse_model_config(name: str, data: dict) -> ModelConfig:
     roles = data.get("roles", ["executor"])
     if isinstance(roles, str):
         roles = [roles]
+
+    capabilities = None
+    caps_data = data.get("capabilities")
+    if isinstance(caps_data, dict):
+        capabilities = ModelCapabilities(
+            vision=caps_data.get("vision", False),
+            native_pdf=caps_data.get("native_pdf", False),
+            thinking=caps_data.get("thinking", False),
+            citations=caps_data.get("citations", False),
+            audio_input=caps_data.get("audio_input", False),
+            audio_output=caps_data.get("audio_output", False),
+        )
+
     return ModelConfig(
         provider=data["provider"],
         base_url=data.get("base_url", ""),
@@ -124,6 +192,7 @@ def _parse_model_config(name: str, data: dict) -> ModelConfig:
         roles=roles,
         api_key=data.get("api_key", ""),
         tier=data.get("tier", 0),
+        capabilities=capabilities,
     )
 
 

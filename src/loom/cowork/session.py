@@ -80,10 +80,32 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _estimate_message_tokens(msg: dict) -> int:
-    """Estimate tokens for a full message dict."""
-    total = _estimate_tokens(msg.get("content") or "")
+    """Estimate tokens for a full message dict, including multimodal content."""
+    content = msg.get("content") or ""
+    total = _estimate_tokens(content)
+
     if msg.get("tool_calls"):
         total += _estimate_tokens(json.dumps(msg["tool_calls"]))
+
+    # Account for multimodal content blocks in tool results
+    if msg.get("role") == "tool" and content:
+        try:
+            parsed = json.loads(content)
+            for block in parsed.get("content_blocks", []):
+                btype = block.get("type", "")
+                if btype == "image":
+                    w = block.get("width", 1024)
+                    h = block.get("height", 1024)
+                    total += (w * h) // 750
+                elif btype == "document":
+                    pages = block.get("page_count", 1)
+                    pr = block.get("page_range")
+                    if pr and len(pr) == 2:
+                        pages = pr[1] - pr[0]
+                    total += pages * 1500
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     return max(1, total)
 
 
