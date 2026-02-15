@@ -2110,3 +2110,427 @@ This is just file discovery from a remote repository — no plugin system, no pa
 | Domain detected from workspace files | Process selected by user via `--process` flag |
 | 3280 LOC across 4 batches | **2540 LOC across 4 batches** |
 | New domain = new Python class | **New process = new YAML file** |
+
+---
+
+## Criticism Round 1: Architectural Blind Spots and Runtime Gaps
+
+### C1.1 The Tool Gap: Processes Can't Deliver Capability
+
+R4's central claim is "new process = new YAML file, no code needed." But this only holds when the existing tools are sufficient. The moment a domain needs a capability the base toolset doesn't provide, the promise breaks:
+
+- A financial analysis process needs a DCF model builder, a WACC calculator, or a financial statement normalizer. The generic `calculator` tool does arithmetic, but it doesn't know about cost-of-equity formulas or how to link income statement → balance sheet → cash flow.
+- A legal review process needs a clause extraction tool, a contract comparison tool, or a regulatory citation validator.
+- A data analysis process needs a `run_python` sandbox or a `sql_query` tool.
+
+In R4, the user who needs a new tool must: (1) write a Python class extending `Tool`, (2) get it registered in the `ToolRegistry`, and (3) then reference it from their YAML. This makes the "no code" claim misleading — it's "no code *if the tools already exist*."
+
+**The programming language analogy is precise here.** The base tools are the standard library. Process definitions are user programs. But there's no `import` mechanism — no way for a process definition to deliver the tools it depends on. Imagine Python where you can write scripts but can't install packages.
+
+**Opportunity:** Process definitions should be able to bundle tool definitions. This doesn't mean arbitrary Python execution from YAML — it means a process *package* (a directory, not a single file) that can include:
+
+```
+marketing-strategy/
+├── process.yaml          # The process definition (what R4 already defines)
+├── tools/
+│   ├── market_sizer.py   # Tool: Tool subclass, auto-registered when process loads
+│   └── brand_scorer.py   # Tool: scoring rubric evaluator
+└── templates/            # Optional: custom prompt fragments
+    └── brand-voice.txt   # Included via {brand_voice} in persona
+```
+
+The `ProcessLoader` would scan the `tools/` directory, import the modules, and register the tools into the `ToolRegistry` before orchestration begins. Tools bundled with a process are only available when that process is active — they don't pollute the global tool namespace.
+
+This makes process definitions a true extension unit: intelligence + capability in one package.
+
+### C1.2 Verification Rules Are Under-Specified
+
+The verification rules in R4 are natural-language strings evaluated by the LLM verifier:
+
+```yaml
+- name: sources-cited
+  check: "output contains at least one URL or source reference per data point"
+  severity: warning
+```
+
+This has two problems:
+
+1. **No deterministic path.** Some checks are trivially deterministic — "deliverables do not contain [TBD]" is a regex. Running it through an LLM is wasteful and non-deterministic. The plan puts *all* process rules into Tier 2 (LLM) verification, but some belong in Tier 1 (deterministic).
+
+2. **No check type taxonomy.** The `check` field is a free-form string. The engine has no way to know whether a check is regex-matchable, requires file inspection, or needs LLM judgment. This means you can't optimize, can't give useful error messages when a check is malformed, and can't route checks to the right tier.
+
+**Opportunity:** Add an optional `type` field:
+
+```yaml
+- name: no-placeholders
+  type: regex                    # Tier 1: deterministic
+  check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
+  target: deliverables           # What to check against
+  severity: error
+
+- name: sources-cited
+  type: llm                     # Tier 2: needs judgment
+  check: "Every quantitative claim cites a source"
+  severity: warning
+```
+
+When `type: regex`, the `DeterministicVerifier` runs it. When `type: llm` (or omitted), it goes to the LLM verifier as currently planned. This keeps the "just write natural language" simplicity as the default while enabling fast, free, deterministic checks for the common cases.
+
+### C1.3 The Planner's Relationship to Phase Templates Is Ambiguous
+
+R4.7 says:
+
+> "You may use the recommended phase structure as a starting point, adapting it to the specific goal. Add, remove, or modify phases as needed."
+
+This creates an identity crisis. Are phase templates:
+
+- **Prescriptive blueprints** that the planner should follow unless there's a strong reason not to?
+- **Suggestive examples** that the planner can freely ignore?
+
+The answer matters because it determines how much the process author can rely on their phases actually executing. A marketing strategist who carefully designs a 6-phase process with specific dependency ordering will be frustrated if the planner decides to skip competitive analysis because it didn't seem relevant.
+
+**Opportunity:** Add a `strictness` field to the process definition:
+
+```yaml
+phase_mode: guided     # "strict" | "guided" | "suggestive"
+# strict:     planner must use these phases (can adjust descriptions, not structure)
+# guided:     planner should follow this structure, may add/modify, explain deviations
+# suggestive: phases are just hints, planner decomposes freely
+```
+
+Default to `guided` for backward compatibility with R4's current semantics. `strict` is important for regulated workflows (compliance, audit) where the process must be followed exactly. `suggestive` is the current no-process behavior.
+
+### C1.4 No Process Composition or Inheritance
+
+Every process definition is a standalone island. There's no way to:
+
+- **Compose:** "Run competitive-intel as phase 2 of marketing-strategy" (process-calls-process)
+- **Inherit:** "This is like research-report but with financial verification rules" (extend a base)
+- **Mixin:** "Add the citation-checking rules to any process" (reusable fragments)
+
+This means the `consulting-engagement.yaml` and `research-report.yaml` processes will duplicate persona text, verification rules, and memory guidance — because they share a "research-then-synthesize" pattern.
+
+**Not proposing full inheritance** (that way lies YAML Turing-completeness). But a simple `includes` mechanism would help:
+
+```yaml
+includes:
+  - common/citation-rules.yaml    # Merges verification rules
+  - common/research-persona.yaml  # Merges persona text
+```
+
+The merge semantics should be trivial: later values override earlier ones, lists are concatenated. This keeps it simple while preventing copy-paste rot across process definitions.
+
+### C1.5 Workspace Analysis Runs Code Analysis for Non-Code Workspaces
+
+The orchestrator's `_analyze_workspace` method (line 451-466 in orchestrator.py) calls `analyze_directory` from `loom.tools.code_analysis`, which parses Python ASTs, extracts classes/functions/imports. For a marketing workspace full of CSVs, PDFs, and Markdown files, this returns nothing useful.
+
+The plan's `workspace_analysis` section in process definitions describes *what to scan for*, but the engine's actual implementation always runs code analysis. The process definition's `scan_for` guidance is never wired to anything — it's documentation masquerading as configuration.
+
+**Opportunity:** The `_analyze_workspace` method should be process-aware. When a process defines `workspace_analysis.scan_for`, the engine should use that to decide what to analyze, not blindly run `code_analysis.analyze_directory`. For non-code workspaces, this means: list file types present, read headers of CSV files, extract titles from Markdown files, note PDF filenames. This is a different analysis than AST parsing.
+
+---
+
+## Criticism Round 2: Real-World Usage Scenarios and Edge Cases
+
+### C2.1 Process Selection Is Manual — But Should Sometimes Be Automatic
+
+R4 requires `--process marketing-strategy` on the command line. The R4.15 comparison table even lists this as an advantage: "Domain detected from workspace files → Process selected by user via --process flag."
+
+But this creates friction for the most common case: the user has a workspace with existing process artifacts (market sizing spreadsheets, competitor analyses) and types `loom cowork`. They now need to remember which process they used last time. Worse, if they share a workspace with a colleague, the colleague needs to know which process to specify.
+
+**Opportunity:** Allow an optional `loom-process.yaml` symlink or `[process]` setting in workspace-local `loom.toml`:
+
+```toml
+# workspace loom.toml
+[process]
+default = "marketing-strategy"
+```
+
+This already exists in R4.9's config section but only at the global level. Make it workspace-scoped too. When present, `--process` becomes optional. The workspace remembers its own process.
+
+Additionally, process *auto-detection* isn't inherently bad — it was bad in R3 because it was based on fragile workspace file heuristics picking Python classes. A simpler version works: if there's exactly one `.yaml` file in `./loom-processes/`, use it. If there are multiple, list them and ask. This is discoverable and predictable.
+
+### C2.2 Process Definitions Will Outgrow Single Files
+
+The marketing-strategy.yaml example is already ~150 lines. A serious financial analysis process with detailed phase descriptions, 10+ verification rules, 5 planner examples, and extensive memory guidance will hit 400-500 lines. That's still manageable, but add the tool bundling from C1.1, custom prompt fragments, and example deliverables, and you're looking at a package.
+
+R4 assumes process = single YAML file. This works for simple processes but doesn't scale.
+
+**Opportunity:** Support both:
+
+```
+# Simple: single file (current R4 behavior)
+~/.loom/processes/quick-research.yaml
+
+# Complex: directory with manifest
+~/.loom/processes/financial-analysis/
+├── process.yaml              # Main definition
+├── tools/                    # Bundled tools (C1.1)
+│   └── dcf_builder.py
+├── examples/                 # Planner few-shot examples (externalized)
+│   ├── equity-analysis.yaml
+│   └── fixed-income.yaml
+├── verification/             # Verification rule sets (externalized)
+│   └── financial-checks.yaml
+└── templates/                # Prompt fragments
+    └── risk-framework.txt
+```
+
+The `ProcessLoader` already discovers by scanning directories. Make it handle both: if the path is a `.yaml` file, load it directly (current behavior). If it's a directory, look for `process.yaml` inside it.
+
+### C2.3 Version Field Has No Teeth
+
+The `version: "1.0"` field exists but nothing consumes it. There's no:
+
+- **Compatibility check:** "This process requires Loom engine ≥ 2.0"
+- **Migration path:** "This process uses schema v2 features not in v1"
+- **Upgrade warning:** "Your saved process is v1, the installed version is v2"
+
+In practice, when the process definition format evolves (and it will — adding `type` to verification rules, adding `phase_mode`, adding `includes`), old YAML files will silently break or produce unexpected behavior.
+
+**Opportunity:** Define what `version` means. The simplest approach: it's the *schema version*, not the content version. The engine validates against the declared schema version and gives clear errors:
+
+```
+Error: Process 'financial-analysis' uses schema v2 (phase_mode field)
+but this version of Loom only supports schema v1. Upgrade Loom or
+downgrade the process definition.
+```
+
+Content versioning (v1.0 → v1.1 of the marketing strategy) is the user's responsibility and doesn't need engine support.
+
+### C2.4 Memory Guidance Has No Feedback Loop
+
+The `memory.extract_types` section tells the extractor what *kinds* of knowledge to look for. But there's no mechanism for:
+
+- **The planner to know what memory types exist** when building the plan. If market_insight memories are available from a prior run, the planner should know to check for them before scheduling a market-sizing phase.
+- **Cross-process memory sharing.** If a user runs `competitive-intel` and then `marketing-strategy`, the competitive intelligence memories are tagged with `competitive-intel`'s memory types (if any), not `marketing-strategy`'s. The marketing process can't find them because memory retrieval is type-filtered.
+- **Memory type validation.** Nothing prevents a process from defining `extract_types: [{type: "foo"}]` and the extractor producing entries tagged `bar`. The types are suggestions, not constraints.
+
+**Opportunity:** Memory types in the process definition should feed into the memory *retrieval* prompt, not just the extraction prompt. When the planner or executor retrieves memories, the process's `extract_types` should guide what to search for. And cross-process memory sharing should work by defining a shared type namespace — or by making memory retrieval ignore types entirely and rely on semantic similarity (which the current system may already do).
+
+### C2.5 The Deliverables Field Is Unverified
+
+Phase templates specify `deliverables`:
+
+```yaml
+deliverables:
+  - "market-sizing-model.csv — TAM/SAM/SOM with assumptions"
+  - "market-sizing-summary.md — narrative with methodology and sources"
+```
+
+But nothing in the verification pipeline checks whether these specific files were actually created. The `DeterministicVerifier` checks `tool_calls.result.files_changed` for non-emptiness, but it doesn't cross-reference against the expected deliverables list.
+
+This is a missed opportunity for a free Tier 1 check: "Phase declared deliverables X, Y, Z. Files actually created: X, Z. Missing: Y." This is deterministic, zero-cost, and immediately useful.
+
+### C2.6 No Process-Level Error Budget or Retry Policy
+
+Individual subtask retries exist in the engine. But processes have no way to express:
+
+- "If any research phase fails, it's OK — skip it and note the gap in synthesis"
+- "If the market-sizing phase fails, stop the entire process (it's a hard dependency)"
+- "Allow up to 2 retries on web_search-heavy phases (they're flaky)"
+
+The `is_critical_path` field exists on `PhaseTemplate` but it's not wired to anything. The engine treats all phase failures identically.
+
+**Opportunity:** Wire `is_critical_path` to the replanning logic. When a critical-path phase fails after retries, halt the process. When a non-critical phase fails, mark it as skipped and adjust downstream phases. This is already implied by the dependency graph but never made explicit.
+
+---
+
+## Criticism Round 3: Extensibility, Evolution, and the Ecosystem Play
+
+### C3.1 The Missing Abstraction: Process Packages as the Extension Unit
+
+Pulling together C1.1 and C2.2: R4 introduces two independent extension mechanisms — tools (Python classes) and processes (YAML files). But the user's insight is correct: **these should be one extension unit.**
+
+The programming language analogy:
+
+| Concept | Language Analog | Current Loom | Proposed Loom |
+|---------|----------------|-------------|---------------|
+| Runtime | Python interpreter | Orchestrator engine | Same |
+| Standard library | builtins, os, json | web_search, read_file, calculator | Same |
+| User script | .py file | Process definition YAML | Same |
+| Package | pip package (code + data + deps) | **Nothing** | **Process package** |
+| Package manager | pip/PyPI | **Nothing** | `loom process install` (R4.14) |
+
+Right now, R4.14's "marketplace" concept is "just YAML files." But if processes can bundle tools, templates, and verification rules, the marketplace becomes a real package ecosystem. The download unit is a directory, not a file. The install process is "copy directory + register tools."
+
+This is the highest-leverage design decision in the whole plan. Getting the package format right enables an ecosystem. Getting it wrong means every serious process requires users to also manually install Python tool packages.
+
+**Recommendation:** Define the process package format now, even if Batch A only implements single-file loading. The format should be:
+
+```
+<process-name>/
+├── process.yaml          # Required: the process definition
+├── tools/                # Optional: Python Tool subclasses
+├── templates/            # Optional: prompt fragments
+├── examples/             # Optional: few-shot examples
+└── README.md             # Optional: human documentation
+```
+
+The `ProcessLoader` in Batch A can initially only support `process.yaml` (single file). Batch D adds directory support and tool auto-registration. But the format is defined upfront so early adopters structure their processes correctly.
+
+### C3.2 Tool Guidance vs. Tool Requirements
+
+R4 is explicit: "Does NOT restrict tools — all registered tools remain available." The process's `tool_guidance` is advisory, not prescriptive.
+
+This is the right default, but there are cases where restriction matters:
+
+- **Security:** A process running in a sandboxed environment shouldn't have access to `shell_execute`.
+- **Cost control:** A "quick research" process shouldn't use the `spreadsheet` tool (which might trigger expensive model calls for layout decisions).
+- **Correctness:** A financial analysis process where the user wants all math in the `calculator` tool, not freeform text arithmetic.
+
+**Opportunity:** Add optional `tools.required` and `tools.excluded` fields:
+
+```yaml
+tools:
+  guidance: |
+    Prefer web_search for market data...
+  required: [web_search, calculator, spreadsheet]  # Must be available or error
+  excluded: [shell_execute]                         # Remove from tool schemas
+```
+
+`required` is a pre-flight check: if a required tool isn't registered, fail fast with a clear message. `excluded` removes tools from the schema sent to the model. `guidance` remains advisory. This is a clean separation of concerns.
+
+### C3.3 Process Lifecycle Hooks
+
+R4 describes processes as static definitions loaded at startup. But real workflows have lifecycle needs:
+
+- **Before planning:** "Check that API keys for data sources are configured" (pre-flight)
+- **After planning:** "Show the plan to the user and get approval before executing" (gate)
+- **Between phases:** "Export intermediate deliverables to a shared drive" (side-effect)
+- **After completion:** "Generate a summary email with all deliverables attached" (post-processing)
+
+The engine's event system (`_emit(TASK_REPLANNING, ...)`) already has the hooks infrastructure. Process definitions should be able to declare lifecycle handlers:
+
+```yaml
+hooks:
+  before_plan:
+    - check: "Environment variable OPENAI_API_KEY is set"
+      action: warn
+  after_complete:
+    - action: "Generate executive summary from all deliverables"
+      model_tier: 2
+```
+
+This is lower priority than the core architecture but worth designing the extension point now.
+
+### C3.4 The Cowork Gap Is Bigger Than D4 Suggests
+
+Batch D4 says "Cowork mode process awareness (system prompt from persona) — ~30 lines." This undersells the integration challenge.
+
+In cowork mode, the user has a conversation. They might say "analyze AAPL for me." If a process is loaded, the cowork session should:
+
+1. Recognize this as a process-appropriate task
+2. Use the process's persona in the system prompt (D4 covers this)
+3. When the user says "delegate this" or the model decides to use `delegate_task`, pass the process to the orchestrator
+4. Make process-specific memory types available for conversation recall
+5. Let the user ask "what phase are we on?" and get a meaningful answer
+
+Items 3-5 aren't covered. In particular, the handoff from cowork → orchestrator needs to carry the process definition, and the orchestrator's results need to flow back with process-aware context.
+
+**Opportunity:** Define the cowork-process contract explicitly:
+
+- `CoworkSession.__init__` accepts an optional `ProcessDefinition`
+- The system prompt includes the persona (D4) AND tool guidance AND workspace analysis guidance
+- `delegate_task` passes the process to the orchestrator
+- Process memory types are included in the conversation recall tool's system context
+
+### C3.5 No Telemetry or Process Performance Tracking
+
+When a user runs the same process multiple times, there's no way to know:
+
+- Which phases consistently fail or need retries?
+- Which phases take the most tokens (cost)?
+- Which verification rules fire most often?
+- How does the process perform across different model tiers?
+
+This data is essential for process authors to improve their definitions. It's also essential for Loom to recommend model tier adjustments.
+
+**Opportunity:** The existing task/subtask result storage in SQLite should tag results with the process name and phase ID. A `loom process stats marketing-strategy` command could then show:
+
+```
+Phase               Avg Tokens  Fail Rate  Avg Retries
+market-sizing           4,200      5%         0.1
+competitive-analysis    6,800     15%         0.3    ← consider higher model tier
+positioning             8,100      8%         0.2
+channel-strategy        3,200      2%         0.0
+campaign-plan           5,500     12%         0.2
+```
+
+This is just a query over existing data — minimal new code, high value.
+
+### C3.6 Process Definition Testing Is Under-Specified
+
+R4.12 says "Process definitions are data — validate schema only." But schema validation only catches structural errors (missing required fields, wrong types). It doesn't catch:
+
+- **Dependency cycles:** Phase A depends on B, B depends on A
+- **Dangling dependencies:** Phase A depends on "market-sizing" but no phase has that ID
+- **Model tier conflicts:** A Tier 1 model assigned to a synthesis task that clearly needs Tier 3
+- **Deliverable conflicts:** Two phases declare the same deliverable filename
+- **Empty phases:** A phase with no description (the planner will hallucinate)
+
+**Opportunity:** `ProcessLoader._parse()` should run validation beyond schema:
+
+```python
+def _validate(self, defn: ProcessDefinition) -> list[str]:
+    errors = []
+    # Check dependency graph is a DAG
+    # Check all depends_on references exist
+    # Check no duplicate phase IDs
+    # Check no duplicate deliverable filenames
+    # Warn if synthesis phases aren't model_tier >= 2
+    return errors
+```
+
+This is cheap to implement and catches errors at load time rather than mid-execution.
+
+### C3.7 The Biggest Missed Opportunity: Process Definitions as Composable Pipelines
+
+R4 treats a process as a flat list of phases with dependencies. But the most powerful real-world workflows are *recursive* — a phase in one process is itself a sub-process:
+
+- Marketing strategy's "competitive analysis" phase is actually the entire `competitive-intel.yaml` process.
+- Due diligence's "financial analysis" phase is the entire `investment-analysis.yaml` process.
+- A consulting engagement's workstreams are each mini-processes.
+
+This is the process-calls-process composition from C1.4, but elevated to a core design principle. If process definitions can reference other processes as phases, you get:
+
+1. **Reusability without duplication** — write `competitive-intel` once, use it in 5 processes
+2. **Depth without complexity** — each process stays under 100 lines
+3. **Independent versioning** — update `competitive-intel` and all parent processes benefit
+4. **The marketplace becomes modular** — install building-block processes, compose them
+
+This is how real programming languages work: you don't write everything in `main()`, you compose functions.
+
+**Recommendation:** Add a `process` field to phase templates:
+
+```yaml
+phases:
+  - id: competitive-analysis
+    process: competitive-intel    # Delegate to another process definition
+    depends_on: []
+    # Description, verification, etc. come from the referenced process
+```
+
+The engine sees this phase, loads the referenced process, runs it as a sub-orchestration, and collects its deliverables as the phase output. The parent process's dependency graph treats the sub-process as an atomic phase.
+
+This is the single feature that would transform Loom from "a tool that runs workflows" to "a platform that composes intelligence." It's ambitious — but the engine already supports nested task orchestration via `delegate_task`. This just makes it declarative.
+
+### C3.8 Summary of Recommendations by Priority
+
+| Priority | Issue | Fix | Batch |
+|----------|-------|-----|-------|
+| **P0** | Process package format (C3.1) | Define format now, implement single-file in A, directory in D | A + D |
+| **P0** | Deliverables verification (C2.5) | Add to DeterministicVerifier | A |
+| **P0** | Dependency graph validation (C3.6) | Add to ProcessLoader._parse() | A |
+| **P1** | Verification rule types (C1.2) | Add `type: regex\|llm` field | A |
+| **P1** | Phase strictness (C1.3) | Add `phase_mode` field | A |
+| **P1** | Cowork integration (C3.4) | Expand D4 scope | D |
+| **P1** | Workspace-scoped default process (C2.1) | Workspace loom.toml `[process]` | A |
+| **P2** | Tool bundling (C1.1) | Directory-based processes with tools/ | D |
+| **P2** | Process composition (C3.7) | `process:` field on phase templates | D |
+| **P2** | Tool requirements/exclusions (C3.2) | `tools.required` / `tools.excluded` | A |
+| **P3** | Process includes (C1.4) | `includes:` for shared fragments | Future |
+| **P3** | Lifecycle hooks (C3.3) | `hooks:` section | Future |
+| **P3** | Performance telemetry (C3.5) | Tag results with process/phase | D |
+| **P3** | Schema versioning (C2.3) | Engine-aware `version` validation | D |
+| **P3** | Memory cross-process (C2.4) | Shared memory type namespace | Future |
