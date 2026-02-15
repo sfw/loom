@@ -468,33 +468,51 @@ class LoomApp(App):
     def _update_files_panel(self, turn: CoworkTurn) -> None:
         """Update the Files Changed panel from tool call events."""
         file_entries: list[dict] = []
+        last_diff = ""
         for tc in turn.tool_calls:
             if not tc.result or not tc.result.success:
                 continue
             path = tc.args.get(
                 "path", tc.args.get("file_path", "?"),
             )
+            now = _now_str()
             if tc.name == "write_file":
                 file_entries.append({
                     "operation": "create",
                     "path": path,
-                    "timestamp": _now_str(),
+                    "timestamp": now,
                 })
             elif tc.name == "edit_file":
                 file_entries.append({
                     "operation": "modify",
                     "path": path,
-                    "timestamp": _now_str(),
+                    "timestamp": now,
                 })
+                # Extract diff from edit output for the diff viewer
+                output = tc.result.output or ""
+                marker = "--- a/"
+                idx = output.find(marker)
+                if idx != -1:
+                    last_diff = output[idx:]
             elif tc.name == "delete_file":
                 file_entries.append({
                     "operation": "delete",
                     "path": path,
-                    "timestamp": _now_str(),
+                    "timestamp": now,
+                })
+            elif tc.name == "move_file":
+                src = tc.args.get("source", "?")
+                dst = tc.args.get("destination", "?")
+                file_entries.append({
+                    "operation": "rename",
+                    "path": f"{src} -> {dst}",
+                    "timestamp": now,
                 })
         if file_entries:
             panel = self.query_one("#files-panel", FilesChangedPanel)
             panel.update_files(file_entries)
+            if last_diff:
+                panel.show_diff(last_diff)
             count = len(file_entries)
             s = "s" if count != 1 else ""
             self.notify(

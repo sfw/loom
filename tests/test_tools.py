@@ -15,6 +15,7 @@ from loom.tools.file_ops import (
     WriteFileTool,
     _generate_compact_diff,
     _line_similarity,
+    _line_start_offsets,
 )
 from loom.tools.git import GitCommandTool, check_git_safety, parse_subcommand
 from loom.tools.registry import (
@@ -798,3 +799,158 @@ class TestCompactDiff:
         after = "\n".join(f"LINE{i}" for i in range(100))
         diff = _generate_compact_diff(before, after, "test.py", max_lines=10)
         assert "more diff lines" in diff
+
+
+# --- _line_start_offsets ---
+
+class TestLineStartOffsets:
+    def test_unix_newlines(self):
+        offsets = _line_start_offsets("abc\ndef\nghi")
+        assert offsets == [0, 4, 8]
+
+    def test_windows_newlines(self):
+        offsets = _line_start_offsets("abc\r\ndef\r\nghi")
+        assert offsets == [0, 5, 10]
+
+    def test_old_mac_newlines(self):
+        offsets = _line_start_offsets("abc\rdef\rghi")
+        assert offsets == [0, 4, 8]
+
+    def test_trailing_newline(self):
+        offsets = _line_start_offsets("abc\n")
+        assert offsets == [0, 4]
+
+    def test_empty_string(self):
+        offsets = _line_start_offsets("")
+        assert offsets == [0]
+
+    def test_single_line_no_newline(self):
+        offsets = _line_start_offsets("hello")
+        assert offsets == [0]
+
+
+# --- Fuzzy ambiguity rejection ---
+
+class TestEditFileFuzzyAmbiguity:
+    async def test_ambiguous_fuzzy_rejects(self, ctx: ToolContext, workspace: Path):
+        """Two nearly-identical regions should cause fuzzy to reject (ambiguous)."""
+        # Two blocks that differ only slightly — both would fuzzy-match
+        (workspace / "ambig.py").write_text(
+            "def process_a():\n    return 1\n\n"
+            "def process_b():\n    return 1\n"
+        )
+        tool = EditFileTool()
+        # old_str with slightly wrong name — matches both blocks equally
+        result = await tool.execute(
+            {"path": "ambig.py", "old_str": "def process_x():\n    return 1", "new_str": "x"},
+            ctx,
+        )
+        assert not result.success
+
+    async def test_single_fuzzy_match_succeeds(self, ctx: ToolContext, workspace: Path):
+        """One clear fuzzy candidate should succeed."""
+        (workspace / "clear.py").write_text(
+            "def unique_function():  \n    return 42\n\ndef other_stuff():\n    pass\n"
+        )
+        tool = EditFileTool()
+        # Trailing whitespace difference only — clear unique match
+        result = await tool.execute(
+            {"path": "clear.py", "old_str": "def unique_function():\n    return 42", "new_str": "def unique_function():\n    return 99"},
+            ctx,
+        )
+        assert result.success
+        assert "99" in (workspace / "clear.py").read_text()
+
+
+# --- Fuzzy match with \r\n ---
+
+class TestEditFileCRLF:
+    async def test_fuzzy_with_crlf(self, ctx: ToolContext, workspace: Path):
+        """Fuzzy matching should handle \\r\\n files correctly."""
+        # Write a CRLF file using binary mode to prevent Python text mode conversion
+        (workspace / "crlf.py").write_bytes(b"def hello():  \r\n    return 1\r\n")
+        tool = EditFileTool()
+        # Model sends LF-only old_str (common from local models)
+        result = await tool.execute(
+            {"path": "crlf.py", "old_str": "def hello():\n    return 1", "new_str": "def hello():\n    return 2"},
+            ctx,
+        )
+        assert result.success
+        content = (workspace / "crlf.py").read_text()
+        assert "return 2" in content
+
+
+# --- Input validation ---
+
+class TestEditFileInputValidation:
+    async def test_edits_not_a_list(self, ctx: ToolContext, workspace: Path):
+        """edits parameter must be a list."""
+        tool = EditFileTool()
+        result = await tool.execute(
+            {"path": "src/main.py", "edits": "not a list"},
+            ctx,
+        )
+        assert not result.success
+        assert "array" in (result.error or "").lower()
+
+    async def test_edits_contains_non_dict(self, ctx: ToolContext, workspace: Path):
+        """Each element in edits must be a dict."""
+        tool = EditFileTool()
+        result = await tool.execute(
+            {"path": "src/main.py", "edits": [42]},
+            ctx,
+        )
+        assert not result.success
+        assert "object" in (result.error or "").lower()
+
+    async def test_single_edit_fuzzy_message_no_index(self, ctx: ToolContext, workspace: Path):
+        """Single-edit fuzzy message should not include an index number."""
+        (workspace / "fmsg.py").write_text("def foo():  \n    pass\n")
+        tool = EditFileTool()
+        result = await tool.execute(
+            {"path": "fmsg.py", "old_str": "def foo():\n    pass", "new_str": "def bar():\n    pass"},
+            ctx,
+        )
+        assert result.success
+        assert "(fuzzy match used)" in result.output
+        # Should NOT contain "edit 0"
+        assert "edit 0" not in result.output
+
+    async def test_batch_fuzzy_message_with_indices(self, ctx: ToolContext, workspace: Path):
+        """Batch fuzzy message should include which edit indices used fuzzy."""
+        # Multi-line old_str where trailing whitespace prevents exact match
+        (workspace / "bfmsg.py").write_text("def aaa():  \n    return 1\ndef bbb():\n    return 2\n")
+        tool = EditFileTool()
+        result = await tool.execute(
+            {
+                "path": "bfmsg.py",
+                "edits": [
+                    # edit 0: fuzzy — file has trailing ws on first line
+                    {"old_str": "def aaa():\n    return 1", "new_str": "def aaa():\n    return 10"},
+                    # edit 1: exact match
+                    {"old_str": "def bbb():\n    return 2", "new_str": "def bbb():\n    return 20"},
+                ],
+            },
+            ctx,
+        )
+        assert result.success
+        assert "fuzzy match used for edit 0" in result.output
+
+
+# --- Display: _extract_diff ---
+
+class TestExtractDiff:
+    def test_extracts_from_output(self):
+        from loom.cowork.display import _extract_diff
+        output = "Edited foo.py: replaced 1 lines\n\n--- a/foo.py\n+++ b/foo.py\n@@ stuff"
+        diff = _extract_diff(output)
+        assert diff.startswith("--- a/foo.py")
+        assert "+++ b/foo.py" in diff
+
+    def test_no_diff_present(self):
+        from loom.cowork.display import _extract_diff
+        assert _extract_diff("Edited foo.py: replaced 1 lines") == ""
+
+    def test_empty_output(self):
+        from loom.cowork.display import _extract_diff
+        assert _extract_diff("") == ""

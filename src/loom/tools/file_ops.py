@@ -360,10 +360,13 @@ class EditFileTool(Tool):
         # Build edit list from either single or batch mode
         edits_raw = args.get("edits")
         if edits_raw:
-            edit_pairs = [
-                (e.get("old_str", ""), e.get("new_str", ""))
-                for e in edits_raw
-            ]
+            if not isinstance(edits_raw, list):
+                return ToolResult.fail("'edits' must be an array of {old_str, new_str} objects.")
+            edit_pairs = []
+            for idx, e in enumerate(edits_raw):
+                if not isinstance(e, dict):
+                    return ToolResult.fail(f"edits[{idx}] must be an object with old_str and new_str.")
+                edit_pairs.append((e.get("old_str", ""), e.get("new_str", "")))
         elif "old_str" in args:
             edit_pairs = [(args["old_str"], args.get("new_str", ""))]
         else:
@@ -374,10 +377,6 @@ class EditFileTool(Tool):
             if not old_str:
                 label = f"edit[{i}]" if len(edit_pairs) > 1 else "old_str"
                 return ToolResult.fail(f"{label}: old_str cannot be empty.")
-
-        # Record in changelog before writing
-        if ctx.changelog is not None:
-            ctx.changelog.record_before_write(rel_path, subtask_id=ctx.subtask_id)
 
         original_content = content
         applied = []
@@ -396,6 +395,10 @@ class EditFileTool(Tool):
             if was_fuzzy:
                 fuzzy_used.append(i)
 
+        # Record in changelog only after all edits validated, before writing
+        if ctx.changelog is not None:
+            ctx.changelog.record_before_write(rel_path, subtask_id=ctx.subtask_id)
+
         # Write the final result
         path.write_text(content, encoding="utf-8")
 
@@ -412,8 +415,11 @@ class EditFileTool(Tool):
             msg = f"Edited {rel_path}: applied {n} edits"
 
         if fuzzy_used:
-            indices = ", ".join(str(i) for i in fuzzy_used)
-            msg += f" (fuzzy match used for edit{'s' if len(fuzzy_used) > 1 else ''} {indices})"
+            if n == 1:
+                msg += " (fuzzy match used)"
+            else:
+                indices = ", ".join(str(i) for i in fuzzy_used)
+                msg += f" (fuzzy match used for edit{'s' if len(fuzzy_used) > 1 else ''} {indices})"
 
         if diff_text:
             msg += f"\n\n{diff_text}"
@@ -462,6 +468,8 @@ class EditFileTool(Tool):
         """Find old_str in content using whitespace-normalized fuzzy matching.
 
         Returns (matched_text, start_index, end_index) or None.
+        Only matches if the best candidate is unambiguously better than
+        any runner-up (or the only match above threshold).
         """
         old_lines = old_str.splitlines()
         content_lines = content.splitlines()
@@ -471,6 +479,7 @@ class EditFileTool(Tool):
 
         n = len(old_lines)
         best_ratio = 0.0
+        second_ratio = 0.0
         best_range: tuple[int, int] | None = None
 
         # Slide a window of size n over content lines
@@ -478,28 +487,37 @@ class EditFileTool(Tool):
             candidate = content_lines[start:start + n]
             ratio = _line_similarity(old_lines, candidate)
             if ratio > best_ratio:
+                second_ratio = best_ratio
                 best_ratio = ratio
                 best_range = (start, start + n)
+            elif ratio > second_ratio:
+                second_ratio = ratio
 
         if best_ratio < self.FUZZY_THRESHOLD or best_range is None:
             return None
 
-        # Convert line range back to character positions
-        matched_lines = content_lines[best_range[0]:best_range[1]]
-        matched_text = "\n".join(matched_lines)
+        # Reject if runner-up is too close — match is ambiguous
+        if second_ratio >= self.FUZZY_THRESHOLD and (best_ratio - second_ratio) < 0.05:
+            return None
 
-        # Find the character offset of the matched line range
-        char_start = 0
-        for i in range(best_range[0]):
-            char_start += len(content_lines[i]) + 1  # +1 for newline
+        # Find the character range by searching for the exact line boundaries
+        # in the original content.  This handles \r\n, \r, and \n correctly
+        # because we locate lines by walking the raw content string.
+        line_starts = _line_start_offsets(content)
+        char_start = line_starts[best_range[0]]
 
-        char_end = char_start + len(matched_text)
+        end_line = best_range[1] - 1  # last matched line (inclusive)
+        # End offset is start of the last line + its raw length
+        line_end_offset = line_starts[end_line] + len(content_lines[end_line])
+        char_end = line_end_offset
+
+        matched_text = content[char_start:char_end]
 
         # Handle trailing newline edge case: if the original old_str ended
         # with a newline, extend the match to include it
         if old_str.endswith("\n") and char_end < len(content) and content[char_end] == "\n":
             char_end += 1
-            matched_text += "\n"
+            matched_text = content[char_start:char_end]
 
         return matched_text, char_start, char_end
 
@@ -526,6 +544,30 @@ class EditFileTool(Tool):
         snippet = content_lines[start:end]
         numbered = [f"  {start + j + 1:4d} | {line}" for j, line in enumerate(snippet)]
         return "\n".join(numbered)
+
+
+def _line_start_offsets(content: str) -> list[int]:
+    """Return the character offset where each line begins.
+
+    Works correctly for \\n, \\r\\n, and \\r line endings.
+    """
+    offsets = [0]
+    i = 0
+    while i < len(content):
+        ch = content[i]
+        if ch == "\r":
+            # \r\n or standalone \r
+            if i + 1 < len(content) and content[i + 1] == "\n":
+                i += 2
+            else:
+                i += 1
+            offsets.append(i)
+        elif ch == "\n":
+            i += 1
+            offsets.append(i)
+        else:
+            i += 1
+    return offsets
 
 
 def _line_similarity(a: list[str], b: list[str]) -> float:

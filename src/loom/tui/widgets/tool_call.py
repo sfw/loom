@@ -55,6 +55,9 @@ def tool_output_preview(tool_name: str, output: str) -> str:
         return f"{len(output.splitlines())} lines"
     if tool_name == "shell_execute":
         return _trunc(output.strip().split("\n")[0], 60)
+    if tool_name == "edit_file":
+        # Show summary line only, not the diff
+        return _trunc(output.split("\n")[0], 80)
     if tool_name == "web_search":
         hits = [
             x for x in output.strip().split("\n")
@@ -62,6 +65,39 @@ def tool_output_preview(tool_name: str, output: str) -> str:
         ]
         return f"{len(hits)} results" if hits else ""
     return ""
+
+
+def _style_diff_output(output: str) -> str:
+    """Apply Rich markup to diff output for syntax highlighting.
+
+    Colors diff lines: green for additions, red for removals,
+    cyan for hunk headers. Summary lines stay dim.
+    """
+    lines = output.splitlines()
+    styled_lines = []
+    in_diff = False
+
+    for line in lines:
+        if line.startswith("--- a/"):
+            in_diff = True
+            styled_lines.append(f"[bold]{_escape(line)}[/bold]")
+        elif line.startswith("+++ b/"):
+            styled_lines.append(f"[bold]{_escape(line)}[/bold]")
+        elif line.startswith("@@") and in_diff:
+            styled_lines.append(f"[#7dcfff]{_escape(line)}[/]")
+        elif line.startswith("+") and in_diff:
+            styled_lines.append(f"[#9ece6a]{_escape(line)}[/]")
+        elif line.startswith("-") and in_diff:
+            styled_lines.append(f"[#f7768e]{_escape(line)}[/]")
+        else:
+            styled_lines.append(f"[dim]{_escape(line)}[/dim]")
+
+    return "\n".join(styled_lines)
+
+
+def _escape(text: str) -> str:
+    """Escape Rich markup characters in text."""
+    return text.replace("[", "\\[")
 
 
 class ToolCallWidget(Static):
@@ -118,8 +154,13 @@ class ToolCallWidget(Static):
                 snippet = self._output[:2000]
                 if len(self._output) > 2000:
                     snippet += "\n..."
+                # Apply diff highlighting for edit_file output
+                if self._tool_name == "edit_file":
+                    styled = _style_diff_output(snippet)
+                else:
+                    styled = f"[dim]{snippet}[/dim]"
                 yield Collapsible(
-                    Static(f"[dim]{snippet}[/dim]"),
+                    Static(styled),
                     title=title,
                     collapsed=True,
                 )
