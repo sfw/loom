@@ -128,8 +128,7 @@ workspace_analysis:
     - "*.csv — market data, customer lists, or survey results"
     - "*.md — prior strategy documents or briefs"
   guidance: |
-    Reference existing research rather than duplicating. Use customer data
-    to ground segmentation in reality.
+    Reference existing research rather than duplicating.
 
 planner_examples:
   - goal: "GTM strategy for B2B SaaS analytics platform entering mid-market"

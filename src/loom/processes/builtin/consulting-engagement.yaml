@@ -58,9 +58,7 @@ phases:
       - "workstream-findings.md — findings with hypothesis verdicts"
       - "evidence-exhibits.csv — data supporting each finding"
   - id: synthesize-recommendations
-    description: >
-      Synthesize into 3-5 ranked recommendations with quantified impact,
-      effort, timeline, and confidence level.
+    description: "Synthesize into 3-5 ranked recommendations with quantified impact and effort."
     depends_on: [gather-evidence]
     model_tier: 3
     verification_tier: 2
@@ -88,8 +86,8 @@ verification:
     - name: mece-structure
       description: "Issue tree branches must be MECE"
       check: >
-        Confirm no branch overlaps and together they fully cover the
-        governing question. Sub-hypotheses do not duplicate across branches.
+        Confirm no branch overlaps and they fully cover the governing
+        question. No duplicate sub-hypotheses across branches.
       severity: error
       type: llm
     - name: red-team
@@ -131,8 +129,7 @@ workspace_analysis:
     - "*.csv — financial data, operational metrics, or benchmarks"
     - "*.md — prior analyses, strategy docs, or meeting notes"
   guidance: |
-    Look for existing issue trees or hypothesis lists from prior work.
-    Check for data that can ground analysis in real numbers.
+    Look for existing issue trees or data from prior work.
 
 planner_examples:
   - goal: "Advise retailer on DTC e-commerce vs. doubling down on wholesale"
