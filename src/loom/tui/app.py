@@ -227,10 +227,14 @@ class LoomApp(App):
                     f"Resumed session [dim]{self._resume_session}[/dim] "
                     f"({self._session.session_state.turn_count} turns)"
                 )
-            except (ValueError, RuntimeError) as e:
-                chat.add_info(f"[bold #f7768e]Resume failed: {e}[/]")
+            except Exception as e:
+                chat.add_info(
+                    f"[bold #f7768e]Resume failed: {e}[/] "
+                    f"Starting fresh session."
+                )
                 self._session = None
-        elif self._store is not None:
+
+        if self._session is None and self._store is not None:
             # New persisted session
             session_id = await self._store.create_session(
                 workspace=str(self._workspace),
@@ -290,36 +294,43 @@ class LoomApp(App):
                 session_state=self._session.session_state,
             )
         if self._delegate_tool and self._config and self._db:
-            from loom.engine.orchestrator import Orchestrator
-            from loom.events.bus import EventBus
-            from loom.models.router import ModelRouter
-            from loom.prompts.assembler import PromptAssembler
-            from loom.state.memory import MemoryManager
-            from loom.state.task_state import TaskStateManager
-            from loom.tools import create_default_registry as _create_tools
+            try:
+                from loom.engine.orchestrator import Orchestrator
+                from loom.events.bus import EventBus
+                from loom.models.router import ModelRouter
+                from loom.prompts.assembler import PromptAssembler
+                from loom.state.memory import MemoryManager
+                from loom.state.task_state import TaskStateManager
+                from loom.tools import create_default_registry as _create_tools
 
-            config = self._config
-            db = self._db
+                config = self._config
+                db = self._db
 
-            if hasattr(config, "workspace"):
-                data_dir = Path(config.workspace.scratch_dir).expanduser()
-            else:
-                data_dir = Path.home() / ".loom"
+                if hasattr(config, "workspace"):
+                    data_dir = Path(
+                        config.workspace.scratch_dir,
+                    ).expanduser()
+                else:
+                    data_dir = Path.home() / ".loom"
 
-            router = ModelRouter.from_config(config)
+                router = ModelRouter.from_config(config)
 
-            async def _orchestrator_factory():
-                return Orchestrator(
-                    model_router=router,
-                    tool_registry=_create_tools(),
-                    memory_manager=MemoryManager(db),
-                    prompt_assembler=PromptAssembler(),
-                    state_manager=TaskStateManager(data_dir),
-                    event_bus=EventBus(),
-                    config=config,
-                )
+                async def _orchestrator_factory():
+                    return Orchestrator(
+                        model_router=router,
+                        tool_registry=_create_tools(),
+                        memory_manager=MemoryManager(db),
+                        prompt_assembler=PromptAssembler(),
+                        state_manager=TaskStateManager(data_dir),
+                        event_bus=EventBus(),
+                        config=config,
+                    )
 
-            self._delegate_tool.bind(_orchestrator_factory)
+                self._delegate_tool.bind(_orchestrator_factory)
+            except Exception:
+                # delegate_task remains unbound; it will return a
+                # "not available" message if the model tries to use it.
+                pass
 
     # ------------------------------------------------------------------
     # Session management helpers
@@ -555,7 +566,7 @@ class LoomApp(App):
             if match:
                 try:
                     await self._switch_to_session(match["id"])
-                except (ValueError, RuntimeError) as e:
+                except Exception as e:
                     chat.add_info(f"[bold #f7768e]Resume failed: {e}[/]")
             else:
                 chat.add_info(f"No session found matching '{prefix}'.")
@@ -743,6 +754,16 @@ class LoomApp(App):
                             and event.result.data
                         ):
                             self._update_sidebar_tasks(event)
+
+                        # Handle ask_user in followup turns too
+                        if (
+                            event.name == "ask_user"
+                            and event.result
+                            and event.result.success
+                        ):
+                            answer = await self._handle_ask_user(event)
+                            if answer:
+                                await self._run_followup(answer)
 
                 elif isinstance(event, CoworkTurn):
                     if event.text and not streamed_text:

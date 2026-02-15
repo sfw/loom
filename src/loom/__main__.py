@@ -92,8 +92,20 @@ def _launch_tui(
     provider = _resolve_model(config, model_name)
     tools = create_default_registry()
 
-    # Initialize database and conversation store
+    # Initialize database and conversation store (fall back to ephemeral)
     db, store = _init_persistence(config)
+    if db is None:
+        click.echo(
+            "Warning: database unavailable, running in ephemeral mode.",
+            err=True,
+        )
+        if resume_session:
+            click.echo(
+                "Error: --resume requires database. Fix the database path "
+                "and retry.",
+                err=True,
+            )
+            sys.exit(1)
 
     app = LoomApp(
         model=provider,
@@ -109,23 +121,32 @@ def _launch_tui(
 
 
 def _init_persistence(config: Config):
-    """Initialize database and conversation store, returns (db, store)."""
+    """Initialize database and conversation store.
+
+    Returns (db, store) on success, or (None, None) if initialization fails.
+    The TUI will fall back to ephemeral mode when store is None.
+    """
     from loom.state.conversation_store import ConversationStore
     from loom.state.memory import Database
 
-    if hasattr(config, "workspace"):
-        data_dir = Path(config.workspace.scratch_dir).expanduser()
-    else:
-        data_dir = Path.home() / ".loom"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    db_path = data_dir / "loom.db"
-    db = Database(db_path)
+    try:
+        if hasattr(config, "workspace"):
+            data_dir = Path(config.workspace.scratch_dir).expanduser()
+        else:
+            data_dir = Path.home() / ".loom"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        db_path = data_dir / "loom.db"
+        db = Database(db_path)
 
-    # Run async init synchronously — Database.initialize() creates tables
-    asyncio.run(db.initialize())
+        # Run async init synchronously — each aiosqlite call opens its
+        # own connection so there's no state leaking into Textual's loop.
+        asyncio.run(db.initialize())
 
-    store = ConversationStore(db)
-    return db, store
+        store = ConversationStore(db)
+        return db, store
+    except Exception as e:
+        click.echo(f"Warning: database init failed: {e}", err=True)
+        return None, None
 
 
 # -- Subcommands that launch the TUI (aliases) ----------------------------
