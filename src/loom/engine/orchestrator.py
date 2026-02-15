@@ -14,8 +14,12 @@ import asyncio
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loom.config import Config
+
+if TYPE_CHECKING:
+    from loom.processes.schema import ProcessDefinition
 from loom.engine.runner import SubtaskResult, SubtaskRunner, ToolCallRecord
 from loom.engine.scheduler import Scheduler
 from loom.engine.verification import VerificationGates, VerificationResult
@@ -91,7 +95,7 @@ class Orchestrator:
         config: Config,
         approval_manager: ApprovalManager | None = None,
         learning_manager: LearningManager | None = None,
-        process: object | None = None,
+        process: ProcessDefinition | None = None,
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -501,7 +505,7 @@ class Orchestrator:
         """
         try:
             found_files: dict[str, list[str]] = {}
-            for pattern in self._process.workspace_scan:  # type: ignore[union-attr]
+            for pattern in self._process.workspace_scan:
                 # Pattern format: "*.md — description"
                 glob_pattern = pattern.split("—")[0].split(" — ")[0].strip()
                 # Handle comma-separated patterns like "*.csv, *.xlsx"

@@ -86,10 +86,11 @@ class DeterministicVerifier:
                 for f in tc.result.files_changed:
                     fpath = workspace / f
                     if fpath.exists():
+                        fsize = fpath.stat().st_size
                         checks.append(Check(
                             name=f"file_nonempty_{f}",
-                            passed=fpath.stat().st_size > 0,
-                            detail=f"File '{f}' is empty" if fpath.stat().st_size == 0 else None,
+                            passed=fsize > 0,
+                            detail=f"File '{f}' is empty" if fsize == 0 else None,
                         ))
 
         # 3. Syntax checks for known file types

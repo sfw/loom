@@ -119,10 +119,12 @@ def run(
     click.echo(f"Submitting task to {url}: {goal}")
     if ws:
         click.echo(f"Workspace: {ws}")
+    if process_name:
+        click.echo(f"Process: {process_name}")
 
     import asyncio
 
-    asyncio.run(_run_task(url, goal, ws))
+    asyncio.run(_run_task(url, goal, ws, process_name=process_name))
 
 
 def _validate_task_id(task_id: str) -> str:
@@ -134,7 +136,10 @@ def _validate_task_id(task_id: str) -> str:
     return task_id
 
 
-async def _run_task(server_url: str, goal: str, workspace: str | None) -> None:
+async def _run_task(
+    server_url: str, goal: str, workspace: str | None,
+    process_name: str | None = None,
+) -> None:
     """Submit task and stream progress."""
     import httpx
 
@@ -143,6 +148,8 @@ async def _run_task(server_url: str, goal: str, workspace: str | None) -> None:
             payload: dict = {"goal": goal}
             if workspace:
                 payload["workspace"] = workspace
+            if process_name:
+                payload["process"] = process_name
 
             response = await client.post("/tasks", json=payload)
             if response.status_code != 201:
@@ -312,11 +319,13 @@ def cowork(
     config = ctx.obj["config"]
     ws = (workspace or Path.cwd()).resolve()
 
-    asyncio.run(_cowork_session(config, ws, model, resume_session))
+    asyncio.run(_cowork_session(config, ws, model, resume_session, process_name))
 
 
 async def _cowork_session(
-    config, workspace: Path, model_name: str | None, resume_id: str | None = None,
+    config, workspace: Path, model_name: str | None,
+    resume_id: str | None = None,
+    process_name: str | None = None,
 ) -> None:
     """Run an interactive cowork session."""
     from loom.cowork.approval import ToolApprover, async_terminal_approval_prompt
@@ -385,8 +394,42 @@ async def _cowork_session(
 
     approver = ToolApprover(prompt_callback=async_terminal_approval_prompt)
 
+    # Load process definition if specified
+    process_defn = None
+    if process_name:
+        from loom.processes.schema import ProcessLoader
+
+        extra = [Path(p) for p in config.process.search_paths]
+        loader = ProcessLoader(workspace=workspace, extra_search_paths=extra)
+        try:
+            process_defn = loader.load(process_name)
+            click.echo(f"Loaded process: {process_defn.name} v{process_defn.version}")
+
+            # Apply tool exclusions from process
+            if process_defn.tools.excluded:
+                for tool_name in process_defn.tools.excluded:
+                    if tool_name in tools._tools:
+                        del tools._tools[tool_name]
+        except Exception as e:
+            display_error(f"Failed to load process '{process_name}': {e}")
+            return
+
     # Build session
     system_prompt = build_cowork_system_prompt(workspace)
+
+    # Inject process persona and guidance into system prompt
+    if process_defn:
+        process_additions = []
+        if process_defn.persona:
+            process_additions.append(
+                f"\n\nDOMAIN ROLE:\n{process_defn.persona.strip()}"
+            )
+        if process_defn.tool_guidance:
+            process_additions.append(
+                f"\n\nDOMAIN TOOL GUIDANCE:\n{process_defn.tool_guidance.strip()}"
+            )
+        if process_additions:
+            system_prompt += "".join(process_additions)
 
     if resume_id:
         # Resume existing session
