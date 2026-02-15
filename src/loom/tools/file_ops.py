@@ -10,14 +10,17 @@ from loom.content import (
     DocumentBlock,
     ImageBlock,
 )
-from loom.content_utils import get_image_dimensions
+from loom.content_utils import extract_docx_text, extract_pptx_text, get_image_dimensions
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg"})
 _PDF_EXTENSION = ".pdf"
+_DOCX_EXTENSIONS = frozenset({".doc", ".docx"})
+_PPTX_EXTENSIONS = frozenset({".ppt", ".pptx"})
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5MB
 MAX_PDF_BYTES = 32 * 1024 * 1024  # 32MB
+MAX_OFFICE_BYTES = 64 * 1024 * 1024  # 64MB
 MAX_PDF_PAGES_PER_READ = 20
 
 
@@ -30,8 +33,9 @@ class ReadFileTool(Tool):
     def description(self) -> str:
         return (
             "Read the contents of a file. Optionally specify a line range. "
-            "Supports text files, PDFs (with pagination), and image files "
-            "(returned as multimodal content for vision-capable models)."
+            "Supports text files, PDFs (with pagination), Word documents "
+            "(.doc/.docx), PowerPoint presentations (.ppt/.pptx), and image "
+            "files (returned as multimodal content for vision-capable models)."
         )
 
     @property
@@ -77,6 +81,14 @@ class ReadFileTool(Tool):
                 page_start=args.get("page_start", 0),
                 page_end=args.get("page_end"),
             )
+
+        # Word document handling
+        if suffix in _DOCX_EXTENSIONS:
+            return self._read_docx(path)
+
+        # PowerPoint handling
+        if suffix in _PPTX_EXTENSIONS:
+            return self._read_pptx(path)
 
         # Image handling
         if suffix in _IMAGE_EXTENSIONS:
@@ -212,6 +224,81 @@ class ReadFileTool(Tool):
             blocks=[block],
             data={"type": "image", "name": path.name,
                   "size": size, "format": suffix},
+        )
+
+
+    @staticmethod
+    def _read_docx(path: Path) -> ToolResult:
+        """Read a Word document and return extracted text."""
+        size = path.stat().st_size
+        if size > MAX_OFFICE_BYTES:
+            return ToolResult.fail(
+                f"Word document too large: {size:,} bytes "
+                f"(limit: {MAX_OFFICE_BYTES:,} bytes)"
+            )
+
+        try:
+            text = extract_docx_text(path)
+        except Exception as e:
+            return ToolResult.fail(f"Error reading Word document: {e}")
+
+        if not text.strip():
+            text_fallback = f"[Word document: {path.name}, {size:,} bytes, no extractable text]"
+        else:
+            text_fallback = text
+
+        block = DocumentBlock(
+            source_path=str(path),
+            media_type=(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+            size_bytes=size,
+            extracted_text=text,
+            text_fallback=text_fallback,
+        )
+
+        return ToolResult.multimodal(
+            output=text_fallback,
+            blocks=[block],
+            data={"type": "docx", "name": path.name, "size": size},
+        )
+
+    @staticmethod
+    def _read_pptx(path: Path) -> ToolResult:
+        """Read a PowerPoint presentation and return extracted text."""
+        size = path.stat().st_size
+        if size > MAX_OFFICE_BYTES:
+            return ToolResult.fail(
+                f"PowerPoint file too large: {size:,} bytes "
+                f"(limit: {MAX_OFFICE_BYTES:,} bytes)"
+            )
+
+        try:
+            text = extract_pptx_text(path)
+        except Exception as e:
+            return ToolResult.fail(f"Error reading PowerPoint file: {e}")
+
+        if not text.strip():
+            text_fallback = (
+                f"[PowerPoint: {path.name}, {size:,} bytes, no extractable text]"
+            )
+        else:
+            text_fallback = text
+
+        block = DocumentBlock(
+            source_path=str(path),
+            media_type=(
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            ),
+            size_bytes=size,
+            extracted_text=text,
+            text_fallback=text_fallback,
+        )
+
+        return ToolResult.multimodal(
+            output=text_fallback,
+            blocks=[block],
+            data={"type": "pptx", "name": path.name, "size": size},
         )
 
 

@@ -126,6 +126,47 @@ def _resize_and_encode(path: Path, max_dim: int) -> str:
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def extract_docx_text(path: Path) -> str:
+    """Extract text content from a .docx file.
+
+    Extracts paragraph text in document order.
+    Returns the extracted text or raises on failure.
+    """
+    from docx import Document
+
+    doc = Document(str(path))
+    paragraphs = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            paragraphs.append(text)
+    return "\n\n".join(paragraphs)
+
+
+def extract_pptx_text(path: Path) -> str:
+    """Extract text content from a .pptx file.
+
+    Iterates over slides and extracts text from all shapes,
+    prefixed with slide numbers.
+    Returns the extracted text or raises on failure.
+    """
+    from pptx import Presentation
+
+    prs = Presentation(str(path))
+    slides_text = []
+    for i, slide in enumerate(prs.slides, 1):
+        texts = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    text = para.text.strip()
+                    if text:
+                        texts.append(text)
+        if texts:
+            slides_text.append(f"--- Slide {i} ---\n" + "\n".join(texts))
+    return "\n\n".join(slides_text)
+
+
 def pdf_pages_to_images(
     path: Path,
     page_range: tuple[int, int] | None = None,
