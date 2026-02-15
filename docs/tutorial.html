@@ -411,7 +411,7 @@
   <a href="#first-task">Your First Task</a>
   <a href="#streaming">Streaming Events</a>
   <a href="#steering">Steering Tasks</a>
-  <a href="#tui">Terminal UI</a>
+  <a href="#tui">Interactive TUI</a>
   <div class="section-label">Features</div>
   <a href="#processes">Process Definitions</a>
   <a href="#approval">Approval Gates</a>
@@ -848,31 +848,57 @@
 
 <!-- ======================== TUI ======================== -->
 <section id="tui">
-  <h2>Terminal UI</h2>
+  <h2>Interactive TUI</h2>
 
-  <p>Loom includes a full terminal dashboard built with <strong>Textual</strong>. It connects to the API server as a client.</p>
+  <p>Loom's default interface is a rich terminal UI built with <strong>Textual</strong>. It runs the model directly &mdash; no server needed. Just run <code>loom</code>.</p>
 
-  <pre><code><span class="cmt"># Make sure the server is running first</span>
-<span class="cmd">loom serve</span> &amp;
+  <pre><code><span class="cmt"># Launch the interactive TUI (default command)</span>
+<span class="cmd">loom</span> <span class="flag">-w</span> /path/to/project
 
-<span class="cmt"># Launch the TUI</span>
-<span class="cmd">loom tui</span>
+<span class="cmt"># With a process definition</span>
+<span class="cmd">loom</span> <span class="flag">-w</span> /path/to/project <span class="flag">--process</span> consulting-engagement
 
-<span class="cmt"># Connect to a different server</span>
-<span class="cmd">loom tui</span> <span class="flag">--base-url</span> http://localhost:8080</code></pre>
+<span class="cmt"># Resume a previous session</span>
+<span class="cmd">loom</span> <span class="flag">--resume</span> a1b2c3d4
+
+<span class="cmt"># "loom cowork" is an alias for the same interface</span>
+<span class="cmd">loom cowork</span> <span class="flag">-w</span> /path/to/project</code></pre>
+
+  <h3>Layout</h3>
+  <p>The TUI has a sidebar with workspace browser and task progress, a main area with tabbed content (Chat, Files Changed, Events), and a status bar showing workspace, model, and token count.</p>
 
   <h3>Keyboard Shortcuts</h3>
   <table>
     <tr><th>Key</th><th>Action</th></tr>
-    <tr><td><code>n</code></td><td>Create a new task</td></tr>
-    <tr><td><code>r</code></td><td>Refresh the task list</td></tr>
-    <tr><td><code>s</code></td><td>Steer the selected task (inject instructions)</td></tr>
-    <tr><td><code>a</code></td><td>Approve/reject a gated step</td></tr>
-    <tr><td><code>c</code></td><td>Cancel the selected task</td></tr>
-    <tr><td><code>q</code></td><td>Quit</td></tr>
+    <tr><td><code>Ctrl+B</code></td><td>Toggle sidebar</td></tr>
+    <tr><td><code>Ctrl+L</code></td><td>Clear chat</td></tr>
+    <tr><td><code>Ctrl+P</code></td><td>Command palette</td></tr>
+    <tr><td><code>Ctrl+1/2/3</code></td><td>Switch tabs (Chat / Files / Events)</td></tr>
+    <tr><td><code>Ctrl+C</code></td><td>Quit</td></tr>
   </table>
 
-  <p>The dashboard shows all tasks in a table view. Select a task to see its plan tree, live execution output, and subtask status. Events stream in real-time via SSE.</p>
+  <h3>Slash Commands</h3>
+  <table>
+    <tr><th>Command</th><th>Action</th></tr>
+    <tr><td><code>/help</code></td><td>Show available commands and shortcuts</td></tr>
+    <tr><td><code>/sessions</code></td><td>List all saved sessions</td></tr>
+    <tr><td><code>/new</code></td><td>Start a new session</td></tr>
+    <tr><td><code>/session</code></td><td>Show current session info (turns, tokens, focus)</td></tr>
+    <tr><td><code>/resume &lt;id&gt;</code></td><td>Switch to a different session</td></tr>
+    <tr><td><code>/model</code></td><td>Show current model</td></tr>
+    <tr><td><code>/tools</code></td><td>List available tools</td></tr>
+    <tr><td><code>/tokens</code></td><td>Show session token usage</td></tr>
+    <tr><td><code>/clear</code></td><td>Clear the chat display</td></tr>
+    <tr><td><code>/quit</code></td><td>Exit Loom</td></tr>
+  </table>
+
+  <h3>Session Persistence</h3>
+  <p>Every conversation turn is persisted to SQLite. Sessions survive restarts. The model has access to a <code>conversation_recall</code> tool to search past context that has fallen out of the context window, and a <code>delegate_task</code> tool to spawn autonomous sub-agents for complex work.</p>
+
+  <div class="callout callout-info">
+    <strong>Tool approval</strong>
+    Read-only tools (read_file, search, glob, web_search, etc.) are auto-approved. Write and execute tools show an approval modal: <strong>[y]es</strong>, <strong>[a]lways</strong>, or <strong>[n]o</strong>.
+  </div>
 </section>
 
 <!-- ======================== PROCESSES ======================== -->
@@ -906,8 +932,8 @@
 <span class="cmt"># Run a task with a specific process</span>
 <span class="cmd">loom run</span> <span class="str">"Analyze Tesla for investment"</span> <span class="flag">--workspace</span> /tmp/tesla <span class="flag">--process</span> investment-analysis
 
-<span class="cmt"># Interactive cowork with a process</span>
-<span class="cmd">loom cowork</span> <span class="flag">-w</span> /tmp/project <span class="flag">--process</span> consulting-engagement</code></pre>
+<span class="cmt"># Interactive session with a process</span>
+<span class="cmd">loom</span> <span class="flag">-w</span> /tmp/project <span class="flag">--process</span> consulting-engagement</code></pre>
 
   <h3>What a Process Injects</h3>
   <div class="card-grid">
@@ -1288,13 +1314,17 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
 
   <h3>Source Layout</h3>
   <pre><code>src/loom/
-  __main__.py            <span class="cmt"># CLI (Click)</span>
+  __main__.py            <span class="cmt"># CLI (Click), TUI launcher (default command)</span>
   config.py              <span class="cmt"># TOML config loader</span>
   api/
     server.py            <span class="cmt"># FastAPI app + lifespan</span>
     routes.py            <span class="cmt"># All REST endpoints</span>
     schemas.py           <span class="cmt"># Pydantic models</span>
     engine.py            <span class="cmt"># Component wiring</span>
+  cowork/
+    session.py           <span class="cmt"># CoworkSession — core conversation engine</span>
+    session_state.py     <span class="cmt"># Session metadata tracking</span>
+    approval.py          <span class="cmt"># Per-tool-call approval system</span>
   engine/
     orchestrator.py      <span class="cmt"># Plan -> execute -> verify -> finalize</span>
     scheduler.py         <span class="cmt"># Dependency resolution</span>
@@ -1327,6 +1357,7 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
   state/
     task_state.py        <span class="cmt"># Task/Subtask dataclasses</span>
     memory.py            <span class="cmt"># SQLite memory archive</span>
+    conversation_store.py<span class="cmt"># Session persistence + recall</span>
     schema.sql           <span class="cmt"># DB schema</span>
   tools/
     registry.py          <span class="cmt"># Tool ABC + auto-discovery</span>
@@ -1341,8 +1372,9 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     document_write.py    <span class="cmt"># Structured Markdown generation</span>
     workspace.py         <span class="cmt"># Changelog + revert</span>
   tui/
-    api_client.py        <span class="cmt"># Async HTTP + SSE client</span>
-    app.py               <span class="cmt"># Textual dashboard</span></code></pre>
+    app.py               <span class="cmt"># Textual TUI — unified interactive interface</span>
+    widgets/             <span class="cmt"># Chat log, sidebar, status bar, panels</span>
+    screens/             <span class="cmt"># Tool approval, ask_user modals</span></code></pre>
 </section>
 
 <!-- ======================== CONFIG REF ======================== -->

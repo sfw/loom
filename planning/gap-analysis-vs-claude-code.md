@@ -328,10 +328,9 @@ All 14 gaps identified in this analysis have been implemented and tested (612+ t
 ## Implementation Summary
 
 ### Phase 1: Interactive Cowork Mode (Gaps 1-4) — COMPLETE
-- `loom cowork -w /path` — CLI REPL with streaming, tool display, ask_user
-- `loom tui -w /path` — Textual app with modals, scrollback, same engine
+- `loom -w /path` — unified Textual TUI with full session persistence, conversation recall, task delegation
 - CoworkSession: conversation-first tool loop, no planning phase
-- Full message history as primary context
+- Full message history as primary context, SQLite write-through persistence
 
 ### Phase 2: Tool Parity (Gaps 5-8) — COMPLETE
 - ripgrep_search, glob_find, web_search tools added

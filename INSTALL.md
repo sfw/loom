@@ -272,20 +272,18 @@ curl http://localhost:9000/health
 
 ## First Session
 
-### Interactive Cowork (Recommended)
+### Interactive (Recommended)
 
-The fastest way to start — no server needed:
+The fastest way to start — no server needed. Just run `loom`:
 
 ```bash
 mkdir -p /tmp/loom-demo
-loom cowork -w /tmp/loom-demo
+loom -w /tmp/loom-demo
 ```
 
-Or use the Textual TUI for a richer interface:
-
-```bash
-loom tui -w /tmp/loom-demo
-```
+This launches the interactive TUI with full session persistence, conversation
+recall, and tool approval modals. All conversation history is saved to SQLite
+and survives restarts. Resume any session with `loom --resume <session-id>`.
 
 ### Autonomous Task Mode
 

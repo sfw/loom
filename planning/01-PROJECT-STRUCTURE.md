@@ -242,10 +242,11 @@ event_log_path = "~/.loom/logs"
 ## CLI Entry Points
 
 ```
-loom serve              # Start the API server
-loom tui                # Launch the terminal UI
+loom                    # Launch the interactive TUI (default)
+loom cowork             # Alias for the interactive TUI
 loom run <goal>         # Quick run: submit task, show progress, return result
 loom run <goal> --workspace /path/to/project
+loom serve              # Start the API server
 loom status <task_id>   # Check task status
 loom cancel <task_id>   # Cancel a running task
 loom models             # List available models and status

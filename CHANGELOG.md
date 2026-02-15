@@ -4,6 +4,9 @@ All notable changes to Loom are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Unified TUI as default interface** (`tui/app.py`, `__main__.py`) -- `loom` with no subcommand now launches the Textual TUI with full cowork backend: session persistence (SQLite), conversation recall, task delegation, process definitions, and session management. The separate plain-text REPL is removed. `loom cowork` is an alias for the default TUI. New slash commands: `/sessions`, `/new`, `/session`, `/resume <id>`.
+
 ### Added
 - **Process definition plugin architecture** (`processes/schema.py`) -- YAML-based domain specialization. Process definitions inject personas, phase blueprints, verification rules, tool guidance, and memory extraction types into the engine without code changes. Multi-path discovery (builtin → user-global → workspace-local), comprehensive validation with dependency cycle detection, and support for process packages that bundle tools.
 - **5 built-in process definitions** (`processes/builtin/`) -- `investment-analysis` (5-phase strict financial workflow), `marketing-strategy` (6-phase guided GTM), `research-report` (4-phase research pipeline), `competitive-intel` (3-phase competitive analysis), `consulting-engagement` (5-phase McKinsey-style issue tree).
@@ -77,8 +80,8 @@ All notable changes to Loom are documented in this file.
 - **delegate_task files** (`tools/delegate_task.py`) -- reports change counts instead of returning timestamp as path.
 
 ### Previously added
-- **Cowork mode** (`cowork/session.py`, `cowork/display.py`) -- conversation-first interactive execution. No planning phase, no subtask decomposition -- just a continuous tool-calling loop driven by natural conversation with the developer. Full conversation history maintained as context.
-- **`loom cowork` CLI command** -- interactive REPL with real-time tool call display, ANSI-colored output, and special commands (`/quit`, `/help`). Usage: `loom cowork -w /path/to/project`.
+- **Cowork mode** (`cowork/session.py`) -- conversation-first interactive execution. No planning phase, no subtask decomposition -- just a continuous tool-calling loop driven by natural conversation with the developer. Full conversation history maintained as context. Now the default `loom` interface via the unified TUI.
+- **`loom cowork` CLI command** -- interactive session with real-time tool call display and special commands (`/quit`, `/help`, `/sessions`, `/new`, `/resume`). Usage: `loom -w /path/to/project` (or `loom cowork -w /path/to/project`).
 - **`ask_user` tool** -- lets the model ask the developer questions mid-execution instead of guessing. Supports free-text and multiple-choice options. The cowork CLI intercepts these and prompts the user.
 - **`ripgrep_search` tool** -- fast content search that shells out to `rg` (ripgrep). Falls back to `grep`, then pure Python. Supports regex, file type filtering, context lines, case insensitivity, and files-only mode.
 - **`glob_find` tool** -- fast file discovery by glob pattern (`**/*.py`, `src/**/*.ts`). Results sorted by modification time, automatically skips `.git`, `node_modules`, `__pycache__`, etc.
@@ -92,8 +95,8 @@ All notable changes to Loom are documented in this file.
 - **PDF/image file support** in `read_file` -- PDFs: extracts text page-by-page via `pypdf` (optional dep). Images: returns file metadata. Both fall back gracefully when libraries aren't installed.
 
 ### Changed
-- **TUI rewritten for cowork mode** (`tui/app.py`) -- no longer requires a running `loom serve`. Uses `CoworkSession` directly with streaming text, tool approval modals (`[y]es / [a]lways / [n]o`), and `ask_user` modals. Same interface as `loom cowork` but with Textual widgets. Usage: `loom tui -w /path/to/project`.
-- **Cowork CLI uses streaming by default** -- text tokens display incrementally as they arrive instead of waiting for the full response.
+- **TUI is the unified interactive interface** (`tui/app.py`) -- runs `CoworkSession` directly with full persistence, streaming text, tool approval modals, `ask_user` modals, conversation recall, and task delegation. Launched as the default `loom` command.
+- **Streaming by default** -- text tokens display incrementally as they arrive instead of waiting for the full response.
 - **Git tool** -- `push` and `remote` added to allowed subcommands (force push still blocked).
 - **Shell tool** -- timeout increased from 60s to 120s for longer-running commands.
 - **Tool output limit** -- increased from 10KB to 30KB for richer tool results.
@@ -163,7 +166,7 @@ All notable changes to Loom are documented in this file.
 - **Scheduler** (`engine/scheduler.py`) -- dependency graph resolution for subtask ordering.
 - **Verification gates** (`engine/verification.py`) -- three-tier verification: deterministic checks (syntax, file existence), independent LLM review, multi-vote verification.
 - **Event bus** (`events/bus.py`) -- in-process async pub/sub for real-time updates.
-- **CLI** (`__main__.py`) -- Click-based CLI with serve, run, status, cancel, models, tui, mcp-serve commands.
+- **CLI** (`__main__.py`) -- Click-based CLI with default TUI, serve, run, status, cancel, models, cowork, mcp-serve commands.
 
 ---
 

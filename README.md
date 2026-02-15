@@ -14,9 +14,9 @@ Loom is that help. It's the harness that turns a local model into a working agen
 
 ## Two Ways to Work
 
-**Cowork mode** (`loom cowork` / `loom tui`) -- Interactive pair programming. You talk, the model responds and uses tools, you see what it's doing in real time. Like Claude Code, but running against whatever model you want. Streaming text, inline diffs after file edits, per-tool-call approval, and slash commands for control.
+**Interactive** (`loom`) -- Pair programming in a rich terminal UI. You talk, the model responds and uses tools, you see what it's doing in real time. Like Claude Code, but running against whatever model you want. Streaming text, inline diffs, per-tool-call approval, session persistence, conversation recall, and slash commands for control.
 
-**Task mode** (`loom run`) -- Autonomous execution. Give Loom a goal, walk away. It decomposes the work into subtasks with a dependency graph, runs independent subtasks in parallel, verifies each result with an independent model, and replans when things go wrong.
+**Autonomous** (`loom run`) -- Give Loom a goal, walk away. It decomposes the work into subtasks with a dependency graph, runs independent subtasks in parallel, verifies each result with an independent model, and replans when things go wrong.
 
 ```
                     +----------------------------+
@@ -36,7 +36,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Built for local model weaknesses.** Cloud models reproduce code strings precisely. Local models don't -- they drift on whitespace, swap tabs for spaces, drop trailing newlines. Loom's edit tool handles this with fuzzy matching: when an exact string match fails, it normalizes whitespace and finds the closest candidate above a similarity threshold. It also rejects ambiguous matches (two similar regions) so it won't silently edit the wrong code. This is the difference between a tool that works with Qwen 14B and one that fails 30% of the time.
 
-**Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. A dangling reference detector nudges the model to use recall when the user says "as I mentioned earlier." No compression pass, no lost details, no extra LLM calls.
+**Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. Resume any previous session exactly where you left off with `--resume`. No compression pass, no lost details, no extra LLM calls.
 
 **The harness drives, not the model.** The model is a reasoning engine called repeatedly with scoped prompts. The orchestrator decides what happens next: which subtasks to run, when to verify, when to replan, when to escalate. This means a weaker model in a strong harness outperforms a stronger model in a weak one.
 
@@ -46,7 +46,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **21 built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move), shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch, web search (DuckDuckGo, no API key), code analysis (tree-sitter), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, and ask_user for mid-execution questions. All tools auto-discovered via `__init_subclass__`.
 
-**Inline diffs.** Every file edit produces a unified diff in the tool result. In cowork mode, diffs render with ANSI colors (green additions, red removals). In the TUI, diffs get Rich markup syntax highlighting. You always see exactly what changed.
+**Inline diffs.** Every file edit produces a unified diff in the tool result. Diffs render with Rich markup syntax highlighting in the TUI -- green additions, red removals. You always see exactly what changed.
 
 ## Quick Start
 
@@ -58,11 +58,14 @@ uv sync          # or: pip install -e .
 cp loom.toml ~/.loom/loom.toml
 # Edit with your model endpoints (Ollama, LM Studio, vLLM, Claude, etc.)
 
-# Interactive pair programming
-loom cowork -w /path/to/project
+# Launch the interactive TUI (default)
+loom -w /path/to/project
 
-# Or with the richer Textual TUI
-loom tui -w /path/to/project
+# With a process definition
+loom -w /path/to/project --process consulting-engagement
+
+# Resume a previous session
+loom --resume <session-id>
 
 # Autonomous task execution
 loom run "Refactor the auth module to use JWT" --workspace /path/to/project
@@ -106,24 +109,23 @@ YAML-based domain specialization. A process definition injects a persona, phase 
 
 ```bash
 loom processes                              # list available
-loom cowork -w /tmp/acme --process consulting-engagement
+loom -w /tmp/acme --process consulting-engagement
 loom install user/repo                      # install from GitHub
 ```
 
 ## Interfaces
 
-- **CLI cowork** -- streaming conversation with ANSI-colored tool output and inline diffs
-- **Textual TUI** -- rich terminal interface with chat panel, file changes panel with diff viewer, task progress sidebar, tool approval modals, event log with token sparkline
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Full session persistence, conversation recall, task delegation, and session management (`/sessions`, `/new`, `/resume`).
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
 ## CLI Commands
 
 ```
-loom serve              Start the API server
-loom cowork             Interactive pair programming (CLI)
-loom tui                Interactive pair programming (Textual TUI)
+loom                    Launch the interactive TUI (default)
+loom cowork             Alias for the interactive TUI
 loom run GOAL           Autonomous task execution with streaming progress
+loom serve              Start the API server
 loom status ID          Check task status
 loom cancel ID          Cancel a running task
 loom models             List configured models
@@ -134,16 +136,22 @@ loom mcp-serve          Start the MCP server (stdio transport)
 loom reset-learning     Clear learned patterns
 ```
 
+Common flags for `loom` / `loom cowork`:
+- `-w /path` -- workspace directory
+- `-m model` -- model name from config
+- `--resume <id>` -- resume a previous session
+- `--process <name>` -- load a process definition
+
 ## Architecture
 
 16,000 lines of Python. 1,039 tests. No frameworks (no LangChain, no CrewAI).
 
 ```
 src/loom/
-  __main__.py            CLI (Click), cowork loop, TUI launcher
+  __main__.py            CLI (Click), TUI launcher (default command)
   config.py              TOML config loader
   api/                   FastAPI server, REST routes, SSE streaming
-  cowork/                Conversation session, approval, terminal display
+  cowork/                Conversation session, approval, session state
   engine/                Orchestrator, subtask runner, scheduler, verification
   events/                Pub/sub event bus, persistence, webhooks
   integrations/          MCP server
@@ -154,7 +162,7 @@ src/loom/
   recovery/              Approval gates, confidence scoring, retry escalation
   state/                 Task state, SQLite memory archive, conversation store
   tools/                 21 tools with auto-discovery, safety, changelog
-  tui/                   Textual app, chat log, diff viewer, approval modals
+  tui/                   Textual TUI: chat, sidebar, diff viewer, modals, events
 ```
 
 ## Development

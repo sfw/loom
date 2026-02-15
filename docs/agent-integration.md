@@ -3,7 +3,7 @@
 This guide shows how to connect external agents (Claude Code, custom scripts, cron jobs, other AI agents) to Loom as clients.
 
 **Two execution models:**
-- **Cowork mode** (`loom cowork` / `loom tui`) — interactive, conversation-first. The agent and developer collaborate in real time with 19 tools, streaming, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition.
+- **Interactive** (`loom`) — conversation-first TUI with full session persistence. The agent and developer collaborate in real time with 21 tools, streaming, conversation recall, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition.
 - **Task mode** (REST API / MCP) — autonomous, fire-and-forget. Loom decomposes the goal into subtasks, executes, verifies, and reports back.
 
 This document covers both modes.
@@ -507,7 +507,7 @@ loom processes
 
 # Use with CLI
 loom run "Analyze ACME Corp" --workspace /tmp/acme --process investment-analysis
-loom cowork -w /tmp/project --process consulting-engagement
+loom -w /tmp/project --process consulting-engagement
 ```
 
 | Process | Phases | Mode | Domain |
