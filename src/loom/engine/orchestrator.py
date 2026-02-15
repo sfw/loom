@@ -478,22 +478,94 @@ class Orchestrator:
 
         return self._parse_plan(response, goal=task.goal)
 
-    async def _analyze_workspace(self, workspace_path: Path) -> str:
-        """Run code analysis on workspace files for better planning context.
+    # Document extensions grouped by category for workspace scanning.
+    _DOC_EXTENSIONS: dict[str, tuple[str, ...]] = {
+        "Documents": (".md", ".rst", ".txt", ".pdf"),
+        "Data": (".csv", ".json", ".yaml", ".yml", ".toml", ".xml"),
+        "Images": (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp"),
+        "Office": (".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"),
+    }
+    _ALL_DOC_EXTENSIONS: frozenset[str] = frozenset(
+        ext for exts in _DOC_EXTENSIONS.values() for ext in exts
+    )
 
-        Returns a summary of code structure (classes, functions, imports)
-        for key source files. Best-effort — returns empty string on failure.
+    async def _analyze_workspace(self, workspace_path: Path) -> str:
+        """Run code analysis *and* document scan for better planning context.
+
+        Returns a summary combining code structure (classes, functions,
+        imports) and an inventory of non-code documents found in the
+        workspace.  Best-effort — returns empty string on failure.
         """
+        parts: list[str] = []
+
+        # --- Code analysis (existing behaviour) ---
         try:
             from loom.tools.code_analysis import analyze_directory
 
             structures = analyze_directory(workspace_path, max_files=20)
-            if not structures:
-                return ""
-            summaries = [s.to_summary() for s in structures]
-            return "\n\n".join(summaries)
+            if structures:
+                summaries = [s.to_summary() for s in structures]
+                parts.append("\n\n".join(summaries))
         except Exception:
+            pass
+
+        # --- Document / non-code file scan ---
+        try:
+            doc_summary = self._scan_workspace_documents(workspace_path)
+            if doc_summary:
+                parts.append(doc_summary)
+        except Exception:
+            pass
+
+        return "\n\n".join(parts)
+
+    def _scan_workspace_documents(
+        self,
+        workspace_path: Path,
+        max_per_category: int = 15,
+    ) -> str:
+        """Scan workspace for non-code documents grouped by category.
+
+        Returns a concise inventory string, or empty string if nothing
+        found.  Skips hidden directories and common noise directories.
+        """
+        skip_dirs = {
+            ".git", "node_modules", "__pycache__", ".venv", "venv",
+            ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+            "dist", "build", ".eggs",
+        }
+
+        found: dict[str, list[str]] = {}
+
+        for path in sorted(workspace_path.rglob("*")):
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            if suffix not in self._ALL_DOC_EXTENSIONS:
+                continue
+            # Skip noisy directories
+            rel_parts = path.relative_to(workspace_path).parts
+            if any(p.startswith(".") or p in skip_dirs for p in rel_parts[:-1]):
+                continue
+
+            for category, extensions in self._DOC_EXTENSIONS.items():
+                if suffix in extensions:
+                    found.setdefault(category, [])
+                    if len(found[category]) < max_per_category:
+                        found[category].append(
+                            str(path.relative_to(workspace_path)),
+                        )
+                    break
+
+        if not found:
             return ""
+
+        lines = ["Documents and non-code files:"]
+        for category, files in found.items():
+            lines.append(f"\n  {category}:")
+            for f in files:
+                lines.append(f"    - {f}")
+        return "\n".join(lines)
 
     async def _analyze_workspace_for_process(
         self, workspace_path: Path,

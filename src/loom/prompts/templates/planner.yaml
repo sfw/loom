@@ -20,7 +20,7 @@ instructions: |
   WORKSPACE CONTENTS:
   {workspace_listing}
 
-  CODE STRUCTURE ANALYSIS:
+  WORKSPACE STRUCTURE ANALYSIS:
   {code_analysis}
 
   WORKSPACE ANALYSIS:
