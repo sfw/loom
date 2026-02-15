@@ -86,7 +86,7 @@ You can also create the config manually. Loom reads `loom.toml` from the current
 [models.primary]
 provider = "ollama"                    # or "openai_compatible" or "anthropic"
 base_url = "http://localhost:11434"
-model = "minimax:14b"
+model = "minimax-m2.5"
 max_tokens = 4096
 temperature = 0.1
 roles = ["planner", "executor"]
@@ -94,7 +94,7 @@ roles = ["planner", "executor"]
 [models.utility]
 provider = "ollama"
 base_url = "http://localhost:11434"
-model = "minimax:8b"
+model = "minimax-m2.1"
 max_tokens = 2048
 temperature = 0.0
 roles = ["extractor", "verifier"]
