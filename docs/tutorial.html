@@ -977,6 +977,29 @@
     <li>Built-in processes shipped with Loom</li>
   </ol>
 
+  <h3>Installing Process Packages</h3>
+  <p>Process packages can be installed from GitHub repos with <code>loom install</code>. The installer validates structure, auto-installs Python dependencies, and places the package into your discovery path.</p>
+
+  <pre><code><span class="cmt"># From GitHub URL or shorthand</span>
+<span class="cmd">loom install</span> https://github.com/acme/loom-google-analytics
+<span class="cmd">loom install</span> acme/loom-google-analytics
+
+<span class="cmt"># From local directory</span>
+<span class="cmd">loom install</span> ./my-local-process
+
+<span class="cmt"># Into a specific workspace</span>
+<span class="cmd">loom install</span> ./my-process -w /path/to/project
+
+<span class="cmt"># Remove an installed process</span>
+<span class="cmd">loom uninstall</span> google-analytics</code></pre>
+
+  <p>Declare Python dependencies in <code>process.yaml</code> — they're auto-installed during <code>loom install</code>:</p>
+
+  <pre><code><span class="key">name</span>: <span class="str">google-analytics</span>
+<span class="key">dependencies</span>:
+  - <span class="str">google-analytics-data>=0.18.0</span>
+  - <span class="str">pandas>=2.0</span></code></pre>
+
   <div class="callout callout-success">
     <strong>New tools included</strong>
     Three new tools complement the process system: <code>calculator</code> (safe math with financial functions like NPV, CAGR, WACC), <code>spreadsheet</code> (CSV operations), and <code>document_write</code> (structured Markdown generation).
@@ -1291,6 +1314,7 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     router.py            <span class="cmt"># Role + tier routing</span>
   processes/
     schema.py            <span class="cmt"># Process definition loader + validation</span>
+    installer.py         <span class="cmt"># Install/uninstall from GitHub or local path</span>
     builtin/             <span class="cmt"># 5 built-in YAML process definitions</span>
   prompts/
     assembler.py         <span class="cmt"># 7-section builder + process injection</span>

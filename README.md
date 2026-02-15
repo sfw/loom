@@ -41,7 +41,7 @@ Goal -> Planner ->  │ [Subtask A]  [Subtask B] │  parallel batch
 - **Three model backends** -- Ollama, OpenAI-compatible APIs (LM Studio, vLLM, etc.), and Anthropic/Claude
 - **Role-based routing** -- planner, executor, extractor, verifier roles with tier selection
 - **Tool system** -- 19 built-in tools (file ops, shell, git, ripgrep search, glob find, web search, web fetch, code analysis, task tracker, ask user, calculator, spreadsheet, document write) with plugin auto-discovery
-- **Process definitions** -- YAML-based domain specialization (investment analysis, marketing strategy, consulting, etc.) that inject personas, phase blueprints, verification rules, and tool guidance without changing engine code
+- **Process definitions** -- YAML-based domain specialization (investment analysis, marketing strategy, consulting, etc.) that inject personas, phase blueprints, verification rules, and tool guidance without changing engine code. Installable from GitHub repos (`loom install user/repo`) with automatic dependency management.
 - **Workspace safety** -- path traversal prevention, destructive command blocking
 - **Full undo** -- changelog with before-snapshots, revert at file/subtask/task level
 - **Token budgeting** -- prompt assembly with 7-section ordering and trim-to-budget
@@ -113,6 +113,8 @@ loom status ID          Check status of a task
 loom cancel ID          Cancel a running task
 loom models             List configured models
 loom processes          List available process definitions
+loom install SOURCE     Install a process package (GitHub URL, user/repo, or local path)
+loom uninstall NAME     Remove an installed process package
 loom mcp-serve          Start the MCP server (stdio transport)
 loom reset-learning     Clear all learned patterns
 ```

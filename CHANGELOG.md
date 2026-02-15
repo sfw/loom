@@ -13,6 +13,9 @@ All notable changes to Loom are documented in this file.
 - **`document_write` tool** (`tools/document_write.py`) -- structured Markdown generation with sections, frontmatter metadata, and append mode.
 - **`--process` CLI flag** (`__main__.py`) -- on `run` and `cowork` commands. Loads and applies a named process definition.
 - **`loom processes` command** (`__main__.py`) -- lists all available process definitions with metadata.
+- **`loom install` command** (`__main__.py`, `processes/installer.py`) -- install process packages from GitHub repos (`loom install user/repo`), URLs, or local paths. Validates structure, auto-installs Python dependencies (tries `uv` then `pip`), copies to `~/.loom/processes/` or workspace-local with `--workspace`.
+- **`loom uninstall` command** (`__main__.py`, `processes/installer.py`) -- remove installed process packages by name. Built-in processes cannot be removed.
+- **`dependencies` field in process.yaml** (`processes/schema.py`) -- declare pip packages that are auto-installed during `loom install`.
 - **`[process]` config section** (`config.py`) -- `default` process and `search_paths` for additional process directories.
 - **Session switching** (`__main__.py`) -- `/sessions`, `/new`, `/session` commands for mid-session switching between cowork sessions across workspaces.
 - **EventBus unsubscribe** (`events/bus.py`) -- `unsubscribe()` and `unsubscribe_all()` methods to prevent handler leaks on SSE disconnect.

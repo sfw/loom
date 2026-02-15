@@ -140,6 +140,9 @@ class ProcessDefinition:
     replanning_triggers: str = ""
     replanning_guidance: str = ""
 
+    # Package metadata
+    dependencies: list[str] = field(default_factory=list)
+
     # Resolved paths (set by loader)
     source_path: Path | None = None
     package_dir: Path | None = None
@@ -385,6 +388,11 @@ class ProcessLoader:
         # Top-level tool_guidance (legacy compat — also check tools.guidance)
         tool_guidance = raw.get("tool_guidance", "") or tools.guidance
 
+        # Dependencies
+        deps_raw = raw.get("dependencies", [])
+        if not isinstance(deps_raw, list):
+            deps_raw = []
+
         return ProcessDefinition(
             name=raw.get("name", ""),
             version=str(raw.get("version", "1.0")),
@@ -406,6 +414,7 @@ class ProcessLoader:
             planner_examples=examples,
             replanning_triggers=replan_triggers,
             replanning_guidance=replan_guidance,
+            dependencies=deps_raw,
         )
 
     def _validate(self, defn: ProcessDefinition) -> list[str]:

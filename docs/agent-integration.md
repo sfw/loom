@@ -601,11 +601,48 @@ For more complex processes, create a directory with bundled tools:
 
 ```
 ~/.loom/processes/my-process/
-  process.yaml          # Process definition
+  process.yaml          # Process definition (with optional dependencies: list)
   tools/
     custom_tool.py      # Automatically loaded and registered
   templates/
     report_template.md  # Available as reference
+```
+
+### Installing Process Packages
+
+Process packages can be installed from GitHub repos, shorthands, or local paths:
+
+```bash
+# From a GitHub URL
+loom install https://github.com/acme/loom-google-analytics
+
+# From GitHub shorthand (user/repo)
+loom install acme/loom-google-analytics
+
+# From a local directory
+loom install ./my-local-process
+
+# Into a workspace (instead of global ~/.loom/processes/)
+loom install ./my-process -w /path/to/project
+
+# Skip auto-installing Python dependencies
+loom install acme/loom-analytics --skip-deps
+
+# Uninstall
+loom uninstall google-analytics
+```
+
+The installer expects a `process.yaml` at the repo root. Python dependencies
+declared in the `dependencies` field are auto-installed (tries `uv` first, falls back to `pip`):
+
+```yaml
+name: google-analytics
+version: "1.0"
+description: "Google Analytics analysis workflow"
+dependencies:
+  - google-analytics-data>=0.18.0
+  - pandas>=2.0
+# ... rest of process definition
 ```
 
 ---

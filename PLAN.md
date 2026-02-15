@@ -210,6 +210,16 @@ personas, phase blueprints, verification rules, and tool guidance into the engin
 
 **Tests:** 905 tests passing (206 new for process system + tools)
 
+### 7g. Process package installer ✓
+- `processes/installer.py` — install from GitHub repos, shorthands, or local paths
+- `loom install` and `loom uninstall` CLI commands
+- `dependencies` field in process.yaml for auto-installing pip packages
+- Validates structure (process.yaml, name format), tries `uv` then `pip` for deps
+- Protects built-in processes from overwrite/uninstall
+- 49 tests covering source resolution, validation, deps, copy, uninstall
+
+**Tests:** 954 tests passing (49 new for installer)
+
 ---
 
 ## Summary: Priority Order
@@ -222,8 +232,8 @@ personas, phase blueprints, verification rules, and tool guidance into the engin
 | 4. Smarter Planning | Medium | Medium | Phase 1 done (tree-sitter, web_fetch) |
 | 5. Error Intelligence | Medium | Low | Partial (error categorizer done) |
 | 6. Interactive Mode | Medium | High | **DONE** (cowork + TUI) |
-| 7. Process Definitions | High | High | **DONE** (plugin architecture + 5 built-in) |
+| 7. Process Definitions | High | High | **DONE** (plugin architecture + 5 built-in + installer) |
 
 Additionally implemented (from gap analysis):
 - Anthropic/Claude provider, per-tool-call approval, web_search, ripgrep_search,
-  glob_find, ask_user, task_tracker, PDF/image support. 905 tests passing.
+  glob_find, ask_user, task_tracker, PDF/image support. 954 tests passing.

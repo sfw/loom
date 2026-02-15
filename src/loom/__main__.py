@@ -773,6 +773,104 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
     )
 
 
+@cli.command(name="install")
+@click.argument("source")
+@click.option(
+    "--global", "install_global", is_flag=True, default=True,
+    help="Install to ~/.loom/processes/ (default).",
+)
+@click.option(
+    "--workspace", "-w", "install_workspace",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Install to <workspace>/loom-processes/ instead of global.",
+)
+@click.option(
+    "--skip-deps", is_flag=True, default=False,
+    help="Skip installing Python dependencies.",
+)
+@click.pass_context
+def install(
+    ctx: click.Context,
+    source: str,
+    install_global: bool,
+    install_workspace: Path | None,
+    skip_deps: bool,
+) -> None:
+    """Install a process package from a GitHub repo or local path.
+
+    SOURCE can be:
+
+    \b
+      - A GitHub URL: https://github.com/user/loom-my-process
+      - A shorthand:  user/loom-my-process
+      - A local path:  /path/to/my-process/
+
+    The package must contain a process.yaml at its root. Python dependencies
+    listed in the 'dependencies' field of process.yaml are automatically
+    installed (use --skip-deps to disable).
+
+    Examples:
+
+    \b
+      loom install https://github.com/acme/loom-google-analytics
+      loom install acme/loom-google-analytics
+      loom install ./my-local-process
+      loom install ./my-local-process -w /path/to/project
+    """
+    from loom.processes.installer import InstallError, install_process
+
+    if install_workspace:
+        target_dir = install_workspace.resolve() / "loom-processes"
+    else:
+        target_dir = Path.home() / ".loom" / "processes"
+
+    click.echo(f"Installing process from: {source}")
+    click.echo(f"Target: {target_dir}")
+
+    try:
+        dest = install_process(
+            source, target_dir=target_dir, skip_deps=skip_deps,
+        )
+        click.echo(f"Installed to: {dest}")
+        click.echo("Done. Use --process <name> with 'run' or 'cowork'.")
+    except InstallError as e:
+        click.echo(f"Install failed: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command(name="uninstall")
+@click.argument("name")
+@click.option(
+    "--workspace", "-w", "uninstall_workspace",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Also search <workspace>/loom-processes/.",
+)
+@click.confirmation_option(prompt="Are you sure you want to remove this process?")
+@click.pass_context
+def uninstall(
+    ctx: click.Context, name: str, uninstall_workspace: Path | None,
+) -> None:
+    """Remove an installed process package by name.
+
+    Only removes user-installed processes. Built-in processes cannot be
+    removed.
+    """
+    from loom.processes.installer import UninstallError, uninstall_process
+
+    search_dirs = [Path.home() / ".loom" / "processes"]
+    if uninstall_workspace:
+        search_dirs.append(uninstall_workspace.resolve() / "loom-processes")
+
+    try:
+        removed = uninstall_process(name, search_dirs=search_dirs)
+        click.echo(f"Removed: {removed}")
+    except UninstallError as e:
+        click.echo(f"Uninstall failed: {e}", err=True)
+        sys.exit(1)
+
+
 @cli.command(name="reset-learning")
 @click.confirmation_option(prompt="Are you sure you want to clear all learned patterns?")
 @click.pass_context
