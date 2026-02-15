@@ -8,7 +8,7 @@ from pathlib import Path
 import click
 
 from loom import __version__
-from loom.config import load_config
+from loom.config import Config, load_config
 
 
 @click.group()
@@ -251,9 +251,8 @@ async def _cancel_task(server_url: str, task_id: str) -> None:
 
 
 @cli.command()
-@click.option("--server", "server_url", default=None, help="Server URL.")
 @click.pass_context
-def models(ctx: click.Context, server_url: str | None) -> None:
+def models(ctx: click.Context) -> None:
     """List available models and their status."""
     config = ctx.obj["config"]
 
@@ -323,7 +322,7 @@ def cowork(
 
 
 async def _cowork_session(
-    config, workspace: Path, model_name: str | None,
+    config: Config, workspace: Path, model_name: str | None,
     resume_id: str | None = None,
     process_name: str | None = None,
 ) -> None:
