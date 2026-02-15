@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from loom.tui.api_client import LoomAPIClient
 from loom.tui.screens.approval import ToolApprovalScreen
@@ -328,3 +331,142 @@ class TestCoworkSessionTokens:
 
         session = CoworkSession(model=model, tools=tools)
         assert session.total_tokens == 0
+
+
+# --- Sad-path: _init_persistence -------------------------------------------
+
+
+class TestInitPersistence:
+    """Test graceful degradation when database init fails."""
+
+    def test_returns_none_on_db_error(self, tmp_path):
+        """If the db path is unwritable, return (None, None)."""
+        from loom.__main__ import _init_persistence
+        from loom.config import Config, WorkspaceConfig
+
+        # Point scratch_dir at a path that won't exist
+        cfg = Config(
+            workspace=WorkspaceConfig(
+                scratch_dir=str(tmp_path / "no" / "such" / "parent" / "\0invalid"),
+            ),
+        )
+        db, store = _init_persistence(cfg)
+        assert db is None
+        assert store is None
+
+    def test_returns_valid_on_success(self, tmp_path):
+        """Sanity: happy path still works."""
+        from loom.__main__ import _init_persistence
+        from loom.config import Config, WorkspaceConfig
+
+        cfg = Config(
+            workspace=WorkspaceConfig(scratch_dir=str(tmp_path / "scratch")),
+        )
+        db, store = _init_persistence(cfg)
+        assert db is not None
+        assert store is not None
+
+
+# --- Sad-path: delegate_task unbound ----------------------------------------
+
+
+class TestDelegateTaskUnbound:
+    """delegate_task returns a clean error when not bound."""
+
+    @pytest.mark.asyncio
+    async def test_unbound_returns_not_available(self):
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        tool = DelegateTaskTool()
+        ctx = ToolContext(workspace=Path("/tmp"))
+        result = await tool.execute({"goal": "do something"}, ctx)
+        assert not result.success
+        assert "not available" in result.error
+
+    @pytest.mark.asyncio
+    async def test_missing_goal(self):
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        async def _factory():
+            return MagicMock()
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+        result = await tool.execute({}, ctx)
+        assert not result.success
+        assert "goal" in result.error
+
+
+# --- Sad-path: session resume failures --------------------------------------
+
+
+class TestSessionResumeFallback:
+    """Verify CoworkSession.resume raises on bad IDs."""
+
+    @pytest.mark.asyncio
+    async def test_resume_nonexistent_session(self, tmp_path):
+        """Resuming a session that doesn't exist should raise."""
+        from loom.cowork.session import CoworkSession
+        from loom.state.conversation_store import ConversationStore
+        from loom.state.memory import Database
+
+        db = Database(tmp_path / "test.db")
+        await db.initialize()
+        store = ConversationStore(db)
+
+        model = MagicMock()
+        model.name = "test"
+        tools = MagicMock()
+        tools.all_schemas.return_value = []
+
+        session = CoworkSession(
+            model=model, tools=tools, store=store,
+        )
+        with pytest.raises(Exception):
+            await session.resume("nonexistent-session-id")
+
+    @pytest.mark.asyncio
+    async def test_resume_without_store_raises(self):
+        """Resuming with no store should raise."""
+        from loom.cowork.session import CoworkSession
+
+        model = MagicMock()
+        model.name = "test"
+        tools = MagicMock()
+        tools.all_schemas.return_value = []
+
+        session = CoworkSession(model=model, tools=tools)
+        with pytest.raises(Exception):
+            await session.resume("any-id")
+
+
+# --- Sad-path: CLI --resume with no DB -------------------------------------
+
+
+class TestCLIResumeNoDB:
+    """--resume should fail cleanly when persistence is unavailable."""
+
+    def test_resume_flag_without_db(self, monkeypatch):
+        """If _init_persistence returns None, --resume should exit 1."""
+        from click.testing import CliRunner
+
+        from loom.__main__ import cli
+
+        # Force _init_persistence to fail
+        import loom.__main__ as main_mod
+
+        monkeypatch.setattr(main_mod, "_init_persistence", lambda cfg: (None, None))
+        # Mock model resolution so we don't need a real config
+        monkeypatch.setattr(
+            main_mod, "_resolve_model", lambda cfg, name: MagicMock(name="mock"),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["--resume", "abc123"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 1
+        assert "requires database" in result.output
