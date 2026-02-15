@@ -185,6 +185,69 @@ def _summarize_args(tool_name: str, args: dict) -> str:
     return ""
 
 
+def display_file_diff(event: ToolCallEvent) -> None:
+    """Display an inline diff when a file-modifying tool completes."""
+    if event.result is None or not event.result.success:
+        return
+
+    # Only show diffs for file-modifying tools
+    if event.name not in ("edit_file", "write_file", "delete_file", "move_file"):
+        return
+
+    output = event.result.output or ""
+
+    # For edit_file, the diff is already embedded in the output
+    if event.name == "edit_file":
+        diff_text = _extract_diff(output)
+        if diff_text:
+            _render_diff(diff_text)
+        return
+
+    # For write/delete, show a short summary of what changed
+    files = event.result.files_changed
+    if files:
+        for f in files:
+            if event.name == "write_file":
+                sys.stdout.write(
+                    f"  {_C.GRAY}    {_C.GREEN}M{_C.RESET} {_C.DIM}{f}{_C.RESET}\n"
+                )
+            elif event.name == "delete_file":
+                sys.stdout.write(
+                    f"  {_C.GRAY}    {_C.RED}D{_C.RESET} {_C.DIM}{f}{_C.RESET}\n"
+                )
+            elif event.name == "move_file":
+                sys.stdout.write(
+                    f"  {_C.GRAY}    {_C.YELLOW}R{_C.RESET} {_C.DIM}{f}{_C.RESET}\n"
+                )
+        sys.stdout.flush()
+
+
+def _extract_diff(output: str) -> str:
+    """Extract the diff portion from edit_file output."""
+    # The diff starts with --- a/ line
+    marker = "--- a/"
+    idx = output.find(marker)
+    if idx == -1:
+        return ""
+    return output[idx:]
+
+
+def _render_diff(diff_text: str) -> None:
+    """Render a unified diff with colors."""
+    for line in diff_text.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            sys.stdout.write(f"  {_C.GRAY}    {_C.BOLD}{line}{_C.RESET}\n")
+        elif line.startswith("@@"):
+            sys.stdout.write(f"  {_C.GRAY}    {_C.CYAN}{line}{_C.RESET}\n")
+        elif line.startswith("+"):
+            sys.stdout.write(f"  {_C.GRAY}    {_C.GREEN}{line}{_C.RESET}\n")
+        elif line.startswith("-"):
+            sys.stdout.write(f"  {_C.GRAY}    {_C.RED}{line}{_C.RESET}\n")
+        else:
+            sys.stdout.write(f"  {_C.GRAY}    {_C.DIM}{line}{_C.RESET}\n")
+    sys.stdout.flush()
+
+
 def _output_preview(tool_name: str, output: str) -> str:
     """Create a short preview of tool output."""
     if not output:
@@ -206,6 +269,11 @@ def _output_preview(tool_name: str, output: str) -> str:
     if tool_name == "shell_execute":
         first = output.strip().split("\n")[0]
         return _truncate(first, 60)
+
+    # For edit_file, show the summary line only (not the diff)
+    if tool_name == "edit_file":
+        first = output.split("\n")[0]
+        return _truncate(first, 80)
 
     return ""
 

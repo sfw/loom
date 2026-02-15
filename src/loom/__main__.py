@@ -331,6 +331,7 @@ async def _cowork_session(
     from loom.cowork.display import (
         display_ask_user,
         display_error,
+        display_file_diff,
         display_goodbye,
         display_text_chunk,
         display_tool_complete,
@@ -695,6 +696,7 @@ async def _cowork_session(
                         display_tool_start(event)
                     else:
                         display_tool_complete(event)
+                        display_file_diff(event)
 
                         # Special handling for ask_user
                         if event.name == "ask_user" and event.result:
@@ -707,6 +709,7 @@ async def _cowork_session(
                                             display_tool_start(follow_event)
                                         else:
                                             display_tool_complete(follow_event)
+                                            display_file_diff(follow_event)
                                     elif isinstance(follow_event, CoworkTurn):
                                         display_turn_summary(follow_event)
                                     elif isinstance(follow_event, str):

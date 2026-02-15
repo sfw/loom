@@ -13,6 +13,8 @@ from loom.tools.file_ops import (
     MoveFileTool,
     ReadFileTool,
     WriteFileTool,
+    _generate_compact_diff,
+    _line_similarity,
 )
 from loom.tools.git import GitCommandTool, check_git_safety, parse_subcommand
 from loom.tools.registry import (
@@ -561,3 +563,238 @@ class TestGitSafety:
         assert parse_subcommand(["status"]) == "status"
         assert parse_subcommand(["--global", "config", "user.name"]) == "config"
         assert parse_subcommand(["-v"]) is None
+
+
+# --- EditFileTool: Fuzzy Matching ---
+
+class TestEditFileFuzzyMatch:
+    """Tests for the fuzzy matching feature in EditFileTool."""
+
+    async def test_exact_match_still_works(self, ctx: ToolContext, workspace: Path):
+        """Exact matches should work as before, with no fuzzy flag."""
+        tool = EditFileTool()
+        result = await tool.execute(
+            {"path": "src/main.py", "old_str": "print('hello')", "new_str": "print('world')"},
+            ctx,
+        )
+        assert result.success
+        assert "print('world')" in (workspace / "src" / "main.py").read_text()
+        assert "fuzzy" not in result.output.lower()
+
+    async def test_fuzzy_whitespace_trailing(self, ctx: ToolContext, workspace: Path):
+        """Trailing whitespace differences should be fuzzy-matched."""
+        (workspace / "ws.py").write_text("def foo():  \n    return 1\n")
+        tool = EditFileTool()
+        # Model omits trailing spaces
+        result = await tool.execute(
+            {"path": "ws.py", "old_str": "def foo():\n    return 1", "new_str": "def foo():\n    return 2"},
+            ctx,
+        )
+        assert result.success
+        assert "return 2" in (workspace / "ws.py").read_text()
+        assert "fuzzy" in result.output.lower()
+
+    async def test_fuzzy_indentation_tabs_vs_spaces(self, ctx: ToolContext, workspace: Path):
+        """Tab vs space indentation differences should be fuzzy-matched."""
+        (workspace / "indent.py").write_text("def bar():\n\treturn 42\n")
+        tool = EditFileTool()
+        # Model uses spaces instead of tabs
+        result = await tool.execute(
+            {"path": "indent.py", "old_str": "def bar():\n    return 42", "new_str": "def bar():\n    return 99"},
+            ctx,
+        )
+        assert result.success
+        assert "99" in (workspace / "indent.py").read_text()
+        assert "fuzzy" in result.output.lower()
+
+    async def test_fuzzy_no_match_below_threshold(self, ctx: ToolContext, workspace: Path):
+        """Completely different content should not fuzzy-match."""
+        tool = EditFileTool()
+        result = await tool.execute(
+            {"path": "src/main.py", "old_str": "class TotallyDifferent:\n    pass", "new_str": "x"},
+            ctx,
+        )
+        assert not result.success
+        assert "not found" in result.output.lower() or "not found" in (result.error or "").lower()
+
+    async def test_fuzzy_provides_closest_snippet(self, ctx: ToolContext, workspace: Path):
+        """When match fails, error should include closest snippet."""
+        (workspace / "big.py").write_text(
+            "line1\nline2\ndef target_func():\n    pass\nline5\n"
+        )
+        tool = EditFileTool()
+        result = await tool.execute(
+            {"path": "big.py", "old_str": "def completely_wrong():\n    pass", "new_str": "x"},
+            ctx,
+        )
+        assert not result.success
+        # Error should contain nearby lines for context
+        error = result.error or ""
+        assert "target_func" in error or "Closest" in error or "not found" in error
+
+    async def test_fuzzy_multiple_occurrences_still_fails(self, ctx: ToolContext, workspace: Path):
+        """Fuzzy matching should not bypass the uniqueness check."""
+        (workspace / "dupe.py").write_text("def foo():\n    pass\ndef foo():\n    pass\n")
+        tool = EditFileTool()
+        result = await tool.execute(
+            {"path": "dupe.py", "old_str": "def foo():\n    pass", "new_str": "x"},
+            ctx,
+        )
+        assert not result.success
+        assert "2 times" in (result.error or "")
+
+
+# --- EditFileTool: Batch Edits ---
+
+class TestEditFileBatch:
+    """Tests for the batch edit feature in EditFileTool."""
+
+    async def test_batch_multiple_edits(self, ctx: ToolContext, workspace: Path):
+        """Multiple edits should be applied sequentially."""
+        (workspace / "multi.py").write_text(
+            "alpha = 1\nbeta = 2\ngamma = 3\n"
+        )
+        tool = EditFileTool()
+        result = await tool.execute(
+            {
+                "path": "multi.py",
+                "edits": [
+                    {"old_str": "alpha = 1", "new_str": "alpha = 10"},
+                    {"old_str": "gamma = 3", "new_str": "gamma = 30"},
+                ],
+            },
+            ctx,
+        )
+        assert result.success
+        content = (workspace / "multi.py").read_text()
+        assert "alpha = 10" in content
+        assert "beta = 2" in content
+        assert "gamma = 30" in content
+        assert "applied 2 edits" in result.output
+
+    async def test_batch_early_failure_no_write(self, ctx: ToolContext, workspace: Path):
+        """If any edit in a batch fails, no edits should be written."""
+        (workspace / "safe.py").write_text("keep = 1\n")
+        tool = EditFileTool()
+        result = await tool.execute(
+            {
+                "path": "safe.py",
+                "edits": [
+                    {"old_str": "keep = 1", "new_str": "keep = 2"},
+                    {"old_str": "nonexistent", "new_str": "x"},
+                ],
+            },
+            ctx,
+        )
+        assert not result.success
+        # File should be unchanged — first edit was NOT written
+        assert (workspace / "safe.py").read_text() == "keep = 1\n"
+
+    async def test_batch_sequential_dependency(self, ctx: ToolContext, workspace: Path):
+        """Later edits should see the result of earlier edits."""
+        (workspace / "seq.py").write_text("value = old\n")
+        tool = EditFileTool()
+        result = await tool.execute(
+            {
+                "path": "seq.py",
+                "edits": [
+                    {"old_str": "value = old", "new_str": "value = mid"},
+                    {"old_str": "value = mid", "new_str": "value = new"},
+                ],
+            },
+            ctx,
+        )
+        assert result.success
+        assert (workspace / "seq.py").read_text() == "value = new\n"
+
+    async def test_batch_empty_old_str_fails(self, ctx: ToolContext, workspace: Path):
+        """Empty old_str in a batch should fail validation."""
+        (workspace / "empty.py").write_text("x = 1\n")
+        tool = EditFileTool()
+        result = await tool.execute(
+            {
+                "path": "empty.py",
+                "edits": [
+                    {"old_str": "", "new_str": "y = 2"},
+                ],
+            },
+            ctx,
+        )
+        assert not result.success
+        assert "empty" in (result.error or "").lower()
+
+    async def test_no_args_fails(self, ctx: ToolContext, workspace: Path):
+        """Calling with neither old_str nor edits should fail."""
+        tool = EditFileTool()
+        result = await tool.execute({"path": "src/main.py"}, ctx)
+        assert not result.success
+
+
+# --- EditFileTool: Diff Output ---
+
+class TestEditFileDiff:
+    """Tests for diff output in edit results."""
+
+    async def test_diff_in_output(self, ctx: ToolContext, workspace: Path):
+        """Successful edits should include a unified diff."""
+        tool = EditFileTool()
+        result = await tool.execute(
+            {"path": "src/main.py", "old_str": "print('hello')", "new_str": "print('world')"},
+            ctx,
+        )
+        assert result.success
+        assert "--- a/" in result.output
+        assert "+++ b/" in result.output
+        assert "-" in result.output  # removed line
+        assert "+" in result.output  # added line
+
+    async def test_diff_shows_changes(self, ctx: ToolContext, workspace: Path):
+        """Diff should reflect the actual change made."""
+        (workspace / "difftest.py").write_text("x = 1\ny = 2\nz = 3\n")
+        tool = EditFileTool()
+        result = await tool.execute(
+            {"path": "difftest.py", "old_str": "y = 2", "new_str": "y = 99"},
+            ctx,
+        )
+        assert result.success
+        # Diff should contain both old and new values
+        assert "y = 2" in result.output or "-y = 2" in result.output
+        assert "y = 99" in result.output or "+y = 99" in result.output
+
+
+# --- Helper functions ---
+
+class TestLineSimilarity:
+    def test_identical_lines(self):
+        assert _line_similarity(["foo", "bar"], ["foo", "bar"]) == 1.0
+
+    def test_whitespace_normalized(self):
+        ratio = _line_similarity(["  foo  bar  "], ["foo bar"])
+        assert ratio > 0.95
+
+    def test_different_lengths(self):
+        assert _line_similarity(["a"], ["a", "b"]) == 0.0
+
+    def test_totally_different(self):
+        ratio = _line_similarity(["aaaa"], ["zzzz"])
+        assert ratio < 0.5
+
+
+class TestCompactDiff:
+    def test_simple_diff(self):
+        before = "line1\nline2\nline3\n"
+        after = "line1\nLINE2\nline3\n"
+        diff = _generate_compact_diff(before, after, "test.py")
+        assert "--- a/test.py" in diff
+        assert "+++ b/test.py" in diff
+
+    def test_no_changes(self):
+        content = "same\n"
+        diff = _generate_compact_diff(content, content, "test.py")
+        assert diff == ""
+
+    def test_truncation(self):
+        before = "\n".join(f"line{i}" for i in range(100))
+        after = "\n".join(f"LINE{i}" for i in range(100))
+        diff = _generate_compact_diff(before, after, "test.py", max_lines=10)
+        assert "more diff lines" in diff

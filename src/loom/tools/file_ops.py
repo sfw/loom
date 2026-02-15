@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import difflib
+
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg"})
@@ -283,6 +285,16 @@ class MoveFileTool(Tool):
 
 
 class EditFileTool(Tool):
+    """Edit a file by replacing strings, with fuzzy matching for local model tolerance.
+
+    Supports single edits (old_str/new_str) and batched edits (edits array).
+    When an exact match fails, attempts whitespace-normalized fuzzy matching
+    so that local models with imprecise string reproduction still succeed.
+    """
+
+    # Minimum similarity ratio for fuzzy matching (0.0-1.0).
+    FUZZY_THRESHOLD = 0.85
+
     @property
     def name(self) -> str:
         return "edit_file"
@@ -290,8 +302,11 @@ class EditFileTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Edit a file by replacing a unique string. "
-            "old_str must appear exactly once in the file."
+            "Edit a file by replacing strings. Supports two modes:\n"
+            "1. Single edit: provide old_str and new_str (old_str must be unique).\n"
+            "2. Batch edit: provide an 'edits' array of {old_str, new_str} objects, "
+            "applied sequentially.\n"
+            "Whitespace-tolerant: minor whitespace differences are handled automatically."
         )
 
     @property
@@ -302,11 +317,29 @@ class EditFileTool(Tool):
                 "path": {"type": "string", "description": "File path relative to workspace"},
                 "old_str": {
                     "type": "string",
-                    "description": "Exact string to find (must be unique)",
+                    "description": "Exact string to find (must be unique). Use for single edits.",
                 },
-                "new_str": {"type": "string", "description": "Replacement string"},
+                "new_str": {
+                    "type": "string",
+                    "description": "Replacement string. Use for single edits.",
+                },
+                "edits": {
+                    "type": "array",
+                    "description": (
+                        "Array of edits to apply sequentially. "
+                        "Each element: {old_str: string, new_str: string}."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_str": {"type": "string"},
+                            "new_str": {"type": "string"},
+                        },
+                        "required": ["old_str", "new_str"],
+                    },
+                },
             },
-            "required": ["path", "old_str", "new_str"],
+            "required": ["path"],
         }
 
     @property
@@ -322,32 +355,216 @@ class EditFileTool(Tool):
             return ToolResult.fail(f"File not found: {args['path']}")
 
         content = path.read_text(encoding="utf-8")
-        old_str = args["old_str"]
-        new_str = args["new_str"]
-
-        if not old_str:
-            return ToolResult.fail("old_str cannot be empty.")
-
-        count = content.count(old_str)
-        if count == 0:
-            return ToolResult.fail(f"old_str not found in {args['path']}")
-        if count > 1:
-            return ToolResult.fail(
-                f"old_str appears {count} times in {args['path']}. Must be unique."
-            )
-
         rel_path = str(path.relative_to(ctx.workspace.resolve()))
+
+        # Build edit list from either single or batch mode
+        edits_raw = args.get("edits")
+        if edits_raw:
+            edit_pairs = [
+                (e.get("old_str", ""), e.get("new_str", ""))
+                for e in edits_raw
+            ]
+        elif "old_str" in args:
+            edit_pairs = [(args["old_str"], args.get("new_str", ""))]
+        else:
+            return ToolResult.fail("Provide either old_str/new_str or an edits array.")
+
+        # Validate all edits before applying any
+        for i, (old_str, _) in enumerate(edit_pairs):
+            if not old_str:
+                label = f"edit[{i}]" if len(edit_pairs) > 1 else "old_str"
+                return ToolResult.fail(f"{label}: old_str cannot be empty.")
 
         # Record in changelog before writing
         if ctx.changelog is not None:
             ctx.changelog.record_before_write(rel_path, subtask_id=ctx.subtask_id)
 
-        new_content = content.replace(old_str, new_str, 1)
-        path.write_text(new_content, encoding="utf-8")
+        original_content = content
+        applied = []
+        fuzzy_used = []
 
-        lines_old = old_str.count("\n") + 1
-        lines_new = new_str.count("\n") + 1
-        return ToolResult.ok(
-            f"Edited {rel_path}: replaced {lines_old} lines with {lines_new} lines",
-            files_changed=[rel_path],
+        for i, (old_str, new_str) in enumerate(edit_pairs):
+            label = f"edit[{i}]" if len(edit_pairs) > 1 else ""
+            result = self._apply_single_edit(content, old_str, new_str, rel_path, label)
+
+            if isinstance(result, ToolResult):
+                # Failed — don't write anything
+                return result
+
+            content, was_fuzzy = result
+            applied.append((old_str, new_str))
+            if was_fuzzy:
+                fuzzy_used.append(i)
+
+        # Write the final result
+        path.write_text(content, encoding="utf-8")
+
+        # Build diff for the response
+        diff_text = _generate_compact_diff(original_content, content, rel_path)
+
+        # Build summary message
+        n = len(applied)
+        if n == 1:
+            lines_old = applied[0][0].count("\n") + 1
+            lines_new = applied[0][1].count("\n") + 1
+            msg = f"Edited {rel_path}: replaced {lines_old} lines with {lines_new} lines"
+        else:
+            msg = f"Edited {rel_path}: applied {n} edits"
+
+        if fuzzy_used:
+            indices = ", ".join(str(i) for i in fuzzy_used)
+            msg += f" (fuzzy match used for edit{'s' if len(fuzzy_used) > 1 else ''} {indices})"
+
+        if diff_text:
+            msg += f"\n\n{diff_text}"
+
+        return ToolResult.ok(msg, files_changed=[rel_path])
+
+    def _apply_single_edit(
+        self,
+        content: str,
+        old_str: str,
+        new_str: str,
+        rel_path: str,
+        label: str,
+    ) -> tuple[str, bool] | ToolResult:
+        """Apply a single old_str->new_str edit, falling back to fuzzy match.
+
+        Returns (new_content, was_fuzzy) on success, or ToolResult on failure.
+        """
+        prefix = f"{label}: " if label else ""
+
+        # --- Exact match attempt ---
+        count = content.count(old_str)
+        if count == 1:
+            return content.replace(old_str, new_str, 1), False
+        if count > 1:
+            return ToolResult.fail(
+                f"{prefix}old_str appears {count} times in {rel_path}. "
+                "Provide more surrounding context to make it unique."
+            )
+
+        # --- Fuzzy match attempt ---
+        match = self._fuzzy_find(content, old_str)
+        if match is not None:
+            matched_text, start, end = match
+            return content[:start] + new_str + content[end:], True
+
+        # --- Helpful error ---
+        return ToolResult.fail(
+            f"{prefix}old_str not found in {rel_path}. "
+            f"Closest match:\n{self._closest_snippet(content, old_str)}"
         )
+
+    def _fuzzy_find(
+        self, content: str, old_str: str
+    ) -> tuple[str, int, int] | None:
+        """Find old_str in content using whitespace-normalized fuzzy matching.
+
+        Returns (matched_text, start_index, end_index) or None.
+        """
+        old_lines = old_str.splitlines()
+        content_lines = content.splitlines()
+
+        if not old_lines:
+            return None
+
+        n = len(old_lines)
+        best_ratio = 0.0
+        best_range: tuple[int, int] | None = None
+
+        # Slide a window of size n over content lines
+        for start in range(len(content_lines) - n + 1):
+            candidate = content_lines[start:start + n]
+            ratio = _line_similarity(old_lines, candidate)
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_range = (start, start + n)
+
+        if best_ratio < self.FUZZY_THRESHOLD or best_range is None:
+            return None
+
+        # Convert line range back to character positions
+        matched_lines = content_lines[best_range[0]:best_range[1]]
+        matched_text = "\n".join(matched_lines)
+
+        # Find the character offset of the matched line range
+        char_start = 0
+        for i in range(best_range[0]):
+            char_start += len(content_lines[i]) + 1  # +1 for newline
+
+        char_end = char_start + len(matched_text)
+
+        # Handle trailing newline edge case: if the original old_str ended
+        # with a newline, extend the match to include it
+        if old_str.endswith("\n") and char_end < len(content) and content[char_end] == "\n":
+            char_end += 1
+            matched_text += "\n"
+
+        return matched_text, char_start, char_end
+
+    def _closest_snippet(self, content: str, old_str: str, context: int = 3) -> str:
+        """Find the closest matching region and return it for error diagnostics."""
+        old_lines = old_str.splitlines()
+        content_lines = content.splitlines()
+
+        if not old_lines or not content_lines:
+            return "(empty)"
+
+        # Find the best matching single line to anchor the snippet
+        best_ratio = 0.0
+        best_line = 0
+        first_old = old_lines[0]
+        for i, line in enumerate(content_lines):
+            ratio = difflib.SequenceMatcher(None, first_old.strip(), line.strip()).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_line = i
+
+        start = max(0, best_line - context)
+        end = min(len(content_lines), best_line + len(old_lines) + context)
+        snippet = content_lines[start:end]
+        numbered = [f"  {start + j + 1:4d} | {line}" for j, line in enumerate(snippet)]
+        return "\n".join(numbered)
+
+
+def _line_similarity(a: list[str], b: list[str]) -> float:
+    """Compare two line sequences with whitespace normalization.
+
+    Returns a ratio between 0.0 (no match) and 1.0 (identical after normalization).
+    """
+    if len(a) != len(b):
+        return 0.0
+
+    total = 0.0
+    for la, lb in zip(a, b):
+        # Normalize: strip trailing whitespace, normalize internal whitespace runs
+        na = " ".join(la.split())
+        nb = " ".join(lb.split())
+        total += difflib.SequenceMatcher(None, na, nb).ratio()
+
+    return total / len(a)
+
+
+def _generate_compact_diff(before: str, after: str, path: str, max_lines: int = 40) -> str:
+    """Generate a compact unified diff, truncated if too long."""
+    before_lines = before.splitlines(keepends=True)
+    after_lines = after.splitlines(keepends=True)
+
+    diff = list(difflib.unified_diff(
+        before_lines, after_lines,
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        lineterm="",
+    ))
+
+    if not diff:
+        return ""
+
+    if len(diff) <= max_lines:
+        return "\n".join(line.rstrip() for line in diff)
+
+    truncated = diff[:max_lines]
+    remaining = len(diff) - max_lines
+    truncated.append(f"... ({remaining} more diff lines)")
+    return "\n".join(line.rstrip() for line in truncated)
