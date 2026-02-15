@@ -219,6 +219,8 @@ roles = ["planner", "executor", "extractor", "verifier"]
 | `memory` | `database_path` | `~/.loom/loom.db` | SQLite database location |
 | `logging` | `level` | `INFO` | Log verbosity |
 | `logging` | `event_log_path` | `~/.loom/logs` | Event log directory |
+| `process` | `default` | `""` | Default process definition for all tasks |
+| `process` | `search_paths` | `[]` | Additional directories to search for process definitions |
 
 ---
 
@@ -248,7 +250,7 @@ curl http://localhost:1234/v1/models
 
 ```bash
 pytest
-# Should show 633+ passed
+# Should show 905+ passed
 ```
 
 ### 4. Start the Server

@@ -79,6 +79,16 @@ loom/
 │       │   │   └── replanner.yaml  # Re-planning prompt
 │       │   └── constraints.py      # Constraint library for local models
 │       │
+│       ├── processes/
+│       │   ├── __init__.py
+│       │   ├── schema.py             # ProcessDefinition, ProcessLoader, validation
+│       │   └── builtin/              # 5 built-in YAML process definitions
+│       │       ├── investment-analysis.yaml
+│       │       ├── marketing-strategy.yaml
+│       │       ├── research-report.yaml
+│       │       ├── competitive-intel.yaml
+│       │       └── consulting-engagement.yaml
+│       │
 │       ├── tui/
 │       │   ├── __init__.py
 │       │   ├── app.py              # Textual application (Spec 09)

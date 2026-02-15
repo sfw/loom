@@ -166,6 +166,52 @@ Cowork mode is the primary interactive interface.
 
 ---
 
+## Phase 7: Process Definition Plugin Architecture ✓ DONE
+
+Domain specialization without code changes. YAML-based process definitions inject
+personas, phase blueprints, verification rules, and tool guidance into the engine.
+
+### 7a. Process definition schema and loader ✓
+- `ProcessDefinition` dataclass with phases, verification rules, memory types, tool config
+- `ProcessLoader` with multi-path discovery (builtin → user-global → workspace-local)
+- Comprehensive validation: name format, phase dependencies, cycle detection (DFS),
+  duplicate deliverables, regex compilation
+- Process packages: directory-based processes that bundle tools + templates
+
+### 7b. PromptAssembler process injection ✓
+- Persona overrides role in all prompt types (planner, executor, verifier, extractor)
+- Phase blueprint and planner examples injected into planner prompt
+- Tool guidance appended to executor constraints
+- LLM verification rules injected into verifier prompt
+- Memory extraction types injected into extractor prompt
+
+### 7c. Orchestrator + Verifier process integration ✓
+- Orchestrator accepts `ProcessDefinition`, passes to assembler and verification gates
+- Tool exclusions applied from process config
+- Workspace analysis scans for domain-relevant file types
+- `DeterministicVerifier` runs process regex rules and deliverables checks
+
+### 7d. CLI and config ✓
+- `--process` flag on `run` and `cowork` commands
+- `loom processes` command lists all available definitions
+- `[process]` config section for default process and search paths
+
+### 7e. Built-in process definitions ✓
+- `investment-analysis` — 5-phase strict financial workflow
+- `marketing-strategy` — 6-phase guided GTM pipeline
+- `research-report` — 4-phase lightweight research pipeline
+- `competitive-intel` — 3-phase fast competitive analysis
+- `consulting-engagement` — 5-phase McKinsey-style issue tree
+
+### 7f. New tools ✓
+- `calculator` — safe AST-based math evaluation with financial functions (NPV, CAGR, WACC, PMT)
+- `spreadsheet` — CSV operations (create, read, add rows/columns, update cells, summary)
+- `document_write` — structured Markdown generation with sections and metadata
+
+**Tests:** 905 tests passing (206 new for process system + tools)
+
+---
+
 ## Summary: Priority Order
 
 | Phase | Impact | Effort | Status |
@@ -176,7 +222,8 @@ Cowork mode is the primary interactive interface.
 | 4. Smarter Planning | Medium | Medium | Phase 1 done (tree-sitter, web_fetch) |
 | 5. Error Intelligence | Medium | Low | Partial (error categorizer done) |
 | 6. Interactive Mode | Medium | High | **DONE** (cowork + TUI) |
+| 7. Process Definitions | High | High | **DONE** (plugin architecture + 5 built-in) |
 
 Additionally implemented (from gap analysis):
 - Anthropic/Claude provider, per-tool-call approval, web_search, ripgrep_search,
-  glob_find, ask_user, task_tracker, PDF/image support. 612+ tests passing.
+  glob_find, ask_user, task_tracker, PDF/image support. 905 tests passing.

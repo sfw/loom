@@ -3,7 +3,7 @@
 This guide shows how to connect external agents (Claude Code, custom scripts, cron jobs, other AI agents) to Loom as clients.
 
 **Two execution models:**
-- **Cowork mode** (`loom cowork` / `loom tui`) — interactive, conversation-first. The agent and developer collaborate in real time with 16 tools, streaming, and per-tool-call approval. No server needed.
+- **Cowork mode** (`loom cowork` / `loom tui`) — interactive, conversation-first. The agent and developer collaborate in real time with 19 tools, streaming, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition.
 - **Task mode** (REST API / MCP) — autonomous, fire-and-forget. Loom decomposes the goal into subtasks, executes, verifies, and reports back.
 
 This document covers both modes.
@@ -70,6 +70,7 @@ print(f"Task submitted: {task_id}")
 |-------|----------|-------------|
 | `goal` | Yes | Natural language description of what to accomplish |
 | `workspace` | No | Absolute path to the working directory for file operations |
+| `process` | No | Name of a process definition to apply (e.g., `"investment-analysis"`) |
 | `context` | No | Dict with constraints, focus areas, preferences |
 | `approval_mode` | No | `"auto"` (default), `"manual"`, or `"confidence_threshold"` |
 | `callback_url` | No | URL to POST results to on completion/failure |
@@ -494,7 +495,122 @@ event_bus.subscribe_all(log_all)
 
 ---
 
-## 4. Approval Modes
+## 4. Process Definitions
+
+Process definitions inject domain expertise into Loom without changing engine code. They're YAML files that specify personas, phase blueprints, verification rules, tool guidance, and memory extraction types.
+
+### Built-in Processes
+
+```bash
+# List available processes
+loom processes
+
+# Use with CLI
+loom run "Analyze ACME Corp" --workspace /tmp/acme --process investment-analysis
+loom cowork -w /tmp/project --process consulting-engagement
+```
+
+| Process | Phases | Mode | Domain |
+|---------|--------|------|--------|
+| `investment-analysis` | 5 | strict | Financial due diligence and valuation |
+| `marketing-strategy` | 6 | guided | Go-to-market strategy and campaigns |
+| `research-report` | 4 | guided | Research synthesis and reporting |
+| `competitive-intel` | 3 | guided | Competitive landscape analysis |
+| `consulting-engagement` | 5 | guided | McKinsey-style issue tree consulting |
+
+### Using with REST API
+
+Include `"process"` in the task creation payload:
+
+```python
+response = client.post("/tasks", json={
+    "goal": "Evaluate Tesla as an investment opportunity",
+    "workspace": "/projects/tesla-analysis",
+    "process": "investment-analysis",
+})
+```
+
+### Using with Python
+
+```python
+from loom.processes.schema import ProcessLoader
+
+# Discover and load a process
+loader = ProcessLoader(workspace=Path("/projects/myapp"))
+process = loader.load("investment-analysis")
+
+# List available processes
+available = loader.list_available()
+for p in available:
+    print(f"{p['name']} v{p['version']}: {p['description']}")
+```
+
+### Creating Custom Processes
+
+Create a YAML file in `~/.loom/processes/` or `<workspace>/.loom/processes/`:
+
+```yaml
+name: my-custom-process
+version: "1.0"
+description: "Custom domain process"
+persona: |
+  You are a domain expert specializing in...
+
+phase_mode: guided  # strict | guided | suggestive
+
+phases:
+  - id: research
+    description: "Gather and analyze data"
+    depends_on: []
+    model_tier: 2
+    verification_tier: 1
+    deliverables:
+      - "research-notes.md"
+    acceptance_criteria: "Notes cover all key areas"
+
+  - id: synthesize
+    description: "Synthesize findings into report"
+    depends_on: [research]
+    model_tier: 3
+    verification_tier: 2
+    deliverables:
+      - "final-report.md"
+    acceptance_criteria: "Report is comprehensive and actionable"
+
+verification:
+  rules:
+    - name: no-placeholders
+      description: "No placeholder text in output"
+      check: "(?i)(TODO|PLACEHOLDER|TBD|INSERT HERE)"
+      severity: error
+      type: regex
+
+memory:
+  extract_types:
+    - key_finding
+    - recommendation
+
+tool_guidance: |
+  Use the calculator tool for any quantitative analysis.
+  Use the spreadsheet tool for data organization.
+```
+
+### Process Packages
+
+For more complex processes, create a directory with bundled tools:
+
+```
+~/.loom/processes/my-process/
+  process.yaml          # Process definition
+  tools/
+    custom_tool.py      # Automatically loaded and registered
+  templates/
+    report_template.md  # Available as reference
+```
+
+---
+
+## 5. Approval Modes
 
 Control how much autonomy Loom has:
 
@@ -526,7 +642,7 @@ client.post(f"/tasks/{task_id}/approve", json={
 
 ---
 
-## 5. Configuration
+## 6. Configuration
 
 Loom reads `loom.toml` from the current directory or `~/.loom/loom.toml`:
 
@@ -570,7 +686,7 @@ scratch_dir = "~/.loom/scratch"
 
 ---
 
-## 6. End-to-End Example: Bash Script Agent
+## 7. End-to-End Example: Bash Script Agent
 
 A minimal agent that submits a task and waits for results:
 

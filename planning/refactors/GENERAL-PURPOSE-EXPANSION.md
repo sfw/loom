@@ -1,5 +1,7 @@
 # Loom General-Purpose Expansion Plan
 
+**Status: IMPLEMENTED** — R4 (Process Definition Plugin Architecture) is fully built and shipped. See `src/loom/processes/` for the implementation and `PLAN.md` Phase 7 for the summary.
+
 **Goal:** Transform Loom from a code-only orchestration engine into a general-purpose AI work engine capable of handling complex white-collar tasks: marketing strategy, investment analysis, financial modeling, consulting engagements, policy analysis, and research workflows.
 
 **Guiding principle:** Loom's orchestration layer (plan → execute → verify → learn) is domain-agnostic. The code-specific assumptions live in the _tools_, _prompts_, _verification_, and _workspace model_. This plan abstracts those layers behind domain-aware interfaces without breaking the existing code workflow.

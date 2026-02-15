@@ -5,6 +5,15 @@ All notable changes to Loom are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Process definition plugin architecture** (`processes/schema.py`) -- YAML-based domain specialization. Process definitions inject personas, phase blueprints, verification rules, tool guidance, and memory extraction types into the engine without code changes. Multi-path discovery (builtin → user-global → workspace-local), comprehensive validation with dependency cycle detection, and support for process packages that bundle tools.
+- **5 built-in process definitions** (`processes/builtin/`) -- `investment-analysis` (5-phase strict financial workflow), `marketing-strategy` (6-phase guided GTM), `research-report` (4-phase research pipeline), `competitive-intel` (3-phase competitive analysis), `consulting-engagement` (5-phase McKinsey-style issue tree).
+- **Process-aware verification** (`engine/verification.py`) -- DeterministicVerifier now runs process-specific regex rules and deliverables existence checks.
+- **`calculator` tool** (`tools/calculator.py`) -- safe AST-based math evaluation with financial functions (NPV, CAGR, WACC, PMT). Exponent limits prevent OOM.
+- **`spreadsheet` tool** (`tools/spreadsheet.py`) -- CSV operations: create, read, add rows/columns, update cells, summary. 5MB file size limit.
+- **`document_write` tool** (`tools/document_write.py`) -- structured Markdown generation with sections, frontmatter metadata, and append mode.
+- **`--process` CLI flag** (`__main__.py`) -- on `run` and `cowork` commands. Loads and applies a named process definition.
+- **`loom processes` command** (`__main__.py`) -- lists all available process definitions with metadata.
+- **`[process]` config section** (`config.py`) -- `default` process and `search_paths` for additional process directories.
 - **Session switching** (`__main__.py`) -- `/sessions`, `/new`, `/session` commands for mid-session switching between cowork sessions across workspaces.
 - **EventBus unsubscribe** (`events/bus.py`) -- `unsubscribe()` and `unsubscribe_all()` methods to prevent handler leaks on SSE disconnect.
 

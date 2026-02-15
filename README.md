@@ -40,7 +40,8 @@ Goal -> Planner ->  │ [Subtask A]  [Subtask B] │  parallel batch
 - **Isolated execution** -- each subtask runs in a `SubtaskRunner` with its own context (no cross-contamination)
 - **Three model backends** -- Ollama, OpenAI-compatible APIs (LM Studio, vLLM, etc.), and Anthropic/Claude
 - **Role-based routing** -- planner, executor, extractor, verifier roles with tier selection
-- **Tool system** -- 16 built-in tools (file ops, shell, git, ripgrep search, glob find, web search, web fetch, code analysis, task tracker, ask user) with plugin auto-discovery
+- **Tool system** -- 19 built-in tools (file ops, shell, git, ripgrep search, glob find, web search, web fetch, code analysis, task tracker, ask user, calculator, spreadsheet, document write) with plugin auto-discovery
+- **Process definitions** -- YAML-based domain specialization (investment analysis, marketing strategy, consulting, etc.) that inject personas, phase blueprints, verification rules, and tool guidance without changing engine code
 - **Workspace safety** -- path traversal prevention, destructive command blocking
 - **Full undo** -- changelog with before-snapshots, revert at file/subtask/task level
 - **Token budgeting** -- prompt assembly with 7-section ordering and trim-to-budget
@@ -111,6 +112,7 @@ loom run GOAL           Submit a task and stream progress inline
 loom status ID          Check status of a task
 loom cancel ID          Cancel a running task
 loom models             List configured models
+loom processes          List available process definitions
 loom mcp-serve          Start the MCP server (stdio transport)
 loom reset-learning     Clear all learned patterns
 ```
@@ -187,7 +189,28 @@ tier3_enabled = false   # Multi-vote verification (expensive)
 
 [memory]
 database_path = "~/.loom/loom.db"
+
+[process]
+default = ""                        # Default process for all tasks (empty = none)
+search_paths = ["~/.loom/processes"]  # Additional directories to search for process definitions
 ```
+
+### Process Definitions
+
+Loom ships with 5 built-in process definitions that inject domain expertise:
+
+```bash
+# List available processes
+loom processes
+
+# Run a task with a specific process
+loom run "Analyze ACME Corp for investment" --workspace /tmp/acme --process investment-analysis
+
+# Or in cowork mode
+loom cowork -w /tmp/acme --process consulting-engagement
+```
+
+Built-in processes: `investment-analysis`, `marketing-strategy`, `research-report`, `competitive-intel`, `consulting-engagement`. You can create custom processes as YAML files in `~/.loom/processes/` or in your workspace's `.loom/processes/` directory.
 
 See [INSTALL.md](INSTALL.md) for detailed setup instructions.
 
@@ -225,8 +248,11 @@ src/loom/
     ollama_provider.py   Ollama API client
     openai_provider.py   OpenAI-compatible API client
     router.py            Role+tier model selection
+  processes/
+    schema.py            Process definition loader, validation, cycle detection
+    builtin/             5 built-in YAML process definitions
   prompts/
-    assembler.py         7-section prompt builder
+    assembler.py         7-section prompt builder with process injection
     constraints.py       Safety and behavior constraints
     templates/           YAML prompt templates
   recovery/
@@ -250,6 +276,9 @@ src/loom/
     web.py               Web fetch with URL safety
     web_search.py        Internet search via DuckDuckGo (no API key)
     task_tracker.py      Progress tracking for multi-step tasks
+    calculator.py        Safe math evaluation (AST-based, financial functions)
+    spreadsheet.py       CSV spreadsheet operations (create, read, modify)
+    document_write.py    Structured Markdown document generation
     workspace.py         Changelog, diff, revert
   tui/
     app.py               Textual TUI (cowork chat, approval/ask_user modals)

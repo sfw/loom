@@ -413,6 +413,7 @@
   <a href="#steering">Steering Tasks</a>
   <a href="#tui">Terminal UI</a>
   <div class="section-label">Features</div>
+  <a href="#processes">Process Definitions</a>
   <a href="#approval">Approval Gates</a>
   <a href="#learning">Learning System</a>
   <a href="#mcp">MCP Server</a>
@@ -874,6 +875,114 @@
   <p>The dashboard shows all tasks in a table view. Select a task to see its plan tree, live execution output, and subtask status. Events stream in real-time via SSE.</p>
 </section>
 
+<!-- ======================== PROCESSES ======================== -->
+<section id="processes">
+  <h2>Process Definitions</h2>
+
+  <p>Process definitions let you specialize Loom for specific domains <strong>without writing any code</strong>. A process definition is a YAML file that injects domain expertise into every stage of the engine: planning, execution, verification, and memory extraction.</p>
+
+  <div class="callout callout-info">
+    <strong>Think of it like a programming language</strong>
+    The engine is the runtime, built-in tools are the standard library, and process definitions are user programs that configure behavior. Process <em>packages</em> can even bundle custom tools alongside the YAML &mdash; delivering both intelligence and capability in a single unit.
+  </div>
+
+  <h3>Built-in Processes</h3>
+  <p>Loom ships with 5 domain-specific process definitions:</p>
+
+  <table>
+    <tr><th>Process</th><th>Phases</th><th>Mode</th><th>Domain</th></tr>
+    <tr><td><code>investment-analysis</code></td><td>5</td><td>strict</td><td>Financial due diligence and valuation</td></tr>
+    <tr><td><code>marketing-strategy</code></td><td>6</td><td>guided</td><td>Go-to-market strategy and campaigns</td></tr>
+    <tr><td><code>research-report</code></td><td>4</td><td>guided</td><td>Research synthesis and reporting</td></tr>
+    <tr><td><code>competitive-intel</code></td><td>3</td><td>guided</td><td>Competitive landscape analysis</td></tr>
+    <tr><td><code>consulting-engagement</code></td><td>5</td><td>guided</td><td>McKinsey-style issue tree consulting</td></tr>
+  </table>
+
+  <h3>Using a Process</h3>
+
+  <pre><code><span class="cmt"># List all available processes</span>
+<span class="cmd">loom processes</span>
+
+<span class="cmt"># Run a task with a specific process</span>
+<span class="cmd">loom run</span> <span class="str">"Analyze Tesla for investment"</span> <span class="flag">--workspace</span> /tmp/tesla <span class="flag">--process</span> investment-analysis
+
+<span class="cmt"># Interactive cowork with a process</span>
+<span class="cmd">loom cowork</span> <span class="flag">-w</span> /tmp/project <span class="flag">--process</span> consulting-engagement</code></pre>
+
+  <h3>What a Process Injects</h3>
+  <div class="card-grid">
+    <div class="card">
+      <h4>Persona</h4>
+      <p>Domain-expert identity injected into all prompts (planner, executor, verifier, extractor)</p>
+    </div>
+    <div class="card">
+      <h4>Phase Blueprint</h4>
+      <p>Recommended phase structure with dependencies, deliverables, and acceptance criteria</p>
+    </div>
+    <div class="card">
+      <h4>Verification Rules</h4>
+      <p>Domain-specific checks &mdash; regex patterns for deterministic validation, LLM rules for semantic review</p>
+    </div>
+    <div class="card">
+      <h4>Tool Guidance</h4>
+      <p>Instructions on which tools to use and how, plus tool exclusions for irrelevant tools</p>
+    </div>
+  </div>
+
+  <h3>Phase Modes</h3>
+  <table>
+    <tr><th>Mode</th><th>Planner Freedom</th><th>Use When</th></tr>
+    <tr><td><code>strict</code></td><td>Must follow the phase blueprint exactly</td><td>Regulatory, financial, compliance workflows</td></tr>
+    <tr><td><code>guided</code></td><td>Should follow the blueprint but can adapt</td><td>Most domain work (recommended default)</td></tr>
+    <tr><td><code>suggestive</code></td><td>Blueprint is optional inspiration</td><td>Creative or exploratory tasks</td></tr>
+  </table>
+
+  <h3>Creating Custom Processes</h3>
+  <p>Drop a YAML file in <code>~/.loom/processes/</code> or <code>&lt;workspace&gt;/.loom/processes/</code>:</p>
+
+  <pre><code><span class="label">my-process.yaml</span>
+<span class="key">name</span>: <span class="str">my-custom-process</span>
+<span class="key">version</span>: <span class="str">"1.0"</span>
+<span class="key">description</span>: <span class="str">"My domain specialization"</span>
+<span class="key">persona</span>: <span class="str">|
+  You are a domain expert specializing in...</span>
+
+<span class="key">phase_mode</span>: <span class="str">guided</span>
+
+<span class="key">phases</span>:
+  - <span class="key">id</span>: <span class="str">research</span>
+    <span class="key">description</span>: <span class="str">"Gather and analyze data"</span>
+    <span class="key">depends_on</span>: []
+    <span class="key">deliverables</span>:
+      - <span class="str">"research-notes.md"</span>
+
+  - <span class="key">id</span>: <span class="str">synthesize</span>
+    <span class="key">description</span>: <span class="str">"Create final report"</span>
+    <span class="key">depends_on</span>: [<span class="str">research</span>]
+    <span class="key">deliverables</span>:
+      - <span class="str">"final-report.md"</span>
+
+<span class="key">verification</span>:
+  <span class="key">rules</span>:
+    - <span class="key">name</span>: <span class="str">no-placeholders</span>
+      <span class="key">check</span>: <span class="str">"(?i)(TODO|PLACEHOLDER|TBD)"</span>
+      <span class="key">severity</span>: <span class="str">error</span>
+      <span class="key">type</span>: <span class="str">regex</span></code></pre>
+
+  <h3>Process Discovery Order</h3>
+  <p>Loom searches for process definitions in this order (first match wins):</p>
+  <ol style="padding-left: 24px; margin: 12px 0; color: var(--text-dim);">
+    <li><code>&lt;workspace&gt;/.loom/processes/</code> &mdash; workspace-local</li>
+    <li>Paths from <code>[process] search_paths</code> in config &mdash; user-global</li>
+    <li>Built-in processes shipped with Loom</li>
+  </ol>
+
+  <div class="callout callout-success">
+    <strong>New tools included</strong>
+    Three new tools complement the process system: <code>calculator</code> (safe math with financial functions like NPV, CAGR, WACC), <code>spreadsheet</code> (CSV operations), and <code>document_write</code> (structured Markdown generation).
+  </div>
+</section>
+
 <!-- ======================== APPROVAL ======================== -->
 <section id="approval">
   <h2>Approval Gates</h2>
@@ -1180,8 +1289,11 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     ollama_provider.py   <span class="cmt"># Ollama client</span>
     openai_provider.py   <span class="cmt"># OpenAI-compatible client</span>
     router.py            <span class="cmt"># Role + tier routing</span>
+  processes/
+    schema.py            <span class="cmt"># Process definition loader + validation</span>
+    builtin/             <span class="cmt"># 5 built-in YAML process definitions</span>
   prompts/
-    assembler.py         <span class="cmt"># 7-section builder</span>
+    assembler.py         <span class="cmt"># 7-section builder + process injection</span>
     constraints.py       <span class="cmt"># Safety rules</span>
     templates/           <span class="cmt"># YAML templates</span>
   recovery/
@@ -1200,6 +1312,9 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     search.py            <span class="cmt"># File search</span>
     code_analysis.py     <span class="cmt"># Code structure analysis</span>
     web.py               <span class="cmt"># Web fetch</span>
+    calculator.py        <span class="cmt"># Safe math + financial functions</span>
+    spreadsheet.py       <span class="cmt"># CSV spreadsheet operations</span>
+    document_write.py    <span class="cmt"># Structured Markdown generation</span>
     workspace.py         <span class="cmt"># Changelog + revert</span>
   tui/
     api_client.py        <span class="cmt"># Async HTTP + SSE client</span>
@@ -1232,6 +1347,8 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     <tr><td><code>memory.database_path</code></td><td><code>~/.loom/loom.db</code></td><td>SQLite database location</td></tr>
     <tr><td><code>logging.level</code></td><td><code>INFO</code></td><td>Log verbosity (DEBUG, INFO, WARN, ERROR)</td></tr>
     <tr><td><code>logging.event_log_path</code></td><td><code>~/.loom/logs</code></td><td>Event log directory</td></tr>
+    <tr><td><code>process.default</code></td><td><code>""</code></td><td>Default process definition for all tasks</td></tr>
+    <tr><td><code>process.search_paths</code></td><td><code>[]</code></td><td>Additional directories for process discovery</td></tr>
   </table>
 
   <h3>Config Search Order</h3>
