@@ -23,8 +23,10 @@ class ToolApprovalScreen(ModalScreen[str]):
     ]
 
     CSS = """
-    #approval-dialog {
+    ToolApprovalScreen {
         align: center middle;
+    }
+    #approval-dialog {
         width: 72;
         height: auto;
         max-height: 20;

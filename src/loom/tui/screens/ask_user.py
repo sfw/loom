@@ -16,8 +16,10 @@ class AskUserScreen(ModalScreen[str]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     CSS = """
-    #ask-user-dialog {
+    AskUserScreen {
         align: center middle;
+    }
+    #ask-user-dialog {
         width: 72;
         height: auto;
         max-height: 20;

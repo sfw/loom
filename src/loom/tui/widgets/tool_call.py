@@ -188,7 +188,7 @@ class ToolCallWidget(Static):
                 elif _is_multimodal_output(self._output):
                     styled = _style_multimodal_output(snippet)
                 else:
-                    styled = f"[dim]{snippet}[/dim]"
+                    styled = f"[dim]{_escape(snippet)}[/dim]"
                 yield Collapsible(
                     Static(styled),
                     title=title,
@@ -204,7 +204,7 @@ class ToolCallWidget(Static):
             )
             if self._error:
                 yield Collapsible(
-                    Static(f"[#f7768e]{err_msg}[/]"),
+                    Static(f"[#f7768e]{_escape(err_msg)}[/]"),
                     title=title,
                     collapsed=True,
                 )

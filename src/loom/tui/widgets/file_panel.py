@@ -69,9 +69,11 @@ class FilesChangedPanel(Vertical):
 
     def show_diff(self, diff_text: str) -> None:
         """Display a diff in the viewer panel."""
+        from loom.tui.widgets.tool_call import _style_diff_output
+
         viewer = self.query_one("#diff-viewer", Static)
         if diff_text:
-            viewer.update(f"```diff\n{diff_text}\n```")
+            viewer.update(_style_diff_output(diff_text))
             viewer.add_class("visible")
         else:
             viewer.update("")
