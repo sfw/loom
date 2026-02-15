@@ -516,10 +516,11 @@ class ProcessLoader:
                 if color[neighbor] == _gray:
                     # Found a cycle — reconstruct path
                     cycle = [neighbor, node]
-                    cur = node
-                    while parent.get(cur) and parent[cur] != neighbor:
-                        cur = parent[cur]  # type: ignore[assignment]
-                        cycle.append(cur)
+                    cur: str | None = node
+                    while cur and parent.get(cur) and parent[cur] != neighbor:
+                        cur = parent[cur]
+                        if cur:
+                            cycle.append(cur)
                     cycle.append(neighbor)
                     return list(reversed(cycle))
                 if color[neighbor] == _white:
