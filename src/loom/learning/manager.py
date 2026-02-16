@@ -199,6 +199,29 @@ class LearningManager:
 
         return count
 
+    async def delete_pattern(self, pattern_id: int) -> bool:
+        """Delete a single learned pattern by ID.
+
+        Returns True if a row was deleted, False if the ID was not found.
+        """
+        existing = await self._db.query_one(
+            "SELECT id FROM learned_patterns WHERE id = ?", (pattern_id,),
+        )
+        if not existing:
+            return False
+        await self._db.execute(
+            "DELETE FROM learned_patterns WHERE id = ?", (pattern_id,),
+        )
+        return True
+
+    async def query_all(self, limit: int = 50) -> list[LearnedPattern]:
+        """Query all learned patterns regardless of type."""
+        sql = """SELECT * FROM learned_patterns
+                 ORDER BY frequency DESC, last_seen DESC
+                 LIMIT ?"""
+        rows = await self._db.query(sql, (limit,))
+        return [self._row_to_pattern(r) for r in rows]
+
     async def clear_all(self) -> None:
         """Clear all learned patterns (reset learning)."""
         await self._db.execute("DELETE FROM learned_patterns")

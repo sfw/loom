@@ -52,7 +52,12 @@ from loom.cowork.session import (
 from loom.models.base import ModelProvider
 from loom.tools.registry import ToolRegistry
 from loom.tui.commands import LoomCommands
-from loom.tui.screens import AskUserScreen, SetupScreen, ToolApprovalScreen
+from loom.tui.screens import (
+    AskUserScreen,
+    LearnedScreen,
+    SetupScreen,
+    ToolApprovalScreen,
+)
 from loom.tui.theme import LOOM_DARK
 from loom.tui.widgets import (
     ChatLog,
@@ -446,6 +451,49 @@ class LoomApp(App):
         )
 
     # ------------------------------------------------------------------
+    # Learned patterns
+    # ------------------------------------------------------------------
+
+    async def _show_learned_patterns(self) -> None:
+        """Show the learned patterns review modal."""
+        from loom.learning.manager import LearningManager
+
+        mgr = LearningManager(self._db)
+        patterns = await mgr.query_all(limit=50)
+
+        def handle_result(result: str) -> None:
+            if result:
+                self._delete_learned_patterns(result)
+
+        self.push_screen(LearnedScreen(patterns), callback=handle_result)
+
+    @work
+    async def _delete_learned_patterns(self, deleted_ids_csv: str) -> None:
+        """Delete patterns whose IDs were selected in the review screen."""
+        from loom.learning.manager import LearningManager
+
+        if not deleted_ids_csv or not self._db:
+            return
+
+        mgr = LearningManager(self._db)
+        chat = self.query_one("#chat-log", ChatLog)
+        count = 0
+
+        for raw_id in deleted_ids_csv.split(","):
+            raw_id = raw_id.strip()
+            if not raw_id:
+                continue
+            try:
+                pid = int(raw_id)
+                if await mgr.delete_pattern(pid):
+                    count += 1
+            except (ValueError, Exception):
+                pass
+
+        if count:
+            chat.add_info(f"Deleted {count} learned pattern(s).")
+
+    # ------------------------------------------------------------------
     # Approval callback
     # ------------------------------------------------------------------
 
@@ -519,7 +567,7 @@ class LoomApp(App):
         if cmd == "/help":
             lines = [
                 "Commands: /quit, /clear, /model, /tools, /tokens, "
-                "/setup, /help",
+                "/learned, /setup, /help",
                 "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette, "
                 "Ctrl+1/2/3 tabs",
             ]
@@ -527,6 +575,7 @@ class LoomApp(App):
                 lines.insert(1, "  /sessions — list and switch sessions")
                 lines.insert(2, "  /new — start a new session")
                 lines.insert(3, "  /session — current session info")
+                lines.insert(4, "  /learned — review/delete learned patterns")
             chat.add_info("\n".join(lines))
             return True
         if cmd == "/model":
@@ -622,6 +671,13 @@ class LoomApp(App):
                     chat.add_info(f"[bold #f7768e]Resume failed: {e}[/]")
             else:
                 chat.add_info(f"No session found matching '{prefix}'.")
+            return True
+
+        if cmd == "/learned":
+            if not self._db:
+                chat.add_info("No database — learned patterns unavailable.")
+                return True
+            await self._show_learned_patterns()
             return True
 
         return False
