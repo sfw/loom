@@ -179,6 +179,14 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
+    def exclude(self, name: str) -> bool:
+        """Remove a tool. Returns True if it existed."""
+        return self._tools.pop(name, None) is not None
+
+    def has(self, name: str) -> bool:
+        """Check if tool is registered."""
+        return name in self._tools
+
     async def execute(
         self,
         name: str,

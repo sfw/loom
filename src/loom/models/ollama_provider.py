@@ -7,6 +7,7 @@ multimodal content (images), and thinking mode switching for Qwen3 models.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -24,6 +25,8 @@ from loom.models.base import (
     TokenUsage,
     ToolCall,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class OllamaProvider(ModelProvider):
@@ -113,6 +116,7 @@ class OllamaProvider(ModelProvider):
                     try:
                         args = json.loads(args)
                     except json.JSONDecodeError:
+                        logger.warning("Malformed tool args from Ollama: %s", str(args)[:200])
                         args = {}
                 tool_calls.append(ToolCall(
                     id=f"call_{i}",
@@ -165,11 +169,72 @@ class OllamaProvider(ModelProvider):
             payload["tools"] = self._format_ollama_tools(tools)
 
         try:
-            cm = self._client.stream(
+            async with self._client.stream(
                 "POST", "/api/chat", json=payload,
-            )
-            response = await cm.__aenter__()
-            response.raise_for_status()
+            ) as response:
+                response.raise_for_status()
+
+                accumulated_tool_calls: list[dict] = []
+
+                async for line in response.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    message = data.get("message", {})
+                    text = message.get("content") or ""
+                    done = data.get("done", False)
+
+                    # Collect tool calls (only available in final message)
+                    if message.get("tool_calls"):
+                        accumulated_tool_calls.extend(message["tool_calls"])
+
+                    parsed_tools = None
+                    usage = None
+
+                    if done:
+                        # Parse accumulated tool calls
+                        if accumulated_tool_calls:
+                            parsed_tools = []
+                            for i, tc in enumerate(accumulated_tool_calls):
+                                func = tc.get("function", {})
+                                args = func.get("arguments", {})
+                                if isinstance(args, str):
+                                    try:
+                                        args = json.loads(args)
+                                    except json.JSONDecodeError:
+                                        logger.warning(
+                                            "Malformed tool args from Ollama stream: %s",
+                                            str(args)[:200],
+                                        )
+                                        args = {}
+                                parsed_tools.append(ToolCall(
+                                    id=f"call_{i}",
+                                    name=func.get("name", ""),
+                                    arguments=args,
+                                ))
+
+                        usage = TokenUsage(
+                            input_tokens=data.get("prompt_eval_count", 0),
+                            output_tokens=data.get("eval_count", 0),
+                            total_tokens=(
+                                data.get("prompt_eval_count", 0)
+                                + data.get("eval_count", 0)
+                            ),
+                        )
+
+                    yield StreamChunk(
+                        text=text,
+                        done=done,
+                        tool_calls=parsed_tools,
+                        usage=usage,
+                    )
+
+                    if done:
+                        return
         except httpx.ConnectError as e:
             raise ModelConnectionError(
                 f"Cannot connect to Ollama at "
@@ -187,72 +252,11 @@ class OllamaProvider(ModelProvider):
                 f"{e.response.text[:200]}",
                 original=e,
             ) from e
-
-        try:
-            accumulated_tool_calls: list[dict] = []
-
-            async for line in response.aiter_lines():
-                if not line.strip():
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                message = data.get("message", {})
-                text = message.get("content") or ""
-                done = data.get("done", False)
-
-                # Collect tool calls (only available in final message)
-                if message.get("tool_calls"):
-                    accumulated_tool_calls.extend(message["tool_calls"])
-
-                parsed_tools = None
-                usage = None
-
-                if done:
-                    # Parse accumulated tool calls
-                    if accumulated_tool_calls:
-                        parsed_tools = []
-                        for i, tc in enumerate(accumulated_tool_calls):
-                            func = tc.get("function", {})
-                            args = func.get("arguments", {})
-                            if isinstance(args, str):
-                                try:
-                                    args = json.loads(args)
-                                except json.JSONDecodeError:
-                                    args = {}
-                            parsed_tools.append(ToolCall(
-                                id=f"call_{i}",
-                                name=func.get("name", ""),
-                                arguments=args,
-                            ))
-
-                    usage = TokenUsage(
-                        input_tokens=data.get("prompt_eval_count", 0),
-                        output_tokens=data.get("eval_count", 0),
-                        total_tokens=(
-                            data.get("prompt_eval_count", 0)
-                            + data.get("eval_count", 0)
-                        ),
-                    )
-
-                yield StreamChunk(
-                    text=text,
-                    done=done,
-                    tool_calls=parsed_tools,
-                    usage=usage,
-                )
-
-                if done:
-                    return
         except httpx.ReadError as e:
             raise ModelConnectionError(
                 f"Ollama stream interrupted ({self._model}): {e}",
                 original=e,
             ) from e
-        finally:
-            await cm.__aexit__(None, None, None)
 
     async def health_check(self) -> bool:
         try:
@@ -348,28 +352,3 @@ class OllamaProvider(ModelProvider):
         await self._client.aclose()
 
 
-class ThinkingModeManager:
-    """Manages thinking/acting mode for models that support it.
-
-    Qwen3 models support /think and /no_think mode switching.
-    Planner/replanner roles use thinking mode for deeper reasoning.
-    Executor/extractor/verifier roles use acting mode for reliability.
-    """
-
-    THINKING_ROLES = frozenset({"planner", "replanner"})
-
-    def prepare_messages(self, messages: list[dict], role: str) -> list[dict]:
-        """Inject thinking mode control based on the role."""
-        messages = [dict(m) for m in messages]  # shallow copy
-
-        if role in self.THINKING_ROLES:
-            mode_instruction = "/think"
-        else:
-            mode_instruction = "/no_think"
-
-        if messages and messages[0].get("role") == "system":
-            messages[0]["content"] = f"{mode_instruction}\n{messages[0]['content']}"
-        else:
-            messages.insert(0, {"role": "system", "content": mode_instruction})
-
-        return messages

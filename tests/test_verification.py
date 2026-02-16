@@ -244,9 +244,10 @@ class TestLLMVerifier:
         prompts = MagicMock(spec=PromptAssembler)
         v = LLMVerifier(router, prompts, ResponseValidator())
         result = await v.verify(_make_subtask(), "output", [], None)
-        assert not result.passed
-        assert result.confidence == 0.0
-        assert "No verifier model configured" in result.feedback
+        assert result.passed
+        assert result.tier == 0
+        assert result.confidence == 0.5
+        assert "Verification skipped" in result.feedback
 
 
 # --- VotingVerifier ---

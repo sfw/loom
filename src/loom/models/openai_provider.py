@@ -8,6 +8,7 @@ Supports multimodal content (images, documents) via content parts.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -24,6 +25,8 @@ from loom.models.base import (
     TokenUsage,
     ToolCall,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAICompatibleProvider(ModelProvider):
@@ -117,6 +120,7 @@ class OpenAICompatibleProvider(ModelProvider):
                     try:
                         args = json.loads(args)
                     except json.JSONDecodeError:
+                        logger.warning("Malformed tool args from OpenAI: %s", str(args)[:200])
                         args = {}
                 tool_calls.append(ToolCall(
                     id=tc.get("id", ""),
@@ -160,11 +164,94 @@ class OpenAICompatibleProvider(ModelProvider):
             payload["tools"] = self._format_tools(tools)
 
         try:
-            cm = self._client.stream(
+            async with self._client.stream(
                 "POST", "/chat/completions", json=payload,
-            )
-            response = await cm.__aenter__()
-            response.raise_for_status()
+            ) as response:
+                response.raise_for_status()
+
+                # Buffer tool call deltas until complete
+                tool_call_buffers: dict[int, dict] = {}
+
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data_str = line[len("data:"):].strip()
+                    if data_str == "[DONE]":
+                        # Final chunk — assemble tool calls
+                        parsed_tools = None
+                        if tool_call_buffers:
+                            parsed_tools = []
+                            for idx in sorted(tool_call_buffers):
+                                buf = tool_call_buffers[idx]
+                                args_str = buf.get("arguments", "")
+                                try:
+                                    args = (
+                                        json.loads(args_str)
+                                        if args_str
+                                        else {}
+                                    )
+                                except json.JSONDecodeError:
+                                    args = {}
+                                parsed_tools.append(ToolCall(
+                                    id=buf.get("id", ""),
+                                    name=buf.get("name", ""),
+                                    arguments=args,
+                                ))
+                        yield StreamChunk(
+                            text="", done=True,
+                            tool_calls=parsed_tools,
+                        )
+                        return
+
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choice = data.get("choices", [{}])[0]
+                    delta = choice.get("delta", {})
+                    text = delta.get("content") or ""
+
+                    # Accumulate tool call deltas
+                    if delta.get("tool_calls"):
+                        for tc_delta in delta["tool_calls"]:
+                            idx = tc_delta.get("index", 0)
+                            if idx not in tool_call_buffers:
+                                tool_call_buffers[idx] = {
+                                    "id": "",
+                                    "name": "",
+                                    "arguments": "",
+                                }
+                            buf = tool_call_buffers[idx]
+                            if tc_delta.get("id"):
+                                buf["id"] = tc_delta["id"]
+                            func = tc_delta.get("function", {})
+                            if func.get("name"):
+                                buf["name"] = func["name"]
+                            if func.get("arguments"):
+                                buf["arguments"] += func["arguments"]
+
+                    # Check for usage in the chunk
+                    usage = None
+                    if data.get("usage"):
+                        u = data["usage"]
+                        usage = TokenUsage(
+                            input_tokens=u.get(
+                                "prompt_tokens", 0,
+                            ),
+                            output_tokens=u.get(
+                                "completion_tokens", 0,
+                            ),
+                            total_tokens=u.get(
+                                "total_tokens", 0,
+                            ),
+                        )
+
+                    if text:
+                        yield StreamChunk(
+                            text=text, done=False, usage=usage,
+                        )
         except httpx.ConnectError as e:
             raise ModelConnectionError(
                 f"Cannot connect to model server at "
@@ -183,98 +270,11 @@ class OpenAICompatibleProvider(ModelProvider):
                 f"{e.response.text[:200]}",
                 original=e,
             ) from e
-
-        try:
-            # Buffer tool call deltas until complete
-            tool_call_buffers: dict[int, dict] = {}
-
-            async for line in response.aiter_lines():
-                line = line.strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[len("data:"):].strip()
-                if data_str == "[DONE]":
-                    # Final chunk — assemble tool calls
-                    parsed_tools = None
-                    if tool_call_buffers:
-                        parsed_tools = []
-                        for idx in sorted(tool_call_buffers):
-                            buf = tool_call_buffers[idx]
-                            args_str = buf.get("arguments", "")
-                            try:
-                                args = (
-                                    json.loads(args_str)
-                                    if args_str
-                                    else {}
-                                )
-                            except json.JSONDecodeError:
-                                args = {}
-                            parsed_tools.append(ToolCall(
-                                id=buf.get("id", ""),
-                                name=buf.get("name", ""),
-                                arguments=args,
-                            ))
-                    yield StreamChunk(
-                        text="", done=True,
-                        tool_calls=parsed_tools,
-                    )
-                    return
-
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
-                choice = data.get("choices", [{}])[0]
-                delta = choice.get("delta", {})
-                text = delta.get("content") or ""
-
-                # Accumulate tool call deltas
-                if delta.get("tool_calls"):
-                    for tc_delta in delta["tool_calls"]:
-                        idx = tc_delta.get("index", 0)
-                        if idx not in tool_call_buffers:
-                            tool_call_buffers[idx] = {
-                                "id": "",
-                                "name": "",
-                                "arguments": "",
-                            }
-                        buf = tool_call_buffers[idx]
-                        if tc_delta.get("id"):
-                            buf["id"] = tc_delta["id"]
-                        func = tc_delta.get("function", {})
-                        if func.get("name"):
-                            buf["name"] = func["name"]
-                        if func.get("arguments"):
-                            buf["arguments"] += func["arguments"]
-
-                # Check for usage in the chunk
-                usage = None
-                if data.get("usage"):
-                    u = data["usage"]
-                    usage = TokenUsage(
-                        input_tokens=u.get(
-                            "prompt_tokens", 0,
-                        ),
-                        output_tokens=u.get(
-                            "completion_tokens", 0,
-                        ),
-                        total_tokens=u.get(
-                            "total_tokens", 0,
-                        ),
-                    )
-
-                if text:
-                    yield StreamChunk(
-                        text=text, done=False, usage=usage,
-                    )
         except httpx.ReadError as e:
             raise ModelConnectionError(
                 f"Stream interrupted ({self._model}): {e}",
                 original=e,
             ) from e
-        finally:
-            await cm.__aexit__(None, None, None)
 
     async def health_check(self) -> bool:
         try:

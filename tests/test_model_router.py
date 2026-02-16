@@ -12,7 +12,6 @@ from loom.models.base import (
     TokenUsage,
     ToolCall,
 )
-from loom.models.ollama_provider import ThinkingModeManager
 from loom.models.router import ModelRouter, ResponseValidator, _create_provider
 
 # --- Mock Provider ---
@@ -198,41 +197,6 @@ class TestCreateProvider:
         )
         with pytest.raises(ValueError, match="Unknown provider"):
             _create_provider("test", config)
-
-
-# --- Thinking Mode ---
-
-class TestThinkingModeManager:
-    def test_thinking_mode_for_planner(self):
-        mgr = ThinkingModeManager()
-        messages = [{"role": "system", "content": "You are a planner."}]
-        result = mgr.prepare_messages(messages, role="planner")
-        assert result[0]["content"].startswith("/think")
-
-    def test_no_think_for_executor(self):
-        mgr = ThinkingModeManager()
-        messages = [{"role": "system", "content": "You are an executor."}]
-        result = mgr.prepare_messages(messages, role="executor")
-        assert result[0]["content"].startswith("/no_think")
-
-    def test_no_think_for_extractor(self):
-        mgr = ThinkingModeManager()
-        messages = [{"role": "user", "content": "Extract data."}]
-        result = mgr.prepare_messages(messages, role="extractor")
-        assert result[0]["role"] == "system"
-        assert "/no_think" in result[0]["content"]
-
-    def test_thinking_for_replanner(self):
-        mgr = ThinkingModeManager()
-        messages = [{"role": "system", "content": "Replan."}]
-        result = mgr.prepare_messages(messages, role="replanner")
-        assert "/think" in result[0]["content"]
-
-    def test_does_not_mutate_original(self):
-        mgr = ThinkingModeManager()
-        original = [{"role": "system", "content": "Original content"}]
-        mgr.prepare_messages(original, role="executor")
-        assert original[0]["content"] == "Original content"
 
 
 # --- Response Validator ---

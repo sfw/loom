@@ -10,6 +10,7 @@ Selection logic:
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 
 from loom.config import Config, ModelConfig
@@ -17,6 +18,8 @@ from loom.models.anthropic_provider import AnthropicProvider
 from loom.models.base import ModelNotAvailableError, ModelProvider, ModelResponse
 from loom.models.ollama_provider import OllamaProvider
 from loom.models.openai_provider import OpenAICompatibleProvider
+
+logger = logging.getLogger(__name__)
 
 
 class ModelRouter:
@@ -104,7 +107,8 @@ class ModelRouter:
         for name, provider in self._providers.items():
             try:
                 results[name] = await provider.health_check()
-            except Exception:
+            except Exception as e:
+                logger.warning("Health check failed for provider %s: %s", name, e)
                 results[name] = False
         return results
 

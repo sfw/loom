@@ -161,7 +161,6 @@ class PromptAssembler:
         state_manager: TaskStateManager,
         memory_entries: list[MemoryEntry] | None = None,
         available_tools: list[dict] | None = None,
-        memory_formatter=None,
     ) -> str:
         """Assemble the full prompt for subtask execution.
 
@@ -195,9 +194,7 @@ class PromptAssembler:
         ).strip()
 
         # 4. RETRIEVED CONTEXT (memory)
-        if memory_entries and memory_formatter:
-            memory_text = memory_formatter(memory_entries)
-        elif memory_entries:
+        if memory_entries:
             memory_text = self._format_memory(memory_entries)
         else:
             memory_text = "No relevant prior context."
@@ -452,6 +449,8 @@ class PromptAssembler:
             if entry.subtask_id:
                 prefix += f" (from {entry.subtask_id})"
             lines.append(f"{prefix} {entry.summary}")
+            if entry.detail and len(entry.detail) <= 200:
+                lines.append(f"  Detail: {entry.detail}")
         return "\n".join(lines)
 
     def _format_tools(self, tools: list[dict]) -> str:
@@ -471,7 +470,8 @@ class PromptAssembler:
     @staticmethod
     def estimate_tokens(text: str) -> int:
         """Rough token estimate: ~4 chars per token for English."""
-        return len(text) // 4
+        from loom.utils.tokens import estimate_tokens
+        return estimate_tokens(text)
 
     def _trim_to_budget(
         self, prompt: str, max_tokens: int = 8000,

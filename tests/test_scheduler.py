@@ -21,7 +21,7 @@ def _subtask(id: str, depends_on: list[str] | None = None, status: str = "pendin
     )
 
 
-class TestSchedulerNextSubtask:
+class TestSchedulerNextRunnable:
     def test_simple_linear(self):
         scheduler = Scheduler()
         plan = _plan(
@@ -31,23 +31,25 @@ class TestSchedulerNextSubtask:
         )
 
         # First runnable should be 'a' (no deps)
-        assert scheduler.next_subtask(plan).id == "a"
+        runnable = scheduler.runnable_subtasks(plan)
+        assert len(runnable) == 1
+        assert runnable[0].id == "a"
 
-    def test_returns_none_when_all_completed(self):
+    def test_returns_empty_when_all_completed(self):
         scheduler = Scheduler()
         plan = _plan(
             _subtask("a", status="completed"),
             _subtask("b", status="completed"),
         )
-        assert scheduler.next_subtask(plan) is None
+        assert scheduler.runnable_subtasks(plan) == []
 
-    def test_returns_none_when_blocked(self):
+    def test_returns_empty_when_blocked(self):
         scheduler = Scheduler()
         plan = _plan(
             _subtask("a", status="running"),
             _subtask("b", depends_on=["a"]),
         )
-        assert scheduler.next_subtask(plan) is None
+        assert scheduler.runnable_subtasks(plan) == []
 
     def test_skips_running(self):
         scheduler = Scheduler()
@@ -56,7 +58,9 @@ class TestSchedulerNextSubtask:
             _subtask("b"),
         )
         # 'a' is running, 'b' has no deps so it's runnable
-        assert scheduler.next_subtask(plan).id == "b"
+        runnable = scheduler.runnable_subtasks(plan)
+        assert len(runnable) == 1
+        assert runnable[0].id == "b"
 
     def test_dep_completed_unlocks(self):
         scheduler = Scheduler()
@@ -64,7 +68,9 @@ class TestSchedulerNextSubtask:
             _subtask("a", status="completed"),
             _subtask("b", depends_on=["a"]),
         )
-        assert scheduler.next_subtask(plan).id == "b"
+        runnable = scheduler.runnable_subtasks(plan)
+        assert len(runnable) == 1
+        assert runnable[0].id == "b"
 
     def test_multiple_deps_must_all_complete(self):
         scheduler = Scheduler()
@@ -75,13 +81,14 @@ class TestSchedulerNextSubtask:
         )
         # 'c' depends on both a and b; b is not done
         # But 'b' itself is runnable
-        result = scheduler.next_subtask(plan)
-        assert result.id == "b"
+        runnable = scheduler.runnable_subtasks(plan)
+        assert len(runnable) == 1
+        assert runnable[0].id == "b"
 
     def test_empty_plan(self):
         scheduler = Scheduler()
         plan = _plan()
-        assert scheduler.next_subtask(plan) is None
+        assert scheduler.runnable_subtasks(plan) == []
 
 
 class TestSchedulerRunnableSubtasks:
