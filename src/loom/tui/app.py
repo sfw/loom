@@ -213,10 +213,12 @@ class LoomApp(App):
             from loom.tools.delegate_task import DelegateTaskTool
 
             self._recall_tool = ConversationRecallTool()
-            self._tools.register(self._recall_tool)
+            if not self._tools.has(self._recall_tool.name):
+                self._tools.register(self._recall_tool)
 
             self._delegate_tool = DelegateTaskTool()
-            self._tools.register(self._delegate_tool)
+            if not self._tools.has(self._delegate_tool.name):
+                self._tools.register(self._delegate_tool)
 
         # Load process definition if specified
         process_defn = None
