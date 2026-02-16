@@ -30,15 +30,19 @@ class PromptAssembler:
 
     Context assembly order (spec 12):
     1. ROLE DEFINITION
-    2. TASK STATE
-    3. CURRENT SUBTASK
-    4. RETRIEVED CONTEXT (memory)
-    5. AVAILABLE TOOLS
-    6. OUTPUT FORMAT
-    7. CONSTRAINTS
+    2. LEARNED BEHAVIORS (from ALM reflection)
+    3. TASK STATE
+    4. CURRENT SUBTASK
+    5. RETRIEVED CONTEXT (memory)
+    6. AVAILABLE TOOLS
+    7. OUTPUT FORMAT
+    8. CONSTRAINTS
 
     When a process definition is loaded, domain intelligence is injected
     into these same sections — the template structure doesn't change.
+
+    When learned behavioral patterns exist, they are injected after the
+    role definition so the model sees them before any task-specific context.
     """
 
     SECTION_SEPARATOR = "\n\n---\n\n"
@@ -47,12 +51,14 @@ class PromptAssembler:
         self,
         templates_dir: Path | None = None,
         process: ProcessDefinition | None = None,
+        behaviors_section: str = "",
     ):
         if templates_dir is None:
             templates_dir = Path(__file__).parent / "templates"
         self._templates_dir = templates_dir
         self._templates: dict[str, dict] = {}
         self._process = process
+        self._behaviors_section = behaviors_section
         self._load_templates()
 
     @property
@@ -62,6 +68,14 @@ class PromptAssembler:
     @process.setter
     def process(self, value: ProcessDefinition | None) -> None:
         self._process = value
+
+    @property
+    def behaviors_section(self) -> str:
+        return self._behaviors_section
+
+    @behaviors_section.setter
+    def behaviors_section(self, value: str) -> None:
+        self._behaviors_section = value
 
     def _load_templates(self) -> None:
         """Load all YAML templates from the templates directory."""
@@ -137,7 +151,7 @@ class PromptAssembler:
         instructions = instructions.strip()
         constraints = template.get("constraints", "").strip()
 
-        sections = [role, instructions, constraints]
+        sections = [role, self._behaviors_section, instructions, constraints]
         return self.SECTION_SEPARATOR.join(s for s in sections if s)
 
     def build_executor_prompt(
@@ -213,6 +227,7 @@ class PromptAssembler:
 
         sections = [
             role,
+            self._behaviors_section,  # Learned behaviors (from ALM reflection)
             task_state,
             subtask_section,
             memory_section,

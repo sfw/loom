@@ -1,8 +1,15 @@
-"""Learning system: extract patterns from task execution for future improvement.
+"""Learning system: extract patterns from execution and interaction.
 
-After every task completes (or fails), patterns are extracted from the execution
-history. These patterns inform future model selection, plan templates, and
-prompt construction.
+Two learning modes:
+1. Post-task: After autonomous task completion, extract operational patterns
+   (model success, retry hints, plan templates). Informs model selection and planning.
+2. Per-turn: After every user prompt in interactive sessions, extract behavioral
+   patterns (corrections, preferences, style, domain knowledge). Informs prompt
+   construction so users never repeat themselves.
+
+Both modes store patterns in the same table with frequency-based reinforcement.
+Behavioral patterns are domain-agnostic — they work for coding, writing,
+analysis, or any other task type.
 """
 
 from __future__ import annotations
@@ -106,7 +113,7 @@ class LearningManager:
         stored = []
         for pattern in patterns:
             try:
-                await self._store_or_update(pattern)
+                await self.store_or_update(pattern)
                 stored.append(pattern)
             except Exception as e:
                 logger.warning("Failed to store pattern: %s", e)
@@ -196,8 +203,25 @@ class LearningManager:
         """Clear all learned patterns (reset learning)."""
         await self._db.execute("DELETE FROM learned_patterns")
 
-    async def _store_or_update(self, pattern: LearnedPattern) -> None:
-        """Store a new pattern or update frequency of an existing one."""
+    async def query_behavioral(self, limit: int = 15) -> list[LearnedPattern]:
+        """Query all behavioral patterns, sorted by frequency.
+
+        Returns patterns from reflection (corrections, preferences, style,
+        domain knowledge) — everything needed to personalize prompts.
+        """
+        sql = """SELECT * FROM learned_patterns
+                 WHERE pattern_type LIKE 'behavioral_%'
+                    OR pattern_type = 'user_correction'
+                 ORDER BY frequency DESC, last_seen DESC
+                 LIMIT ?"""
+        rows = await self._db.query(sql, (limit,))
+        return [self._row_to_pattern(r) for r in rows]
+
+    async def store_or_update(self, pattern: LearnedPattern) -> None:
+        """Store a new pattern or update frequency of an existing one.
+
+        Public API — used by both post-task learning and per-turn reflection.
+        """
         existing = await self._db.query_one(
             "SELECT id, frequency FROM learned_patterns WHERE pattern_type=? AND pattern_key=?",
             (pattern.pattern_type, pattern.pattern_key),

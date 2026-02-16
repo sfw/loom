@@ -28,6 +28,7 @@ from loom.models.base import ModelProvider, ToolCall
 from loom.tools.registry import ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
+    from loom.learning.reflection import ReflectionEngine
     from loom.state.conversation_store import ConversationStore
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,7 @@ class CoworkSession:
         session_id: str = "",
         session_state: SessionState | None = None,
         max_context_tokens: int = 180_000,
+        reflection: ReflectionEngine | None = None,
     ):
         self._model = model
         self._tools = tools
@@ -152,6 +154,10 @@ class CoworkSession:
         self._store = store
         self._session_id = session_id
 
+        # Automatic reflection (ALM behavioral learning)
+        self._reflection = reflection
+        self._last_assistant_text = ""  # Track for reflection context
+
         # Session state (Layer 1 for cowork)
         self._session_state = session_state or SessionState(
             workspace=str(workspace) if workspace else "",
@@ -159,6 +165,9 @@ class CoworkSession:
             session_id=session_id,
         )
         self._static_system_prompt = system_prompt
+
+        # Learned behaviors section (injected into system prompt)
+        self._behaviors_section = ""
 
         self._messages: list[dict] = []
         if system_prompt:
@@ -288,18 +297,23 @@ class CoworkSession:
         self._total_tokens += total_tokens
         self._session_state.turn_count = self._turn_counter
         self._session_state.total_tokens = self._total_tokens
-        self._update_system_message()
 
         # Extract session state from tool events
         extract_state_from_tool_events(
             self._session_state, self._turn_counter, all_tool_events,
         )
 
+        # Automatic reflection: analyze this exchange for behavioral patterns
+        response_text = "\n\n".join(text_parts)
+        await self._reflect(user_message, response_text)
+
+        self._update_system_message()
+
         # Persist session metadata
         await self._persist_session_metadata()
 
         yield CoworkTurn(
-            text="\n\n".join(text_parts),
+            text=response_text,
             tool_calls=all_tool_events,
             tokens_used=total_tokens,
             model=self._model.name,
@@ -407,16 +421,21 @@ class CoworkSession:
         self._total_tokens += total_tokens
         self._session_state.turn_count = self._turn_counter
         self._session_state.total_tokens = self._total_tokens
-        self._update_system_message()
 
         extract_state_from_tool_events(
             self._session_state, self._turn_counter, all_tool_events,
         )
 
+        # Automatic reflection: analyze this exchange for behavioral patterns
+        response_text = "\n\n".join(all_text_parts)
+        await self._reflect(user_message, response_text)
+
+        self._update_system_message()
+
         await self._persist_session_metadata()
 
         yield CoworkTurn(
-            text="\n\n".join(all_text_parts),
+            text=response_text,
             tool_calls=all_tool_events,
             tokens_used=total_tokens,
             model=self._model.name,
@@ -533,11 +552,50 @@ class CoworkSession:
     # ------------------------------------------------------------------
 
     def _build_system_content(self) -> str:
-        """Build the full system prompt with session state."""
+        """Build the full system prompt with session state and learned behaviors."""
         parts = [self._static_system_prompt]
+        if self._behaviors_section:
+            parts.append(f"\n{self._behaviors_section}")
         if self._session_state and self._session_state.turn_count > 0:
             parts.append(f"\n## Session State\n{self._session_state.to_yaml()}")
         return "\n".join(parts)
+
+    async def _reflect(self, user_message: str, assistant_response: str) -> None:
+        """Run automatic reflection on this user-assistant exchange.
+
+        Best-effort: failures are logged but never surface to the user.
+        Updates the behaviors section for system prompt injection.
+        """
+        if self._reflection is None:
+            return
+        try:
+            await self._reflection.reflect_on_turn(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                previous_assistant_message=self._last_assistant_text,
+                session_id=self._session_id,
+            )
+            # Refresh the behaviors section from all accumulated patterns
+            await self._load_behaviors()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug("Reflection failed (non-fatal): %s", e)
+
+        self._last_assistant_text = assistant_response
+
+    async def _load_behaviors(self) -> None:
+        """Load learned behavioral patterns and format for prompt injection."""
+        if self._reflection is None:
+            return
+        try:
+            from loom.learning.reflection import (
+                format_behaviors_for_prompt,
+                get_learned_behaviors,
+            )
+            patterns = await get_learned_behaviors(self._reflection._learning)
+            self._behaviors_section = format_behaviors_for_prompt(patterns)
+        except Exception:
+            pass
 
     def _update_system_message(self) -> None:
         """Update the system message in-place with current session state."""
