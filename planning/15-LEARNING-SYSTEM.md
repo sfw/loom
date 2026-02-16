@@ -215,18 +215,21 @@ As the learning database grows, these can be relaxed.
 - Patterns older than 90 days with frequency=1 are pruned.
 - High-frequency patterns are kept indefinitely.
 - Users can clear the learning database: `loom reset-learning`
+- Users can review and selectively delete patterns: `loom learned` (CLI) or `/learned` (TUI)
 
 ## Acceptance Criteria
 
-- [ ] Patterns are extracted after every task completion
-- [ ] Model success rates are tracked per subtask type
-- [ ] Retry patterns inform future model selection (skip known-bad tiers)
-- [ ] User corrections are captured and available for prompt personalization
-- [ ] Successful task plans are stored as reusable templates
-- [ ] Template matching works for similar goals
+- [x] Patterns are extracted after every task completion
+- [x] Model success rates are tracked per subtask type
+- [x] Retry patterns inform future model selection (skip known-bad tiers)
+- [x] User corrections are captured and available for prompt personalization
+- [x] Successful task plans are stored as reusable templates
+- [x] Template matching works for similar goals
 - [ ] Built-in templates are loaded at startup
 - [ ] Cold start uses conservative defaults
-- [ ] Learning database is persistent across restarts
-- [ ] `loom reset-learning` clears all learned patterns
-- [ ] Pattern frequency updates correctly on repeat observations
-- [ ] Stale low-frequency patterns are pruned
+- [x] Learning database is persistent across restarts
+- [x] `loom reset-learning` clears all learned patterns
+- [x] `loom learned` lists, filters, and deletes individual patterns (CLI)
+- [x] `/learned` opens an interactive review/delete modal (TUI)
+- [x] Pattern frequency updates correctly on repeat observations
+- [x] Stale low-frequency patterns are pruned

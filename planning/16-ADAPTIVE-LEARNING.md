@@ -307,6 +307,8 @@ Same policy as Spec 15:
 - Patterns with frequency=1 and age >90 days are pruned
 - High-frequency patterns persist indefinitely
 - `loom reset-learning` clears all patterns (operational and behavioral)
+- `loom learned` lists, filters, and deletes individual patterns (CLI)
+- `/learned` opens an interactive review/delete modal (TUI)
 
 ## Privacy Considerations
 
@@ -314,21 +316,25 @@ Same policy as Spec 15:
 - No patterns are transmitted externally
 - Patterns contain behavioral rules, not raw conversation content
 - `loom reset-learning` provides a complete erasure mechanism
+- `loom learned --delete ID` provides surgical removal of individual patterns
 
 ## Acceptance Criteria
 
-- [ ] Task completion point detection works for wrap-up responses
-- [ ] Follow-up classification distinguishes new tasks from continuations from corrections
-- [ ] Gap extraction produces general behavioral rules via LLM
-- [ ] Implicit patterns are captured (e.g., "test and lint it" → "run tests after writing code")
-- [ ] Explicit corrections are captured (e.g., "no, use JSON" → "use JSON not YAML")
-- [ ] Behavioral patterns are stored in learned_patterns with frequency tracking
+- [x] Task completion point detection works for wrap-up responses
+- [x] Follow-up classification distinguishes new tasks from continuations from corrections
+- [x] Gap extraction produces general behavioral rules via LLM
+- [x] Implicit patterns are captured (e.g., "test and lint it" → "run tests after writing code")
+- [x] Explicit corrections are captured (e.g., "no, use JSON" → "use JSON not YAML")
+- [x] Behavioral patterns are stored in learned_patterns with frequency tracking
 - [ ] Learned behaviors are injected into cowork system prompt
 - [ ] Learned behaviors are injected into executor and planner prompts
-- [ ] Pattern deduplication prevents redundant storage
-- [ ] High-frequency patterns appear before low-frequency ones
-- [ ] Gap analysis is non-blocking (failures don't affect user experience)
-- [ ] Works for non-coding domains (writing, analysis, planning, etc.)
-- [ ] No regex in the detection pipeline
-- [ ] Stale behavioral patterns are pruned (same policy as operational)
-- [ ] `loom reset-learning` clears behavioral patterns too
+- [x] Pattern deduplication prevents redundant storage
+- [x] High-frequency patterns appear before low-frequency ones
+- [x] Gap analysis is non-blocking (failures don't affect user experience)
+- [x] Works for non-coding domains (writing, analysis, planning, etc.)
+- [x] No regex in the detection pipeline
+- [x] Stale behavioral patterns are pruned (same policy as operational)
+- [x] `loom reset-learning` clears behavioral patterns too
+- [x] `loom learned` reviews patterns with type, frequency, and description (CLI)
+- [x] `/learned` opens interactive review/delete modal (TUI)
+- [x] Individual patterns can be deleted by ID
