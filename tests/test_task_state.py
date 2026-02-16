@@ -226,3 +226,24 @@ class TestTaskStateManager:
         # Truncated to 200 chars + "..."
         assert len(data["subtasks"][0]["summary"]) == 203
         assert data["subtasks"][0]["summary"].endswith("...")
+
+    def test_roundtrip_preserves_metadata_fields(self, tmp_path: Path):
+        """All externally visible fields survive YAML round-trip."""
+        mgr = TaskStateManager(tmp_path)
+        task = _make_task()
+        task.approval_mode = "manual"
+        task.callback_url = "https://example.com/hook"
+        task.context = {"env": "test"}
+        task.metadata = {"source": "api"}
+        task.created_at = "2026-01-01T00:00:00"
+        task.updated_at = "2026-01-01T00:00:01"
+        task.completed_at = "2026-01-01T01:00:00"
+        mgr.create(task)
+
+        loaded = mgr.load("test-123")
+        assert loaded.approval_mode == "manual"
+        assert loaded.callback_url == "https://example.com/hook"
+        assert loaded.context == {"env": "test"}
+        assert loaded.metadata == {"source": "api"}
+        assert loaded.created_at == "2026-01-01T00:00:00"
+        assert loaded.completed_at == "2026-01-01T01:00:00"

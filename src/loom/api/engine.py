@@ -123,6 +123,7 @@ async def create_engine(config: Config) -> Engine:
         event_bus=event_bus,
         config=config,
         approval_manager=approval_manager,
+        learning_manager=learning_manager,
     )
 
     return Engine(

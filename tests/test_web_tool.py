@@ -94,3 +94,22 @@ class TestStripHtml:
 
     def test_empty_input(self):
         assert _strip_html("") == ""
+
+
+# --- DNS-based SSRF check ---
+
+
+class TestSSRFDnsResolution:
+    def test_blocks_ipv6_loopback(self):
+        safe, reason = is_safe_url("http://[::1]:8080/")
+        assert not safe
+        assert "Blocked" in reason
+
+    def test_private_ip_helper(self):
+        from loom.tools.web import _is_private_ip
+        assert _is_private_ip("127.0.0.1")
+        assert _is_private_ip("10.0.0.1")
+        assert _is_private_ip("192.168.1.1")
+        assert _is_private_ip("172.16.0.1")
+        assert _is_private_ip("::1")
+        assert not _is_private_ip("8.8.8.8")

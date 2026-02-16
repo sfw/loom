@@ -99,6 +99,7 @@ class ShellExecuteTool(Tool):
 
         cwd = str(ctx.workspace) if ctx.workspace else None
 
+        process = None
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
@@ -114,6 +115,15 @@ class ShellExecuteTool(Tool):
             await process.wait()
         except OSError as e:
             return ToolResult.fail(f"Failed to execute: {e}")
+        except (asyncio.CancelledError, TimeoutError):
+            # Ensure subprocess is terminated on cancellation/timeout
+            if process is not None:
+                try:
+                    process.kill()
+                    await process.wait()
+                except ProcessLookupError:
+                    pass
+            raise
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace")
         stderr_text = stderr_bytes.decode("utf-8", errors="replace")

@@ -89,3 +89,14 @@ class TestGlobFind:
         result = await tool.execute({"pattern": "**/*.py"}, ctx)
         assert result.success
         assert result.data["count"] == 3
+
+    async def test_relative_path_with_workspace(self, tool, workspace):
+        """Relative path='src' should resolve against workspace."""
+        ctx = ToolContext(workspace=workspace)
+        result = await tool.execute({
+            "pattern": "*.py",
+            "path": "src",
+        }, ctx)
+        assert result.success
+        assert "main.py" in result.output
+        assert "test_main.py" not in result.output

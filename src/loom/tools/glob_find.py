@@ -57,11 +57,19 @@ class GlobFindTool(Tool):
         if not pattern:
             return ToolResult(success=False, output="No pattern provided.")
 
-        search_path = Path(args["path"]) if args.get("path") else ctx.workspace
+        raw_path = args.get("path")
+        if raw_path:
+            p = Path(raw_path)
+            if not p.is_absolute() and ctx.workspace:
+                search_path = (ctx.workspace / p).resolve()
+            else:
+                search_path = p.expanduser().resolve()
+        else:
+            search_path = ctx.workspace
         if not search_path:
             return ToolResult(success=False, output="No workspace or path specified.")
 
-        search_path = Path(search_path).expanduser().resolve()
+        search_path = Path(search_path).resolve()
         if not search_path.is_dir():
             return ToolResult(success=False, output=f"Not a directory: {search_path}")
 

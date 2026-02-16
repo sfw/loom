@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
@@ -54,6 +55,18 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         if not valid:
             raise HTTPException(status_code=400, detail=msg)
 
+    # Resolve process definition if specified
+    process_def = None
+    if body.process:
+        from loom.processes.schema import ProcessLoader, ProcessNotFoundError
+        loader = ProcessLoader(
+            workspace=Path(body.workspace) if body.workspace else None,
+        )
+        try:
+            process_def = loader.load(body.process)
+        except ProcessNotFoundError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     task = create_task(
         goal=body.goal,
         workspace=body.workspace or "",
@@ -61,15 +74,28 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         callback_url=body.callback_url or "",
         context=body.context,
     )
+    task.metadata["process"] = body.process or ""
 
     engine.state_manager.save(task)
+
+    # Persist task metadata to SQLite (source of truth for /tasks list)
+    await engine.database.insert_task(
+        task_id=task.id,
+        goal=task.goal,
+        workspace_path=task.workspace,
+        status=task.status.value,
+        approval_mode=task.approval_mode,
+        context=task.context or None,
+        callback_url=task.callback_url or None,
+        metadata=body.metadata or None,
+    )
 
     # Register webhook if callback_url provided
     if task.callback_url:
         engine.webhook_delivery.register(task.id, task.callback_url)
 
     # Launch execution in background
-    asyncio.create_task(_execute_in_background(engine, task))
+    asyncio.create_task(_execute_in_background(engine, task, process_def))
 
     return TaskCreateResponse(
         task_id=task.id,
@@ -78,18 +104,28 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
     )
 
 
-async def _execute_in_background(engine: Engine, task) -> None:
+async def _execute_in_background(engine: Engine, task, process_def=None) -> None:
     """Run task execution without blocking the API response."""
     import logging
     _bg_logger = logging.getLogger(__name__)
     try:
-        await engine.orchestrator.execute_task(task)
+        # Inject process definition for this task if specified
+        if process_def is not None:
+            engine.orchestrator._process = process_def
+            engine.orchestrator._prompts.process = process_def
+        result = await engine.orchestrator.execute_task(task)
+        # Sync final status to SQLite
+        try:
+            await engine.database.update_task_status(result.id, result.status.value)
+        except Exception:
+            _bg_logger.warning("Failed to sync task %s status to DB", result.id)
     except Exception as e:
         _bg_logger.exception("Task %s failed with uncaught exception: %s", task.id, e)
         # Ensure task is marked failed even if orchestrator didn't catch it
         try:
             task.status = TaskStatus.FAILED
             engine.state_manager.save(task)
+            await engine.database.update_task_status(task.id, TaskStatus.FAILED.value)
         except Exception:
             _bg_logger.exception("Failed to save error state for task %s", task.id)
 

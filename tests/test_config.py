@@ -107,3 +107,16 @@ roles = "executor"
 """)
         config = load_config(toml_file)
         assert config.models["simple"].roles == ["executor"]
+
+    def test_enable_streaming_loaded(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[execution]
+enable_streaming = true
+""")
+        config = load_config(toml_file)
+        assert config.execution.enable_streaming is True
+
+    def test_enable_streaming_default_false(self):
+        config = Config()
+        assert config.execution.enable_streaming is False
