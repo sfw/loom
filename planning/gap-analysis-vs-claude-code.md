@@ -347,6 +347,6 @@ All 14 gaps identified in this analysis have been implemented and tested (612+ t
 - Plan-execute-verify pipeline (for autonomous/background tasks)
 - 3-tier verification (for high-stakes operations)
 - Workspace changelog & undo
-- Learning system
+- Adaptive Learning Memory with user-facing review (`loom learned`, `/learned`)
 - Event bus architecture
 - SQLite persistence

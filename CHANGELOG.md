@@ -5,6 +5,11 @@ All notable changes to Loom are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Adaptive Learning Memory (ALM)** (`learning/reflection.py`) -- behavioral pattern extraction via task completion gap analysis. Detects the gap between what the model delivered and what the user actually wanted. Extracts general behavioral rules ("run tests after writing code") from implicit follow-ups ("test and lint it") and explicit corrections ("no, use JSON"). Patterns are frequency-weighted and injected into future system prompts. No regex -- gaps are structural, not lexical.
+- **`loom learned` CLI command** (`__main__.py`) -- review, filter, and delete learned patterns from the terminal. Supports `--type` filtering, `--delete ID` for removal, and `--limit` for output control.
+- **`/learned` TUI slash command** (`tui/app.py`, `tui/screens/learned.py`) -- interactive modal for reviewing and deleting learned patterns. Shows pattern type, description, frequency, last seen date, and per-row delete buttons. Added to `/help` output.
+- **`LearningManager.delete_pattern()`** (`learning/manager.py`) -- delete individual learned patterns by ID. Enables selective curation of the learning database.
+- **`LearningManager.query_all()`** (`learning/manager.py`) -- query all patterns regardless of type, for use by review interfaces.
 - **Word and PowerPoint document support** (`tools/file_ops.py`, `content_utils.py`) -- `read_file` now extracts text from `.docx`/`.doc` and `.pptx`/`.ppt` files using `python-docx` and `python-pptx`. Returns a `DocumentBlock` with extracted text for all model providers. Both libraries are required dependencies (not optional).
 
 ### Changed

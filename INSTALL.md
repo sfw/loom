@@ -356,6 +356,14 @@ Common causes:
 - Workspace path doesn't exist (create it first)
 - Model server went down mid-task
 
+### Learned patterns not appearing
+
+The learning system requires a database. If `loom learned` shows nothing:
+- Make sure `memory.database_path` is set in your config (default: `~/.loom/loom.db`)
+- Patterns are extracted after task completion — you need at least one conversation with a follow-up to generate behavioral patterns
+- Check that the database file exists: `ls ~/.loom/loom.db`
+- Reset if corrupted: `loom reset-learning`
+
 ### Port already in use
 
 Change the port in your config or use the CLI override:

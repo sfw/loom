@@ -415,7 +415,7 @@
   <div class="section-label">Features</div>
   <a href="#processes">Process Definitions</a>
   <a href="#approval">Approval Gates</a>
-  <a href="#learning">Learning System</a>
+  <a href="#learning">Adaptive Learning</a>
   <a href="#mcp">MCP Server</a>
   <div class="section-label">API Reference</div>
   <a href="#endpoints">Endpoints</a>
@@ -885,9 +885,11 @@
     <tr><td><code>/new</code></td><td>Start a new session</td></tr>
     <tr><td><code>/session</code></td><td>Show current session info (turns, tokens, focus)</td></tr>
     <tr><td><code>/resume &lt;id&gt;</code></td><td>Switch to a different session</td></tr>
+    <tr><td><code>/learned</code></td><td>Review, inspect, and delete learned behavioral patterns</td></tr>
     <tr><td><code>/model</code></td><td>Show current model</td></tr>
     <tr><td><code>/tools</code></td><td>List available tools</td></tr>
     <tr><td><code>/tokens</code></td><td>Show session token usage</td></tr>
+    <tr><td><code>/setup</code></td><td>Reconfigure models and settings</td></tr>
     <tr><td><code>/clear</code></td><td>Clear the chat display</td></tr>
     <tr><td><code>/quit</code></td><td>Exit Loom</td></tr>
   </table>
@@ -1118,25 +1120,52 @@
 
 <!-- ======================== LEARNING ======================== -->
 <section id="learning">
-  <h2>Learning System</h2>
+  <h2>Adaptive Learning</h2>
 
-  <p>Loom learns from task execution history to improve future runs. Patterns are extracted automatically after each task completes.</p>
+  <p>Loom learns from your interactions so you never repeat yourself. Two learning modes work together:</p>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Operational Learning</h4>
+      <p>After every autonomous task, Loom extracts model success rates, retry patterns, and successful plan templates. These inform future model selection and planning.</p>
+    </div>
+    <div class="card">
+      <h4>Behavioral Learning</h4>
+      <p>Loom detects the gap between what the model delivered and what you actually wanted. Implicit follow-ups ("test and lint it") and explicit corrections ("no, use JSON") are captured as general behavioral rules and injected into future prompts.</p>
+    </div>
+  </div>
 
   <h3>Pattern Types</h3>
   <table>
-    <tr><th>Type</th><th>What it captures</th><th>How it helps</th></tr>
-    <tr><td><code>subtask_success</code></td><td>Successful subtask tool sequences</td><td>Suggests proven approaches for similar subtasks</td></tr>
-    <tr><td><code>retry_pattern</code></td><td>How many retries common subtasks need</td><td>Sets better initial retry expectations</td></tr>
-    <tr><td><code>task_template</code></td><td>Full plan structures for completed tasks</td><td>Templates for similar future goals</td></tr>
-    <tr><td><code>model_failure</code></td><td>Which models failed on which tasks</td><td>Avoids repeating known bad model assignments</td></tr>
+    <tr><th>Type</th><th>Source</th><th>Example</th></tr>
+    <tr><td><code>behavioral_gap</code></td><td>Implicit &mdash; user had to ask for something the model should have done</td><td>"Run tests after writing code"</td></tr>
+    <tr><td><code>behavioral_correction</code></td><td>Explicit &mdash; user contradicted the model's output</td><td>"Use JSON not YAML"</td></tr>
+    <tr><td><code>subtask_success</code></td><td>Post-task &mdash; model success rates per subtask type</td><td>Success rate for "install-deps"</td></tr>
+    <tr><td><code>retry_pattern</code></td><td>Post-task &mdash; which subtasks needed escalation</td><td>"Schema conversion needs tier 2"</td></tr>
+    <tr><td><code>task_template</code></td><td>Post-task &mdash; successful plans as reusable templates</td><td>7-step migration plan</td></tr>
   </table>
 
-  <h3>Querying Patterns</h3>
-  <p>The learning system is used internally by the orchestrator. You can also manage it via the CLI:</p>
-  <pre><code><span class="cmt"># Clear all learned patterns (start fresh)</span>
+  <p>Patterns are frequency-weighted &mdash; the more a pattern is observed, the higher it ranks. High-frequency patterns persist indefinitely; low-frequency ones are pruned after 90 days. All data stays local in your SQLite database.</p>
+
+  <h3>Reviewing and Managing Patterns</h3>
+  <pre><code><span class="cmt"># List all learned patterns</span>
+<span class="cmd">loom learned</span>
+
+<span class="cmt"># Filter by type</span>
+<span class="cmd">loom learned</span> <span class="flag">--type</span> behavioral_gap
+
+<span class="cmt"># Delete a specific pattern by ID</span>
+<span class="cmd">loom learned</span> <span class="flag">--delete</span> <span class="val">5</span>
+
+<span class="cmt"># Clear all learned patterns (start fresh)</span>
 <span class="cmd">loom reset-learning</span></code></pre>
 
-  <p>Patterns are pruned automatically after 90 days of inactivity.</p>
+  <p>In the TUI, use <code>/learned</code> to open an interactive review screen where you can inspect each pattern's type, description, frequency count, and last-seen date, and delete individual patterns with a single click.</p>
+
+  <div class="callout callout-info">
+    <strong>How gap detection works</strong>
+    When the model delivers a response it considers complete ("Here's the code, hope that helps"), Loom marks that as a completion point. If you follow up with a continuation or correction instead of a new topic, Loom extracts a general behavioral rule from the gap and stores it for future prompt injection.
+  </div>
 </section>
 
 <!-- ======================== MCP ======================== -->
@@ -1336,7 +1365,8 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
   integrations/
     mcp_server.py        <span class="cmt"># MCP server (3 tools)</span>
   learning/
-    manager.py           <span class="cmt"># Pattern extraction + query</span>
+    manager.py           <span class="cmt"># Pattern storage, query, delete, prune</span>
+    reflection.py        <span class="cmt"># Gap analysis engine (behavioral learning)</span>
   models/
     base.py              <span class="cmt"># Provider ABC</span>
     ollama_provider.py   <span class="cmt"># Ollama client</span>
@@ -1374,7 +1404,7 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
   tui/
     app.py               <span class="cmt"># Textual TUI — unified interactive interface</span>
     widgets/             <span class="cmt"># Chat log, sidebar, status bar, panels</span>
-    screens/             <span class="cmt"># Tool approval, ask_user modals</span></code></pre>
+    screens/             <span class="cmt"># Tool approval, ask_user, learned patterns modals</span></code></pre>
 </section>
 
 <!-- ======================== CONFIG REF ======================== -->

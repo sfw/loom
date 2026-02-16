@@ -647,7 +647,69 @@ dependencies:
 
 ---
 
-## 5. Approval Modes
+## 5. Learned Patterns (Adaptive Learning)
+
+Loom learns behavioral patterns from your interactions and uses them to personalize future prompts. You can query and manage these patterns programmatically.
+
+### CLI
+
+```bash
+# List all learned patterns
+loom learned
+
+# Filter by type
+loom learned --type behavioral_gap
+loom learned --type behavioral_correction
+
+# Delete a specific pattern
+loom learned --delete 5
+
+# Clear everything
+loom reset-learning
+```
+
+### TUI
+
+Use the `/learned` slash command to open an interactive review screen. Each pattern shows its type, description, frequency count, and last-seen date, with a Delete button for removal.
+
+### Python API
+
+```python
+from loom.learning.manager import LearningManager
+from loom.state.memory import Database
+
+db = Database("~/.loom/loom.db")
+await db.initialize()
+mgr = LearningManager(db)
+
+# Query all patterns
+patterns = await mgr.query_all(limit=50)
+
+# Query behavioral patterns only (for prompt injection)
+behavioral = await mgr.query_behavioral(limit=15)
+
+# Delete a specific pattern
+await mgr.delete_pattern(pattern_id=5)
+
+# Clear all patterns
+await mgr.clear_all()
+```
+
+### Pattern Types
+
+| Type | Source | Example |
+|------|--------|---------|
+| `behavioral_gap` | Implicit -- user had to ask for something the model should have done | "Run tests after writing code" |
+| `behavioral_correction` | Explicit -- user contradicted the model's output | "Use JSON not YAML" |
+| `subtask_success` | Post-task -- model success rates per subtask type | Success rate for "install-deps" |
+| `retry_pattern` | Post-task -- which subtasks needed escalation | "Schema conversion needs tier 2" |
+| `task_template` | Post-task -- successful plans as reusable templates | 7-step migration plan |
+
+Behavioral patterns are injected into system prompts to personalize future interactions. Operational patterns (subtask_success, retry_pattern, task_template) inform model routing and planning.
+
+---
+
+## 6. Approval Modes
 
 Control how much autonomy Loom has:
 
@@ -679,7 +741,7 @@ client.post(f"/tasks/{task_id}/approve", json={
 
 ---
 
-## 6. Configuration
+## 7. Configuration
 
 Loom reads `loom.toml` from the current directory or `~/.loom/loom.toml`:
 
@@ -723,7 +785,7 @@ scratch_dir = "~/.loom/scratch"
 
 ---
 
-## 7. End-to-End Example: Bash Script Agent
+## 8. End-to-End Example: Bash Script Agent
 
 A minimal agent that submits a task and waits for results:
 

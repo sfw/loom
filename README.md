@@ -117,9 +117,28 @@ loom -w /tmp/acme --process consulting-engagement
 loom install user/repo                      # install from GitHub
 ```
 
+## Adaptive Learning
+
+Loom learns from your interactions so you never repeat yourself. Two learning modes work together:
+
+**Operational learning** (autonomous tasks) -- after every task, Loom extracts model success rates, retry patterns, and successful plan templates. These inform future model selection and planning.
+
+**Behavioral learning** (all interactions) -- Loom detects the gap between what the model delivered and what you actually wanted. When you say "test and lint it" after the model considers its code done, that's a gap signal. Loom extracts a general behavioral rule ("run tests and linter after writing code") and injects it into future prompts. Explicit corrections ("no, use JSON not YAML") are captured the same way.
+
+Patterns are frequency-weighted -- the more a pattern is observed, the higher it ranks. High-frequency patterns persist indefinitely; low-frequency ones are pruned after 90 days. All data stays local in your SQLite database.
+
+```bash
+loom learned                              # review all patterns
+loom learned --type behavioral_gap        # filter by type
+loom learned --delete 5                   # remove a specific pattern
+loom reset-learning                       # clear everything
+```
+
+In the TUI, use `/learned` to open an interactive review screen where you can inspect and delete individual patterns.
+
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, and session management (`/sessions`, `/new`, `/resume`, `/setup`).
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), and learned pattern review (`/learned`).
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
@@ -138,7 +157,8 @@ loom processes          List available process definitions
 loom install SOURCE     Install a process package
 loom uninstall NAME     Remove a process package
 loom mcp-serve          Start the MCP server (stdio transport)
-loom reset-learning     Clear learned patterns
+loom learned            Review learned patterns (list, filter, delete)
+loom reset-learning     Clear all learned patterns
 ```
 
 Common flags for `loom` / `loom cowork`:
@@ -149,7 +169,7 @@ Common flags for `loom` / `loom cowork`:
 
 ## Architecture
 
-16,000 lines of Python. 1,039 tests. No frameworks (no LangChain, no CrewAI).
+16,000 lines of Python. 1,213 tests. No frameworks (no LangChain, no CrewAI).
 
 ```
 src/loom/
@@ -174,7 +194,7 @@ src/loom/
 
 ```bash
 uv sync --extra dev     # or: pip install -e ".[dev]"
-pytest                  # 1,039 tests
+pytest                  # 1,213 tests
 ruff check src/ tests/  # lint
 ```
 
