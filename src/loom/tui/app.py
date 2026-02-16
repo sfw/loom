@@ -26,11 +26,14 @@ Layout:
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from textual import on, work
+
+logger = logging.getLogger(__name__)
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -232,8 +235,7 @@ class LoomApp(App):
                 )
                 if process_defn.tools.excluded:
                     for tool_name in process_defn.tools.excluded:
-                        if tool_name in self._tools._tools:
-                            del self._tools._tools[tool_name]
+                        self._tools.exclude(tool_name)
             except Exception as e:
                 chat.add_info(
                     f"[bold #f7768e]Failed to load process "
@@ -377,10 +379,8 @@ class LoomApp(App):
                     )
 
                 self._delegate_tool.bind(_orchestrator_factory)
-            except Exception:
-                # delegate_task remains unbound; it will return a
-                # "not available" message if the model tries to use it.
-                pass
+            except Exception as e:
+                logger.warning("Failed to bind delegate_task tool: %s", e)
 
     # ------------------------------------------------------------------
     # Session management helpers
@@ -694,105 +694,12 @@ class LoomApp(App):
         self._busy = True
         chat = self.query_one("#chat-log", ChatLog)
         status = self.query_one("#status-bar", StatusBar)
-        events_panel = self.query_one("#events-panel", EventPanel)
 
         chat.add_user_message(user_message)
         status.state = "Thinking..."
 
-        streamed_text = False
-
         try:
-            async for event in self._session.send_streaming(
-                user_message,
-            ):
-                if isinstance(event, str):
-                    if not streamed_text:
-                        streamed_text = True
-                    chat.add_streaming_text(event)
-
-                elif isinstance(event, ToolCallEvent):
-                    if event.result is None:
-                        # Tool starting
-                        chat.add_tool_call(event.name, event.args)
-                        status.state = f"Running {event.name}..."
-                        events_panel.add_event(
-                            _now_str(), "tool_start",
-                            (
-                                f"{event.name} "
-                                f"{tool_args_preview(event.name, event.args)}"
-                            ),
-                        )
-                    else:
-                        # Tool completed
-                        output = ""
-                        if event.result.success:
-                            output = event.result.output
-                        error = event.result.error or ""
-                        chat.add_tool_call(
-                            event.name, event.args,
-                            success=event.result.success,
-                            elapsed_ms=event.elapsed_ms,
-                            output=output,
-                            error=error,
-                        )
-
-                        # Show multimodal content indicators
-                        if (
-                            event.result.content_blocks
-                            and event.result.success
-                        ):
-                            chat.add_content_indicator(
-                                event.result.content_blocks,
-                            )
-
-                        etype = (
-                            "tool_ok"
-                            if event.result.success
-                            else "tool_err"
-                        )
-                        events_panel.add_event(
-                            _now_str(), etype,
-                            f"{event.name} {event.elapsed_ms}ms",
-                        )
-
-                        # Update sidebar tasks if task_tracker
-                        if (
-                            event.name == "task_tracker"
-                            and event.result.data
-                        ):
-                            self._update_sidebar_tasks(event)
-
-                        # Handle ask_user
-                        if (
-                            event.name == "ask_user"
-                            and event.result
-                            and event.result.success
-                        ):
-                            answer = await self._handle_ask_user(event)
-                            if answer:
-                                await self._run_followup(answer)
-
-                elif isinstance(event, CoworkTurn):
-                    if event.text and not streamed_text:
-                        chat.add_model_text(event.text)
-
-                    self._total_tokens += event.tokens_used
-                    status.total_tokens = self._total_tokens
-
-                    chat.add_turn_separator(
-                        len(event.tool_calls),
-                        event.tokens_used,
-                        event.model,
-                    )
-                    events_panel.add_event(
-                        _now_str(), "turn",
-                        f"{event.tokens_used} tokens",
-                    )
-                    events_panel.record_turn_tokens(event.tokens_used)
-
-                    # Update files panel
-                    self._update_files_panel(event)
-
+            await self._run_interaction(user_message)
         except Exception as e:
             chat.add_model_text(f"[bold #f7768e]Error:[/] {e}")
             self.notify(str(e), severity="error", timeout=5)
@@ -804,91 +711,113 @@ class LoomApp(App):
         """Run a follow-up turn (e.g. after ask_user answer)."""
         if self._session is None:
             return
-
-        chat = self.query_one("#chat-log", ChatLog)
-        events_panel = self.query_one("#events-panel", EventPanel)
-        streamed_text = False
-
         try:
-            async for event in self._session.send_streaming(message):
-                if isinstance(event, str):
-                    if not streamed_text:
-                        streamed_text = True
-                    chat.add_streaming_text(event)
-
-                elif isinstance(event, ToolCallEvent):
-                    if event.result is None:
-                        chat.add_tool_call(event.name, event.args)
-                        events_panel.add_event(
-                            _now_str(), "tool_start",
-                            (
-                                f"{event.name} "
-                                f"{tool_args_preview(event.name, event.args)}"
-                            ),
-                        )
-                    else:
-                        output = ""
-                        if event.result.success:
-                            output = event.result.output
-                        error = event.result.error or ""
-                        chat.add_tool_call(
-                            event.name, event.args,
-                            success=event.result.success,
-                            elapsed_ms=event.elapsed_ms,
-                            output=output,
-                            error=error,
-                        )
-
-                        # Show multimodal content indicators
-                        if (
-                            event.result.content_blocks
-                            and event.result.success
-                        ):
-                            chat.add_content_indicator(
-                                event.result.content_blocks,
-                            )
-
-                        etype = (
-                            "tool_ok"
-                            if event.result.success
-                            else "tool_err"
-                        )
-                        events_panel.add_event(
-                            _now_str(), etype,
-                            f"{event.name} {event.elapsed_ms}ms",
-                        )
-                        if (
-                            event.name == "task_tracker"
-                            and event.result.data
-                        ):
-                            self._update_sidebar_tasks(event)
-
-                        # Handle ask_user in followup turns too
-                        if (
-                            event.name == "ask_user"
-                            and event.result
-                            and event.result.success
-                        ):
-                            answer = await self._handle_ask_user(event)
-                            if answer:
-                                await self._run_followup(answer)
-
-                elif isinstance(event, CoworkTurn):
-                    if event.text and not streamed_text:
-                        chat.add_model_text(event.text)
-                    self._total_tokens += event.tokens_used
-                    status = self.query_one("#status-bar", StatusBar)
-                    status.total_tokens = self._total_tokens
-                    chat.add_turn_separator(
-                        len(event.tool_calls),
-                        event.tokens_used,
-                        event.model,
-                    )
-                    events_panel.record_turn_tokens(event.tokens_used)
-                    self._update_files_panel(event)
+            await self._run_interaction(message)
         except Exception as e:
+            chat = self.query_one("#chat-log", ChatLog)
             chat.add_model_text(f"[bold #f7768e]Error:[/] {e}")
             self.notify(str(e), severity="error", timeout=5)
+
+    async def _run_interaction(self, message: str) -> None:
+        """Execute a turn interaction with the model.
+
+        Shared implementation for both initial turns and follow-ups.
+        """
+        chat = self.query_one("#chat-log", ChatLog)
+        status = self.query_one("#status-bar", StatusBar)
+        events_panel = self.query_one("#events-panel", EventPanel)
+
+        streamed_text = False
+
+        async for event in self._session.send_streaming(message):
+            if isinstance(event, str):
+                if not streamed_text:
+                    streamed_text = True
+                chat.add_streaming_text(event)
+
+            elif isinstance(event, ToolCallEvent):
+                if event.result is None:
+                    # Tool starting
+                    chat.add_tool_call(event.name, event.args)
+                    status.state = f"Running {event.name}..."
+                    events_panel.add_event(
+                        _now_str(), "tool_start",
+                        (
+                            f"{event.name} "
+                            f"{tool_args_preview(event.name, event.args)}"
+                        ),
+                    )
+                else:
+                    # Tool completed
+                    output = ""
+                    if event.result.success:
+                        output = event.result.output
+                    error = event.result.error or ""
+                    chat.add_tool_call(
+                        event.name, event.args,
+                        success=event.result.success,
+                        elapsed_ms=event.elapsed_ms,
+                        output=output,
+                        error=error,
+                    )
+
+                    # Show multimodal content indicators
+                    if (
+                        event.result.content_blocks
+                        and event.result.success
+                    ):
+                        chat.add_content_indicator(
+                            event.result.content_blocks,
+                        )
+
+                    etype = (
+                        "tool_ok"
+                        if event.result.success
+                        else "tool_err"
+                    )
+                    events_panel.add_event(
+                        _now_str(), etype,
+                        f"{event.name} {event.elapsed_ms}ms",
+                    )
+
+                    # Update sidebar tasks if task_tracker
+                    if (
+                        event.name == "task_tracker"
+                        and event.result.data
+                    ):
+                        self._update_sidebar_tasks(event)
+
+                    # Handle ask_user
+                    if (
+                        event.name == "ask_user"
+                        and event.result
+                        and event.result.success
+                    ):
+                        answer = await self._handle_ask_user(event)
+                        if answer:
+                            await self._run_followup(answer)
+
+            elif isinstance(event, CoworkTurn):
+                if event.text and not streamed_text:
+                    chat.add_model_text(event.text)
+
+                self._total_tokens += event.tokens_used
+                status = self.query_one("#status-bar", StatusBar)
+                status.total_tokens = self._total_tokens
+
+                chat.add_turn_separator(
+                    len(event.tool_calls),
+                    event.tokens_used,
+                    event.model,
+                )
+                events_panel.add_event(
+                    _now_str(), "turn",
+                    f"{event.tokens_used} tokens",
+                )
+                events_panel.record_turn_tokens(event.tokens_used)
+
+                # Update files panel
+                self._update_files_panel(event)
 
     async def _handle_ask_user(self, event: ToolCallEvent) -> str:
         """Show an ask_user modal and return the answer."""

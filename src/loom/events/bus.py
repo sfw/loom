@@ -7,12 +7,15 @@ orchestrator and consumed by the API (SSE), logger, and other listeners.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -88,12 +91,15 @@ class EventBus:
                     loop = asyncio.get_running_loop()
                     loop.create_task(handler(event))
                 except RuntimeError:
-                    pass  # No running loop — skip async handlers
+                    logger.debug("Skipped async handler %s: no running event loop", handler.__name__)
             else:
                 try:
                     handler(event)
-                except Exception:
-                    pass  # Don't let handler errors break the emitter
+                except Exception as e:
+                    logger.warning(
+                        "Event handler %s failed for %s: %s",
+                        getattr(handler, '__name__', handler), event.event_type, e,
+                    )
 
     def recent_events(self, limit: int = 50) -> list[Event]:
         """Return recent events."""
@@ -125,8 +131,8 @@ class EventPersister:
                 event_type=event.event_type,
                 data=event.data,
             )
-        except Exception:
-            pass  # Event persistence is best-effort
+        except Exception as e:
+            logger.warning("Event persistence failed for %s: %s", event.event_type, e)
 
     def attach(self, event_bus: EventBus) -> None:
         """Subscribe to all events on the given bus."""

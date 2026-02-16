@@ -38,9 +38,12 @@ class ChatLog(VerticalScroll):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._auto_scroll = True
+        self._stream_buffer: list[str] = []
+        self._stream_widget: Static | None = None
 
     def add_user_message(self, text: str) -> None:
         """Append a user message to the chat."""
+        self._flush_and_reset_stream()
         self.mount(
             Static(
                 f"[bold #73daca]> {text}[/]",
@@ -51,25 +54,41 @@ class ChatLog(VerticalScroll):
 
     def add_model_text(self, text: str) -> None:
         """Append model response text."""
+        self._flush_and_reset_stream()
         self.mount(Static(text, classes="model-text"))
         self._scroll_to_end()
 
     def add_streaming_text(self, text: str) -> None:
         """Append a streamed text chunk.
 
-        Tries to append to the last model-text widget if one exists.
-        Otherwise creates a new one.
+        Buffers chunks and flushes to the widget periodically to avoid
+        O(n^2) string concatenation on every chunk.
         """
-        children = list(self.children)
-        if children and isinstance(children[-1], Static):
-            last = children[-1]
-            if "model-text" in last.classes:
-                current = str(last.renderable)
-                last.update(current + text)
-                self._scroll_to_end()
-                return
-        self.mount(Static(text, classes="model-text"))
+        self._stream_buffer.append(text)
+
+        if self._stream_widget is None:
+            self._stream_widget = Static("", classes="model-text")
+            self.mount(self._stream_widget)
+
+        # Flush every 5 chunks or when text is large
+        if len(self._stream_buffer) >= 5 or len(text) > 100:
+            self._flush_stream_buffer()
+
         self._scroll_to_end()
+
+    def _flush_stream_buffer(self) -> None:
+        """Flush buffered streaming chunks to the widget."""
+        if not self._stream_buffer or self._stream_widget is None:
+            return
+        current = str(self._stream_widget.renderable)
+        current += "".join(self._stream_buffer)
+        self._stream_widget.update(current)
+        self._stream_buffer.clear()
+
+    def _flush_and_reset_stream(self) -> None:
+        """Flush any buffered stream data and reset stream state."""
+        self._flush_stream_buffer()
+        self._stream_widget = None
 
     def add_tool_call(
         self,
@@ -82,6 +101,7 @@ class ChatLog(VerticalScroll):
         error: str = "",
     ) -> None:
         """Append a tool call widget."""
+        self._flush_and_reset_stream()
         self.mount(ToolCallWidget(
             tool_name,
             args,
@@ -99,6 +119,7 @@ class ChatLog(VerticalScroll):
         model: str,
     ) -> None:
         """Add a turn separator line with stats."""
+        self._flush_and_reset_stream()
         parts: list[str] = []
         if tool_count:
             s = "s" if tool_count != 1 else ""
@@ -113,6 +134,7 @@ class ChatLog(VerticalScroll):
 
     def add_info(self, text: str) -> None:
         """Add an informational message (e.g. welcome text)."""
+        self._flush_and_reset_stream()
         self.mount(Static(f"[dim]{text}[/dim]", classes="model-text"))
         self._scroll_to_end()
 
@@ -122,6 +144,7 @@ class ChatLog(VerticalScroll):
         Shows styled placeholders for images and documents that the model
         is processing, since terminals cannot display actual images.
         """
+        self._flush_and_reset_stream()
         from loom.content import DocumentBlock, ImageBlock
 
         def _esc(text: str) -> str:

@@ -114,7 +114,11 @@ class AnthropicProvider(ModelProvider):
                 },
             )
             return response.status_code in (200, 400, 401, 429)
-        except Exception:
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            logger.debug("Anthropic health check failed: %s", e)
+            return False
+        except Exception as e:
+            logger.warning("Unexpected error in Anthropic health check: %s", e)
             return False
 
     # ------------------------------------------------------------------
@@ -457,9 +461,76 @@ class AnthropicProvider(ModelProvider):
         output_tokens = 0
 
         try:
-            cm = client.stream("POST", "/v1/messages", json=body)
-            response = await cm.__aenter__()
-            response.raise_for_status()
+            async with client.stream("POST", "/v1/messages", json=body) as response:
+                response.raise_for_status()
+
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+
+                    try:
+                        event = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    event_type = event.get("type", "")
+
+                    if event_type == "message_start":
+                        usage_info = event.get("message", {}).get("usage", {})
+                        input_tokens = usage_info.get("input_tokens", 0)
+
+                    elif event_type == "content_block_start":
+                        block = event.get("content_block", {})
+                        if block.get("type") == "tool_use":
+                            current_tool_id = block.get("id", "")
+                            current_tool_name = block.get("name", "")
+                            current_tool_json = ""
+
+                    elif event_type == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            yield StreamChunk(text=delta.get("text", ""))
+                        elif delta.get("type") == "input_json_delta":
+                            current_tool_json += delta.get("partial_json", "")
+
+                    elif event_type == "content_block_stop":
+                        if current_tool_name:
+                            try:
+                                arguments = json.loads(current_tool_json) if current_tool_json else {}
+                            except json.JSONDecodeError as e:
+                                logger.warning(
+                                    "Malformed tool args for %s: %s",
+                                    current_tool_name, current_tool_json[:200],
+                                )
+                                arguments = {}
+                            current_tool_calls.append(ToolCall(
+                                id=current_tool_id,
+                                name=current_tool_name,
+                                arguments=arguments,
+                            ))
+                            current_tool_name = ""
+                            current_tool_id = ""
+                            current_tool_json = ""
+
+                    elif event_type == "message_delta":
+                        usage_info = event.get("usage", {})
+                        output_tokens = usage_info.get("output_tokens", 0)
+
+                # Yield final chunk with tool calls and usage
+                yield StreamChunk(
+                    tool_calls=(
+                        current_tool_calls if current_tool_calls else None
+                    ),
+                    usage=TokenUsage(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        total_tokens=input_tokens + output_tokens,
+                    ),
+                )
         except httpx.ConnectError as e:
             raise ModelConnectionError(
                 f"Cannot connect to Anthropic API at "
@@ -484,76 +555,9 @@ class AnthropicProvider(ModelProvider):
             raise ModelConnectionError(
                 f"{msg}: {body_text}", original=e,
             ) from e
-
-        try:
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    break
-
-                try:
-                    event = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
-                event_type = event.get("type", "")
-
-                if event_type == "message_start":
-                    usage_info = event.get("message", {}).get("usage", {})
-                    input_tokens = usage_info.get("input_tokens", 0)
-
-                elif event_type == "content_block_start":
-                    block = event.get("content_block", {})
-                    if block.get("type") == "tool_use":
-                        current_tool_id = block.get("id", "")
-                        current_tool_name = block.get("name", "")
-                        current_tool_json = ""
-
-                elif event_type == "content_block_delta":
-                    delta = event.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        yield StreamChunk(text=delta.get("text", ""))
-                    elif delta.get("type") == "input_json_delta":
-                        current_tool_json += delta.get("partial_json", "")
-
-                elif event_type == "content_block_stop":
-                    if current_tool_name:
-                        try:
-                            arguments = json.loads(current_tool_json) if current_tool_json else {}
-                        except json.JSONDecodeError:
-                            arguments = {}
-                        current_tool_calls.append(ToolCall(
-                            id=current_tool_id,
-                            name=current_tool_name,
-                            arguments=arguments,
-                        ))
-                        current_tool_name = ""
-                        current_tool_id = ""
-                        current_tool_json = ""
-
-                elif event_type == "message_delta":
-                    usage_info = event.get("usage", {})
-                    output_tokens = usage_info.get("output_tokens", 0)
-
-            # Yield final chunk with tool calls and usage
-            yield StreamChunk(
-                tool_calls=(
-                    current_tool_calls if current_tool_calls else None
-                ),
-                usage=TokenUsage(
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    total_tokens=input_tokens + output_tokens,
-                ),
-            )
         except httpx.ReadError as e:
             raise ModelConnectionError(
                 f"Anthropic stream interrupted "
                 f"({self._model}): {e}",
                 original=e,
             ) from e
-        finally:
-            await cm.__aexit__(None, None, None)

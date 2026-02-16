@@ -15,7 +15,9 @@ Complex work can be delegated to the task orchestrator via delegate_task.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -30,6 +32,8 @@ from loom.tools.registry import ToolRegistry, ToolResult
 if TYPE_CHECKING:
     from loom.learning.reflection import GapAnalysisEngine
     from loom.state.conversation_store import ConversationStore
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -73,11 +77,7 @@ _DANGLING_REF_INDICATORS = [
     "like I mentioned", "that thing", "we already",
 ]
 
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: 1 token per 4 characters."""
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
+from loom.utils.tokens import estimate_tokens as _estimate_tokens
 
 
 def _estimate_message_tokens(msg: dict) -> int:
@@ -106,8 +106,8 @@ def _estimate_message_tokens(msg: dict) -> int:
                     if pr and isinstance(pr, list) and len(pr) == 2:
                         pages = max(0, pr[1] - pr[0])
                     total += min(pages * 1500, 200_000)
-        except (json.JSONDecodeError, TypeError):
-            pass
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.debug("Token estimation parse failed: %s", e)
 
     return max(1, total)
 
@@ -168,6 +168,9 @@ class CoworkSession:
         # Learned behaviors section (injected into system prompt)
         self._behaviors_section = ""
 
+        self._messages_lock = asyncio.Lock()
+        self._counter_lock = asyncio.Lock()
+
         self._messages: list[dict] = []
         if system_prompt:
             self._messages.append({"role": "system", "content": self._build_system_content()})
@@ -211,7 +214,8 @@ class CoworkSession:
         The caller should display streamed text inline, show tool calls
         as they happen, and use the final CoworkTurn for bookkeeping.
         """
-        self._turn_counter += 1
+        async with self._counter_lock:
+            self._turn_counter += 1
         self._session_state.set_focus(user_message.split("\n")[0])
 
         # Possibly inject a recall hint
@@ -326,7 +330,8 @@ class CoworkSession:
         Yields str chunks for incremental display, ToolCallEvents for
         tool calls, and a final CoworkTurn.
         """
-        self._turn_counter += 1
+        async with self._counter_lock:
+            self._turn_counter += 1
         self._session_state.set_focus(user_message.split("\n")[0])
 
         hint = self._maybe_recall_hint(user_message)
@@ -499,8 +504,11 @@ class CoworkSession:
             msg_tokens = _estimate_message_tokens(msg)
             if used + msg_tokens > budget:
                 break
-            selected.insert(0, msg)
+            selected.append(msg)
             used += msg_tokens
+
+        # Restore chronological order
+        selected.reverse()
 
         # Ensure we don't start on an orphaned tool result
         while selected and selected[0].get("role") == "tool":
@@ -576,8 +584,7 @@ class CoworkSession:
             # Refresh the behaviors section from all accumulated patterns
             await self._load_behaviors()
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).debug("Gap analysis failed (non-fatal): %s", e)
+            logger.debug("Gap analysis failed (non-fatal): %s", e)
 
     async def _load_behaviors(self) -> None:
         """Load learned behavioral patterns and format for prompt injection."""
@@ -590,8 +597,8 @@ class CoworkSession:
             )
             patterns = await get_learned_behaviors(self._reflection._learning)
             self._behaviors_section = format_behaviors_for_prompt(patterns)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to load behaviors: %s", e)
 
     def _update_system_message(self) -> None:
         """Update the system message in-place with current session state."""
@@ -640,10 +647,12 @@ class CoworkSession:
         if self._store is None or not self._session_id:
             return
         try:
-            self._message_counter += 1
+            async with self._counter_lock:
+                self._message_counter += 1
+                counter = self._message_counter
             await self._store.append_turn(
                 session_id=self._session_id,
-                turn_number=self._message_counter,
+                turn_number=counter,
                 role=role,
                 content=content,
                 tool_calls=tool_calls,
@@ -651,8 +660,7 @@ class CoworkSession:
                 tool_name=tool_name,
             )
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("Persist turn failed: %s", e)
+            logger.warning("Persist turn failed: %s", e)
 
     async def _persist_session_metadata(self) -> None:
         """Persist session state and token counts."""
@@ -666,8 +674,7 @@ class CoworkSession:
                 session_state=self._session_state.to_dict(),
             )
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("Persist metadata failed: %s", e)
+            logger.warning("Persist metadata failed: %s", e)
 
 
 def build_cowork_system_prompt(workspace: Path | None = None) -> str:

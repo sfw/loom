@@ -8,20 +8,6 @@ from loom.state.task_state import Plan, Subtask, SubtaskStatus
 class Scheduler:
     """Determines which subtask to execute next based on the dependency graph."""
 
-    def next_subtask(self, plan: Plan) -> Subtask | None:
-        """Return the next runnable subtask, or None if all are blocked/completed.
-
-        A subtask is runnable if:
-        1. Status is 'pending'
-        2. All depends_on subtasks are 'completed'
-        """
-        for subtask in plan.subtasks:
-            if subtask.status != SubtaskStatus.PENDING:
-                continue
-            if self._deps_met(plan, subtask):
-                return subtask
-        return None
-
     def runnable_subtasks(self, plan: Plan) -> list[Subtask]:
         """Return ALL runnable subtasks (for potential parallel execution)."""
         return [
@@ -40,7 +26,7 @@ class Scheduler:
         """Check if all remaining subtasks are blocked (no progress possible)."""
         if not self.has_pending(plan):
             return False
-        return self.next_subtask(plan) is None
+        return len(self.runnable_subtasks(plan)) == 0
 
     @staticmethod
     def _deps_met(plan: Plan, subtask: Subtask) -> bool:

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 
 from loom.config import Config
@@ -25,6 +27,8 @@ from loom.state.memory import MemoryEntry, MemoryManager
 from loom.state.task_state import Subtask, Task, TaskStateManager
 from loom.tools.registry import ToolRegistry, ToolResult
 from loom.tools.workspace import ChangeLog
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -41,12 +45,18 @@ class ToolCallRecord:
             self.timestamp = datetime.now().isoformat()
 
 
+class SubtaskResultStatus(StrEnum):
+    SUCCESS = "success"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+
+
 @dataclass
 class SubtaskResult:
     """Result of a subtask execution."""
 
-    status: str  # success, failed, blocked
-    summary: str
+    status: SubtaskResultStatus = SubtaskResultStatus.SUCCESS
+    summary: str = ""
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
     duration_seconds: float = 0.0
     tokens_used: int = 0
@@ -221,7 +231,7 @@ class SubtaskRunner:
         summary = response.text[:200] if response and response.text else "No output"
 
         result = SubtaskResult(
-            status="success",
+            status=SubtaskResultStatus.SUCCESS,
             summary=summary,
             tool_calls=tool_calls_record,
             duration_seconds=elapsed,
@@ -239,7 +249,7 @@ class SubtaskRunner:
         )
 
         if not verification.passed:
-            result.status = "failed"
+            result.status = SubtaskResultStatus.FAILED
 
         # 5. Memory extraction — fire-and-forget
         self._spawn_memory_extraction(task.id, subtask.id, result)
@@ -260,19 +270,16 @@ class SubtaskRunner:
                 self._extract_memory(task_id, subtask_id, result)
             )
         except RuntimeError:
-            pass  # No running loop — skip
+            logger.debug("Memory extraction skipped: no running event loop")
 
     async def _extract_memory(
         self, task_id: str, subtask_id: str, result: SubtaskResult,
     ) -> None:
         """Extract structured memory entries from subtask execution."""
-        import logging
-        _mem_logger = logging.getLogger(__name__)
-
         try:
             model = self._router.select(tier=1, role="extractor")
         except Exception as e:
-            _mem_logger.debug("Memory extraction skipped (no extractor model): %s", e)
+            logger.debug("Memory extraction skipped (no extractor model): %s", e)
             return
 
         tool_lines = []
@@ -298,7 +305,7 @@ class SubtaskRunner:
             if entries:
                 await self._memory.store_many(entries)
         except Exception as e:
-            _mem_logger.debug("Memory extraction failed for subtask %s: %s", subtask_id, e)
+            logger.debug("Memory extraction failed for subtask %s: %s", subtask_id, e)
 
     def _parse_memory_entries(
         self, response: ModelResponse, task_id: str, subtask_id: str,

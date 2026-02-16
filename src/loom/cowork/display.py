@@ -297,7 +297,8 @@ def _display_content_indicators(content_blocks: list) -> None:
 
     def _sanitize(text: str) -> str:
         """Strip ANSI escape sequences from user-controlled text."""
-        return text.replace("\033", "")
+        import re
+        return re.sub(r'\033\[[0-9;]*[a-zA-Z]', '', text)
 
     for block in content_blocks:
         if isinstance(block, ImageBlock):

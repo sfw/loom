@@ -11,6 +11,7 @@ Subtask execution is delegated to SubtaskRunner.  Independent subtasks
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,7 @@ from loom.config import Config
 
 if TYPE_CHECKING:
     from loom.processes.schema import ProcessDefinition
-from loom.engine.runner import SubtaskResult, SubtaskRunner, ToolCallRecord
+from loom.engine.runner import SubtaskResult, SubtaskResultStatus, SubtaskRunner, ToolCallRecord
 from loom.engine.scheduler import Scheduler
 from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import Event, EventBus
@@ -55,6 +56,8 @@ from loom.state.task_state import (
 )
 from loom.tools.registry import ToolRegistry
 from loom.tools.workspace import ChangeLog
+
+logger = logging.getLogger(__name__)
 
 # Re-export dataclasses that existing code imports from here
 __all__ = [
@@ -120,6 +123,7 @@ class Orchestrator:
             max_retries=config.execution.max_subtask_retries,
         )
         self._state_lock = asyncio.Lock()
+        self._changelog_cache: dict[str, ChangeLog] = {}
 
         # Inject process into prompt assembler
         if process is not None:
@@ -128,8 +132,7 @@ class Orchestrator:
         # Apply tool exclusions from process definition
         if process and process.tools.excluded:
             for tool_name in process.tools.excluded:
-                if tool_name in self._tools._tools:
-                    del self._tools._tools[tool_name]
+                self._tools.exclude(tool_name)
 
         # Runner handles the inner subtask execution
         self._runner = SubtaskRunner(
@@ -202,9 +205,13 @@ class Orchestrator:
                             # Convert exception into a failed result
                             from loom.engine.runner import SubtaskResult
 
+                            logger.error(
+                                "Subtask %s raised exception: %s",
+                                batch[i].id, item, exc_info=item,
+                            )
                             failed = SubtaskResult(
-                                status="failed",
-                                summary=str(item),
+                                status=SubtaskResultStatus.FAILED,
+                                summary=f"{type(item).__name__}: {item}",
                             )
                             no_verif = VerificationResult(
                                 tier=0, passed=False,
@@ -237,10 +244,17 @@ class Orchestrator:
             return result_task
 
         except Exception as e:
+            logger.exception("Fatal error in task %s", task.id)
             task.status = TaskStatus.FAILED
-            task.add_error("orchestrator", str(e))
-            self._state.save(task)
-            self._emit(TASK_FAILED, task.id, {"error": str(e)})
+            task.add_error("orchestrator", f"{type(e).__name__}: {e}")
+            try:
+                self._state.save(task)
+            except Exception as save_err:
+                logger.error("Failed to save after fatal: %s", save_err)
+            self._emit(TASK_FAILED, task.id, {
+                "error": str(e),
+                "error_type": type(e).__name__,
+            })
             await self._learn_from_task(task)
             return task
 
@@ -450,21 +464,27 @@ class Orchestrator:
         if task.workspace:
             workspace_path = Path(task.workspace)
             if workspace_path.exists():
-                listing_result = await self._tools.execute(
-                    "list_directory", {}, workspace=workspace_path,
+                # Run listing and analysis in parallel
+                async def _do_listing():
+                    return await self._tools.execute(
+                        "list_directory", {}, workspace=workspace_path,
+                    )
+
+                async def _do_analysis():
+                    if self._process and self._process.workspace_scan:
+                        return ("workspace", await self._analyze_workspace_for_process(workspace_path))
+                    return ("code", await self._analyze_workspace(workspace_path))
+
+                listing_result, analysis_result = await asyncio.gather(
+                    _do_listing(), _do_analysis(),
                 )
                 if listing_result.success:
                     workspace_listing = listing_result.output
-
-                # Workspace analysis: process-aware or code-focused
-                if self._process and self._process.workspace_scan:
-                    workspace_analysis = await self._analyze_workspace_for_process(
-                        workspace_path,
-                    )
+                analysis_type, analysis_text = analysis_result
+                if analysis_type == "workspace":
+                    workspace_analysis = analysis_text
                 else:
-                    code_analysis = await self._analyze_workspace(
-                        workspace_path,
-                    )
+                    code_analysis = analysis_text
 
         prompt = self._prompts.build_planner_prompt(
             task=task,
@@ -506,16 +526,18 @@ class Orchestrator:
             if structures:
                 summaries = [s.to_summary() for s in structures]
                 parts.append("\n\n".join(summaries))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Code analysis failed for %s: %s", workspace_path, e)
 
         # --- Document / non-code file scan ---
         try:
-            doc_summary = self._scan_workspace_documents(workspace_path)
+            doc_summary = await asyncio.get_event_loop().run_in_executor(
+                None, self._scan_workspace_documents, workspace_path,
+            )
             if doc_summary:
                 parts.append(doc_summary)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Document scan failed for %s: %s", workspace_path, e)
 
         return "\n\n".join(parts)
 
@@ -600,7 +622,8 @@ class Orchestrator:
                 for f in files:
                     lines.append(f"  - {f}")
             return "\n".join(lines)
-        except Exception:
+        except Exception as e:
+            logger.warning("Process workspace scan failed: %s", e)
             return ""
 
     async def _replan_task(self, task: Task) -> bool:
@@ -695,10 +718,14 @@ class Orchestrator:
         """Get or create a ChangeLog for the task's workspace."""
         if not task.workspace:
             return None
+        if task.id in self._changelog_cache:
+            return self._changelog_cache[task.id]
         workspace = Path(task.workspace)
         data_dir = self._state._data_dir / "tasks" / task.id
         data_dir.mkdir(parents=True, exist_ok=True)
-        return ChangeLog(task_id=task.id, workspace=workspace, data_dir=data_dir)
+        changelog = ChangeLog(task_id=task.id, workspace=workspace, data_dir=data_dir)
+        self._changelog_cache[task.id] = changelog
+        return changelog
 
     def _finalize_task(self, task: Task) -> Task:
         """Finalize task: set status, emit events."""
@@ -735,8 +762,8 @@ class Orchestrator:
             return
         try:
             await self._learning.learn_from_task(task)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Post-task learning failed for %s: %s", task.id, e)
 
     def _emit(self, event_type: str, task_id: str, data: dict) -> None:
         self._events.emit(Event(

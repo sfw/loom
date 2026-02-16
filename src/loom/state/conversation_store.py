@@ -15,15 +15,13 @@ from datetime import datetime
 from loom.state.memory import Database
 
 
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: 1 token per 4 characters."""
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
+from loom.utils.tokens import estimate_tokens as _estimate_tokens
 
 
 class ConversationStore:
     """Append-only persistence for cowork conversation history."""
+
+    MAX_QUERY_LIMIT = 1000
 
     def __init__(self, db: Database):
         self._db = db
@@ -148,6 +146,7 @@ class ConversationStore:
         limit: int = 50,
     ) -> list[dict]:
         """Get turns for a session, ordered by turn number."""
+        limit = min(limit, self.MAX_QUERY_LIMIT)
         return await self._db.query(
             """SELECT * FROM conversation_turns
                WHERE session_id = ?
@@ -162,6 +161,7 @@ class ConversationStore:
         limit: int = 100,
     ) -> list[dict]:
         """Get the most recent turns (for session resumption)."""
+        limit = min(limit, self.MAX_QUERY_LIMIT)
         rows = await self._db.query(
             """SELECT * FROM conversation_turns
                WHERE session_id = ?
@@ -190,6 +190,7 @@ class ConversationStore:
         limit: int = 10,
     ) -> list[dict]:
         """Full-text search across turn content."""
+        limit = min(limit, self.MAX_QUERY_LIMIT)
         # Escape LIKE wildcards in user-supplied query to prevent injection
         escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return await self._db.query(
@@ -207,6 +208,7 @@ class ConversationStore:
         limit: int = 10,
     ) -> list[dict]:
         """Find past calls to a specific tool."""
+        limit = min(limit, self.MAX_QUERY_LIMIT)
         return await self._db.query(
             """SELECT * FROM conversation_turns
                WHERE session_id = ? AND tool_name = ?
