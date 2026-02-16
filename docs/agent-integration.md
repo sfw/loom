@@ -253,7 +253,7 @@ For agents written in Python, you can use Loom's engines directly without the HT
 
 ### Cowork Session (Interactive)
 
-Use CoworkSession for conversation-first interactive work with all 16 tools:
+Use CoworkSession for conversation-first interactive work with all 21 tools:
 
 ```python
 import asyncio
