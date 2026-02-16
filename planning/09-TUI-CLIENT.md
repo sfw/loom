@@ -1,172 +1,208 @@
-# Spec 09: Terminal UI Client
+# Spec 09: Interactive TUI (Default Interface)
 
 ## Overview
 
-The TUI is Loom's primary human interface for V1. Built with Python `textual`, it connects to the API server as a client and provides real-time task monitoring, approval controls, and steering. It is deliberately NOT a chat interface — it's a task monitor, closer to a CI/CD dashboard than a chatbot.
+The TUI is Loom's unified interactive interface — the default `loom` command. Built with Python `textual`, it runs CoworkSession directly with full session persistence, conversation recall, task delegation, and process definitions. No server required.
 
-## Launch
-
+**Launch:**
 ```bash
-loom tui                    # Connect to running server at configured host:port
-loom tui --server http://localhost:9000
+loom -w /path/to/project                    # Default command
+loom -w /path/to/project -m claude          # Specific model
+loom -w /path/to/project --process consulting-engagement  # With process
+loom --resume <session-id>                  # Resume previous session
+loom cowork -w /path/to/project             # Alias
 ```
-
-The TUI is a client of the API. It does not embed the engine. The engine must be running separately via `loom serve`.
 
 ## Layout
 
 ```
-┌─ Loom ─────────────────────────────────────────────────────────────┐
-│ Tasks: 3 active │ Models: M2.1 ● Qwen3 ●  │ ↑↓:navigate  q:quit │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                    │
-│  ┌─ Task List ─────────────────────────────────────────────────┐   │
-│  │ ● [running] Migrate Express to TypeScript    4/7  57%       │   │
-│  │ ● [waiting] Add test coverage for auth       0/5  ⏸ approval│   │
-│  │ ✓ [done]    Fix CORS headers                 3/3  100%      │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                    │
-│  ┌─ Plan ──────────────┐  ┌─ Live Output ─────────────────────┐   │
-│  │ ✓ Install deps      │  │ [schema-convert] Reading schema   │   │
-│  │ ✓ Rename .js → .ts  │  │ from src/models/...               │   │
-│  │ ✓ Add tsconfig.json │  │                                   │   │
-│  │ → Add type annot.   │  │ Tool: edit_file                   │   │
-│  │ ○ Fix type errors   │  │   path: src/models/User.ts        │   │
-│  │ ○ Run tests         │  │   +12 lines, -3 lines             │   │
-│  │ ○ Final validation  │  │                                   │   │
-│  │                     │  │ Tool: read_file                   │   │
-│  │                     │  │   path: src/routes/auth.ts        │   │
-│  └─────────────────────┘  └───────────────────────────────────┘   │
-│                                                                    │
-│  ┌─ Files Changed ────────────────────────────────────────────┐   │
-│  │ M src/models/User.ts (+12/-3)    A tsconfig.json           │   │
-│  │ M src/routes/auth.ts (+23/-8)    M package.json (+5/-1)    │   │
-│  └────────────────────────────────────────────────────────────┘   │
-│                                                                    │
-│  [d]iff  [r]evert  [a]pprove  [s]teer  [p]ause  [c]ancel        │
-└────────────────────────────────────────────────────────────────────┘
+┌─ Loom ──────────────────────────────────────────────────────────────┐
+│ Header (clock)                                                       │
+├─────────┬───────────────────────────────────────────────────────────┤
+│         │ [Chat]  [Files Changed]  [Events]                          │
+│  S I    │                                                            │
+│  I D    │  > Fix the authentication bug in src/auth.py               │
+│  D E    │                                                            │
+│  E B    │    read_file src/auth.py                                   │
+│  B A    │    ok 12ms 45 lines                                        │
+│  A R    │    ripgrep_search /validate_token/                         │
+│  R      │    ok 3ms 2 results                                        │
+│         │    edit_file src/auth.py                                    │
+│  Tasks  │    ok 8ms                                                  │
+│  Files  │                                                            │
+│         │  I found and fixed the bug. The token validation was...     │
+│         │                                                            │
+│         │  [3 tool calls | 1,247 tokens | claude-sonnet-4-5]        │
+├─────────┴───────────────────────────────────────────────────────────┤
+│  [>] Type a message... (Enter to send)                               │
+├─────────────────────────────────────────────────────────────────────┤
+│  /path/to/project  |  qwen3:14b  |  3.2k tokens  |  Ready          │
+├─────────────────────────────────────────────────────────────────────┤
+│  ^B Sidebar  ^L Clear  ^P Commands  ^C Quit                         │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Views
+## Features
 
-### Dashboard View (Task List)
-- Shows all tasks with status, progress bar, and summary
-- Keyboard navigation: arrow keys to select, Enter to open detail view
-- Status indicators: `●` running, `⏸` waiting for approval, `✓` complete, `✗` failed
-- Auto-refreshes via SSE subscription to all events
+### First-Run Setup Wizard
 
-### Task Detail View
-- **Left panel: Plan tree** — Subtask list with status icons (✓ complete, → running, ○ pending, ✗ failed)
-- **Center panel: Live output** — Streaming model activity, tool calls, and results for the active subtask
-- **Bottom panel: Files changed** — Git-style summary (M modified, A added, D deleted) with line counts
-- **Status bar: Controls** — Keyboard shortcuts for actions
+When Loom launches with no configured models, the TUI pushes a `SetupScreen` modal — a five-step guided wizard that collects provider, model details, roles, an optional utility model, and writes `~/.loom/loom.toml`. The session initializes immediately after without restarting. Users can reconfigure at any time via the `/setup` slash command.
 
-### Diff View
-- Press `d` on a changed file to see the full diff
-- Shows before/after with standard unified diff coloring
-- Press `Esc` to return to task detail
+**Steps:**
+1. **Provider** — Anthropic, OpenAI-compatible, or Ollama (number keys to select)
+2. **Details** — base URL, model name/selection, API key (provider-dependent fields)
+3. **Roles** — all roles, primary only (planner + executor), or utility only (extractor + verifier)
+4. **Utility model?** — if roles are incomplete, offer to add a second model
+5. **Confirm** — summary of all models and roles; Enter to save, Esc to go back
 
-### Approval Modal
-- When the engine requests approval, a modal overlay appears
-- Shows: what the engine wants to do, why it needs approval, risk level
-- Keys: `y` approve, `n` reject, `r` reject with reason
+### Multi-Panel Layout
+- **Sidebar** — workspace file browser, task progress tracker
+- **Chat tab** — streaming conversation with rich tool call rendering
+- **Files Changed tab** — tracks all file operations with inline diff viewer
+- **Events tab** — timestamped event log with token sparkline
 
-### Steer Input
-- Press `s` to open a text input for mid-task instructions
-- Typed instruction is sent via PATCH /tasks/{id}
-- Shown as a system event in the live output
+### Session Persistence
+- Every turn persisted to SQLite via `ConversationStore` (write-through)
+- Session survives restarts — resume with `--resume <id>`
+- `SessionState` metadata (focus, decisions, files touched) injected into system prompt
+- Slash commands: `/sessions`, `/new`, `/session`, `/resume <id>`
 
-## Textual Application Structure
+### Conversation Recall
+- `conversation_recall` tool lets the model search past context
+- Full-text search across turns, tool call filtering
+- Dangling reference detection nudges model to use recall
+
+### Task Delegation
+- `delegate_task` tool spawns autonomous sub-agents via the orchestrator
+- Model can offload complex multi-step work while continuing the conversation
+
+### Streaming Text Display
+- Model text tokens stream as they arrive
+- Tool calls show inline: tool name + args preview on start; ok/err + elapsed + output preview on completion
+- Turn summaries show tool count and token usage
+
+### Tool Approval Modal
+When the model calls a write/execute tool, a modal appears:
+
+```
+┌─ Approve tool call? ──────────────────────┐
+│                                            │
+│  shell_execute  ls -la                     │
+│                                            │
+│  [y] Yes  [a] Always allow  [n] No  [Esc] │
+└────────────────────────────────────────────┘
+```
+
+- **[y] Yes** — approve this one call
+- **[a] Always** — approve all future calls to this tool for the session
+- **[n] No / Esc** — deny (model sees "denied by user" error)
+- Read-only tools (read_file, search, glob, web_search, etc.) are auto-approved
+
+### Ask User Modal
+When the model calls `ask_user`, a modal with input field appears:
+
+```
+┌─ Question: Which database should we use? ─┐
+│                                            │
+│   1. PostgreSQL                            │
+│   2. SQLite                                │
+│   3. MySQL                                 │
+│   Enter a number or type your answer       │
+│                                            │
+│   [>] Your answer...                       │
+└────────────────────────────────────────────┘
+```
+
+### Slash Commands
+
+| Command | Action |
+|---------|--------|
+| `/help` | Show available commands and shortcuts |
+| `/sessions` | List all saved sessions |
+| `/new` | Start a new session |
+| `/session` | Show current session info (turns, tokens, focus) |
+| `/resume <id>` | Switch to a different session by ID prefix |
+| `/model` | Show current model |
+| `/tools` | List available tools |
+| `/tokens` | Show session token usage |
+| `/setup` | Open the configuration wizard |
+| `/clear` | Clear the chat display |
+| `/quit` | Exit Loom |
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+C` | Quit |
+| `Ctrl+B` | Toggle sidebar |
+| `Ctrl+L` | Clear chat |
+| `Ctrl+P` | Command palette |
+| `Ctrl+1/2/3` | Switch tabs (Chat / Files / Events) |
+
+## Architecture
 
 ```python
 # tui/app.py
-from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Header, Footer, Static, ListView
-
 class LoomApp(App):
-    CSS_PATH = "loom.tcss"
-    BINDINGS = [
-        ("q", "quit", "Quit"),
-        ("d", "show_diff", "Diff"),
-        ("a", "approve", "Approve"),
-        ("s", "steer", "Steer"),
-        ("p", "pause", "Pause"),
-        ("c", "cancel", "Cancel"),
-        ("r", "revert", "Revert"),
-        ("escape", "back", "Back"),
-    ]
+    """Unified interactive interface with full cowork backend."""
 
-    def __init__(self, server_url: str):
-        super().__init__()
-        self.server_url = server_url
-        self.api_client = LoomAPIClient(server_url)
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield DashboardView()
-        yield Footer()
+    def __init__(self, model: ModelProvider | None, tools, workspace, *,
+                 config=None, db=None, store=None,
+                 resume_session=None, process_name=None):
+        ...
 
     async def on_mount(self):
-        """Start SSE subscription for real-time updates."""
-        self.run_worker(self._subscribe_events())
+        # If model is None → push SetupScreen modal, return
+        # Otherwise → _initialize_session()
 
-    async def _subscribe_events(self):
-        """Background worker consuming SSE stream."""
-        async for event in self.api_client.stream_all_events():
-            self.post_message(TaskEventMessage(event))
+    async def _initialize_session(self):
+        # Register conversation_recall + delegate_task tools
+        # Load process definition
+        # Create or resume session (with persistence)
+        # Bind session-dependent tools
+
+    async def _approval_callback(self, tool_name, args) -> ApprovalDecision:
+        """Shows ToolApprovalScreen modal, waits for response."""
+
+    @work(exclusive=True)
+    async def _run_turn(self, user_message: str):
+        """Streams events from session.send_streaming() into the chat log."""
 ```
 
-## API Client
+### Key Components
 
-The TUI uses a thin async client wrapping the REST API:
-
-```python
-class LoomAPIClient:
-    def __init__(self, base_url: str):
-        self._client = httpx.AsyncClient(base_url=base_url)
-
-    async def list_tasks(self) -> list[dict]: ...
-    async def get_task(self, task_id: str) -> dict: ...
-    async def create_task(self, goal: str, workspace: str = None) -> dict: ...
-    async def cancel_task(self, task_id: str) -> dict: ...
-    async def approve(self, task_id: str, subtask_id: str) -> dict: ...
-    async def steer(self, task_id: str, instruction: str) -> dict: ...
-    async def get_diff(self, task_id: str, file_path: str) -> str: ...
-
-    async def stream_all_events(self) -> AsyncIterator[dict]:
-        """Subscribe to global SSE stream."""
-        ...
-
-    async def stream_task_events(self, task_id: str) -> AsyncIterator[dict]:
-        """Subscribe to task-specific SSE stream."""
-        ...
-```
-
-## Quick Run Mode
-
-For quick tasks, bypass the TUI and run inline in the terminal:
-
-```bash
-loom run "Fix all TypeScript errors in src/" --workspace ./my-project
-```
-
-This:
-1. Starts the engine (if not running)
-2. Submits the task
-3. Streams progress inline (simple log output, not full TUI)
-4. Returns exit code 0 on success, 1 on failure
+| Component | File | Description |
+|-----------|------|-------------|
+| `LoomApp` | `tui/app.py` | Main Textual application with persistence |
+| `ChatLog` | `tui/widgets/chat_log.py` | Scrollable chat with rich tool rendering |
+| `Sidebar` | `tui/widgets/sidebar.py` | Workspace browser + task progress |
+| `FilesChangedPanel` | `tui/widgets/files_changed.py` | File tracking with diff viewer |
+| `EventPanel` | `tui/widgets/event_panel.py` | Timestamped event log |
+| `StatusBar` | `tui/widgets/status_bar.py` | Workspace, model, tokens, state |
+| `ToolApprovalScreen` | `tui/screens/` | Modal for [y]es/[a]lways/[n]o approval |
+| `AskUserScreen` | `tui/screens/` | Modal for model questions |
+| `SetupScreen` | `tui/screens/` | Multi-step first-run setup wizard |
+| `ToolApprover` | `cowork/approval.py` | Tracks auto-approved and always-approved tools |
+| `CoworkSession` | `cowork/session.py` | Conversation-first execution engine |
+| `ConversationStore` | `state/conversation_store.py` | SQLite session persistence |
 
 ## Acceptance Criteria
 
-- [ ] `loom tui` launches and connects to running server
-- [ ] Dashboard shows all tasks with real-time status updates
-- [ ] Task detail view shows plan tree, live output, and files changed
-- [ ] Approval modal appears when engine requests approval
-- [ ] Steer input sends instruction to running task
-- [ ] Diff view shows file changes with color highlighting
-- [ ] Cancel stops a running task
-- [ ] Keyboard shortcuts work from all views
-- [ ] TUI reconnects if SSE connection drops
-- [ ] `loom run` works for quick inline task execution
-- [ ] TUI does not embed the engine (pure API client)
+- [x] `loom` (no args) launches the TUI with full persistence
+- [x] `loom cowork` is an alias for the default TUI
+- [x] Chat log shows streaming text tokens in real time
+- [x] Tool calls display with args preview and completion status
+- [x] Approval modal appears for write/execute tools with [y]/[a]/[n] options
+- [x] "Always allow" remembers per-tool for the session
+- [x] Ask_user modal shows question, options, and input field
+- [x] All 21 tools are supported (including conversation_recall, delegate_task)
+- [x] Session persistence — all turns saved to SQLite
+- [x] Session resumption — `--resume <id>` restores context
+- [x] Session management — `/sessions`, `/new`, `/resume` slash commands
+- [x] Process definitions load and inject persona/tool guidance
+- [x] Multi-panel layout (sidebar, chat, files, events)
+- [x] Status bar shows workspace, model, token count, and state
+- [x] Keyboard shortcuts (Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette)
+- [x] First-run setup wizard inside TUI when no models configured
+- [x] `/setup` slash command for reconfiguration
+- [x] `loom setup` CLI fallback for headless environments

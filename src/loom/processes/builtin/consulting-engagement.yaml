@@ -1,0 +1,150 @@
+name: consulting-engagement
+version: "1.0"
+description: >
+  McKinsey-style structured problem solving. Decomposes a business problem
+  into a MECE issue tree, assigns workstreams, gathers evidence, synthesizes
+  recommendations, and builds presentation-ready output.
+author: "Loom Team"
+tags: [consulting, strategy, problem-solving, mece, presentation]
+
+persona: |
+  You are a senior management consultant. Decompose every problem into a MECE
+  issue tree before gathering data. Lead with the answer (pyramid principle),
+  support with evidence, tie to quantified impact. Every heading is an action
+  title — a complete sentence stating a conclusion.
+
+phase_mode: strict
+
+tool_guidance: |
+  Structure as slide-ready: action title, evidence, "so what." CSV for
+  data exhibits. Markdown as concise slide notes with exhibit references.
+
+phases:
+  - id: define-issue-tree
+    description: >
+      Decompose into MECE issue tree: governing question, 3-5 branches,
+      testable hypotheses. Prioritize by impact.
+    depends_on: []
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      Governing question at root. Branches are MECE with 2-4 sub-hypotheses
+      each. Prioritized with rationale. At least 3 levels deep.
+    deliverables:
+      - "issue-tree.md — full tree with governing question and hypotheses"
+      - "workstream-priorities.csv — branches ranked by impact and feasibility"
+  - id: assign-workstreams
+    description: >
+      Convert priority branches into workstreams with question, hypothesis,
+      analysis approach, data needs, and expected output.
+    depends_on: [define-issue-tree]
+    model_tier: 2
+    verification_tier: 1
+    acceptance_criteria: >
+      Each priority branch has a workstream with question, hypothesis,
+      approach, data requirements, and output format.
+    deliverables:
+      - "workstream-plan.md — workstream definitions and analysis plans"
+  - id: gather-evidence
+    description: >
+      Execute workstreams: gather data, test hypotheses, state verdicts.
+    depends_on: [assign-workstreams]
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      Each workstream has hypothesis verdict with evidence. Exhibits have
+      source and date. Counter-evidence noted.
+    deliverables:
+      - "workstream-findings.md — findings with hypothesis verdicts"
+      - "evidence-exhibits.csv — data supporting each finding"
+  - id: synthesize-recommendations
+    description: "Synthesize into 3-5 ranked recommendations with quantified impact and effort."
+    depends_on: [gather-evidence]
+    model_tier: 3
+    verification_tier: 2
+    acceptance_criteria: >
+      Each has quantified impact, effort in months, confidence, and owner
+      role. Quick wins separated from strategic bets.
+    deliverables:
+      - "recommendations.md — prioritized recommendations with impact"
+      - "impact-model.csv — quantified impact and effort per recommendation"
+  - id: build-presentation
+    description: >
+      Assemble 10-15 slide outline. Every title states a conclusion.
+    depends_on: [synthesize-recommendations]
+    model_tier: 2
+    verification_tier: 2
+    acceptance_criteria: >
+      Slide 1 is executive summary. Each title is a conclusion sentence.
+      Roadmap slide shows phases. Appendix lists methodology.
+    deliverables:
+      - "presentation-outline.md — slide-by-slide outline with action titles"
+      - "executive-summary.md — one-page summary for senior leadership"
+
+verification:
+  rules:
+    - name: mece-structure
+      description: "Issue tree branches must be MECE"
+      check: >
+        Confirm no branch overlaps and they fully cover the governing
+        question. No duplicate sub-hypotheses across branches.
+      severity: error
+      type: llm
+    - name: red-team
+      description: "Recommendations must survive adversarial challenge"
+      check: >
+        Identify strongest counterargument for each recommendation. Would
+        it convince a skeptical CFO? Flag single-source claims.
+      severity: warning
+      type: llm
+    - name: action-titles
+      description: "Headings must be conclusion sentences, not topic labels"
+      check: >
+        Each heading must be a sentence with subject and verb stating a
+        finding. Reject labels like "Market Analysis."
+      severity: warning
+      type: llm
+    - name: no-placeholders
+      description: "No placeholder text in deliverables"
+      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
+      severity: error
+      type: regex
+
+memory:
+  extract_types:
+    - type: hypothesis_verdict
+      description: "Tested hypothesis and whether confirmed, refuted, or modified"
+    - type: key_finding
+      description: "Significant finding with quantified evidence"
+    - type: recommendation
+      description: "Specific recommendation with impact and confidence"
+    - type: stakeholder_concern
+      description: "Anticipated objection from a key stakeholder role"
+  extraction_guidance: |
+    Prioritize hypothesis verdicts — they drive the logic chain. Tag
+    stakeholder concerns with role (CEO, CFO, ops lead).
+
+workspace_analysis:
+  scan_for:
+    - "*.csv — financial data, operational metrics, or benchmarks"
+    - "*.md — prior analyses, strategy docs, or meeting notes"
+  guidance: |
+    Look for existing issue trees or data from prior work.
+
+planner_examples:
+  - goal: "Advise retailer on DTC e-commerce vs. doubling down on wholesale"
+    subtasks:
+      - { id: define-issue-tree, description: "Decompose: DTC vs wholesale economics, capability gaps, channel preference, cannibalization", depends_on: [], model_tier: 3 }
+      - { id: assign-workstreams, description: "4 streams: unit economics, customer analysis, competitive mapping, capability assessment", depends_on: [define-issue-tree], model_tier: 2 }
+      - { id: gather-evidence, description: "Margins by channel, DTC CAC estimate, benchmark 3 pivots, tech readiness", depends_on: [assign-workstreams], model_tier: 3 }
+      - { id: synthesize-recommendations, description: "Pilot DTC in 2 categories, maintain wholesale, go/no-go at 6 and 12 months", depends_on: [gather-evidence], model_tier: 3 }
+      - { id: build-presentation, description: "12 slides: 'Phased DTC pilot captures upside while limiting downside risk'", depends_on: [synthesize-recommendations], model_tier: 2 }
+
+replanning:
+  triggers: |
+    - Problem is fundamentally different than initially framed
+    - Workstream uncovers a showstopper making other streams moot
+    - Evidence contradicts majority of initial hypotheses
+  guidance: |
+    If reframed, return to issue tree with new framing. If showstopper
+    found, fast-track to recommendations. Preserve prior evidence.

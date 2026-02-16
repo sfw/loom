@@ -79,6 +79,16 @@ loom/
 │       │   │   └── replanner.yaml  # Re-planning prompt
 │       │   └── constraints.py      # Constraint library for local models
 │       │
+│       ├── processes/
+│       │   ├── __init__.py
+│       │   ├── schema.py             # ProcessDefinition, ProcessLoader, validation
+│       │   └── builtin/              # 5 built-in YAML process definitions
+│       │       ├── investment-analysis.yaml
+│       │       ├── marketing-strategy.yaml
+│       │       ├── research-report.yaml
+│       │       ├── competitive-intel.yaml
+│       │       └── consulting-engagement.yaml
+│       │
 │       ├── tui/
 │       │   ├── __init__.py
 │       │   ├── app.py              # Textual application (Spec 09)
@@ -232,10 +242,11 @@ event_log_path = "~/.loom/logs"
 ## CLI Entry Points
 
 ```
-loom serve              # Start the API server
-loom tui                # Launch the terminal UI
+loom                    # Launch the interactive TUI (default)
+loom cowork             # Alias for the interactive TUI
 loom run <goal>         # Quick run: submit task, show progress, return result
 loom run <goal> --workspace /path/to/project
+loom serve              # Start the API server
 loom status <task_id>   # Check task status
 loom cancel <task_id>   # Cancel a running task
 loom models             # List available models and status

@@ -79,17 +79,27 @@ class Tool(ABC):
 
 | Tool | Description | Timeout |
 |------|-------------|---------|
-| `read_file` | Read file contents, optional line range | 10s |
+| `read_file` | Read file contents (text, PDF via pypdf, image metadata), optional line range | 10s |
 | `write_file` | Write/create file, records changelog | 10s |
 | `edit_file` | Find-and-replace unique string in file, records changelog | 10s |
-| `shell_execute` | Run shell command in workspace directory | 60s |
+| `shell_execute` | Run shell command in workspace directory | 120s |
 | `search_files` | Grep for patterns across workspace files | 30s |
 | `list_directory` | List files and dirs up to 2 levels deep | 10s |
+| `delete_file` | Delete file or empty directory | 10s |
+| `move_file` | Move or rename a file within workspace | 10s |
+| `git_command` | Git operations (status, diff, log, add, commit, push, etc.) | 60s |
+| `analyze_code` | Parse file structure (classes, functions, imports) | 15s |
+| `web_fetch` | Fetch URL content for documentation/specs | 45s |
+| `web_search` | Internet search via DuckDuckGo (no API key required) | 30s |
+| `ripgrep_search` | Fast content search via ripgrep with regex, context lines, type filters | 30s |
+| `glob_find` | Fast file discovery by glob pattern, sorted by mtime, skips junk dirs | 10s |
+| `ask_user` | Ask the developer questions mid-execution (free-text or multiple choice) | 300s |
+| `task_tracker` | In-memory progress tracking (add/update/list/clear tasks) | 10s |
 
 ### read_file
-- Parameters: `path` (required, string), `line_range` (optional, [start, end])
+- Parameters: `path` (required, string), `line_range` (optional, [start, end]), `page_start`/`page_end` (optional, for PDFs)
 - Resolves path relative to workspace
-- Returns file content as text
+- Returns file content as text. Supports text files, PDFs (with pagination via pypdf), Word documents (.doc/.docx via python-docx), PowerPoint presentations (.ppt/.pptx via python-pptx), and images (as multimodal content blocks)
 
 ### write_file
 - Parameters: `path` (required), `content` (required)
@@ -119,6 +129,27 @@ class Tool(ABC):
 - Parameters: `path` (optional, defaults to workspace root)
 - Returns tree-style listing, 2 levels deep, ignoring `.git`, `node_modules`, `__pycache__`
 
+## Plugin Discovery
+
+Tools are auto-discovered via `Tool.__init_subclass__`. Any concrete `Tool` subclass
+in the `loom.tools` package is automatically collected when its module is imported.
+The `discover_tools()` function scans all modules in the package and returns the
+collected classes. `create_default_registry()` calls `discover_tools()` and
+instantiates each class.
+
+To add a new built-in tool:
+1. Create a new module in `src/loom/tools/`
+2. Define a class that subclasses `Tool` and implements all abstract methods
+3. That's it — no manual registration code needed
+
+For tools outside the package, use manual registration:
+
+```python
+from loom.tools import create_default_registry
+registry = create_default_registry()
+registry.register(MyCustomTool())
+```
+
 ## Path Security
 
 All file tools MUST validate resolved paths stay within the workspace:
@@ -147,11 +178,12 @@ Every file-modifying tool (write_file, edit_file) records changes via the worksp
 
 ## Acceptance Criteria
 
-- [ ] All built-in tools register and produce valid OpenAI-format schemas
-- [ ] File tools resolve paths relative to workspace
-- [ ] Path traversal attacks are blocked
-- [ ] Dangerous shell commands are blocked
-- [ ] Tool execution respects timeout limits
-- [ ] Changelog entries are recorded before file modifications
-- [ ] ToolResult serializes to JSON for model consumption
-- [ ] Tools work gracefully when workspace is None (report error, don't crash)
+- [x] All built-in tools register and produce valid OpenAI-format schemas
+- [x] File tools resolve paths relative to workspace
+- [x] Path traversal attacks are blocked
+- [x] Dangerous shell commands are blocked
+- [x] Tool execution respects timeout limits
+- [x] Changelog entries are recorded before file modifications
+- [x] ToolResult serializes to JSON for model consumption
+- [x] Tools work gracefully when workspace is None (report error, don't crash)
+- [x] Tools auto-discovered via `__init_subclass__` — no manual registration needed

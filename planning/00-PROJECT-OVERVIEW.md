@@ -1,10 +1,14 @@
-# Loom: Local LLM Agentic Task Orchestrator
+# Loom: LLM Agentic Task Orchestrator
 
-> Loom harnesses local LLMs to finish complex tasks. It decomposes work, drives execution through verified steps, and keeps models on track with structured state instead of chat history. Routes between thinking and acting models, verifies outputs independently, and exposes a clean API for both humans and agents.
+> Loom harnesses LLMs (local or cloud) to finish complex tasks. Two modes: **interactive** (pair programming in a rich TUI with session persistence and conversation recall) and **task** (autonomous decomposition, execution, and verification). 21 built-in tools, 3 model backends (Ollama, OpenAI-compatible, Anthropic/Claude), per-tool-call approval, streaming, and full SQLite persistence.
 
 ## Project Overview
 
-Loom is a local-first task orchestration engine that brings Claude Code/Cowork-style agentic capabilities to local LLM models. It solves the core problem of LLMs completing one subtask and stopping by implementing a harness-driven execution loop with structured state management, multi-tier verification, and intelligent model routing.
+Loom is a task orchestration engine that brings Claude Code-style agentic capabilities to any LLM. It supports two execution models:
+
+- **Interactive** (`loom`) — conversation-first pair programming in a Textual TUI. No planning phase, no subtask decomposition. The model and developer collaborate in a continuous tool-calling loop with streaming text, real-time tool display, per-tool-call approval, session persistence, conversation recall, and task delegation. This is the default `loom` command.
+
+- **Task mode** (`loom run` / REST API) — autonomous execution. Loom decomposes a goal into subtasks with dependency graphs, executes them in parallel with isolated runners, verifies results independently, and learns from the process.
 
 ## Target Hardware
 

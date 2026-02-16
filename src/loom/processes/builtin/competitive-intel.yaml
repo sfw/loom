@@ -1,0 +1,135 @@
+name: competitive-intel
+version: "1.0"
+description: >
+  Quick competitive intelligence gathering and comparison. Three lightweight
+  phases for identifying competitors, researching their offerings, and
+  building a structured comparison. Designed for fast ad-hoc requests
+  when a full marketing strategy is unnecessary.
+author: "Loom Team"
+tags: [competitive, intelligence, research, comparison, quick]
+
+persona: |
+  You are a competitive intelligence analyst who works fast and focuses on
+  actionable differences. You care about what competitors actually do, not
+  what they claim. You look for pricing pages, job postings, product
+  changelogs, and customer reviews as signal sources.
+
+phase_mode: suggestive
+
+tool_guidance: |
+  Favor structured comparison tables over narrative. Use CSV for the final
+  comparison matrix so it can be imported into other tools. Keep narrative
+  sections concise — bullet points over paragraphs. When a data point is
+  uncertain, mark it with a tilde (~) prefix and note the source.
+
+phases:
+  - id: identify-competitors
+    description: >
+      Build the initial competitor list. Include direct competitors (same
+      product category), indirect competitors (different approach to same
+      problem), and emerging threats. Categorize each by type and relevance.
+    depends_on: []
+    model_tier: 1
+    verification_tier: 1
+    acceptance_criteria: >
+      At least 5 competitors identified. Each has a name, website, one-line
+      description, competitor type (direct/indirect/emerging), and estimated
+      relevance (high/medium/low). The list is prioritized.
+    deliverables:
+      - "competitor-list.csv — identified competitors with categorization"
+
+  - id: research-competitors
+    description: >
+      For each high-relevance competitor, gather: product capabilities,
+      pricing model, target customer, recent funding or revenue signals,
+      stated strategy, key hires, and notable customer wins or losses.
+    depends_on: [identify-competitors]
+    model_tier: 2
+    verification_tier: 1
+    acceptance_criteria: >
+      Each high-relevance competitor has a profile covering at least 5 of
+      the 7 research dimensions. Data sources are noted. Recency of
+      information is stated (e.g., pricing as of Q3 2025).
+    deliverables:
+      - "competitor-profiles.md — detailed profiles of top competitors"
+
+  - id: build-comparison
+    description: >
+      Create a structured comparison matrix across key dimensions. Identify
+      where the subject company is stronger, weaker, or at parity. Highlight
+      the top 3 competitive advantages and top 3 vulnerabilities.
+    depends_on: [research-competitors]
+    model_tier: 2
+    verification_tier: 2
+    acceptance_criteria: >
+      Comparison matrix has at least 8 dimensions (features, pricing,
+      integrations, support, market position, etc.). Strengths and
+      weaknesses are specific and supported by evidence from profiles.
+      A summary table shows win/lose/parity per competitor per dimension.
+    deliverables:
+      - "comparison-matrix.csv — feature and capability comparison grid"
+      - "competitive-summary.md — key advantages, vulnerabilities, and recommendations"
+
+verification:
+  rules:
+    - name: evidence-backed
+      description: "Competitive claims must reference observable evidence"
+      check: >
+        Review each strength and weakness claim. It must reference a
+        specific feature, pricing data point, customer review, job posting,
+        or other observable signal. Reject claims based solely on brand
+        perception or unsupported assumptions.
+      severity: warning
+      type: llm
+    - name: no-placeholders
+      description: "No placeholder text left in deliverables"
+      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
+      severity: error
+      type: regex
+
+memory:
+  extract_types:
+    - type: competitor_profile
+      description: "Key facts about a competitor — product, pricing, positioning, recent moves"
+    - type: competitive_gap
+      description: "A specific dimension where the subject company is weaker or stronger"
+  extraction_guidance: |
+    Focus on facts that would influence product or sales strategy. Always
+    include the competitor name and the date or recency of the information.
+    For gaps, note whether the gap is widening or narrowing.
+
+workspace_analysis:
+  scan_for:
+    - "*.csv — existing competitor data or feature matrices"
+    - "*.md — prior competitive analyses or battle cards"
+  guidance: |
+    If prior competitor research exists, use it as a starting point and
+    focus on updating stale data points rather than rebuilding from scratch.
+    Look for sales battle cards that may contain validated competitive
+    positioning.
+
+planner_examples:
+  - goal: "Build a competitive comparison of project management tools against our product"
+    subtasks:
+      - id: identify-competitors
+        description: "List direct competitors (Asana, Monday, Linear, Jira, ClickUp) and indirect (Notion, Airtable), categorize by threat level"
+        depends_on: []
+        model_tier: 1
+      - id: research-competitors
+        description: "Profile each on pricing tiers, feature set, integrations, target segment, and recent product launches or pivots"
+        depends_on: [identify-competitors]
+        model_tier: 2
+      - id: build-comparison
+        description: "Build matrix on 10 dimensions: task management, views, automation, reporting, integrations, pricing, collaboration, mobile, API, and support"
+        depends_on: [research-competitors]
+        model_tier: 2
+
+replanning:
+  triggers: |
+    - The competitive landscape is too fragmented to compare meaningfully
+    - A key competitor has been acquired or shut down during research
+    - The subject company's own product scope is unclear
+  guidance: |
+    If there are too many competitors, narrow to the top 5 by relevance
+    and note the long tail. If the subject company's product is unclear,
+    add a preliminary scoping step before competitor identification.

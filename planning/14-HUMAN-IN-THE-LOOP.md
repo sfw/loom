@@ -210,16 +210,32 @@ async def inject_steering(self, task_id: str, instruction: str):
     self._event_bus.emit(SteerInstruction(task_id, instruction))
 ```
 
+## Per-Tool-Call Approval (Cowork Mode)
+
+In addition to the confidence-based model above (used in autonomous task mode), Loom
+has a **per-tool-call approval system** for interactive cowork/TUI sessions
+(`cowork/approval.py`):
+
+| Category | Tools | Approval |
+|----------|-------|----------|
+| Auto-approved | `read_file`, `search_files`, `list_directory`, `glob_find`, `ripgrep_search`, `analyze_code`, `ask_user`, `web_search`, `web_fetch`, `task_tracker` | Never prompted |
+| Needs approval | `write_file`, `edit_file`, `delete_file`, `move_file`, `shell_execute`, `git_command` | `[y]es / [a]lways / [n]o` |
+
+"Always" remembers per-tool for the session. In the CLI: `terminal_approval_prompt()`.
+In the TUI: `ToolApprovalScreen` modal.
+
 ## Acceptance Criteria
 
-- [ ] Confidence scoring produces values between 0.0 and 1.0
-- [ ] Destructive operations are detected and flagged
-- [ ] Auto mode proceeds at high confidence, gates at low
-- [ ] Manual mode gates every subtask
-- [ ] Confidence threshold mode respects configured threshold
-- [ ] Approval requests appear in TUI and are available via API
-- [ ] Approved subtasks resume execution
-- [ ] Rejected subtasks are marked failed with reason
+- [x] Confidence scoring produces values between 0.0 and 1.0
+- [x] Destructive operations are detected and flagged
+- [x] Auto mode proceeds at high confidence, gates at low
+- [x] Manual mode gates every subtask
+- [x] Confidence threshold mode respects configured threshold
+- [x] Approval requests appear in TUI and are available via API
+- [x] Approved subtasks resume execution
+- [x] Rejected subtasks are marked failed with reason
 - [ ] Timed approvals auto-proceed after timeout
-- [ ] Steering instructions are injected into subsequent prompts
-- [ ] Always-gated operations require approval regardless of confidence
+- [x] Steering instructions are injected into subsequent prompts
+- [x] Always-gated operations require approval regardless of confidence
+- [x] Per-tool-call approval in cowork mode with auto/approve/always/deny
+- [x] TUI shows approval modal with [y]/[a]/[n] keybindings
