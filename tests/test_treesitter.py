@@ -231,6 +231,84 @@ class TestExtractRust:
         assert "std::io" in result.imports
         assert "crate::config" in result.imports
 
+    def test_impl_methods(self):
+        source = (
+            "pub struct Config { name: String }\n\n"
+            "impl Config {\n"
+            "    pub fn new() -> Self { Config { name: String::new() } }\n"
+            "    pub fn load(&self) -> bool { true }\n"
+            "}\n"
+        )
+        result = extract_with_treesitter(source, "rust")
+        assert result is not None
+        assert "Config" in result.classes
+        assert "new" in result.functions
+        assert "load" in result.functions
+
+
+# --- Python edge cases ---
+
+
+class TestExtractPythonEdgeCases:
+    def test_try_except_import(self):
+        source = (
+            "try:\n"
+            "    import ujson\n"
+            "except ImportError:\n"
+            "    import json\n"
+        )
+        result = extract_with_treesitter(source, "python")
+        assert result is not None
+        assert "ujson" in result.imports
+        assert "json" in result.imports
+
+    def test_if_type_checking_import(self):
+        source = (
+            "from __future__ import annotations\n"
+            "if TYPE_CHECKING:\n"
+            "    from typing import Protocol\n"
+        )
+        result = extract_with_treesitter(source, "python")
+        assert result is not None
+        assert "__future__" in result.imports
+        assert "typing" in result.imports
+
+    def test_function_inside_if_main(self):
+        source = (
+            "if __name__ == '__main__':\n"
+            "    def main():\n"
+            "        pass\n"
+        )
+        result = extract_with_treesitter(source, "python")
+        assert result is not None
+        assert "main" in result.functions
+
+    def test_non_ascii_source(self):
+        source = '# -*- coding: utf-8 -*-\ndef greet():\n    return "\u4e16\u754c"\n'
+        result = extract_with_treesitter(source, "python")
+        assert result is not None
+        assert "greet" in result.functions
+
+
+# --- Non-ASCII structural candidates ---
+
+
+class TestNonAsciiStructuralCandidates:
+    def test_non_ascii_candidates(self):
+        source = (
+            '# Comment with \u00e9\u00e8\u00ea\n'
+            'def hello():\n'
+            '    return "\u4e16\u754c"\n\n'
+            'def world():\n'
+            '    return "ok"\n'
+        )
+        candidates = find_structural_candidates(source, "python")
+        assert len(candidates) >= 2
+        # Verify character offsets are valid for indexing into the str
+        for start, end in candidates:
+            segment = source[start:end]
+            assert "def " in segment
+
 
 # --- Fallback ---
 
@@ -291,10 +369,10 @@ class TestStructuralCandidates:
         )
         candidates = find_structural_candidates(source, "python")
         assert len(candidates) >= 2  # class + function at minimum
-        # Each candidate is a (start_byte, end_byte) tuple
+        # Each candidate is a (start_char, end_char) tuple
         for start, end in candidates:
             assert start < end
-            segment = source.encode("utf-8")[start:end]
+            segment = source[start:end]
             # Should contain actual code
             assert len(segment) > 0
 

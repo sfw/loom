@@ -11,11 +11,6 @@ Two integration points:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
-
 # ---------------------------------------------------------------------------
 # Availability check
 # ---------------------------------------------------------------------------
@@ -103,21 +98,46 @@ def extract_with_treesitter(source: str, language: str):
 
 def _extract_python(root, structure) -> None:
     """Walk a Python tree and populate *structure*."""
-    for node in root.children:
-        ntype = node.type
-        if ntype in ("import_statement", "import_from_statement"):
-            _python_import(node, structure)
+    _python_walk_block(root, structure, top_level=True)
+
+
+def _python_walk_block(node, structure, *, top_level: bool) -> None:
+    """Recurse into a block of Python statements.
+
+    Handles top-level definitions, decorated definitions, and compound
+    statements (if/try/with/for) that may contain imports and definitions.
+    """
+    for child in node.children:
+        ntype = child.type
+        if ntype in ("import_statement", "import_from_statement",
+                     "future_import_statement"):
+            _python_import(child, structure)
         elif ntype == "class_definition":
-            _python_class(node, structure)
+            _python_class(child, structure)
         elif ntype == "function_definition":
-            _python_function(node, structure, top_level=True)
+            _python_function(child, structure, top_level=top_level)
         elif ntype == "decorated_definition":
-            # The actual def/class is a child of the decorator wrapper
-            for child in node.children:
-                if child.type == "class_definition":
-                    _python_class(child, structure)
-                elif child.type == "function_definition":
-                    _python_function(child, structure, top_level=True)
+            for sub in child.children:
+                if sub.type == "class_definition":
+                    _python_class(sub, structure)
+                elif sub.type == "function_definition":
+                    _python_function(sub, structure, top_level=top_level)
+        elif ntype in ("if_statement", "try_statement", "with_statement",
+                        "for_statement", "while_statement"):
+            # Recurse into compound statement bodies (block children)
+            _python_walk_compound(child, structure, top_level=top_level)
+
+
+def _python_walk_compound(node, structure, *, top_level: bool) -> None:
+    """Recurse into block children of compound statements (if/try/with/for)."""
+    for child in node.children:
+        if child.type == "block":
+            _python_walk_block(child, structure, top_level=top_level)
+        elif child.type in ("except_clause", "finally_clause",
+                             "else_clause", "elif_clause"):
+            for sub in child.children:
+                if sub.type == "block":
+                    _python_walk_block(sub, structure, top_level=top_level)
 
 
 def _python_import(node, structure) -> None:
@@ -130,6 +150,9 @@ def _python_import(node, structure) -> None:
                 name_node = child.children[0] if child.children else None
                 if name_node is not None:
                     structure.imports.append(name_node.text.decode())
+    elif node.type == "future_import_statement":
+        # from __future__ import X — the module is __future__
+        structure.imports.append("__future__")
     elif node.type == "import_from_statement":
         # from X import Y — capture the module (X)
         for child in node.children:
@@ -333,6 +356,19 @@ def _extract_rust(root, structure) -> None:
             _rust_enum(node, structure)
         elif ntype == "function_item":
             _rust_function(node, structure)
+        elif ntype == "impl_item":
+            # Extract methods from impl blocks
+            _rust_impl(node, structure)
+
+
+def _rust_impl(node, structure) -> None:
+    """Extract methods from a Rust impl block."""
+    body = node.child_by_field_name("body")
+    if body is None:
+        return
+    for child in body.children:
+        if child.type == "function_item":
+            _rust_function(child, structure)
 
 
 def _rust_use(node, structure) -> None:
@@ -378,11 +414,14 @@ def find_structural_candidates(
     source: str,
     language: str,
 ) -> list[tuple[int, int]]:
-    """Return byte-offset ranges of top-level structural nodes.
+    """Return **character-offset** ranges of top-level structural nodes.
 
-    Each element is ``(start_byte, end_byte)`` for a function, class,
+    Each element is ``(start_char, end_char)`` for a function, class,
     method, struct, etc.  Used by ``EditFileTool`` to narrow fuzzy-match
     search to structural boundaries instead of a naive sliding window.
+
+    Tree-sitter internally uses byte offsets; this function converts them
+    to character offsets so callers can index directly into the Python str.
 
     Returns an empty list when tree-sitter is unavailable or parse fails.
     """
@@ -394,23 +433,67 @@ def find_structural_candidates(
     if finder is None:
         return []
 
-    ranges: list[tuple[int, int]] = []
-    finder(root, ranges)
-    return ranges
+    byte_ranges: list[tuple[int, int]] = []
+    finder(root, byte_ranges)
+
+    # Convert byte offsets → character offsets.
+    # For pure ASCII this is a no-op, but for multi-byte UTF-8 we need the map.
+    source_bytes = source.encode("utf-8")
+    if len(source_bytes) == len(source):
+        # Fast path: all ASCII, byte == char
+        return byte_ranges
+
+    b2c = _byte_to_char_map(source)
+    return [(b2c[s], b2c[e]) for s, e in byte_ranges]
+
+
+def _byte_to_char_map(source: str) -> list[int]:
+    """Build a mapping from byte offset → character offset.
+
+    Returns a list where ``result[byte_idx]`` is the character index
+    in *source* that corresponds to that byte position in the UTF-8
+    encoding.  The list has length ``len(source.encode('utf-8')) + 1``
+    so that end-of-string byte offsets map correctly.
+    """
+    encoded = source.encode("utf-8")
+    mapping = [0] * (len(encoded) + 1)
+    byte_idx = 0
+    for char_idx, ch in enumerate(source):
+        ch_bytes = len(ch.encode("utf-8"))
+        for b in range(ch_bytes):
+            mapping[byte_idx + b] = char_idx
+        byte_idx += ch_bytes
+    mapping[byte_idx] = len(source)  # sentinel for end-of-string
+    return mapping
 
 
 def _python_candidates(root, ranges: list[tuple[int, int]]) -> None:
-    for node in root.children:
-        ntype = node.type
+    _python_candidates_walk(root, ranges)
+
+
+def _python_candidates_walk(node, ranges: list[tuple[int, int]]) -> None:
+    for child in node.children:
+        ntype = child.type
         if ntype in ("function_definition", "class_definition", "decorated_definition"):
-            ranges.append((node.start_byte, node.end_byte))
+            ranges.append((child.start_byte, child.end_byte))
             # Also add inner definitions for classes
             if ntype == "class_definition":
-                _add_inner_defs(node, ranges)
+                _add_inner_defs(child, ranges)
             elif ntype == "decorated_definition":
-                for child in node.children:
-                    if child.type == "class_definition":
-                        _add_inner_defs(child, ranges)
+                for sub in child.children:
+                    if sub.type == "class_definition":
+                        _add_inner_defs(sub, ranges)
+        elif ntype in ("if_statement", "try_statement", "with_statement",
+                        "for_statement", "while_statement"):
+            # Recurse into compound statement bodies
+            for sub in child.children:
+                if sub.type == "block":
+                    _python_candidates_walk(sub, ranges)
+                elif sub.type in ("except_clause", "finally_clause",
+                                   "else_clause", "elif_clause"):
+                    for inner in sub.children:
+                        if inner.type == "block":
+                            _python_candidates_walk(inner, ranges)
 
 
 def _add_inner_defs(class_node, ranges: list[tuple[int, int]]) -> None:

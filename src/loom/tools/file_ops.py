@@ -702,10 +702,10 @@ class EditFileTool(Tool):
         content_lines = content.splitlines()
         line_starts = _line_start_offsets(content)
 
-        for start_byte, end_byte in candidates:
-            # Convert byte offsets to line numbers
-            start_line = _byte_to_line(line_starts, start_byte)
-            end_line = _byte_to_line(line_starts, end_byte)
+        for start_char, end_char in candidates:
+            # Convert character offsets to line numbers
+            start_line = _offset_to_line(line_starts, start_char)
+            end_line = _offset_to_line(line_starts, end_char)
             # Ensure we have enough lines in this candidate region
             region_lines = content_lines[start_line:end_line + 1]
             if len(region_lines) < n:
@@ -822,12 +822,12 @@ class EditFileTool(Tool):
         return "\n".join(numbered)
 
 
-def _byte_to_line(line_starts: list[int], byte_offset: int) -> int:
-    """Return the 0-based line index containing *byte_offset*."""
+def _offset_to_line(line_starts: list[int], char_offset: int) -> int:
+    """Return the 0-based line index containing *char_offset*."""
     lo, hi = 0, len(line_starts) - 1
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if line_starts[mid] <= byte_offset:
+        if line_starts[mid] <= char_offset:
             lo = mid
         else:
             hi = mid - 1
