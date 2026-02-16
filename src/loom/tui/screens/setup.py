@@ -252,6 +252,9 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         # Focus the first input on the details step
         if step == _STEP_DETAILS:
             self._configure_details_step()
+        else:
+            # Clear focus so Input widgets don't swallow digit keys
+            self.set_focus(None)
 
     def _configure_details_step(self) -> None:
         """Show/hide detail fields based on selected provider."""
