@@ -24,6 +24,7 @@ data/
 
 # Loom runtime
 .loom/
+loom.toml
 
 # OS
 .DS_Store
