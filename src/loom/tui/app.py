@@ -197,6 +197,16 @@ class LoomApp(App):
             )
             return
 
+        # P1-5: If re-running /setup during an active session, invalidate
+        # the old session so _initialize_session creates a fresh one with
+        # the new model and system prompt.
+        if self._session is not None:
+            if self._store and self._session.session_id:
+                await self._store.update_session(
+                    self._session.session_id, is_active=False,
+                )
+            self._session = None
+
         await self._initialize_session()
 
     async def _initialize_session(self) -> None:
@@ -531,8 +541,9 @@ class LoomApp(App):
     # User input
     # ------------------------------------------------------------------
 
-    @on(Input.Submitted)
+    @on(Input.Submitted, "#user-input")
     async def on_user_submit(self, event: Input.Submitted) -> None:
+        # P0-2: Only handle submissions from the main chat input
         text = event.value.strip()
         if not text:
             return

@@ -105,8 +105,20 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         self._model_name: str = ""
         self._api_key: str = ""
         self._roles: list[str] = []
-        self._models: list[dict] = []
+        # P0-3: Explicit primary/utility drafts instead of append-only list
+        self._primary_model: dict | None = None
+        self._utility_model: dict | None = None
         self._adding_utility: bool = False
+
+    @property
+    def _models(self) -> list[dict]:
+        """Build the models list from the primary/utility drafts."""
+        result = []
+        if self._primary_model is not None:
+            result.append(self._primary_model)
+        if self._utility_model is not None:
+            result.append(self._utility_model)
+        return result
 
     def compose(self) -> ComposeResult:
         with Vertical(id="setup-dialog"):
@@ -249,12 +261,28 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             except Exception:
                 pass
 
-        # Focus the first input on the details step
+        # P0-1: Disable/enable inputs based on current step to prevent
+        # hidden inputs from swallowing keypresses.
         if step == _STEP_DETAILS:
             self._configure_details_step()
         else:
-            # Clear focus so Input widgets don't swallow digit keys
+            self._disable_all_inputs()
             self.set_focus(None)
+
+    def _disable_all_inputs(self) -> None:
+        """Disable all setup inputs so they cannot capture focus or keys."""
+        for input_id in ("input-url", "input-model", "input-apikey"):
+            try:
+                inp = self.query_one(f"#{input_id}", Input)
+                inp.disabled = True
+            except Exception:
+                pass
+
+    def _enable_input(self, input_id: str) -> Input:
+        """Enable a specific input widget and return it."""
+        inp = self.query_one(f"#{input_id}", Input)
+        inp.disabled = False
+        return inp
 
     def _configure_details_step(self) -> None:
         """Show/hide detail fields based on selected provider."""
@@ -274,9 +302,12 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             self.query_one(f"#lbl-anthropic-{i}").display = is_anthropic
         self.query_one("#lbl-anthropic-hint").display = is_anthropic
 
+        # P0-1: Start with all inputs disabled, then selectively enable
+        self._disable_all_inputs()
+
         # URL input
         self.query_one("#lbl-url").display = True
-        url_input = self.query_one("#input-url", Input)
+        url_input = self._enable_input("input-url")
         url_input.display = True
         url_input.value = default_url
 
@@ -285,6 +316,8 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         model_input = self.query_one("#input-model", Input)
         model_input.display = not is_anthropic
         model_input.value = ""
+        if not is_anthropic:
+            model_input.disabled = False
 
         # API key
         needs_key = is_anthropic
@@ -292,11 +325,13 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         apikey_input = self.query_one("#input-apikey", Input)
         apikey_input.display = needs_key or is_openai
         apikey_input.value = ""
+        if needs_key or is_openai:
+            apikey_input.disabled = False
 
         # Focus the right field
         if is_anthropic:
-            # Wait for anthropic model number key
-            pass
+            # Wait for anthropic model number key — don't focus any input yet
+            self.set_focus(None)
         else:
             url_input.focus()
 
@@ -305,11 +340,11 @@ class SetupScreen(ModalScreen[list[dict] | None]):
     # ------------------------------------------------------------------
 
     def on_key(self, event) -> None:
-        key = event.character
+        # P2-9: Use event.key for normalized key names
+        key = event.key
 
         if (
             self._step == _STEP_PROVIDER
-            and key
             and key.isdigit()
             and 1 <= int(key) <= len(PROVIDERS)
         ):
@@ -321,7 +356,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             event.stop()
 
         elif self._step == _STEP_DETAILS and self._provider_key == "anthropic":
-            if key and key.isdigit():
+            if key.isdigit():
                 num = int(key)
                 if 1 <= num <= len(ANTHROPIC_MODELS):
                     self._model_name = ANTHROPIC_MODELS[num - 1]
@@ -353,7 +388,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             event.prevent_default()
             event.stop()
 
-        elif self._step == _STEP_CONFIRM and event.key == "enter":
+        elif self._step == _STEP_CONFIRM and key == "enter":
             self._save_and_dismiss()
             event.prevent_default()
             event.stop()
@@ -370,6 +405,9 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         """Handle Enter in input fields — advance to next field or step."""
         if self._step != _STEP_DETAILS:
             return
+
+        # Stop the event from bubbling to the app-level handler
+        event.stop()
 
         input_id = event.input.id
 
@@ -434,12 +472,13 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             "max_tokens": 2048 if self._adding_utility else 4096,
             "temperature": 0.0 if self._adding_utility else 0.1,
         }
-        self._models.append(model)
 
+        # P0-3: Replace draft instead of appending
         if self._adding_utility:
-            # Done collecting, go to confirm
+            self._utility_model = model
             self._prepare_confirm()
         else:
+            self._primary_model = model
             # Check if all roles covered
             missing = set(ROLE_PRESETS["all"]) - set(self._roles)
             if missing:
@@ -453,8 +492,21 @@ class SetupScreen(ModalScreen[list[dict] | None]):
 
     def _prepare_confirm(self) -> None:
         """Build confirmation summary and show confirm step."""
+        models = self._models
+
+        # P0-4: Validate that at least one model has executor role
+        has_executor = any("executor" in m["roles"] for m in models)
+        if not has_executor:
+            self.notify(
+                "At least one model must have the executor role.",
+                severity="error",
+            )
+            # Go back to roles step to fix
+            self._step = _STEP_ROLES
+            return
+
         lines = []
-        for m in self._models:
+        for m in models:
             roles_str = ", ".join(m["roles"])
             lines.append(
                 f"  {m['name']}: {m['model']} ({m['provider']})"
@@ -468,7 +520,23 @@ class SetupScreen(ModalScreen[list[dict] | None]):
 
     def _save_and_dismiss(self) -> None:
         """Write config and dismiss with the model list."""
-        toml_content = _generate_toml(self._models)
+        models = self._models
+
+        # Final validation: ensure unique model names and executor coverage
+        names = [m["name"] for m in models]
+        if len(names) != len(set(names)):
+            self.notify("Duplicate model names detected.", severity="error")
+            return
+
+        has_executor = any("executor" in m["roles"] for m in models)
+        if not has_executor:
+            self.notify(
+                "At least one model must have the executor role.",
+                severity="error",
+            )
+            return
+
+        toml_content = _generate_toml(models)
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(toml_content)
 
@@ -477,7 +545,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         (CONFIG_DIR / "logs").mkdir(parents=True, exist_ok=True)
         (CONFIG_DIR / "processes").mkdir(parents=True, exist_ok=True)
 
-        self.dismiss(self._models)
+        self.dismiss(models)
 
     def action_back_or_cancel(self) -> None:
         """Go back one step or cancel if on the first step."""
@@ -488,21 +556,23 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         elif self._step == _STEP_ROLES:
             self._step = _STEP_DETAILS
         elif self._step == _STEP_UTILITY:
+            # P0-3: Going back from utility clears the primary draft
+            # so re-selection replaces rather than duplicates
             self._step = _STEP_ROLES
         elif self._step == _STEP_CONFIRM:
-            # If we had a utility prompt, go back there
-            if len(self._models) > 1:
-                self._models.pop()  # remove utility
+            if self._utility_model is not None:
+                # Go back to utility prompt, clear utility draft
+                self._utility_model = None
                 self._adding_utility = False
                 self._step = _STEP_UTILITY
-            elif len(self._models) == 1:
+            elif self._primary_model is not None:
                 missing = set(ROLE_PRESETS["all"]) - set(
-                    self._models[0]["roles"]
+                    self._primary_model["roles"]
                 )
                 if missing:
                     self._step = _STEP_UTILITY
                 else:
-                    self._models.pop()
+                    self._primary_model = None
                     self._step = _STEP_ROLES
             else:
                 self._step = _STEP_ROLES

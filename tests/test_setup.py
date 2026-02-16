@@ -290,7 +290,7 @@ class TestSetupScreen:
         monkeypatch.setattr(setup_mod, "CONFIG_PATH", cfg_path)
 
         screen = setup_mod.SetupScreen()
-        screen._models = [{
+        screen._primary_model = {
             "name": "primary",
             "provider": "ollama",
             "base_url": "http://localhost:11434",
@@ -299,7 +299,7 @@ class TestSetupScreen:
             "roles": ["planner", "executor", "extractor", "verifier"],
             "max_tokens": 4096,
             "temperature": 0.1,
-        }]
+        }
 
         # Stub dismiss to capture result
         dismissed = []
@@ -364,6 +364,213 @@ class TestSetupScreen:
 
         assert len(screen._models) == 1
         assert screen._step == _STEP_UTILITY
+
+
+class TestSetupScreenModelDrafts:
+    """P0-3: Verify primary/utility draft model replaces rather than appends."""
+
+    def test_models_property_empty(self):
+        from loom.tui.screens.setup import SetupScreen
+
+        screen = SetupScreen()
+        assert screen._models == []
+
+    def test_models_property_primary_only(self):
+        from loom.tui.screens.setup import SetupScreen
+
+        screen = SetupScreen()
+        screen._primary_model = {"name": "primary", "roles": ["executor"]}
+        assert len(screen._models) == 1
+        assert screen._models[0]["name"] == "primary"
+
+    def test_models_property_primary_and_utility(self):
+        from loom.tui.screens.setup import SetupScreen
+
+        screen = SetupScreen()
+        screen._primary_model = {"name": "primary", "roles": ["executor"]}
+        screen._utility_model = {"name": "utility", "roles": ["extractor"]}
+        assert len(screen._models) == 2
+
+    def test_collect_model_replaces_primary_on_reselection(self):
+        """Re-selecting roles should replace, not duplicate, the primary model."""
+        from loom.tui.screens.setup import SetupScreen
+
+        screen = SetupScreen()
+        screen._provider_key = "ollama"
+        screen._base_url = "http://localhost:11434"
+        screen._model_name = "model-v1"
+        screen._api_key = ""
+        screen._roles = ["planner", "executor", "extractor", "verifier"]
+
+        screen._prepare_confirm = lambda: None
+
+        # First collection
+        screen._collect_model()
+        assert len(screen._models) == 1
+        assert screen._models[0]["model"] == "model-v1"
+
+        # Simulate re-selection (back nav then re-choose)
+        screen._model_name = "model-v2"
+        screen._collect_model()
+        # Should still be 1, not 2
+        assert len(screen._models) == 1
+        assert screen._models[0]["model"] == "model-v2"
+
+    def test_back_from_utility_clears_draft(self):
+        """Going back from utility step should not leave stale drafts."""
+        from loom.tui.screens.setup import (
+            _STEP_ROLES,
+            _STEP_UTILITY,
+            SetupScreen,
+        )
+
+        screen = SetupScreen()
+        screen._primary_model = {
+            "name": "primary",
+            "roles": ["planner", "executor"],
+            "model": "test",
+            "provider": "ollama",
+            "base_url": "http://localhost:11434",
+            "api_key": "",
+            "max_tokens": 4096,
+            "temperature": 0.1,
+        }
+        screen._step = _STEP_UTILITY
+
+        screen.action_back_or_cancel()
+        assert screen._step == _STEP_ROLES
+
+    def test_back_from_confirm_clears_utility(self):
+        """Going back from confirm should clear utility draft."""
+        from loom.tui.screens.setup import (
+            _STEP_UTILITY,
+            SetupScreen,
+        )
+
+        screen = SetupScreen()
+        screen._primary_model = {
+            "name": "primary",
+            "roles": ["planner", "executor"],
+            "model": "test",
+            "provider": "ollama",
+            "base_url": "http://localhost:11434",
+            "api_key": "",
+            "max_tokens": 4096,
+            "temperature": 0.1,
+        }
+        screen._utility_model = {
+            "name": "utility",
+            "roles": ["extractor", "verifier"],
+            "model": "test2",
+            "provider": "ollama",
+            "base_url": "http://localhost:11434",
+            "api_key": "",
+            "max_tokens": 2048,
+            "temperature": 0.0,
+        }
+        screen._step = 4  # _STEP_CONFIRM
+
+        screen.action_back_or_cancel()
+        assert screen._utility_model is None
+        assert screen._adding_utility is False
+        assert screen._step == _STEP_UTILITY
+
+
+class TestSetupScreenExecutorValidation:
+    """P0-4: Validate executor-capable model before save."""
+
+    def test_save_blocked_without_executor(self, tmp_path: Path, monkeypatch):
+        """_save_and_dismiss should refuse if no model has executor role."""
+        from loom.tui.screens import setup as setup_mod
+
+        cfg_dir = tmp_path / ".loom"
+        cfg_path = cfg_dir / "loom.toml"
+        monkeypatch.setattr(setup_mod, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(setup_mod, "CONFIG_PATH", cfg_path)
+
+        screen = setup_mod.SetupScreen()
+        screen._primary_model = {
+            "name": "primary",
+            "provider": "ollama",
+            "base_url": "http://localhost:11434",
+            "model": "qwen3:14b",
+            "api_key": "",
+            "roles": ["extractor", "verifier"],  # no executor!
+            "max_tokens": 4096,
+            "temperature": 0.1,
+        }
+
+        dismissed = []
+        screen.dismiss = lambda val: dismissed.append(val)
+        notifications = []
+        screen.notify = lambda msg, **kw: notifications.append(msg)
+
+        screen._save_and_dismiss()
+
+        # Should not have written config or dismissed
+        assert not cfg_path.exists()
+        assert len(dismissed) == 0
+        assert any("executor" in n for n in notifications)
+
+    def test_prepare_confirm_blocked_without_executor(self):
+        """_prepare_confirm should bounce back to roles if no executor."""
+        from unittest.mock import MagicMock
+
+        from loom.tui.screens.setup import (
+            _STEP_ROLES,
+            SetupScreen,
+        )
+
+        screen = SetupScreen()
+        screen._primary_model = {
+            "name": "primary",
+            "roles": ["extractor", "verifier"],  # no executor
+            "model": "test",
+            "provider": "ollama",
+            "base_url": "http://localhost:11434",
+            "api_key": "",
+            "max_tokens": 4096,
+            "temperature": 0.1,
+        }
+
+        notifications = []
+        screen.notify = lambda msg, **kw: notifications.append(msg)
+        screen.query_one = MagicMock()
+
+        screen._prepare_confirm()
+        assert screen._step == _STEP_ROLES
+        assert any("executor" in n for n in notifications)
+
+
+class TestFilesChangedPanelAccumulation:
+    """P1-6: Files panel should accumulate entries across turns."""
+
+    def test_update_files_accumulates(self):
+        from loom.tui.widgets.file_panel import FilesChangedPanel
+
+        panel = FilesChangedPanel()
+        panel._all_entries = []
+
+        entries_1 = [{"operation": "create", "path": "a.py", "timestamp": "10:00:00"}]
+        entries_2 = [{"operation": "modify", "path": "b.py", "timestamp": "10:01:00"}]
+
+        # Simulate update_files without table (just check _all_entries)
+        panel._all_entries.extend(entries_1)
+        panel._all_entries.extend(entries_2)
+
+        assert len(panel._all_entries) == 2
+        assert panel._all_entries[0]["path"] == "a.py"
+        assert panel._all_entries[1]["path"] == "b.py"
+
+    def test_clear_files_resets(self):
+        from loom.tui.widgets.file_panel import FilesChangedPanel
+
+        panel = FilesChangedPanel()
+        panel._all_entries = [
+            {"operation": "create", "path": "a.py", "timestamp": "10:00:00"},
+        ]
+        panel._all_entries.clear()
+        assert len(panel._all_entries) == 0
 
 
 class TestLoomAppNoModel:

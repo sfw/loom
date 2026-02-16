@@ -30,6 +30,11 @@ class FilesChangedPanel(Vertical):
     }
     """
 
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # P1-6: Cumulative file change history across all turns
+        self._all_entries: list[dict] = []
+
     def compose(self) -> ComposeResult:
         table = DataTable(id="files-table")
         table.add_columns("Status", "File", "Time")
@@ -38,10 +43,21 @@ class FilesChangedPanel(Vertical):
         yield Static("", id="diff-viewer")
 
     def update_files(self, entries: list[dict]) -> None:
-        """Refresh the file table with changelog entries.
+        """Append new file change entries and refresh the table.
 
         Each entry should have: operation, path, timestamp
         """
+        # P1-6: Accumulate entries across turns instead of replacing
+        self._all_entries.extend(entries)
+        self._refresh_table()
+
+    def clear_files(self) -> None:
+        """Clear all accumulated file entries (e.g. on new session)."""
+        self._all_entries.clear()
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        """Rebuild the table from accumulated entries."""
         table = self.query_one("#files-table", DataTable)
         table.clear()
 
@@ -52,7 +68,7 @@ class FilesChangedPanel(Vertical):
             "rename": "#7dcfff",
         }
 
-        for entry in entries:
+        for entry in self._all_entries:
             op = entry.get("operation", "?")
             path = entry.get("path", "?")
             ts = entry.get("timestamp", "")
