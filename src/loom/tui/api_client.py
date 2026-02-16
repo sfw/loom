@@ -149,15 +149,3 @@ class LoomAPIClient:
         r.raise_for_status()
         return r.json()
 
-    async def stream_all_events(self) -> AsyncIterator[dict]:
-        """Subscribe to global SSE event stream (all tasks)."""
-        client = await self._get_client()
-        async with client.stream("GET", "/events/stream") as response:
-            async for line in response.aiter_lines():
-                if not line.strip() or line.startswith(":"):
-                    continue
-                if line.startswith("data: "):
-                    try:
-                        yield json.loads(line[6:])
-                    except json.JSONDecodeError:
-                        continue

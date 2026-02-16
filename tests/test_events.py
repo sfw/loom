@@ -189,3 +189,22 @@ class TestEventBus:
         asyncio.run(run())
         assert len(sync_received) == 1
         assert len(async_received) == 1
+
+    def test_async_callable_object_handler(self):
+        """A callable with async __call__ should be dispatched as coroutine."""
+        bus = EventBus()
+        received = []
+
+        class AsyncCallable:
+            async def __call__(self, event: Event):
+                received.append(event)
+
+        handler = AsyncCallable()
+        bus.subscribe("test", handler)
+
+        async def run():
+            bus.emit(Event(event_type="test", task_id="t1"))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(run())
+        assert len(received) == 1

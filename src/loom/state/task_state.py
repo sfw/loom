@@ -231,13 +231,26 @@ class TaskStateManager:
                 entry["resolution"] = e.resolution
             errors_data.append(entry)
 
+        task_dict: dict = {
+            "id": task.id,
+            "goal": task.goal,
+            "status": task.status.value,
+            "workspace": task.workspace,
+            "approval_mode": task.approval_mode,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+        }
+        if task.callback_url:
+            task_dict["callback_url"] = task.callback_url
+        if task.context:
+            task_dict["context"] = task.context
+        if task.metadata:
+            task_dict["metadata"] = task.metadata
+        if task.completed_at:
+            task_dict["completed_at"] = task.completed_at
+
         result = {
-            "task": {
-                "id": task.id,
-                "goal": task.goal,
-                "status": task.status.value,
-                "workspace": task.workspace,
-            },
+            "task": task_dict,
             "plan": {
                 "version": task.plan.version,
                 "last_replanned": task.plan.last_replanned,
@@ -301,6 +314,13 @@ class TaskStateManager:
             goal=task_data.get("goal", ""),
             status=TaskStatus(task_data.get("status", "pending")),
             workspace=task_data.get("workspace", ""),
+            approval_mode=task_data.get("approval_mode", "auto"),
+            callback_url=task_data.get("callback_url", ""),
+            context=task_data.get("context", {}),
+            metadata=task_data.get("metadata", {}),
+            created_at=task_data.get("created_at", ""),
+            updated_at=task_data.get("updated_at", ""),
+            completed_at=task_data.get("completed_at", ""),
             plan=Plan(
                 subtasks=subtasks,
                 version=plan_data.get("version", 1),

@@ -142,12 +142,8 @@ def _init_persistence(config: Config):
     from loom.state.memory import Database
 
     try:
-        if hasattr(config, "workspace"):
-            data_dir = Path(config.workspace.scratch_dir).expanduser()
-        else:
-            data_dir = Path.home() / ".loom"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = data_dir / "loom.db"
+        db_path = Path(config.memory.database_path).expanduser()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         db = Database(db_path)
 
         # Run async init synchronously — each aiosqlite call opens its
@@ -354,7 +350,7 @@ async def _cancel_task(server_url: str, task_id: str) -> None:
 
     try:
         async with httpx.AsyncClient(base_url=server_url) as client:
-            response = await client.post(f"/tasks/{task_id}/cancel")
+            response = await client.delete(f"/tasks/{task_id}")
             if response.status_code == 404:
                 click.echo(f"Task not found: {task_id}", err=True)
                 sys.exit(1)

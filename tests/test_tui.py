@@ -342,12 +342,12 @@ class TestInitPersistence:
     def test_returns_none_on_db_error(self, tmp_path):
         """If the db path is unwritable, return (None, None)."""
         from loom.__main__ import _init_persistence
-        from loom.config import Config, WorkspaceConfig
+        from loom.config import Config, MemoryConfig
 
-        # Point scratch_dir at a path that won't exist
+        # Point database_path at a path with a null byte (invalid)
         cfg = Config(
-            workspace=WorkspaceConfig(
-                scratch_dir=str(tmp_path / "no" / "such" / "parent" / "\0invalid"),
+            memory=MemoryConfig(
+                database_path=str(tmp_path / "no" / "such" / "parent" / "\0invalid" / "loom.db"),
             ),
         )
         db, store = _init_persistence(cfg)
@@ -357,10 +357,10 @@ class TestInitPersistence:
     def test_returns_valid_on_success(self, tmp_path):
         """Sanity: happy path still works."""
         from loom.__main__ import _init_persistence
-        from loom.config import Config, WorkspaceConfig
+        from loom.config import Config, MemoryConfig
 
         cfg = Config(
-            workspace=WorkspaceConfig(scratch_dir=str(tmp_path / "scratch")),
+            memory=MemoryConfig(database_path=str(tmp_path / "loom.db")),
         )
         db, store = _init_persistence(cfg)
         assert db is not None

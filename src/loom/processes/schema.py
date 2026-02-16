@@ -250,11 +250,14 @@ class ProcessLoader:
         return self._load_from_path(available[name_or_path])
 
     def list_available(self) -> list[dict[str, str]]:
-        """List all available processes with metadata."""
+        """List all available processes with metadata.
+
+        Only parses YAML for metadata — does NOT import bundled tools.
+        """
         result = []
         for name, path in sorted(self.discover().items()):
             try:
-                defn = self._load_from_path(path)
+                defn = self._load_metadata_only(path)
                 result.append({
                     "name": defn.name,
                     "version": defn.version,
@@ -274,6 +277,22 @@ class ProcessLoader:
         return result
 
     # --- Internal ---
+
+    def _load_metadata_only(self, path: Path) -> ProcessDefinition:
+        """Parse a process definition for metadata only (no bundled tool imports)."""
+        if path.is_dir():
+            yaml_path = path / "process.yaml"
+            if not yaml_path.exists():
+                raise ProcessValidationError(
+                    ["Package directory missing process.yaml"],
+                    path,
+                )
+            defn = self._parse(yaml_path)
+            defn.package_dir = path
+            # Deliberately skip _register_bundled_tools
+            return defn
+        else:
+            return self._parse(path)
 
     def _load_from_path(self, path: Path) -> ProcessDefinition:
         """Load from a YAML file or package directory."""

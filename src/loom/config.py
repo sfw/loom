@@ -248,6 +248,7 @@ def load_config(path: Path | None = None) -> Config:
         auto_approve_confidence_threshold=exec_data.get(
             "auto_approve_confidence_threshold", 0.8
         ),
+        enable_streaming=exec_data.get("enable_streaming", False),
     )
 
     verif_data = raw.get("verification", {})

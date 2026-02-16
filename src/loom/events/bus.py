@@ -7,6 +7,7 @@ orchestrator and consumed by the API (SSE), logger, and other listeners.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import uuid
 from collections import defaultdict
@@ -86,14 +87,18 @@ class EventBus:
         all_handlers = list(self._global_handlers) + list(self._handlers.get(event.event_type, []))
 
         for handler in all_handlers:
-            if asyncio.iscoroutinefunction(handler):
+            is_async = inspect.iscoroutinefunction(handler) or (
+                callable(handler)
+                and inspect.iscoroutinefunction(getattr(handler, "__call__", None))
+            )
+            if is_async:
                 try:
                     loop = asyncio.get_running_loop()
                     loop.create_task(handler(event))
                 except RuntimeError:
                     logger.debug(
                         "Skipped async handler %s: no running event loop",
-                        handler.__name__,
+                        getattr(handler, "__name__", handler),
                     )
             else:
                 try:

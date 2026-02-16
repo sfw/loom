@@ -47,7 +47,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     # CORS — local only for V1
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:*", "http://127.0.0.1:*"],
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
         allow_methods=["*"],
         allow_headers=["*"],
     )

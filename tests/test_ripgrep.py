@@ -101,3 +101,13 @@ class TestRipgrepSearch:
         assert result.success
         # Should include context around matches
         assert result.output.strip()
+
+    async def test_relative_path_with_workspace(self, tool, workspace):
+        """Relative path='src' should resolve against workspace."""
+        ctx = ToolContext(workspace=workspace)
+        result = await tool.execute({
+            "pattern": "def",
+            "path": "src",
+        }, ctx)
+        assert result.success
+        assert "def" in result.output

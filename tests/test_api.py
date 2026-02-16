@@ -385,3 +385,74 @@ class TestMemoryEndpoints:
         response = await client.get("/memory/search?q=test")
         assert response.status_code == 200
         assert response.json() == []
+
+
+# --- Split-brain fix: create -> list consistency ---
+
+
+class TestTaskListAfterCreate:
+    @pytest.mark.asyncio
+    async def test_create_then_list_shows_task(self, client, database):
+        """Verify that after POST /tasks, GET /tasks returns the new task."""
+        response = await client.post("/tasks", json={
+            "goal": "Integration test goal",
+        })
+        assert response.status_code == 201
+        task_id = response.json()["task_id"]
+
+        list_response = await client.get("/tasks")
+        assert list_response.status_code == 200
+        tasks = list_response.json()
+        task_ids = [t["task_id"] for t in tasks]
+        assert task_id in task_ids
+
+    @pytest.mark.asyncio
+    async def test_create_then_list_status_transitions(self, client, database):
+        """Verify task appears with correct initial status in /tasks list."""
+        response = await client.post("/tasks", json={"goal": "Status test"})
+        assert response.status_code == 201
+        task_id = response.json()["task_id"]
+
+        list_response = await client.get("/tasks?status=pending")
+        assert list_response.status_code == 200
+        tasks = list_response.json()
+        task_ids = [t["task_id"] for t in tasks]
+        assert task_id in task_ids
+
+
+# --- CLI cancel uses DELETE ---
+
+
+class TestCancelUsesDelete:
+    @pytest.mark.asyncio
+    async def test_cancel_via_delete(self, client, state_manager, mock_orchestrator):
+        """Verify cancel endpoint is DELETE /tasks/{id}."""
+        _make_task(state_manager, status=TaskStatus.EXECUTING)
+        response = await client.delete("/tasks/test-1")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        mock_orchestrator.cancel_task.assert_called_once()
+
+
+# --- Process field in task creation ---
+
+
+class TestProcessField:
+    @pytest.mark.asyncio
+    async def test_create_task_with_invalid_process(self, client, tmp_path):
+        """Submitting an unknown process name returns 400."""
+        response = await client.post("/tasks", json={
+            "goal": "Test",
+            "workspace": str(tmp_path),
+            "process": "nonexistent-process-xyz",
+        })
+        assert response.status_code == 400
+        assert "not found" in response.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_task_without_process(self, client):
+        """Creating a task without process still works."""
+        response = await client.post("/tasks", json={
+            "goal": "No process",
+        })
+        assert response.status_code == 201

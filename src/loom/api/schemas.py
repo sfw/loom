@@ -14,6 +14,7 @@ class TaskCreateRequest(BaseModel):
     approval_mode: str = "auto"
     callback_url: str | None = None
     metadata: dict = Field(default_factory=dict)
+    process: str | None = None
 
 
 class TaskSteerRequest(BaseModel):

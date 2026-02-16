@@ -6,7 +6,9 @@ timeout, max response size, and URL validation.
 
 from __future__ import annotations
 
+import ipaddress
 import re
+import socket
 
 import httpx
 
@@ -21,6 +23,22 @@ _BLOCKED_HOSTS = re.compile(
 
 MAX_RESPONSE_SIZE = 512 * 1024  # 512KB
 FETCH_TIMEOUT = 30.0
+
+
+def _is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address belongs to a private/reserved range."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr.is_reserved
+            or addr.is_unspecified
+        )
+    except ValueError:
+        return False
 
 
 def is_safe_url(url: str) -> tuple[bool, str]:
@@ -38,6 +56,17 @@ def is_safe_url(url: str) -> tuple[bool, str]:
 
     if _BLOCKED_HOSTS.match(host):
         return False, f"Blocked host: {host} (private/internal network)"
+
+    # Resolve hostname and check resolved IPs against private ranges
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for _family, _type, _proto, _canonname, sockaddr in infos:
+            ip_str = sockaddr[0]
+            if _is_private_ip(ip_str):
+                return False, f"Blocked host: {host} resolves to private address {ip_str}"
+    except socket.gaierror:
+        # DNS resolution failed — allow the request to proceed and fail naturally
+        pass
 
     return True, ""
 
