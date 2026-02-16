@@ -214,6 +214,75 @@ class TestLearningManager:
         assert len(patterns_after) == 0
 
     @pytest.mark.asyncio
+    async def test_delete_pattern(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        mgr = LearningManager(db)
+
+        await mgr.store_or_update(LearnedPattern(
+            pattern_type="behavioral_gap",
+            pattern_key="test-delete",
+            data={"description": "Delete me"},
+        ))
+        patterns = await mgr.query_patterns(pattern_key="test-delete")
+        assert len(patterns) == 1
+        pid = patterns[0].id
+
+        deleted = await mgr.delete_pattern(pid)
+        assert deleted is True
+
+        patterns = await mgr.query_patterns(pattern_key="test-delete")
+        assert len(patterns) == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_pattern_not_found(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        mgr = LearningManager(db)
+
+        deleted = await mgr.delete_pattern(9999)
+        assert deleted is False
+
+    @pytest.mark.asyncio
+    async def test_query_all(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        mgr = LearningManager(db)
+
+        await mgr.store_or_update(LearnedPattern(
+            pattern_type="behavioral_gap",
+            pattern_key="gap-1",
+            data={"description": "Gap one"},
+        ))
+        await mgr.store_or_update(LearnedPattern(
+            pattern_type="subtask_success",
+            pattern_key="op-1",
+            data={"success": True},
+        ))
+
+        all_patterns = await mgr.query_all()
+        assert len(all_patterns) == 2
+        types = {p.pattern_type for p in all_patterns}
+        assert "behavioral_gap" in types
+        assert "subtask_success" in types
+
+    @pytest.mark.asyncio
+    async def test_query_all_respects_limit(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        mgr = LearningManager(db)
+
+        for i in range(10):
+            await mgr.store_or_update(LearnedPattern(
+                pattern_type="behavioral_gap",
+                pattern_key=f"gap-{i}",
+                data={"description": f"Gap {i}"},
+            ))
+
+        all_patterns = await mgr.query_all(limit=3)
+        assert len(all_patterns) == 3
+
+    @pytest.mark.asyncio
     async def test_subtask_type_key(self):
         assert LearningManager._subtask_type_key("install-deps") == "install-deps"
 

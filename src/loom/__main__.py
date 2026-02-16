@@ -560,6 +560,79 @@ def uninstall(
         sys.exit(1)
 
 
+@cli.command()
+@click.option(
+    "--type", "pattern_type", default=None,
+    help="Filter by pattern type (e.g., behavioral_gap, behavioral_correction).",
+)
+@click.option(
+    "--delete", "delete_id", type=int, default=None,
+    help="Delete a pattern by ID.",
+)
+@click.option(
+    "--limit", default=30, show_default=True,
+    help="Max number of patterns to show.",
+)
+@click.pass_context
+def learned(
+    ctx: click.Context,
+    pattern_type: str | None,
+    delete_id: int | None,
+    limit: int,
+) -> None:
+    """Review learned patterns.
+
+    Lists all patterns the learning system has extracted from your
+    interactions.  Use --delete ID to remove a specific pattern.
+
+    \b
+    Examples:
+      loom learned                              # list all
+      loom learned --type behavioral_gap        # filter by type
+      loom learned --delete 5                   # delete pattern #5
+    """
+    from loom.learning.manager import LearningManager
+    from loom.state.memory import Database
+
+    config = ctx.obj["config"]
+
+    async def _run():
+        db = Database(str(Path(config.memory.database_path).expanduser()))
+        await db.initialize()
+        mgr = LearningManager(db)
+
+        if delete_id is not None:
+            deleted = await mgr.delete_pattern(delete_id)
+            if deleted:
+                click.echo(f"Deleted pattern {delete_id}.")
+            else:
+                click.echo(f"Pattern {delete_id} not found.", err=True)
+            return
+
+        if pattern_type:
+            patterns = await mgr.query_patterns(
+                pattern_type=pattern_type, limit=limit,
+            )
+        else:
+            patterns = await mgr.query_all(limit=limit)
+
+        if not patterns:
+            click.echo("No learned patterns.")
+            return
+
+        click.echo(f"{'ID':>4}  {'Type':<24} {'Freq':>4}  {'Last Seen':<12} Description")
+        click.echo("-" * 80)
+        for p in patterns:
+            desc = p.data.get("description", p.pattern_key)[:40]
+            ptype = p.pattern_type
+            last = p.last_seen[:10] if p.last_seen else ""
+            click.echo(f"{p.id:>4}  {ptype:<24} {p.frequency:>4}  {last:<12} {desc}")
+
+        click.echo(f"\n{len(patterns)} pattern(s). Use --delete ID to remove one.")
+
+    asyncio.run(_run())
+
+
 @cli.command(name="reset-learning")
 @click.confirmation_option(prompt="Are you sure you want to clear all learned patterns?")
 @click.pass_context

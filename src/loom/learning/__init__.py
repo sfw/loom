@@ -1,1 +1,1 @@
-"""Learning system: pattern extraction and template matching."""
+"""Learning system: pattern extraction, template matching, and behavioral adaptation."""
