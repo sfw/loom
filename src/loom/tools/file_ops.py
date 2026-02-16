@@ -11,6 +11,7 @@ from loom.content import (
     ImageBlock,
 )
 from loom.content_utils import extract_docx_text, extract_pptx_text, get_image_dimensions
+from loom.tools.code_analysis import detect_language
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg"})
@@ -572,9 +573,11 @@ class EditFileTool(Tool):
         applied = []
         fuzzy_used = []
 
+        language = detect_language(rel_path)
+
         for i, (old_str, new_str) in enumerate(edit_pairs):
             label = f"edit[{i}]" if len(edit_pairs) > 1 else ""
-            result = self._apply_single_edit(content, old_str, new_str, rel_path, label)
+            result = self._apply_single_edit(content, old_str, new_str, rel_path, label, language)
 
             if isinstance(result, ToolResult):
                 # Failed — don't write anything
@@ -623,6 +626,7 @@ class EditFileTool(Tool):
         new_str: str,
         rel_path: str,
         label: str,
+        language: str = "unknown",
     ) -> tuple[str, bool] | ToolResult:
         """Apply a single old_str->new_str edit, falling back to fuzzy match.
 
@@ -640,8 +644,8 @@ class EditFileTool(Tool):
                 "Provide more surrounding context to make it unique."
             )
 
-        # --- Fuzzy match attempt ---
-        match = self._fuzzy_find(content, old_str)
+        # --- Fuzzy match attempt (structural + sliding window) ---
+        match = self._fuzzy_find(content, old_str, language)
         if match is not None:
             matched_text, start, end = match
             return content[:start] + new_str + content[end:], True
@@ -653,14 +657,87 @@ class EditFileTool(Tool):
         )
 
     def _fuzzy_find(
-        self, content: str, old_str: str
+        self, content: str, old_str: str, language: str = "unknown"
     ) -> tuple[str, int, int] | None:
         """Find old_str in content using whitespace-normalized fuzzy matching.
+
+        When tree-sitter is available and *language* is supported, structural
+        candidates (function/class boundaries) are tried first to narrow the
+        search space.  Falls back to a full sliding-window scan.
 
         Returns (matched_text, start_index, end_index) or None.
         Only matches if the best candidate is unambiguously better than
         any runner-up (or the only match above threshold).
         """
+        # Try structural matching first when tree-sitter is available
+        structural_result = self._structural_fuzzy_find(content, old_str, language)
+        if structural_result is not None:
+            return structural_result
+
+        # Full sliding-window fallback
+        return self._sliding_window_fuzzy_find(content, old_str)
+
+    def _structural_fuzzy_find(
+        self, content: str, old_str: str, language: str
+    ) -> tuple[str, int, int] | None:
+        """Try fuzzy matching anchored to structural (tree-sitter) nodes."""
+        from loom.tools.treesitter import find_structural_candidates, is_available
+
+        if not is_available() or language == "unknown":
+            return None
+
+        candidates = find_structural_candidates(content, language)
+        if not candidates:
+            return None
+
+        old_lines = old_str.splitlines()
+        if not old_lines:
+            return None
+
+        n = len(old_lines)
+        best_ratio = 0.0
+        second_ratio = 0.0
+        best_line_range: tuple[int, int] | None = None
+
+        content_lines = content.splitlines()
+        line_starts = _line_start_offsets(content)
+
+        for start_byte, end_byte in candidates:
+            # Convert byte offsets to line numbers
+            start_line = _byte_to_line(line_starts, start_byte)
+            end_line = _byte_to_line(line_starts, end_byte)
+            # Ensure we have enough lines in this candidate region
+            region_lines = content_lines[start_line:end_line + 1]
+            if len(region_lines) < n:
+                continue
+
+            # Slide window within this structural region
+            for offset in range(len(region_lines) - n + 1):
+                candidate = region_lines[offset:offset + n]
+                ratio = _line_similarity(old_lines, candidate)
+                if ratio > best_ratio:
+                    second_ratio = best_ratio
+                    best_ratio = ratio
+                    abs_start = start_line + offset
+                    best_line_range = (abs_start, abs_start + n)
+                elif ratio > second_ratio:
+                    second_ratio = ratio
+
+        if best_ratio < self.FUZZY_THRESHOLD or best_line_range is None:
+            return None
+
+        # Reject ambiguous matches
+        if second_ratio >= self.FUZZY_THRESHOLD and (best_ratio - second_ratio) < 0.05:
+            return None
+
+        return self._line_range_to_match(
+            content, content_lines, line_starts, best_line_range, old_str
+        )
+
+    def _sliding_window_fuzzy_find(
+        self, content: str, old_str: str
+    ) -> tuple[str, int, int] | None:
+        """Original sliding-window fuzzy matching over the full file."""
         old_lines = old_str.splitlines()
         content_lines = content.splitlines()
 
@@ -690,14 +767,23 @@ class EditFileTool(Tool):
         if second_ratio >= self.FUZZY_THRESHOLD and (best_ratio - second_ratio) < 0.05:
             return None
 
-        # Find the character range by searching for the exact line boundaries
-        # in the original content.  This handles \r\n, \r, and \n correctly
-        # because we locate lines by walking the raw content string.
         line_starts = _line_start_offsets(content)
-        char_start = line_starts[best_range[0]]
+        return self._line_range_to_match(
+            content, content_lines, line_starts, best_range, old_str
+        )
 
-        end_line = best_range[1] - 1  # last matched line (inclusive)
-        # End offset is start of the last line + its raw length
+    @staticmethod
+    def _line_range_to_match(
+        content: str,
+        content_lines: list[str],
+        line_starts: list[int],
+        line_range: tuple[int, int],
+        old_str: str,
+    ) -> tuple[str, int, int]:
+        """Convert a (start_line, end_line) range to (matched_text, char_start, char_end)."""
+        char_start = line_starts[line_range[0]]
+
+        end_line = line_range[1] - 1  # last matched line (inclusive)
         line_end_offset = line_starts[end_line] + len(content_lines[end_line])
         char_end = line_end_offset
 
@@ -734,6 +820,18 @@ class EditFileTool(Tool):
         snippet = content_lines[start:end]
         numbered = [f"  {start + j + 1:4d} | {line}" for j, line in enumerate(snippet)]
         return "\n".join(numbered)
+
+
+def _byte_to_line(line_starts: list[int], byte_offset: int) -> int:
+    """Return the 0-based line index containing *byte_offset*."""
+    lo, hi = 0, len(line_starts) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if line_starts[mid] <= byte_offset:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
 
 
 def _line_start_offsets(content: str) -> list[int]:

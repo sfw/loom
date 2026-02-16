@@ -1,8 +1,9 @@
-"""Code analysis tool using regex-based extraction.
+"""Code analysis tool with tree-sitter and regex backends.
 
 Parses source files and returns structural information:
-classes, functions, imports. Works for Python, JavaScript/TypeScript,
-Go, and Rust without external dependencies.
+classes, functions, imports. Uses tree-sitter when available
+(via ``tree-sitter-language-pack``), falling back to regex
+extractors for Python, JavaScript/TypeScript, Go, and Rust.
 """
 
 from __future__ import annotations
@@ -160,8 +161,23 @@ _EXTRACTORS = {
 
 
 def analyze_file(file_path: str, source: str) -> CodeStructure:
-    """Analyze a source file and return its structure."""
+    """Analyze a source file and return its structure.
+
+    Tries tree-sitter first (when installed), falls back to regex extractors.
+    """
     lang = detect_language(file_path)
+
+    # Try tree-sitter backend first
+    from loom.tools.treesitter import extract_with_treesitter, is_available
+
+    if is_available():
+        ts_result = extract_with_treesitter(source, lang)
+        if ts_result is not None:
+            ts_result.file_path = file_path
+            ts_result.language = lang
+            return ts_result
+
+    # Fallback to regex extractors
     extractor = _EXTRACTORS.get(lang)
     if extractor is None:
         return CodeStructure(file_path=file_path, language=lang or "unknown")
