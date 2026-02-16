@@ -18,14 +18,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loom.config import VerificationConfig
-
-logger = logging.getLogger(__name__)
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.state.task_state import Subtask
 
 if TYPE_CHECKING:
     from loom.processes.schema import ProcessDefinition
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -226,8 +226,7 @@ class DeterministicVerifier:
                             fpath.read_text(encoding="utf-8", errors="replace"),
                         )
                     except Exception as e:
-                        import logging
-                        logging.getLogger(__name__).warning(
+                        logger.warning(
                             "Failed to read deliverable %s: %s", f, e,
                         )
         return "\n".join(texts)

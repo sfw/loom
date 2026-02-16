@@ -500,11 +500,15 @@ class AnthropicProvider(ModelProvider):
                     elif event_type == "content_block_stop":
                         if current_tool_name:
                             try:
-                                arguments = json.loads(current_tool_json) if current_tool_json else {}
-                            except json.JSONDecodeError as e:
+                                arguments = (
+                                    json.loads(current_tool_json)
+                                    if current_tool_json else {}
+                                )
+                            except json.JSONDecodeError:
                                 logger.warning(
                                     "Malformed tool args for %s: %s",
-                                    current_tool_name, current_tool_json[:200],
+                                    current_tool_name,
+                                    current_tool_json[:200],
                                 )
                                 arguments = {}
                             current_tool_calls.append(ToolCall(

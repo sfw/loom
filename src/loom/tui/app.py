@@ -32,8 +32,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from textual import on, work
-
-logger = logging.getLogger(__name__)
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -75,6 +73,8 @@ if TYPE_CHECKING:
     from loom.config import Config
     from loom.state.conversation_store import ConversationStore
     from loom.state.memory import Database
+
+logger = logging.getLogger(__name__)
 
 
 class LoomApp(App):

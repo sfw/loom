@@ -91,7 +91,10 @@ class EventBus:
                     loop = asyncio.get_running_loop()
                     loop.create_task(handler(event))
                 except RuntimeError:
-                    logger.debug("Skipped async handler %s: no running event loop", handler.__name__)
+                    logger.debug(
+                        "Skipped async handler %s: no running event loop",
+                        handler.__name__,
+                    )
             else:
                 try:
                     handler(event)

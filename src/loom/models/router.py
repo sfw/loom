@@ -14,12 +14,12 @@ import logging
 from dataclasses import dataclass
 
 from loom.config import Config, ModelConfig
-
-logger = logging.getLogger(__name__)
 from loom.models.anthropic_provider import AnthropicProvider
 from loom.models.base import ModelNotAvailableError, ModelProvider, ModelResponse
 from loom.models.ollama_provider import OllamaProvider
 from loom.models.openai_provider import OpenAICompatibleProvider
+
+logger = logging.getLogger(__name__)
 
 
 class ModelRouter:

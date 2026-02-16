@@ -472,8 +472,13 @@ class Orchestrator:
 
                 async def _do_analysis():
                     if self._process and self._process.workspace_scan:
-                        return ("workspace", await self._analyze_workspace_for_process(workspace_path))
-                    return ("code", await self._analyze_workspace(workspace_path))
+                        result = await self._analyze_workspace_for_process(
+                            workspace_path,
+                        )
+                        return ("workspace", result)
+                    return ("code", await self._analyze_workspace(
+                        workspace_path,
+                    ))
 
                 listing_result, analysis_result = await asyncio.gather(
                     _do_listing(), _do_analysis(),

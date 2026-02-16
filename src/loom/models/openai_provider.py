@@ -15,8 +15,6 @@ from pathlib import Path
 
 import httpx
 
-logger = logging.getLogger(__name__)
-
 from loom.config import ModelConfig
 from loom.content_utils import encode_file_base64, encode_image_base64
 from loom.models.base import (
@@ -27,6 +25,8 @@ from loom.models.base import (
     TokenUsage,
     ToolCall,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAICompatibleProvider(ModelProvider):

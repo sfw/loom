@@ -28,6 +28,7 @@ from loom.cowork.approval import ApprovalDecision, ToolApprover
 from loom.cowork.session_state import SessionState, extract_state_from_tool_events
 from loom.models.base import ModelProvider, ToolCall
 from loom.tools.registry import ToolRegistry, ToolResult
+from loom.utils.tokens import estimate_tokens as _estimate_tokens
 
 if TYPE_CHECKING:
     from loom.learning.reflection import GapAnalysisEngine
@@ -76,8 +77,6 @@ _DANGLING_REF_INDICATORS = [
     "what we did", "earlier", "the previous", "as I said",
     "like I mentioned", "that thing", "we already",
 ]
-
-from loom.utils.tokens import estimate_tokens as _estimate_tokens
 
 
 def _estimate_message_tokens(msg: dict) -> int:
