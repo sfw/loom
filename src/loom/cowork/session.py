@@ -28,7 +28,7 @@ from loom.models.base import ModelProvider, ToolCall
 from loom.tools.registry import ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
-    from loom.learning.reflection import ReflectionEngine
+    from loom.learning.reflection import GapAnalysisEngine
     from loom.state.conversation_store import ConversationStore
 
 # ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ class CoworkSession:
         session_id: str = "",
         session_state: SessionState | None = None,
         max_context_tokens: int = 180_000,
-        reflection: ReflectionEngine | None = None,
+        reflection: GapAnalysisEngine | None = None,
     ):
         self._model = model
         self._tools = tools
@@ -154,9 +154,8 @@ class CoworkSession:
         self._store = store
         self._session_id = session_id
 
-        # Automatic reflection (ALM behavioral learning)
+        # Automatic gap analysis (ALM behavioral learning)
         self._reflection = reflection
-        self._last_assistant_text = ""  # Track for reflection context
 
         # Session state (Layer 1 for cowork)
         self._session_state = session_state or SessionState(
@@ -561,7 +560,7 @@ class CoworkSession:
         return "\n".join(parts)
 
     async def _reflect(self, user_message: str, assistant_response: str) -> None:
-        """Run automatic reflection on this user-assistant exchange.
+        """Run gap analysis on this user-assistant exchange.
 
         Best-effort: failures are logged but never surface to the user.
         Updates the behaviors section for system prompt injection.
@@ -569,19 +568,16 @@ class CoworkSession:
         if self._reflection is None:
             return
         try:
-            await self._reflection.reflect_on_turn(
+            await self._reflection.on_turn_complete(
                 user_message=user_message,
                 assistant_response=assistant_response,
-                previous_assistant_message=self._last_assistant_text,
                 session_id=self._session_id,
             )
             # Refresh the behaviors section from all accumulated patterns
             await self._load_behaviors()
         except Exception as e:
             import logging
-            logging.getLogger(__name__).debug("Reflection failed (non-fatal): %s", e)
-
-        self._last_assistant_text = assistant_response
+            logging.getLogger(__name__).debug("Gap analysis failed (non-fatal): %s", e)
 
     async def _load_behaviors(self) -> None:
         """Load learned behavioral patterns and format for prompt injection."""

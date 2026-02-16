@@ -1,28 +1,33 @@
-"""Automatic reflection engine: extract behavioral patterns from every interaction.
+"""Task completion gap analysis: learn behavioral patterns from what users had to ask for.
 
-After every user prompt, the reflection engine analyzes the user-assistant exchange
-to detect steering signals — corrections, preferences, domain knowledge, and
-communication style cues. These are stored as learned patterns that accumulate
-over time, allowing the system to adapt its behavior without users needing to
-repeat themselves.
+Instead of scanning individual messages for correction keywords (regex), this
+module detects the *gap* between what the model delivered and what the user
+actually wanted.  The mechanism:
 
-This is domain-agnostic: it works for coding, writing, analysis, planning, or
-any other task type. The patterns it extracts are behavioral, not operational.
+1. Task boundary detection -- when the model gives a "final-sounding" response,
+   mark it as a completion point.
+2. Follow-up classification -- when the user responds after a completion point,
+   classify it as new_task, continuation, or correction.
+3. Gap extraction -- for continuations and corrections, ask the LLM to extract
+   a general behavioral rule the model should learn.
+
+This catches implicit patterns that keyword scanning can never detect.
+"test and lint it" has no correction keywords, but the gap is clear: the model
+thought it was done, and the user needed more.
 
 Design principles:
-- Runs after every user turn (automatic, not opt-in)
-- Non-blocking: reflection runs after the response is delivered
-- Hybrid extraction: rule-based for obvious signals, LLM-assisted for nuance
-- Cumulative: pattern frequency increases with repeated observations
-- Injected: learned patterns influence future prompts via system prompt
+- No regex.  Gaps are structural, not lexical.
+- LLM calls only at task boundaries (infrequent), not every message.
+- Non-blocking: gap analysis runs after the response is delivered.
+- Cumulative: pattern frequency increases with repeated observations.
+- Injected: learned patterns influence future prompts via system prompt.
 """
 
 from __future__ import annotations
 
-import json
+import enum
 import logging
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from loom.learning.manager import LearnedPattern, LearningManager
 
@@ -30,135 +35,245 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Signal detection markers
+# Data types
 # ---------------------------------------------------------------------------
 
-# Phrases that indicate the user is correcting agent behavior.
-_CORRECTION_MARKERS = [
-    r"\bno[,.]?\s",
-    r"\bdon'?t\b",
-    r"\bstop\b",
-    r"\binstead\b",
-    r"\bactually[,]?\s",
-    r"\bi said\b",
-    r"\bi meant\b",
-    r"\bnot like that\b",
-    r"\bthat'?s (?:not |wrong)",
-    r"\bi didn'?t (?:ask|want|mean)",
-    r"\bplease don'?t\b",
-    r"\bnot what i\b",
-    r"\bwrong\b.*\bright\b",
-]
 
-# Phrases that indicate an explicit preference.
-_PREFERENCE_MARKERS = [
-    r"\balways\b",
-    r"\bnever\b",
-    r"\bprefer\b",
-    r"\buse\b.+\bnot\b",
-    r"\bi like\b",
-    r"\bi want\b",
-    r"\bi need\b.+\bto be\b",
-    r"\bfrom now on\b",
-    r"\bgoing forward\b",
-    r"\bin the future\b",
-    r"\bby default\b",
-    r"\bmake sure\b.+\balways\b",
-    r"\bremember\b.+\bto\b",
-]
+class FollowupType(enum.Enum):
+    """Classification of a user follow-up after a task completion point."""
 
-# Phrases that indicate communication style feedback.
-_STYLE_MARKERS = [
-    r"\bbe more\b",
-    r"\bless\b.+\b(?:verbose|wordy|detailed)\b",
-    r"\bmore\b.+\b(?:concise|brief|detail|specific)\b",
-    r"\btoo\b.+\b(?:long|short|verbose|wordy|vague|detailed)\b",
-    r"\bshorter\b",
-    r"\blonger\b",
-    r"\bsimpler\b",
-    r"\bjust\b.+\b(?:tell|show|give)\b",
-    r"\bskip\b.+\b(?:explanation|intro|preamble)\b",
-    r"\bget to the point\b",
-    r"\bdon'?t explain\b",
-]
-
-# Phrases that indicate domain knowledge the user is providing.
-_KNOWLEDGE_MARKERS = [
-    r"\bwe use\b",
-    r"\bour\b.+\b(?:uses?|runs?|requires?|starts?|is|are)\b",
-    r"\bour (?:team|company|org|project|codebase|stack|fiscal|api|database|workflow)\b",
-    r"\bin our\b",
-    r"\bfyi\b",
-    r"\bjust so you know\b",
-    r"\bfor context\b",
-    r"\bfor reference\b",
-    r"\bthe way we\b",
-    r"\bour convention\b",
-    r"\bour standard\b",
-    r"\bkeep (?:that |this )?in mind\b",
-    r"\bwe (?:follow|adopt|run|deploy)\b",
-]
+    NEW_TASK = "new_task"
+    CONTINUATION = "continuation"
+    CORRECTION = "correction"
 
 
 @dataclass
-class SteeringSignal:
-    """A detected steering signal from a user message."""
+class GapSignal:
+    """A behavioral gap detected between completion and follow-up."""
 
-    signal_type: str  # correction, preference, style, knowledge
-    content: str  # The relevant text from the user
-    confidence: float = 0.5  # 0.0 to 1.0
-    context: str = ""  # Surrounding context
+    followup_type: FollowupType
+    rule: str  # The general behavioral rule extracted
+    completed_summary: str = ""  # What the model considered complete
+    user_followup: str = ""  # What the user said next
+    confidence: float = 0.7
 
 
 @dataclass
-class ReflectionResult:
-    """Result of reflecting on a single user-assistant exchange."""
+class GapResult:
+    """Result of gap analysis for a single turn."""
 
-    signals: list[SteeringSignal] = field(default_factory=list)
-    patterns: list[LearnedPattern] = field(default_factory=list)
-    had_correction: bool = False
-    had_preference: bool = False
-    had_style_feedback: bool = False
-    had_knowledge: bool = False
+    is_completion_point: bool = False
+    followup_type: FollowupType | None = None
+    signal: GapSignal | None = None
+    pattern: LearnedPattern | None = None
 
 
 # ---------------------------------------------------------------------------
-# LLM extraction prompt
+# Completion detection heuristics
 # ---------------------------------------------------------------------------
 
-_REFLECTION_PROMPT = """\
-You are analyzing a user-assistant exchange to detect behavioral steering signals.
-The user may be correcting the assistant, expressing preferences, providing domain
-knowledge, or giving feedback on communication style.
+# Phrases that suggest the model considers its work done.
+_COMPLETION_PHRASES = [
+    "let me know if",
+    "let me know when",
+    "hope that helps",
+    "should do it",
+    "that should",
+    "does that work",
+    "anything else",
+    "if you need",
+    "feel free to",
+    "here's the",
+    "here is the",
+    "i've completed",
+    "i've finished",
+    "i've updated",
+    "i've implemented",
+    "i've added",
+    "i've created",
+    "i've fixed",
+    "i've made",
+    "all done",
+    "that's it",
+    "you're all set",
+    "should be good",
+    "ready to go",
+    "implementation is complete",
+    "changes are in place",
+    "everything looks good",
+]
 
-USER MESSAGE:
-{user_message}
+# Phrases that suggest the model is asking a question (not done).
+_QUESTION_INDICATORS = [
+    "would you like",
+    "do you want",
+    "shall i",
+    "should i",
+    "which one",
+    "what do you",
+    "how would you",
+    "could you clarify",
+    "can you tell me",
+    "what should",
+    "before i proceed",
+    "before proceeding",
+]
 
-ASSISTANT'S PREVIOUS RESPONSE (if any):
-{previous_response}
 
-Analyze this exchange and extract any behavioral signals. For each signal found,
-output a JSON object on its own line with these fields:
-- "type": one of "correction", "preference", "style", "knowledge"
-- "pattern": a concise, reusable description of the learned behavior (imperative form)
-  Examples: "Use YAML instead of JSON for configs", "Keep responses under 3 paragraphs",
-  "Project uses PostgreSQL 15", "Prefer functional style over classes"
-- "confidence": 0.0-1.0 how confident you are this is a real signal (not just conversation)
+def _is_completion_point(assistant_response: str) -> bool:
+    """Heuristic: does this response look like the model considers the task done?
 
-Output ONLY the JSON lines, one per signal. If no signals are detected, output nothing.
-Do not explain. Do not wrap in markdown. Just the JSON lines."""
+    Checks for wrap-up language and absence of follow-up questions.
+    Doesn't need to be perfect -- a false positive just means one extra
+    LLM call that finds no gap.
+    """
+    if not assistant_response or len(assistant_response.strip()) < 20:
+        return False
+
+    lower = assistant_response.lower()
+
+    # If the model is asking a question, it's not done
+    if lower.rstrip().endswith("?"):
+        for indicator in _QUESTION_INDICATORS:
+            if indicator in lower:
+                return False
+
+    # Check for completion language
+    for phrase in _COMPLETION_PHRASES:
+        if phrase in lower:
+            return True
+
+    # Heuristic: if the response is substantial (>200 chars) and doesn't
+    # end with a question, it's likely a completion point.  Most continuation
+    # responses from the model are either questions or contain completion
+    # phrases.  This catches the "here's your code" case without explicit
+    # wrap-up language.
+    if len(assistant_response.strip()) > 200 and not lower.rstrip().endswith("?"):
+        return True
+
+    return False
 
 
-class ReflectionEngine:
-    """Analyzes user-assistant exchanges to extract behavioral patterns.
+# ---------------------------------------------------------------------------
+# Follow-up classification
+# ---------------------------------------------------------------------------
 
-    Two-phase extraction:
-    1. Rule-based: fast regex scan for obvious steering markers
-    2. LLM-assisted: when a model is available, extract nuanced signals
+# Strong indicators that the user is starting a new, unrelated topic.
+_NEW_TASK_PHRASES = [
+    "new topic",
+    "different question",
+    "unrelated",
+    "switching to",
+    "moving on",
+    "by the way",
+    "btw",
+    "on another note",
+    "separate question",
+    "something else",
+    "change of subject",
+]
 
-    The engine is designed to be called after every user turn. It's
-    intentionally lightweight — rule-based extraction adds zero latency,
-    and LLM extraction uses the utility (small) model.
+# Strong indicators of explicit correction.
+_CORRECTION_PHRASES = [
+    "no,",
+    "no.",
+    "that's wrong",
+    "thats wrong",
+    "that's not right",
+    "thats not right",
+    "that's incorrect",
+    "thats incorrect",
+    "not what i",
+    "i said",
+    "i meant",
+    "i asked for",
+    "wrong",
+    "incorrect",
+    "that's not what",
+    "thats not what",
+]
+
+
+def _classify_followup_heuristic(
+    user_message: str,
+    completed_summary: str,
+) -> FollowupType:
+    """Fast heuristic classification of a follow-up message.
+
+    This is a first pass.  The LLM gap extraction will further validate
+    whether a continuation represents a real gap or a reasonable new request.
+    """
+    lower = user_message.lower().strip()
+
+    # Very short messages after completion are usually continuations
+    # ("test it", "push it", "lint it", "now deploy")
+    if len(lower) < 5:
+        return FollowupType.NEW_TASK  # Too short to analyze
+
+    # Check for explicit correction language
+    for phrase in _CORRECTION_PHRASES:
+        if phrase in lower:
+            return FollowupType.CORRECTION
+
+    # Check for new-task indicators
+    for phrase in _NEW_TASK_PHRASES:
+        if phrase in lower:
+            return FollowupType.NEW_TASK
+
+    # Default: treat as continuation (the LLM will decide if it's a real gap)
+    return FollowupType.CONTINUATION
+
+
+# ---------------------------------------------------------------------------
+# LLM prompts
+# ---------------------------------------------------------------------------
+
+_GAP_EXTRACTION_PROMPT = """\
+The assistant considered the following work complete:
+{completed_summary}
+
+The user then said:
+{user_followup}
+
+If this follow-up represents something the assistant should have done \
+proactively -- without being asked -- describe the general behavioral rule \
+the assistant should learn.  Frame it as a reusable instruction, not specific \
+to this task.
+
+If the follow-up is genuinely a new request, a reasonable extension that \
+couldn't have been anticipated, or just a "thanks" / acknowledgment, output \
+the single word NONE.
+
+Output ONLY the behavioral rule (one sentence, imperative form) or NONE.  \
+No explanation."""
+
+
+_FOLLOWUP_CLASSIFICATION_PROMPT = """\
+The assistant just completed some work and gave this summary:
+{completed_summary}
+
+The user responded with:
+{user_followup}
+
+Classify the user's response as one of:
+- NEW_TASK: The user moved to a different topic or asked something unrelated
+- CONTINUATION: The user is extending, adding to, or asking for more on the completed work
+- CORRECTION: The user is saying the completed work was wrong or not what they wanted
+
+Output exactly one word: NEW_TASK, CONTINUATION, or CORRECTION."""
+
+
+# ---------------------------------------------------------------------------
+# Gap analysis engine
+# ---------------------------------------------------------------------------
+
+
+class GapAnalysisEngine:
+    """Detects behavioral gaps at task completion boundaries.
+
+    Called after every turn in cowork mode.  Tracks when the model
+    considers work complete and analyzes user follow-ups to extract
+    general behavioral rules the model should learn.
     """
 
     def __init__(
@@ -169,230 +284,174 @@ class ReflectionEngine:
         self._learning = learning
         self._model = model
 
-        # Pre-compile regex patterns for performance
-        self._correction_re = [re.compile(p, re.IGNORECASE) for p in _CORRECTION_MARKERS]
-        self._preference_re = [re.compile(p, re.IGNORECASE) for p in _PREFERENCE_MARKERS]
-        self._style_re = [re.compile(p, re.IGNORECASE) for p in _STYLE_MARKERS]
-        self._knowledge_re = [re.compile(p, re.IGNORECASE) for p in _KNOWLEDGE_MARKERS]
+        # State: the last completion point
+        self._pending_completion: str | None = None  # summary of completed work
 
     @property
     def has_model(self) -> bool:
         """Whether LLM-assisted extraction is available."""
         return self._model is not None
 
-    async def reflect_on_turn(
+    async def on_turn_complete(
         self,
         user_message: str,
-        assistant_response: str = "",
-        previous_assistant_message: str = "",
+        assistant_response: str,
         session_id: str = "",
-    ) -> ReflectionResult:
-        """Analyze a user turn and extract behavioral patterns.
+    ) -> GapResult:
+        """Called after every turn.  Manages completion tracking and gap analysis.
 
-        Called after every user prompt. Runs both rule-based and (optionally)
-        LLM-assisted extraction.
-
-        Args:
-            user_message: The user's current message.
-            assistant_response: The assistant's response to this message (may
-                be empty if reflection runs before response).
-            previous_assistant_message: The assistant's prior response (the one
-                the user might be reacting to).
-            session_id: Current session ID for pattern scoping.
-
-        Returns:
-            ReflectionResult with detected signals and stored patterns.
+        Flow:
+        1. If there's a pending completion point, analyze the user's message
+           as a follow-up (gap analysis).
+        2. Then check if the current assistant response is a new completion point.
         """
-        result = ReflectionResult()
+        result = GapResult()
 
-        # Phase 1: Rule-based signal detection
-        rule_signals = self._detect_signals_rule_based(
-            user_message, previous_assistant_message,
-        )
-        result.signals.extend(rule_signals)
-
-        # Phase 2: LLM-assisted extraction (if model available and signals detected)
-        if self._model is not None:
-            llm_signals = await self._detect_signals_llm(
-                user_message, previous_assistant_message,
+        # --- Phase 1: Analyze follow-up to previous completion ---
+        if self._pending_completion is not None:
+            followup_type = await self._classify_followup(
+                user_message, self._pending_completion,
             )
-            # Merge, preferring LLM signals (higher quality) but keeping
-            # rule-based signals that LLM might have missed
-            result.signals = self._merge_signals(rule_signals, llm_signals)
+            result.followup_type = followup_type
 
-        # Classify what we found
-        for signal in result.signals:
-            if signal.signal_type == "correction":
-                result.had_correction = True
-            elif signal.signal_type == "preference":
-                result.had_preference = True
-            elif signal.signal_type == "style":
-                result.had_style_feedback = True
-            elif signal.signal_type == "knowledge":
-                result.had_knowledge = True
+            if followup_type in (FollowupType.CONTINUATION, FollowupType.CORRECTION):
+                signal = await self._extract_gap(
+                    completed_summary=self._pending_completion,
+                    user_followup=user_message,
+                    followup_type=followup_type,
+                )
+                if signal:
+                    result.signal = signal
+                    pattern = await self._store_gap_pattern(signal, session_id)
+                    result.pattern = pattern
 
-        # Store patterns from detected signals
-        for signal in result.signals:
-            if signal.confidence >= 0.3:  # Only store reasonably confident signals
-                pattern = await self._signal_to_pattern(signal, session_id)
-                if pattern:
-                    result.patterns.append(pattern)
+            # Clear the pending completion regardless of classification
+            self._pending_completion = None
+
+        # --- Phase 2: Check if current response is a completion point ---
+        if _is_completion_point(assistant_response):
+            result.is_completion_point = True
+            # Store a summary of what was completed for gap analysis on next turn
+            self._pending_completion = self._summarize_completion(assistant_response)
 
         return result
 
-    # ------------------------------------------------------------------
-    # Rule-based detection
-    # ------------------------------------------------------------------
-
-    def _detect_signals_rule_based(
+    async def _classify_followup(
         self,
         user_message: str,
-        previous_response: str = "",
-    ) -> list[SteeringSignal]:
-        """Fast regex-based signal detection."""
-        signals: list[SteeringSignal] = []
-        msg_lower = user_message.lower()
+        completed_summary: str,
+    ) -> FollowupType:
+        """Classify a user follow-up as new_task, continuation, or correction.
 
-        # Skip very short messages (likely just acknowledgments)
-        if len(user_message.strip()) < 10:
-            return signals
+        Uses heuristics first.  If an LLM is available and the heuristic
+        returns CONTINUATION (the ambiguous case), validates with the LLM.
+        """
+        heuristic = _classify_followup_heuristic(user_message, completed_summary)
 
-        # Check for corrections
-        correction_score = self._scan_markers(msg_lower, self._correction_re)
-        if correction_score > 0:
-            signals.append(SteeringSignal(
-                signal_type="correction",
-                content=user_message[:200],
-                confidence=min(0.7, 0.3 + correction_score * 0.2),
-                context=previous_response[:200] if previous_response else "",
-            ))
+        # For new_task and correction, the heuristics are strong enough
+        if heuristic != FollowupType.CONTINUATION:
+            return heuristic
 
-        # Check for preferences
-        preference_score = self._scan_markers(msg_lower, self._preference_re)
-        if preference_score > 0:
-            signals.append(SteeringSignal(
-                signal_type="preference",
-                content=user_message[:200],
-                confidence=min(0.8, 0.4 + preference_score * 0.2),
-                context="",
-            ))
+        # For continuation (the default/ambiguous case), use LLM if available
+        if self._model is not None:
+            return await self._classify_followup_llm(user_message, completed_summary)
 
-        # Check for style feedback
-        style_score = self._scan_markers(msg_lower, self._style_re)
-        if style_score > 0:
-            signals.append(SteeringSignal(
-                signal_type="style",
-                content=user_message[:200],
-                confidence=min(0.8, 0.4 + style_score * 0.2),
-                context="",
-            ))
+        return heuristic
 
-        # Check for domain knowledge
-        knowledge_score = self._scan_markers(msg_lower, self._knowledge_re)
-        if knowledge_score > 0:
-            signals.append(SteeringSignal(
-                signal_type="knowledge",
-                content=user_message[:200],
-                confidence=min(0.7, 0.3 + knowledge_score * 0.2),
-                context="",
-            ))
-
-        return signals
-
-    @staticmethod
-    def _scan_markers(text: str, patterns: list[re.Pattern]) -> int:
-        """Count how many marker patterns match in the text."""
-        return sum(1 for p in patterns if p.search(text))
-
-    # ------------------------------------------------------------------
-    # LLM-assisted detection
-    # ------------------------------------------------------------------
-
-    async def _detect_signals_llm(
+    async def _classify_followup_llm(
         self,
         user_message: str,
-        previous_response: str = "",
-    ) -> list[SteeringSignal]:
-        """Use a small model to extract nuanced behavioral signals."""
-        if self._model is None:
-            return []
-
-        prompt = _REFLECTION_PROMPT.format(
-            user_message=user_message[:500],
-            previous_response=previous_response[:500] if previous_response else "(none)",
+        completed_summary: str,
+    ) -> FollowupType:
+        """Use LLM to classify the follow-up type."""
+        prompt = _FOLLOWUP_CLASSIFICATION_PROMPT.format(
+            completed_summary=completed_summary[:500],
+            user_followup=user_message[:500],
         )
-
         try:
             response = await self._model.complete(
                 [{"role": "user", "content": prompt}],
             )
-            return self._parse_llm_signals(response.text or "")
+            text = (response.text or "").strip().upper()
+            if "NEW_TASK" in text:
+                return FollowupType.NEW_TASK
+            if "CORRECTION" in text:
+                return FollowupType.CORRECTION
+            return FollowupType.CONTINUATION
         except Exception as e:
-            logger.debug("LLM reflection failed (non-fatal): %s", e)
-            return []
+            logger.debug("LLM follow-up classification failed (non-fatal): %s", e)
+            return FollowupType.CONTINUATION
 
-    @staticmethod
-    def _parse_llm_signals(text: str) -> list[SteeringSignal]:
-        """Parse JSON lines from LLM output into SteeringSignals."""
-        signals: list[SteeringSignal] = []
-        for line in text.strip().splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                data = json.loads(line)
-                signal_type = data.get("type", "")
-                if signal_type not in ("correction", "preference", "style", "knowledge"):
-                    continue
-                signals.append(SteeringSignal(
-                    signal_type=signal_type,
-                    content=data.get("pattern", "")[:200],
-                    confidence=min(1.0, max(0.0, float(data.get("confidence", 0.5)))),
-                ))
-            except (json.JSONDecodeError, ValueError, TypeError):
-                continue
-        return signals
-
-    # ------------------------------------------------------------------
-    # Signal merging
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _merge_signals(
-        rule_signals: list[SteeringSignal],
-        llm_signals: list[SteeringSignal],
-    ) -> list[SteeringSignal]:
-        """Merge rule-based and LLM signals, preferring LLM quality.
-
-        LLM signals have better pattern descriptions (concise, reusable).
-        Rule signals catch things the LLM might miss.
-        When both detect the same type, prefer the LLM version.
-        """
-        llm_types = {s.signal_type for s in llm_signals}
-        merged = list(llm_signals)
-
-        # Add rule-based signals for types the LLM didn't detect
-        for signal in rule_signals:
-            if signal.signal_type not in llm_types:
-                merged.append(signal)
-
-        return merged
-
-    # ------------------------------------------------------------------
-    # Pattern storage
-    # ------------------------------------------------------------------
-
-    async def _signal_to_pattern(
+    async def _extract_gap(
         self,
-        signal: SteeringSignal,
+        completed_summary: str,
+        user_followup: str,
+        followup_type: FollowupType,
+    ) -> GapSignal | None:
+        """Extract a behavioral rule from the gap between completion and follow-up.
+
+        If no LLM is available, falls back to a simple heuristic that
+        captures the follow-up as-is.
+        """
+        if self._model is not None:
+            return await self._extract_gap_llm(
+                completed_summary, user_followup, followup_type,
+            )
+
+        # No LLM: store the follow-up directly as a rough pattern.
+        # Less precise than LLM extraction but still captures the signal.
+        return GapSignal(
+            followup_type=followup_type,
+            rule=user_followup[:200],
+            completed_summary=completed_summary[:200],
+            user_followup=user_followup[:200],
+            confidence=0.4,
+        )
+
+    async def _extract_gap_llm(
+        self,
+        completed_summary: str,
+        user_followup: str,
+        followup_type: FollowupType,
+    ) -> GapSignal | None:
+        """Use LLM to extract a general behavioral rule from the gap."""
+        prompt = _GAP_EXTRACTION_PROMPT.format(
+            completed_summary=completed_summary[:500],
+            user_followup=user_followup[:500],
+        )
+        try:
+            response = await self._model.complete(
+                [{"role": "user", "content": prompt}],
+            )
+            text = (response.text or "").strip()
+
+            # LLM says this isn't a real gap
+            if not text or text.upper() == "NONE":
+                return None
+
+            return GapSignal(
+                followup_type=followup_type,
+                rule=text[:300],
+                completed_summary=completed_summary[:200],
+                user_followup=user_followup[:200],
+                confidence=0.7,
+            )
+        except Exception as e:
+            logger.debug("LLM gap extraction failed (non-fatal): %s", e)
+            return None
+
+    async def _store_gap_pattern(
+        self,
+        signal: GapSignal,
         session_id: str = "",
     ) -> LearnedPattern | None:
-        """Convert a steering signal into a stored learned pattern."""
-        # Map signal types to pattern types
-        pattern_type = f"behavioral_{signal.signal_type}"
+        """Convert a gap signal into a stored learned pattern."""
+        if signal.followup_type == FollowupType.CORRECTION:
+            pattern_type = "behavioral_correction"
+        else:
+            pattern_type = "behavioral_gap"
 
-        # Generate a stable key for deduplication
-        pattern_key = self._signal_key(signal)
+        pattern_key = _pattern_key(signal.rule)
         if not pattern_key:
             return None
 
@@ -400,11 +459,12 @@ class ReflectionEngine:
             pattern_type=pattern_type,
             pattern_key=pattern_key,
             data={
-                "description": signal.content[:200],
+                "description": signal.rule,
                 "confidence": signal.confidence,
-                "source": "reflection",
+                "source": "gap_analysis",
                 "session_id": session_id,
-                "context": signal.context[:200] if signal.context else "",
+                "completed_summary": signal.completed_summary[:200],
+                "user_followup": signal.user_followup[:200],
             },
         )
 
@@ -412,33 +472,51 @@ class ReflectionEngine:
             await self._learning.store_or_update(pattern)
             return pattern
         except Exception as e:
-            logger.warning("Failed to store behavioral pattern: %s", e)
+            logger.warning("Failed to store gap pattern: %s", e)
             return None
 
     @staticmethod
-    def _signal_key(signal: SteeringSignal) -> str:
-        """Generate a stable, deduplicated key for a signal.
+    def _summarize_completion(assistant_response: str) -> str:
+        """Create a concise summary of what the model delivered.
 
-        For LLM-extracted signals, the content IS the pattern description
-        (concise, reusable). For rule-based signals, we normalize the
-        user's raw text into a key.
+        Takes the first ~300 chars of the response as a proxy.
+        A proper implementation could use the LLM to summarize,
+        but this is good enough for gap analysis prompting.
         """
-        text = signal.content.strip().lower()
-        if not text:
-            return ""
+        text = assistant_response.strip()
+        if len(text) <= 300:
+            return text
+        # Take the first 300 chars and cut at the last sentence boundary
+        truncated = text[:300]
+        for sep in (".\n", ". ", ".\t"):
+            last = truncated.rfind(sep)
+            if last > 100:
+                return truncated[: last + 1]
+        return truncated + "..."
 
-        # Remove common filler words for key generation
-        text = re.sub(r"\b(please|just|can you|could you|would you)\b", "", text)
-        text = re.sub(r"\s+", " ", text).strip()
 
-        # Truncate to reasonable key length
-        words = text.split()[:8]
-        return "-".join(words)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_FILLER_WORDS = frozenset({
+    "please", "just", "can", "you", "could", "would", "the", "a", "an",
+})
+
+
+def _pattern_key(text: str) -> str:
+    """Generate a stable, deduplicated key from a behavioral rule."""
+    text = text.strip().lower()
+    if not text:
+        return ""
+    words = [w for w in text.split() if w not in _FILLER_WORDS][:8]
+    return "-".join(words)
 
 
 # ---------------------------------------------------------------------------
 # Convenience: query behavioral patterns for prompt injection
 # ---------------------------------------------------------------------------
+
 
 async def get_learned_behaviors(
     learning: LearningManager,
@@ -450,6 +528,7 @@ async def get_learned_behaviors(
     suitable for injection into system prompts.
     """
     behavioral_types = [
+        "behavioral_gap",
         "behavioral_correction",
         "behavioral_preference",
         "behavioral_style",
@@ -474,12 +553,12 @@ def format_behaviors_for_prompt(patterns: list[LearnedPattern]) -> str:
     """Format learned behavioral patterns for system prompt injection.
 
     Returns a concise section that can be appended to any system prompt.
-    Domain-agnostic — works for coding, writing, analysis, planning, etc.
+    Domain-agnostic -- works for coding, writing, analysis, planning, etc.
     """
     if not patterns:
         return ""
 
-    lines = ["## Learned Preferences", ""]
+    lines = ["## Learned Behaviors", ""]
     lines.append(
         "The following behavioral patterns have been learned from previous "
         "interactions. Apply them without being asked:"

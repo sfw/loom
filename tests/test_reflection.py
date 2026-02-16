@@ -1,4 +1,4 @@
-"""Tests for the reflection engine (behavioral pattern extraction)."""
+"""Tests for the gap analysis engine (behavioral pattern extraction)."""
 
 from __future__ import annotations
 
@@ -6,222 +6,362 @@ import pytest
 
 from loom.learning.manager import LearnedPattern, LearningManager
 from loom.learning.reflection import (
-    ReflectionEngine,
-    SteeringSignal,
+    FollowupType,
+    GapAnalysisEngine,
+    _classify_followup_heuristic,
+    _is_completion_point,
+    _pattern_key,
     format_behaviors_for_prompt,
     get_learned_behaviors,
 )
 from loom.state.memory import Database
 
-
 # --- Helpers ---
 
 
-async def _make_engine(tmp_path) -> tuple[ReflectionEngine, LearningManager]:
-    """Create a ReflectionEngine with an in-memory DB (no LLM model)."""
+async def _make_engine(tmp_path) -> tuple[GapAnalysisEngine, LearningManager]:
+    """Create a GapAnalysisEngine with an in-memory DB (no LLM model)."""
     db = Database(str(tmp_path / "test.db"))
     await db.initialize()
     mgr = LearningManager(db)
-    engine = ReflectionEngine(learning=mgr)
+    engine = GapAnalysisEngine(learning=mgr)
     return engine, mgr
 
 
-# --- Rule-based signal detection ---
+# --- Completion point detection ---
 
 
-class TestRuleBasedDetection:
-    @pytest.mark.asyncio
-    async def test_detects_correction(self, tmp_path):
-        engine, _ = await _make_engine(tmp_path)
-        result = await engine.reflect_on_turn(
-            user_message="No, don't add docstrings unless I ask for them.",
-            assistant_response="",
-            previous_assistant_message="I've added docstrings to all functions.",
+class TestCompletionDetection:
+    def test_completion_with_wrap_up_phrase(self):
+        assert _is_completion_point(
+            "I've implemented the feature. Let me know if you need anything else."
         )
-        assert result.had_correction
-        assert any(s.signal_type == "correction" for s in result.signals)
 
-    @pytest.mark.asyncio
-    async def test_detects_preference(self, tmp_path):
-        engine, _ = await _make_engine(tmp_path)
-        result = await engine.reflect_on_turn(
-            user_message="Always use TypeScript, never plain JavaScript.",
+    def test_completion_with_heres_the(self):
+        assert _is_completion_point(
+            "Here's the updated implementation with error handling added."
         )
-        assert result.had_preference
-        assert any(s.signal_type == "preference" for s in result.signals)
 
-    @pytest.mark.asyncio
-    async def test_detects_style_feedback(self, tmp_path):
-        engine, _ = await _make_engine(tmp_path)
-        result = await engine.reflect_on_turn(
-            user_message="Be more concise. I don't need the full explanation.",
+    def test_completion_all_done(self):
+        assert _is_completion_point("All done. The tests pass and linting is clean.")
+
+    def test_completion_ive_fixed(self):
+        assert _is_completion_point(
+            "I've fixed the bug in the parser. The issue was an off-by-one error."
         )
-        assert result.had_style_feedback
-        assert any(s.signal_type == "style" for s in result.signals)
 
-    @pytest.mark.asyncio
-    async def test_detects_domain_knowledge(self, tmp_path):
-        engine, _ = await _make_engine(tmp_path)
-        result = await engine.reflect_on_turn(
-            user_message="We use PostgreSQL with pgvector in production.",
+    def test_not_completion_question(self):
+        assert not _is_completion_point(
+            "Would you like me to add error handling as well?"
         )
-        assert result.had_knowledge
-        assert any(s.signal_type == "knowledge" for s in result.signals)
 
-    @pytest.mark.asyncio
-    async def test_ignores_short_messages(self, tmp_path):
-        engine, _ = await _make_engine(tmp_path)
-        result = await engine.reflect_on_turn(
-            user_message="ok",
+    def test_not_completion_short(self):
+        assert not _is_completion_point("ok")
+
+    def test_not_completion_empty(self):
+        assert not _is_completion_point("")
+
+    def test_completion_long_response_no_question(self):
+        # Substantial response without explicit completion phrase but no question
+        long_response = "def calculate(x, y):\n    return x + y\n\n" * 10
+        assert _is_completion_point(long_response)
+
+    def test_not_completion_question_with_indicator(self):
+        assert not _is_completion_point(
+            "I can implement this. Should I use async or sync approach?"
         )
-        assert len(result.signals) == 0
 
-    @pytest.mark.asyncio
-    async def test_ignores_neutral_messages(self, tmp_path):
-        engine, _ = await _make_engine(tmp_path)
-        result = await engine.reflect_on_turn(
-            user_message="Can you read the file src/main.py and tell me what it does?",
+    def test_completion_changes_in_place(self):
+        assert _is_completion_point(
+            "The changes are in place. The config now uses YAML format."
         )
-        # Neutral request — no steering signals
-        assert not result.had_correction
-        assert not result.had_style_feedback
 
-    @pytest.mark.asyncio
-    async def test_multiple_signals(self, tmp_path):
-        engine, _ = await _make_engine(tmp_path)
-        result = await engine.reflect_on_turn(
-            user_message="No, don't use classes. I always prefer functional style. Be more concise.",
+
+# --- Follow-up classification ---
+
+
+class TestFollowupClassification:
+    def test_correction_no_comma(self):
+        result = _classify_followup_heuristic("no, use JSON not YAML", "")
+        assert result == FollowupType.CORRECTION
+
+    def test_correction_thats_wrong(self):
+        result = _classify_followup_heuristic("that's wrong, it should be async", "")
+        assert result == FollowupType.CORRECTION
+
+    def test_correction_i_said(self):
+        result = _classify_followup_heuristic("i said use PostgreSQL not MySQL", "")
+        assert result == FollowupType.CORRECTION
+
+    def test_new_task_btw(self):
+        result = _classify_followup_heuristic(
+            "btw, can you help with something unrelated?", "",
         )
-        assert result.had_correction
-        assert result.had_preference
-        assert result.had_style_feedback
-        assert len(result.signals) >= 3
+        assert result == FollowupType.NEW_TASK
 
-    @pytest.mark.asyncio
-    async def test_from_now_on(self, tmp_path):
-        engine, _ = await _make_engine(tmp_path)
-        result = await engine.reflect_on_turn(
-            user_message="From now on, use snake_case for all variable names.",
+    def test_new_task_different_question(self):
+        result = _classify_followup_heuristic(
+            "I have a different question about the API", "",
         )
-        assert result.had_preference
+        assert result == FollowupType.NEW_TASK
 
-    @pytest.mark.asyncio
-    async def test_our_convention(self, tmp_path):
-        engine, _ = await _make_engine(tmp_path)
-        result = await engine.reflect_on_turn(
-            user_message="Our convention is to put tests in a __tests__ directory.",
+    def test_continuation_default(self):
+        result = _classify_followup_heuristic("test and lint it", "")
+        assert result == FollowupType.CONTINUATION
+
+    def test_continuation_add_more(self):
+        result = _classify_followup_heuristic("can you add error handling?", "")
+        assert result == FollowupType.CONTINUATION
+
+    def test_continuation_edge_cases(self):
+        result = _classify_followup_heuristic("what about edge cases?", "")
+        assert result == FollowupType.CONTINUATION
+
+    def test_too_short_is_new_task(self):
+        # Messages under 5 chars are too short to analyze
+        result = _classify_followup_heuristic("ok", "")
+        assert result == FollowupType.NEW_TASK
+
+    def test_correction_i_meant(self):
+        result = _classify_followup_heuristic(
+            "i meant the other file, not this one", "",
         )
-        assert result.had_knowledge
+        assert result == FollowupType.CORRECTION
 
 
-# --- Pattern storage ---
+# --- Full gap analysis flow (no LLM) ---
 
 
-class TestPatternStorage:
+class TestGapAnalysisNoLLM:
     @pytest.mark.asyncio
-    async def test_stores_behavioral_pattern(self, tmp_path):
+    async def test_detects_completion_point(self, tmp_path):
+        engine, _ = await _make_engine(tmp_path)
+
+        result = await engine.on_turn_complete(
+            user_message="Add error handling to the parser",
+            assistant_response=(
+                "I've implemented the error handling."
+                " Let me know if you need anything else."
+            ),
+        )
+        assert result.is_completion_point
+
+    @pytest.mark.asyncio
+    async def test_no_gap_on_first_turn(self, tmp_path):
+        """First turn has no pending completion, so no gap analysis."""
+        engine, _ = await _make_engine(tmp_path)
+
+        result = await engine.on_turn_complete(
+            user_message="Add error handling",
+            assistant_response="I've added error handling. Let me know if you need anything else.",
+        )
+        assert result.signal is None
+        assert result.followup_type is None
+
+    @pytest.mark.asyncio
+    async def test_gap_detected_on_continuation(self, tmp_path):
+        """When user follows up after completion, gap is detected."""
         engine, mgr = await _make_engine(tmp_path)
-        await engine.reflect_on_turn(
-            user_message="Always use YAML instead of JSON for config files.",
+
+        # Turn 1: model completes work
+        await engine.on_turn_complete(
+            user_message="Write a function to parse CSV",
+            assistant_response=(
+                "Here's the CSV parser implementation."
+                " Let me know if you need anything else."
+            ),
         )
+
+        # Turn 2: user asks for more (continuation)
+        result = await engine.on_turn_complete(
+            user_message="test and lint it",
+            assistant_response="Running tests now...",
+        )
+
+        assert result.followup_type == FollowupType.CONTINUATION
+        assert result.signal is not None
+        # Without LLM, the rule is the raw follow-up text
+        assert "test and lint it" in result.signal.rule
+
+    @pytest.mark.asyncio
+    async def test_gap_stored_as_pattern(self, tmp_path):
+        """Detected gaps should be stored in the learning manager."""
+        engine, mgr = await _make_engine(tmp_path)
+
+        # Turn 1: completion
+        await engine.on_turn_complete(
+            user_message="Implement the feature",
+            assistant_response="I've implemented the feature. All done.",
+        )
+
+        # Turn 2: continuation
+        result = await engine.on_turn_complete(
+            user_message="what about error handling?",
+            assistant_response="Good point, adding error handling now.",
+        )
+
+        assert result.pattern is not None
         patterns = await mgr.query_behavioral()
         assert len(patterns) >= 1
-        assert any("behavioral_" in p.pattern_type for p in patterns)
+        assert any(p.pattern_type == "behavioral_gap" for p in patterns)
 
     @pytest.mark.asyncio
-    async def test_frequency_increases_on_repeated_signal(self, tmp_path):
+    async def test_correction_stored_as_correction_type(self, tmp_path):
+        """Explicit corrections should be stored as behavioral_correction."""
         engine, mgr = await _make_engine(tmp_path)
 
-        # Same preference expressed twice
-        await engine.reflect_on_turn(
-            user_message="Always use YAML instead of JSON for config files.",
-        )
-        await engine.reflect_on_turn(
-            user_message="Always use YAML instead of JSON for config files.",
+        # Turn 1: completion
+        await engine.on_turn_complete(
+            user_message="Write the config loader",
+            assistant_response=(
+                "Here's the config loader using YAML."
+                " Let me know if you need changes."
+            ),
         )
 
-        patterns = await mgr.query_behavioral()
-        # At least one pattern should have frequency > 1
-        assert any(p.frequency >= 2 for p in patterns)
+        # Turn 2: correction
+        result = await engine.on_turn_complete(
+            user_message="no, use JSON not YAML",
+            assistant_response="Got it, switching to JSON.",
+        )
+
+        assert result.followup_type == FollowupType.CORRECTION
+        assert result.pattern is not None
+        assert result.pattern.pattern_type == "behavioral_correction"
 
     @pytest.mark.asyncio
-    async def test_stores_correction_pattern(self, tmp_path):
+    async def test_new_task_no_gap(self, tmp_path):
+        """New tasks after completion should not trigger gap analysis."""
         engine, mgr = await _make_engine(tmp_path)
-        await engine.reflect_on_turn(
-            user_message="No, don't add comments to every line of code.",
-            previous_assistant_message="I've added comments throughout.",
+
+        # Turn 1: completion
+        await engine.on_turn_complete(
+            user_message="Fix the login bug",
+            assistant_response="I've fixed the login bug. Let me know if you need anything else.",
         )
-        patterns = await mgr.query_behavioral()
-        assert any(p.pattern_type == "behavioral_correction" for p in patterns)
+
+        # Turn 2: new task
+        result = await engine.on_turn_complete(
+            user_message="btw, can you help me with something else entirely?",
+            assistant_response="Sure, what do you need?",
+        )
+
+        assert result.followup_type == FollowupType.NEW_TASK
+        assert result.signal is None
+        assert result.pattern is None
 
     @pytest.mark.asyncio
-    async def test_stores_style_pattern(self, tmp_path):
+    async def test_no_completion_no_gap(self, tmp_path):
+        """If the model didn't reach a completion point, no gap analysis."""
+        engine, _ = await _make_engine(tmp_path)
+
+        # Turn 1: model asks a question (not a completion point)
+        await engine.on_turn_complete(
+            user_message="Build the API",
+            assistant_response="Should I use REST or GraphQL?",
+        )
+
+        # Turn 2: user answers (not a follow-up to completion)
+        result = await engine.on_turn_complete(
+            user_message="Use REST",
+            assistant_response=(
+                "Got it, implementing REST API."
+                " Here's the implementation."
+                " Let me know if you need anything else."
+            ),
+        )
+
+        assert result.followup_type is None
+        assert result.signal is None
+
+    @pytest.mark.asyncio
+    async def test_frequency_increases_on_repeated_gap(self, tmp_path):
+        """Same gap pattern appearing multiple times increases frequency."""
         engine, mgr = await _make_engine(tmp_path)
-        await engine.reflect_on_turn(
-            user_message="Be more concise. Skip the explanation and just show code.",
-        )
+
+        for i in range(3):
+            # Completion
+            await engine.on_turn_complete(
+                user_message=f"Write function {i}",
+                assistant_response=(
+                    "I've implemented the function."
+                    " Let me know if you need anything else."
+                ),
+            )
+            # Same follow-up each time
+            await engine.on_turn_complete(
+                user_message="test and lint it",
+                assistant_response="Running tests...",
+            )
+
         patterns = await mgr.query_behavioral()
-        assert any(p.pattern_type == "behavioral_style" for p in patterns)
+        assert any(p.frequency >= 3 for p in patterns)
 
+    @pytest.mark.asyncio
+    async def test_pending_completion_cleared_after_analysis(self, tmp_path):
+        """Pending completion is cleared after follow-up analysis."""
+        engine, _ = await _make_engine(tmp_path)
 
-# --- LLM signal parsing ---
-
-
-class TestLLMParsing:
-    def test_parse_valid_json_lines(self):
-        text = (
-            '{"type": "preference", "pattern": "Use YAML for configs", "confidence": 0.8}\n'
-            '{"type": "correction", "pattern": "No docstrings", "confidence": 0.6}\n'
+        # Turn 1: completion
+        await engine.on_turn_complete(
+            user_message="Do the thing",
+            assistant_response="All done. Let me know if you need anything else.",
         )
-        signals = ReflectionEngine._parse_llm_signals(text)
-        assert len(signals) == 2
-        assert signals[0].signal_type == "preference"
-        assert signals[1].signal_type == "correction"
+        assert engine._pending_completion is not None
 
-    def test_parse_empty_output(self):
-        signals = ReflectionEngine._parse_llm_signals("")
-        assert len(signals) == 0
-
-    def test_parse_invalid_json(self):
-        text = "This is not JSON\n{broken json}\n"
-        signals = ReflectionEngine._parse_llm_signals(text)
-        assert len(signals) == 0
-
-    def test_parse_unknown_type_ignored(self):
-        text = '{"type": "unknown", "pattern": "something", "confidence": 0.5}\n'
-        signals = ReflectionEngine._parse_llm_signals(text)
-        assert len(signals) == 0
-
-    def test_parse_clamps_confidence(self):
-        text = '{"type": "preference", "pattern": "test", "confidence": 5.0}\n'
-        signals = ReflectionEngine._parse_llm_signals(text)
-        assert len(signals) == 1
-        assert signals[0].confidence == 1.0
+        # Turn 2: any follow-up clears it
+        await engine.on_turn_complete(
+            user_message="thanks",
+            assistant_response="You're welcome!",
+        )
+        assert engine._pending_completion is None
 
 
-# --- Signal merging ---
+# --- Completion summary ---
 
 
-class TestSignalMerging:
-    def test_prefers_llm_signals(self):
-        rule = [SteeringSignal(signal_type="correction", content="raw text")]
-        llm = [SteeringSignal(signal_type="correction", content="Use YAML")]
-        merged = ReflectionEngine._merge_signals(rule, llm)
-        # LLM version should be preferred for correction type
-        assert len(merged) == 1
-        assert merged[0].content == "Use YAML"
+class TestCompletionSummary:
+    def test_short_response_kept_as_is(self):
+        text = "I've fixed the bug."
+        assert GapAnalysisEngine._summarize_completion(text) == text
 
-    def test_adds_rule_signals_for_missing_types(self):
-        rule = [
-            SteeringSignal(signal_type="correction", content="raw"),
-            SteeringSignal(signal_type="style", content="concise"),
-        ]
-        llm = [SteeringSignal(signal_type="correction", content="Use YAML")]
-        merged = ReflectionEngine._merge_signals(rule, llm)
-        assert len(merged) == 2
-        types = {s.signal_type for s in merged}
-        assert "correction" in types
-        assert "style" in types
+    def test_long_response_truncated(self):
+        text = "A" * 500
+        summary = GapAnalysisEngine._summarize_completion(text)
+        assert len(summary) <= 304  # 300 + "..."
+
+    def test_truncates_at_sentence_boundary(self):
+        sentences = "First sentence. " * 25  # >300 chars
+        summary = GapAnalysisEngine._summarize_completion(sentences)
+        assert summary.endswith(".")
+        assert len(summary) <= 300
+
+
+# --- Pattern key ---
+
+
+class TestPatternKey:
+    def test_basic_key(self):
+        key = _pattern_key("Run tests after writing code")
+        assert key == "run-tests-after-writing-code"
+
+    def test_removes_filler_words(self):
+        key = _pattern_key("Can you please just run the tests")
+        assert "please" not in key
+        assert "just" not in key
+        assert "can" not in key
+        assert "you" not in key
+        assert "the" not in key
+
+    def test_truncates_to_8_words(self):
+        key = _pattern_key("one two three four five six seven eight nine ten")
+        assert len(key.split("-")) <= 8
+
+    def test_empty_input(self):
+        assert _pattern_key("") == ""
+
+    def test_only_filler_words(self):
+        assert _pattern_key("just the a") == ""
 
 
 # --- Prompt formatting ---
@@ -235,23 +375,23 @@ class TestPromptFormatting:
     def test_format_single_pattern(self):
         patterns = [
             LearnedPattern(
-                pattern_type="behavioral_preference",
+                pattern_type="behavioral_gap",
                 pattern_key="test",
-                data={"description": "Use YAML for configs"},
+                data={"description": "Run tests after writing code"},
                 frequency=3,
             ),
         ]
         result = format_behaviors_for_prompt(patterns)
-        assert "Learned Preferences" in result
-        assert "Use YAML for configs" in result
+        assert "Learned Behaviors" in result
+        assert "Run tests after writing code" in result
         assert "3x" in result
 
     def test_format_frequency_1_no_count(self):
         patterns = [
             LearnedPattern(
-                pattern_type="behavioral_preference",
+                pattern_type="behavioral_gap",
                 pattern_key="test",
-                data={"description": "Use YAML for configs"},
+                data={"description": "Run tests after writing code"},
                 frequency=1,
             ),
         ]
@@ -261,21 +401,21 @@ class TestPromptFormatting:
     def test_format_multiple_patterns(self):
         patterns = [
             LearnedPattern(
-                pattern_type="behavioral_preference",
+                pattern_type="behavioral_gap",
                 pattern_key="k1",
-                data={"description": "Use YAML"},
+                data={"description": "Run tests after code changes"},
                 frequency=5,
             ),
             LearnedPattern(
                 pattern_type="behavioral_correction",
                 pattern_key="k2",
-                data={"description": "No docstrings"},
+                data={"description": "Use JSON not YAML"},
                 frequency=2,
             ),
         ]
         result = format_behaviors_for_prompt(patterns)
-        assert "Use YAML" in result
-        assert "No docstrings" in result
+        assert "Run tests after code changes" in result
+        assert "Use JSON not YAML" in result
 
 
 # --- Query behavioral patterns ---
@@ -290,9 +430,9 @@ class TestQueryBehavioral:
 
         # Store a behavioral pattern
         await mgr.store_or_update(LearnedPattern(
-            pattern_type="behavioral_preference",
-            pattern_key="yaml-preference",
-            data={"description": "Use YAML"},
+            pattern_type="behavioral_gap",
+            pattern_key="test-gap",
+            data={"description": "Run tests after writing code"},
         ))
 
         # Store an operational pattern
@@ -304,7 +444,7 @@ class TestQueryBehavioral:
 
         behavioral = await mgr.query_behavioral()
         assert len(behavioral) == 1
-        assert behavioral[0].pattern_type == "behavioral_preference"
+        assert behavioral[0].pattern_type == "behavioral_gap"
 
     @pytest.mark.asyncio
     async def test_get_learned_behaviors(self, tmp_path):
@@ -315,9 +455,9 @@ class TestQueryBehavioral:
         # Store multiple behavioral patterns
         for i in range(20):
             await mgr.store_or_update(LearnedPattern(
-                pattern_type="behavioral_preference",
-                pattern_key=f"pref-{i}",
-                data={"description": f"Preference {i}"},
+                pattern_type="behavioral_gap",
+                pattern_key=f"gap-{i}",
+                data={"description": f"Rule {i}"},
             ))
 
         patterns = await get_learned_behaviors(mgr, limit=10)
@@ -340,47 +480,90 @@ class TestQueryBehavioral:
         assert behavioral[0].pattern_type == "user_correction"
 
 
-# --- Non-coding domain examples ---
+# --- Domain-agnostic examples ---
 
 
 class TestDomainAgnostic:
-    """Verify ALM works for non-coding domains."""
+    """Verify gap analysis works across domains."""
 
     @pytest.mark.asyncio
-    async def test_writing_preference(self, tmp_path):
+    async def test_coding_test_and_lint(self, tmp_path):
+        """The canonical case: 'test and lint it' after code completion."""
         engine, mgr = await _make_engine(tmp_path)
-        await engine.reflect_on_turn(
-            user_message="Always use Oxford comma in lists, never skip it.",
+
+        await engine.on_turn_complete(
+            user_message="Implement the CSV parser",
+            assistant_response="Here's the implementation. Let me know if you need anything else.",
         )
+        result = await engine.on_turn_complete(
+            user_message="test and lint it",
+            assistant_response="Running tests and linter...",
+        )
+
+        assert result.followup_type == FollowupType.CONTINUATION
+        assert result.signal is not None
         patterns = await mgr.query_behavioral()
         assert len(patterns) >= 1
 
     @pytest.mark.asyncio
-    async def test_financial_knowledge(self, tmp_path):
+    async def test_writing_edge_case(self, tmp_path):
+        """Writing domain: user asks for something the model should have included."""
         engine, mgr = await _make_engine(tmp_path)
-        await engine.reflect_on_turn(
-            user_message="Our fiscal year starts April 1, keep that in mind for all reports.",
+
+        await engine.on_turn_complete(
+            user_message="Write an executive summary of the Q3 report",
+            assistant_response=(
+                "Here's the executive summary covering revenue"
+                " and growth. Let me know if you need changes."
+            ),
         )
+        result = await engine.on_turn_complete(
+            user_message="what about the methodology section?",
+            assistant_response="Adding methodology now.",
+        )
+
+        assert result.followup_type == FollowupType.CONTINUATION
+        assert result.signal is not None
+
+    @pytest.mark.asyncio
+    async def test_explicit_correction_across_domains(self, tmp_path):
+        """Corrections work the same regardless of domain."""
+        engine, mgr = await _make_engine(tmp_path)
+
+        await engine.on_turn_complete(
+            user_message="Recommend a deployment strategy",
+            assistant_response=(
+                "I recommend a waterfall approach."
+                " Here's the plan."
+                " Let me know if you need changes."
+            ),
+        )
+        result = await engine.on_turn_complete(
+            user_message="no, we use agile sprints exclusively",
+            assistant_response="Got it, switching to agile.",
+        )
+
+        assert result.followup_type == FollowupType.CORRECTION
         patterns = await mgr.query_behavioral()
-        assert len(patterns) >= 1
+        assert any(p.pattern_type == "behavioral_correction" for p in patterns)
 
     @pytest.mark.asyncio
-    async def test_style_feedback_research(self, tmp_path):
+    async def test_financial_analysis(self, tmp_path):
+        """Financial domain: model forgets sensitivity analysis."""
         engine, mgr = await _make_engine(tmp_path)
-        await engine.reflect_on_turn(
-            user_message="Be more specific with citations. Too vague. Show the actual paper title.",
+
+        await engine.on_turn_complete(
+            user_message="Run a DCF analysis on the acquisition target",
+            assistant_response=(
+                "Here's the DCF analysis with projected cash"
+                " flows. The NPV is $12M."
+                " Let me know if you need anything else."
+            ),
         )
-        assert any(
-            p.pattern_type == "behavioral_style"
-            for p in await mgr.query_behavioral()
+        result = await engine.on_turn_complete(
+            user_message="add a sensitivity table",
+            assistant_response="Adding sensitivity table now.",
         )
 
-    @pytest.mark.asyncio
-    async def test_consulting_correction(self, tmp_path):
-        engine, mgr = await _make_engine(tmp_path)
-        await engine.reflect_on_turn(
-            user_message="No, don't recommend waterfall. We use agile sprints exclusively.",
-            previous_assistant_message="I recommend a waterfall approach for this project.",
-        )
-        result_patterns = await mgr.query_behavioral()
-        assert any(p.pattern_type == "behavioral_correction" for p in result_patterns)
+        assert result.followup_type == FollowupType.CONTINUATION
+        assert result.signal is not None
