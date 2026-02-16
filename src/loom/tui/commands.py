@@ -15,6 +15,8 @@ _COMMANDS = [
     ("List tools", "list_tools", "Show all available tools"),
     ("Show model info", "model_info", "Display model details"),
     ("Show token usage", "token_info", "Display session token count"),
+    ("Show help", "help", "List commands and keyboard shortcuts"),
+    ("Quit", "quit", "Save session and exit"),
 ]
 
 

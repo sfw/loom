@@ -1009,8 +1009,11 @@ class LoomApp(App):
         tabs = self.query_one("#tabs", TabbedContent)
         tabs.active = "tab-events"
 
-    def action_loom_command(self, command: str) -> None:
+    async def action_loom_command(self, command: str) -> None:
         """Dispatch command palette actions."""
+        if command == "quit":
+            await self._palette_quit()
+            return
         actions = {
             "clear_chat": self.action_clear_chat,
             "toggle_sidebar": self.action_toggle_sidebar,
@@ -1020,6 +1023,7 @@ class LoomApp(App):
             "list_tools": self._show_tools,
             "model_info": self._show_model_info,
             "token_info": self._show_token_info,
+            "help": self._show_help,
         }
         action_fn = actions.get(command)
         if action_fn:
@@ -1038,6 +1042,28 @@ class LoomApp(App):
     def _show_token_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)
         chat.add_info(f"Session tokens: {self._total_tokens:,}")
+
+    def _show_help(self) -> None:
+        chat = self.query_one("#chat-log", ChatLog)
+        lines = [
+            "Commands: /quit, /clear, /model, /tools, /tokens, "
+            "/learned, /setup, /help",
+            "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette, "
+            "Ctrl+1/2/3 tabs",
+        ]
+        if self._store:
+            lines.insert(1, "  /sessions \u2014 list and switch sessions")
+            lines.insert(2, "  /new \u2014 start a new session")
+            lines.insert(3, "  /session \u2014 current session info")
+            lines.insert(4, "  /learned \u2014 review/delete learned patterns")
+        chat.add_info("\n".join(lines))
+
+    async def _palette_quit(self) -> None:
+        if self._store and self._session and self._session.session_id:
+            await self._store.update_session(
+                self._session.session_id, is_active=False,
+            )
+        self.exit()
 
 
 def _now_str() -> str:

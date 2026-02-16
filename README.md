@@ -8,6 +8,10 @@ It handles anything a capable assistant should: writing and editing code, resear
 
 It also works with Claude and any OpenAI-compatible API, so you can mix local and cloud models in the same task.
 
+**Want the power of Claude Code but coworking with a local model?** Claude Code can technically run against local models — Ollama v0.14.0+ natively speaks the Anthropic Messages API, and proxies like LiteLLM or LM Studio can bridge the gap — but it wasn't designed for them. Local models drift on whitespace, hallucinate tool schemas, and fall apart on multi-step plans. Loom was built from the ground up for these weaknesses: fuzzy edit matching, harness-driven execution, independent verification, and lossless memory. You get the same agentic coding experience with models that actually run on your hardware.
+
+Loom also exposes a REST API built for agentic systems. Orchestrators like OpenClaw can call Loom's 19 endpoints to offload complex multi-step tasks — decomposition, tool calling, verification, and memory — that they are largely inept at executing on their own. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive.
+
 ## Why Loom Exists
 
 Cloud-hosted agents are good but come with constraints: token costs, rate limits, privacy concerns, and vendor lock-in. Local models are getting capable enough for real work, but they lack the scaffolding that makes cloud agents useful. A 14B model can write correct code, draft a solid analysis, or answer complex questions -- but it can't plan multi-step work, verify its own output, recover from mistakes, or remember what it did three turns ago without help.
