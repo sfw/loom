@@ -53,6 +53,13 @@ class TestCLI:
         assert "--live" in result.output
         assert "--case" in result.output
 
+    def test_learned_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["learned", "--help"])
+        assert result.exit_code == 0
+        assert "--all" in result.output
+        assert "--type" in result.output
+
     def test_status_help(self):
         runner = CliRunner()
         result = runner.invoke(cli, ["status", "--help"])

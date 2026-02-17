@@ -37,6 +37,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (
+    DirectoryTree,
     Footer,
     Header,
     Input,
@@ -58,6 +59,7 @@ from loom.tui.commands import LoomCommands
 from loom.tui.screens import (
     AskUserScreen,
     ExitConfirmScreen,
+    FileViewerScreen,
     LearnedScreen,
     SetupScreen,
     ToolApprovalScreen,
@@ -853,11 +855,11 @@ class LoomApp(App):
     # ------------------------------------------------------------------
 
     async def _show_learned_patterns(self) -> None:
-        """Show the learned patterns review modal."""
+        """Show the learned behavioral patterns review modal."""
         from loom.learning.manager import LearningManager
 
         mgr = LearningManager(self._db)
-        patterns = await mgr.query_all(limit=50)
+        patterns = await mgr.query_behavioral(limit=50)
 
         def handle_result(result: str) -> None:
             if result:
@@ -972,6 +974,21 @@ class LoomApp(App):
         if self._apply_slash_tab_completion(reverse=event.key == "shift+tab"):
             event.stop()
             event.prevent_default()
+
+    @on(DirectoryTree.FileSelected, "#workspace-tree")
+    def on_workspace_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        """Open a modal preview when selecting a file in the workspace tree."""
+        selected = self._resolve_workspace_file(Path(event.path))
+        if selected is None:
+            self.notify(
+                "Cannot open files outside the workspace.",
+                severity="error",
+                timeout=4,
+            )
+            return
+        event.stop()
+        event.prevent_default()
+        self.push_screen(FileViewerScreen(selected, self._workspace))
 
     async def _handle_slash_command(self, text: str) -> bool:
         """Handle slash commands. Returns True if handled."""
@@ -1447,6 +1464,21 @@ class LoomApp(App):
         except Exception:
             return
         sidebar.refresh_workspace_tree()
+
+    def _resolve_workspace_file(self, path: Path) -> Path | None:
+        """Resolve a selected file and ensure it remains inside workspace."""
+        try:
+            resolved = path.resolve()
+            workspace_root = self._workspace.resolve()
+        except OSError:
+            return None
+        if not resolved.is_file():
+            return None
+        try:
+            resolved.relative_to(workspace_root)
+        except ValueError:
+            return None
+        return resolved
 
     def _update_files_panel(self, turn: CoworkTurn) -> None:
         """Update the Files Changed panel from tool call events."""

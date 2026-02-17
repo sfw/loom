@@ -1753,6 +1753,51 @@ class TestCommandPaletteProcessActions:
         app.notify.assert_called_once_with("Workspace reloaded", timeout=2)
 
     @pytest.mark.asyncio
+    async def test_show_learned_patterns_queries_behavioral(self, monkeypatch):
+        from loom.learning.manager import LearnedPattern
+        from loom.tui.app import LoomApp
+        from loom.tui.screens.learned import LearnedScreen
+
+        pattern = LearnedPattern(
+            pattern_type="behavioral_gap",
+            pattern_key="run-tests",
+            data={"description": "Run tests before reporting completion."},
+        )
+
+        class FakeLearningManager:
+            def __init__(self, db):
+                self._db = db
+
+            async def query_behavioral(self, limit=15):
+                assert limit == 50
+                return [pattern]
+
+        monkeypatch.setattr(
+            "loom.learning.manager.LearningManager", FakeLearningManager,
+        )
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._db = MagicMock()
+
+        pushed: dict[str, object] = {}
+
+        def _push(screen, callback=None):
+            pushed["screen"] = screen
+            pushed["callback"] = callback
+
+        app.push_screen = _push
+
+        await app._show_learned_patterns()
+
+        assert isinstance(pushed.get("screen"), LearnedScreen)
+        assert pushed["screen"]._patterns == [pattern]
+        assert callable(pushed.get("callback"))
+
+    @pytest.mark.asyncio
     async def test_process_info_action(self):
         from loom.tui.app import LoomApp
 
@@ -1941,3 +1986,167 @@ class TestSlashHelp:
 
         assert handled is True
         chat.add_info.assert_called_once_with("Usage: /resume <session-id-prefix>")
+
+
+class TestFileViewer:
+    def test_renderer_registry_supports_common_types(self):
+        from loom.tui.screens.file_viewer import resolve_file_renderer
+
+        assert resolve_file_renderer(Path("README.md")) is not None
+        assert resolve_file_renderer(Path("README.markdown")) is not None
+        assert resolve_file_renderer(Path("src/main.ts")) is not None
+        assert resolve_file_renderer(Path("styles/site.css")) is not None
+        assert resolve_file_renderer(Path("data.json")) is not None
+        assert resolve_file_renderer(Path("report.csv")) is not None
+        assert resolve_file_renderer(Path("slides.pptx")) is not None
+        assert resolve_file_renderer(Path("paper.pdf")) is not None
+        assert resolve_file_renderer(Path("image.png")) is not None
+        assert resolve_file_renderer(Path("Dockerfile")) is not None
+        assert resolve_file_renderer(Path("README.foobar")) is None
+
+    def test_file_viewer_loads_markdown_preview(self, tmp_path):
+        from loom.tui.screens.file_viewer import FileViewerScreen
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        doc = workspace / "notes.md"
+        doc.write_text("# Hello\n\nThis is a markdown preview.\n", encoding="utf-8")
+
+        screen = FileViewerScreen(doc, workspace)
+
+        assert screen._error is None
+        assert screen._viewer is not None
+
+    def test_file_viewer_loads_json_preview(self, tmp_path):
+        from loom.tui.screens.file_viewer import FileViewerScreen
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        doc = workspace / "data.json"
+        doc.write_text('{"b":2,"a":1}', encoding="utf-8")
+
+        screen = FileViewerScreen(doc, workspace)
+
+        assert screen._error is None
+        assert screen._viewer is not None
+
+    def test_file_viewer_loads_csv_preview(self, tmp_path):
+        from loom.tui.screens.file_viewer import FileViewerScreen
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        doc = workspace / "table.csv"
+        doc.write_text("name,value\nfoo,1\nbar,2\n", encoding="utf-8")
+
+        screen = FileViewerScreen(doc, workspace)
+
+        assert screen._error is None
+        assert screen._viewer is not None
+
+    def test_file_viewer_loads_html_preview(self, tmp_path):
+        from loom.tui.screens.file_viewer import FileViewerScreen
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        doc = workspace / "index.html"
+        doc.write_text(
+            "<html><body><h1>Title</h1><p>Hello world</p></body></html>",
+            encoding="utf-8",
+        )
+
+        screen = FileViewerScreen(doc, workspace)
+
+        assert screen._error is None
+        assert screen._viewer is not None
+
+    def test_file_viewer_image_metadata_preview(self, tmp_path):
+        from loom.tui.screens.file_viewer import FileViewerScreen
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        image = workspace / "pixel.png"
+        image.write_bytes(
+            bytes.fromhex(
+                "89504E470D0A1A0A"
+                "0000000D49484452"
+                "0000000100000001"
+                "08060000001F15C489"
+                "0000000A49444154"
+                "789C6360000000020001E221BC33"
+                "0000000049454E44AE426082"
+            ),
+        )
+
+        screen = FileViewerScreen(image, workspace)
+
+        assert screen._error is None
+        assert screen._viewer is not None
+
+    def test_file_viewer_unsupported_extension_sets_error(self, tmp_path):
+        from loom.tui.screens.file_viewer import FileViewerScreen
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        unknown = workspace / "data.foobar"
+        unknown.write_text("hello", encoding="utf-8")
+
+        screen = FileViewerScreen(unknown, workspace)
+
+        assert screen._viewer is None
+        assert screen._error is not None
+        assert "No viewer renderer registered" in screen._error
+
+    def test_workspace_file_selected_opens_viewer_modal(self, tmp_path):
+        from textual.widgets import DirectoryTree
+
+        from loom.tui.app import LoomApp
+        from loom.tui.screens.file_viewer import FileViewerScreen
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        doc = workspace / "notes.md"
+        doc.write_text("# Hello\n", encoding="utf-8")
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=workspace,
+        )
+        app.push_screen = MagicMock()
+        app.notify = MagicMock()
+
+        event = DirectoryTree.FileSelected(MagicMock(), doc)
+        app.on_workspace_file_selected(event)
+
+        app.push_screen.assert_called_once()
+        screen = app.push_screen.call_args.args[0]
+        assert isinstance(screen, FileViewerScreen)
+        app.notify.assert_not_called()
+
+    def test_workspace_file_selected_rejects_paths_outside_workspace(self, tmp_path):
+        from textual.widgets import DirectoryTree
+
+        from loom.tui.app import LoomApp
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        outside = tmp_path / "outside.md"
+        outside.write_text("# Outside\n", encoding="utf-8")
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=workspace,
+        )
+        app.push_screen = MagicMock()
+        app.notify = MagicMock()
+
+        event = DirectoryTree.FileSelected(MagicMock(), outside)
+        app.on_workspace_file_selected(event)
+
+        app.push_screen.assert_not_called()
+        app.notify.assert_called_once_with(
+            "Cannot open files outside the workspace.",
+            severity="error",
+            timeout=4,
+        )
