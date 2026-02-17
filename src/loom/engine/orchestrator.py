@@ -516,7 +516,8 @@ class Orchestrator:
         model = self._router.select(tier=2, role="planner")
         response = await model.complete([{"role": "user", "content": prompt}])
 
-        return self._parse_plan(response, goal=task.goal)
+        plan = self._parse_plan(response, goal=task.goal)
+        return self._apply_process_phase_mode(plan)
 
     # Document extensions grouped by category for workspace scanning.
     _DOC_EXTENSIONS: dict[str, tuple[str, ...]] = {
@@ -670,7 +671,9 @@ class Orchestrator:
 
             model = self._router.select(tier=2, role="planner")
             response = await model.complete([{"role": "user", "content": prompt}])
-            new_plan = self._parse_plan(response, goal=task.goal)
+            new_plan = self._apply_process_phase_mode(
+                self._parse_plan(response, goal=task.goal),
+            )
 
             # Preserve completed subtask state
             completed_ids = {
@@ -729,6 +732,48 @@ class Orchestrator:
             ))
 
         return Plan(subtasks=subtasks, version=1)
+
+    def _apply_process_phase_mode(self, plan: Plan) -> Plan:
+        """Apply process phase-mode constraints to the planner output."""
+        if not self._process or not self._process.phases:
+            return plan
+        if self._process.phase_mode != "strict":
+            return plan
+
+        planner_subtasks = {s.id: s for s in plan.subtasks}
+        strict_subtasks: list[Subtask] = []
+
+        for phase in self._process.phases:
+            existing = planner_subtasks.get(phase.id)
+            if existing is None:
+                strict_subtasks.append(
+                    Subtask(
+                        id=phase.id,
+                        description=phase.description,
+                        depends_on=list(phase.depends_on),
+                        model_tier=phase.model_tier,
+                        verification_tier=phase.verification_tier,
+                        is_critical_path=phase.is_critical_path,
+                        acceptance_criteria=phase.acceptance_criteria,
+                        max_retries=self._config.execution.max_subtask_retries,
+                    )
+                )
+                continue
+
+            existing.description = phase.description or existing.description
+            existing.depends_on = list(phase.depends_on)
+            existing.model_tier = phase.model_tier
+            existing.verification_tier = phase.verification_tier
+            existing.is_critical_path = phase.is_critical_path
+            if phase.acceptance_criteria:
+                existing.acceptance_criteria = phase.acceptance_criteria
+            strict_subtasks.append(existing)
+
+        return Plan(
+            subtasks=strict_subtasks,
+            version=plan.version,
+            last_replanned=plan.last_replanned,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
