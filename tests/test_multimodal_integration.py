@@ -244,10 +244,10 @@ class TestRunnerToolEvents:
         from loom.engine.runner import SubtaskRunner
         runner = SubtaskRunner.__new__(SubtaskRunner)
         runner._event_bus = None
-        # Should not raise
-        runner._emit_tool_event(
+        result = runner._emit_tool_event(
             "tool_call_started", "task1", "sub1", "read_file", {"path": "a.py"},
         )
+        assert result is None
 
     def test_emit_tool_event_with_result(self):
         """Runner emits tool events with content_blocks data."""

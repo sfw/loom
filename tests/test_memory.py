@@ -39,6 +39,12 @@ class TestDatabase:
     async def test_initialize_idempotent(self, db: Database):
         # Calling initialize again should not error
         await db.initialize()
+        tables = await db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        table_names = {t["name"] for t in tables}
+        assert "tasks" in table_names
+        assert "memory_entries" in table_names
 
     async def test_insert_and_get_task(self, db: Database):
         await db.insert_task(

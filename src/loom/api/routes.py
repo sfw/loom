@@ -59,8 +59,11 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
     process_def = None
     if body.process:
         from loom.processes.schema import ProcessLoader, ProcessNotFoundError
+
+        extra = [Path(p) for p in engine.config.process.search_paths]
         loader = ProcessLoader(
             workspace=Path(body.workspace) if body.workspace else None,
+            extra_search_paths=extra,
         )
         try:
             process_def = loader.load(body.process)
@@ -109,11 +112,13 @@ async def _execute_in_background(engine: Engine, task, process_def=None) -> None
     import logging
     _bg_logger = logging.getLogger(__name__)
     try:
-        # Inject process definition for this task if specified
+        # Process-aware runs use an isolated orchestrator to avoid
+        # cross-task state leakage on shared engine.orchestrator.
+        orchestrator = engine.orchestrator
         if process_def is not None:
-            engine.orchestrator._process = process_def
-            engine.orchestrator._prompts.process = process_def
-        result = await engine.orchestrator.execute_task(task)
+            orchestrator = engine.create_task_orchestrator(process_def)
+
+        result = await orchestrator.execute_task(task)
         # Sync final status to SQLite
         try:
             await engine.database.update_task_status(result.id, result.status.value)

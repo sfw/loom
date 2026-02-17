@@ -1191,11 +1191,21 @@ class TestRegisterBundledTools:
 
     def test_skips_missing_tools_dir(self, tmp_path):
         """No error when package has no tools/ directory."""
+        import sys
+
         pkg = tmp_path / "pkg"
         pkg.mkdir()
         (pkg / "process.yaml").write_text("name: no-tools\nversion: '1.0'\n")
-        # Should not raise
+        before = {
+            name for name in sys.modules
+            if name.startswith("loom.processes._bundled.pkg.")
+        }
         ProcessLoader._register_bundled_tools(pkg)
+        after = {
+            name for name in sys.modules
+            if name.startswith("loom.processes._bundled.pkg.")
+        }
+        assert after == before
 
     def test_skips_underscore_files(self, tmp_path):
         """Files starting with _ are skipped."""
