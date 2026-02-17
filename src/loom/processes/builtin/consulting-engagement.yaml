@@ -81,6 +81,17 @@ phases:
       - "presentation-outline.md — slide-by-slide outline with action titles"
       - "executive-summary.md — one-page summary for senior leadership"
 
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Run the consulting-engagement process and produce all declared deliverables."
+    timeout_seconds: 900
+  - id: live-canary
+    mode: live
+    goal: "Execute a consulting-style strategic engagement using current evidence and recommendations."
+    timeout_seconds: 1200
+    requires_network: true
+
 verification:
   rules:
     - name: mece-structure

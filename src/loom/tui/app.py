@@ -74,6 +74,7 @@ from loom.tui.widgets.tool_call import tool_args_preview
 
 if TYPE_CHECKING:
     from loom.config import Config
+    from loom.processes.schema import ProcessDefinition
     from loom.state.conversation_store import ConversationStore
     from loom.state.memory import Database
 
@@ -114,6 +115,16 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         canonical="/learned",
         description="review/delete learned patterns",
     ),
+    SlashCommandSpec(
+        canonical="/process",
+        usage="[list|use <name>|off]",
+        description="inspect/switch active process",
+    ),
+    SlashCommandSpec(
+        canonical="/run",
+        usage="<goal>",
+        description="run goal via active process orchestrator",
+    ),
 )
 _MAX_SLASH_HINT_LINES = 14
 
@@ -151,6 +162,7 @@ class LoomApp(App):
         Binding("ctrl+c", "request_quit", "Quit", show=True, priority=True),
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True),
         Binding("ctrl+l", "clear_chat", "Clear", show=True),
+        Binding("ctrl+r", "reload_workspace", "Reload", show=True),
         Binding("ctrl+1", "tab_chat", "Chat"),
         Binding("ctrl+2", "tab_files", "Files"),
         Binding("ctrl+3", "tab_events", "Events"),
@@ -178,6 +190,7 @@ class LoomApp(App):
         self._store = store
         self._resume_session = resume_session
         self._process_name = process_name
+        self._process_defn: ProcessDefinition | None = None
         self._session: CoworkSession | None = None
         self._busy = False
         self._total_tokens = 0
@@ -266,6 +279,124 @@ class LoomApp(App):
 
         await self._initialize_session()
 
+    def _refresh_tool_registry(self) -> None:
+        """Reset registry to discovered tools."""
+        from loom.tools import create_default_registry
+
+        self._tools = create_default_registry(self._config)
+
+    def _create_process_loader(self):
+        """Create a process loader for the current workspace/config."""
+        from loom.processes.schema import ProcessLoader
+
+        extra: list[Path] = []
+        if self._config:
+            extra = [Path(p) for p in self._config.process.search_paths]
+        return ProcessLoader(
+            workspace=self._workspace,
+            extra_search_paths=extra,
+        )
+
+    def _active_process_name(self) -> str:
+        """Return active process display name."""
+        if self._process_defn:
+            return self._process_defn.name
+        return "none"
+
+    def _load_process_definition(self, chat: ChatLog) -> None:
+        """Load active process definition and import bundled tools."""
+        self._process_defn = None
+        if not self._process_name:
+            return
+
+        loader = self._create_process_loader()
+        try:
+            self._process_defn = loader.load(self._process_name)
+            # Process load may import bundled tool modules; rebuild to include
+            # them in the active registry.
+            self._refresh_tool_registry()
+            chat.add_info(
+                f"Process: [bold]{self._process_defn.name}[/bold] "
+                f"v{self._process_defn.version}"
+            )
+        except Exception as e:
+            chat.add_info(
+                f"[bold #f7768e]Failed to load process "
+                f"'{self._process_name}': {e}[/]"
+            )
+
+    async def _reload_session_for_process_change(self, chat: ChatLog) -> None:
+        """Rebuild session after changing active process."""
+        if self._busy:
+            chat.add_info(
+                "[bold #f7768e]Cannot switch process while a turn is running.[/]"
+            )
+            return
+
+        if self._session is not None:
+            if self._store and self._session.session_id:
+                await self._store.update_session(
+                    self._session.session_id, is_active=False,
+                )
+            self._session = None
+
+        self._resume_session = None
+        await self._initialize_session()
+
+    def _render_process_catalog(self) -> str:
+        """Build a human-readable process list."""
+        loader = self._create_process_loader()
+        available = loader.list_available()
+        if not available:
+            return "No process definitions found."
+
+        active = self._process_defn.name if self._process_defn else ""
+        lines = ["[bold]Available processes:[/bold]"]
+        for proc in available:
+            name = proc["name"]
+            ver = proc["version"]
+            desc = proc.get("description", "").strip().split("\n")[0]
+            marker = " [cyan]<< active[/cyan]" if name == active else ""
+            lines.append(f"  {name:30s} v{ver:6s}{marker}")
+            if desc:
+                lines.append(f"    [dim]{desc[:80]}[/dim]")
+        return "\n".join(lines)
+
+    def _apply_process_tool_policy(self, chat: ChatLog) -> None:
+        """Apply process tool exclusions to the active registry."""
+        if not self._process_defn:
+            return
+        if self._process_defn.tools.excluded:
+            for tool_name in self._process_defn.tools.excluded:
+                self._tools.exclude(tool_name)
+        if self._process_defn.tools.required:
+            missing = [
+                tool_name
+                for tool_name in self._process_defn.tools.required
+                if not self._tools.has(tool_name)
+            ]
+            if missing:
+                joined = ", ".join(sorted(missing))
+                chat.add_info(
+                    f"[bold #f7768e]Process requires missing tool(s): "
+                    f"{joined}[/]"
+                )
+
+    def _build_system_prompt(self) -> str:
+        """Build cowork system prompt with optional process extensions."""
+        system_prompt = build_cowork_system_prompt(self._workspace)
+        if self._process_defn:
+            if self._process_defn.persona:
+                system_prompt += (
+                    f"\n\nDOMAIN ROLE:\n{self._process_defn.persona.strip()}"
+                )
+            if self._process_defn.tool_guidance:
+                system_prompt += (
+                    f"\n\nDOMAIN TOOL GUIDANCE:\n"
+                    f"{self._process_defn.tool_guidance.strip()}"
+                )
+        return system_prompt
+
     async def _initialize_session(self) -> None:
         """Initialize tools, session, and welcome message.
 
@@ -273,56 +404,21 @@ class LoomApp(App):
         Requires self._model to be set.
         """
         chat = self.query_one("#chat-log", ChatLog)
+        self._total_tokens = 0
 
-        # Register extra tools if persistence is available
-        if self._store is not None and self._recall_tool is None:
-            from loom.tools.conversation_recall import ConversationRecallTool
-            from loom.tools.delegate_task import DelegateTaskTool
+        # Start from a clean registry each initialization to avoid stale
+        # excludes/bindings when setup or process configuration changes.
+        self._refresh_tool_registry()
 
-            self._recall_tool = ConversationRecallTool()
-            if not self._tools.has(self._recall_tool.name):
-                self._tools.register(self._recall_tool)
+        # Load process definition (imports bundled tools, then refreshes).
+        self._load_process_definition(chat)
 
-            self._delegate_tool = DelegateTaskTool()
-            if not self._tools.has(self._delegate_tool.name):
-                self._tools.register(self._delegate_tool)
-
-        # Load process definition if specified
-        process_defn = None
-        if self._process_name and self._config:
-            from loom.processes.schema import ProcessLoader
-
-            extra = [Path(p) for p in self._config.process.search_paths]
-            loader = ProcessLoader(
-                workspace=self._workspace, extra_search_paths=extra,
-            )
-            try:
-                process_defn = loader.load(self._process_name)
-                chat.add_info(
-                    f"Process: [bold]{process_defn.name}[/bold] "
-                    f"v{process_defn.version}"
-                )
-                if process_defn.tools.excluded:
-                    for tool_name in process_defn.tools.excluded:
-                        self._tools.exclude(tool_name)
-            except Exception as e:
-                chat.add_info(
-                    f"[bold #f7768e]Failed to load process "
-                    f"'{self._process_name}': {e}[/]"
-                )
+        # Ensure persistence-dependent tools are present and tracked.
+        self._ensure_persistence_tools()
 
         # Build system prompt
-        system_prompt = build_cowork_system_prompt(self._workspace)
-        if process_defn:
-            if process_defn.persona:
-                system_prompt += (
-                    f"\n\nDOMAIN ROLE:\n{process_defn.persona.strip()}"
-                )
-            if process_defn.tool_guidance:
-                system_prompt += (
-                    f"\n\nDOMAIN TOOL GUIDANCE:\n"
-                    f"{process_defn.tool_guidance.strip()}"
-                )
+        self._apply_process_tool_policy(chat)
+        system_prompt = self._build_system_prompt()
 
         # Build approver
         approver = ToolApprover(prompt_callback=self._approval_callback)
@@ -388,6 +484,7 @@ class LoomApp(App):
         status = self.query_one("#status-bar", StatusBar)
         status.workspace_name = self._workspace.name
         status.model_name = self._model.name
+        status.process_name = self._active_process_name()
 
         # Welcome message
         chat.add_info(
@@ -402,7 +499,52 @@ class LoomApp(App):
                 f"[dim]session: {self._session.session_id}[/dim]"
             )
 
+        # Resume is a one-shot startup hint; subsequent reinitializations
+        # should not keep trying to reopen the same prior session.
+        self._resume_session = None
+
         self.query_one("#user-input", Input).focus()
+
+    def _ensure_persistence_tools(self) -> None:
+        """Ensure recall/delegate tools are registered and tracked.
+
+        Tool auto-discovery may pre-register these tool names. We must bind
+        and use the *registered* instances, otherwise /run can hit an
+        unbound delegate_task instance ("no orchestrator configured").
+        """
+        self._recall_tool = None
+        self._delegate_tool = None
+        if self._store is None:
+            return
+
+        from loom.tools.conversation_recall import ConversationRecallTool
+        from loom.tools.delegate_task import DelegateTaskTool
+
+        recall = self._tools.get("conversation_recall")
+        if recall is not None and not isinstance(recall, ConversationRecallTool):
+            logger.warning(
+                "Replacing unexpected conversation_recall tool type: %s",
+                type(recall).__name__,
+            )
+            self._tools.exclude("conversation_recall")
+            recall = None
+        if recall is None:
+            recall = ConversationRecallTool()
+            self._tools.register(recall)
+        self._recall_tool = recall
+
+        delegate = self._tools.get("delegate_task")
+        if delegate is not None and not isinstance(delegate, DelegateTaskTool):
+            logger.warning(
+                "Replacing unexpected delegate_task tool type: %s",
+                type(delegate).__name__,
+            )
+            self._tools.exclude("delegate_task")
+            delegate = None
+        if delegate is None:
+            delegate = DelegateTaskTool()
+            self._tools.register(delegate)
+        self._delegate_tool = delegate
 
     def _slash_command_catalog(self) -> list[tuple[str, str]]:
         """Return canonical slash commands with optional alias annotations."""
@@ -434,7 +576,8 @@ class LoomApp(App):
                 label = f"{label} ({alias_str})"
             lines.append(f"  {label:<34} {spec.description}")
         lines.append(
-            "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette, Ctrl+1/2/3 tabs",
+            "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+R reload workspace, "
+            "Ctrl+P palette, Ctrl+1/2/3 tabs",
         )
         return lines
 
@@ -523,6 +666,8 @@ class LoomApp(App):
 
     def _render_slash_hint(self, raw_input: str) -> str:
         """Build slash-command hint text for the current input."""
+        if " " in raw_input.strip():
+            return ""
         token, matches = self._matching_slash_commands(raw_input)
         if not token:
             return ""
@@ -538,6 +683,14 @@ class LoomApp(App):
         for cmd, desc in matches:
             lines.append(f"  [#73daca]{cmd:<10}[/] {desc}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _strip_wrapping_quotes(value: str) -> str:
+        """Remove matching wrapping quotes from a command argument."""
+        text = value.strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+            return text[1:-1].strip()
+        return text
 
     def _set_slash_hint(self, hint_text: str) -> None:
         """Show or hide the slash-command hint panel."""
@@ -612,6 +765,7 @@ class LoomApp(App):
                         state_manager=TaskStateManager(data_dir),
                         event_bus=EventBus(),
                         config=config,
+                        process=self._process_defn,
                     )
 
                 self._delegate_tool.bind(_orchestrator_factory)
@@ -638,7 +792,7 @@ class LoomApp(App):
             self._session.session_id, is_active=False,
         )
 
-        system_prompt = build_cowork_system_prompt(self._workspace)
+        system_prompt = self._build_system_prompt()
         approver = ToolApprover(prompt_callback=self._approval_callback)
         session_id = await self._store.create_session(
             workspace=str(self._workspace),
@@ -667,7 +821,7 @@ class LoomApp(App):
             return
 
         old_id = self._session.session_id
-        system_prompt = build_cowork_system_prompt(self._workspace)
+        system_prompt = self._build_system_prompt()
         approver = ToolApprover(prompt_callback=self._approval_callback)
 
         new_session = CoworkSession(
@@ -854,6 +1008,74 @@ class LoomApp(App):
         if token == "/tokens":
             chat.add_info(f"Session tokens: {self._total_tokens:,}")
             return True
+        if token == "/process":
+            if not arg:
+                active = self._active_process_name()
+                chat.add_info(
+                    f"Active process: {active}\n"
+                    "Usage:\n"
+                    "  /process list\n"
+                    "  /process use <name-or-path>\n"
+                    "  /process off"
+                )
+                return True
+
+            subparts = arg.split(None, 1)
+            subcmd = subparts[0].lower()
+            rest = subparts[1].strip() if len(subparts) > 1 else ""
+
+            if subcmd == "list":
+                chat.add_info(self._render_process_catalog())
+                return True
+
+            if subcmd == "use":
+                if not rest:
+                    chat.add_info("Usage: /process use <name-or-path>")
+                    return True
+                loader = self._create_process_loader()
+                try:
+                    loaded = loader.load(rest)
+                except Exception as e:
+                    chat.add_info(
+                        f"[bold #f7768e]Failed to load process "
+                        f"'{rest}': {e}[/]"
+                    )
+                    return True
+
+                self._process_name = rest
+                await self._reload_session_for_process_change(chat)
+                chat.add_info(
+                    f"Active process: [bold]{loaded.name}[/bold] v{loaded.version}"
+                )
+                return True
+
+            if subcmd in {"off", "none", "clear"}:
+                if not self._process_name and self._process_defn is None:
+                    chat.add_info("No active process.")
+                    return True
+                self._process_name = None
+                self._process_defn = None
+                await self._reload_session_for_process_change(chat)
+                chat.add_info("Active process: none")
+                return True
+
+            chat.add_info(
+                "Usage: /process [list|use <name-or-path>|off]"
+            )
+            return True
+
+        if token == "/run":
+            goal = self._strip_wrapping_quotes(arg)
+            if not goal:
+                chat.add_info("Usage: /run <goal>")
+                return True
+            if self._process_defn is None:
+                chat.add_info(
+                    "No active process. Use /process use <name-or-path> first.",
+                )
+                return True
+            await self._run_process_goal(goal)
+            return True
 
         # Persistence-dependent commands
         if token == "/session":
@@ -864,6 +1086,7 @@ class LoomApp(App):
             info = (
                 f"Session: {self._session.session_id}\n"
                 f"Workspace: {self._session.workspace}\n"
+                f"Process: {self._active_process_name()}\n"
                 f"Turns: {state.turn_count}\n"
                 f"Tokens: {state.total_tokens}\n"
                 f"Focus: {state.current_focus or '(none)'}"
@@ -1041,12 +1264,11 @@ class LoomApp(App):
                         f"{event.name} {event.elapsed_ms}ms",
                     )
 
-                    # Update sidebar tasks if task_tracker
                     if (
-                        event.name == "task_tracker"
+                        event.name in {"task_tracker", "delegate_task"}
                         and event.result.data
                     ):
-                        self._update_sidebar_tasks(event)
+                        self._update_sidebar_tasks(event.result.data)
 
                     # Handle ask_user
                     if (
@@ -1080,6 +1302,99 @@ class LoomApp(App):
                 # Update files panel
                 self._update_files_panel(event)
 
+    async def _run_process_goal(self, goal: str) -> None:
+        """Run a goal through delegate_task using the active process."""
+        chat = self.query_one("#chat-log", ChatLog)
+        status = self.query_one("#status-bar", StatusBar)
+        events_panel = self.query_one("#events-panel", EventPanel)
+
+        if self._busy:
+            chat.add_info(
+                "[bold #f7768e]Cannot run /run while another turn is running.[/]",
+            )
+            return
+
+        if not self._tools.has("delegate_task"):
+            chat.add_info(
+                "[bold #f7768e]Process orchestration is unavailable in this "
+                "session.[/]",
+            )
+            return
+
+        self._busy = True
+        process_name = self._active_process_name()
+        chat.add_user_message(f"/run {goal}")
+        status.state = f"Running {process_name}..."
+        events_panel.add_event(
+            _now_str(),
+            "process_run",
+            f"{process_name}: {goal[:120]}",
+        )
+
+        result = None
+        try:
+            result = await self._tools.execute(
+                "delegate_task",
+                {
+                    "goal": goal,
+                    "wait": True,
+                    "_progress_callback": self._on_process_progress_event,
+                },
+                workspace=self._workspace,
+            )
+            data = getattr(result, "data", None)
+            if isinstance(data, dict):
+                self._update_sidebar_tasks(data)
+            if result.success:
+                chat.add_model_text(result.output or "Process run completed.")
+                events_panel.add_event(_now_str(), "process_ok", process_name)
+            else:
+                error = result.error or result.output or "Process run failed."
+                chat.add_model_text(f"[bold #f7768e]Error:[/] {error}")
+                events_panel.add_event(_now_str(), "process_err", process_name)
+                self._mark_process_run_failed(error)
+                self.notify(error, severity="error", timeout=5)
+            self._refresh_workspace_tree()
+        except Exception as e:  # pragma: no cover - defensive guard
+            chat.add_model_text(f"[bold #f7768e]Error:[/] {e}")
+            events_panel.add_event(_now_str(), "process_err", process_name)
+            self._mark_process_run_failed(str(e))
+            self.notify(str(e), severity="error", timeout=5)
+        finally:
+            self._busy = False
+            status.state = "Ready"
+
+    def _on_process_progress_event(self, data: dict) -> None:
+        """Handle incremental delegate_task progress events in /run flows."""
+        if not isinstance(data, dict):
+            return
+        self._update_sidebar_tasks(data)
+        if data.get("event_type") in {
+            "subtask_completed",
+            "subtask_failed",
+            "task_completed",
+            "task_failed",
+        }:
+            self._refresh_workspace_tree()
+
+    def _mark_process_run_failed(self, error: str) -> None:
+        """Reflect a failed /run execution in the progress panel."""
+        message = error.strip() or "Process run failed."
+        if "timed out" in message.lower():
+            message = (
+                f"{message} Increase LOOM_DELEGATE_TIMEOUT_SECONDS for longer "
+                "runs."
+            )
+        self._update_sidebar_tasks({
+            "tasks": [
+                {
+                    "id": "process-run",
+                    "status": "failed",
+                    "content": f"/run failed: {message}",
+                },
+            ],
+        })
+
     async def _handle_ask_user(self, event: ToolCallEvent) -> str:
         """Show an ask_user modal and return the answer."""
         question = event.args.get("question", "")
@@ -1110,16 +1425,28 @@ class LoomApp(App):
     # Data panel updates
     # ------------------------------------------------------------------
 
-    def _update_sidebar_tasks(self, event: ToolCallEvent) -> None:
-        """Update sidebar task progress from task_tracker result."""
-        if not event.result or not event.result.data:
+    def _update_sidebar_tasks(self, data: dict) -> None:
+        """Update sidebar task progress from a tool result payload."""
+        if not data:
             return
-        data = event.result.data
+        if not isinstance(data, dict):
+            return
         tasks = data.get("tasks", [])
         if not tasks and "id" in data:
             tasks = [data]
-        sidebar = self.query_one("#sidebar", Sidebar)
+        try:
+            sidebar = self.query_one("#sidebar", Sidebar)
+        except Exception:
+            return
         sidebar.update_tasks(tasks)
+
+    def _refresh_workspace_tree(self) -> None:
+        """Reload sidebar workspace tree to pick up new files."""
+        try:
+            sidebar = self.query_one("#sidebar", Sidebar)
+        except Exception:
+            return
+        sidebar.refresh_workspace_tree()
 
     def _update_files_panel(self, turn: CoworkTurn) -> None:
         """Update the Files Changed panel from tool call events."""
@@ -1169,6 +1496,7 @@ class LoomApp(App):
             panel.update_files(file_entries)
             if last_diff:
                 panel.show_diff(last_diff)
+            self._refresh_workspace_tree()
             count = len(file_entries)
             s = "s" if count != 1 else ""
             self.notify(
@@ -1186,6 +1514,11 @@ class LoomApp(App):
         chat = self.query_one("#chat-log", ChatLog)
         for child in list(chat.children):
             child.remove()
+
+    def action_reload_workspace(self) -> None:
+        """Reload sidebar workspace tree to show external file changes."""
+        self._refresh_workspace_tree()
+        self.notify("Workspace reloaded", timeout=2)
 
     def action_tab_chat(self) -> None:
         tabs = self.query_one("#tabs", TabbedContent)
@@ -1244,14 +1577,27 @@ class LoomApp(App):
         if command == "quit":
             self.action_request_quit()
             return
+        if command == "process_off":
+            chat = self.query_one("#chat-log", ChatLog)
+            if not self._process_name and self._process_defn is None:
+                chat.add_info("No active process.")
+                return
+            self._process_name = None
+            self._process_defn = None
+            await self._reload_session_for_process_change(chat)
+            chat.add_info("Active process: none")
+            return
         actions = {
             "clear_chat": self.action_clear_chat,
             "toggle_sidebar": self.action_toggle_sidebar,
+            "reload_workspace": self.action_reload_workspace,
             "tab_chat": self.action_tab_chat,
             "tab_files": self.action_tab_files,
             "tab_events": self.action_tab_events,
             "list_tools": self._show_tools,
             "model_info": self._show_model_info,
+            "process_info": self._show_process_info,
+            "process_list": self._show_process_list,
             "token_info": self._show_token_info,
             "help": self._show_help,
         }
@@ -1268,6 +1614,14 @@ class LoomApp(App):
         chat = self.query_one("#chat-log", ChatLog)
         name = self._model.name if self._model else "(not configured)"
         chat.add_info(f"Model: {name}")
+
+    def _show_process_info(self) -> None:
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(f"Active process: {self._active_process_name()}")
+
+    def _show_process_list(self) -> None:
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(self._render_process_catalog())
 
     def _show_token_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)

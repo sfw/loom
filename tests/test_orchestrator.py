@@ -7,8 +7,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from loom.config import Config
+from loom.config import Config, ExecutionConfig
 from loom.engine.orchestrator import Orchestrator, SubtaskResult, ToolCallRecord, create_task
+from loom.engine.verification import VerificationResult
 from loom.events.bus import EventBus
 from loom.events.types import (
     TASK_COMPLETED,
@@ -19,6 +20,7 @@ from loom.events.types import (
 )
 from loom.models.base import ModelResponse, TokenUsage, ToolCall
 from loom.models.router import ModelRouter
+from loom.processes.schema import PhaseTemplate, ProcessDefinition
 from loom.prompts.assembler import PromptAssembler
 from loom.state.task_state import (
     Subtask,
@@ -79,6 +81,7 @@ def _make_mock_router(plan_response_text: str = "", executor_responses=None):
 def _make_mock_tools():
     tools = MagicMock(spec=ToolRegistry)
     tools.execute = AsyncMock(return_value=ToolResult.ok("success"))
+    tools.list_tools = MagicMock(return_value=["read_file", "write_file"])
     tools.all_schemas = MagicMock(return_value=[
         {"name": "read_file", "description": "Read a file"},
         {"name": "write_file", "description": "Write a file"},
@@ -216,6 +219,223 @@ class TestOrchestratorPlan:
         assert result.status == TaskStatus.COMPLETED
         assert len(result.plan.subtasks) == 1
         assert result.plan.subtasks[0].id == "execute-goal"
+
+
+class TestOrchestratorProcessPhaseMode:
+    @pytest.mark.asyncio
+    async def test_strict_phase_mode_overrides_planner_structure(self, tmp_path):
+        """Strict process mode should force plan shape to declared phases."""
+        plan_json = json.dumps({
+            "subtasks": [
+                {"id": "unexpected-step", "description": "Wrong output"},
+                {"id": "implement", "description": "Partial match"},
+            ]
+        })
+        process = ProcessDefinition(
+            name="strict-proc",
+            phase_mode="strict",
+            phases=[
+                PhaseTemplate(
+                    id="research",
+                    description="Research phase",
+                    depends_on=[],
+                    model_tier=1,
+                    verification_tier=1,
+                    acceptance_criteria="Gather context",
+                ),
+                PhaseTemplate(
+                    id="implement",
+                    description="Implementation phase",
+                    depends_on=["research"],
+                    model_tier=2,
+                    verification_tier=1,
+                    is_critical_path=True,
+                    acceptance_criteria="Ship changes",
+                ),
+            ],
+        )
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert [s.id for s in result.plan.subtasks] == ["research", "implement"]
+        assert result.plan.subtasks[1].depends_on == ["research"]
+        assert result.plan.subtasks[1].is_critical_path is True
+        assert result.plan.subtasks[1].acceptance_criteria == "Ship changes"
+
+    @pytest.mark.asyncio
+    async def test_guided_phase_mode_keeps_planner_structure(self, tmp_path):
+        """Guided mode should preserve planner-created subtask graph."""
+        plan_json = json.dumps({
+            "subtasks": [
+                {"id": "model-step", "description": "Planner owns structure"},
+            ]
+        })
+        process = ProcessDefinition(
+            name="guided-proc",
+            phase_mode="guided",
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Phase A",
+                ),
+            ],
+        )
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert [s.id for s in result.plan.subtasks] == ["model-step"]
+
+    @pytest.mark.asyncio
+    async def test_strict_phase_mode_propagates_synthesis_flag(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [
+                {"id": "custom-step", "description": "Planner output"},
+            ]
+        })
+        process = ProcessDefinition(
+            name="strict-synth",
+            phase_mode="strict",
+            phases=[
+                PhaseTemplate(
+                    id="analyze",
+                    description="Analyze inputs",
+                ),
+                PhaseTemplate(
+                    id="synthesize",
+                    description="Synthesize final output",
+                    depends_on=["analyze"],
+                    is_synthesis=True,
+                ),
+            ],
+        )
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert [s.id for s in result.plan.subtasks] == ["analyze", "synthesize"]
+        assert result.plan.subtasks[1].is_synthesis is True
+
+
+class TestOrchestratorCriticalPathBehavior:
+    @pytest.mark.asyncio
+    async def test_critical_path_failure_exhausted_retries_aborts_without_replan(
+        self, tmp_path
+    ):
+        plan_json = json.dumps({
+            "subtasks": [
+                {
+                    "id": "critical-step",
+                    "description": "Must succeed",
+                    "is_critical_path": True,
+                },
+                {
+                    "id": "later-step",
+                    "description": "Depends on critical",
+                    "depends_on": ["critical-step"],
+                },
+            ]
+        })
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=50,
+            max_parallel_subtasks=3,
+            auto_approve_confidence_threshold=0.8,
+            enable_streaming=False,
+        ))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=cfg,
+        )
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="failed", summary="failed"),
+            VerificationResult(tier=1, passed=False, feedback="failed checks"),
+        ))
+        orch._replan_task = AsyncMock(return_value=True)
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.FAILED
+        assert result.get_subtask("critical-step").status == SubtaskStatus.FAILED
+        assert result.get_subtask("later-step").status == SubtaskStatus.SKIPPED
+        orch._replan_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_critical_failure_still_triggers_replan(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [
+                {"id": "normal-step", "description": "Can replan"},
+            ]
+        })
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=50,
+            max_parallel_subtasks=3,
+            auto_approve_confidence_threshold=0.8,
+            enable_streaming=False,
+        ))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=cfg,
+        )
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="failed", summary="failed"),
+            VerificationResult(tier=1, passed=False, feedback="failed checks"),
+        ))
+        orch._replan_task = AsyncMock(return_value=False)
+
+        task = _make_task()
+        await orch.execute_task(task)
+
+        orch._replan_task.assert_awaited_once()
 
 
 class TestOrchestratorExecution:

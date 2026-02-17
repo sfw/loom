@@ -3,7 +3,7 @@
 This guide shows how to connect external agents (Claude Code, custom scripts, cron jobs, other AI agents) to Loom as clients.
 
 **Two execution models:**
-- **Interactive** (`loom`) — conversation-first TUI with full session persistence. The agent and developer collaborate in real time with 21 tools, streaming, conversation recall, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition.
+- **Interactive** (`loom`) — conversation-first TUI with full session persistence. The agent and developer collaborate in real time with 21 tools, streaming, conversation recall, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition, and `/run <goal>` forces process orchestration in-session.
 - **Task mode** (REST API / MCP) — autonomous, fire-and-forget. Loom decomposes the goal into subtasks, executes, verifies, and reports back.
 
 This document covers both modes.
@@ -515,8 +515,8 @@ loom -w /tmp/project --process consulting-engagement
 | `investment-analysis` | 5 | strict | Financial due diligence and valuation |
 | `marketing-strategy` | 6 | guided | Go-to-market strategy and campaigns |
 | `research-report` | 4 | guided | Research synthesis and reporting |
-| `competitive-intel` | 3 | guided | Competitive landscape analysis |
-| `consulting-engagement` | 5 | guided | McKinsey-style issue tree consulting |
+| `competitive-intel` | 3 | suggestive | Competitive landscape analysis |
+| `consulting-engagement` | 5 | strict | McKinsey-style issue tree consulting |
 
 ### Using with REST API
 
@@ -628,8 +628,19 @@ loom install ./my-process -w /path/to/project
 # Skip auto-installing Python dependencies
 loom install acme/loom-analytics --skip-deps
 
+# Install dependencies in isolated per-process envs
+loom install acme/loom-analytics --isolated-deps
+
 # Uninstall
 loom uninstall google-analytics
+```
+
+Run packaged test cases (deterministic by default, or live with real providers):
+
+```bash
+loom process test investment-analysis
+loom process test ./my-local-process --case smoke
+loom process test ./my-local-process --live
 ```
 
 The installer expects a `process.yaml` at the repo root. Python dependencies
@@ -644,6 +655,24 @@ dependencies:
   - pandas>=2.0
 # ... rest of process definition
 ```
+
+Process packages can also declare a `tests:` manifest in `process.yaml` with
+test IDs, deterministic/live mode, optional tool/network requirements, and
+acceptance checks for phases, deliverables, and verification output.
+
+Notes:
+- `tools.required` is enforced at runtime. Missing required tools fail process activation/task creation.
+- Bundled tool name collisions are rejected at load time for the colliding tool (warning + skip).
+- `--isolated-deps` installs dependencies into `<install-target>/.deps/<process-name>/`.
+
+### Process package troubleshooting
+
+- `Process '<name>' requires missing tool(s): ...`:
+  ensure those tools are available in the active registry, or remove them from `tools.required`.
+- `Bundled tool '<name>' ... conflicts with existing tool class ...; skipping bundled tool`:
+  rename the bundled tool to a globally unique name and reinstall.
+- `Failed to install isolated dependencies`:
+  verify dependency names/versions and Python packaging access in the isolated environment.
 
 ---
 
@@ -781,7 +810,19 @@ database_path = "~/.loom/loom.db"
 [workspace]
 default_path = "~/projects"
 scratch_dir = "~/.loom/scratch"
+
+[mcp.servers.notion]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-notion"]
+timeout_seconds = 30
+
+[mcp.servers.notion.env]
+NOTION_TOKEN = "your-token"
 ```
+
+Configured MCP servers are auto-discovered and exposed as namespaced tools:
+`mcp.<server>.<tool>`. Tool registrations refresh at runtime as connected MCP
+servers publish new tool lists.
 
 ---
 

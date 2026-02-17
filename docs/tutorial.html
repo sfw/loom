@@ -641,7 +641,21 @@
 
 <span class="cmt"># Memory storage</span>
 <span class="key">[memory]</span>
-<span class="key">database_path</span> = <span class="str">"~/.loom/loom.db"</span></code></pre>
+<span class="key">database_path</span> = <span class="str">"~/.loom/loom.db"</span>
+
+<span class="cmt"># Optional external MCP servers (auto-registered as tools)</span>
+<span class="key">[mcp.servers.notion]</span>
+<span class="key">command</span> = <span class="str">"npx"</span>
+<span class="key">args</span> = <span class="str">["-y", "@modelcontextprotocol/server-notion"]</span>
+<span class="key">timeout_seconds</span> = <span class="val">30</span>
+
+<span class="key">[mcp.servers.notion.env]</span>
+<span class="key">NOTION_TOKEN</span> = <span class="str">"your-token"</span></code></pre>
+
+  <div class="callout callout-info">
+    <strong>External MCP tools</strong>
+    Configured MCP servers are auto-discovered and exposed as namespaced tools in Loom (for example <code>mcp.notion.search</code>).
+  </div>
 
   <div class="callout callout-warn">
     <strong>Single model?</strong>
@@ -858,6 +872,10 @@
 <span class="cmt"># With a process definition</span>
 <span class="cmd">loom</span> <span class="flag">-w</span> /path/to/project <span class="flag">--process</span> consulting-engagement
 
+<span class="cmt"># Activate/switch process at runtime, then force orchestration</span>
+<span class="cmd">/process use</span> investment-analysis
+<span class="cmd">/run</span> Analyze Tesla for investment
+
 <span class="cmt"># Resume a previous session</span>
 <span class="cmd">loom</span> <span class="flag">--resume</span> a1b2c3d4
 
@@ -872,8 +890,11 @@
     <tr><th>Key</th><th>Action</th></tr>
     <tr><td><code>Ctrl+B</code></td><td>Toggle sidebar</td></tr>
     <tr><td><code>Ctrl+L</code></td><td>Clear chat</td></tr>
+    <tr><td><code>Ctrl+R</code></td><td>Reload workspace tree</td></tr>
     <tr><td><code>Ctrl+P</code></td><td>Command palette</td></tr>
     <tr><td><code>Ctrl+1/2/3</code></td><td>Switch tabs (Chat / Files / Events)</td></tr>
+    <tr><td><code>Tab</code></td><td>Cycle slash-command autocomplete (when input starts with <code>/</code>)</td></tr>
+    <tr><td><code>Shift+Tab</code></td><td>Cycle slash-command autocomplete backward</td></tr>
     <tr><td><code>Ctrl+C</code></td><td>Quit</td></tr>
   </table>
 
@@ -889,13 +910,22 @@
     <tr><td><code>/model</code></td><td>Show current model</td></tr>
     <tr><td><code>/tools</code></td><td>List available tools</td></tr>
     <tr><td><code>/tokens</code></td><td>Show session token usage</td></tr>
+    <tr><td><code>/process list</code></td><td>List discovered process definitions</td></tr>
+    <tr><td><code>/process use &lt;name-or-path&gt;</code></td><td>Activate a process in the current session</td></tr>
+    <tr><td><code>/process off</code></td><td>Disable the active process</td></tr>
+    <tr><td><code>/run &lt;goal&gt;</code></td><td>Force orchestration through the active process</td></tr>
     <tr><td><code>/setup</code></td><td>Reconfigure models and settings</td></tr>
     <tr><td><code>/clear</code></td><td>Clear the chat display</td></tr>
-    <tr><td><code>/quit</code></td><td>Exit Loom</td></tr>
+    <tr><td><code>/quit</code> (<code>/exit</code>, <code>/q</code>)</td><td>Exit Loom</td></tr>
   </table>
 
   <h3>Session Persistence</h3>
   <p>Every conversation turn is persisted to SQLite. Sessions survive restarts. The model has access to a <code>conversation_recall</code> tool to search past context that has fallen out of the context window, and a <code>delegate_task</code> tool to spawn autonomous sub-agents for complex work.</p>
+
+  <div class="callout callout-info">
+    <strong>About /run</strong>
+    <code>/run &lt;goal&gt;</code> uses in-process orchestration via <code>delegate_task</code>. You do not need to run <code>loom serve</code> for this flow.
+  </div>
 
   <div class="callout callout-info">
     <strong>Tool approval</strong>
@@ -935,7 +965,38 @@
 <span class="cmd">loom run</span> <span class="str">"Analyze Tesla for investment"</span> <span class="flag">--workspace</span> /tmp/tesla <span class="flag">--process</span> investment-analysis
 
 <span class="cmt"># Interactive session with a process</span>
-<span class="cmd">loom</span> <span class="flag">-w</span> /tmp/project <span class="flag">--process</span> consulting-engagement</code></pre>
+<span class="cmd">loom</span> <span class="flag">-w</span> /tmp/project <span class="flag">--process</span> consulting-engagement
+
+<span class="cmt"># Inside the TUI: force the active process</span>
+<span class="cmd">/run</span> Analyze Tesla for investment</code></pre>
+
+  <p>In interactive mode, plain chat stays conversational. Use <code>/run &lt;goal&gt;</code> when you want explicit process orchestration for the active process.</p>
+
+  <h3>Testing a Process Package</h3>
+  <pre><code><span class="cmt"># Run all declared deterministic test cases</span>
+<span class="cmd">loom process test</span> investment-analysis
+
+<span class="cmt"># Run one specific case</span>
+<span class="cmd">loom process test</span> ./my-local-process <span class="flag">--case</span> smoke
+
+<span class="cmt"># Run only live cases (real providers + external tools)</span>
+<span class="cmd">loom process test</span> ./my-local-process <span class="flag">--live</span></code></pre>
+
+  <p>Declare test cases in your <code>process.yaml</code> using a <code>tests:</code> manifest with a unique case ID, mode (<code>deterministic</code> or <code>live</code>), and acceptance checks.</p>
+
+  <pre><code><span class="key">tests</span>:
+  - <span class="key">id</span>: <span class="str">smoke</span>
+    <span class="key">mode</span>: <span class="str">deterministic</span>
+    <span class="key">goal</span>: <span class="str">"Analyze Tesla for investment"</span>
+    <span class="key">acceptance</span>:
+      <span class="key">deliverables</span>:
+        <span class="key">must_exist</span>:
+          - <span class="str">company-overview.md</span></code></pre>
+
+  <div class="callout callout-warn">
+    <strong>Deliverable names are exact</strong>
+    If a process phase declares <code>financial-summary.csv</code>, verification expects that exact filename. Variant names (for example prefixed/suffixed alternatives) will fail deterministic checks.
+  </div>
 
   <h3>What a Process Injects</h3>
   <div class="card-grid">
@@ -1494,6 +1555,8 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
         <li>Workspace path doesn't exist (create it first)</li>
         <li>Model server went down mid-task</li>
       </ul>
+      <p>If delegated process runs time out, raise the timeout budget:</p>
+      <pre><code><span class="cmd">export</span> LOOM_DELEGATE_TIMEOUT_SECONDS=7200</code></pre>
     </div>
   </details>
 

@@ -8,6 +8,8 @@ or parallel execution — the same way Claude Code spawns Task subagents.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import os
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -18,6 +20,21 @@ from loom.tools.registry import Tool, ToolContext, ToolResult
 if TYPE_CHECKING:
     from loom.engine.orchestrator import Orchestrator
     from loom.state.task_state import Task
+
+
+DEFAULT_DELEGATE_TIMEOUT_SECONDS = 3600
+
+
+def _delegate_timeout_seconds() -> int:
+    """Resolve delegate timeout from env with safe fallback."""
+    raw = os.environ.get("LOOM_DELEGATE_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_DELEGATE_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_DELEGATE_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_DELEGATE_TIMEOUT_SECONDS
 
 
 class DelegateTaskTool(Tool):
@@ -71,7 +88,10 @@ class DelegateTaskTool(Tool):
         "required": ["goal"],
     }
 
-    timeout_seconds = 600  # 10 minutes for complex tasks
+    @property
+    def timeout_seconds(self) -> int:
+        # Long-running orchestration can exceed simple tool time budgets.
+        return _delegate_timeout_seconds()
 
     def __init__(
         self,
@@ -97,6 +117,7 @@ class DelegateTaskTool(Tool):
 
         context = args.get("context", {})
         wait = args.get("wait", True)
+        progress_callback = args.get("_progress_callback")
         workspace = str(ctx.workspace) if ctx.workspace else ""
 
         # Lazy-init orchestrator
@@ -108,24 +129,85 @@ class DelegateTaskTool(Tool):
 
         # Build task
         task = _create_task(goal, workspace, context)
+        event_bus = getattr(self._orchestrator, "_events", None)
+        subscriptions: list[tuple[str, object]] = []
+
+        def _emit_progress(event_type: str | None = None) -> None:
+            if not callable(progress_callback):
+                return
+            payload = _progress_payload(task)
+            if event_type:
+                payload["event_type"] = event_type
+            try:
+                maybe = progress_callback(payload)
+                if inspect.isawaitable(maybe):
+                    asyncio.create_task(maybe)
+            except Exception:
+                pass
+
+        if callable(progress_callback) and event_bus is not None:
+            from loom.events.types import (
+                SUBTASK_COMPLETED,
+                SUBTASK_FAILED,
+                SUBTASK_RETRYING,
+                SUBTASK_STARTED,
+                TASK_COMPLETED,
+                TASK_FAILED,
+                TASK_PLAN_READY,
+            )
+
+            observed = (
+                TASK_PLAN_READY,
+                SUBTASK_STARTED,
+                SUBTASK_RETRYING,
+                SUBTASK_COMPLETED,
+                SUBTASK_FAILED,
+                TASK_COMPLETED,
+                TASK_FAILED,
+            )
+
+            def _on_event(event) -> None:
+                _emit_progress(event.event_type)
+
+            for event_type in observed:
+                try:
+                    event_bus.subscribe(event_type, _on_event)
+                    subscriptions.append((event_type, _on_event))
+                except Exception:
+                    pass
 
         if not wait:
             asyncio.create_task(self._orchestrator.execute_task(task))
             return ToolResult.ok(
                 f"Task submitted (async): {task.id}\n"
                 f"Goal: {goal}\n"
-                f"Use task_tracker to monitor progress."
+                f"Use task_tracker to monitor progress.",
+                data={
+                    "task_id": task.id,
+                    "status": "submitted",
+                    "tasks": [],
+                },
             )
 
         # Synchronous: execute and wait
         try:
+            _emit_progress()
             completed = await self._orchestrator.execute_task(task)
+            _emit_progress("task_completed")
             return ToolResult.ok(
                 _format_result(completed),
                 files_changed=_collect_files_changed(completed),
+                data=_progress_payload(completed),
             )
         except Exception as e:
             return ToolResult.fail(f"Task execution failed: {e}")
+        finally:
+            if event_bus is not None and subscriptions:
+                for event_type, handler in subscriptions:
+                    try:
+                        event_bus.unsubscribe(event_type, handler)
+                    except Exception:
+                        pass
 
 
 def _create_task(
@@ -206,3 +288,32 @@ def _collect_files_changed(task: Task) -> list[str]:
     if changes.files_deleted:
         result.append(f"({changes.files_deleted} files deleted)")
     return result
+
+
+def _progress_payload(task: Task) -> dict:
+    """Build a sidebar-friendly progress payload from orchestrator task state."""
+    task_status = task.status.value if hasattr(task.status, "value") else str(task.status)
+    progress_rows: list[dict] = []
+    for subtask in task.plan.subtasks:
+        raw_status = (
+            subtask.status.value
+            if hasattr(subtask.status, "value")
+            else str(subtask.status)
+        )
+        if raw_status in {"running", "blocked"}:
+            status = "in_progress"
+        elif raw_status in {"completed", "failed", "skipped"}:
+            status = raw_status
+        else:
+            status = "pending"
+        content = (subtask.summary or subtask.description or subtask.id).strip()
+        progress_rows.append({
+            "id": subtask.id,
+            "status": status,
+            "content": content,
+        })
+    return {
+        "task_id": task.id,
+        "status": task_status,
+        "tasks": progress_rows,
+    }

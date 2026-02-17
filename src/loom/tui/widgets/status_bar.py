@@ -22,6 +22,7 @@ class StatusBar(Static):
     state: reactive[str] = reactive("Ready")
     workspace_name: reactive[str] = reactive("")
     model_name: reactive[str] = reactive("")
+    process_name: reactive[str] = reactive("")
     total_tokens: reactive[int] = reactive(0)
 
     def render(self) -> str:
@@ -30,6 +31,8 @@ class StatusBar(Static):
             parts.append(self.workspace_name)
         if self.model_name:
             parts.append(self.model_name)
+        if self.process_name:
+            parts.append(f"process:{self.process_name}")
         if self.total_tokens:
             parts.append(f"{self.total_tokens:,} tokens")
         return "[dim]" + " | ".join(parts) + "[/dim]"

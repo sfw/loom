@@ -34,9 +34,14 @@ class OllamaProvider(ModelProvider):
 
     def __init__(self, config: ModelConfig, provider_name: str = "", tier_override: int = 0):
         self._config = config
+        headers: dict[str, str] = {}
+        api_key = config.api_key.strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         self._client = httpx.AsyncClient(
             base_url=config.base_url,
             timeout=httpx.Timeout(300.0),
+            headers=headers,
         )
         self._model = config.model
         self._max_tokens = config.max_tokens

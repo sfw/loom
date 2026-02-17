@@ -129,10 +129,25 @@ class Orchestrator:
         if process is not None:
             self._prompts.process = process
 
-        # Apply tool exclusions from process definition
-        if process and process.tools.excluded:
-            for tool_name in process.tools.excluded:
+        # Apply process tool policy
+        if process:
+            excluded_tools = list(getattr(process.tools, "excluded", []) or [])
+            for tool_name in excluded_tools:
                 self._tools.exclude(tool_name)
+
+            required_tools = list(getattr(process.tools, "required", []) or [])
+            if required_tools:
+                available = set(self._tools.list_tools())
+                missing = sorted(
+                    tool_name
+                    for tool_name in required_tools
+                    if tool_name not in available
+                )
+                if missing:
+                    joined = ", ".join(missing)
+                    raise ValueError(
+                        f"Process '{process.name}' requires missing tool(s): {joined}"
+                    )
 
         # Runner handles the inner subtask execution
         self._runner = SubtaskRunner(
@@ -360,8 +375,69 @@ class Orchestrator:
                 "feedback": verification.feedback if verification else None,
             })
         else:
-            # All retries exhausted — trigger re-planning
-            await self._replan_task(task)
+            # All retries exhausted.
+            # Critical-path failures abort the remaining plan.
+            if subtask.is_critical_path:
+                await self._abort_on_critical_path_failure(
+                    task, subtask, verification,
+                )
+                return
+
+            # Non-critical failures trigger re-planning.
+            await self._replan_task(
+                task,
+                reason=self._build_replan_reason(subtask, verification),
+                failed_subtask_id=subtask.id,
+                verification_feedback=verification.feedback,
+            )
+
+    async def _abort_on_critical_path_failure(
+        self,
+        task: Task,
+        subtask: Subtask,
+        verification: VerificationResult,
+    ) -> None:
+        """Abort remaining work when a critical-path subtask exhausts retries."""
+        block_summary = (
+            f"Skipped: blocked by critical-path failure in {subtask.id}"
+        )
+        async with self._state_lock:
+            for candidate in task.plan.subtasks:
+                if candidate.status == SubtaskStatus.PENDING:
+                    candidate.status = SubtaskStatus.SKIPPED
+                    candidate.summary = block_summary
+                    task.update_subtask(
+                        candidate.id,
+                        status=SubtaskStatus.SKIPPED,
+                        summary=candidate.summary,
+                    )
+
+            task.status = TaskStatus.FAILED
+            task.add_error(
+                subtask.id,
+                (
+                    "Critical-path subtask failed after retries: "
+                    + (verification.feedback or subtask.summary or "unknown failure")
+                ),
+            )
+            self._state.save(task)
+
+    @staticmethod
+    def _build_replan_reason(
+        subtask: Subtask,
+        verification: VerificationResult,
+    ) -> str:
+        """Build a concise, structured reason string for replanning prompts."""
+        feedback = (verification.feedback or "").strip()
+        if feedback:
+            return (
+                f"Subtask '{subtask.id}' failed verification tier "
+                f"{verification.tier}: {feedback}"
+            )
+        return (
+            f"Subtask '{subtask.id}' failed verification tier "
+            f"{verification.tier} with no feedback."
+        )
 
     async def _handle_success(
         self,
@@ -501,7 +577,8 @@ class Orchestrator:
         model = self._router.select(tier=2, role="planner")
         response = await model.complete([{"role": "user", "content": prompt}])
 
-        return self._parse_plan(response, goal=task.goal)
+        plan = self._parse_plan(response, goal=task.goal)
+        return self._apply_process_phase_mode(plan)
 
     # Document extensions grouped by category for workspace scanning.
     _DOC_EXTENSIONS: dict[str, tuple[str, ...]] = {
@@ -631,12 +708,23 @@ class Orchestrator:
             logger.warning("Process workspace scan failed: %s", e)
             return ""
 
-    async def _replan_task(self, task: Task) -> bool:
+    async def _replan_task(
+        self,
+        task: Task,
+        *,
+        reason: str = "subtask_failures",
+        failed_subtask_id: str = "",
+        verification_feedback: str | None = None,
+    ) -> bool:
         """Re-plan the task after subtask failures.
 
         Returns True if re-planning succeeded and execution can continue.
         """
-        self._emit(TASK_REPLANNING, task.id, {"reason": "subtask_failures"})
+        self._emit(TASK_REPLANNING, task.id, {
+            "reason": reason,
+            "failed_subtask_id": failed_subtask_id,
+            "verification_feedback": verification_feedback or "",
+        })
 
         discoveries = [d for d in task.decisions_log]
         errors = [
@@ -651,11 +739,14 @@ class Orchestrator:
                 discoveries=discoveries,
                 errors=errors,
                 original_plan=task.plan,
+                replan_reason=reason,
             )
 
             model = self._router.select(tier=2, role="planner")
             response = await model.complete([{"role": "user", "content": prompt}])
-            new_plan = self._parse_plan(response, goal=task.goal)
+            new_plan = self._apply_process_phase_mode(
+                self._parse_plan(response, goal=task.goal),
+            )
 
             # Preserve completed subtask state
             completed_ids = {
@@ -709,11 +800,56 @@ class Orchestrator:
                 model_tier=s.get("model_tier", 1),
                 verification_tier=s.get("verification_tier", 1),
                 is_critical_path=s.get("is_critical_path", False),
+                is_synthesis=s.get("is_synthesis", False),
                 acceptance_criteria=s.get("acceptance_criteria", ""),
                 max_retries=self._config.execution.max_subtask_retries,
             ))
 
         return Plan(subtasks=subtasks, version=1)
+
+    def _apply_process_phase_mode(self, plan: Plan) -> Plan:
+        """Apply process phase-mode constraints to the planner output."""
+        if not self._process or not self._process.phases:
+            return plan
+        if self._process.phase_mode != "strict":
+            return plan
+
+        planner_subtasks = {s.id: s for s in plan.subtasks}
+        strict_subtasks: list[Subtask] = []
+
+        for phase in self._process.phases:
+            existing = planner_subtasks.get(phase.id)
+            if existing is None:
+                strict_subtasks.append(
+                    Subtask(
+                        id=phase.id,
+                        description=phase.description,
+                        depends_on=list(phase.depends_on),
+                        model_tier=phase.model_tier,
+                        verification_tier=phase.verification_tier,
+                        is_critical_path=phase.is_critical_path,
+                        is_synthesis=phase.is_synthesis,
+                        acceptance_criteria=phase.acceptance_criteria,
+                        max_retries=self._config.execution.max_subtask_retries,
+                    )
+                )
+                continue
+
+            existing.description = phase.description or existing.description
+            existing.depends_on = list(phase.depends_on)
+            existing.model_tier = phase.model_tier
+            existing.verification_tier = phase.verification_tier
+            existing.is_critical_path = phase.is_critical_path
+            existing.is_synthesis = phase.is_synthesis
+            if phase.acceptance_criteria:
+                existing.acceptance_criteria = phase.acceptance_criteria
+            strict_subtasks.append(existing)
+
+        return Plan(
+            subtasks=strict_subtasks,
+            version=plan.version,
+            last_replanned=plan.last_replanned,
+        )
 
     # ------------------------------------------------------------------
     # Helpers

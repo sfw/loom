@@ -69,9 +69,15 @@ select = ["E", "F", "I", "N", "W", "UP"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "--strict-markers"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests requiring external services",
+    "process_contract: deterministic process conformance tests",
+    "process_integration: process-level integration tests",
+    "process_live: live process canary tests",
+    "network: tests requiring real network access",
+    "mcp: tests exercising MCP-backed tooling",
 ]
 
 [tool.coverage.run]

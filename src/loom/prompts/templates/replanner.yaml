@@ -7,6 +7,12 @@ instructions: |
   ORIGINAL GOAL:
   {goal}
 
+  REPLANNING REASON:
+  {replan_reason}
+
+  PROCESS REPLANNING TRIGGERS:
+  {process_replanning_triggers}
+
   CURRENT STATE:
   {current_state_yaml}
 

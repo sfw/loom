@@ -60,6 +60,9 @@ class DeterministicVerifier:
     - Process deliverables (if phases define expected deliverables)
     """
 
+    _ADVISORY_TOOL_FAILURES = frozenset({"web_fetch", "web_search"})
+    _ADVISORY_HTTP_STATUS = frozenset({403, 408, 425, 429, 500, 502, 503, 504})
+
     def __init__(
         self,
         process: ProcessDefinition | None = None,
@@ -77,10 +80,27 @@ class DeterministicVerifier:
 
         # 1. Did tool calls succeed?
         for tc in tool_calls:
+            if not tc.result.success:
+                if self._is_advisory_tool_failure(tc.tool, tc.result.error):
+                    checks.append(Check(
+                        name=f"tool_{tc.tool}_advisory",
+                        passed=True,
+                        detail=(
+                            "Advisory tool failure (non-blocking): "
+                            f"{tc.result.error or 'unknown error'}"
+                        ),
+                    ))
+                    continue
+                checks.append(Check(
+                    name=f"tool_{tc.tool}_success",
+                    passed=False,
+                    detail=tc.result.error,
+                ))
+                continue
+
             checks.append(Check(
                 name=f"tool_{tc.tool}_success",
-                passed=tc.result.success,
-                detail=tc.result.error if not tc.result.success else None,
+                passed=True,
             ))
 
         # 2. Were expected files created/modified? Check non-empty.
@@ -137,26 +157,22 @@ class DeterministicVerifier:
                 ))
 
             # 5. Process deliverables check
-            # Collect all expected deliverables across all phases.
-            # Subtask IDs don't map to phase IDs, so we check the full set.
-            deliverables = self._process.get_deliverables()
-            if deliverables and workspace:
-                all_expected: list[str] = []
-                for phase_files in deliverables.values():
-                    all_expected.extend(phase_files)
+            # Enforce only deliverables for the matching phase/subtask id.
+            expected = self._expected_deliverables_for_subtask(subtask)
+            if expected and workspace:
                 files_created = set()
                 for tc in tool_calls:
                     files_created.update(tc.result.files_changed)
-                for expected in all_expected:
+                for expected_path in expected:
                     found_file = (
-                        expected in files_created
-                        or (workspace / expected).exists()
+                        expected_path in files_created
+                        or (workspace / expected_path).exists()
                     )
                     checks.append(Check(
-                        name=f"deliverable_{expected}",
+                        name=f"deliverable_{expected_path}",
                         passed=found_file,
                         detail=(
-                            f"Expected deliverable '{expected}' "
+                            f"Expected deliverable '{expected_path}' "
                             f"not found"
                             if not found_file else None
                         ),
@@ -230,6 +246,67 @@ class DeterministicVerifier:
                             "Failed to read deliverable %s: %s", f, e,
                         )
         return "\n".join(texts)
+
+    def _expected_deliverables_for_subtask(
+        self,
+        subtask: Subtask,
+    ) -> list[str]:
+        """Return expected deliverable filenames for the current subtask."""
+        if not self._process:
+            return []
+
+        deliverables = self._process.get_deliverables()
+        if not deliverables:
+            return []
+
+        # Strict phase-mode subtasks use phase IDs directly; enforce only the
+        # matching phase's deliverables to avoid cross-phase false negatives.
+        if subtask.id in deliverables:
+            return deliverables[subtask.id]
+
+        # Backward-compatible fallback for single-phase processes where the
+        # planner subtask ID may not match the declared phase ID exactly.
+        if len(deliverables) == 1:
+            return next(iter(deliverables.values()))
+
+        return []
+
+    def _is_advisory_tool_failure(
+        self,
+        tool_name: str,
+        error: str | None,
+    ) -> bool:
+        """Return True if a failed tool call should be treated as advisory."""
+        if tool_name not in self._ADVISORY_TOOL_FAILURES or not error:
+            return False
+
+        text = error.lower()
+        hard_fail_markers = (
+            "blocked host:",
+            "safety violation:",
+            "only http:// and https:// urls are allowed",
+            "no url provided",
+            "no search query provided",
+        )
+        if any(marker in text for marker in hard_fail_markers):
+            return False
+
+        advisory_codes = "|".join(
+            str(code) for code in sorted(self._ADVISORY_HTTP_STATUS)
+        )
+        if re.search(rf"\b(?:{advisory_codes})\b", text):
+            return True
+
+        advisory_markers = (
+            "timeout",
+            "timed out",
+            "connection failed",
+            "temporarily unavailable",
+            "rate limit",
+            "rate-limited",
+            "response too large",
+        )
+        return any(marker in text for marker in advisory_markers)
 
     @staticmethod
     def _build_feedback(checks: list[Check]) -> str:

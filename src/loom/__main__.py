@@ -97,7 +97,7 @@ def _launch_tui(
     from loom.tui.app import LoomApp
 
     ws = (workspace or Path.cwd()).resolve()
-    tools = create_default_registry()
+    tools = create_default_registry(config)
 
     # Resolve model — None triggers the TUI setup wizard
     provider = None
@@ -119,6 +119,8 @@ def _launch_tui(
             )
             sys.exit(1)
 
+    effective_process = process_name or config.process.default or None
+
     app = LoomApp(
         model=provider,
         tools=tools,
@@ -127,7 +129,7 @@ def _launch_tui(
         db=db,
         store=store,
         resume_session=resume_session,
-        process_name=process_name,
+        process_name=effective_process,
     )
     app.run()
 
@@ -238,14 +240,15 @@ def run(
     config = ctx.obj["config"]
     url = server_url or f"http://{config.server.host}:{config.server.port}"
     ws = str(workspace.resolve()) if workspace else None
+    effective_process = process_name or config.process.default or None
 
     click.echo(f"Submitting task to {url}: {goal}")
     if ws:
         click.echo(f"Workspace: {ws}")
-    if process_name:
-        click.echo(f"Process: {process_name}")
+    if effective_process:
+        click.echo(f"Process: {effective_process}")
 
-    asyncio.run(_run_task(url, goal, ws, process_name=process_name))
+    asyncio.run(_run_task(url, goal, ws, process_name=effective_process))
 
 
 def _validate_task_id(task_id: str) -> str:
@@ -440,6 +443,98 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
     )
 
 
+@cli.group()
+def process() -> None:
+    """Process subcommands."""
+
+
+@process.command(name="test")
+@click.argument("name_or_path")
+@click.option(
+    "--workspace", "-w",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Workspace for process execution and local process discovery.",
+)
+@click.option(
+    "--live",
+    is_flag=True,
+    default=False,
+    help="Include live test cases from process.yaml (requires configured models).",
+)
+@click.option(
+    "--case",
+    "case_id",
+    default=None,
+    help="Run a single process test case by ID.",
+)
+@click.pass_context
+def process_test(
+    ctx: click.Context,
+    name_or_path: str,
+    workspace: Path | None,
+    live: bool,
+    case_id: str | None,
+) -> None:
+    """Run declared (or default) process test cases.
+
+    NAME_OR_PATH can be either a process name from discovery or a direct
+    path to a process YAML/package directory.
+    """
+    from loom.processes.schema import ProcessLoader
+    from loom.processes.testing import run_process_tests
+
+    config = ctx.obj["config"]
+    ws = (workspace or Path.cwd()).resolve()
+    extra = [Path(p) for p in config.process.search_paths]
+    loader = ProcessLoader(workspace=ws, extra_search_paths=extra)
+
+    try:
+        process_def = loader.load(name_or_path)
+    except Exception as e:
+        click.echo(f"Failed to load process {name_or_path!r}: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(
+        f"Running process tests for {process_def.name} v{process_def.version}"
+    )
+
+    try:
+        results = asyncio.run(run_process_tests(
+            process_def,
+            config=config,
+            workspace=ws,
+            include_live=live,
+            case_id=case_id,
+        ))
+    except ValueError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+
+    if not results:
+        click.echo("No matching process test cases selected.")
+        sys.exit(1)
+
+    failed = 0
+    for result in results:
+        status = "PASS" if result.passed else "FAIL"
+        click.echo(
+            f"[{status}] case={result.case_id} mode={result.mode} "
+            f"task_status={result.task_status or 'n/a'} "
+            f"duration={result.duration_seconds:.2f}s"
+        )
+        if result.message:
+            click.echo(f"  {result.message}")
+        for detail in result.details:
+            click.echo(f"  - {detail}")
+        if not result.passed:
+            failed += 1
+
+    click.echo(f"\n{len(results) - failed}/{len(results)} case(s) passed.")
+    if failed:
+        sys.exit(1)
+
+
 @cli.command(name="install")
 @click.argument("source")
 @click.option(
@@ -453,6 +548,13 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
     help="Skip installing Python dependencies.",
 )
 @click.option(
+    "--isolated-deps", is_flag=True, default=False,
+    help=(
+        "Install package dependencies into <target>/.deps/<process-name>/ "
+        "instead of the current Python environment."
+    ),
+)
+@click.option(
     "--yes", "-y", is_flag=True, default=False,
     help="Skip interactive review and approve automatically.",
 )
@@ -462,6 +564,7 @@ def install(
     source: str,
     install_workspace: Path | None,
     skip_deps: bool,
+    isolated_deps: bool,
     yes: bool,
 ) -> None:
     """Install a process package from a GitHub repo or local path.
@@ -488,6 +591,7 @@ def install(
       loom install acme/loom-google-analytics
       loom install ./my-local-process
       loom install ./my-local-process -w /path/to/project
+      loom install ./my-local-process --isolated-deps
     """
     from loom.processes.installer import (
         InstallError,
@@ -501,6 +605,15 @@ def install(
         target_dir = Path.home() / ".loom" / "processes"
 
     click.echo(f"Resolving source: {source}")
+    if isolated_deps and not skip_deps:
+        click.echo(
+            "Dependency mode: isolated "
+            "(per-process env under <target>/.deps/...)"
+        )
+    elif isolated_deps and skip_deps:
+        click.echo(
+            "Note: --isolated-deps has no effect when --skip-deps is set."
+        )
 
     def _review_and_prompt(review) -> bool:
         """Display review and ask user for confirmation."""
@@ -515,6 +628,7 @@ def install(
             source,
             target_dir=target_dir,
             skip_deps=skip_deps,
+            isolated_deps=isolated_deps,
             review_callback=_review_and_prompt,
         )
         click.echo(f"Installed to: {dest}")

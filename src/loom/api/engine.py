@@ -68,7 +68,7 @@ class Engine:
         """
         return Orchestrator(
             model_router=self.model_router,
-            tool_registry=create_default_registry(),
+            tool_registry=create_default_registry(self.config),
             memory_manager=self.memory_manager,
             prompt_assembler=PromptAssembler(),
             state_manager=self.state_manager,
@@ -116,7 +116,7 @@ async def create_engine(config: Config) -> Engine:
     model_router = ModelRouter.from_config(config)
 
     # Tools
-    tool_registry = create_default_registry()
+    tool_registry = create_default_registry(config)
 
     # Prompts
     prompt_assembler = PromptAssembler()

@@ -126,7 +126,7 @@ tools:
 ```
 
 - `tool_guidance` — free-text instructions injected into the system prompt
-- `tools.required` — tools that must be available (Loom warns if missing)
+- `tools.required` — tools that must be available (Loom fails fast if missing)
 - `tools.excluded` — tools the model should not use in this process
 
 The required and excluded lists must not overlap.
@@ -175,6 +175,10 @@ phases:
 | `is_synthesis` | No | If true, this is a final phase that combines prior work. |
 | `acceptance_criteria` | No | Concrete criteria for phase completion. |
 | `deliverables` | No | List of expected output files with descriptions. |
+
+Deliverables are enforced by exact filename at execution and verification time.
+If a phase declares `financial-summary.csv`, the model must create/update that
+exact path (not `tesla_financial_summary.csv` or other variants).
 
 **Dependency rules:**
 - Dependencies form a DAG (directed acyclic graph). Cycles are rejected at load time.
@@ -291,6 +295,48 @@ replanning:
 
 Declares when the engine should re-plan and how to adapt. Without replanning configuration, the engine follows the original plan rigidly.
 
+### Process test manifest
+
+Process packages can embed runnable test contracts directly in `process.yaml`:
+
+```yaml
+tests:
+  - id: smoke
+    mode: deterministic         # deterministic | live
+    goal: "Analyze Tesla for investment"
+    timeout_seconds: 900
+    requires_network: false
+    requires_tools:
+      - write_file
+    acceptance:
+      phases:
+        must_include:
+          - company-screening
+      deliverables:
+        must_exist:
+          - company-overview.md
+      verification:
+        forbidden_patterns:
+          - "deliverable_.* not found"
+```
+
+`mode: deterministic` runs with a scripted model backend for reproducible CI checks.  
+`mode: live` runs against configured real providers and external tools/sources.
+
+Run package tests:
+
+```bash
+loom process test <name-or-path>
+loom process test <name-or-path> --case smoke
+loom process test <name-or-path> --live
+```
+
+Validation rules:
+- `id` is required and must be unique per package.
+- `mode` must be `deterministic` or `live`.
+- `goal` is required.
+- `timeout_seconds` must be greater than zero.
+
 ## Bundled tools
 
 Packages can include custom Python tools in a `tools/` directory. These are auto-discovered and registered when the process loads.
@@ -372,6 +418,12 @@ class MyDomainTool(Tool):
 6. **File names** in `tools/` must not start with `_` (those are skipped)
 7. **One class per file** is conventional but not required — all `Tool` subclasses in the module are registered
 
+### Tool naming and collision policy
+
+- Bundled tool names must be globally unique across built-in tools and all loaded packages.
+- If a bundled tool name collides with an existing tool, Loom logs a warning and skips loading the colliding bundled tool.
+- Use clear prefixes for package tools (for example, `ga_`, `fin_`, `crm_`) to avoid conflicts.
+
 ### ToolContext
 
 The `ctx` object provides:
@@ -402,6 +454,9 @@ loom install /path/to/my-process
 
 # Into a specific workspace (instead of global ~/.loom/processes/)
 loom install /path/to/my-process -w /path/to/project
+
+# Install dependencies in an isolated per-process environment
+loom install /path/to/my-process --isolated-deps
 ```
 
 ### Installing from GitHub
@@ -450,6 +505,10 @@ Risk levels:
 - **HIGH** — Has both dependencies and bundled code
 
 Users must explicitly approve before installation proceeds.
+
+Dependency install modes:
+- Default: dependencies install into the current Python environment.
+- Isolated: `--isolated-deps` installs dependencies into `<install-target>/.deps/<process-name>/`.
 
 ## Design patterns
 
@@ -548,7 +607,7 @@ See [`packages/google-analytics/`](../packages/google-analytics/) for a full pac
 - 2 planner examples
 - Replanning triggers and guidance
 
-## Checklist
+## Process Package Compatibility Checklist
 
 Before publishing a package:
 
@@ -562,7 +621,23 @@ Before publishing a package:
 - [ ] 2-3 planner examples with realistic goals
 - [ ] `replanning` section describes when to adapt
 - [ ] Bundled tools (if any) handle errors gracefully and return `ToolResult.fail`
+- [ ] Bundled tool names are unique (no collisions with built-ins or other packages)
 - [ ] Dependencies are version-pinned
 - [ ] `loom install /path/to/package` succeeds
+- [ ] `loom install /path/to/package --isolated-deps` succeeds (if dependencies are declared)
 - [ ] `loom -w /tmp/test --process my-process` loads without errors
 - [ ] README.md explains usage, deliverables, and input data
+
+## Troubleshooting
+
+- `Process '<name>' requires missing tool(s): ...`:
+Install or enable the required tools, or remove them from `tools.required`.
+
+- `Bundled tool '<name>' ... conflicts with existing tool class ...; skipping bundled tool`:
+Rename the bundled tool to a globally unique name and reinstall the package.
+
+- `Failed to create isolated dependency environment`:
+Ensure the selected Python executable can create virtual environments (`python -m venv`).
+
+- `Failed to install isolated dependencies`:
+Check package names/versions and network/index access in the isolated environment.

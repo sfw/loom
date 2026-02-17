@@ -88,6 +88,17 @@ phases:
       - "campaign-plan.md — 90-day campaign plan with timeline"
       - "budget-allocation.csv — channel budget breakdown"
 
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Run the marketing-strategy process and produce all declared deliverables."
+    timeout_seconds: 900
+  - id: live-canary
+    mode: live
+    goal: "Build a real-world marketing strategy with current market signals and channel plans."
+    timeout_seconds: 1200
+    requires_network: true
+
 verification:
   rules:
     - name: sources-cited

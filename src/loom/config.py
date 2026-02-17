@@ -140,6 +140,25 @@ class ProcessConfig:
 
 
 @dataclass(frozen=True)
+class MCPServerConfig:
+    """Configuration for one external MCP server."""
+
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    cwd: str = ""
+    timeout_seconds: int = 30
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class MCPConfig:
+    """Configuration for MCP-backed tool discovery."""
+
+    servers: dict[str, MCPServerConfig] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Config:
     """Top-level Loom configuration."""
 
@@ -151,6 +170,7 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     process: ProcessConfig = field(default_factory=ProcessConfig)
+    mcp: MCPConfig = field(default_factory=MCPConfig)
 
     @property
     def database_path(self) -> Path:
@@ -276,6 +296,41 @@ def load_config(path: Path | None = None) -> Config:
         search_paths=proc_data.get("search_paths", []),
     )
 
+    mcp_servers: dict[str, MCPServerConfig] = {}
+    mcp_data = raw.get("mcp", {})
+    servers_data = mcp_data.get("servers", {}) if isinstance(mcp_data, dict) else {}
+    if isinstance(servers_data, dict):
+        for alias, server_data in servers_data.items():
+            if not isinstance(server_data, dict):
+                continue
+
+            raw_args = server_data.get("args", [])
+            args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
+
+            raw_env = server_data.get("env", {})
+            env: dict[str, str] = {}
+            if isinstance(raw_env, dict):
+                for key, value in raw_env.items():
+                    if isinstance(key, str):
+                        env[key] = str(value)
+
+            timeout_raw = server_data.get("timeout_seconds", 30)
+            try:
+                timeout_seconds = int(timeout_raw)
+            except (TypeError, ValueError):
+                timeout_seconds = 30
+            if timeout_seconds <= 0:
+                timeout_seconds = 30
+
+            mcp_servers[str(alias)] = MCPServerConfig(
+                command=str(server_data.get("command", "")),
+                args=args,
+                env=env,
+                cwd=str(server_data.get("cwd", "")),
+                timeout_seconds=timeout_seconds,
+                enabled=bool(server_data.get("enabled", True)),
+            )
+
     return Config(
         server=server,
         models=models,
@@ -285,4 +340,5 @@ def load_config(path: Path | None = None) -> Config:
         memory=memory,
         logging=logging_cfg,
         process=process,
+        mcp=MCPConfig(servers=mcp_servers),
     )

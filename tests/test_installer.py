@@ -14,6 +14,7 @@ Covers:
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -507,6 +508,46 @@ class TestCopyPackage:
         assert not (tools_dest / "old_tool.py").exists()
         assert (tools_dest / "my_tool.py").exists()
 
+    def test_copies_additional_package_assets(self, tmp_path):
+        """Installer should preserve non-tool package assets."""
+        src = _make_package_with_tools(tmp_path)
+        templates = src / "templates"
+        templates.mkdir()
+        (templates / "planner-snippet.txt").write_text("example")
+        examples = src / "examples"
+        examples.mkdir()
+        (examples / "sample.yaml").write_text("name: sample\n")
+        (src / ".gitignore").write_text("*.tmp\n")
+
+        dest = tmp_path / "dest"
+        _copy_package(src, dest)
+
+        assert (dest / "templates" / "planner-snippet.txt").exists()
+        assert (dest / "examples" / "sample.yaml").exists()
+        assert (dest / ".gitignore").exists()
+
+    def test_skips_vcs_cache_and_bytecode_artifacts(self, tmp_path):
+        """Unsafe/noisy artifacts should be excluded from copied package."""
+        src = _make_package_with_tools(tmp_path)
+        git_dir = src / ".git"
+        git_dir.mkdir()
+        (git_dir / "config").write_text("git-config")
+        pycache = src / "__pycache__"
+        pycache.mkdir()
+        (pycache / "tool.cpython-312.pyc").write_bytes(b"abc")
+        (src / "artifact.pyc").write_bytes(b"compiled")
+        (src / ".DS_Store").write_text("noise")
+
+        dest = tmp_path / "dest"
+        _copy_package(src, dest)
+
+        assert not (dest / ".git").exists()
+        assert not (dest / "__pycache__").exists()
+        assert not (dest / "artifact.pyc").exists()
+        assert not (dest / ".DS_Store").exists()
+        # Core manifest still copied.
+        assert (dest / "process.yaml").exists()
+
 
 # ===================================================================
 # install_process — review callback gate
@@ -684,6 +725,57 @@ class TestInstallProcess:
         with pytest.raises(InstallError, match="Cannot resolve source"):
             install_process("/nonexistent/path", target_dir=tmp_path)
 
+    @patch("subprocess.run")
+    def test_install_with_isolated_deps(self, mock_run, tmp_path):
+        src = _make_package(tmp_path, YAML_WITH_DEPS)
+        target = tmp_path / "installed"
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        dest = install_process(
+            str(src),
+            target_dir=target,
+            isolated_deps=True,
+            skip_deps=False,
+        )
+
+        assert dest == target / "dep-process"
+        assert (dest / "process.yaml").exists()
+        assert mock_run.call_count == 2
+        create_cmd = mock_run.call_args_list[0][0][0]
+        pip_cmd = mock_run.call_args_list[1][0][0]
+        assert create_cmd[:3] == ["python3", "-m", "venv"]
+        assert str(target / ".deps" / "dep-process") in create_cmd
+        expected_python = target / ".deps" / "dep-process"
+        if sys.platform.startswith("win"):
+            expected_python = expected_python / "Scripts" / "python.exe"
+        else:
+            expected_python = expected_python / "bin" / "python"
+        assert pip_cmd[:3] == [
+            str(expected_python),
+            "-m",
+            "pip",
+        ]
+        assert "requests>=2.28.0" in pip_cmd
+
+    @patch("loom.processes.installer._install_dependencies_isolated")
+    @patch("loom.processes.installer._install_dependencies")
+    def test_skip_deps_disables_isolated_dep_install(
+        self,
+        mock_install,
+        mock_isolated,
+        tmp_path,
+    ):
+        src = _make_package(tmp_path, YAML_WITH_DEPS)
+        target = tmp_path / "installed"
+        install_process(
+            str(src),
+            target_dir=target,
+            skip_deps=True,
+            isolated_deps=True,
+        )
+        mock_install.assert_not_called()
+        mock_isolated.assert_not_called()
+
 
 # ===================================================================
 # uninstall_process
@@ -735,6 +827,22 @@ class TestUninstallProcess:
         removed = uninstall_process("test-process", search_dirs=[dir1, dir2])
         assert removed == pkg
         assert not pkg.exists()
+
+    def test_uninstall_removes_isolated_dependency_env(self, tmp_path):
+        proc_dir = tmp_path / "processes"
+        proc_dir.mkdir()
+        pkg = proc_dir / "test-process"
+        pkg.mkdir()
+        (pkg / "process.yaml").write_text(MINIMAL_YAML)
+
+        deps_dir = proc_dir / ".deps" / "test-process"
+        deps_dir.mkdir(parents=True)
+        (deps_dir / "marker.txt").write_text("x")
+
+        removed = uninstall_process("test-process", search_dirs=[proc_dir])
+        assert removed == pkg
+        assert not pkg.exists()
+        assert not deps_dir.exists()
 
 
 # ===================================================================

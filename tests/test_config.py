@@ -19,6 +19,10 @@ class TestDefaultConfig:
         config = Config()
         assert config.models == {}
 
+    def test_default_mcp_servers_empty(self):
+        config = Config()
+        assert config.mcp.servers == {}
+
     def test_default_execution(self):
         config = Config()
         assert config.execution.max_subtask_retries == 3
@@ -120,3 +124,24 @@ enable_streaming = true
     def test_enable_streaming_default_false(self):
         config = Config()
         assert config.execution.enable_streaming is False
+
+    def test_load_mcp_servers(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[mcp.servers.notion]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-notion"]
+timeout_seconds = 45
+enabled = true
+
+[mcp.servers.notion.env]
+NOTION_TOKEN = "secret-token"
+""")
+        config = load_config(toml_file)
+        assert "notion" in config.mcp.servers
+        server = config.mcp.servers["notion"]
+        assert server.command == "npx"
+        assert server.args == ["-y", "@modelcontextprotocol/server-notion"]
+        assert server.timeout_seconds == 45
+        assert server.enabled is True
+        assert server.env["NOTION_TOKEN"] == "secret-token"

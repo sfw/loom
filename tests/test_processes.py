@@ -9,6 +9,7 @@ Covers:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -237,6 +238,58 @@ INVALID_PHASE_MODE_YAML = """\
 name: bad-mode
 version: '1.0'
 phase_mode: mandatory
+"""
+
+VALID_TESTS_YAML = """\
+name: tests-valid
+version: '1.0'
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Run a deterministic smoke test"
+    timeout_seconds: 120
+    requires_tools: ["write_file"]
+    acceptance:
+      phases:
+        must_include: ["phase-a"]
+      deliverables:
+        must_exist: ["out.md"]
+      verification:
+        forbidden_patterns: ["deliverable_.* not found"]
+phases:
+  - id: phase-a
+    description: Phase A
+"""
+
+INVALID_TEST_MODE_YAML = """\
+name: tests-bad-mode
+version: '1.0'
+tests:
+  - id: smoke
+    mode: chaos
+    goal: "Test"
+"""
+
+DUPLICATE_TEST_ID_YAML = """\
+name: tests-dup
+version: '1.0'
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "First"
+  - id: smoke
+    mode: deterministic
+    goal: "Second"
+"""
+
+INVALID_TEST_TIMEOUT_YAML = """\
+name: tests-timeout
+version: '1.0'
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Test"
+    timeout_seconds: 0
 """
 
 
@@ -736,6 +789,31 @@ class TestProcessLoaderValidation:
             self._load_yaml_str(tmp_path, INVALID_PHASE_MODE_YAML)
         assert any("Invalid phase_mode" in e for e in exc_info.value.errors)
 
+    def test_valid_process_tests_parse(self, tmp_path):
+        defn = self._load_yaml_str(tmp_path, VALID_TESTS_YAML)
+        assert len(defn.tests) == 1
+        test_case = defn.tests[0]
+        assert test_case.id == "smoke"
+        assert test_case.mode == "deterministic"
+        assert test_case.timeout_seconds == 120
+        assert test_case.acceptance.phases_must_include == ["phase-a"]
+        assert test_case.acceptance.deliverables_must_exist == ["out.md"]
+
+    def test_invalid_process_test_mode_raises(self, tmp_path):
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, INVALID_TEST_MODE_YAML)
+        assert any("invalid mode" in e for e in exc_info.value.errors)
+
+    def test_duplicate_process_test_ids_raise(self, tmp_path):
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, DUPLICATE_TEST_ID_YAML)
+        assert any("Duplicate process test id" in e for e in exc_info.value.errors)
+
+    def test_invalid_process_test_timeout_raises(self, tmp_path):
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, INVALID_TEST_TIMEOUT_YAML)
+        assert any("timeout_seconds must be > 0" in e for e in exc_info.value.errors)
+
     def test_empty_yaml_raises(self, tmp_path):
         f = tmp_path / "empty.yaml"
         f.write_text("")
@@ -937,6 +1015,25 @@ class TestExecutorPromptWithProcess:
         assert "DOMAIN-SPECIFIC TOOL GUIDANCE" in prompt
         assert "read_file before editing" in prompt
 
+    def test_exact_deliverables_injected_for_matching_subtask(
+        self, sample_task, state_manager, full_process_defn,
+    ):
+        state_manager.create(sample_task)
+        assembler = PromptAssembler(process=full_process_defn)
+        subtask = Subtask(
+            id="implement",
+            description="Implement phase",
+            acceptance_criteria="Create implementation artifacts.",
+        )
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+        assert "REQUIRED OUTPUT FILES (EXACT FILENAMES)" in prompt
+        assert "main.py" in prompt
+        assert "Do not rename them" in prompt
+
 
 class TestVerifierPromptWithProcess:
     """Test verifier prompt assembly with process verification rules."""
@@ -1035,6 +1132,20 @@ class TestReplannerPromptWithProcess:
             original_plan=sample_task.plan,
         )
         assert "DOMAIN-SPECIFIC REPLANNING GUIDANCE" not in prompt
+
+    def test_replanning_triggers_and_reason_injected(self, sample_task, full_process_defn):
+        assembler = PromptAssembler(process=full_process_defn)
+        prompt = assembler.build_replanner_prompt(
+            goal=sample_task.goal,
+            current_state_yaml="status: executing",
+            discoveries=[],
+            errors=["verification failed"],
+            original_plan=sample_task.plan,
+            replan_reason="verify phase failed due inconsistent metrics",
+        )
+        assert "PROCESS REPLANNING TRIGGERS" in prompt
+        assert "When tests fail unexpectedly" in prompt
+        assert "verify phase failed due inconsistent metrics" in prompt
 
 
 class TestBackwardCompatibility:
@@ -1228,6 +1339,126 @@ class TestRegisterBundledTools:
         with caplog.at_level(logging.WARNING):
             ProcessLoader._register_bundled_tools(pkg)
         assert "Failed to load bundled tool" in caplog.text
+
+    def test_logs_warning_on_tool_name_collision(self, tmp_path, caplog):
+        """Conflicting bundled tool names should be diagnosed and skipped."""
+        import logging
+
+        from loom.tools import discover_tools
+        from loom.tools.registry import Tool
+
+        discover_tools()  # ensure built-ins are registered
+        before = set(Tool._registered_classes)
+
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        tools_dir = pkg / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "collision.py").write_text(
+            "from loom.tools.registry import Tool, ToolContext, ToolResult\n"
+            "class CollisionReadFile(Tool):\n"
+            "    @property\n"
+            "    def name(self):\n"
+            "        return 'read_file'\n"
+            "    @property\n"
+            "    def description(self):\n"
+            "        return 'bad collision'\n"
+            "    @property\n"
+            "    def parameters(self):\n"
+            "        return {'type': 'object', 'properties': {}}\n"
+            "    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:\n"
+            "        return ToolResult.ok('no-op')\n"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            ProcessLoader._register_bundled_tools(pkg)
+
+        after = set(Tool._registered_classes)
+        assert after == before
+        assert "conflicts with existing tool class" in caplog.text
+
+    def test_activate_isolated_dependencies(self, tmp_path):
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        if sys.platform.startswith("win"):
+            site_packages = (
+                tmp_path / ".deps" / "pkg" / "Lib" / "site-packages"
+            )
+        else:
+            site_packages = (
+                tmp_path / ".deps" / "pkg" / "lib" / "python3.14" / "site-packages"
+            )
+        site_packages.mkdir(parents=True)
+
+        site_path = str(site_packages)
+        if site_path in sys.path:
+            sys.path.remove(site_path)
+
+        ProcessLoader._activate_isolated_dependencies(pkg)
+        assert sys.path[0] == site_path
+
+        # Cleanup so later tests see a stable sys.path.
+        if site_path in sys.path:
+            sys.path.remove(site_path)
+
+    def test_skips_duplicate_bundled_tool_names_within_same_module(
+        self,
+        tmp_path,
+        caplog,
+    ):
+        """Duplicate tool names in bundled modules should be pruned safely."""
+        import logging
+
+        from loom.tools.registry import Tool
+
+        before = set(Tool._registered_classes)
+
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        tools_dir = pkg / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "dupes.py").write_text(
+            "from loom.tools.registry import Tool, ToolContext, ToolResult\n"
+            "class ToolA(Tool):\n"
+            "    @property\n"
+            "    def name(self):\n"
+            "        return 'pkg_duplicate'\n"
+            "    @property\n"
+            "    def description(self):\n"
+            "        return 'a'\n"
+            "    @property\n"
+            "    def parameters(self):\n"
+            "        return {'type': 'object', 'properties': {}}\n"
+            "    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:\n"
+            "        return ToolResult.ok('ok')\n"
+            "class ToolB(Tool):\n"
+            "    @property\n"
+            "    def name(self):\n"
+            "        return 'pkg_duplicate'\n"
+            "    @property\n"
+            "    def description(self):\n"
+            "        return 'b'\n"
+            "    @property\n"
+            "    def parameters(self):\n"
+            "        return {'type': 'object', 'properties': {}}\n"
+            "    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:\n"
+            "        return ToolResult.ok('ok')\n"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            ProcessLoader._register_bundled_tools(pkg)
+
+        after = set(Tool._registered_classes)
+        new_classes = [cls for cls in after if cls not in before]
+        duplicate_classes = [
+            cls for cls in new_classes
+            if ProcessLoader._tool_name_from_class(cls) == "pkg_duplicate"
+        ]
+        assert len(duplicate_classes) == 1
+        assert "conflicts with existing tool class" in caplog.text
+
+        for cls in new_classes:
+            Tool._registered_classes.discard(cls)
 
 
 # ===================================================================

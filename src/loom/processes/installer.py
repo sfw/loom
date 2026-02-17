@@ -24,6 +24,7 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -51,6 +52,31 @@ class UninstallError(Exception):
 # ---------------------------------------------------------------------------
 
 BUILTIN_DIR = Path(__file__).parent / "builtin"
+_SKIP_DIR_NAMES = frozenset({
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".tox",
+    ".venv",
+    "venv",
+    "node_modules",
+    "dist",
+    "build",
+    ".eggs",
+})
+_SKIP_FILE_NAMES = frozenset({
+    ".DS_Store",
+})
+_SKIP_FILE_SUFFIXES = frozenset({
+    ".pyc",
+    ".pyo",
+    ".swp",
+    ".swo",
+    ".tmp",
+})
+_ISOLATED_DEPS_DIRNAME = ".deps"
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +189,7 @@ def install_process(
     *,
     target_dir: Path | None = None,
     skip_deps: bool = False,
+    isolated_deps: bool = False,
     python_cmd: str = "python3",
     review_callback: Callable[[PackageReview], bool] | None = None,
 ) -> Path:
@@ -179,6 +206,10 @@ def install_process(
         Where to install.  Defaults to ``~/.loom/processes/``.
     skip_deps:
         If True, skip installing Python dependencies.
+    isolated_deps:
+        If True, install dependencies into a per-process virtualenv under
+        ``<target_dir>/.deps/<process-name>/`` instead of the current
+        Python environment.
     python_cmd:
         Python executable for ``pip install``.  Defaults to ``python3``.
     review_callback:
@@ -218,7 +249,15 @@ def install_process(
 
         # Install dependencies (only after review approval)
         if not skip_deps:
-            _install_dependencies(src_dir, python_cmd)
+            if isolated_deps:
+                _install_dependencies_isolated(
+                    src_dir=src_dir,
+                    process_name=name,
+                    target_dir=target_dir,
+                    python_cmd=python_cmd,
+                )
+            else:
+                _install_dependencies(src_dir, python_cmd)
 
         # Copy to target
         dest = target_dir / name
@@ -269,6 +308,9 @@ def uninstall_process(
         pkg_dir = search_dir / name
         if pkg_dir.is_dir() and (pkg_dir / "process.yaml").exists():
             shutil.rmtree(pkg_dir)
+            isolated_dir = search_dir / _ISOLATED_DEPS_DIRNAME / name
+            if isolated_dir.exists():
+                shutil.rmtree(isolated_dir)
             logger.info("Removed process %r from %s", name, pkg_dir)
             return pkg_dir
 
@@ -276,6 +318,9 @@ def uninstall_process(
         yaml_file = search_dir / f"{name}.yaml"
         if yaml_file.is_file():
             yaml_file.unlink()
+            isolated_dir = search_dir / _ISOLATED_DEPS_DIRNAME / name
+            if isolated_dir.exists():
+                shutil.rmtree(isolated_dir)
             logger.info("Removed process %r (%s)", name, yaml_file)
             return yaml_file
 
@@ -487,16 +532,7 @@ def _validate_package(src_dir: Path) -> str:
 
 def _install_dependencies(src_dir: Path, python_cmd: str) -> None:
     """Install Python dependencies declared in process.yaml."""
-    manifest = src_dir / "process.yaml"
-    with open(manifest) as f:
-        raw = yaml.safe_load(f)
-
-    deps = raw.get("dependencies", [])
-    if not deps or not isinstance(deps, list):
-        return
-
-    # Filter to strings only
-    deps = [d for d in deps if isinstance(d, str) and d.strip()]
+    deps = _read_dependencies(src_dir)
     if not deps:
         return
 
@@ -537,23 +573,107 @@ def _install_dependencies(src_dir: Path, python_cmd: str) -> None:
         )
 
 
+def _install_dependencies_isolated(
+    src_dir: Path,
+    process_name: str,
+    target_dir: Path,
+    python_cmd: str,
+) -> None:
+    """Install dependencies into an isolated per-process virtualenv."""
+    deps = _read_dependencies(src_dir)
+    if not deps:
+        return
+
+    venv_dir = target_dir / _ISOLATED_DEPS_DIRNAME / process_name
+    logger.info(
+        "Installing %d dependencies into isolated env: %s",
+        len(deps), venv_dir,
+    )
+
+    # Recreate the env to avoid stale/partial dependency states.
+    if venv_dir.exists():
+        shutil.rmtree(venv_dir)
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        create = subprocess.run(
+            [python_cmd, "-m", "venv", str(venv_dir)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except FileNotFoundError:
+        raise InstallError(
+            f"Python executable not found for isolated deps: {python_cmd}"
+        )
+    except subprocess.TimeoutExpired:
+        raise InstallError("Creating isolated dependency environment timed out (120s).")
+
+    if create.returncode != 0:
+        raise InstallError(
+            "Failed to create isolated dependency environment: "
+            f"{(create.stderr or '').strip()[:500]}"
+        )
+
+    venv_python = _venv_python(venv_dir)
+    try:
+        install = subprocess.run(
+            [str(venv_python), "-m", "pip", "install", *deps],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        raise InstallError(
+            f"Isolated environment Python not found at: {venv_python}"
+        )
+    except subprocess.TimeoutExpired:
+        raise InstallError(
+            f"Dependency installation timed out (300s). "
+            f"Packages: {', '.join(deps)}"
+        )
+
+    if install.returncode != 0:
+        raise InstallError(
+            "Failed to install isolated dependencies: "
+            f"{(install.stderr or '').strip()[:500]}"
+        )
+
+
+def _read_dependencies(src_dir: Path) -> list[str]:
+    """Read and normalize dependency strings from process.yaml."""
+    manifest = src_dir / "process.yaml"
+    with open(manifest) as f:
+        raw = yaml.safe_load(f)
+    deps = raw.get("dependencies", [])
+    if not deps or not isinstance(deps, list):
+        return []
+    return [d for d in deps if isinstance(d, str) and d.strip()]
+
+
+def _venv_python(venv_dir: Path) -> Path:
+    """Return the Python executable path for a virtualenv directory."""
+    if sys.platform.startswith("win"):
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
 def _copy_package(src_dir: Path, dest: Path) -> None:
     """Copy the process package from *src_dir* to *dest*."""
-    dest.mkdir(parents=True, exist_ok=True)
+    def _ignore(dirpath: str, names: list[str]) -> list[str]:
+        ignored: list[str] = []
+        for name in names:
+            path = Path(dirpath) / name
+            if path.is_dir():
+                if name in _SKIP_DIR_NAMES:
+                    ignored.append(name)
+                continue
+            if name in _SKIP_FILE_NAMES or path.suffix in _SKIP_FILE_SUFFIXES:
+                ignored.append(name)
+        return ignored
 
-    # Always copy process.yaml
-    shutil.copy2(src_dir / "process.yaml", dest / "process.yaml")
-
-    # Copy tools/ directory if present
-    tools_src = src_dir / "tools"
-    if tools_src.is_dir():
-        tools_dest = dest / "tools"
-        if tools_dest.exists():
-            shutil.rmtree(tools_dest)
-        shutil.copytree(tools_src, tools_dest)
-
-    # Copy optional files
-    for name in ("README.md", "readme.md", "LICENSE"):
-        src_file = src_dir / name
-        if src_file.is_file():
-            shutil.copy2(src_file, dest / name)
+    # Ensure clean destination copy.
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src_dir, dest, ignore=_ignore)

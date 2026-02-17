@@ -459,6 +459,73 @@ class TestProcessField:
         assert response.status_code == 201
 
     @pytest.mark.asyncio
+    async def test_create_task_uses_default_process_when_omitted(
+        self,
+        client,
+        engine,
+        monkeypatch,
+    ):
+        """When request omits process, config.process.default should apply."""
+        engine.config = Config(
+            process=ProcessConfig(default="default-process"),
+        )
+        captured: dict[str, object] = {}
+
+        class DummyLoader:
+            def __init__(self, workspace=None, extra_search_paths=None):
+                captured["workspace"] = workspace
+                captured["extra_search_paths"] = extra_search_paths
+
+            def load(self, name):
+                captured["name"] = name
+                return SimpleNamespace(
+                    name=name,
+                    tools=SimpleNamespace(required=[], excluded=[]),
+                )
+
+        monkeypatch.setattr("loom.processes.schema.ProcessLoader", DummyLoader)
+
+        response = await client.post("/tasks", json={"goal": "Use default process"})
+
+        assert response.status_code == 201
+        assert captured["name"] == "default-process"
+
+    @pytest.mark.asyncio
+    async def test_create_task_explicit_process_overrides_default(
+        self,
+        client,
+        engine,
+        monkeypatch,
+    ):
+        """Explicit request process should override config.process.default."""
+        engine.config = Config(
+            process=ProcessConfig(default="default-process"),
+        )
+        captured: dict[str, object] = {}
+
+        class DummyLoader:
+            def __init__(self, workspace=None, extra_search_paths=None):
+                captured["workspace"] = workspace
+                captured["extra_search_paths"] = extra_search_paths
+
+            def load(self, name):
+                captured["name"] = name
+                return SimpleNamespace(
+                    name=name,
+                    tools=SimpleNamespace(required=[], excluded=[]),
+                )
+
+        monkeypatch.setattr("loom.processes.schema.ProcessLoader", DummyLoader)
+
+        response = await client.post("/tasks", json={
+            "goal": "Use explicit process",
+            "process": "explicit-process",
+        })
+
+        assert response.status_code == 201
+        assert captured["name"] == "explicit-process"
+
+    @pytest.mark.asyncio
     async def test_create_task_uses_configured_process_search_paths(
         self,
         client,
@@ -495,6 +562,41 @@ class TestProcessField:
         assert response.status_code == 201
         assert captured["workspace"] == tmp_path
         assert captured["extra_search_paths"] == [extra_dir]
+
+    @pytest.mark.asyncio
+    async def test_create_task_rejects_missing_required_tools(
+        self,
+        client,
+        monkeypatch,
+    ):
+        """Process-required missing tools should return HTTP 400 immediately."""
+        captured: dict[str, object] = {}
+
+        class DummyLoader:
+            def __init__(self, workspace=None, extra_search_paths=None):
+                captured["workspace"] = workspace
+                captured["extra_search_paths"] = extra_search_paths
+
+            def load(self, name):
+                return SimpleNamespace(
+                    name=name,
+                    tools=SimpleNamespace(
+                        required=["definitely-missing-tool"],
+                        excluded=[],
+                    ),
+                )
+
+        monkeypatch.setattr("loom.processes.schema.ProcessLoader", DummyLoader)
+
+        response = await client.post("/tasks", json={
+            "goal": "Reject missing required tools",
+            "process": "demo-process",
+        })
+
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert "requires missing tool" in detail
+        assert "definitely-missing-tool" in detail
 
 
 class TestBackgroundExecution:
@@ -566,3 +668,16 @@ class TestEngineOrchestratorFactory:
         assert task_orch._tools is not engine.tool_registry
         assert task_orch._prompts is not engine.prompt_assembler
         assert task_orch._process == process_def
+
+    def test_create_task_orchestrator_rejects_missing_required_tools(self, engine):
+        """Process-required tools must exist at orchestrator creation time."""
+        process_def = SimpleNamespace(
+            name="process",
+            tools=SimpleNamespace(
+                excluded=[],
+                required=["definitely-missing-tool"],
+            ),
+        )
+
+        with pytest.raises(ValueError, match="requires missing tool"):
+            engine.create_task_orchestrator(process=process_def)

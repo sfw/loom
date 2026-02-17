@@ -6,6 +6,7 @@ graceful degradation paths.
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -56,13 +57,53 @@ class _StreamingHTTPErrorResponse:
         return self.status_code >= 400
 
 
+class _StreamingSuccessResponse:
+    """Simulate a successful streaming response with SSE lines."""
+
+    def __init__(self, lines: list[str], status_code: int = 200) -> None:
+        self.status_code = status_code
+        self.headers = {}
+        self._lines = lines
+
+    @property
+    def is_error(self) -> bool:
+        return self.status_code >= 400
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+class _HTTPErrorResponse:
+    """Simple non-streaming response that raises HTTPStatusError."""
+
+    def __init__(self, status_code: int, body: str = "") -> None:
+        self.status_code = status_code
+        self.headers = {}
+        self._body = body
+
+    async def aread(self) -> bytes:
+        return self._body.encode("utf-8")
+
+    @property
+    def text(self) -> str:
+        return self._body
+
+    def raise_for_status(self) -> None:
+        raise httpx.HTTPStatusError(
+            str(self.status_code),
+            request=MagicMock(),
+            response=self,
+        )
+
+
 class _ErrorStreamContext:
     """Async context manager that yields a response raising HTTPStatusError."""
 
-    def __init__(self, response: _StreamingHTTPErrorResponse) -> None:
+    def __init__(self, response) -> None:
         self._response = response
 
-    async def __aenter__(self) -> _StreamingHTTPErrorResponse:
+    async def __aenter__(self):
         return self._response
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
@@ -93,7 +134,7 @@ class TestModelConnectionError:
 
 
 class TestOpenAIProviderErrors:
-    def _make_provider(self):
+    def _make_provider(self, *, api_key: str = ""):
         from loom.config import ModelConfig
         from loom.models.openai_provider import OpenAICompatibleProvider
 
@@ -101,8 +142,23 @@ class TestOpenAIProviderErrors:
             provider="openai_compatible",
             base_url="http://localhost:9999",
             model="test-model",
+            api_key=api_key,
         )
         return OpenAICompatibleProvider(config)
+
+    def test_constructor_applies_bearer_auth_header_when_api_key_is_set(self):
+        provider = self._make_provider(api_key="test-key")
+        try:
+            assert provider._client.headers.get("authorization") == "Bearer test-key"
+        finally:
+            asyncio.run(provider._client.aclose())
+
+    def test_constructor_omits_auth_header_when_api_key_is_empty(self):
+        provider = self._make_provider(api_key="")
+        try:
+            assert provider._client.headers.get("authorization") is None
+        finally:
+            asyncio.run(provider._client.aclose())
 
     @pytest.mark.asyncio
     async def test_complete_connect_error(self):
@@ -146,6 +202,108 @@ class TestOpenAIProviderErrors:
             await provider.complete([{"role": "user", "content": "hi"}])
 
     @pytest.mark.asyncio
+    async def test_complete_retries_with_reasoning_content_for_tool_calls(self):
+        provider = self._make_provider(api_key="test-key")
+        provider._client = AsyncMock()
+        provider._client.base_url = "https://api.example.test/v1"
+
+        first = _HTTPErrorResponse(
+            400,
+            body=(
+                '{"error":{"message":"thinking is enabled but reasoning_content '
+                'is missing in assistant tool call message at index 1"}}'
+            ),
+        )
+        second = MagicMock()
+        second.raise_for_status.return_value = None
+        second.json.return_value = {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        provider._client.post = AsyncMock(side_effect=[first, second])
+
+        messages = [
+            {"role": "user", "content": "start"},
+            {
+                "role": "assistant",
+                "content": "Calling tool",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "arguments": "{\"url\":\"https://example.com\"}",
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "{\"ok\":true}",
+            },
+        ]
+
+        response = await provider.complete(messages)
+        assert response.text == "ok"
+        assert provider._client.post.await_count == 2
+
+        first_payload = provider._client.post.await_args_list[0].kwargs["json"]
+        second_payload = provider._client.post.await_args_list[1].kwargs["json"]
+        assert "reasoning_content" not in first_payload["messages"][1]
+        assert second_payload["messages"][1]["reasoning_content"] == "Calling tool"
+
+    @pytest.mark.asyncio
+    async def test_complete_retry_injects_non_empty_reasoning_content_when_content_empty(self):
+        provider = self._make_provider(api_key="test-key")
+        provider._client = AsyncMock()
+        provider._client.base_url = "https://api.example.test/v1"
+
+        first = _HTTPErrorResponse(
+            400,
+            body=(
+                '{"error":{"message":"thinking is enabled but reasoning_content '
+                'is missing in assistant tool call message at index 1"}}'
+            ),
+        )
+        second = MagicMock()
+        second.raise_for_status.return_value = None
+        second.json.return_value = {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        provider._client.post = AsyncMock(side_effect=[first, second])
+
+        messages = [
+            {"role": "user", "content": "start"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "arguments": "{\"url\":\"https://example.com\"}",
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "{\"ok\":true}",
+            },
+        ]
+
+        response = await provider.complete(messages)
+        assert response.text == "ok"
+
+        retry_payload = provider._client.post.await_args_list[1].kwargs["json"]
+        assert (
+            retry_payload["messages"][1]["reasoning_content"]
+            == "Tool call required to continue."
+        )
+
+    @pytest.mark.asyncio
     async def test_stream_http_error_does_not_access_response_text(self):
         """Streaming HTTP errors should be reported without .text access crashes."""
         provider = self._make_provider()
@@ -165,6 +323,64 @@ class TestOpenAIProviderErrors:
 
         assert "unauthorized" in str(exc.value)
 
+    @pytest.mark.asyncio
+    async def test_stream_retries_with_reasoning_content_for_tool_calls(self):
+        provider = self._make_provider(api_key="test-key")
+        provider._client = MagicMock()
+
+        first = _StreamingHTTPErrorResponse(
+            400,
+            body=(
+                '{"error":{"message":"thinking is enabled but reasoning_content '
+                'is missing in assistant tool call message at index 1"}}'
+            ),
+        )
+        second = _StreamingSuccessResponse([
+            'data: {"choices":[{"delta":{"content":"ok"}}]}',
+            "data: [DONE]",
+        ])
+        provider._client.stream = MagicMock(side_effect=[
+            _ErrorStreamContext(first),
+            _ErrorStreamContext(second),
+        ])
+
+        messages = [
+            {"role": "user", "content": "start"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "arguments": "{\"url\":\"https://example.com\"}",
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "{\"ok\":true}",
+            },
+        ]
+
+        chunks = []
+        async for chunk in provider.stream(messages):
+            chunks.append(chunk)
+
+        assert "".join(c.text for c in chunks) == "ok"
+        assert chunks[-1].done is True
+        assert provider._client.stream.call_count == 2
+
+        first_payload = provider._client.stream.call_args_list[0].kwargs["json"]
+        second_payload = provider._client.stream.call_args_list[1].kwargs["json"]
+        assert "reasoning_content" not in first_payload["messages"][1]
+        assert (
+            second_payload["messages"][1]["reasoning_content"]
+            == "Tool call required to continue."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Ollama provider error handling
@@ -172,7 +388,7 @@ class TestOpenAIProviderErrors:
 
 
 class TestOllamaProviderErrors:
-    def _make_provider(self):
+    def _make_provider(self, *, api_key: str = ""):
         from loom.config import ModelConfig
         from loom.models.ollama_provider import OllamaProvider
 
@@ -180,8 +396,23 @@ class TestOllamaProviderErrors:
             provider="ollama",
             base_url="http://localhost:11434",
             model="llama3",
+            api_key=api_key,
         )
         return OllamaProvider(config)
+
+    def test_constructor_applies_bearer_auth_header_when_api_key_is_set(self):
+        provider = self._make_provider(api_key="test-key")
+        try:
+            assert provider._client.headers.get("authorization") == "Bearer test-key"
+        finally:
+            asyncio.run(provider._client.aclose())
+
+    def test_constructor_omits_auth_header_when_api_key_is_empty(self):
+        provider = self._make_provider(api_key="")
+        try:
+            assert provider._client.headers.get("authorization") is None
+        finally:
+            asyncio.run(provider._client.aclose())
 
     @pytest.mark.asyncio
     async def test_complete_connect_error(self):

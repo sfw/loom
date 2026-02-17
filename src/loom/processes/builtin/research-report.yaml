@@ -73,6 +73,17 @@ phases:
       - "research-report.md — final report with all sections"
       - "references.csv — structured reference list with URLs"
 
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Run the research-report process and produce all declared deliverables."
+    timeout_seconds: 900
+  - id: live-canary
+    mode: live
+    goal: "Research a current topic end-to-end and produce a sourced report."
+    timeout_seconds: 1200
+    requires_network: true
+
 verification:
   rules:
     - name: citations-present
