@@ -115,6 +115,11 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         canonical="/learned",
         description="review/delete learned patterns",
     ),
+    SlashCommandSpec(
+        canonical="/process",
+        usage="[list|use <name>|off]",
+        description="inspect/switch active process",
+    ),
 )
 _MAX_SLASH_HINT_LINES = 14
 
@@ -274,19 +279,31 @@ class LoomApp(App):
 
         self._tools = create_default_registry()
 
-    def _load_process_definition(self, chat: ChatLog) -> None:
-        """Load active process definition and import bundled tools."""
-        self._process_defn = None
-        if not self._process_name or not self._config:
-            return
-
+    def _create_process_loader(self):
+        """Create a process loader for the current workspace/config."""
         from loom.processes.schema import ProcessLoader
 
-        extra = [Path(p) for p in self._config.process.search_paths]
-        loader = ProcessLoader(
+        extra: list[Path] = []
+        if self._config:
+            extra = [Path(p) for p in self._config.process.search_paths]
+        return ProcessLoader(
             workspace=self._workspace,
             extra_search_paths=extra,
         )
+
+    def _active_process_name(self) -> str:
+        """Return active process display name."""
+        if self._process_defn:
+            return self._process_defn.name
+        return "none"
+
+    def _load_process_definition(self, chat: ChatLog) -> None:
+        """Load active process definition and import bundled tools."""
+        self._process_defn = None
+        if not self._process_name:
+            return
+
+        loader = self._create_process_loader()
         try:
             self._process_defn = loader.load(self._process_name)
             # Process load may import bundled tool modules; rebuild to include
@@ -301,6 +318,43 @@ class LoomApp(App):
                 f"[bold #f7768e]Failed to load process "
                 f"'{self._process_name}': {e}[/]"
             )
+
+    async def _reload_session_for_process_change(self, chat: ChatLog) -> None:
+        """Rebuild session after changing active process."""
+        if self._busy:
+            chat.add_info(
+                "[bold #f7768e]Cannot switch process while a turn is running.[/]"
+            )
+            return
+
+        if self._session is not None:
+            if self._store and self._session.session_id:
+                await self._store.update_session(
+                    self._session.session_id, is_active=False,
+                )
+            self._session = None
+
+        self._resume_session = None
+        await self._initialize_session()
+
+    def _render_process_catalog(self) -> str:
+        """Build a human-readable process list."""
+        loader = self._create_process_loader()
+        available = loader.list_available()
+        if not available:
+            return "No process definitions found."
+
+        active = self._process_defn.name if self._process_defn else ""
+        lines = ["[bold]Available processes:[/bold]"]
+        for proc in available:
+            name = proc["name"]
+            ver = proc["version"]
+            desc = proc.get("description", "").strip().split("\n")[0]
+            marker = " [cyan]<< active[/cyan]" if name == active else ""
+            lines.append(f"  {name:30s} v{ver:6s}{marker}")
+            if desc:
+                lines.append(f"    [dim]{desc[:80]}[/dim]")
+        return "\n".join(lines)
 
     def _apply_process_tool_policy(self, chat: ChatLog) -> None:
         """Apply process tool exclusions to the active registry."""
@@ -344,6 +398,7 @@ class LoomApp(App):
         Requires self._model to be set.
         """
         chat = self.query_one("#chat-log", ChatLog)
+        self._total_tokens = 0
 
         # Start from a clean registry each initialization to avoid stale
         # excludes/bindings when setup or process configuration changes.
@@ -435,6 +490,7 @@ class LoomApp(App):
         status = self.query_one("#status-bar", StatusBar)
         status.workspace_name = self._workspace.name
         status.model_name = self._model.name
+        status.process_name = self._active_process_name()
 
         # Welcome message
         chat.add_info(
@@ -448,6 +504,10 @@ class LoomApp(App):
             chat.add_info(
                 f"[dim]session: {self._session.session_id}[/dim]"
             )
+
+        # Resume is a one-shot startup hint; subsequent reinitializations
+        # should not keep trying to reopen the same prior session.
+        self._resume_session = None
 
         self.query_one("#user-input", Input).focus()
 
@@ -902,6 +962,61 @@ class LoomApp(App):
         if token == "/tokens":
             chat.add_info(f"Session tokens: {self._total_tokens:,}")
             return True
+        if token == "/process":
+            if not arg:
+                active = self._active_process_name()
+                chat.add_info(
+                    f"Active process: {active}\n"
+                    "Usage:\n"
+                    "  /process list\n"
+                    "  /process use <name-or-path>\n"
+                    "  /process off"
+                )
+                return True
+
+            subparts = arg.split(None, 1)
+            subcmd = subparts[0].lower()
+            rest = subparts[1].strip() if len(subparts) > 1 else ""
+
+            if subcmd == "list":
+                chat.add_info(self._render_process_catalog())
+                return True
+
+            if subcmd == "use":
+                if not rest:
+                    chat.add_info("Usage: /process use <name-or-path>")
+                    return True
+                loader = self._create_process_loader()
+                try:
+                    loaded = loader.load(rest)
+                except Exception as e:
+                    chat.add_info(
+                        f"[bold #f7768e]Failed to load process "
+                        f"'{rest}': {e}[/]"
+                    )
+                    return True
+
+                self._process_name = rest
+                await self._reload_session_for_process_change(chat)
+                chat.add_info(
+                    f"Active process: [bold]{loaded.name}[/bold] v{loaded.version}"
+                )
+                return True
+
+            if subcmd in {"off", "none", "clear"}:
+                if not self._process_name and self._process_defn is None:
+                    chat.add_info("No active process.")
+                    return True
+                self._process_name = None
+                self._process_defn = None
+                await self._reload_session_for_process_change(chat)
+                chat.add_info("Active process: none")
+                return True
+
+            chat.add_info(
+                "Usage: /process [list|use <name-or-path>|off]"
+            )
+            return True
 
         # Persistence-dependent commands
         if token == "/session":
@@ -912,6 +1027,7 @@ class LoomApp(App):
             info = (
                 f"Session: {self._session.session_id}\n"
                 f"Workspace: {self._session.workspace}\n"
+                f"Process: {self._active_process_name()}\n"
                 f"Turns: {state.turn_count}\n"
                 f"Tokens: {state.total_tokens}\n"
                 f"Focus: {state.current_focus or '(none)'}"
