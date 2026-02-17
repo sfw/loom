@@ -507,6 +507,46 @@ class TestCopyPackage:
         assert not (tools_dest / "old_tool.py").exists()
         assert (tools_dest / "my_tool.py").exists()
 
+    def test_copies_additional_package_assets(self, tmp_path):
+        """Installer should preserve non-tool package assets."""
+        src = _make_package_with_tools(tmp_path)
+        templates = src / "templates"
+        templates.mkdir()
+        (templates / "planner-snippet.txt").write_text("example")
+        examples = src / "examples"
+        examples.mkdir()
+        (examples / "sample.yaml").write_text("name: sample\n")
+        (src / ".gitignore").write_text("*.tmp\n")
+
+        dest = tmp_path / "dest"
+        _copy_package(src, dest)
+
+        assert (dest / "templates" / "planner-snippet.txt").exists()
+        assert (dest / "examples" / "sample.yaml").exists()
+        assert (dest / ".gitignore").exists()
+
+    def test_skips_vcs_cache_and_bytecode_artifacts(self, tmp_path):
+        """Unsafe/noisy artifacts should be excluded from copied package."""
+        src = _make_package_with_tools(tmp_path)
+        git_dir = src / ".git"
+        git_dir.mkdir()
+        (git_dir / "config").write_text("git-config")
+        pycache = src / "__pycache__"
+        pycache.mkdir()
+        (pycache / "tool.cpython-312.pyc").write_bytes(b"abc")
+        (src / "artifact.pyc").write_bytes(b"compiled")
+        (src / ".DS_Store").write_text("noise")
+
+        dest = tmp_path / "dest"
+        _copy_package(src, dest)
+
+        assert not (dest / ".git").exists()
+        assert not (dest / "__pycache__").exists()
+        assert not (dest / "artifact.pyc").exists()
+        assert not (dest / ".DS_Store").exists()
+        # Core manifest still copied.
+        assert (dest / "process.yaml").exists()
+
 
 # ===================================================================
 # install_process — review callback gate

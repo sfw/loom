@@ -51,6 +51,30 @@ class UninstallError(Exception):
 # ---------------------------------------------------------------------------
 
 BUILTIN_DIR = Path(__file__).parent / "builtin"
+_SKIP_DIR_NAMES = frozenset({
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".tox",
+    ".venv",
+    "venv",
+    "node_modules",
+    "dist",
+    "build",
+    ".eggs",
+})
+_SKIP_FILE_NAMES = frozenset({
+    ".DS_Store",
+})
+_SKIP_FILE_SUFFIXES = frozenset({
+    ".pyc",
+    ".pyo",
+    ".swp",
+    ".swo",
+    ".tmp",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -539,21 +563,20 @@ def _install_dependencies(src_dir: Path, python_cmd: str) -> None:
 
 def _copy_package(src_dir: Path, dest: Path) -> None:
     """Copy the process package from *src_dir* to *dest*."""
-    dest.mkdir(parents=True, exist_ok=True)
+    def _ignore(dirpath: str, names: list[str]) -> list[str]:
+        ignored: list[str] = []
+        for name in names:
+            path = Path(dirpath) / name
+            if path.is_dir():
+                if name in _SKIP_DIR_NAMES:
+                    ignored.append(name)
+                continue
+            if name in _SKIP_FILE_NAMES or path.suffix in _SKIP_FILE_SUFFIXES:
+                ignored.append(name)
+        return ignored
 
-    # Always copy process.yaml
-    shutil.copy2(src_dir / "process.yaml", dest / "process.yaml")
-
-    # Copy tools/ directory if present
-    tools_src = src_dir / "tools"
-    if tools_src.is_dir():
-        tools_dest = dest / "tools"
-        if tools_dest.exists():
-            shutil.rmtree(tools_dest)
-        shutil.copytree(tools_src, tools_dest)
-
-    # Copy optional files
-    for name in ("README.md", "readme.md", "LICENSE"):
-        src_file = src_dir / name
-        if src_file.is_file():
-            shutil.copy2(src_file, dest / name)
+    # Ensure clean destination copy.
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src_dir, dest, ignore=_ignore)

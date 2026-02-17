@@ -27,6 +27,7 @@ All notable changes to Loom are documented in this file.
 - **`process.default` now applied by CLI launch paths** (`__main__.py`) -- when `--process` is omitted, `loom`, `loom cowork`, and `loom run` now automatically use `config.process.default` if configured.
 - **In-session process controls in TUI** (`tui/app.py`) -- added `/process` command family for live process management: `/process` (status/usage), `/process list`, `/process use <name-or-path>`, and `/process off`.
 - **Process visibility in TUI status/session output** (`tui/widgets/status_bar.py`, `tui/app.py`) -- active process now appears in the bottom status bar (`process:<name>`) and `/session` output.
+- **Installer now preserves full package assets with artifact filtering** (`processes/installer.py`) -- package installation now copies full process directories (templates/examples/docs and other assets), while excluding VCS/cache/bytecode artifacts such as `.git/`, `__pycache__/`, and `*.pyc`.
 - **Process/package system refactor plan documented** (`planning/refactors/2026-02-17-PROCESS-PACKAGE-SYSTEM-PLAN.md`) -- added a prioritized execution plan covering TUI/API parity, strictness enforcement, package hardening, and demo-readiness criteria.
 
 ### Fixed
