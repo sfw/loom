@@ -240,6 +240,58 @@ version: '1.0'
 phase_mode: mandatory
 """
 
+VALID_TESTS_YAML = """\
+name: tests-valid
+version: '1.0'
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Run a deterministic smoke test"
+    timeout_seconds: 120
+    requires_tools: ["write_file"]
+    acceptance:
+      phases:
+        must_include: ["phase-a"]
+      deliverables:
+        must_exist: ["out.md"]
+      verification:
+        forbidden_patterns: ["deliverable_.* not found"]
+phases:
+  - id: phase-a
+    description: Phase A
+"""
+
+INVALID_TEST_MODE_YAML = """\
+name: tests-bad-mode
+version: '1.0'
+tests:
+  - id: smoke
+    mode: chaos
+    goal: "Test"
+"""
+
+DUPLICATE_TEST_ID_YAML = """\
+name: tests-dup
+version: '1.0'
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "First"
+  - id: smoke
+    mode: deterministic
+    goal: "Second"
+"""
+
+INVALID_TEST_TIMEOUT_YAML = """\
+name: tests-timeout
+version: '1.0'
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Test"
+    timeout_seconds: 0
+"""
+
 
 @pytest.fixture
 def process_dir(tmp_path):
@@ -736,6 +788,31 @@ class TestProcessLoaderValidation:
         with pytest.raises(ProcessValidationError) as exc_info:
             self._load_yaml_str(tmp_path, INVALID_PHASE_MODE_YAML)
         assert any("Invalid phase_mode" in e for e in exc_info.value.errors)
+
+    def test_valid_process_tests_parse(self, tmp_path):
+        defn = self._load_yaml_str(tmp_path, VALID_TESTS_YAML)
+        assert len(defn.tests) == 1
+        test_case = defn.tests[0]
+        assert test_case.id == "smoke"
+        assert test_case.mode == "deterministic"
+        assert test_case.timeout_seconds == 120
+        assert test_case.acceptance.phases_must_include == ["phase-a"]
+        assert test_case.acceptance.deliverables_must_exist == ["out.md"]
+
+    def test_invalid_process_test_mode_raises(self, tmp_path):
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, INVALID_TEST_MODE_YAML)
+        assert any("invalid mode" in e for e in exc_info.value.errors)
+
+    def test_duplicate_process_test_ids_raise(self, tmp_path):
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, DUPLICATE_TEST_ID_YAML)
+        assert any("Duplicate process test id" in e for e in exc_info.value.errors)
+
+    def test_invalid_process_test_timeout_raises(self, tmp_path):
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, INVALID_TEST_TIMEOUT_YAML)
+        assert any("timeout_seconds must be > 0" in e for e in exc_info.value.errors)
 
     def test_empty_yaml_raises(self, tmp_path):
         f = tmp_path / "empty.yaml"

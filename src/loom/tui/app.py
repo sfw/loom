@@ -277,7 +277,7 @@ class LoomApp(App):
         """Reset registry to discovered tools."""
         from loom.tools import create_default_registry
 
-        self._tools = create_default_registry()
+        self._tools = create_default_registry(self._config)
 
     def _create_process_loader(self):
         """Create a process loader for the current workspace/config."""

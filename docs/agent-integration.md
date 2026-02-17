@@ -635,6 +635,14 @@ loom install acme/loom-analytics --isolated-deps
 loom uninstall google-analytics
 ```
 
+Run packaged test cases (deterministic by default, or live with real providers):
+
+```bash
+loom process test investment-analysis
+loom process test ./my-local-process --case smoke
+loom process test ./my-local-process --live
+```
+
 The installer expects a `process.yaml` at the repo root. Python dependencies
 declared in the `dependencies` field are auto-installed (tries `uv` first, falls back to `pip`):
 
@@ -647,6 +655,10 @@ dependencies:
   - pandas>=2.0
 # ... rest of process definition
 ```
+
+Process packages can also declare a `tests:` manifest in `process.yaml` with
+test IDs, deterministic/live mode, optional tool/network requirements, and
+acceptance checks for phases, deliverables, and verification output.
 
 Notes:
 - `tools.required` is enforced at runtime. Missing required tools fail process activation/task creation.
@@ -798,7 +810,19 @@ database_path = "~/.loom/loom.db"
 [workspace]
 default_path = "~/projects"
 scratch_dir = "~/.loom/scratch"
+
+[mcp.servers.notion]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-notion"]
+timeout_seconds = 30
+
+[mcp.servers.notion.env]
+NOTION_TOKEN = "your-token"
 ```
+
+Configured MCP servers are auto-discovered and exposed as namespaced tools:
+`mcp.<server>.<tool>`. Tool registrations refresh at runtime as connected MCP
+servers publish new tool lists.
 
 ---
 

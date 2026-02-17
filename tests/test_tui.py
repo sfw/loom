@@ -846,7 +846,10 @@ class TestDelegateBindingProcess:
         monkeypatch.setattr("loom.prompts.assembler.PromptAssembler", lambda: MagicMock())
         monkeypatch.setattr("loom.state.memory.MemoryManager", lambda _db: MagicMock())
         monkeypatch.setattr("loom.state.task_state.TaskStateManager", lambda _dir: MagicMock())
-        monkeypatch.setattr("loom.tools.create_default_registry", lambda: MagicMock())
+        monkeypatch.setattr(
+            "loom.tools.create_default_registry",
+            lambda _config=None: MagicMock(),
+        )
 
         app = LoomApp(
             model=MagicMock(name="model"),

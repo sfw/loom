@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -107,11 +109,15 @@ class Tool(ABC):
     """
 
     _registered_classes: ClassVar[set[type[Tool]]] = set()
+    __loom_register__: ClassVar[bool] = True
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         # Only collect concrete classes (no remaining abstract methods)
-        if not getattr(cls, "__abstractmethods__", None):
+        if (
+            getattr(cls, "__loom_register__", True)
+            and not getattr(cls, "__abstractmethods__", None)
+        ):
             Tool._registered_classes.add(cls)
 
     @property
@@ -169,6 +175,45 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        self._mcp_refresh_hook: Any = None
+        self._mcp_refresh_interval_seconds: float = 30.0
+        self._mcp_last_refresh_at: float = 0.0
+        self._mcp_refresh_running = False
+
+    def set_mcp_refresh_hook(
+        self,
+        hook: Any,
+        *,
+        interval_seconds: float = 30.0,
+    ) -> None:
+        """Register a best-effort MCP refresh hook for dynamic tool sets."""
+        self._mcp_refresh_hook = hook
+        self._mcp_refresh_interval_seconds = max(1.0, float(interval_seconds))
+        self._mcp_last_refresh_at = 0.0
+
+    def _maybe_refresh_mcp(self, *, force: bool = False) -> None:
+        if self._mcp_refresh_hook is None:
+            return
+        if self._mcp_refresh_running:
+            return
+
+        now = time.monotonic()
+        if not force and (
+            now - self._mcp_last_refresh_at
+        ) < self._mcp_refresh_interval_seconds:
+            return
+
+        self._mcp_refresh_running = True
+        try:
+            self._mcp_refresh_hook(force=force)
+            self._mcp_last_refresh_at = time.monotonic()
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "MCP refresh hook failed: %s",
+                e,
+            )
+        finally:
+            self._mcp_refresh_running = False
 
     def register(self, tool: Tool) -> None:
         """Register a tool. Raises if name conflicts."""
@@ -185,6 +230,8 @@ class ToolRegistry:
 
     def has(self, name: str) -> bool:
         """Check if tool is registered."""
+        if name.startswith("mcp."):
+            self._maybe_refresh_mcp()
         return name in self._tools
 
     async def execute(
@@ -197,7 +244,11 @@ class ToolRegistry:
         subtask_id: str = "",
     ) -> ToolResult:
         """Execute a tool by name with timeout and context."""
+        self._maybe_refresh_mcp()
         tool = self._tools.get(name)
+        if tool is None and name.startswith("mcp."):
+            self._maybe_refresh_mcp(force=True)
+            tool = self._tools.get(name)
         if tool is None:
             return ToolResult.fail(f"Unknown tool: {name}")
 
@@ -225,8 +276,10 @@ class ToolRegistry:
 
     def all_schemas(self) -> list[dict]:
         """Return all tool schemas for model consumption."""
+        self._maybe_refresh_mcp()
         return [tool.schema() for tool in self._tools.values()]
 
     def list_tools(self) -> list[str]:
         """Return registered tool names."""
+        self._maybe_refresh_mcp()
         return list(self._tools.keys())

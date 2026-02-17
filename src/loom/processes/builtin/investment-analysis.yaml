@@ -18,6 +18,11 @@ phase_mode: strict
 tool_guidance: |
   Use CSV for financial data and models. Markdown for narrative. Always
   state fiscal year, currency, reported vs adjusted. Prefer TTM with date.
+  For filing-derived metrics, prefer SEC sources first
+  (`https://data.sec.gov/submissions/CIK*.json` and filing URLs from SEC
+  metadata) before secondary aggregators. When SEC is unavailable, document
+  the fallback source chain explicitly in deliverables. Avoid paywalled or
+  anti-bot brittle sources when an official filing source is available.
 
 phases:
   - id: company-screening
@@ -85,6 +90,17 @@ phases:
       top 3 risks, catalysts with timing, and position sizing guidance.
     deliverables:
       - "investment-memo.md — final recommendation with analysis"
+
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Run the investment-analysis process and produce all declared deliverables."
+    timeout_seconds: 900
+  - id: live-canary
+    mode: live
+    goal: "Analyze a public company for investment and produce a complete memo."
+    timeout_seconds: 1200
+    requires_network: true
 
 verification:
   rules:

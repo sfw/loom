@@ -641,7 +641,21 @@
 
 <span class="cmt"># Memory storage</span>
 <span class="key">[memory]</span>
-<span class="key">database_path</span> = <span class="str">"~/.loom/loom.db"</span></code></pre>
+<span class="key">database_path</span> = <span class="str">"~/.loom/loom.db"</span>
+
+<span class="cmt"># Optional external MCP servers (auto-registered as tools)</span>
+<span class="key">[mcp.servers.notion]</span>
+<span class="key">command</span> = <span class="str">"npx"</span>
+<span class="key">args</span> = <span class="str">["-y", "@modelcontextprotocol/server-notion"]</span>
+<span class="key">timeout_seconds</span> = <span class="val">30</span>
+
+<span class="key">[mcp.servers.notion.env]</span>
+<span class="key">NOTION_TOKEN</span> = <span class="str">"your-token"</span></code></pre>
+
+  <div class="callout callout-info">
+    <strong>External MCP tools</strong>
+    Configured MCP servers are auto-discovered and exposed as namespaced tools in Loom (for example <code>mcp.notion.search</code>).
+  </div>
 
   <div class="callout callout-warn">
     <strong>Single model?</strong>
@@ -936,6 +950,27 @@
 
 <span class="cmt"># Interactive session with a process</span>
 <span class="cmd">loom</span> <span class="flag">-w</span> /tmp/project <span class="flag">--process</span> consulting-engagement</code></pre>
+
+  <h3>Testing a Process Package</h3>
+  <pre><code><span class="cmt"># Run all declared deterministic test cases</span>
+<span class="cmd">loom process test</span> investment-analysis
+
+<span class="cmt"># Run one specific case</span>
+<span class="cmd">loom process test</span> ./my-local-process <span class="flag">--case</span> smoke
+
+<span class="cmt"># Run only live cases (real providers + external tools)</span>
+<span class="cmd">loom process test</span> ./my-local-process <span class="flag">--live</span></code></pre>
+
+  <p>Declare test cases in your <code>process.yaml</code> using a <code>tests:</code> manifest with a unique case ID, mode (<code>deterministic</code> or <code>live</code>), and acceptance checks.</p>
+
+  <pre><code><span class="key">tests</span>:
+  - <span class="key">id</span>: <span class="str">smoke</span>
+    <span class="key">mode</span>: <span class="str">deterministic</span>
+    <span class="key">goal</span>: <span class="str">"Analyze Tesla for investment"</span>
+    <span class="key">acceptance</span>:
+      <span class="key">deliverables</span>:
+        <span class="key">must_exist</span>:
+          - <span class="str">company-overview.md</span></code></pre>
 
   <h3>What a Process Injects</h3>
   <div class="card-grid">

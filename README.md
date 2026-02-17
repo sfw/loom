@@ -1,4 +1,6 @@
 # Loom
+[![CI](https://github.com/sfw/loom/actions/workflows/ci.yml/badge.svg)](https://github.com/sfw/loom/actions/workflows/ci.yml)
+[![Process Canary](https://github.com/sfw/loom/actions/workflows/process-canary.yml/badge.svg)](https://github.com/sfw/loom/actions/workflows/process-canary.yml)
 
 **Local model orchestration engine** -- task decomposition, execution, and verification using local LLMs.
 
@@ -107,9 +109,18 @@ roles = ["extractor", "verifier"]
 max_subtask_retries = 3
 max_loop_iterations = 50
 max_parallel_subtasks = 3
+
+[mcp.servers.notion]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-notion"]
+timeout_seconds = 30
+
+[mcp.servers.notion.env]
+NOTION_TOKEN = "your-token"
 ```
 
 Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor) so you can use a big model for planning and a small one for verification.
+Optional MCP servers are auto-discovered at startup and registered as namespaced tools (`mcp.<server>.<tool>`).
 
 ## Process Definitions
 
@@ -120,6 +131,7 @@ loom processes                              # list available
 loom -w /tmp/acme --process consulting-engagement
 loom install user/repo                      # install from GitHub
 loom install user/repo --isolated-deps      # per-process dependency env
+loom process test consulting-engagement     # run process test cases
 ```
 
 Process-required tools are enforced at runtime: if `tools.required` contains
@@ -164,6 +176,7 @@ loom models             List configured models
 loom processes          List available process definitions
 loom install SOURCE     Install a process package
 loom uninstall NAME     Remove a process package
+loom process test NAME  Run process package test cases
 loom mcp-serve          Start the MCP server (stdio transport)
 loom learned            Review learned patterns (list, filter, delete)
 loom reset-learning     Clear all learned patterns

@@ -97,7 +97,7 @@ def _launch_tui(
     from loom.tui.app import LoomApp
 
     ws = (workspace or Path.cwd()).resolve()
-    tools = create_default_registry()
+    tools = create_default_registry(config)
 
     # Resolve model — None triggers the TUI setup wizard
     provider = None
@@ -441,6 +441,98 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
         f"\n{len(available)} process(es) found. "
         f"Use --process <name> with 'run' or 'cowork'.",
     )
+
+
+@cli.group()
+def process() -> None:
+    """Process subcommands."""
+
+
+@process.command(name="test")
+@click.argument("name_or_path")
+@click.option(
+    "--workspace", "-w",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Workspace for process execution and local process discovery.",
+)
+@click.option(
+    "--live",
+    is_flag=True,
+    default=False,
+    help="Include live test cases from process.yaml (requires configured models).",
+)
+@click.option(
+    "--case",
+    "case_id",
+    default=None,
+    help="Run a single process test case by ID.",
+)
+@click.pass_context
+def process_test(
+    ctx: click.Context,
+    name_or_path: str,
+    workspace: Path | None,
+    live: bool,
+    case_id: str | None,
+) -> None:
+    """Run declared (or default) process test cases.
+
+    NAME_OR_PATH can be either a process name from discovery or a direct
+    path to a process YAML/package directory.
+    """
+    from loom.processes.schema import ProcessLoader
+    from loom.processes.testing import run_process_tests
+
+    config = ctx.obj["config"]
+    ws = (workspace or Path.cwd()).resolve()
+    extra = [Path(p) for p in config.process.search_paths]
+    loader = ProcessLoader(workspace=ws, extra_search_paths=extra)
+
+    try:
+        process_def = loader.load(name_or_path)
+    except Exception as e:
+        click.echo(f"Failed to load process {name_or_path!r}: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(
+        f"Running process tests for {process_def.name} v{process_def.version}"
+    )
+
+    try:
+        results = asyncio.run(run_process_tests(
+            process_def,
+            config=config,
+            workspace=ws,
+            include_live=live,
+            case_id=case_id,
+        ))
+    except ValueError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+
+    if not results:
+        click.echo("No matching process test cases selected.")
+        sys.exit(1)
+
+    failed = 0
+    for result in results:
+        status = "PASS" if result.passed else "FAIL"
+        click.echo(
+            f"[{status}] case={result.case_id} mode={result.mode} "
+            f"task_status={result.task_status or 'n/a'} "
+            f"duration={result.duration_seconds:.2f}s"
+        )
+        if result.message:
+            click.echo(f"  {result.message}")
+        for detail in result.details:
+            click.echo(f"  - {detail}")
+        if not result.passed:
+            failed += 1
+
+    click.echo(f"\n{len(results) - failed}/{len(results)} case(s) passed.")
+    if failed:
+        sys.exit(1)
 
 
 @cli.command(name="install")

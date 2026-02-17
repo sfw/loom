@@ -79,7 +79,9 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         if required:
             from loom.tools import create_default_registry
 
-            available = set(create_default_registry().list_tools()) - excluded
+            available = set(
+                create_default_registry(engine.config).list_tools()
+            ) - excluded
             missing = sorted(name for name in required if name not in available)
             if missing:
                 raise HTTPException(

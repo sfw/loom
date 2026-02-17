@@ -291,6 +291,48 @@ replanning:
 
 Declares when the engine should re-plan and how to adapt. Without replanning configuration, the engine follows the original plan rigidly.
 
+### Process test manifest
+
+Process packages can embed runnable test contracts directly in `process.yaml`:
+
+```yaml
+tests:
+  - id: smoke
+    mode: deterministic         # deterministic | live
+    goal: "Analyze Tesla for investment"
+    timeout_seconds: 900
+    requires_network: false
+    requires_tools:
+      - write_file
+    acceptance:
+      phases:
+        must_include:
+          - company-screening
+      deliverables:
+        must_exist:
+          - company-overview.md
+      verification:
+        forbidden_patterns:
+          - "deliverable_.* not found"
+```
+
+`mode: deterministic` runs with a scripted model backend for reproducible CI checks.  
+`mode: live` runs against configured real providers and external tools/sources.
+
+Run package tests:
+
+```bash
+loom process test <name-or-path>
+loom process test <name-or-path> --case smoke
+loom process test <name-or-path> --live
+```
+
+Validation rules:
+- `id` is required and must be unique per package.
+- `mode` must be `deterministic` or `live`.
+- `goal` is required.
+- `timeout_seconds` must be greater than zero.
+
 ## Bundled tools
 
 Packages can include custom Python tools in a `tools/` directory. These are auto-discovered and registered when the process loads.

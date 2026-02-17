@@ -100,6 +100,30 @@ class PlannerExample:
 
 
 @dataclass
+class ProcessTestAcceptance:
+    """Acceptance contract for a process test case."""
+
+    phases_must_include: list[str] = field(default_factory=list)
+    deliverables_must_exist: list[str] = field(default_factory=list)
+    verification_forbidden_patterns: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProcessTestCase:
+    """Declarative test case embedded in process.yaml."""
+
+    id: str
+    mode: str = "deterministic"  # "deterministic" | "live"
+    goal: str = ""
+    timeout_seconds: int = 900
+    requires_network: bool = False
+    requires_tools: list[str] = field(default_factory=list)
+    acceptance: ProcessTestAcceptance = field(
+        default_factory=ProcessTestAcceptance,
+    )
+
+
+@dataclass
 class ToolRequirements:
     """Tool availability and restriction configuration."""
 
@@ -137,6 +161,7 @@ class ProcessDefinition:
     workspace_scan: list[str] = field(default_factory=list)
     workspace_guidance: str = ""
     planner_examples: list[PlannerExample] = field(default_factory=list)
+    tests: list[ProcessTestCase] = field(default_factory=list)
     replanning_triggers: str = ""
     replanning_guidance: str = ""
 
@@ -379,6 +404,64 @@ class ProcessLoader:
                 subtasks=ex.get("subtasks", []),
             ))
 
+        # Process tests
+        tests: list[ProcessTestCase] = []
+        tests_raw = raw.get("tests", [])
+        if isinstance(tests_raw, list):
+            for t in tests_raw:
+                if not isinstance(t, dict):
+                    continue
+                timeout_raw = t.get("timeout_seconds", 900)
+                try:
+                    timeout_seconds = int(timeout_raw)
+                except (TypeError, ValueError):
+                    timeout_seconds = -1
+                acceptance_raw = t.get("acceptance", {})
+                if not isinstance(acceptance_raw, dict):
+                    acceptance_raw = {}
+
+                phases_raw = acceptance_raw.get("phases", {})
+                if not isinstance(phases_raw, dict):
+                    phases_raw = {}
+                deliverables_raw = acceptance_raw.get("deliverables", {})
+                if not isinstance(deliverables_raw, dict):
+                    deliverables_raw = {}
+                verification_raw = acceptance_raw.get("verification", {})
+                if not isinstance(verification_raw, dict):
+                    verification_raw = {}
+
+                tests.append(ProcessTestCase(
+                    id=str(t.get("id", "")).strip(),
+                    mode=str(t.get("mode", "deterministic")).strip(),
+                    goal=str(t.get("goal", "")).strip(),
+                    timeout_seconds=timeout_seconds,
+                    requires_network=bool(t.get("requires_network", False)),
+                    requires_tools=[
+                        item
+                        for item in t.get("requires_tools", [])
+                        if isinstance(item, str) and item.strip()
+                    ] if isinstance(t.get("requires_tools", []), list) else [],
+                    acceptance=ProcessTestAcceptance(
+                        phases_must_include=[
+                            item
+                            for item in phases_raw.get("must_include", [])
+                            if isinstance(item, str) and item.strip()
+                        ] if isinstance(phases_raw.get("must_include", []), list) else [],
+                        deliverables_must_exist=[
+                            item
+                            for item in deliverables_raw.get("must_exist", [])
+                            if isinstance(item, str) and item.strip()
+                        ] if isinstance(deliverables_raw.get("must_exist", []), list) else [],
+                        verification_forbidden_patterns=[
+                            item
+                            for item in verification_raw.get("forbidden_patterns", [])
+                            if isinstance(item, str) and item.strip()
+                        ] if isinstance(
+                            verification_raw.get("forbidden_patterns", []), list
+                        ) else [],
+                    ),
+                ))
+
         # Tool requirements
         tool_raw = raw.get("tools", {})
         if isinstance(tool_raw, dict):
@@ -435,6 +518,7 @@ class ProcessLoader:
             workspace_scan=ws_scan,
             workspace_guidance=ws_guidance,
             planner_examples=examples,
+            tests=tests,
             replanning_triggers=replan_triggers,
             replanning_guidance=replan_guidance,
             dependencies=deps_raw,
@@ -510,6 +594,35 @@ class ProcessLoader:
                 errors.append(
                     f"Tool(s) both required and excluded: "
                     f"{', '.join(sorted(overlap))}",
+                )
+
+        # Process test validation
+        seen_test_ids: set[str] = set()
+        valid_test_modes = {"deterministic", "live"}
+        for test_case in defn.tests:
+            if not test_case.id:
+                errors.append("Process test case missing required field: id")
+            elif test_case.id in seen_test_ids:
+                errors.append(
+                    f"Duplicate process test id: {test_case.id!r}",
+                )
+            else:
+                seen_test_ids.add(test_case.id)
+
+            if test_case.mode not in valid_test_modes:
+                errors.append(
+                    f"Process test {test_case.id!r}: invalid mode "
+                    f"{test_case.mode!r} (expected one of {valid_test_modes})",
+                )
+
+            if not test_case.goal:
+                errors.append(
+                    f"Process test {test_case.id!r} missing required field: goal",
+                )
+
+            if test_case.timeout_seconds <= 0:
+                errors.append(
+                    f"Process test {test_case.id!r}: timeout_seconds must be > 0",
                 )
 
         # Verification rule validation
