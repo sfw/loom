@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 class OpenAICompatibleProvider(ModelProvider):
     """Provider for OpenAI-compatible API endpoints."""
 
+    ASSISTANT_CONTENT_FALLBACK = "Tool call required to continue."
+
     def __init__(self, config: ModelConfig, provider_name: str = "", tier_override: int = 0):
         self._config = config
         headers: dict[str, str] = {}
@@ -104,7 +106,9 @@ class OpenAICompatibleProvider(ModelProvider):
                 else:
                     # Some reasoning-enabled OpenAI-compatible providers reject
                     # empty reasoning_content on assistant tool-call turns.
-                    updated["reasoning_content"] = "Tool call required to continue."
+                    updated["reasoning_content"] = (
+                        OpenAICompatibleProvider.ASSISTANT_CONTENT_FALLBACK
+                    )
                 patched.append(updated)
                 changed = True
                 continue
@@ -460,6 +464,7 @@ class OpenAICompatibleProvider(ModelProvider):
 
         Some providers reject:
         - assistant tool-call messages with null content
+        - assistant messages with empty/whitespace-only content
         - missing tool-call IDs
         - tool messages with missing tool_call_id
         """
@@ -476,6 +481,20 @@ class OpenAICompatibleProvider(ModelProvider):
                 out["content"] = ""
 
             if role == "assistant":
+                content = out.get("content")
+                if isinstance(content, str):
+                    if not content.strip():
+                        out["content"] = OpenAICompatibleProvider.ASSISTANT_CONTENT_FALLBACK
+                elif content is None:
+                    out["content"] = OpenAICompatibleProvider.ASSISTANT_CONTENT_FALLBACK
+                else:
+                    content_as_str = str(content)
+                    out["content"] = (
+                        content_as_str
+                        if content_as_str.strip()
+                        else OpenAICompatibleProvider.ASSISTANT_CONTENT_FALLBACK
+                    )
+
                 raw_tool_calls = out.get("tool_calls")
                 tool_calls: list[dict] = []
                 pending_tool_ids = []
