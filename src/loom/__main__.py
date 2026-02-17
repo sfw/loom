@@ -683,21 +683,30 @@ def uninstall(
     "--limit", default=30, show_default=True,
     help="Max number of patterns to show.",
 )
+@click.option(
+    "--all", "include_all", is_flag=True, default=False,
+    help="Include internal operational patterns (task templates, retries, failures).",
+)
 @click.pass_context
 def learned(
     ctx: click.Context,
     pattern_type: str | None,
     delete_id: int | None,
     limit: int,
+    include_all: bool,
 ) -> None:
     """Review learned patterns.
 
-    Lists all patterns the learning system has extracted from your
-    interactions.  Use --delete ID to remove a specific pattern.
+    By default, shows learned behavioral patterns used to personalize
+    cowork interactions. Use --all to include internal operational
+    patterns from autonomous task execution.
+
+    Use --delete ID to remove a specific pattern.
 
     \b
     Examples:
-      loom learned                              # list all
+      loom learned                              # list behavioral patterns
+      loom learned --all                        # include internal patterns
       loom learned --type behavioral_gap        # filter by type
       loom learned --delete 5                   # delete pattern #5
     """
@@ -723,8 +732,10 @@ def learned(
             patterns = await mgr.query_patterns(
                 pattern_type=pattern_type, limit=limit,
             )
-        else:
+        elif include_all:
             patterns = await mgr.query_all(limit=limit)
+        else:
+            patterns = await mgr.query_behavioral(limit=limit)
 
         if not patterns:
             click.echo("No learned patterns.")

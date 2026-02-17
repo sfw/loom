@@ -883,7 +883,7 @@
 <span class="cmd">loom cowork</span> <span class="flag">-w</span> /path/to/project</code></pre>
 
   <h3>Layout</h3>
-  <p>The TUI has a sidebar with workspace browser and task progress, a main area with tabbed content (Chat, Files Changed, Events), and a status bar showing workspace, model, and token count.</p>
+  <p>The TUI has a sidebar with workspace browser and task progress, a main area with tabbed content (Chat, Files Changed, Events), and a status bar showing workspace, model, and token count. Selecting a file in the workspace tree opens a read-only preview modal with renderer support for Markdown, code/text (including TypeScript and CSS with syntax highlighting), JSON, CSV/TSV, HTML, diff/patch, Word/PowerPoint, PDF text extraction, and image metadata.</p>
 
   <h3>Keyboard Shortcuts</h3>
   <table>
@@ -1209,8 +1209,11 @@
   <p>Patterns are frequency-weighted &mdash; the more a pattern is observed, the higher it ranks. High-frequency patterns persist indefinitely; low-frequency ones are pruned after 90 days. All data stays local in your SQLite database.</p>
 
   <h3>Reviewing and Managing Patterns</h3>
-  <pre><code><span class="cmt"># List all learned patterns</span>
+  <pre><code><span class="cmt"># List learned behavioral patterns (default)</span>
 <span class="cmd">loom learned</span>
+
+<span class="cmt"># Include internal operational patterns</span>
+<span class="cmd">loom learned</span> <span class="flag">--all</span>
 
 <span class="cmt"># Filter by type</span>
 <span class="cmd">loom learned</span> <span class="flag">--type</span> behavioral_gap
@@ -1221,7 +1224,7 @@
 <span class="cmt"># Clear all learned patterns (start fresh)</span>
 <span class="cmd">loom reset-learning</span></code></pre>
 
-  <p>In the TUI, use <code>/learned</code> to open an interactive review screen where you can inspect each pattern's type, description, frequency count, and last-seen date, and delete individual patterns with a single click.</p>
+  <p>In the TUI, use <code>/learned</code> to open an interactive review screen for behavioral patterns, where you can inspect each pattern's type, description, frequency count, and last-seen date, and delete individual patterns with a single click.</p>
 
   <div class="callout callout-info">
     <strong>How gap detection works</strong>

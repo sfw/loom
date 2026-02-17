@@ -683,8 +683,11 @@ Loom learns behavioral patterns from your interactions and uses them to personal
 ### CLI
 
 ```bash
-# List all learned patterns
+# List learned behavioral patterns (default)
 loom learned
+
+# Include internal operational patterns
+loom learned --all
 
 # Filter by type
 loom learned --type behavioral_gap
@@ -699,7 +702,7 @@ loom reset-learning
 
 ### TUI
 
-Use the `/learned` slash command to open an interactive review screen. Each pattern shows its type, description, frequency count, and last-seen date, with a Delete button for removal.
+Use the `/learned` slash command to open an interactive review screen for behavioral patterns. Each pattern shows its type, description, frequency count, and last-seen date, with a Delete button for removal.
 
 ### Python API
 

@@ -101,16 +101,16 @@ class LearnedScreen(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Vertical(id="learned-dialog"):
             yield Label(
-                "[bold #e0af68]Learned Patterns[/bold #e0af68]",
+                "[bold #e0af68]Learned Behaviors[/bold #e0af68]",
                 id="learned-title",
             )
 
             with VerticalScroll(id="learned-scroll"):
                 if not self._patterns:
                     yield Label(
-                        "[dim]No learned patterns yet. "
-                        "Patterns are extracted automatically from your "
-                        "interactions.[/dim]"
+                        "[dim]No learned behaviors yet. "
+                        "Behavioral patterns are extracted automatically from "
+                        "your interactions.[/dim]"
                     )
                 else:
                     for p in self._patterns:

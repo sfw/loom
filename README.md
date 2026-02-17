@@ -153,17 +153,18 @@ Loom learns from your interactions so you never repeat yourself. Two learning mo
 Patterns are frequency-weighted -- the more a pattern is observed, the higher it ranks. High-frequency patterns persist indefinitely; low-frequency ones are pruned after 90 days. All data stays local in your SQLite database.
 
 ```bash
-loom learned                              # review all patterns
+loom learned                              # review learned behavioral patterns
+loom learned --all                        # include internal operational patterns
 loom learned --type behavioral_gap        # filter by type
 loom learned --delete 5                   # remove a specific pattern
 loom reset-learning                       # clear everything
 ```
 
-In the TUI, use `/learned` to open an interactive review screen where you can inspect and delete individual patterns.
+In the TUI, use `/learned` to open an interactive review screen for learned behavioral patterns, where you can inspect and delete individual items.
 
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal>`), and learned pattern review (`/learned`). `/run` executes in-process and does not require `loom serve`.
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal>`), learned pattern review (`/learned`), and click-to-open workspace file previews (Markdown, code/text with syntax highlighting including TypeScript/CSS, JSON, CSV/TSV, HTML, diff/patch, Office docs, PDF text, and image metadata). `/run` executes in-process and does not require `loom serve`.
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
@@ -183,7 +184,7 @@ loom install SOURCE     Install a process package
 loom uninstall NAME     Remove a process package
 loom process test NAME  Run process package test cases
 loom mcp-serve          Start the MCP server (stdio transport)
-loom learned            Review learned patterns (list, filter, delete)
+loom learned            Review learned patterns (behavioral by default)
 loom reset-learning     Clear all learned patterns
 ```
 
