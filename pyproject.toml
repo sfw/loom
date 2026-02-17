@@ -45,6 +45,9 @@ pdf = [
 mcp = [
     "mcp>=1.0.0",
 ]
+treesitter = [
+    "tree-sitter-language-pack>=0.3",
+]
 
 [project.scripts]
 loom = "loom.__main__:cli"

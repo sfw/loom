@@ -145,7 +145,7 @@ If you prefer to write the config by hand:
 
 ```bash
 mkdir -p ~/.loom
-cp loom.toml ~/.loom/loom.toml
+cp loom.toml.example ~/.loom/loom.toml
 # Or keep it in your project directory (Loom checks ./loom.toml first)
 ```
 
@@ -256,7 +256,7 @@ curl http://localhost:1234/v1/models
 
 ```bash
 pytest
-# Should show 954+ passed
+# Should show 1,234+ passed
 ```
 
 ### 4. Start the Server

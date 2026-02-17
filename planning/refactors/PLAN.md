@@ -101,11 +101,12 @@ Streaming chat, tool approval modals, ask_user modals, all 16 tools.
 
 The planner currently gets only a directory listing. Better context = better plans.
 
-### 4a. Tree-sitter code analysis tool (`tools/code_analysis.py`)
+### 4a. Tree-sitter code analysis tool (`tools/code_analysis.py`) ✓
 - `analyze_code` tool: parse a file and return structure (classes, functions, imports)
-- Use tree-sitter for Python, JS/TS, Go, Rust (the common ones)
+- Tree-sitter backend for Python, JS/TS, Go, Rust via `tree-sitter-language-pack`
 - Returns structured JSON: `{classes: [...], functions: [...], imports: [...]}`
 - Graceful fallback: regex-based extraction if tree-sitter not installed
+- Structural matching in `edit_file` anchors fuzzy search to syntax nodes
 
 ### 4b. Planner context enhancement (`engine/orchestrator.py`)
 - Before planning, auto-run `analyze_code` on key files in focus_dirs
@@ -229,7 +230,7 @@ personas, phase blueprints, verification rules, and tool guidance into the engin
 | 1. New Tools | High | Low | **DONE** |
 | 2. Streaming | High | Medium | **DONE** |
 | 3. TUI Enhancements | High | Medium | **DONE** |
-| 4. Smarter Planning | Medium | Medium | Phase 1 done (tree-sitter, web_fetch) |
+| 4. Smarter Planning | Medium | Medium | Phase A+B done (tree-sitter), web_fetch done |
 | 5. Error Intelligence | Medium | Low | Partial (error categorizer done) |
 | 6. Interactive Mode | Medium | High | **DONE** (cowork + TUI) |
 | 7. Process Definitions | High | High | **DONE** (plugin architecture + 5 built-in + installer) |

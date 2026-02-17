@@ -108,22 +108,22 @@ check availability at runtime and fall back to regex/difflib.
 
 ## Implementation Order
 
-### Phase A: analyze_code backend swap
-1. Add `tree-sitter-language-pack` to optional deps
-2. Write tree-sitter query files for Python, JS/TS, Go, Rust
-3. Add `_extract_with_treesitter(source, language) -> CodeStructure`
-4. Wire into `analyze_file()` with try/fallback to regex
-5. Tests: same test suite passes with both backends
+### Phase A: analyze_code backend swap ✓ DONE
+1. Add `tree-sitter-language-pack` to optional deps ✓
+2. Tree-sitter tree-walking extractors for Python, JS/TS, Go, Rust ✓
+3. `extract_with_treesitter(source, language) -> CodeStructure` in `tools/treesitter.py` ✓
+4. Wired into `analyze_file()` with try/fallback to regex ✓
+5. Tests: 38 new tree-sitter tests + all 1272 existing tests pass ✓
 
-### Phase B: edit_file structural anchoring
-1. Add `_parse_file_tree(source, language)` using tree-sitter
-2. Add `_find_structural_candidates(tree, old_str)` that returns node ranges
-3. Modify `_fuzzy_find` to try structural candidates first, then fall back
-4. Tests: new tests for indentation-drift and decorator-reorder cases
+### Phase B: edit_file structural anchoring ✓ DONE
+1. `find_structural_candidates(source, language)` returns node byte ranges ✓
+2. `_structural_fuzzy_find()` narrows search to syntax boundaries ✓
+3. `_fuzzy_find()` tries structural candidates first, falls back to sliding window ✓
+4. Tests: indentation-drift, decorator-reorder, and non-source fallback cases ✓
 
 ### Phase C: Language expansion (optional, later)
 - Add queries for Java, C/C++, Ruby, PHP, Kotlin, Swift
-- Each language is just a query file + entry in the language map
+- Each language is just an extractor function + entry in the language map
 
 ---
 

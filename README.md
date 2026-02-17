@@ -50,7 +50,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Full undo.** Every file write is preceded by a snapshot. You can revert any individual change, all changes from a subtask, or the entire task. The changelog tracks creates, modifies, deletes, and renames with before-state snapshots.
 
-**21 built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch, web search (DuckDuckGo, no API key), code analysis (tree-sitter), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, and ask_user for mid-execution questions. All tools auto-discovered via `__init_subclass__`.
+**21 built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch, web search (DuckDuckGo, no API key), code analysis (regex-based structural extraction), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, and ask_user for mid-execution questions. All tools auto-discovered via `__init_subclass__`.
 
 **Inline diffs.** Every file edit produces a unified diff in the tool result. Diffs render with Rich markup syntax highlighting in the TUI -- green additions, red removals. You always see exactly what changed.
 
@@ -173,7 +173,7 @@ Common flags for `loom` / `loom cowork`:
 
 ## Architecture
 
-16,000 lines of Python. 1,213 tests. No frameworks (no LangChain, no CrewAI).
+19,500 lines of Python. 1,234 tests. No frameworks (no LangChain, no CrewAI).
 
 ```
 src/loom/
@@ -198,7 +198,7 @@ src/loom/
 
 ```bash
 uv sync --extra dev     # or: pip install -e ".[dev]"
-pytest                  # 1,213 tests
+pytest                  # 1,234 tests
 ruff check src/ tests/  # lint
 ```
 
