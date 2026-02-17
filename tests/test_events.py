@@ -162,8 +162,7 @@ class TestEventBus:
 
         async def run():
             bus.emit(Event(event_type="test", task_id="t1"))
-            # Give the fire-and-forget task a chance to complete
-            await asyncio.sleep(0.05)
+            await bus.drain(timeout=1.0)
 
         asyncio.run(run())
         assert len(received) == 1
@@ -184,7 +183,7 @@ class TestEventBus:
 
         async def run():
             bus.emit(Event(event_type="test", task_id="t1"))
-            await asyncio.sleep(0.05)
+            await bus.drain(timeout=1.0)
 
         asyncio.run(run())
         assert len(sync_received) == 1
@@ -204,7 +203,25 @@ class TestEventBus:
 
         async def run():
             bus.emit(Event(event_type="test", task_id="t1"))
-            await asyncio.sleep(0.05)
+            await bus.drain(timeout=1.0)
 
         asyncio.run(run())
         assert len(received) == 1
+
+    def test_drain_waits_for_async_handlers(self):
+        bus = EventBus()
+        received = []
+
+        async def async_handler(event: Event):
+            await asyncio.sleep(0.01)
+            received.append(event.task_id)
+
+        bus.subscribe("test", async_handler)
+
+        async def run():
+            for i in range(5):
+                bus.emit(Event(event_type="test", task_id=f"t{i}"))
+            await bus.drain(timeout=1.0)
+
+        asyncio.run(run())
+        assert received == ["t0", "t1", "t2", "t3", "t4"]

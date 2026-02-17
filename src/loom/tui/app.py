@@ -180,8 +180,13 @@ class ProcessRunPane(Vertical):
         text-style: bold;
         margin: 1 0 0 0;
     }
-    ProcessRunPane TaskProgressPanel {
+    ProcessRunPane #process-run-progress {
         max-height: 12;
+        height: auto;
+        overflow-y: auto;
+    }
+    ProcessRunPane #process-run-outputs {
+        max-height: 8;
         height: auto;
         overflow-y: auto;
     }
@@ -198,12 +203,16 @@ class ProcessRunPane(Vertical):
         self._process_name = process_name
         self._goal = goal
         self._pending_tasks: list[dict] | None = None
+        self._pending_outputs: list[dict] | None = None
         self._pending_activity: list[str] = []
         self._pending_results: list[tuple[str, bool]] = []
         self._header = Static(classes="process-run-header")
         self._meta = Static(classes="process-run-meta")
         self._progress_label = Static("Progress", classes="process-run-section")
-        self._progress = TaskProgressPanel()
+        self._progress = TaskProgressPanel(id="process-run-progress")
+        self._outputs_label = Static("Outputs", classes="process-run-section")
+        self._outputs = TaskProgressPanel(id="process-run-outputs")
+        self._outputs.empty_message = "No outputs yet"
         self._log_label = Static("Activity", classes="process-run-section")
         self._log = ChatLog()
 
@@ -212,6 +221,8 @@ class ProcessRunPane(Vertical):
         yield self._meta
         yield self._progress_label
         yield self._progress
+        yield self._outputs_label
+        yield self._outputs
         yield self._log_label
         yield self._log
 
@@ -243,6 +254,13 @@ class ProcessRunPane(Vertical):
             return
         self._progress.tasks = tasks
 
+    def set_outputs(self, outputs: list[dict]) -> None:
+        """Replace output rows shown in the outputs section."""
+        if not self.is_attached:
+            self._pending_outputs = list(outputs)
+            return
+        self._outputs.tasks = outputs
+
     def add_activity(self, text: str) -> None:
         """Append informational activity text."""
         if not self.is_attached:
@@ -265,6 +283,9 @@ class ProcessRunPane(Vertical):
         if self._pending_tasks is not None:
             self._progress.tasks = self._pending_tasks
             self._pending_tasks = None
+        if self._pending_outputs is not None:
+            self._outputs.tasks = self._pending_outputs
+            self._pending_outputs = None
         if self._pending_activity:
             for line in self._pending_activity:
                 self._log.add_info(line)
@@ -303,6 +324,7 @@ class ProcessRunState:
     started_at: float = field(default_factory=time.monotonic)
     ended_at: float | None = None
     tasks: list[dict] = field(default_factory=list)
+    task_labels: dict[str, str] = field(default_factory=dict)
     last_progress_message: str = ""
     last_progress_at: float = 0.0
     worker: object | None = None
@@ -1205,6 +1227,7 @@ class LoomApp(App):
         )
         tabs.active = pane_id
         self._update_process_run_visuals(run)
+        self._refresh_process_run_outputs(run)
         self._refresh_sidebar_progress_summary()
 
         chat.add_user_message(f"{command_prefix} {goal}")
@@ -1266,8 +1289,10 @@ class LoomApp(App):
                 run.task_id = str(data.get("task_id", "") or run.task_id)
                 tasks = data.get("tasks", [])
                 if isinstance(tasks, list):
-                    run.tasks = tasks
-                    run.pane.set_tasks(tasks)
+                    normalized = self._normalize_process_run_tasks(run, tasks)
+                    run.tasks = normalized
+                    run.pane.set_tasks(normalized)
+                    self._refresh_process_run_outputs(run)
 
             if result.success:
                 output = result.output or "Process run completed."
@@ -2455,8 +2480,10 @@ class LoomApp(App):
                 return
             tasks = data.get("tasks", [])
             if isinstance(tasks, list):
-                run.tasks = tasks
-                run.pane.set_tasks(tasks)
+                normalized = self._normalize_process_run_tasks(run, tasks)
+                run.tasks = normalized
+                run.pane.set_tasks(normalized)
+                self._refresh_process_run_outputs(run)
 
             task_id = str(data.get("task_id", "")).strip()
             if task_id:
@@ -2538,6 +2565,144 @@ class LoomApp(App):
         if len(compact) <= max_len:
             return compact
         return f"{compact[:max_len - 1].rstrip()}…"
+
+    def _normalize_process_run_tasks(
+        self, run: ProcessRunState, tasks: list[dict]
+    ) -> list[dict]:
+        """Keep process task rows stable and focused on the original plan labels."""
+        phase_labels: dict[str, str] = {}
+        process = getattr(run, "process_defn", None)
+        if process is not None:
+            for phase in getattr(process, "phases", []):
+                phase_id = str(getattr(phase, "id", "")).strip()
+                if not phase_id:
+                    continue
+                phase_desc = self._one_line(getattr(phase, "description", ""), 110)
+                phase_labels[phase_id] = phase_desc or phase_id
+
+        task_labels = getattr(run, "task_labels", None)
+        if not isinstance(task_labels, dict):
+            task_labels = {}
+            try:
+                run.task_labels = task_labels
+            except Exception:
+                pass
+
+        normalized: list[dict] = []
+        for row in tasks:
+            if not isinstance(row, dict):
+                continue
+            subtask_id = str(row.get("id", "")).strip()
+            raw_status = str(row.get("status", "pending")).strip()
+            status = raw_status if raw_status in {
+                "pending", "in_progress", "completed", "failed", "skipped",
+            } else "pending"
+            candidate = self._one_line(row.get("content", ""), 140)
+            if not candidate:
+                candidate = subtask_id or "subtask"
+
+            if subtask_id in phase_labels:
+                label = phase_labels[subtask_id]
+                task_labels[subtask_id] = label
+            else:
+                if subtask_id:
+                    existing = str(task_labels.get(subtask_id, "")).strip()
+                    # Only improve labels while task is active; don't let
+                    # completion summaries replace the original checklist label.
+                    if (
+                        status in {"pending", "in_progress"}
+                        and candidate
+                        and (not existing or existing == subtask_id)
+                    ):
+                        task_labels[subtask_id] = candidate
+                    label = str(task_labels.get(subtask_id, "")).strip() or candidate
+                else:
+                    label = candidate
+
+            normalized.append({
+                "id": subtask_id or candidate,
+                "status": status,
+                "content": label,
+            })
+        return normalized
+
+    def _process_run_output_rows(self, run: ProcessRunState) -> list[dict]:
+        """Build per-deliverable output status rows for the process run pane."""
+        process = getattr(run, "process_defn", None)
+        if process is None or not hasattr(process, "get_deliverables"):
+            return []
+        try:
+            deliverables_by_phase = process.get_deliverables()
+        except Exception:
+            return []
+        if not isinstance(deliverables_by_phase, dict) or not deliverables_by_phase:
+            return []
+
+        subtask_status: dict[str, str] = {}
+        for row in getattr(run, "tasks", []):
+            if not isinstance(row, dict):
+                continue
+            subtask_id = str(row.get("id", "")).strip()
+            if not subtask_id:
+                continue
+            subtask_status[subtask_id] = str(row.get("status", "pending")).strip()
+
+        ordered_phase_ids: list[str] = []
+        for phase in getattr(process, "phases", []):
+            phase_id = str(getattr(phase, "id", "")).strip()
+            if phase_id:
+                ordered_phase_ids.append(phase_id)
+        for phase_id in deliverables_by_phase.keys():
+            if phase_id not in ordered_phase_ids:
+                ordered_phase_ids.append(phase_id)
+
+        rows: list[dict] = []
+        for phase_id in ordered_phase_ids:
+            phase_deliverables = deliverables_by_phase.get(phase_id) or []
+            if not isinstance(phase_deliverables, list):
+                continue
+            phase_state = subtask_status.get(phase_id, "pending")
+            if phase_state == "pending":
+                continue
+            for path in phase_deliverables:
+                rel_path = str(path).strip()
+                if not rel_path:
+                    continue
+                exists = (self._workspace / rel_path).exists()
+                if exists:
+                    status = "completed"
+                    suffix = ""
+                elif phase_state == "in_progress":
+                    status = "in_progress"
+                    suffix = " [dim](pending)[/]"
+                elif phase_state == "completed":
+                    status = "failed"
+                    suffix = " [#f7768e](missing)[/]"
+                elif phase_state == "failed":
+                    status = "failed"
+                    suffix = " [#f7768e](not produced)[/]"
+                elif phase_state == "skipped":
+                    status = "skipped"
+                    suffix = " [dim](skipped)[/]"
+                else:
+                    status = "pending"
+                    suffix = ""
+                rows.append({
+                    "id": f"{phase_id}:{rel_path}",
+                    "status": status,
+                    "content": f"{rel_path} [dim]({phase_id})[/]{suffix}",
+                })
+        return rows
+
+    def _refresh_process_run_outputs(self, run: ProcessRunState) -> None:
+        """Refresh per-run output rows in the process pane."""
+        if not hasattr(run, "pane") or run.pane is None:
+            return
+        try:
+            rows = self._process_run_output_rows(run)
+            run.pane.set_outputs(rows)
+        except Exception:
+            return
 
     @staticmethod
     def _subtask_content(data: dict, subtask_id: str) -> str:

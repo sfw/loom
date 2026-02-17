@@ -2351,6 +2351,194 @@ class TestProcessSlashCommands:
         chat.add_info.assert_not_called()
         events_panel.add_event.assert_called_once()
 
+    def test_process_progress_keeps_stable_phase_labels(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        process_defn = SimpleNamespace(
+            phases=[
+                SimpleNamespace(
+                    id="scope-companies",
+                    description=(
+                        "Interpret requested company name(s), normalize legal/entity "
+                        "naming, and define product/service lines."
+                    ),
+                ),
+            ],
+            get_deliverables=lambda: {},
+        )
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="market-research",
+            goal="Analyze market",
+            process_defn=process_defn,
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            task_labels={},
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc123": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#chat-log":
+                return chat
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._on_process_progress_event(
+            {
+                "event_type": "subtask_started",
+                "event_data": {"subtask_id": "scope-companies"},
+                "tasks": [
+                    {
+                        "id": "scope-companies",
+                        "status": "in_progress",
+                        "content": "Short working label",
+                    },
+                ],
+            },
+            run_id="abc123",
+        )
+        app._on_process_progress_event(
+            {
+                "event_type": "subtask_completed",
+                "event_data": {"subtask_id": "scope-companies"},
+                "tasks": [
+                    {
+                        "id": "scope-companies",
+                        "status": "completed",
+                        "content": (
+                            "**Subtask Complete** Created research-scope.md and "
+                            "company-service-map.csv with long narrative summary."
+                        ),
+                    },
+                ],
+            },
+            run_id="abc123",
+        )
+
+        final_tasks = pane.set_tasks.call_args.args[0]
+        assert final_tasks[0]["id"] == "scope-companies"
+        assert final_tasks[0]["status"] == "completed"
+        assert "normalize legal/entity naming" in final_tasks[0]["content"]
+        assert "Subtask Complete" not in final_tasks[0]["content"]
+
+    def test_process_progress_updates_outputs_panel(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        (tmp_path / "research-scope.md").write_text("ok")
+
+        pane = MagicMock()
+        process_defn = SimpleNamespace(
+            phases=[
+                SimpleNamespace(id="scope-companies", description="Scope companies"),
+                SimpleNamespace(id="map-geographies", description="Map geographies"),
+            ],
+            get_deliverables=lambda: {
+                "scope-companies": ["research-scope.md"],
+                "map-geographies": ["geography-footprint.csv"],
+            },
+        )
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="market-research",
+            goal="Analyze market",
+            process_defn=process_defn,
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            task_labels={},
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc123": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#chat-log":
+                return chat
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._on_process_progress_event(
+            {
+                "event_type": "subtask_completed",
+                "event_data": {"subtask_id": "map-geographies"},
+                "tasks": [
+                    {
+                        "id": "scope-companies",
+                        "status": "completed",
+                        "content": "Scope companies",
+                    },
+                    {
+                        "id": "map-geographies",
+                        "status": "completed",
+                        "content": "Map geographies",
+                    },
+                ],
+            },
+            run_id="abc123",
+        )
+
+        output_rows = pane.set_outputs.call_args.args[0]
+        by_content = {row["content"]: row for row in output_rows}
+        assert "research-scope.md [dim](scope-companies)[/]" in by_content
+        assert by_content["research-scope.md [dim](scope-companies)[/]"]["status"] == (
+            "completed"
+        )
+        assert (
+            "geography-footprint.csv [dim](map-geographies)[/] [#f7768e](missing)[/]"
+            in by_content
+        )
+        assert by_content[
+            "geography-footprint.csv [dim](map-geographies)[/] [#f7768e](missing)[/]"
+        ]["status"] == "failed"
+
     def test_process_progress_event_refreshes_tree_on_subtask_completion(self):
         from loom.tui.app import LoomApp
 

@@ -51,6 +51,7 @@ class EventBus:
         self._global_handlers: list[EventHandler] = []
         self._history: list[Event] = []
         self._max_history = 1000
+        self._pending_tasks: set[asyncio.Task[Any]] = set()
 
     def subscribe(self, event_type: str, handler: EventHandler) -> None:
         """Subscribe to a specific event type."""
@@ -94,7 +95,9 @@ class EventBus:
             if is_async:
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(handler(event))
+                    task = loop.create_task(handler(event))
+                    self._pending_tasks.add(task)
+                    task.add_done_callback(self._on_task_done)
                 except RuntimeError:
                     logger.debug(
                         "Skipped async handler %s: no running event loop",
@@ -118,6 +121,39 @@ class EventBus:
         self._handlers.clear()
         self._global_handlers.clear()
         self._history.clear()
+        for task in list(self._pending_tasks):
+            task.cancel()
+        self._pending_tasks.clear()
+
+    async def drain(self, timeout: float | None = None) -> None:
+        """Wait for in-flight async handler tasks to complete.
+
+        This is primarily useful in tests and shutdown paths where callers need
+        deterministic completion of fire-and-forget handlers.
+        """
+        pending = list(self._pending_tasks)
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Timed out draining %d pending event handler task(s).",
+                len(self._pending_tasks),
+            )
+
+    def _on_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Track and log async handler task completion."""
+        self._pending_tasks.discard(task)
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            logger.warning("Async event handler failed: %s", exc)
 
 
 class EventPersister:

@@ -39,3 +39,7 @@ coverage.xml
 # Testing
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+
+# Local tool caches
+.uv-cache/

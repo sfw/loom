@@ -56,7 +56,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Inline diffs.** Every file edit produces a unified diff in the tool result. Diffs render with Rich markup syntax highlighting in the TUI -- green additions, red removals. You always see exactly what changed.
 
-**Process definitions.** YAML-based domain specialization lets you define personas, phase blueprints, verification rules, and tool guidance for any workflow. A process can represent a consulting methodology, an investment analysis framework, a research protocol, or a coding standard -- the engine doesn't care. Loom ships with 5 built-in processes and supports installing more from GitHub.
+**Process definitions.** YAML-based domain specialization lets you define personas, phase blueprints, verification rules, and tool guidance for any workflow. A process can represent a consulting methodology, an investment analysis framework, a research protocol, or a coding standard -- the engine doesn't care. Loom ships with 6 built-in processes and supports installing more from GitHub.
 
 ## Quick Start
 
@@ -137,7 +137,7 @@ Configured MCP servers are auto-discovered at startup and registered as namespac
 
 ## Process Definitions
 
-A process definition injects a persona, phase blueprint, verification rules, and tool guidance without changing engine code. Loom ships with 5 built-in processes: investment analysis, marketing strategy, research report, competitive intelligence, and consulting engagement. You can [create your own](docs/creating-packages.md) or install them from GitHub:
+A process definition injects a persona, phase blueprint, verification rules, and tool guidance without changing engine code. Loom ships with 6 built-in processes: investment analysis, marketing strategy, research report, competitive intelligence, consulting engagement, and market research. You can [create your own](docs/creating-packages.md) or install them from GitHub:
 
 ```bash
 loom processes                              # list available
@@ -220,7 +220,7 @@ src/loom/
   integrations/          MCP server
   learning/              Pattern extraction from execution history
   models/                Provider ABC + Ollama, OpenAI, Anthropic backends
-  processes/             Process definition loader + 5 built-in YAML processes
+  processes/             Process definition loader + 6 built-in YAML processes
   prompts/               7-section prompt assembler with budget trimming
   recovery/              Approval gates, confidence scoring, retry escalation
   state/                 Task state, SQLite memory archive, conversation store
