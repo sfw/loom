@@ -1337,8 +1337,9 @@ class TestSlashCommandHints:
         assert fake_hint.display is True
         assert fake_hint.styles.height == 3
         fake_hint.scroll_home.assert_called_once_with(animate=False)
-        assert fake_footer.display is False
-        assert fake_status.display is False
+        # Slash hints no longer toggle footer/status visibility.
+        assert fake_footer.display is True
+        assert fake_status.display is True
 
     def test_set_slash_hint_empty_resets_auto_height(self):
         from loom.tui.app import LoomApp
@@ -1370,8 +1371,9 @@ class TestSlashCommandHints:
 
         assert fake_hint.display is False
         assert fake_hint.styles.height == "auto"
-        assert fake_footer.display is True
-        assert fake_status.display is True
+        # Slash hints no longer toggle footer/status visibility.
+        assert fake_footer.display is False
+        assert fake_status.display is False
 
     def test_slash_completion_candidates_prefix(self):
         from loom.tui.app import LoomApp

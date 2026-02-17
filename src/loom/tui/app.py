@@ -149,13 +149,49 @@ class LoomApp(App):
     #main-area {
         width: 1fr;
     }
-    #user-input {
+    #bottom-stack {
         dock: bottom;
+        height: 4;
+        background: $panel;
+    }
+    #input-top-rule {
+        height: 1;
+        border: none;
+        border-top: solid $primary-darken-1;
+        border-left: solid $primary-darken-2;
+        border-right: solid $primary-darken-2;
+        background: $panel;
+    }
+    #user-input {
         margin: 0;
+        height: 2;
+        padding: 0 1;
+        background: $panel;
+        border: none;
+        border-left: solid $primary-darken-2;
+        border-right: solid $primary-darken-2;
+        border-bottom: solid $primary-darken-1;
+        color: $text;
+    }
+    #user-input:focus {
+        border: none;
+        border-left: solid $primary-darken-1;
+        border-right: solid $primary-darken-1;
+        border-bottom: solid $primary;
+        background: $surface;
+    }
+    #status-bar {
+        display: none;
+    }
+    #app-footer {
+        dock: none;
+        height: 1;
+        border: none;
     }
     #slash-hint {
         dock: bottom;
         display: none;
+        margin: 0 0 4 0;
         min-height: 1;
         max-height: 14;
         padding: 0 1;
@@ -227,13 +263,15 @@ class LoomApp(App):
                         yield FilesChangedPanel(id="files-panel")
                     with TabPane("Events", id="tab-events"):
                         yield EventPanel(id="events-panel")
-        yield Input(
-            placeholder="Type a message... (Enter to send)",
-            id="user-input",
-        )
         yield Static("", id="slash-hint")
         yield StatusBar(id="status-bar")
-        yield Footer()
+        with Vertical(id="bottom-stack"):
+            yield Static("", id="input-top-rule")
+            yield Input(
+                placeholder="Type a message... (Enter to send)",
+                id="user-input",
+            )
+            yield Footer(id="app-footer")
 
     async def on_mount(self) -> None:
         # Register and activate theme
@@ -248,6 +286,12 @@ class LoomApp(App):
             return
 
         await self._initialize_session()
+        # Keep input focus deterministic even when _initialize_session is mocked
+        # in tests or returns early in partial startup paths.
+        try:
+            self.query_one("#user-input", Input).focus()
+        except Exception:
+            pass
 
     def _on_setup_complete(self, result: list[dict] | None) -> None:
         """Handle setup wizard dismissal."""
@@ -582,6 +626,8 @@ class LoomApp(App):
         self._resume_session = None
 
         self.query_one("#user-input", Input).focus()
+        # Ensure command/footer bars are visible after any prior slash-hint state.
+        self._set_slash_hint("")
 
     def _ensure_persistence_tools(self) -> None:
         """Ensure recall/delegate tools are registered and tracked.
@@ -773,34 +819,16 @@ class LoomApp(App):
     def _set_slash_hint(self, hint_text: str) -> None:
         """Show or hide the slash-command hint panel."""
         hint = self.query_one("#slash-hint", Static)
-        footer: Footer | None = None
-        status: StatusBar | None = None
-        try:
-            footer = self.query_one(Footer)
-        except Exception:
-            footer = None
-        try:
-            status = self.query_one("#status-bar", StatusBar)
-        except Exception:
-            status = None
         if hint_text:
             hint.update(hint_text)
             hint.display = True
             line_count = max(1, len(hint_text.splitlines()))
             hint.styles.height = min(line_count, _MAX_SLASH_HINT_LINES)
             hint.scroll_home(animate=False)
-            if footer is not None:
-                footer.display = False
-            if status is not None:
-                status.display = False
         else:
             hint.display = False
             hint.styles.height = "auto"
             hint.update("")
-            if footer is not None:
-                footer.display = True
-            if status is not None:
-                status.display = True
 
     def _bind_session_tools(self) -> None:
         """Bind tools that hold a reference to the active session."""

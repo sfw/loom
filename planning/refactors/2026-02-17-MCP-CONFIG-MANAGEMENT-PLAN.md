@@ -1,213 +1,283 @@
-# MCP Tool Management and Config Separation Plan (2026-02-17)
+# MCP Config, Connection Management, and OAuth Plan (2026-02-17)
 
-## Execution Status (2026-02-17)
-Status: Implemented and Audited
+## Status
+- Track A (done): MCP config separation + CLI/TUI management was implemented and tested.
+- Track B (new): transport-aware MCP connections + OAuth support is required for major hosted MCP servers and is not yet implemented.
 
-## Implementation Review (2026-02-17)
-Completed against plan:
-- Phase 1 (core manager): implemented `src/loom/mcp/config.py` with layered merge, atomic writes, redaction helpers, and migration helpers.
-- Phase 2 (CLI): implemented `loom mcp` command group (`list/show/add/edit/remove/enable/disable/test/migrate`) with JSON output and redaction-by-default.
-- Phase 3 (runtime integration): CLI startup now applies merged MCP layers (`--mcp-config` + workspace/user/legacy), and MCP registry discovery continues to use merged runtime config. Added legacy-source migration guidance in list/show output.
-- Phase 4 (TUI): implemented `/mcp` command family (`list/show/test/enable/disable/remove`) with shared backend usage and runtime MCP tool refresh after mutations.
-- Phase 5 (docs): updated `README.md`, `docs/tutorial.html`, and `docs/agent-integration.md` with `mcp.toml` workflow, merge precedence, and migration examples.
+## Why This Refinement Exists
+The original plan delivered config management well, but we now need first-class support for hosted MCP servers (Notion, Figma, Atlassian, Asana, etc.) that depend on OAuth and HTTP transports.
 
-Validation added:
-- Unit tests for manager precedence/mutation/migration/redaction (`tests/test_mcp_config_manager.py`).
-- CLI tests for full `loom mcp` lifecycle and migration/probe flows (`tests/test_cli.py`).
-- Integration tests for loading MCP tools from external `mcp.toml` layers and workspace precedence (`tests/test_mcp_tools_bridge.py`).
-- TUI tests for `/mcp` slash parsing/dispatch/feedback/autocomplete coverage (`tests/test_tui.py`).
-- Regression test ensuring setup does not mutate separate MCP config (`tests/test_setup.py`).
+Without this, Loom can only reliably bridge local stdio MCP servers.
 
-Deferred by design (from original plan’s “Phase 2 TUI enhancement”):
-- Modal add/edit MCP form in TUI (`/mcp add`, `/mcp edit`) remains deferred; CLI provides full mutation coverage.
+## What Has Been Completed (Audit of Existing Work)
+Implemented from the earlier plan:
+- Dedicated MCP config management in `src/loom/mcp/config.py`.
+- Merge precedence:
+  1. `--mcp-config <path>`
+  2. `<workspace>/.loom/mcp.toml`
+  3. `~/.loom/mcp.toml`
+  4. legacy `[mcp]` in `loom.toml`
+- CLI `loom mcp` command group:
+  - `list/show/add/edit/remove/enable/disable/test/migrate`
+- TUI `/mcp` command family:
+  - `list/show/test/enable/disable/remove`
+- Legacy migration flow and guidance.
+- Redaction in CLI/TUI display.
+- Unit/integration/TUI test coverage for the above.
 
-## Scope
-- Add a first-class MCP management workflow for Loom users.
-- Separate MCP server/tool config from `loom.toml` into dedicated MCP config.
-- Provide safe, scriptable CLI commands and practical TUI controls.
-- Define security boundaries for agent-driven configuration changes.
+## Gaps Found After Audit
+1. External MCP bridging is stdio-only:
+   - Current server schema is command/args/env/cwd/timeout/enabled only.
+2. No OAuth lifecycle:
+   - No login callback flow, no refresh-token handling, no token store.
+3. Env ref semantics are incomplete:
+   - `--env-ref KEY=VAR` stores `${VAR}`, but runtime does not expand those placeholders before spawn.
+4. Docs mismatch:
+   - Docs mention `loom mcp-serve --transport sse`, but CLI currently exposes stdio only.
+5. No connection-health model:
+   - We have probe/test, but no persistent runtime status model across transports/auth states.
 
-## Problem Summary
-- MCP servers are currently configured inside `loom.toml`, mixing model/runtime settings with tool-bridge execution policy.
-- `loom setup` rewrites `~/.loom/loom.toml`, which can unintentionally drop MCP configuration.
-- No dedicated CLI/TUI UX exists for adding/editing/removing MCP servers.
-- Users need a safe way to manage secrets and avoid accidental exposure.
-- Exposing MCP config mutation to arbitrary remote agents is high risk.
+## Requirement Confirmation
+If Loom must support hosted MCP servers like Notion in a robust way, OAuth support is effectively a core requirement.
 
-## Recommendations
-1. Introduce a dedicated MCP config file at `~/.loom/mcp.toml`.
-2. Keep backward compatibility with `[mcp.servers.*]` in `loom.toml` during migration.
-3. Ship a dedicated `loom mcp` CLI command group for lifecycle management.
-4. Add a minimal TUI slash-command surface for MCP operations.
-5. Keep MCP config mutation local-only by default; do not expose write APIs on `loom serve` unless explicitly enabled.
+Token-only stdio alternatives exist for some ecosystems, but they are incomplete, vendor-specific, or not the official long-term path.
 
-## Target Design
+## Design Goals (Track B)
+1. Support both local and hosted MCP servers with one config model.
+2. Treat OAuth as first-class for hosted MCP.
+3. Keep secrets out of `mcp.toml` where possible.
+4. Preserve current stdio behavior and backward compatibility.
+5. Make connection/auth state clear in CLI and TUI.
+6. Align with MCP transport direction: Streamable HTTP as primary remote transport; legacy SSE compatibility mode only.
+7. Prefer protocol-level correctness via MCP SDK integration over ad-hoc HTTP implementations where feasible.
 
-## 1) Config Layout and Merge Rules
-- Primary MCP config: `~/.loom/mcp.toml`.
-- Optional workspace override: `<workspace>/.loom/mcp.toml`.
-- Legacy fallback: `[mcp.servers.*]` in active `loom.toml`.
+## Proposed MCP Connection Model
 
-Merge precedence (highest wins):
-1. Explicit `--mcp-config <path>` (new CLI option for MCP-aware commands)
-2. Workspace `./.loom/mcp.toml`
-3. User `~/.loom/mcp.toml`
-4. Legacy `[mcp]` section from active `loom.toml`
+### 1) Transport Types
+Add explicit per-server transport:
+- `transport = "stdio"` (default; current behavior)
+- `transport = "streamable_http"` (new primary remote)
+- `transport = "sse_legacy"` (compat only; optional/deprecated)
 
-Server alias collision rule:
-- Same alias in a higher-precedence source replaces lower-precedence alias.
+### 2) Auth Modes
+Add explicit per-server auth policy:
+- `auth = "none"`
+- `auth = "env_bearer"` (token from env)
+- `auth = "oauth"` (new)
 
-`enabled = false` behavior:
-- Disabled server remains in config but is excluded from discovery/registration.
+### 3) Config Shape (v2)
+Backward compatible with existing stdio blocks.
 
-## 2) File Schema
-Keep existing schema shape for minimal migration cost:
-
+#### Stdio server example
 ```toml
-[mcp.servers.notion]
+[mcp.servers.notion_local]
+transport = "stdio"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-notion"]
-cwd = ""
 timeout_seconds = 30
 enabled = true
 
-[mcp.servers.notion.env]
+[mcp.servers.notion_local.env]
 NOTION_TOKEN = "${NOTION_TOKEN}"
 ```
 
-Secret handling guidance:
-- Prefer environment indirection (`"${VAR_NAME}"`) over plaintext literal tokens.
-- CLI output must redact env values by default.
+#### Hosted OAuth server example
+```toml
+[mcp.servers.notion]
+transport = "streamable_http"
+url = "https://mcp.notion.com/mcp"
+auth = "oauth"
+enabled = true
+timeout_seconds = 30
 
-## 3) CLI Command Group
-Add `loom mcp` subcommands:
-- `loom mcp list [--json] [--verbose]`
-- `loom mcp show <alias> [--json]`
-- `loom mcp add <alias> --command <cmd> [--arg <arg> ...] [--env KEY=VALUE ...] [--env-ref KEY=ENV_VAR ...] [--cwd <path>] [--timeout <sec>] [--disabled]`
-- `loom mcp edit <alias> [same mutating flags as add]`
-- `loom mcp remove <alias>`
-- `loom mcp enable <alias>`
-- `loom mcp disable <alias>`
-- `loom mcp test <alias>` (runs `tools/list` probe and prints discovered tool names + diagnostics)
-- `loom mcp migrate` (moves legacy `[mcp]` from `loom.toml` to `mcp.toml`)
+[mcp.servers.notion.oauth]
+scopes = ["read:content", "write:content"]
+# optional overrides:
+# client_id = "..."
+# authorization_server = "https://..."
+# audience = "..."
+```
 
-CLI behavior requirements:
-- Atomic writes (`write temp + fsync + rename`).
-- Preserve unknown sections/comments where feasible; if not, document normalized rewrite behavior.
-- Redact sensitive values in stdout/stderr and logs.
+## Streaming vs SSE Decision
 
-## 4) TUI UX
-Add slash commands:
-- `/mcp` (help/overview)
-- `/mcp list`
-- `/mcp show <alias>`
-- `/mcp test <alias>`
-- `/mcp enable <alias>`
-- `/mcp disable <alias>`
-- `/mcp remove <alias>`
+### Policy
+- For hosted servers, Loom should target `streamable_http` first.
+- `sse_legacy` is fallback-only compatibility for older servers.
 
-Phase 2 TUI enhancement:
-- Modal/editor workflow for add/edit (`/mcp add`, `/mcp edit`) with explicit save confirmation.
+### Behavior
+1. If configured `streamable_http`, use that directly.
+2. If configured `sse_legacy`, use explicit legacy flow.
+3. Optional `compat_auto` mode (future):
+   - Attempt Streamable HTTP first.
+   - Fallback to legacy SSE only for transport-level incompatibility responses.
 
-TUI implementation note:
-- Reuse same backend service as CLI (single MCP config manager API) to avoid duplicated parsing/writing logic.
+### Loom MCP Server (`loom mcp-serve`)
+- Keep stdio as stable default.
+- Either:
+  - implement real remote transport mode(s), or
+  - remove stale doc claims until implemented.
+- Immediate action: docs must match current CLI behavior.
+- Scope boundary for this plan: external MCP connectivity is priority; `loom mcp-serve` remote transports are optional follow-up unless explicitly scheduled.
 
-## 5) Runtime Reload
-- After MCP config mutation (CLI or TUI), trigger registry refresh in-process:
-  - Reconcile tools via existing MCP synchronizer refresh hook.
-  - Re-render `/tools` output and status hints.
-- For external processes (`loom run`, `loom serve`), refreshed config applies on next process start unless an explicit runtime reload hook is added.
+## OAuth Architecture
 
-## 6) Security Model
-Default posture:
-- MCP config mutation is local and user-initiated only.
-- `loom serve` exposes no config-write API by default.
+### 1) Login Flow
+- CLI command: `loom mcp auth login <alias>`
+- Use Authorization Code + PKCE.
+- Open browser and start local callback listener for redirect completion.
+- Discover authorization server metadata from MCP/protected resource metadata when available; allow explicit override fields when discovery is absent.
 
-Optional advanced posture (deferred):
-- Admin API for MCP mutation behind explicit `--enable-admin-config` flag and auth token.
-- Audit logging for all mutations.
-- Optional allowlist for permitted command prefixes.
+### 2) Token Storage
+- Do not write access/refresh tokens to `mcp.toml`.
+- Store tokens in OS keychain via `keyring` (preferred).
+- Keep only non-secret metadata in config/state (issuer, scopes, expiry metadata).
+- Optional explicit fallback `--allow-plaintext-token-store` (off by default) for headless hosts where keychain is unavailable.
 
-## 7) Agent Access Recommendation
-- Yes, provide CLI-based management for automations and trusted local agents.
-- No, do not allow untrusted/remote agents to mutate MCP config via public API by default.
-- If API mutation is later enabled, require explicit operator opt-in and authentication.
+### 3) Refresh
+- Automatic refresh before expiry.
+- On refresh failure, mark server auth state as expired and surface re-login hint.
 
-## Implementation Plan
+### 4) Commands
+Add:
+- `loom mcp auth login <alias>`
+- `loom mcp auth status [alias]`
+- `loom mcp auth logout <alias>`
+- `loom mcp auth refresh <alias>` (manual repair path)
+- Optional headless support:
+  - `loom mcp auth login <alias> --device` for environments where browser callbacks are not possible.
 
-## Phase 1: MCP Config Manager Core
-- Add `src/loom/mcp/config.py`:
-  - load/merge logic for user/workspace/legacy sources
-  - schema validation and normalization
-  - atomic write helpers
-  - redaction helpers
-- Add tests:
-  - precedence/merge behavior
-  - alias override behavior
-  - env redaction behavior
+## Runtime Connection Manager
+Introduce a single manager for discovery, auth, and tool sync:
 
-## Phase 2: CLI Commands
-- Add `loom mcp` click group and subcommands in `src/loom/__main__.py`.
-- Implement deterministic JSON output for script usage.
-- Add command tests in `tests/test_cli.py`:
-  - add/edit/remove/enable/disable
-  - list/show redaction
-  - migrate from `loom.toml`
-  - test probe success/failure paths
+- `MCPConnectionManager`
+  - resolves merged config
+  - instantiates per-server connection adapters
+  - tracks state:
+    - configured
+    - connecting
+    - authenticated
+    - auth_expired
+    - healthy
+    - degraded
+    - error
+  - exposes diagnostics for CLI/TUI
 
-## Phase 3: Runtime Integration
-- Update startup/config plumbing to read merged MCP config and feed tool registry.
-- Ensure legacy config still works with warning guidance to migrate.
-- Add integration tests:
-  - MCP tools loaded from `mcp.toml`
-  - workspace override precedence
-  - reload/refresh behavior after mutations
+- Adapters:
+  - `StdioConnection`
+  - `StreamableHttpConnection`
+  - optional `SSELegacyConnection`
 
-## Phase 4: TUI Slash Commands
-- Extend slash command parser/help/autocomplete:
-  - `/mcp` command family
-- Show concise success/failure feedback in chat log.
-- Add TUI tests:
-  - parse/dispatch behavior
-  - visible feedback
-  - no regression for existing slash commands/autocomplete
+- Registry integration:
+  - keep current reconciliation behavior
+  - enrich failures with transport/auth reason (not just generic discovery failure)
 
-## Phase 5: Docs and Migration Guidance
-- Update:
-  - `README.md`
-  - `docs/tutorial.html`
-  - `docs/agent-integration.md`
-- Add examples for:
-  - secure env reference usage
-  - migration from legacy config
-  - TUI + CLI workflows
+## Process/Orchestration Integration
+To make MCP-backed tools reliable in processes:
 
-## Test Plan
-- Unit:
-  - parser/merge/serializer/atomic write/redaction.
-- CLI:
-  - all `loom mcp` commands including error cases.
-- Integration:
-  - MCP tool discovery from new config path.
-  - live probe with test MCP fixture.
-- TUI:
-  - slash command correctness + autocomplete.
-- Regression:
-  - existing setup flow still works and does not delete `mcp.toml`.
+1. Preflight at process activation/run:
+   - Validate required MCP servers are configured and enabled.
+   - Validate auth state for required OAuth servers.
+2. Fast-fail with actionable message:
+   - Example: "Process requires MCP server `notion` but OAuth login is missing. Run `loom mcp auth login notion`."
+3. Optional process metadata extension:
+   - `tools.required_mcp_servers: [notion, linear]`
 
-## Risks and Mitigations
-- Risk: config sprawl/confusion.
-  - Mitigation: clear precedence docs and `loom mcp doctor` (optional follow-up).
-- Risk: accidental secret disclosure in logs.
-  - Mitigation: default redaction and dedicated tests.
-- Risk: alias conflicts across files.
-  - Mitigation: explicit precedence and warning output showing source selected.
-- Risk: user expectation mismatch on live reload.
-  - Mitigation: explicit messaging after mutations: “applies immediately in current TUI, otherwise on next run.”
+## Security Model (Refined)
+Defaults:
+- Local-only mutation remains default.
+- No remote config-write API on `loom serve`.
+- Redaction always on for output/logging.
 
-## Demo-Ready Exit Criteria
-- MCP servers can be fully managed via CLI without manual file edits.
-- TUI exposes practical MCP list/show/test/enable/disable/remove commands.
-- MCP config survives `loom setup` reruns.
-- Secrets are redacted in CLI/TUI/log output.
-- Docs clearly explain user workflow and security boundaries.
+Additional hardening:
+- Command allowlist option for stdio server binaries.
+- Per-server "trusted" flag before enabling execution.
+- Audit log for MCP config/auth mutations.
+
+## Migration Strategy
+1. Read legacy and v1 config seamlessly.
+2. Keep writing compatible structure for stdio entries.
+3. New fields (`transport`, `auth`, `url`, `oauth`) are additive.
+4. Add migration helper:
+   - `loom mcp migrate --to-v2` for explicit normalization.
+
+## Implementation Plan (Track B)
+
+## Phase 0: Correctness and Doc Parity
+- Fix docs/CLI mismatch for `mcp-serve --transport sse`.
+- Define final transport/auth schema and validation.
+- Fix `${ENV}` interpolation semantics for stdio env refs.
+- Lock implementation dependency strategy:
+  - adopt MCP SDK client capabilities for Streamable HTTP/OAuth where practical
+  - define minimum compatible `mcp` extra version for Loom.
+
+Exit criteria:
+- Docs match behavior.
+- Env-ref semantics are explicit and tested.
+
+## Phase 1: Transport-Aware Config + Adapter Layer
+- Extend schema with `transport/auth/url/oauth`.
+- Introduce connection adapter interface.
+- Keep existing stdio path as adapter implementation.
+
+Tests:
+- Config parse/merge for old + new schema.
+- Adapter selection and validation failures.
+
+## Phase 2: Streamable HTTP Transport
+- Implement remote MCP connection over Streamable HTTP.
+- Add probe and tool discovery parity with stdio path.
+- Optional compatibility adapter for legacy SSE servers.
+- Prefer SDK-backed transport client path first; use custom client only for explicitly unsupported SDK paths.
+
+Tests:
+- Mock server integration for list/call flows.
+- Retry/backoff and error classification.
+
+## Phase 3: OAuth Support
+- Add auth command group and PKCE login flow.
+- Add token store abstraction (keyring + explicit fallback).
+- Auto-refresh handling and auth status plumbing.
+
+Tests:
+- OAuth state machine unit tests.
+- Token persistence/retrieval/refresh tests.
+- End-to-end mock auth provider integration.
+
+## Phase 4: TUI MCP Connection UX
+- Add `/mcp` auth/status affordances:
+  - status list with auth/health badges
+  - trigger login/logout/test/reload
+- Keep mutation controls reusing shared backend.
+
+Tests:
+- Slash command routing and status rendering.
+- failure-state UX messages.
+
+## Phase 5: Process Readiness and Preflight
+- Add required-MCP preflight checks for process runs.
+- Improve verification feedback for MCP connectivity/auth issues.
+
+Tests:
+- process run blocked on missing auth/config.
+- success path when authenticated.
+
+## Phase 6: Hardening and Release
+- Add nightly canary with at least one hosted MCP mock.
+- Performance and timeout tuning.
+- Security review pass for token handling and logs.
+
+## Updated Exit Criteria
+- Loom can manage and use both local stdio and hosted MCP servers.
+- OAuth-required MCP servers are supported with first-class login/logout/status.
+- Process runs can depend on MCP servers with clear preflight behavior.
+- Streamable HTTP is supported; legacy SSE is explicit compatibility mode only.
+- Docs/tutorial/CLI help/TUI behavior are aligned.
+- Backward compatibility is preserved for existing stdio-only `mcp.toml` entries without manual migration.
+
+## Primary References
+- MCP spec: transports and auth requirements
+  - https://modelcontextprotocol.io/specification/2025-11-05/basic/transports
+  - https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization
+- Notion MCP OAuth requirements
+  - https://developers.notion.com/guides/mcp/get-started-with-mcp
+  - https://developers.notion.com/guides/mcp/build-mcp-client
