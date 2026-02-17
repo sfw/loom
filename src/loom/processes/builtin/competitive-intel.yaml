@@ -1,80 +1,135 @@
 name: competitive-intel
-version: "1.0"
+version: "1.2"
 description: >
-  Quick competitive intelligence gathering and comparison. Three lightweight
-  phases for identifying competitors, researching their offerings, and
-  building a structured comparison. Designed for fast ad-hoc requests
-  when a full marketing strategy is unnecessary.
+  Structured competitive intelligence workflow for scoping the subject product,
+  identifying competitors, collecting evidence-backed profiles, building
+  comparison matrices, defining response playbooks, and setting monitoring.
 author: "Loom Team"
-tags: [competitive, intelligence, research, comparison, quick]
+tags: [competitive, intelligence, research, comparison, battlecards]
 
 persona: |
-  You are a competitive intelligence analyst who works fast and focuses on
-  actionable differences. You care about what competitors actually do, not
-  what they claim. You look for pricing pages, job postings, product
-  changelogs, and customer reviews as signal sources.
+  You are a competitive intelligence analyst who focuses on actionable,
+  evidence-backed differences. You care about what competitors actually do,
+  not what they claim. Use pricing pages, changelogs, hiring signals,
+  customer reviews, and partnership signals as evidence.
 
-phase_mode: suggestive
+phase_mode: strict
 
 tool_guidance: |
-  Favor structured comparison tables over narrative. Use CSV for the final
-  comparison matrix so it can be imported into other tools. Keep narrative
-  sections concise — bullet points over paragraphs. When a data point is
-  uncertain, mark it with a tilde (~) prefix and note the source.
+  Favor structured tables over long narrative. Use CSV for matrices and
+  Markdown for concise synthesis. Mark uncertain data points with a leading
+  tilde (~), including source and recency marker.
+
+tools:
+  guidance: >
+    Use web_search/web_fetch for competitive signals and document_write for
+    battlecard-ready outputs.
+  required: [web_search, web_fetch, read_file, write_file, document_write, search_files]
+  excluded: [delete_file, shell_execute, git_command]
 
 phases:
+  - id: scope-subject
+    description: >
+      Define the subject offering, target buyer, primary use cases, and buying
+      criteria before competitor comparison.
+    depends_on: []
+    model_tier: 2
+    verification_tier: 1
+    is_critical_path: true
+    acceptance_criteria: >
+      Subject company baseline includes product scope, ICP, core workflows,
+      pricing posture, and top buying criteria for comparison.
+    deliverables:
+      - "subject-baseline.md — subject product scope and ICP baseline"
+      - "buying-criteria.csv — weighted buying criteria for comparison"
+
   - id: identify-competitors
     description: >
-      Build the initial competitor list. Include direct competitors (same
-      product category), indirect competitors (different approach to same
-      problem), and emerging threats. Categorize each by type and relevance.
-    depends_on: []
+      Build and prioritize competitor list including direct, indirect, and
+      emerging threats.
+    depends_on: [scope-subject]
     model_tier: 1
     verification_tier: 1
+    is_critical_path: true
     acceptance_criteria: >
-      At least 5 competitors identified. Each has a name, website, one-line
-      description, competitor type (direct/indirect/emerging), and estimated
-      relevance (high/medium/low). The list is prioritized.
+      At least 5 competitors with website, one-line description, competitor
+      type, estimated relevance, and threat rationale.
     deliverables:
       - "competitor-list.csv — identified competitors with categorization"
 
   - id: research-competitors
     description: >
-      For each high-relevance competitor, gather: product capabilities,
-      pricing model, target customer, recent funding or revenue signals,
-      stated strategy, key hires, and notable customer wins or losses.
+      For high-relevance competitors, gather evidence on capabilities, pricing,
+      target customer, GTM strategy, momentum signals, and recent moves.
     depends_on: [identify-competitors]
     model_tier: 2
     verification_tier: 1
+    is_critical_path: true
     acceptance_criteria: >
-      Each high-relevance competitor has a profile covering at least 5 of
-      the 7 research dimensions. Data sources are noted. Recency of
-      information is stated (e.g., pricing as of Q3 2025).
+      Each high-relevance competitor has at least 5 of 7 dimensions covered,
+      with source links and recency labels.
     deliverables:
       - "competitor-profiles.md — detailed profiles of top competitors"
+      - "signal-log.csv — observed signals with date and source"
 
   - id: build-comparison
     description: >
-      Create a structured comparison matrix across key dimensions. Identify
-      where the subject company is stronger, weaker, or at parity. Highlight
-      the top 3 competitive advantages and top 3 vulnerabilities.
+      Create structured comparison matrix against weighted buying criteria and
+      identify where the subject is stronger, weaker, or at parity.
     depends_on: [research-competitors]
     model_tier: 2
     verification_tier: 2
+    is_critical_path: true
     acceptance_criteria: >
-      Comparison matrix has at least 8 dimensions (features, pricing,
-      integrations, support, market position, etc.). Strengths and
-      weaknesses are specific and supported by evidence from profiles.
-      A summary table shows win/lose/parity per competitor per dimension.
+      Matrix includes at least 8 dimensions and win/lose/parity calls per
+      competitor with evidence references.
     deliverables:
       - "comparison-matrix.csv — feature and capability comparison grid"
-      - "competitive-summary.md — key advantages, vulnerabilities, and recommendations"
+      - "competitive-summary.md — advantages, vulnerabilities, and implications"
+
+  - id: response-playbook
+    description: >
+      Convert insights into response plan for product, sales, and marketing.
+    depends_on: [build-comparison]
+    model_tier: 2
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Includes top 3 strategic responses, owner role, timing, expected impact,
+      and risks. Sales battlecards are concrete and competitor-specific.
+    deliverables:
+      - "battlecards.md — competitor-specific sales and positioning battlecards"
+      - "response-backlog.csv — prioritized response actions with owners"
+
+  - id: monitoring-plan
+    description: >
+      Define ongoing monitoring watchlist with signal thresholds that trigger
+      response updates.
+    depends_on: [response-playbook]
+    model_tier: 2
+    verification_tier: 2
+    is_critical_path: true
+    is_synthesis: true
+    acceptance_criteria: >
+      Watchlist includes signal type, source, recency expectation, threshold,
+      and owner for response updates.
+    deliverables:
+      - "watchlist.csv — signals to monitor with thresholds and owners"
+      - "alert-thresholds.md — rules for when to update playbooks"
 
 tests:
   - id: smoke
     mode: deterministic
     goal: "Run the competitive-intel process and produce all declared deliverables."
     timeout_seconds: 900
+    acceptance:
+      phases:
+        must_include: [scope-subject, identify-competitors, research-competitors, build-comparison, response-playbook, monitoring-plan]
+      deliverables:
+        must_exist: [subject-baseline.md, buying-criteria.csv, competitor-list.csv, competitor-profiles.md, signal-log.csv, comparison-matrix.csv, competitive-summary.md, battlecards.md, response-backlog.csv, watchlist.csv, alert-thresholds.md]
+      verification:
+        forbidden_patterns: ["Expected deliverable '.*' not found", "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"]
+
   - id: live-canary
     mode: live
     goal: "Perform competitive intelligence on a live market segment and synthesize recommendations."
@@ -86,12 +141,35 @@ verification:
     - name: evidence-backed
       description: "Competitive claims must reference observable evidence"
       check: >
-        Review each strength and weakness claim. It must reference a
-        specific feature, pricing data point, customer review, job posting,
-        or other observable signal. Reject claims based solely on brand
-        perception or unsupported assumptions.
+        Every major claim should reference specific evidence (feature behavior,
+        pricing datapoint, review signal, hiring signal, or comparable source).
+      severity: error
+      type: llm
+
+    - name: subject-alignment
+      description: "Comparison must align to subject buying criteria"
+      check: >
+        Validate comparison dimensions and recommendations map back to declared
+        subject baseline and buying criteria.
+      severity: error
+      type: llm
+
+    - name: freshness-stated
+      description: "Time-sensitive datapoints must include recency"
+      check: >
+        Pricing, product capabilities, and strategic moves should include a
+        recency marker where applicable.
       severity: warning
       type: llm
+
+    - name: recommendations-actionable
+      description: "Response recommendations must be specific and assignable"
+      check: >
+        Validate recommendations include owner role, timing, expected outcome,
+        and update triggers.
+      severity: error
+      type: llm
+
     - name: no-placeholders
       description: "No placeholder text left in deliverables"
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
@@ -101,46 +179,38 @@ verification:
 memory:
   extract_types:
     - type: competitor_profile
-      description: "Key facts about a competitor — product, pricing, positioning, recent moves"
+      description: "Key facts about competitor product, pricing, positioning, and moves"
     - type: competitive_gap
-      description: "A specific dimension where the subject company is weaker or stronger"
+      description: "Dimension where subject is weaker or stronger"
+    - type: response_action
+      description: "Recommended product/GTM response with owner and timing"
   extraction_guidance: |
-    Focus on facts that would influence product or sales strategy. Always
-    include the competitor name and the date or recency of the information.
-    For gaps, note whether the gap is widening or narrowing.
+    Focus on evidence that changes product or sales strategy. Include
+    competitor name, source, and recency marker.
 
 workspace_analysis:
   scan_for:
-    - "*.csv — existing competitor data or feature matrices"
-    - "*.md — prior competitive analyses or battle cards"
+    - "**/*.csv — competitor data, matrices, or battlecard trackers"
+    - "**/*.md — prior competitive analyses, battle cards, or launch notes"
   guidance: |
-    If prior competitor research exists, use it as a starting point and
-    focus on updating stale data points rather than rebuilding from scratch.
-    Look for sales battle cards that may contain validated competitive
-    positioning.
+    Start from existing artifacts where credible, then refresh stale points and
+    fill gaps with current evidence.
 
 planner_examples:
-  - goal: "Build a competitive comparison of project management tools against our product"
+  - goal: "Build competitive comparison of project management tools"
     subtasks:
-      - id: identify-competitors
-        description: "List direct competitors (Asana, Monday, Linear, Jira, ClickUp) and indirect (Notion, Airtable), categorize by threat level"
-        depends_on: []
-        model_tier: 1
-      - id: research-competitors
-        description: "Profile each on pricing tiers, feature set, integrations, target segment, and recent product launches or pivots"
-        depends_on: [identify-competitors]
-        model_tier: 2
-      - id: build-comparison
-        description: "Build matrix on 10 dimensions: task management, views, automation, reporting, integrations, pricing, collaboration, mobile, API, and support"
-        depends_on: [research-competitors]
-        model_tier: 2
+      - { id: scope-subject, description: "Define product scope, ICP, and buying criteria", depends_on: [], model_tier: 2 }
+      - { id: identify-competitors, description: "List direct/indirect competitors and prioritize", depends_on: [scope-subject], model_tier: 1 }
+      - { id: research-competitors, description: "Collect evidence-backed profiles", depends_on: [identify-competitors], model_tier: 2 }
+      - { id: build-comparison, description: "Build weighted comparison matrix", depends_on: [research-competitors], model_tier: 2 }
+      - { id: response-playbook, description: "Convert gaps into battlecards and response backlog", depends_on: [build-comparison], model_tier: 2 }
+      - { id: monitoring-plan, description: "Define watchlist and alert thresholds", depends_on: [response-playbook], model_tier: 2 }
 
 replanning:
   triggers: |
-    - The competitive landscape is too fragmented to compare meaningfully
-    - A key competitor has been acquired or shut down during research
-    - The subject company's own product scope is unclear
+    - Landscape is too fragmented to compare meaningfully
+    - A key competitor is acquired, merged, or exits during analysis
+    - Subject product scope is unclear
   guidance: |
-    If there are too many competitors, narrow to the top 5 by relevance
-    and note the long tail. If the subject company's product is unclear,
-    add a preliminary scoping step before competitor identification.
+    If landscape is fragmented, narrow to top threats and document long-tail
+    exclusions. If subject scope is unclear, refresh scope-subject first.

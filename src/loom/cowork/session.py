@@ -247,7 +247,7 @@ class CoworkSession:
                 tc_dicts = self._tool_calls_to_dicts(response.tool_calls)
                 self._messages.append({
                     "role": "assistant",
-                    "content": response.text or None,
+                    "content": response.text or "",
                     "tool_calls": tc_dicts,
                 })
                 await self._persist_turn(
@@ -374,7 +374,7 @@ class CoworkSession:
                 tc_dicts = self._tool_calls_to_dicts(final_tool_calls)
                 self._messages.append({
                     "role": "assistant",
-                    "content": response_text or None,
+                    "content": response_text or "",
                     "tool_calls": tc_dicts,
                 })
                 await self._persist_turn(

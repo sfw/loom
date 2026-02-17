@@ -73,6 +73,8 @@ loom -w /path/to/workspace --process consulting-engagement
 # Force process orchestration from inside the TUI (no loom serve required)
 # /process use investment-analysis
 # /run Analyze Tesla for investment
+# /run close                 # close current run tab (with confirmation)
+# /investment-analysis Analyze Tesla for investment
 
 # Resume a previous session
 loom --resume <session-id>
@@ -170,7 +172,7 @@ In the TUI, use `/learned` to open an interactive review screen for learned beha
 
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal>`), learned pattern review (`/learned`), MCP config controls (`/mcp list`, `/mcp show`, `/mcp test`, `/mcp enable`, `/mcp disable`, `/mcp remove`), and click-to-open workspace file previews (Markdown, code/text with syntax highlighting including TypeScript/CSS, JSON, CSV/TSV, HTML, diff/patch, Office docs, PDF text, and image metadata). `/run` executes in-process and does not require `loom serve`.
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal|close [run-id-prefix]>`), dynamic direct process commands (`/<process-name> <goal>`), learned pattern review (`/learned`), MCP config controls (`/mcp list`, `/mcp show`, `/mcp test`, `/mcp enable`, `/mcp disable`, `/mcp remove`), and click-to-open workspace file previews (Markdown, code/text with syntax highlighting including TypeScript/CSS, JSON, CSV/TSV, HTML, diff/patch, Office docs, PDF text, and image metadata). `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `loom serve`.
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 

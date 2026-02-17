@@ -603,6 +603,37 @@ class TestDelegateTaskUnbound:
         payload = events[0]
         assert payload["event_data"]["subtask_id"] == "company-screening"
 
+    @pytest.mark.asyncio
+    async def test_delegate_creates_fresh_orchestrator_per_execute(self):
+        from loom.state.task_state import TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        created: list[MagicMock] = []
+
+        async def _execute(task):
+            task.status = TaskStatus.COMPLETED
+            return task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            created.append(orchestrator)
+            return orchestrator
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+
+        first = await tool.execute({"goal": "first"}, ctx)
+        second = await tool.execute({"goal": "second"}, ctx)
+
+        assert first.success is True
+        assert second.success is True
+        assert len(created) == 2
+        assert created[0] is not created[1]
+        created[0].execute_task.assert_awaited_once()
+        created[1].execute_task.assert_awaited_once()
+
     def test_delegate_timeout_default(self, monkeypatch):
         from loom.tools.delegate_task import DelegateTaskTool
 
@@ -857,6 +888,42 @@ class TestWorkspaceRefresh:
         app._update_files_panel(turn)
 
         files_panel.update_files.assert_called_once()
+        sidebar.refresh_workspace_tree.assert_called_once()
+
+    def test_update_files_panel_refreshes_tree_for_document_write(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        files_panel = MagicMock()
+        sidebar = MagicMock()
+        app.notify = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#files-panel":
+                return files_panel
+            if selector == "#sidebar":
+                return sidebar
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        turn = SimpleNamespace(
+            tool_calls=[
+                SimpleNamespace(
+                    name="document_write",
+                    args={"path": "memo.md"},
+                    result=SimpleNamespace(success=True, output="ok"),
+                ),
+            ],
+        )
+
+        app._update_files_panel(turn)
+
+        files_panel.update_files.assert_not_called()
         sidebar.refresh_workspace_tree.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1287,6 +1354,26 @@ class TestSlashCommandHints:
         assert "/mcp" in hint
         assert "/setup" in hint
 
+    def test_root_slash_includes_dynamic_process_commands(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=[
+                {"name": "investment-analysis", "version": "1.0"},
+                {"name": "marketing-strategy", "version": "1.2"},
+            ])
+        ))
+
+        hint = app._render_slash_hint("/")
+
+        assert "/investment-analysis <goal>" in hint
+        assert "/marketing-strategy <goal>" in hint
+
     def test_prefix_filters_matches(self):
         from loom.tui.app import LoomApp
 
@@ -1522,6 +1609,9 @@ class TestSlashCommandHints:
             tools=MagicMock(),
             workspace=Path("/tmp"),
         )
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=[])
+        ))
         assert app._slash_completion_candidates("/s") == [
             "/setup",
             "/session",
@@ -1532,6 +1622,28 @@ class TestSlashCommandHints:
         assert app._slash_completion_candidates("/t") == ["/tools", "/tokens"]
         assert app._slash_completion_candidates("/p") == ["/process"]
         assert app._slash_completion_candidates("/r") == ["/resume", "/run"]
+
+    def test_slash_completion_candidates_include_dynamic_process_commands(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=[
+                {"name": "investment-analysis", "version": "1.0"},
+                {"name": "marketing-strategy", "version": "1.2"},
+            ])
+        ))
+
+        assert app._slash_completion_candidates("/i") == ["/investment-analysis"]
+        assert app._slash_completion_candidates("/m") == [
+            "/model",
+            "/mcp",
+            "/marketing-strategy",
+        ]
 
 
 class TestProcessSlashCommands:
@@ -1644,6 +1756,32 @@ class TestProcessSlashCommands:
         )
 
     @pytest.mark.asyncio
+    async def test_process_use_blocks_reserved_command_name(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        loader = MagicMock()
+        loader.list_available.return_value = []
+        loader.load.return_value = SimpleNamespace(name="run", version="1.0")
+        app._create_process_loader = MagicMock(return_value=loader)
+        app._reload_session_for_process_change = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/process use run")
+
+        assert handled is True
+        app._reload_session_for_process_change.assert_not_awaited()
+        chat.add_info.assert_called_once()
+        assert "conflicts with a built-in slash command" in (
+            chat.add_info.call_args.args[0]
+        )
+
+    @pytest.mark.asyncio
     async def test_process_off_with_no_active_process(self):
         from loom.tui.app import LoomApp
 
@@ -1723,7 +1861,7 @@ class TestProcessSlashCommands:
         )
 
     @pytest.mark.asyncio
-    async def test_run_executes_delegate_task_for_active_process(self):
+    async def test_run_starts_process_run_for_active_process(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -1732,71 +1870,69 @@ class TestProcessSlashCommands:
             workspace=Path("/tmp"),
         )
         app._process_defn = SimpleNamespace(name="investment-analysis")
-        app._tools.has.return_value = True
-        app._tools.execute = AsyncMock(
-            return_value=SimpleNamespace(
-                success=True,
-                output="Task completed",
-                error=None,
-                data={
-                    "tasks": [
-                        {
-                            "id": "company-screening",
-                            "status": "completed",
-                            "content": "Company screening",
-                        },
-                        {
-                            "id": "financial-analysis",
-                            "status": "in_progress",
-                            "content": "Financial analysis",
-                        },
-                    ],
-                },
-            ),
-        )
-
-        chat = MagicMock()
-        status = SimpleNamespace(state="Ready")
-        events_panel = MagicMock()
-        sidebar = MagicMock()
-
-        def _query_one(selector, *_args, **_kwargs):
-            if selector == "#chat-log":
-                return chat
-            if selector == "#status-bar":
-                return status
-            if selector == "#events-panel":
-                return events_panel
-            if selector == "#sidebar":
-                return sidebar
-            raise AssertionError(f"Unexpected selector: {selector}")
-
-        app.query_one = MagicMock(side_effect=_query_one)
+        app._start_process_run = AsyncMock()
+        app.query_one = MagicMock(return_value=MagicMock())
 
         handled = await app._handle_slash_command(
             '/run "Analyze Tesla for investment"',
         )
 
         assert handled is True
-        app._tools.execute.assert_awaited_once()
-        call = app._tools.execute.await_args
-        assert call.args[0] == "delegate_task"
-        payload = call.args[1]
-        assert payload["goal"] == "Analyze Tesla for investment"
-        assert payload["wait"] is True
-        assert callable(payload["_progress_callback"])
-        assert call.kwargs["workspace"] == Path("/tmp")
-        chat.add_user_message.assert_called_once_with(
-            "/run Analyze Tesla for investment",
+        app._start_process_run.assert_awaited_once_with(
+            "Analyze Tesla for investment",
+            process_defn=app._process_defn,
         )
-        chat.add_model_text.assert_called_once_with("Task completed")
-        sidebar.update_tasks.assert_called_once()
-        sidebar.refresh_workspace_tree.assert_called_once()
-        assert status.state == "Ready"
-        assert events_panel.add_event.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_run_reports_missing_delegate_tool(self):
+    async def test_run_close_routes_to_close_handler(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._close_process_run_from_target = AsyncMock(return_value=True)
+        app.query_one = MagicMock(return_value=MagicMock())
+
+        handled = await app._handle_slash_command("/run close #abc123")
+
+        assert handled is True
+        app._close_process_run_from_target.assert_awaited_once_with("#abc123")
+
+    @pytest.mark.asyncio
+    async def test_dynamic_process_slash_command_runs_process_directly(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._refresh_process_command_index = MagicMock()
+        app._process_command_map = {"/investment-analysis": "investment-analysis"}
+        loader = MagicMock()
+        process_defn = SimpleNamespace(name="investment-analysis", version="1.0")
+        loader.load.return_value = process_defn
+        app._create_process_loader = MagicMock(return_value=loader)
+        app._start_process_run = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command(
+            '/investment-analysis "Analyze Tesla for investment"',
+        )
+
+        assert handled is True
+        loader.load.assert_called_once_with("investment-analysis")
+        app._start_process_run.assert_awaited_once_with(
+            "Analyze Tesla for investment",
+            process_defn=process_defn,
+            command_prefix="/investment-analysis",
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_process_run_reports_missing_delegate_tool(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -1808,28 +1944,412 @@ class TestProcessSlashCommands:
         app._tools.has.return_value = False
 
         chat = MagicMock()
-        status = SimpleNamespace(state="Ready")
         events_panel = MagicMock()
 
         def _query_one(selector, *_args, **_kwargs):
             if selector == "#chat-log":
                 return chat
-            if selector == "#status-bar":
-                return status
             if selector == "#events-panel":
                 return events_panel
             raise AssertionError(f"Unexpected selector: {selector}")
 
         app.query_one = MagicMock(side_effect=_query_one)
 
-        handled = await app._handle_slash_command("/run analyze tesla")
+        await app._start_process_run("analyze tesla")
 
-        assert handled is True
-        app._tools.execute.assert_not_called()
         chat.add_info.assert_called_once()
         assert "Process orchestration is unavailable" in (
             chat.add_info.call_args.args[0]
         )
+
+    @pytest.mark.asyncio
+    async def test_start_process_run_adds_tab_and_worker(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._process_defn = SimpleNamespace(name="investment-analysis")
+        app._tools.has.return_value = True
+        chat = MagicMock()
+        events_panel = MagicMock()
+        tabs = MagicMock()
+        tabs.add_pane = AsyncMock()
+        tabs.active = "tab-chat"
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#tabs":
+                return tabs
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        captured = {}
+
+        def fake_run_worker(coro, **kwargs):
+            captured["kwargs"] = kwargs
+            coro.close()
+            return MagicMock()
+
+        app.run_worker = fake_run_worker
+
+        await app._start_process_run("Analyze Tesla")
+
+        tabs.add_pane.assert_awaited_once()
+        assert captured["kwargs"]["exclusive"] is False
+        assert captured["kwargs"]["group"].startswith("process-run-")
+        assert len(app._process_runs) == 1
+        run = next(iter(app._process_runs.values()))
+        assert run.status == "queued"
+        assert tabs.active == run.pane_id
+        chat.add_user_message.assert_called_once_with("/run Analyze Tesla")
+
+    @pytest.mark.asyncio
+    async def test_start_process_run_respects_concurrency_limit(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._process_defn = SimpleNamespace(name="investment-analysis")
+        app._tools.has.return_value = True
+        app._process_runs = {
+            f"run-{i}": SimpleNamespace(status="running") for i in range(4)
+        }
+
+        chat = MagicMock()
+        events_panel = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        app.run_worker = MagicMock()
+
+        await app._start_process_run("Analyze Tesla")
+
+        chat.add_info.assert_called_once()
+        assert "Too many active process runs" in chat.add_info.call_args.args[0]
+        app.run_worker.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_process_run_supports_multiple_concurrent_runs(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._process_defn = SimpleNamespace(name="investment-analysis")
+        app._tools.has.return_value = True
+        chat = MagicMock()
+        events_panel = MagicMock()
+        tabs = MagicMock()
+        tabs.add_pane = AsyncMock()
+        tabs.active = "tab-chat"
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#tabs":
+                return tabs
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        def fake_run_worker(coro, **_kwargs):
+            coro.close()
+            return MagicMock()
+
+        app.run_worker = fake_run_worker
+
+        await app._start_process_run("Analyze Tesla")
+        await app._start_process_run("Analyze Nvidia")
+
+        assert len(app._process_runs) == 2
+        assert tabs.add_pane.await_count == 2
+        assert chat.add_user_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_execute_process_run_passes_workspace_and_process_override(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        process_defn = SimpleNamespace(name="investment-analysis")
+        pane = MagicMock()
+        app._process_runs = {
+            "abc123": SimpleNamespace(
+                run_id="abc123",
+                process_name="investment-analysis",
+                goal="Analyze Tesla",
+                process_defn=process_defn,
+                pane_id="tab-run-abc123",
+                pane=pane,
+                status="queued",
+                task_id="",
+                started_at=0.0,
+                ended_at=None,
+                tasks=[],
+                last_progress_message="",
+                last_progress_at=0.0,
+                worker=None,
+                closed=False,
+            ),
+        }
+        app._tools.execute = AsyncMock(return_value=SimpleNamespace(
+            success=True,
+            output="ok",
+            error=None,
+            data={"task_id": "cowork-1", "tasks": []},
+        ))
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._refresh_workspace_tree = MagicMock()
+        app.notify = MagicMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        await app._execute_process_run("abc123")
+
+        app._tools.execute.assert_awaited_once()
+        execute_call = app._tools.execute.await_args
+        assert execute_call.args[0] == "delegate_task"
+        payload = execute_call.args[1]
+        assert payload["_process_override"] is process_defn
+        assert payload["context"]["workspace"] == "/tmp"
+        assert payload["context"]["requested_goal"] == "Analyze Tesla"
+        assert execute_call.kwargs["workspace"] == Path("/tmp")
+
+    def test_build_process_run_context_includes_recent_cowork_messages(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(
+            session_state=SimpleNamespace(
+                turn_count=7,
+                current_focus="investment thesis",
+                key_decisions=["Use DCF", "Track catalysts"],
+            ),
+            messages=[
+                {"role": "user", "content": "Using this information, analyze Tesla."},
+                {"role": "assistant", "content": "I will use the prior context."},
+                {"role": "tool", "content": "ignored tool output"},
+            ],
+        )
+
+        context = app._build_process_run_context("Analyze Tesla")
+
+        assert context["workspace"] == "/tmp"
+        assert context["requested_goal"] == "Analyze Tesla"
+        assert context["cowork"]["turn_count"] == 7
+        assert context["cowork"]["recent_messages"] == [
+            {"role": "user", "content": "Using this information, analyze Tesla."},
+            {"role": "assistant", "content": "I will use the prior context."},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_close_process_run_cancelled_by_user_keeps_tab(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="investment-analysis",
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="running",
+            started_at=0.0,
+            ended_at=None,
+            closed=False,
+            worker=MagicMock(),
+        )
+        app._process_runs = {"abc123": run}
+        app._confirm_close_process_run = AsyncMock(return_value=False)
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+        tabs = MagicMock()
+        tabs.remove_pane = AsyncMock()
+        tabs.active = run.pane_id
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#tabs":
+                return tabs
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        closed = await app._close_process_run(run)
+
+        assert closed is False
+        assert run.closed is False
+        tabs.remove_pane.assert_not_awaited()
+        assert "abc123" in app._process_runs
+        run.worker.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_process_run_running_marks_failed_and_cancels_worker(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        worker = MagicMock()
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="investment-analysis",
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="running",
+            started_at=0.0,
+            ended_at=None,
+            closed=False,
+            worker=worker,
+        )
+        app._process_runs = {"abc123": run}
+        app._confirm_close_process_run = AsyncMock(return_value=True)
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+        tabs = MagicMock()
+        tabs.remove_pane = AsyncMock()
+        tabs.active = "tab-chat"
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#tabs":
+                return tabs
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        closed = await app._close_process_run(run)
+
+        assert closed is True
+        assert run.closed is True
+        assert run.status == "failed"
+        assert run.ended_at is not None
+        pane.add_activity.assert_called_once()
+        pane.add_result.assert_called_once()
+        worker.cancel.assert_called_once()
+        tabs.remove_pane.assert_awaited_once_with("tab-run-abc123")
+        assert "abc123" not in app._process_runs
+        chat.add_info.assert_called_once()
+        assert "cancelled" in chat.add_info.call_args.args[0]
+
+    def test_process_progress_event_scoped_to_run_tab(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="investment-analysis",
+            goal="Analyze Tesla",
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc123": run}
+        app._update_process_run_visuals = MagicMock()
+
+        sidebar = MagicMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        payload = {
+            "event_type": "subtask_started",
+            "event_data": {"subtask_id": "company-screening"},
+            "tasks": [
+                {
+                    "id": "company-screening",
+                    "status": "in_progress",
+                    "content": "Build company overview",
+                },
+            ],
+        }
+        app._on_process_progress_event(payload, run_id="abc123")
+
+        pane.set_tasks.assert_called_once_with(payload["tasks"])
+        pane.add_activity.assert_called_once()
+        sidebar.update_tasks.assert_called_once()
+        summary_rows = sidebar.update_tasks.call_args.args[0]
+        assert summary_rows[0]["id"] == "process-run-abc123"
+        assert summary_rows[0]["status"] == "in_progress"
+        assert "investment-analysis #abc123 Running" in summary_rows[0]["content"]
+        chat.add_info.assert_not_called()
+        events_panel.add_event.assert_called_once()
 
     def test_process_progress_event_refreshes_tree_on_subtask_completion(self):
         from loom.tui.app import LoomApp
@@ -1851,6 +2371,50 @@ class TestProcessSlashCommands:
 
         sidebar.update_tasks.assert_called_once()
         sidebar.refresh_workspace_tree.assert_called_once()
+
+    def test_process_progress_event_refreshes_tree_on_document_write_tool(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="investment-analysis",
+            goal="Analyze Tesla",
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc123": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._refresh_workspace_tree = MagicMock()
+
+        app._on_process_progress_event(
+            {
+                "event_type": "tool_call_completed",
+                "event_data": {
+                    "tool": "document_write",
+                    "subtask_id": "investment-memo",
+                    "success": True,
+                },
+            },
+            run_id="abc123",
+        )
+
+        app._refresh_workspace_tree.assert_called_once()
 
     def test_process_progress_event_streams_to_chat(self):
         from loom.tui.app import LoomApp
@@ -2300,6 +2864,50 @@ class TestCommandPaletteProcessActions:
         calls = [c.args[0] for c in app._prefill_user_input.call_args_list]
         assert calls == ["/process use ", "/run ", "/resume "]
 
+    @pytest.mark.asyncio
+    async def test_palette_dynamic_process_prompt_action_prefills_input(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._prefill_user_input = MagicMock()
+
+        await app.action_loom_command("process_run_prompt:investment-analysis")
+
+        app._prefill_user_input.assert_called_once_with(
+            "/investment-analysis "
+        )
+
+    def test_dynamic_process_palette_entries_filter_reserved_names(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        loader = MagicMock()
+        loader.list_available.return_value = [
+            {"name": "run", "version": "1.0", "description": "bad collision"},
+            {
+                "name": "investment-analysis",
+                "version": "1.0",
+                "description": "valid process",
+            },
+        ]
+        app._create_process_loader = MagicMock(return_value=loader)
+
+        entries = app.iter_dynamic_process_palette_entries()
+
+        assert entries == [(
+            "Run investment-analysis…",
+            "process_run_prompt:investment-analysis",
+            "Prefill /investment-analysis for direct process execution",
+        )]
+
     def test_prefill_user_input_updates_value_and_hint(self):
         from loom.tui.app import LoomApp
 
@@ -2479,7 +3087,7 @@ class TestSlashHelp:
         )
         rendered = "\n".join(app._help_lines())
         assert "/resume <session-id-prefix>" in rendered
-        assert "/run <goal>" in rendered
+        assert "/run <goal|close [run-id-prefix]>" in rendered
         assert "/quit (/exit, /q)" in rendered
         assert "/setup" in rendered
         assert "Ctrl+R reload workspace" in rendered

@@ -182,7 +182,7 @@ class SubtaskRunner:
                 if not validation.valid:
                     messages.append({
                         "role": "assistant",
-                        "content": response.text or None,
+                        "content": response.text or "",
                     })
                     messages.append({
                         "role": "system",
@@ -197,7 +197,7 @@ class SubtaskRunner:
                 # Process validated tool calls
                 messages.append({
                     "role": "assistant",
-                    "content": response.text or None,
+                    "content": response.text or "",
                     "tool_calls": [
                         {
                             "id": tc.id,
@@ -238,7 +238,9 @@ class SubtaskRunner:
 
                 # Anti-amnesia reminder
                 messages.append({
-                    "role": "system",
+                    # Some OpenAI-compatible providers reject repeated in-thread
+                    # system messages during tool-call loops.
+                    "role": "user",
                     "content": self._build_todo_reminder(task, subtask),
                 })
             else:

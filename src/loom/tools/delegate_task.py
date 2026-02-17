@@ -96,15 +96,16 @@ class DelegateTaskTool(Tool):
 
     def __init__(
         self,
-        orchestrator_factory: Callable[[], Awaitable[Orchestrator]] | None = None,
+        orchestrator_factory: Callable[..., Awaitable[Orchestrator]] | None = None,
     ):
         self._factory = orchestrator_factory
-        self._orchestrator: Orchestrator | None = None
 
-    def bind(self, orchestrator_factory: Callable[[], Awaitable[Orchestrator]]) -> None:
+    def bind(
+        self,
+        orchestrator_factory: Callable[..., Awaitable[Orchestrator]],
+    ) -> None:
         """Bind the orchestrator factory after construction."""
         self._factory = orchestrator_factory
-        self._orchestrator = None
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         if self._factory is None:
@@ -119,18 +120,27 @@ class DelegateTaskTool(Tool):
         context = args.get("context", {})
         wait = args.get("wait", True)
         progress_callback = args.get("_progress_callback")
+        process_override = args.get("_process_override")
         workspace = str(ctx.workspace) if ctx.workspace else ""
 
-        # Lazy-init orchestrator
-        if self._orchestrator is None:
+        # Fresh orchestrator per call to isolate concurrent delegated runs.
+        try:
+            supports_override = False
             try:
-                self._orchestrator = await self._factory()
-            except Exception as e:
-                return ToolResult.fail(f"Failed to initialize orchestrator: {e}")
+                signature = inspect.signature(self._factory)
+                supports_override = len(signature.parameters) > 0
+            except (TypeError, ValueError):
+                supports_override = False
+            if supports_override:
+                orchestrator = await self._factory(process_override)
+            else:
+                orchestrator = await self._factory()
+        except Exception as e:
+            return ToolResult.fail(f"Failed to initialize orchestrator: {e}")
 
         # Build task
         task = _create_task(goal, workspace, context)
-        event_bus = getattr(self._orchestrator, "_events", None)
+        event_bus = getattr(orchestrator, "_events", None)
         subscriptions: list[tuple[str, object]] = []
         token_burst_count = 0
         token_burst_subtask = ""
@@ -229,7 +239,7 @@ class DelegateTaskTool(Tool):
                     pass
 
         if not wait:
-            asyncio.create_task(self._orchestrator.execute_task(task))
+            asyncio.create_task(orchestrator.execute_task(task))
             return ToolResult.ok(
                 f"Task submitted (async): {task.id}\n"
                 f"Goal: {goal}\n"
@@ -244,7 +254,7 @@ class DelegateTaskTool(Tool):
         # Synchronous: execute and wait
         try:
             _emit_progress()
-            completed = await self._orchestrator.execute_task(task)
+            completed = await orchestrator.execute_task(task)
             _flush_token_burst()
             _emit_progress("task_completed")
             return ToolResult.ok(

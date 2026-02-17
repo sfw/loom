@@ -894,6 +894,7 @@
     <tr><td><code>Ctrl+B</code></td><td>Toggle sidebar</td></tr>
     <tr><td><code>Ctrl+L</code></td><td>Clear chat</td></tr>
     <tr><td><code>Ctrl+R</code></td><td>Reload workspace tree</td></tr>
+    <tr><td><code>Ctrl+W</code></td><td>Close active process-run tab (with confirmation)</td></tr>
     <tr><td><code>Ctrl+P</code></td><td>Command palette</td></tr>
     <tr><td><code>Ctrl+1/2/3</code></td><td>Switch tabs (Chat / Files / Events)</td></tr>
     <tr><td><code>Tab</code></td><td>Cycle slash-command autocomplete (when input starts with <code>/</code>)</td></tr>
@@ -921,6 +922,8 @@
     <tr><td><code>/process use &lt;name-or-path&gt;</code></td><td>Activate a process in the current session</td></tr>
     <tr><td><code>/process off</code></td><td>Disable the active process</td></tr>
     <tr><td><code>/run &lt;goal&gt;</code></td><td>Force orchestration through the active process</td></tr>
+    <tr><td><code>/run close [run-id-prefix]</code></td><td>Close/cancel a process-run tab with confirmation</td></tr>
+    <tr><td><code>/&lt;process-name&gt; &lt;goal&gt;</code></td><td>Run a discovered process directly without changing the active process</td></tr>
     <tr><td><code>/setup</code></td><td>Reconfigure models and settings</td></tr>
     <tr><td><code>/clear</code></td><td>Clear the chat display</td></tr>
     <tr><td><code>/quit</code> (<code>/exit</code>, <code>/q</code>)</td><td>Exit Loom</td></tr>
@@ -931,7 +934,7 @@
 
   <div class="callout callout-info">
     <strong>About /run</strong>
-    <code>/run &lt;goal&gt;</code> uses in-process orchestration via <code>delegate_task</code>. You do not need to run <code>loom serve</code> for this flow.
+    <code>/run &lt;goal&gt;</code> uses in-process orchestration via <code>delegate_task</code>. You do not need to run <code>loom serve</code> for this flow. Use <code>/run close</code> (or <code>Ctrl+W</code> on a process tab) to cancel and close a running tab.
   </div>
 
   <div class="callout callout-info">

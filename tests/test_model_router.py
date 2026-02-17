@@ -223,6 +223,59 @@ class TestResponseValidator:
         assert not result.valid
         assert "Unknown tool" in result.error
 
+    def test_missing_required_tool_argument(self):
+        validator = ResponseValidator()
+        response = ModelResponse(
+            text="",
+            tool_calls=[ToolCall(id="1", name="document_write", arguments={"title": "Report"})],
+        )
+        tools = [
+            {
+                "name": "document_write",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "title": {"type": "string"},
+                    },
+                },
+            },
+        ]
+        result = validator.validate_tool_calls(response, tools)
+        assert not result.valid
+        assert "Missing required arguments for document_write: path" in result.error
+        assert "required tool arguments" in result.suggestion
+
+    def test_blank_required_tool_argument(self):
+        validator = ResponseValidator()
+        response = ModelResponse(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="1",
+                    name="write_file",
+                    arguments={"path": "  ", "content": "x"},
+                )
+            ],
+        )
+        tools = [
+            {
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path", "content"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                },
+            },
+        ]
+        result = validator.validate_tool_calls(response, tools)
+        assert not result.valid
+        assert "Missing required arguments for write_file: path" in result.error
+
     def test_no_tool_calls_is_valid(self):
         validator = ResponseValidator()
         response = ModelResponse(text="Just text")

@@ -208,7 +208,7 @@ class OpenAICompatibleProvider(ModelProvider):
         tool_calls = None
         if message.get("tool_calls"):
             tool_calls = []
-            for tc in message["tool_calls"]:
+            for index, tc in enumerate(message["tool_calls"]):
                 func = tc.get("function", {})
                 args = func.get("arguments", {})
                 if isinstance(args, str):
@@ -217,8 +217,9 @@ class OpenAICompatibleProvider(ModelProvider):
                     except json.JSONDecodeError:
                         logger.warning("Malformed tool args from OpenAI: %s", str(args)[:200])
                         args = {}
+                tc_id = str(tc.get("id", "")).strip() or f"call_{index}"
                 tool_calls.append(ToolCall(
-                    id=tc.get("id", ""),
+                    id=tc_id,
                     name=func.get("name", ""),
                     arguments=args,
                 ))
@@ -312,8 +313,9 @@ class OpenAICompatibleProvider(ModelProvider):
                                         )
                                     except json.JSONDecodeError:
                                         args = {}
+                                    call_id = str(buf.get("id", "")).strip() or f"call_{idx}"
                                     parsed_tools.append(ToolCall(
-                                        id=buf.get("id", ""),
+                                        id=call_id,
                                         name=buf.get("name", ""),
                                         arguments=args,
                                     ))
@@ -430,7 +432,7 @@ class OpenAICompatibleProvider(ModelProvider):
         injected as a follow-up user message with image_url/file content.
         """
         if not self._capabilities or not self._capabilities.vision:
-            return messages
+            return self._normalize_openai_messages(messages)
 
         result = []
         for msg in messages:
@@ -450,7 +452,78 @@ class OpenAICompatibleProvider(ModelProvider):
                     })
             else:
                 result.append(msg)
-        return result
+        return self._normalize_openai_messages(result)
+
+    @staticmethod
+    def _normalize_openai_messages(messages: list[dict]) -> list[dict]:
+        """Normalize message payloads for stricter OpenAI-compatible servers.
+
+        Some providers reject:
+        - assistant tool-call messages with null content
+        - missing tool-call IDs
+        - tool messages with missing tool_call_id
+        """
+        normalized: list[dict] = []
+        pending_tool_ids: list[str] = []
+
+        for msg_index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+
+            out = dict(message)
+            role = str(out.get("role", "")).strip()
+            if out.get("content") is None:
+                out["content"] = ""
+
+            if role == "assistant":
+                raw_tool_calls = out.get("tool_calls")
+                tool_calls: list[dict] = []
+                pending_tool_ids = []
+                if isinstance(raw_tool_calls, list):
+                    for tool_index, tool_call in enumerate(raw_tool_calls):
+                        if not isinstance(tool_call, dict):
+                            continue
+                        call = dict(tool_call)
+                        call_id = str(call.get("id", "")).strip()
+                        if not call_id:
+                            call_id = f"call_{msg_index}_{tool_index}"
+                        call["id"] = call_id
+                        call["type"] = "function"
+
+                        function = call.get("function")
+                        if not isinstance(function, dict):
+                            function = {}
+                        function_payload = dict(function)
+
+                        name = function_payload.get("name")
+                        function_payload["name"] = str(name or "")
+
+                        arguments = function_payload.get("arguments")
+                        if isinstance(arguments, dict):
+                            function_payload["arguments"] = json.dumps(arguments)
+                        elif arguments is None:
+                            function_payload["arguments"] = "{}"
+                        elif not isinstance(arguments, str):
+                            function_payload["arguments"] = str(arguments)
+
+                        call["function"] = function_payload
+                        tool_calls.append(call)
+                        pending_tool_ids.append(call_id)
+
+                out["tool_calls"] = tool_calls
+
+            elif role == "tool":
+                current_id = str(out.get("tool_call_id", "")).strip()
+                if not current_id and pending_tool_ids:
+                    out["tool_call_id"] = pending_tool_ids.pop(0)
+                elif current_id:
+                    out["tool_call_id"] = current_id
+                    if current_id in pending_tool_ids:
+                        pending_tool_ids.remove(current_id)
+
+            normalized.append(out)
+
+        return normalized
 
     def _build_tool_result_content(self, result_json: str) -> str:
         """Convert tool result with content blocks to OpenAI format.

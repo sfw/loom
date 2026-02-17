@@ -29,7 +29,8 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass, replace
+import uuid
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -63,6 +64,7 @@ from loom.tui.screens import (
     ExitConfirmScreen,
     FileViewerScreen,
     LearnedScreen,
+    ProcessRunCloseScreen,
     SetupScreen,
     ToolApprovalScreen,
 )
@@ -74,6 +76,7 @@ from loom.tui.widgets import (
     Sidebar,
     StatusBar,
 )
+from loom.tui.widgets.sidebar import TaskProgressPanel
 from loom.tui.widgets.tool_call import tool_args_preview
 
 if TYPE_CHECKING:
@@ -131,11 +134,179 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     ),
     SlashCommandSpec(
         canonical="/run",
-        usage="<goal>",
+        usage="<goal|close [run-id-prefix]>",
         description="run goal via active process orchestrator",
     ),
 )
-_MAX_SLASH_HINT_LINES = 14
+_MAX_SLASH_HINT_LINES = 24
+_WORKSPACE_REFRESH_TOOLS = {"document_write", "document_create"}
+_PROCESS_STATUS_ICON = {
+    "queued": "\u25cb",
+    "running": "\u25c9",
+    "completed": "\u2713",
+    "failed": "\u2717",
+    "cancelled": "\u25a0",
+}
+_PROCESS_STATUS_LABEL = {
+    "queued": "Queued",
+    "running": "Running",
+    "completed": "Completed",
+    "failed": "Failed",
+    "cancelled": "Cancelled",
+}
+_MAX_CONCURRENT_PROCESS_RUNS = 4
+
+
+class ProcessRunPane(Vertical):
+    """A per-run process pane with status, progress rows, and run log."""
+
+    DEFAULT_CSS = """
+    ProcessRunPane {
+        height: 1fr;
+        padding: 0 1;
+        overflow-y: auto;
+    }
+    ProcessRunPane .process-run-header {
+        color: $text;
+        text-style: bold;
+        margin: 0 0 1 0;
+    }
+    ProcessRunPane .process-run-meta {
+        color: $text-muted;
+        margin: 0 0 1 0;
+    }
+    ProcessRunPane .process-run-section {
+        color: $text-muted;
+        text-style: bold;
+        margin: 1 0 0 0;
+    }
+    ProcessRunPane TaskProgressPanel {
+        max-height: 12;
+        height: auto;
+        overflow-y: auto;
+    }
+    ProcessRunPane ChatLog {
+        height: 1fr;
+        border: round $surface-lighten-1;
+        margin: 1 0 0 0;
+    }
+    """
+
+    def __init__(self, *, run_id: str, process_name: str, goal: str) -> None:
+        super().__init__()
+        self._run_id = run_id
+        self._process_name = process_name
+        self._goal = goal
+        self._pending_tasks: list[dict] | None = None
+        self._pending_activity: list[str] = []
+        self._pending_results: list[tuple[str, bool]] = []
+        self._header = Static(classes="process-run-header")
+        self._meta = Static(classes="process-run-meta")
+        self._progress_label = Static("Progress", classes="process-run-section")
+        self._progress = TaskProgressPanel()
+        self._log_label = Static("Activity", classes="process-run-section")
+        self._log = ChatLog()
+
+    def compose(self) -> ComposeResult:
+        yield self._header
+        yield self._meta
+        yield self._progress_label
+        yield self._progress
+        yield self._log_label
+        yield self._log
+
+    def set_status_header(
+        self,
+        *,
+        status: str,
+        elapsed: str,
+        task_id: str = "",
+    ) -> None:
+        """Update run header metadata."""
+        label = _PROCESS_STATUS_LABEL.get(status, status.title())
+        self._header.update(
+            f"[bold]{self._process_name}[/bold] [dim]#{self._run_id}[/dim]  "
+            f"[{self._status_color(status)}]{label}[/]  [dim]{elapsed}[/dim]"
+        )
+        goal_preview = self._goal
+        if len(goal_preview) > 140:
+            goal_preview = f"{goal_preview[:139].rstrip()}\u2026"
+        meta = f"[dim]Goal:[/] {goal_preview}"
+        if task_id:
+            meta += f"\n[dim]Task:[/] {task_id}"
+        self._meta.update(meta)
+
+    def set_tasks(self, tasks: list[dict]) -> None:
+        """Replace task rows shown in the progress section."""
+        if not self.is_attached:
+            self._pending_tasks = list(tasks)
+            return
+        self._progress.tasks = tasks
+
+    def add_activity(self, text: str) -> None:
+        """Append informational activity text."""
+        if not self.is_attached:
+            self._pending_activity.append(text)
+            return
+        self._log.add_info(text)
+
+    def add_result(self, text: str, *, success: bool) -> None:
+        """Append final result text."""
+        if not self.is_attached:
+            self._pending_results.append((text, success))
+            return
+        if success:
+            self._log.add_model_text(text)
+            return
+        self._log.add_model_text(f"[bold #f7768e]Error:[/] {text}")
+
+    def on_mount(self) -> None:
+        """Flush updates queued before the pane was attached to the DOM."""
+        if self._pending_tasks is not None:
+            self._progress.tasks = self._pending_tasks
+            self._pending_tasks = None
+        if self._pending_activity:
+            for line in self._pending_activity:
+                self._log.add_info(line)
+            self._pending_activity.clear()
+        if self._pending_results:
+            for text, success in self._pending_results:
+                if success:
+                    self._log.add_model_text(text)
+                else:
+                    self._log.add_model_text(f"[bold #f7768e]Error:[/] {text}")
+            self._pending_results.clear()
+
+    @staticmethod
+    def _status_color(status: str) -> str:
+        if status == "completed":
+            return "#9ece6a"
+        if status == "failed":
+            return "#f7768e"
+        if status == "running":
+            return "#7dcfff"
+        return "#a9b1d6"
+
+
+@dataclass
+class ProcessRunState:
+    """In-memory state for a single process run tab."""
+
+    run_id: str
+    process_name: str
+    goal: str
+    process_defn: ProcessDefinition | None
+    pane_id: str
+    pane: ProcessRunPane
+    status: str = "queued"
+    task_id: str = ""
+    started_at: float = field(default_factory=time.monotonic)
+    ended_at: float | None = None
+    tasks: list[dict] = field(default_factory=list)
+    last_progress_message: str = ""
+    last_progress_at: float = 0.0
+    worker: object | None = None
+    closed: bool = False
 
 
 class LoomApp(App):
@@ -208,6 +379,7 @@ class LoomApp(App):
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True),
         Binding("ctrl+l", "clear_chat", "Clear", show=True),
         Binding("ctrl+r", "reload_workspace", "Reload", show=True),
+        Binding("ctrl+w", "close_process_tab", "Close Run", show=False),
         Binding("ctrl+1", "tab_chat", "Chat"),
         Binding("ctrl+2", "tab_files", "Files"),
         Binding("ctrl+3", "tab_events", "Events"),
@@ -237,7 +409,7 @@ class LoomApp(App):
         self._process_name = process_name
         self._process_defn: ProcessDefinition | None = None
         self._session: CoworkSession | None = None
-        self._busy = False
+        self._chat_busy = False
         self._total_tokens = 0
 
         # Approval state — resolved via Textual modal
@@ -252,8 +424,12 @@ class LoomApp(App):
         self._slash_cycle_candidates: list[str] = []
         self._applying_slash_tab_completion = False
         self._skip_slash_cycle_reset_once = False
-        self._last_process_progress_message = ""
-        self._last_process_progress_at = 0.0
+        self._process_runs: dict[str, ProcessRunState] = {}
+        self._process_elapsed_timer = None
+        self._process_command_map: dict[str, str] = {}
+        self._blocked_process_commands: list[str] = []
+        self._cached_process_catalog: list[dict[str, str]] = []
+        self._sidebar_cowork_tasks: list[dict] = []
         self._auto_resume_workspace_on_init = True
 
     def compose(self) -> ComposeResult:
@@ -282,6 +458,10 @@ class LoomApp(App):
         # Register and activate theme
         self.register_theme(LOOM_DARK)
         self.theme = "loom-dark"
+        self._process_elapsed_timer = self.set_interval(
+            1.0,
+            self._tick_process_run_elapsed,
+        )
 
         if self._model is None:
             # No model configured — launch the setup wizard
@@ -398,10 +578,25 @@ class LoomApp(App):
         self._process_defn = None
         if not self._process_name:
             return
+        if self._is_reserved_process_name(self._process_name):
+            chat.add_info(
+                f"[bold #f7768e]Process '{self._process_name}' conflicts with "
+                "a built-in slash command and was not loaded.[/]"
+            )
+            self._process_name = None
+            return
 
         loader = self._create_process_loader()
         try:
             self._process_defn = loader.load(self._process_name)
+            if self._is_reserved_process_name(self._process_defn.name):
+                chat.add_info(
+                    f"[bold #f7768e]Process '{self._process_defn.name}' conflicts "
+                    "with a built-in slash command and was not loaded.[/]"
+                )
+                self._process_defn = None
+                self._process_name = None
+                return
             # Process load may import bundled tool modules; rebuild to include
             # them in the active registry.
             self._refresh_tool_registry()
@@ -417,9 +612,9 @@ class LoomApp(App):
 
     async def _reload_session_for_process_change(self, chat: ChatLog) -> None:
         """Rebuild session after changing active process."""
-        if self._busy:
+        if self._chat_busy or self._has_active_process_runs():
             chat.add_info(
-                "[bold #f7768e]Cannot switch process while a turn is running.[/]"
+                "[bold #f7768e]Cannot switch process while work is running.[/]"
             )
             return
 
@@ -433,11 +628,83 @@ class LoomApp(App):
         self._resume_session = None
         await self._initialize_session()
 
+    def _has_active_process_runs(self) -> bool:
+        """Return True when at least one run is queued/running."""
+        return any(
+            run.status in {"queued", "running"}
+            for run in self._process_runs.values()
+        )
+
+    @staticmethod
+    def _reserved_slash_command_names() -> set[str]:
+        """Return reserved slash command names (without leading slash)."""
+        reserved: set[str] = set()
+        for spec in _SLASH_COMMANDS:
+            reserved.add(spec.canonical.lstrip("/").lower())
+            for alias in spec.aliases:
+                reserved.add(alias.lstrip("/").lower())
+        return reserved
+
+    def _is_reserved_process_name(self, name: str) -> bool:
+        """Return True when process name collides with built-in slash command."""
+        return name.strip().lower() in self._reserved_slash_command_names()
+
+    def _refresh_process_command_index(
+        self,
+        *,
+        chat: ChatLog | None = None,
+        notify_conflicts: bool = False,
+    ) -> None:
+        """Refresh process catalog and dynamic slash-command map."""
+        try:
+            loader = self._create_process_loader()
+            available = loader.list_available()
+        except Exception:
+            self._cached_process_catalog = []
+            self._process_command_map = {}
+            self._blocked_process_commands = []
+            return
+
+        selectable: list[dict[str, str]] = []
+        command_map: dict[str, str] = {}
+        blocked: set[str] = set()
+        reserved = self._reserved_slash_command_names()
+
+        for proc in available:
+            name = str(proc.get("name", "")).strip()
+            if not name:
+                continue
+            lowered = name.lower()
+            if lowered in reserved:
+                blocked.add(name)
+                continue
+            selectable.append(proc)
+            command_map[f"/{lowered}"] = name
+
+        self._cached_process_catalog = selectable
+        self._process_command_map = command_map
+        self._blocked_process_commands = sorted(blocked, key=str.lower)
+
+        if notify_conflicts and chat and self._blocked_process_commands:
+            blocked_cmds = ", ".join(f"/{name}" for name in self._blocked_process_commands)
+            chat.add_info(
+                "[bold #f7768e]Process command name collision:[/] "
+                f"{blocked_cmds}\n"
+                "[dim]These process names collide with built-in slash commands "
+                "and were skipped in TUI.[/dim]"
+            )
+
     def _render_process_catalog(self) -> str:
         """Build a human-readable process list."""
-        loader = self._create_process_loader()
-        available = loader.list_available()
+        self._refresh_process_command_index()
+        available = self._cached_process_catalog
         if not available:
+            if self._blocked_process_commands:
+                blocked = ", ".join(self._blocked_process_commands)
+                return (
+                    "No selectable process definitions found.\n"
+                    f"[dim]Blocked (name collisions): {blocked}[/dim]"
+                )
             return "No process definitions found."
 
         active = self._process_defn.name if self._process_defn else ""
@@ -450,6 +717,9 @@ class LoomApp(App):
             lines.append(f"  {name:30s} v{ver:6s}{marker}")
             if desc:
                 lines.append(f"    [dim]{desc[:80]}[/dim]")
+        if self._blocked_process_commands:
+            blocked = ", ".join(self._blocked_process_commands)
+            lines.append(f"[dim]Blocked (name collisions): {blocked}[/dim]")
         return "\n".join(lines)
 
     @staticmethod
@@ -532,6 +802,7 @@ class LoomApp(App):
         """
         chat = self.query_one("#chat-log", ChatLog)
         self._total_tokens = 0
+        self._sidebar_cowork_tasks = []
 
         # Start from a clean registry each initialization to avoid stale
         # excludes/bindings when setup or process configuration changes.
@@ -539,6 +810,7 @@ class LoomApp(App):
 
         # Load process definition (imports bundled tools, then refreshes).
         self._load_process_definition(chat)
+        self._refresh_process_command_index(chat=chat, notify_conflicts=True)
 
         # Ensure persistence-dependent tools are present and tracked.
         self._ensure_persistence_tools()
@@ -641,6 +913,7 @@ class LoomApp(App):
         self.query_one("#user-input", Input).focus()
         # Ensure command/footer bars are visible after any prior slash-hint state.
         self._set_slash_hint("")
+        self._refresh_sidebar_progress_summary()
 
     async def _resolve_startup_resume_target(self) -> tuple[str | None, bool]:
         """Resolve resume session for startup: explicit first, then workspace latest."""
@@ -660,6 +933,394 @@ class LoomApp(App):
         if not session_id:
             return None, False
         return session_id, True
+
+    def _new_process_run_id(self) -> str:
+        """Create a short unique run ID for display and routing."""
+        while True:
+            run_id = uuid.uuid4().hex[:6]
+            if run_id not in self._process_runs:
+                return run_id
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        """Format elapsed seconds as MM:SS or H:MM:SS."""
+        total = max(0, int(seconds))
+        hours, rem = divmod(total, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _elapsed_seconds_for_run(self, run: ProcessRunState) -> float:
+        """Return elapsed seconds for a run (live or finalized)."""
+        end = run.ended_at if run.ended_at is not None else time.monotonic()
+        return max(0.0, end - run.started_at)
+
+    def _format_process_run_tab_title(self, run: ProcessRunState) -> str:
+        """Build tab title with status indicator and elapsed timer."""
+        icon = _PROCESS_STATUS_ICON.get(run.status, "\u25cb")
+        elapsed = self._format_elapsed(self._elapsed_seconds_for_run(run))
+        name = run.process_name
+        if len(name) > 16:
+            name = f"{name[:15]}\u2026"
+        return f"{icon} {name} #{run.run_id} {elapsed}"
+
+    def _update_process_run_visuals(self, run: ProcessRunState) -> None:
+        """Update pane header and tab title from current run state."""
+        elapsed = self._format_elapsed(self._elapsed_seconds_for_run(run))
+        run.pane.set_status_header(
+            status=run.status,
+            elapsed=elapsed,
+            task_id=run.task_id,
+        )
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+            tab = tabs.get_tab(run.pane_id)
+            tab.label = self._format_process_run_tab_title(run)
+        except Exception:
+            pass
+
+    def _tick_process_run_elapsed(self) -> None:
+        """Periodic timer to refresh elapsed text for active process runs."""
+        active = False
+        for run in self._process_runs.values():
+            if run.status in {"queued", "running"}:
+                active = True
+                self._update_process_run_visuals(run)
+        if active:
+            self._refresh_sidebar_progress_summary()
+
+    def _build_process_run_context(self, goal: str) -> dict:
+        """Build compact cowork context to pass into delegated process runs."""
+        if self._session is None:
+            return {
+                "requested_goal": goal,
+                "workspace": str(self._workspace),
+            }
+        state = self._session.session_state
+        context: dict = {
+            "requested_goal": goal,
+            "workspace": str(self._workspace),
+            "cowork": {
+                "turn_count": state.turn_count,
+                "current_focus": state.current_focus,
+                "key_decisions": state.key_decisions[-8:],
+            },
+        }
+        recent_messages: list[dict[str, str]] = []
+        for message in reversed(self._session.messages):
+            role = str(message.get("role", "")).strip()
+            if role not in {"user", "assistant"}:
+                continue
+            content = self._one_line(message.get("content", ""), 500)
+            if not content:
+                continue
+            recent_messages.append({"role": role, "content": content})
+            if len(recent_messages) >= 6:
+                break
+        if recent_messages:
+            recent_messages.reverse()
+            context["cowork"]["recent_messages"] = recent_messages
+        return context
+
+    def _current_process_run(self) -> ProcessRunState | None:
+        """Return run associated with currently active tab, if any."""
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+            active = tabs.active
+        except Exception:
+            return None
+        if not active:
+            return None
+        return next(
+            (r for r in self._process_runs.values() if r.pane_id == active),
+            None,
+        )
+
+    def _resolve_process_run_target(
+        self, target: str,
+    ) -> tuple[ProcessRunState | None, str | None]:
+        """Resolve a process run by target selector or current tab."""
+        token = target.strip().lstrip("#")
+        if not token or token.lower() in {"current", "this"}:
+            current = self._current_process_run()
+            if current is not None:
+                return current, None
+            if len(self._process_runs) == 1:
+                return next(iter(self._process_runs.values())), None
+            if not self._process_runs:
+                return None, "No process run tabs are open."
+            return None, "Multiple runs open. Use /run close <run-id-prefix>."
+
+        matches = [
+            run
+            for run in self._process_runs.values()
+            if run.run_id.startswith(token)
+        ]
+        if not matches:
+            return None, f"No run found matching '{token}'."
+        if len(matches) > 1:
+            return None, f"Ambiguous run prefix '{token}'."
+        return matches[0], None
+
+    async def _confirm_close_process_run(self, run: ProcessRunState) -> bool:
+        """Prompt before closing a process run tab."""
+        waiter: asyncio.Future[bool] = asyncio.Future()
+
+        def handle_result(confirmed: bool) -> None:
+            if not waiter.done():
+                waiter.set_result(bool(confirmed))
+
+        running = run.status in {"queued", "running"}
+        self.push_screen(
+            ProcessRunCloseScreen(
+                run_label=f"{run.process_name} #{run.run_id}",
+                running=running,
+            ),
+            callback=handle_result,
+        )
+        return await waiter
+
+    async def _close_process_run(self, run: ProcessRunState) -> bool:
+        """Close a process run tab; active runs are marked failed/cancelled."""
+        if run.closed:
+            return False
+        chat = self.query_one("#chat-log", ChatLog)
+        events_panel = self.query_one("#events-panel", EventPanel)
+        tabs = self.query_one("#tabs", TabbedContent)
+
+        if not await self._confirm_close_process_run(run):
+            return False
+
+        was_running = run.status in {"queued", "running"}
+        run.closed = True
+        if was_running:
+            run.status = "failed"
+            run.ended_at = time.monotonic()
+            run.pane.add_activity("Run cancelled: tab closed by user.")
+            run.pane.add_result("Run cancelled: tab closed by user.", success=False)
+            self._update_process_run_visuals(run)
+            events_panel.add_event(
+                _now_str(),
+                "process_err",
+                f"{run.process_name} #{run.run_id} cancelled",
+            )
+            chat.add_info(
+                f"[bold #f7768e]Process run {run.run_id} cancelled:[/] tab closed."
+            )
+            worker = run.worker
+            if worker is not None and hasattr(worker, "cancel"):
+                try:
+                    worker.cancel()
+                except Exception:
+                    pass
+        else:
+            chat.add_info(f"Closed process run tab [dim]{run.run_id}[/dim].")
+
+        try:
+            await tabs.remove_pane(run.pane_id)
+        except Exception:
+            pass
+        self._process_runs.pop(run.run_id, None)
+        self._refresh_sidebar_progress_summary()
+        if not tabs.active:
+            tabs.active = "tab-chat"
+        return True
+
+    async def _close_process_run_from_target(self, target: str) -> bool:
+        """Resolve and close a process run from /run close target syntax."""
+        chat = self.query_one("#chat-log", ChatLog)
+        run, error = self._resolve_process_run_target(target)
+        if run is None:
+            if error:
+                chat.add_info(error)
+            return False
+        return await self._close_process_run(run)
+
+    async def _start_process_run(
+        self,
+        goal: str,
+        *,
+        process_defn: ProcessDefinition | None = None,
+        command_prefix: str = "/run",
+    ) -> None:
+        """Create a run tab and launch process execution in a background worker."""
+        chat = self.query_one("#chat-log", ChatLog)
+        events_panel = self.query_one("#events-panel", EventPanel)
+
+        selected_process = process_defn or self._process_defn
+        if selected_process is None:
+            chat.add_info(
+                "[bold #f7768e]No active process. Use /process use "
+                "<name-or-path> first.[/]"
+            )
+            return
+
+        if not self._tools.has("delegate_task"):
+            chat.add_info(
+                "[bold #f7768e]Process orchestration is unavailable in this "
+                "session.[/]",
+            )
+            return
+
+        active_runs = sum(
+            1 for run in self._process_runs.values()
+            if run.status in {"queued", "running"}
+        )
+        if active_runs >= _MAX_CONCURRENT_PROCESS_RUNS:
+            chat.add_info(
+                f"[bold #f7768e]Too many active process runs "
+                f"({_MAX_CONCURRENT_PROCESS_RUNS} max).[/]"
+            )
+            return
+
+        run_id = self._new_process_run_id()
+        pane_id = f"tab-run-{run_id}"
+        process_name = selected_process.name
+        pane = ProcessRunPane(
+            run_id=run_id,
+            process_name=process_name,
+            goal=goal,
+        )
+        run = ProcessRunState(
+            run_id=run_id,
+            process_name=process_name,
+            goal=goal,
+            process_defn=selected_process,
+            pane_id=pane_id,
+            pane=pane,
+            status="queued",
+            started_at=time.monotonic(),
+        )
+        self._process_runs[run_id] = run
+
+        tabs = self.query_one("#tabs", TabbedContent)
+        await tabs.add_pane(
+            TabPane(
+                self._format_process_run_tab_title(run),
+                pane,
+                id=pane_id,
+            ),
+            after="tab-events",
+        )
+        tabs.active = pane_id
+        self._update_process_run_visuals(run)
+        self._refresh_sidebar_progress_summary()
+
+        chat.add_user_message(f"{command_prefix} {goal}")
+        chat.add_info(
+            f"Started process run [dim]{run_id}[/dim] "
+            f"([bold]{process_name}[/bold])."
+        )
+        run.pane.add_activity("Queued process run.")
+        events_panel.add_event(
+            _now_str(),
+            "process_run",
+            f"{process_name} #{run_id}: {goal[:120]}",
+        )
+
+        run.worker = self.run_worker(
+            self._execute_process_run(run_id),
+            name=f"process-run-{run_id}",
+            group=f"process-run-{run_id}",
+            exclusive=False,
+        )
+
+    async def _execute_process_run(self, run_id: str) -> None:
+        """Execute one process run and stream updates into its dedicated tab."""
+        run = self._process_runs.get(run_id)
+        if run is None:
+            return
+        if run.closed:
+            return
+        chat = self.query_one("#chat-log", ChatLog)
+        events_panel = self.query_one("#events-panel", EventPanel)
+
+        run.status = "running"
+        run.started_at = time.monotonic()
+        run.ended_at = None
+        self._update_process_run_visuals(run)
+        self._refresh_sidebar_progress_summary()
+        run.pane.add_activity("Run started.")
+
+        try:
+            result = await self._tools.execute(
+                "delegate_task",
+                {
+                    "goal": run.goal,
+                    "context": self._build_process_run_context(run.goal),
+                    "wait": True,
+                    "_process_override": run.process_defn,
+                    "_progress_callback": (
+                        lambda data, rid=run_id: self._on_process_progress_event(
+                            data, run_id=rid,
+                        )
+                    ),
+                },
+                workspace=self._workspace,
+            )
+            data = getattr(result, "data", None)
+            if run.closed:
+                return
+            if isinstance(data, dict):
+                run.task_id = str(data.get("task_id", "") or run.task_id)
+                tasks = data.get("tasks", [])
+                if isinstance(tasks, list):
+                    run.tasks = tasks
+                    run.pane.set_tasks(tasks)
+
+            if result.success:
+                output = result.output or "Process run completed."
+                run.pane.add_result(output, success=True)
+                run.status = "completed"
+                run.ended_at = time.monotonic()
+                self._update_process_run_visuals(run)
+                self._refresh_sidebar_progress_summary()
+                events_panel.add_event(
+                    _now_str(), "process_ok", f"{run.process_name} #{run.run_id}",
+                )
+                chat.add_info(f"Process run [dim]{run.run_id}[/dim] completed.")
+            else:
+                error = result.error or result.output or "Process run failed."
+                run.pane.add_result(error, success=False)
+                run.status = "failed"
+                run.ended_at = time.monotonic()
+                self._update_process_run_visuals(run)
+                self._refresh_sidebar_progress_summary()
+                events_panel.add_event(
+                    _now_str(), "process_err", f"{run.process_name} #{run.run_id}",
+                )
+                chat.add_info(
+                    f"[bold #f7768e]Process run {run.run_id} failed:[/] {error}"
+                )
+                self.notify(error, severity="error", timeout=5)
+            self._refresh_workspace_tree()
+        except asyncio.CancelledError:
+            if run.closed:
+                return
+            run.status = "cancelled"
+            run.ended_at = time.monotonic()
+            run.pane.add_result("Process run cancelled.", success=False)
+            self._update_process_run_visuals(run)
+            self._refresh_sidebar_progress_summary()
+            events_panel.add_event(
+                _now_str(), "process_err", f"{run.process_name} #{run.run_id}",
+            )
+            chat.add_info(f"[bold #f7768e]Process run {run.run_id} cancelled.[/]")
+            raise
+        except Exception as e:  # pragma: no cover - defensive guard
+            run.pane.add_result(str(e), success=False)
+            run.status = "failed"
+            run.ended_at = time.monotonic()
+            self._update_process_run_visuals(run)
+            self._refresh_sidebar_progress_summary()
+            events_panel.add_event(
+                _now_str(), "process_err", f"{run.process_name} #{run.run_id}",
+            )
+            chat.add_info(f"[bold #f7768e]Process run {run.run_id} failed:[/] {e}")
+            self.notify(str(e), severity="error", timeout=5)
+        finally:
+            run.worker = None
 
     def _ensure_persistence_tools(self) -> None:
         """Ensure recall/delegate tools are registered and tracked.
@@ -713,6 +1374,8 @@ class LoomApp(App):
             if spec.aliases:
                 desc = f"{desc} ({', '.join(spec.aliases)})"
             entries.append((label, desc))
+        for token, process_name in sorted(self._process_command_map.items()):
+            entries.append((f"{token} <goal>", f"run goal via process '{process_name}'"))
         return entries
 
     @staticmethod
@@ -731,6 +1394,19 @@ class LoomApp(App):
                 alias_str = ", ".join(spec.aliases)
                 label = f"{label} ({alias_str})"
             lines.append(f"  {label:<34} {spec.description}")
+        if self._process_command_map:
+            lines.append("")
+            lines.append("Process slash commands:")
+            for token, process_name in sorted(self._process_command_map.items()):
+                lines.append(
+                    f"  {f'{token} <goal>':<34} run goal via process '{process_name}'"
+                )
+        if self._blocked_process_commands:
+            blocked = ", ".join(f"/{name}" for name in self._blocked_process_commands)
+            lines.append("")
+            lines.append(
+                f"[#f7768e]Blocked process commands (name collisions): {blocked}[/]"
+            )
         lines.append(
             "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+R reload workspace, "
             "Ctrl+P palette, Ctrl+1/2/3 tabs",
@@ -745,6 +1421,8 @@ class LoomApp(App):
         text = raw_input.strip()
         if not text.startswith("/"):
             return "", []
+        # Keep dynamic process slash commands in sync as the user types.
+        self._refresh_process_command_index()
         token = text.split()[0].lower()
         if token == "/":
             return token, self._slash_command_catalog()
@@ -764,6 +1442,15 @@ class LoomApp(App):
                 matches.append(entry)
             elif any(token in key for key in keys):
                 fallback_matches.append(entry)
+        for dynamic_token, process_name in sorted(self._process_command_map.items()):
+            entry = (
+                f"{dynamic_token} <goal>",
+                f"run goal via process '{process_name}'",
+            )
+            if dynamic_token.startswith(token):
+                matches.append(entry)
+            elif token in dynamic_token:
+                fallback_matches.append(entry)
         if matches:
             return token, matches
         return token, fallback_matches
@@ -775,8 +1462,11 @@ class LoomApp(App):
 
     def _slash_completion_candidates(self, token: str) -> list[str]:
         """Return slash command completions for a token prefix."""
+        self._refresh_process_command_index()
         if token == "/":
-            return [spec.canonical for spec in _SLASH_COMMANDS]
+            builtins = [spec.canonical for spec in _SLASH_COMMANDS]
+            dynamic = sorted(self._process_command_map)
+            return builtins + dynamic
 
         candidates: list[str] = []
         seen: set[str] = set()
@@ -785,6 +1475,10 @@ class LoomApp(App):
                 if key.startswith(token) and key not in seen:
                     candidates.append(key)
                     seen.add(key)
+        for key in sorted(self._process_command_map):
+            if key.startswith(token) and key not in seen:
+                candidates.append(key)
+                seen.add(key)
         return candidates
 
     def _process_use_completion_candidates(
@@ -805,11 +1499,8 @@ class LoomApp(App):
         base = "/process use"
         seed = f"{base} {prefix}" if prefix else base
 
-        try:
-            loader = self._create_process_loader()
-            available = loader.list_available()
-        except Exception:
-            return None
+        self._refresh_process_command_index()
+        available = self._cached_process_catalog
 
         candidates: list[str] = []
         seen: set[str] = set()
@@ -836,16 +1527,16 @@ class LoomApp(App):
             return None
 
         prefix = (match.group("prefix") or "").strip()
-        try:
-            loader = self._create_process_loader()
-            available = loader.list_available()
-        except Exception:
-            return (
-                "[#f7768e]Failed to load process list.[/]  "
-                "[dim]Try /process list[/]"
-            )
+        self._refresh_process_command_index()
+        available = self._cached_process_catalog
 
         if not available:
+            if self._blocked_process_commands:
+                blocked = ", ".join(self._blocked_process_commands)
+                return (
+                    "[#f7768e]No selectable process definitions found.[/]  "
+                    f"[dim]Blocked: {blocked}[/]"
+                )
             return (
                 "[#f7768e]No process definitions found.[/]  "
                 "[dim]Try /process list[/]"
@@ -1008,7 +1699,9 @@ class LoomApp(App):
 
                 router = ModelRouter.from_config(config)
 
-                async def _orchestrator_factory():
+                async def _orchestrator_factory(
+                    process_override: ProcessDefinition | None = None,
+                ):
                     return Orchestrator(
                         model_router=router,
                         tool_registry=_create_tools(),
@@ -1017,7 +1710,7 @@ class LoomApp(App):
                         state_manager=TaskStateManager(data_dir),
                         event_bus=EventBus(),
                         config=config,
-                        process=self._process_defn,
+                        process=process_override or self._process_defn,
                     )
 
                 self._delegate_tool.bind(_orchestrator_factory)
@@ -1197,7 +1890,7 @@ class LoomApp(App):
             if handled:
                 return
 
-        if self._busy:
+        if self._chat_busy:
             return
 
         self._run_turn(text)
@@ -1225,6 +1918,11 @@ class LoomApp(App):
             event.stop()
             event.prevent_default()
 
+    @on(TabbedContent.TabActivated, "#tabs")
+    def on_tabs_tab_activated(self, _event: TabbedContent.TabActivated) -> None:
+        """Keep sidebar summary in sync as tabs change."""
+        self._refresh_sidebar_progress_summary()
+
     @on(DirectoryTree.FileSelected, "#workspace-tree")
     def on_workspace_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         """Open a modal preview when selecting a file in the workspace tree."""
@@ -1247,6 +1945,7 @@ class LoomApp(App):
         token = parts[0].lower() if parts else ""
         arg = parts[1].strip() if len(parts) > 1 else ""
         chat = self.query_one("#chat-log", ChatLog)
+        self._refresh_process_command_index()
 
         if token in ("/quit", "/exit", "/q"):
             self.action_request_quit()
@@ -1399,6 +2098,7 @@ class LoomApp(App):
             chat.add_info(f"Session tokens: {self._total_tokens:,}")
             return True
         if token == "/process":
+            self._refresh_process_command_index()
             if not arg:
                 active = self._active_process_name()
                 chat.add_info(
@@ -1431,9 +2131,16 @@ class LoomApp(App):
                         f"'{rest}': {e}[/]"
                     )
                     return True
+                if self._is_reserved_process_name(loaded.name):
+                    chat.add_info(
+                        f"[bold #f7768e]Process '{loaded.name}' conflicts with a "
+                        "built-in slash command and cannot be loaded in TUI.[/]"
+                    )
+                    return True
 
-                self._process_name = rest
+                self._process_name = loaded.name
                 await self._reload_session_for_process_change(chat)
+                self._refresh_process_command_index(chat=chat, notify_conflicts=True)
                 chat.add_info(
                     f"Active process: [bold]{loaded.name}[/bold] v{loaded.version}"
                 )
@@ -1455,6 +2162,11 @@ class LoomApp(App):
             return True
 
         if token == "/run":
+            if arg:
+                subcmd, _, subrest = arg.partition(" ")
+                if subcmd.lower() == "close":
+                    await self._close_process_run_from_target(subrest)
+                    return True
             goal = self._strip_wrapping_quotes(arg)
             if not goal:
                 chat.add_info("Usage: /run <goal>")
@@ -1464,7 +2176,35 @@ class LoomApp(App):
                     "No active process. Use /process use <name-or-path> first.",
                 )
                 return True
-            await self._run_process_goal(goal)
+            await self._start_process_run(goal, process_defn=self._process_defn)
+            return True
+
+        process_name = self._process_command_map.get(token)
+        if process_name:
+            goal = self._strip_wrapping_quotes(arg)
+            if not goal:
+                chat.add_info(f"Usage: /{process_name} <goal>")
+                return True
+            loader = self._create_process_loader()
+            try:
+                process_defn = loader.load(process_name)
+            except Exception as e:
+                chat.add_info(
+                    f"[bold #f7768e]Failed to load process "
+                    f"'{process_name}': {e}[/]"
+                )
+                return True
+            if self._is_reserved_process_name(process_defn.name):
+                chat.add_info(
+                    f"[bold #f7768e]Process '{process_defn.name}' conflicts with "
+                    "a built-in slash command and cannot be run from TUI.[/]"
+                )
+                return True
+            await self._start_process_run(
+                goal,
+                process_defn=process_defn,
+                command_prefix=f"/{process_name}",
+            )
             return True
 
         # Persistence-dependent commands
@@ -1565,7 +2305,7 @@ class LoomApp(App):
         if self._session is None:
             return
 
-        self._busy = True
+        self._chat_busy = True
         chat = self.query_one("#chat-log", ChatLog)
         status = self.query_one("#status-bar", StatusBar)
 
@@ -1578,7 +2318,7 @@ class LoomApp(App):
             chat.add_model_text(f"[bold #f7768e]Error:[/] {e}")
             self.notify(str(e), severity="error", timeout=5)
 
-        self._busy = False
+        self._chat_busy = False
         status.state = "Ready"
 
     async def _run_followup(self, message: str) -> None:
@@ -1653,6 +2393,8 @@ class LoomApp(App):
                         _now_str(), etype,
                         f"{event.name} {event.elapsed_ms}ms",
                     )
+                    if event.result.success and event.name in _WORKSPACE_REFRESH_TOOLS:
+                        self._refresh_workspace_tree()
 
                     if (
                         event.name in {"task_tracker", "delegate_task"}
@@ -1693,77 +2435,78 @@ class LoomApp(App):
                 self._update_files_panel(event)
 
     async def _run_process_goal(self, goal: str) -> None:
-        """Run a goal through delegate_task using the active process."""
-        chat = self.query_one("#chat-log", ChatLog)
-        status = self.query_one("#status-bar", StatusBar)
-        events_panel = self.query_one("#events-panel", EventPanel)
+        """Compatibility wrapper for callers that still use the old method."""
+        await self._start_process_run(goal)
 
-        if self._busy:
-            chat.add_info(
-                "[bold #f7768e]Cannot run /run while another turn is running.[/]",
-            )
-            return
-
-        if not self._tools.has("delegate_task"):
-            chat.add_info(
-                "[bold #f7768e]Process orchestration is unavailable in this "
-                "session.[/]",
-            )
-            return
-
-        self._busy = True
-        self._last_process_progress_message = ""
-        self._last_process_progress_at = 0.0
-        process_name = self._active_process_name()
-        chat.add_user_message(f"/run {goal}")
-        status.state = f"Running {process_name}..."
-        events_panel.add_event(
-            _now_str(),
-            "process_run",
-            f"{process_name}: {goal[:120]}",
-        )
-
-        result = None
-        try:
-            result = await self._tools.execute(
-                "delegate_task",
-                {
-                    "goal": goal,
-                    "wait": True,
-                    "_progress_callback": self._on_process_progress_event,
-                },
-                workspace=self._workspace,
-            )
-            data = getattr(result, "data", None)
-            if isinstance(data, dict):
-                self._update_sidebar_tasks(data)
-            if result.success:
-                chat.add_model_text(result.output or "Process run completed.")
-                events_panel.add_event(_now_str(), "process_ok", process_name)
-            else:
-                error = result.error or result.output or "Process run failed."
-                chat.add_model_text(f"[bold #f7768e]Error:[/] {error}")
-                events_panel.add_event(_now_str(), "process_err", process_name)
-                self._mark_process_run_failed(error)
-                self.notify(error, severity="error", timeout=5)
-            self._refresh_workspace_tree()
-        except Exception as e:  # pragma: no cover - defensive guard
-            chat.add_model_text(f"[bold #f7768e]Error:[/] {e}")
-            events_panel.add_event(_now_str(), "process_err", process_name)
-            self._mark_process_run_failed(str(e))
-            self.notify(str(e), severity="error", timeout=5)
-        finally:
-            self._busy = False
-            status.state = "Ready"
-            self._last_process_progress_message = ""
-            self._last_process_progress_at = 0.0
-
-    def _on_process_progress_event(self, data: dict) -> None:
+    def _on_process_progress_event(
+        self,
+        data: dict,
+        *,
+        run_id: str | None = None,
+    ) -> None:
         """Handle incremental delegate_task progress events in /run flows."""
         if not isinstance(data, dict):
             return
+        run = self._process_runs.get(run_id) if run_id else None
+        if run_id is not None and run is None:
+            return
+        if run is not None:
+            if run.closed:
+                return
+            tasks = data.get("tasks", [])
+            if isinstance(tasks, list):
+                run.tasks = tasks
+                run.pane.set_tasks(tasks)
+
+            task_id = str(data.get("task_id", "")).strip()
+            if task_id:
+                run.task_id = task_id
+
+            event_type = str(data.get("event_type") or "")
+            if event_type == "tool_call_completed":
+                tool_name = str(data.get("event_data", {}).get("tool", "")).strip()
+                if tool_name in _WORKSPACE_REFRESH_TOOLS:
+                    self._refresh_workspace_tree()
+            if event_type in {
+                "subtask_completed",
+                "subtask_failed",
+                "task_completed",
+                "task_failed",
+            }:
+                self._refresh_workspace_tree()
+
+            self._update_process_run_visuals(run)
+            self._refresh_sidebar_progress_summary()
+            message = self._format_process_progress_event(data)
+            if not message:
+                return
+            now = time.monotonic()
+            if (
+                message == run.last_progress_message
+                and (now - run.last_progress_at) < 2.0
+            ):
+                return
+            run.last_progress_message = message
+            run.last_progress_at = now
+            run.pane.add_activity(message)
+            try:
+                events_panel = self.query_one("#events-panel", EventPanel)
+                if event_type != "token_streamed":
+                    events_panel.add_event(
+                        _now_str(),
+                        "process",
+                        f"{run.run_id}: {message[:132]}",
+                    )
+            except Exception:
+                pass
+            return
+
         self._update_sidebar_tasks(data)
         event_type = str(data.get("event_type") or "")
+        if event_type == "tool_call_completed":
+            tool_name = str(data.get("event_data", {}).get("tool", "")).strip()
+            if tool_name in _WORKSPACE_REFRESH_TOOLS:
+                self._refresh_workspace_tree()
         if event_type in {
             "subtask_completed",
             "subtask_failed",
@@ -1774,15 +2517,6 @@ class LoomApp(App):
         message = self._format_process_progress_event(data)
         if not message:
             return
-        event_type = str(data.get("event_type") or "")
-        now = time.monotonic()
-        if (
-            message == self._last_process_progress_message
-            and (now - self._last_process_progress_at) < 2.0
-        ):
-            return
-        self._last_process_progress_message = message
-        self._last_process_progress_at = now
         try:
             chat = self.query_one("#chat-log", ChatLog)
             chat.add_info(message)
@@ -1930,15 +2664,14 @@ class LoomApp(App):
                 f"{message} Increase LOOM_DELEGATE_TIMEOUT_SECONDS for longer "
                 "runs."
             )
-        self._update_sidebar_tasks({
-            "tasks": [
-                {
-                    "id": "process-run",
-                    "status": "failed",
-                    "content": f"/run failed: {message}",
-                },
-            ],
-        })
+        self._sidebar_cowork_tasks = [
+            {
+                "id": "process-run",
+                "status": "failed",
+                "content": f"/run failed: {message}",
+            },
+        ]
+        self._refresh_sidebar_progress_summary()
 
     async def _handle_ask_user(self, event: ToolCallEvent) -> str:
         """Show an ask_user modal and return the answer."""
@@ -1979,11 +2712,87 @@ class LoomApp(App):
         tasks = data.get("tasks", [])
         if not tasks and "id" in data:
             tasks = [data]
+        normalized: list[dict] = []
+        if isinstance(tasks, list):
+            for row in tasks:
+                if isinstance(row, dict):
+                    normalized.append(row)
+        self._sidebar_cowork_tasks = normalized
+        self._refresh_sidebar_progress_summary()
+
+    def _summarize_cowork_tasks(self) -> list[dict]:
+        """Return a compact one-row summary for cowork delegated tasks."""
+        if not self._sidebar_cowork_tasks:
+            return []
+        total = len(self._sidebar_cowork_tasks)
+        in_progress = sum(
+            1
+            for t in self._sidebar_cowork_tasks
+            if str(t.get("status", "")) == "in_progress"
+        )
+        failed = sum(
+            1
+            for t in self._sidebar_cowork_tasks
+            if str(t.get("status", "")) == "failed"
+        )
+        completed = sum(
+            1
+            for t in self._sidebar_cowork_tasks
+            if str(t.get("status", "")) == "completed"
+        )
+        primary = next(
+            (
+                t
+                for t in self._sidebar_cowork_tasks
+                if str(t.get("status", "")) == "in_progress"
+            ),
+            self._sidebar_cowork_tasks[0],
+        )
+        focus = self._one_line(primary.get("content", ""), 120)
+        status = "pending"
+        if in_progress:
+            status = "in_progress"
+        elif failed:
+            status = "failed"
+        elif completed and completed == total:
+            status = "completed"
+        content = (
+            f"Cowork delegated: {total} task(s) "
+            f"({in_progress} active, {failed} failed)"
+        )
+        if focus:
+            content += f" - {focus}"
+        return [{
+            "id": "cowork-delegated",
+            "status": status,
+            "content": content,
+        }]
+
+    def _refresh_sidebar_progress_summary(self) -> None:
+        """Render concise sidebar progress: one row per run + cowork summary."""
         try:
             sidebar = self.query_one("#sidebar", Sidebar)
         except Exception:
             return
-        sidebar.update_tasks(tasks)
+        rows: list[dict] = []
+        for run in sorted(self._process_runs.values(), key=lambda r: r.started_at):
+            state = run.status
+            row_status = {
+                "queued": "pending",
+                "running": "in_progress",
+                "completed": "completed",
+                "failed": "failed",
+                "cancelled": "skipped",
+            }.get(state, "pending")
+            elapsed = self._format_elapsed(self._elapsed_seconds_for_run(run))
+            label = _PROCESS_STATUS_LABEL.get(state, state.title())
+            rows.append({
+                "id": f"process-run-{run.run_id}",
+                "status": row_status,
+                "content": f"{run.process_name} #{run.run_id} {label} {elapsed}",
+            })
+        rows.extend(self._summarize_cowork_tasks())
+        sidebar.update_tasks(rows)
 
     def _refresh_workspace_tree(self) -> None:
         """Reload sidebar workspace tree to pick up new files."""
@@ -2012,9 +2821,12 @@ class LoomApp(App):
         """Update the Files Changed panel from tool call events."""
         file_entries: list[dict] = []
         last_diff = ""
+        refresh_workspace = False
         for tc in turn.tool_calls:
             if not tc.result or not tc.result.success:
                 continue
+            if tc.name in _WORKSPACE_REFRESH_TOOLS:
+                refresh_workspace = True
             path = tc.args.get(
                 "path", tc.args.get("file_path", "?"),
             )
@@ -2062,6 +2874,9 @@ class LoomApp(App):
             self.notify(
                 f"{count} file{s} changed", timeout=3,
             )
+            return
+        if refresh_workspace:
+            self._refresh_workspace_tree()
 
     # ------------------------------------------------------------------
     # Actions
@@ -2078,7 +2893,16 @@ class LoomApp(App):
     def action_reload_workspace(self) -> None:
         """Reload sidebar workspace tree to show external file changes."""
         self._refresh_workspace_tree()
+        self._refresh_process_command_index()
         self.notify("Workspace reloaded", timeout=2)
+
+    def action_close_process_tab(self) -> None:
+        """Close current process run tab with confirmation."""
+        self.run_worker(
+            self._close_process_run_from_target("current"),
+            group="close-process-tab",
+            exclusive=True,
+        )
 
     def action_tab_chat(self) -> None:
         tabs = self.query_one("#tabs", TabbedContent)
@@ -2134,6 +2958,11 @@ class LoomApp(App):
 
     async def action_loom_command(self, command: str) -> None:
         """Dispatch command palette actions."""
+        if command.startswith("process_run_prompt:"):
+            process_name = command.partition(":")[2].strip()
+            if process_name:
+                self._prefill_user_input(f"/{process_name} ")
+            return
         if command == "quit":
             self.action_request_quit()
             return
@@ -2163,6 +2992,9 @@ class LoomApp(App):
             return
         if command == "resume_prompt":
             self._prefill_user_input("/resume ")
+            return
+        if command == "close_process_tab":
+            await self._close_process_run_from_target("current")
             return
         if command == "process_off":
             chat = self.query_one("#chat-log", ChatLog)
@@ -2217,6 +3049,18 @@ class LoomApp(App):
     def _show_process_list(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)
         chat.add_info(self._render_process_catalog())
+
+    def iter_dynamic_process_palette_entries(self) -> list[tuple[str, str, str]]:
+        """Return palette entries for dynamically discovered process commands."""
+        self._refresh_process_command_index()
+        entries: list[tuple[str, str, str]] = []
+        for token, process_name in sorted(self._process_command_map.items()):
+            entries.append((
+                f"Run {process_name}…",
+                f"process_run_prompt:{process_name}",
+                f"Prefill {token} for direct process execution",
+            ))
+        return entries
 
     def _show_token_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)

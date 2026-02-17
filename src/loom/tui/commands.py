@@ -35,6 +35,7 @@ _COMMANDS = [
     ),
     ("Disable process", "process_off", "Disable active process"),
     ("Run process goal…", "run_prompt", "Prefill /run for active process"),
+    ("Close process run tab", "close_process_tab", "Close current process run tab"),
     ("Show token usage", "token_info", "Display session token count"),
     ("Show help", "help", "List commands and keyboard shortcuts"),
     ("Quit", "quit", "Save session and exit"),
@@ -54,6 +55,25 @@ class LoomCommands(Provider):
                     matcher.highlight(label),
                     command=partial(
                         self.app.run_action, f"loom_command('{action}')",
+                    ),
+                    help=help_text,
+                )
+        dynamic_getter = getattr(
+            self.app,
+            "iter_dynamic_process_palette_entries",
+            None,
+        )
+        if callable(dynamic_getter):
+            for label, action, help_text in dynamic_getter():
+                score = matcher.match(label)
+                if score <= 0:
+                    continue
+                yield Hit(
+                    score,
+                    matcher.highlight(label),
+                    command=partial(
+                        self.app.run_action,
+                        f"loom_command('{action}')",
                     ),
                     help=help_text,
                 )
