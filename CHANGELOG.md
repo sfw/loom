@@ -5,6 +5,7 @@ All notable changes to Loom are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Tree-sitter code analysis** (`tools/treesitter.py`) -- optional syntax-tree-based backend for `analyze_code` and `edit_file` structural matching. Uses `tree-sitter-language-pack` when installed, falls back silently to regex extractors. Supports Python, JavaScript/TypeScript, Go, and Rust. Provides accurate class/function extraction including nested definitions, decorators, and doc-strings. Also used by `edit_file` to find structural candidates for fuzzy matching. Install with `uv sync --extra treesitter`.
 - **Adaptive Learning Memory (ALM)** (`learning/reflection.py`) -- behavioral pattern extraction via task completion gap analysis. Detects the gap between what the model delivered and what the user actually wanted. Extracts general behavioral rules ("run tests after writing code") from implicit follow-ups ("test and lint it") and explicit corrections ("no, use JSON"). Patterns are frequency-weighted and injected into future system prompts. No regex -- gaps are structural, not lexical.
 - **`loom learned` CLI command** (`__main__.py`) -- review, filter, and delete learned patterns from the terminal. Supports `--type` filtering, `--delete ID` for removal, and `--limit` for output control.
 - **`/learned` TUI slash command** (`tui/app.py`, `tui/screens/learned.py`) -- interactive modal for reviewing and deleting learned patterns. Shows pattern type, description, frequency, last seen date, and per-row delete buttons. Added to `/help` output.
