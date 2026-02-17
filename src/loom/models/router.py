@@ -207,26 +207,24 @@ class ResponseValidator:
         expected_keys: list[str] | None = None,
     ) -> ValidationResult:
         """Validate that the response text is valid JSON."""
-        text = response.text.strip()
-        # Strip markdown fences
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:])
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as e:
+        text = self._strip_markdown_fences(response.text.strip())
+        parsed, parse_error = self._extract_json_payload(text, expected_keys or [])
+        if parsed is None:
             return ValidationResult(
                 valid=False,
-                error=f"Invalid JSON: {e}",
+                error=f"Invalid JSON: {parse_error}",
                 suggestion="Respond with ONLY valid JSON, no markdown or explanation.",
                 parsed=None,
             )
 
         if expected_keys:
+            if not isinstance(parsed, dict):
+                return ValidationResult(
+                    valid=False,
+                    error="Expected a JSON object response.",
+                    suggestion=f"Response must include: {expected_keys}",
+                    parsed=parsed,
+                )
             missing = [k for k in expected_keys if k not in parsed]
             if missing:
                 return ValidationResult(
@@ -237,6 +235,57 @@ class ResponseValidator:
                 )
 
         return ValidationResult(valid=True, parsed=parsed)
+
+    @staticmethod
+    def _strip_markdown_fences(text: str) -> str:
+        """Strip outer markdown fences when present."""
+        if not text.startswith("```"):
+            return text
+        lines = text.split("\n")
+        text = "\n".join(lines[1:])
+        if text.endswith("```"):
+            text = text[:-3]
+        return text.strip()
+
+    @staticmethod
+    def _extract_json_payload(
+        text: str, expected_keys: list[str]
+    ) -> tuple[dict | list | None, str]:
+        """Extract JSON from plain or wrapped model output."""
+        decoder = json.JSONDecoder()
+        candidates: list[tuple[int, int, dict | list]] = []
+        parse_error = "No JSON object found"
+
+        try:
+            parsed = decoder.decode(text)
+            if isinstance(parsed, (dict, list)):
+                candidates.append((0, len(text), parsed))
+        except json.JSONDecodeError as e:
+            parse_error = str(e)
+
+        for i, ch in enumerate(text):
+            if ch not in "{[":
+                continue
+            try:
+                parsed, end = decoder.raw_decode(text[i:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, (dict, list)):
+                candidates.append((i, i + end, parsed))
+
+        if not candidates:
+            return None, parse_error
+
+        unique = {(start, end): payload for start, end, payload in candidates}
+        ordered = sorted(unique.items(), key=lambda item: (item[0][0], item[0][1]))
+        payloads = [payload for _, payload in ordered]
+
+        if expected_keys:
+            for payload in payloads:
+                if isinstance(payload, dict) and all(k in payload for k in expected_keys):
+                    return payload, ""
+
+        return payloads[0], ""
 
 
 @dataclass

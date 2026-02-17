@@ -303,6 +303,24 @@ class TestResponseValidator:
         assert result.valid
         assert result.parsed == {"key": "value"}
 
+    def test_json_embedded_in_explanatory_text(self):
+        validator = ResponseValidator()
+        response = ModelResponse(
+            text='I checked the task.\n{"passed": true, "confidence": 0.9}\nDone.'
+        )
+        result = validator.validate_json_response(response, expected_keys=["passed"])
+        assert result.valid
+        assert result.parsed == {"passed": True, "confidence": 0.9}
+
+    def test_json_prefers_candidate_with_expected_keys(self):
+        validator = ResponseValidator()
+        response = ModelResponse(
+            text='Example schema: {"foo": 1}\nFinal: {"passed": false, "issues": []}'
+        )
+        result = validator.validate_json_response(response, expected_keys=["passed"])
+        assert result.valid
+        assert result.parsed == {"passed": False, "issues": []}
+
     def test_json_missing_keys(self):
         validator = ResponseValidator()
         response = ModelResponse(text='{"other": "value"}')

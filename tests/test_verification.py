@@ -286,6 +286,53 @@ class TestLLMVerifier:
         assert result.feedback == "Add try/except blocks"
 
     @pytest.mark.asyncio
+    async def test_verifier_parses_json_wrapped_in_text(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.complete = AsyncMock(return_value=ModelResponse(
+            text=(
+                "Assessment complete.\n"
+                '{"passed": true, "issues": [], "confidence": 0.74, '
+                '"suggestion": "Looks good"}\n'
+                "End."
+            ),
+            usage=TokenUsage(input_tokens=40, output_tokens=30, total_tokens=70),
+        ))
+        router.select = MagicMock(return_value=model)
+
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
+
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        result = await v.verify(_make_subtask(), "output", [], None)
+        assert result.passed
+        assert result.confidence == 0.74
+        assert result.feedback == "Looks good"
+
+    @pytest.mark.asyncio
+    async def test_verifier_uses_feedback_field(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.complete = AsyncMock(return_value=ModelResponse(
+            text=json.dumps({
+                "passed": False,
+                "issues": ["Needs citations"],
+                "confidence": 0.6,
+                "feedback": "Add source links for each claim",
+            }),
+            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+        ))
+        router.select = MagicMock(return_value=model)
+
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
+
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        result = await v.verify(_make_subtask(), "output", [], None)
+        assert not result.passed
+        assert result.feedback == "Add source links for each claim"
+
+    @pytest.mark.asyncio
     async def test_fails_safe_on_no_verifier(self):
         router = MagicMock(spec=ModelRouter)
         router.select = MagicMock(side_effect=Exception("No model"))
