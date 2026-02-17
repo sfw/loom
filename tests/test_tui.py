@@ -34,6 +34,7 @@ class TestLoomAPIClient:
     async def test_close_when_no_client(self):
         api = LoomAPIClient()
         await api.close()  # Should not raise
+        assert api._client is None
 
     async def test_list_tasks(self):
         api = LoomAPIClient()
@@ -481,9 +482,12 @@ class TestInputSubmitGuard:
         """Verify the handler is decorated with the '#user-input' selector."""
         from loom.tui.app import LoomApp
 
-        # The @on(Input.Submitted, "#user-input") decorator attaches metadata
-        # We can verify by checking the method exists and app registers correctly
-        assert hasattr(LoomApp, "on_user_submit")
+        bindings = getattr(LoomApp.on_user_submit, "_textual_on", [])
+        assert bindings, "Expected textual on-handler metadata"
+        _event_cls, selector_spec = bindings[0]
+        control = selector_spec.get("control", ())
+        assert control
+        assert "#user-input" in str(control[0])
 
     def test_setup_screen_stops_input_submitted(self):
         """SetupScreen.on_input_submitted should call event.stop()."""
@@ -513,8 +517,9 @@ class TestInputSubmitGuard:
 class TestFinalizeSetupResetsSession:
     """P1-5: Re-running /setup should invalidate the old session."""
 
-    def test_finalize_setup_clears_session(self):
-        """_finalize_setup should set self._session = None before init."""
+    @pytest.mark.asyncio
+    async def test_finalize_setup_clears_session(self, monkeypatch):
+        """_finalize_setup should invalidate old session and reinitialize."""
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -522,17 +527,31 @@ class TestFinalizeSetupResetsSession:
             tools=MagicMock(),
             workspace=Path("/tmp"),
         )
-        # Simulate an existing session
-        app._session = MagicMock()
-        app._session.session_id = None
-        app._store = None
+        app._session = SimpleNamespace(session_id="old-session")
+        app._store = MagicMock()
+        app._store.update_session = AsyncMock()
+        app._initialize_session = AsyncMock()
 
-        # After finalize clears it, session should be None
-        # (We can't run the full async flow, but we can verify the field)
-        # The key assertion is that the code path exists and nullifies session
-        assert app._session is not None
-        app._session = None  # Simulate what _finalize_setup does
-        assert app._session is None
+        fake_config = MagicMock()
+        fake_model = MagicMock()
+        fake_router = MagicMock()
+        fake_router.select.return_value = fake_model
+
+        monkeypatch.setattr("loom.config.load_config", lambda: fake_config)
+        monkeypatch.setattr(
+            "loom.models.router.ModelRouter.from_config",
+            lambda cfg: fake_router,
+        )
+
+        # Call the undecorated coroutine behind @work.
+        await LoomApp._finalize_setup.__wrapped__(app)
+
+        assert app._config is fake_config
+        assert app._model is fake_model
+        app._store.update_session.assert_awaited_once_with(
+            "old-session", is_active=False,
+        )
+        app._initialize_session.assert_awaited_once()
 
 
 class TestFilesPanelReset:
@@ -570,14 +589,20 @@ class TestFilesPanelReset:
         app._store.update_session = AsyncMock()
         app._store.create_session = AsyncMock(return_value="new-session")
         app._bind_session_tools = MagicMock()
-        app._clear_files_panel = MagicMock()
-
+        panel = MagicMock()
         chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#files-panel":
+                return panel
+            return chat
+
+        app.query_one = MagicMock(side_effect=_query_one)
 
         await app._new_session()
 
-        app._clear_files_panel.assert_called_once()
+        panel.clear_files.assert_called_once()
+        panel.show_diff.assert_called_once_with("")
 
     @pytest.mark.asyncio
     async def test_switch_session_clears_files_panel(self, monkeypatch):
@@ -607,11 +632,17 @@ class TestFilesPanelReset:
         app._store = MagicMock()
         app._store.update_session = AsyncMock()
         app._bind_session_tools = MagicMock()
-        app._clear_files_panel = MagicMock()
-
+        panel = MagicMock()
         chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#files-panel":
+                return panel
+            return chat
+
+        app.query_one = MagicMock(side_effect=_query_one)
 
         await app._switch_to_session("new-session")
 
-        app._clear_files_panel.assert_called_once()
+        panel.clear_files.assert_called_once()
+        panel.show_diff.assert_called_once_with("")
