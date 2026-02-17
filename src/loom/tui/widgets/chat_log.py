@@ -40,6 +40,7 @@ class ChatLog(VerticalScroll):
         self._auto_scroll = True
         self._stream_buffer: list[str] = []
         self._stream_widget: Static | None = None
+        self._stream_text: str = ""
 
     def add_user_message(self, text: str) -> None:
         """Append a user message to the chat."""
@@ -67,6 +68,7 @@ class ChatLog(VerticalScroll):
         self._stream_buffer.append(text)
 
         if self._stream_widget is None:
+            self._stream_text = ""
             self._stream_widget = Static("", classes="model-text")
             self.mount(self._stream_widget)
 
@@ -80,15 +82,15 @@ class ChatLog(VerticalScroll):
         """Flush buffered streaming chunks to the widget."""
         if not self._stream_buffer or self._stream_widget is None:
             return
-        current = str(self._stream_widget.renderable)
-        current += "".join(self._stream_buffer)
-        self._stream_widget.update(current)
+        self._stream_text += "".join(self._stream_buffer)
+        self._stream_widget.update(self._stream_text)
         self._stream_buffer.clear()
 
     def _flush_and_reset_stream(self) -> None:
         """Flush any buffered stream data and reset stream state."""
         self._flush_stream_buffer()
         self._stream_widget = None
+        self._stream_text = ""
 
     def add_tool_call(
         self,

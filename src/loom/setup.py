@@ -10,18 +10,13 @@ import sys
 from pathlib import Path
 
 import click
+import httpx
 
 # Provider presets: (display_name, provider_key, needs_api_key, default_base_url)
 PROVIDERS = [
     ("Anthropic (Claude API)", "anthropic", True, "https://api.anthropic.com"),
     ("OpenAI-compatible server", "openai_compatible", False, "http://localhost:1234/v1"),
     ("Ollama", "ollama", False, "http://localhost:11434"),
-]
-
-ANTHROPIC_MODELS = [
-    "claude-sonnet-4-5-20250929",
-    "claude-opus-4-20250115",
-    "claude-haiku-4-5-20251001",
 ]
 
 ROLE_PRESETS = {
@@ -32,6 +27,113 @@ ROLE_PRESETS = {
 
 CONFIG_DIR = Path.home() / ".loom"
 CONFIG_PATH = CONFIG_DIR / "loom.toml"
+
+
+def _unique_models(names: list[str]) -> list[str]:
+    """Return non-empty model names with order-preserving dedupe."""
+    result = []
+    seen: set[str] = set()
+    for name in names:
+        if not isinstance(name, str):
+            continue
+        normalized = name.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _extract_discovered_models(provider_key: str, payload: object) -> list[str]:
+    """Parse provider-specific model-list payloads into model names."""
+    if provider_key == "ollama" and isinstance(payload, dict):
+        models = payload.get("models", [])
+        if isinstance(models, list):
+            names = []
+            for entry in models:
+                if isinstance(entry, dict):
+                    names.append(
+                        entry.get("name", "") or entry.get("model", "")
+                    )
+            return _unique_models(names)
+        return []
+
+    rows: list[object] = []
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(payload.get("models"), list):
+            rows = payload["models"]
+    elif isinstance(payload, list):
+        rows = payload
+
+    names: list[str] = []
+    for entry in rows:
+        if isinstance(entry, dict):
+            names.append(
+                entry.get("id", "")
+                or entry.get("name", "")
+                or entry.get("model", "")
+            )
+        elif isinstance(entry, str):
+            names.append(entry)
+    return _unique_models(names)
+
+
+def discover_models(
+    provider_key: str,
+    base_url: str,
+    api_key: str = "",
+    *,
+    timeout: float = 5.0,
+) -> list[str]:
+    """Discover available models from a provider endpoint.
+
+    Returns an empty list on connectivity/auth/parsing errors.
+    """
+    normalized_base = base_url.strip().rstrip("/")
+    if not normalized_base:
+        return []
+
+    headers: dict[str, str] = {}
+    endpoints: list[str]
+    if provider_key == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
+        if api_key:
+            headers["x-api-key"] = api_key
+        endpoints = ["/v1/models"]
+    elif provider_key == "openai_compatible":
+        if api_key:
+            headers["authorization"] = f"Bearer {api_key}"
+        endpoints = ["/models", "/v1/models"]
+    elif provider_key == "ollama":
+        endpoints = ["/api/tags"]
+    else:
+        return []
+
+    with httpx.Client(
+        base_url=normalized_base,
+        headers=headers,
+        timeout=timeout,
+        follow_redirects=True,
+    ) as client:
+        for endpoint in endpoints:
+            try:
+                response = client.get(endpoint)
+            except httpx.HTTPError:
+                continue
+            if response.status_code != 200:
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                continue
+            names = _extract_discovered_models(provider_key, payload)
+            if names:
+                return names
+
+    return []
 
 
 def needs_setup() -> bool:
@@ -61,35 +163,57 @@ def _prompt_provider() -> tuple[str, str, bool, str]:
     return PROVIDERS[choice - 1]
 
 
-def _prompt_anthropic_model() -> tuple[str, str, str]:
-    """Collect Anthropic-specific settings.  Returns (base_url, model, api_key)."""
-    click.echo()
-    click.echo("Available Claude models:")
-    click.echo()
-    for i, m in enumerate(ANTHROPIC_MODELS, 1):
-        click.echo(f"  {i}. {m}")
-    click.echo()
-    choice = click.prompt(
-        "Model",
-        type=click.IntRange(1, len(ANTHROPIC_MODELS)),
-        default=1,
-    )
-    model = ANTHROPIC_MODELS[choice - 1]
+def _prompt_model_name(
+    provider_display: str,
+    discovered_models: list[str],
+    fallback_prompt: str,
+) -> str:
+    """Select from discovered models or collect a manual model name."""
+    if discovered_models:
+        click.echo()
+        click.echo(f"Discovered models ({provider_display}):")
+        click.echo()
+        for i, model in enumerate(discovered_models, 1):
+            click.echo(f"  {i}. {model}")
+        click.echo()
+        choice = click.prompt(
+            "Model",
+            type=click.IntRange(1, len(discovered_models)),
+            default=1,
+        )
+        return discovered_models[choice - 1]
 
+    click.echo()
+    click.echo("Could not auto-discover models from that endpoint.")
+    return click.prompt(fallback_prompt).strip()
+
+
+def _prompt_anthropic_model(default_url: str) -> tuple[str, str, str]:
+    """Collect Anthropic-specific settings.  Returns (base_url, model, api_key)."""
     api_key = click.prompt(
         "Anthropic API key",
         hide_input=True,
-    )
-    if not api_key.strip():
+    ).strip()
+    if not api_key:
         click.echo("API key is required for Anthropic.", err=True)
         sys.exit(1)
 
     base_url = click.prompt(
         "Base URL (press Enter for default)",
-        default="https://api.anthropic.com",
+        default=default_url,
         show_default=True,
     )
-    return base_url, model, api_key.strip()
+
+    discovered_models = discover_models("anthropic", base_url, api_key)
+    model = _prompt_model_name(
+        "Anthropic",
+        discovered_models,
+        "Model name (e.g. claude-sonnet-4-5-20250929)",
+    )
+    if not model:
+        click.echo("Model name is required.", err=True)
+        sys.exit(1)
+    return base_url, model, api_key
 
 
 def _prompt_openai_model(default_url: str) -> tuple[str, str, str]:
@@ -100,10 +224,18 @@ def _prompt_openai_model(default_url: str) -> tuple[str, str, str]:
         default=default_url,
         show_default=True,
     )
-    model = click.prompt("Model name (e.g. gpt-4o, mistral-nemo, etc.)")
     api_key = ""
     if click.confirm("Does this server require an API key?", default=False):
         api_key = click.prompt("API key", hide_input=True).strip()
+    discovered_models = discover_models("openai_compatible", base_url, api_key)
+    model = _prompt_model_name(
+        "OpenAI-compatible",
+        discovered_models,
+        "Model name (e.g. gpt-4o, mistral-nemo, etc.)",
+    )
+    if not model:
+        click.echo("Model name is required.", err=True)
+        sys.exit(1)
     return base_url, model, api_key
 
 
@@ -115,9 +247,15 @@ def _prompt_ollama_model(default_url: str) -> tuple[str, str, str]:
         default=default_url,
         show_default=True,
     )
-    model = click.prompt(
+    discovered_models = discover_models("ollama", base_url, "")
+    model = _prompt_model_name(
+        "Ollama",
+        discovered_models,
         "Model name (e.g. qwen3:14b, llama3:8b, etc.)",
     )
+    if not model:
+        click.echo("Model name is required.", err=True)
+        sys.exit(1)
     return base_url, model, ""
 
 
@@ -214,10 +352,10 @@ def run_setup(*, reconfigure: bool = False) -> Path:
     click.secho("  Primary model", bold=True)
     click.echo("  This model handles planning and task execution.")
 
-    display, provider_key, needs_key, default_url = _prompt_provider()
+    _display, provider_key, _needs_key, default_url = _prompt_provider()
 
     if provider_key == "anthropic":
-        base_url, model, api_key = _prompt_anthropic_model()
+        base_url, model, api_key = _prompt_anthropic_model(default_url)
     elif provider_key == "openai_compatible":
         base_url, model, api_key = _prompt_openai_model(default_url)
     else:
@@ -250,7 +388,7 @@ def run_setup(*, reconfigure: bool = False) -> Path:
             _, u_provider, _, u_default_url = _prompt_provider()
 
             if u_provider == "anthropic":
-                u_base, u_model, u_key = _prompt_anthropic_model()
+                u_base, u_model, u_key = _prompt_anthropic_model(u_default_url)
             elif u_provider == "openai_compatible":
                 u_base, u_model, u_key = _prompt_openai_model(u_default_url)
             else:
