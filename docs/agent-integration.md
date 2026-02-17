@@ -3,7 +3,7 @@
 This guide shows how to connect external agents (Claude Code, custom scripts, cron jobs, other AI agents) to Loom as clients.
 
 **Two execution models:**
-- **Interactive** (`loom`) — conversation-first TUI with full session persistence. The agent and developer collaborate in real time with 21 tools, streaming, conversation recall, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition, and `/run <goal>` forces process orchestration in-session.
+- **Interactive** (`loom`) — conversation-first TUI with full session persistence. The agent and developer collaborate in real time with 21 tools, streaming, conversation recall, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition, and `/run <goal>` (or dynamic `/<process-name> <goal>`) forces process orchestration in-session. Use `/run close [run-id-prefix]` (or `Ctrl+W` on a run tab) to close/cancel a process run tab.
 - **Task mode** (REST API / MCP) — autonomous, fire-and-forget. Loom decomposes the goal into subtasks, executes, verifies, and reports back.
 
 This document covers both modes.
@@ -813,14 +813,35 @@ database_path = "~/.loom/loom.db"
 [workspace]
 default_path = "~/projects"
 scratch_dir = "~/.loom/scratch"
+```
 
+MCP server configuration is managed separately in `~/.loom/mcp.toml`
+(workspace override: `./.loom/mcp.toml`):
+
+```toml
 [mcp.servers.notion]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-notion"]
 timeout_seconds = 30
+enabled = true
 
 [mcp.servers.notion.env]
-NOTION_TOKEN = "your-token"
+NOTION_TOKEN = "${NOTION_TOKEN}"
+```
+
+Merge precedence is:
+1. `--mcp-config <path>`
+2. `./.loom/mcp.toml`
+3. `~/.loom/mcp.toml`
+4. legacy `[mcp]` sections in `loom.toml`
+
+Use the MCP CLI manager:
+
+```bash
+loom mcp list
+loom mcp add notion --command npx --arg -y --arg @modelcontextprotocol/server-notion --env-ref NOTION_TOKEN=NOTION_TOKEN
+loom mcp test notion
+loom mcp migrate
 ```
 
 Configured MCP servers are auto-discovered and exposed as namespaced tools:

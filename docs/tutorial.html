@@ -643,18 +643,21 @@
 <span class="key">[memory]</span>
 <span class="key">database_path</span> = <span class="str">"~/.loom/loom.db"</span>
 
-<span class="cmt"># Optional external MCP servers (auto-registered as tools)</span>
+<span class="cmt"># MCP servers are managed in ~/.loom/mcp.toml (or ./.loom/mcp.toml)</span></code></pre>
+
+  <pre><code><span class="cmt"># ~/.loom/mcp.toml</span>
 <span class="key">[mcp.servers.notion]</span>
 <span class="key">command</span> = <span class="str">"npx"</span>
 <span class="key">args</span> = <span class="str">["-y", "@modelcontextprotocol/server-notion"]</span>
 <span class="key">timeout_seconds</span> = <span class="val">30</span>
+<span class="key">enabled</span> = <span class="val">true</span>
 
 <span class="key">[mcp.servers.notion.env]</span>
-<span class="key">NOTION_TOKEN</span> = <span class="str">"your-token"</span></code></pre>
+<span class="key">NOTION_TOKEN</span> = <span class="str">"${NOTION_TOKEN}"</span></code></pre>
 
   <div class="callout callout-info">
     <strong>External MCP tools</strong>
-    Configured MCP servers are auto-discovered and exposed as namespaced tools in Loom (for example <code>mcp.notion.search</code>).
+    Configured MCP servers are auto-discovered and exposed as namespaced tools in Loom (for example <code>mcp.notion.search</code>). Merge precedence is <code>--mcp-config</code> &gt; workspace <code>./.loom/mcp.toml</code> &gt; user <code>~/.loom/mcp.toml</code> &gt; legacy <code>[mcp]</code> in <code>loom.toml</code>.
   </div>
 
   <div class="callout callout-warn">
@@ -891,6 +894,7 @@
     <tr><td><code>Ctrl+B</code></td><td>Toggle sidebar</td></tr>
     <tr><td><code>Ctrl+L</code></td><td>Clear chat</td></tr>
     <tr><td><code>Ctrl+R</code></td><td>Reload workspace tree</td></tr>
+    <tr><td><code>Ctrl+W</code></td><td>Close active process-run tab (with confirmation)</td></tr>
     <tr><td><code>Ctrl+P</code></td><td>Command palette</td></tr>
     <tr><td><code>Ctrl+1/2/3</code></td><td>Switch tabs (Chat / Files / Events)</td></tr>
     <tr><td><code>Tab</code></td><td>Cycle slash-command autocomplete (when input starts with <code>/</code>)</td></tr>
@@ -910,10 +914,16 @@
     <tr><td><code>/model</code></td><td>Show current model</td></tr>
     <tr><td><code>/tools</code></td><td>List available tools</td></tr>
     <tr><td><code>/tokens</code></td><td>Show session token usage</td></tr>
+    <tr><td><code>/mcp list</code></td><td>List merged MCP server config entries</td></tr>
+    <tr><td><code>/mcp show &lt;alias&gt;</code></td><td>Show one MCP config entry (redacted env values)</td></tr>
+    <tr><td><code>/mcp test &lt;alias&gt;</code></td><td>Run a <code>tools/list</code> probe against one MCP server</td></tr>
+    <tr><td><code>/mcp enable|disable|remove &lt;alias&gt;</code></td><td>Mutate MCP config and refresh runtime MCP tools</td></tr>
     <tr><td><code>/process list</code></td><td>List discovered process definitions</td></tr>
     <tr><td><code>/process use &lt;name-or-path&gt;</code></td><td>Activate a process in the current session</td></tr>
     <tr><td><code>/process off</code></td><td>Disable the active process</td></tr>
     <tr><td><code>/run &lt;goal&gt;</code></td><td>Force orchestration through the active process</td></tr>
+    <tr><td><code>/run close [run-id-prefix]</code></td><td>Close/cancel a process-run tab with confirmation</td></tr>
+    <tr><td><code>/&lt;process-name&gt; &lt;goal&gt;</code></td><td>Run a discovered process directly without changing the active process</td></tr>
     <tr><td><code>/setup</code></td><td>Reconfigure models and settings</td></tr>
     <tr><td><code>/clear</code></td><td>Clear the chat display</td></tr>
     <tr><td><code>/quit</code> (<code>/exit</code>, <code>/q</code>)</td><td>Exit Loom</td></tr>
@@ -924,7 +934,7 @@
 
   <div class="callout callout-info">
     <strong>About /run</strong>
-    <code>/run &lt;goal&gt;</code> uses in-process orchestration via <code>delegate_task</code>. You do not need to run <code>loom serve</code> for this flow.
+    <code>/run &lt;goal&gt;</code> uses in-process orchestration via <code>delegate_task</code>. You do not need to run <code>loom serve</code> for this flow. Use <code>/run close</code> (or <code>Ctrl+W</code> on a process tab) to cancel and close a running tab.
   </div>
 
   <div class="callout callout-info">
@@ -1242,7 +1252,13 @@
 <span class="cmd">loom mcp-serve</span>
 
 <span class="cmt"># Connect to a different Loom API</span>
-<span class="cmd">loom mcp-serve</span> <span class="flag">--base-url</span> http://localhost:8080</code></pre>
+<span class="cmd">loom mcp-serve</span> <span class="flag">--server</span> http://localhost:8080</code></pre>
+
+  <pre><code><span class="cmt"># Manage external MCP server configs</span>
+<span class="cmd">loom mcp list</span>
+<span class="cmd">loom mcp add notion</span> <span class="flag">--command</span> npx <span class="flag">--arg</span> -y <span class="flag">--arg</span> @modelcontextprotocol/server-notion <span class="flag">--env-ref</span> NOTION_TOKEN=NOTION_TOKEN
+<span class="cmd">loom mcp test notion</span>
+<span class="cmd">loom mcp migrate</span></code></pre>
 
   <div class="callout callout-info">
     <strong>Requires extra</strong>

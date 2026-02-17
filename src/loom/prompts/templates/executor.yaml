@@ -26,6 +26,9 @@ constraints: |
   - Complete ONLY the current subtask. Do NOT proceed to the next one.
   - Do NOT explain your reasoning unless asked. Just act.
   - Do NOT modify files outside the workspace.
+  - For every write/create tool call (write_file, edit_file, document_write,
+    spreadsheet), ALWAYS include an explicit "path" argument relative to the
+    workspace root.
   - If you cannot complete the subtask, respond with:
     {{"status": "blocked", "reason": "explanation of what's wrong"}}
   - If you discover something unexpected, mention it in your summary.

@@ -134,22 +134,72 @@ class ResponseValidator:
         if not response.tool_calls:
             return ValidationResult(valid=True)
 
-        valid_names = {t["name"] for t in available_tools}
+        schema_by_name = {
+            t["name"]: t
+            for t in available_tools
+            if isinstance(t, dict) and isinstance(t.get("name"), str)
+        }
+        valid_names = set(schema_by_name.keys())
         issues = []
 
         for tc in response.tool_calls:
             if tc.name not in valid_names:
                 issues.append(f"Unknown tool: {tc.name}")
+                continue
+
             if not isinstance(tc.arguments, dict):
                 issues.append(f"Invalid arguments for {tc.name}: expected dict")
+                continue
+
+            required_fields = self._required_fields_for_tool(schema_by_name[tc.name])
+            missing = [
+                field
+                for field in required_fields
+                if self._argument_missing(tc.arguments.get(field))
+            ]
+            if missing:
+                issues.append(
+                    f"Missing required arguments for {tc.name}: "
+                    f"{', '.join(sorted(missing))}"
+                )
 
         if issues:
+            missing_required = any(
+                issue.startswith("Missing required arguments for")
+                for issue in issues
+            )
+            suggestion = "Use only the tools listed in AVAILABLE TOOLS."
+            if missing_required:
+                suggestion += (
+                    " Include all required tool arguments exactly as defined in "
+                    "the tool schema."
+                )
             return ValidationResult(
                 valid=False,
                 error="; ".join(issues),
-                suggestion="Use only the tools listed in AVAILABLE TOOLS.",
+                suggestion=suggestion,
             )
         return ValidationResult(valid=True)
+
+    @staticmethod
+    def _required_fields_for_tool(tool_schema: dict) -> set[str]:
+        """Extract top-level required field names from a tool schema."""
+        params = tool_schema.get("parameters")
+        if not isinstance(params, dict):
+            return set()
+        raw_required = params.get("required", [])
+        if not isinstance(raw_required, list):
+            return set()
+        return {field for field in raw_required if isinstance(field, str)}
+
+    @staticmethod
+    def _argument_missing(value: object) -> bool:
+        """Return True when a tool argument should be treated as missing."""
+        if value is None:
+            return True
+        if isinstance(value, str) and not value.strip():
+            return True
+        return False
 
     def validate_json_response(
         self,

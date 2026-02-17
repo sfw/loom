@@ -160,6 +160,40 @@ class TestOpenAIProviderErrors:
         finally:
             asyncio.run(provider._client.aclose())
 
+    def test_build_messages_normalizes_assistant_tool_calls(self):
+        provider = self._make_provider()
+        try:
+            messages = [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": {"path": "a.md"},
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "",
+                    "content": None,
+                },
+            ]
+
+            normalized = provider._build_openai_messages(messages)
+
+            assert normalized[0]["content"] == ""
+            assert normalized[0]["tool_calls"][0]["id"].startswith("call_")
+            assert isinstance(
+                normalized[0]["tool_calls"][0]["function"]["arguments"], str,
+            )
+            assert normalized[1]["content"] == ""
+            assert normalized[1]["tool_call_id"] == normalized[0]["tool_calls"][0]["id"]
+        finally:
+            asyncio.run(provider._client.aclose())
+
     @pytest.mark.asyncio
     async def test_complete_connect_error(self):
         provider = self._make_provider()
@@ -251,6 +285,34 @@ class TestOpenAIProviderErrors:
         second_payload = provider._client.post.await_args_list[1].kwargs["json"]
         assert "reasoning_content" not in first_payload["messages"][1]
         assert second_payload["messages"][1]["reasoning_content"] == "Calling tool"
+
+    @pytest.mark.asyncio
+    async def test_complete_assigns_fallback_tool_call_id_when_missing(self):
+        provider = self._make_provider()
+        provider._client = AsyncMock()
+
+        ok = MagicMock()
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"memo.md\",\"content\":\"x\"}",
+                        },
+                    }],
+                },
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        provider._client.post = AsyncMock(return_value=ok)
+
+        response = await provider.complete([{"role": "user", "content": "hi"}])
+
+        assert response.tool_calls is not None
+        assert response.tool_calls[0].id == "call_0"
 
     @pytest.mark.asyncio
     async def test_complete_retry_injects_non_empty_reasoning_content_when_content_empty(self):
@@ -380,6 +442,33 @@ class TestOpenAIProviderErrors:
             second_payload["messages"][1]["reasoning_content"]
             == "Tool call required to continue."
         )
+
+    @pytest.mark.asyncio
+    async def test_stream_assigns_fallback_tool_call_id_when_missing(self):
+        provider = self._make_provider()
+        provider._client = MagicMock()
+        response = _StreamingSuccessResponse([
+            (
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                '"function":{"name":"write_file"}}]}}]}'
+            ),
+            (
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                '"function":{"arguments":"{\\"path\\":\\"memo.md\\",\\"content\\":\\"x\\"}"}}]}}]}'
+            ),
+            "data: [DONE]",
+        ])
+        provider._client.stream = MagicMock(
+            return_value=_ErrorStreamContext(response),
+        )
+
+        chunks = []
+        async for chunk in provider.stream([{"role": "user", "content": "hi"}]):
+            chunks.append(chunk)
+
+        assert chunks[-1].done is True
+        assert chunks[-1].tool_calls is not None
+        assert chunks[-1].tool_calls[0].id == "call_0"
 
 
 # ---------------------------------------------------------------------------

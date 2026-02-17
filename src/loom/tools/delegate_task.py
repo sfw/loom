@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -95,15 +96,16 @@ class DelegateTaskTool(Tool):
 
     def __init__(
         self,
-        orchestrator_factory: Callable[[], Awaitable[Orchestrator]] | None = None,
+        orchestrator_factory: Callable[..., Awaitable[Orchestrator]] | None = None,
     ):
         self._factory = orchestrator_factory
-        self._orchestrator: Orchestrator | None = None
 
-    def bind(self, orchestrator_factory: Callable[[], Awaitable[Orchestrator]]) -> None:
+    def bind(
+        self,
+        orchestrator_factory: Callable[..., Awaitable[Orchestrator]],
+    ) -> None:
         """Bind the orchestrator factory after construction."""
         self._factory = orchestrator_factory
-        self._orchestrator = None
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         if self._factory is None:
@@ -118,26 +120,43 @@ class DelegateTaskTool(Tool):
         context = args.get("context", {})
         wait = args.get("wait", True)
         progress_callback = args.get("_progress_callback")
+        process_override = args.get("_process_override")
         workspace = str(ctx.workspace) if ctx.workspace else ""
 
-        # Lazy-init orchestrator
-        if self._orchestrator is None:
+        # Fresh orchestrator per call to isolate concurrent delegated runs.
+        try:
+            supports_override = False
             try:
-                self._orchestrator = await self._factory()
-            except Exception as e:
-                return ToolResult.fail(f"Failed to initialize orchestrator: {e}")
+                signature = inspect.signature(self._factory)
+                supports_override = len(signature.parameters) > 0
+            except (TypeError, ValueError):
+                supports_override = False
+            if supports_override:
+                orchestrator = await self._factory(process_override)
+            else:
+                orchestrator = await self._factory()
+        except Exception as e:
+            return ToolResult.fail(f"Failed to initialize orchestrator: {e}")
 
         # Build task
         task = _create_task(goal, workspace, context)
-        event_bus = getattr(self._orchestrator, "_events", None)
+        event_bus = getattr(orchestrator, "_events", None)
         subscriptions: list[tuple[str, object]] = []
+        token_burst_count = 0
+        token_burst_subtask = ""
+        last_token_emit = 0.0
 
-        def _emit_progress(event_type: str | None = None) -> None:
+        def _emit_progress(
+            event_type: str | None = None,
+            event_data: dict | None = None,
+        ) -> None:
             if not callable(progress_callback):
                 return
             payload = _progress_payload(task)
             if event_type:
                 payload["event_type"] = event_type
+            if isinstance(event_data, dict) and event_data:
+                payload["event_data"] = dict(event_data)
             try:
                 maybe = progress_callback(payload)
                 if inspect.isawaitable(maybe):
@@ -145,29 +164,72 @@ class DelegateTaskTool(Tool):
             except Exception:
                 pass
 
+        def _flush_token_burst() -> None:
+            nonlocal token_burst_count, token_burst_subtask, last_token_emit
+            if token_burst_count <= 0:
+                return
+            payload = {"token_count": token_burst_count}
+            if token_burst_subtask:
+                payload["subtask_id"] = token_burst_subtask
+            _emit_progress("token_streamed", payload)
+            token_burst_count = 0
+            token_burst_subtask = ""
+            last_token_emit = time.monotonic()
+
         if callable(progress_callback) and event_bus is not None:
             from loom.events.types import (
+                MODEL_INVOCATION,
                 SUBTASK_COMPLETED,
                 SUBTASK_FAILED,
                 SUBTASK_RETRYING,
                 SUBTASK_STARTED,
                 TASK_COMPLETED,
+                TASK_EXECUTING,
                 TASK_FAILED,
                 TASK_PLAN_READY,
+                TASK_PLANNING,
+                TASK_REPLANNING,
+                TOKEN_STREAMED,
+                TOOL_CALL_COMPLETED,
+                TOOL_CALL_STARTED,
             )
 
             observed = (
+                TASK_PLANNING,
                 TASK_PLAN_READY,
+                TASK_EXECUTING,
+                MODEL_INVOCATION,
                 SUBTASK_STARTED,
                 SUBTASK_RETRYING,
+                TOKEN_STREAMED,
+                TOOL_CALL_STARTED,
+                TOOL_CALL_COMPLETED,
                 SUBTASK_COMPLETED,
                 SUBTASK_FAILED,
+                TASK_REPLANNING,
                 TASK_COMPLETED,
                 TASK_FAILED,
             )
 
             def _on_event(event) -> None:
-                _emit_progress(event.event_type)
+                nonlocal token_burst_count, token_burst_subtask, last_token_emit
+                if getattr(event, "task_id", "") != task.id:
+                    return
+                event_data = getattr(event, "data", None)
+                if event.event_type == TOKEN_STREAMED:
+                    token_burst_count += 1
+                    if isinstance(event_data, dict):
+                        subtask = str(event_data.get("subtask_id", "")).strip()
+                        if subtask:
+                            token_burst_subtask = subtask
+                    now = time.monotonic()
+                    if token_burst_count < 40 and (now - last_token_emit) < 2.0:
+                        return
+                    _flush_token_burst()
+                    return
+                if token_burst_count > 0:
+                    _flush_token_burst()
+                _emit_progress(event.event_type, event_data)
 
             for event_type in observed:
                 try:
@@ -177,7 +239,7 @@ class DelegateTaskTool(Tool):
                     pass
 
         if not wait:
-            asyncio.create_task(self._orchestrator.execute_task(task))
+            asyncio.create_task(orchestrator.execute_task(task))
             return ToolResult.ok(
                 f"Task submitted (async): {task.id}\n"
                 f"Goal: {goal}\n"
@@ -192,7 +254,8 @@ class DelegateTaskTool(Tool):
         # Synchronous: execute and wait
         try:
             _emit_progress()
-            completed = await self._orchestrator.execute_task(task)
+            completed = await orchestrator.execute_task(task)
+            _flush_token_burst()
             _emit_progress("task_completed")
             return ToolResult.ok(
                 _format_result(completed),

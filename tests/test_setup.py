@@ -410,6 +410,42 @@ class TestSetupScreen:
         parsed = tomllib.loads(cfg_path.read_text())
         assert parsed["models"]["primary"]["provider"] == "ollama"
 
+    def test_save_does_not_touch_mcp_toml(self, tmp_path: Path, monkeypatch):
+        """Setup writes loom.toml without mutating separate mcp.toml config."""
+        from loom.tui.screens import setup as setup_mod
+
+        cfg_dir = tmp_path / ".loom"
+        cfg_path = cfg_dir / "loom.toml"
+        mcp_path = cfg_dir / "mcp.toml"
+        mcp_path.parent.mkdir(parents=True, exist_ok=True)
+        mcp_original = (
+            "[mcp.servers.demo]\n"
+            "command = \"python\"\n"
+            "args = [\"-m\", \"demo\"]\n"
+        )
+        mcp_path.write_text(mcp_original)
+
+        monkeypatch.setattr(setup_mod, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(setup_mod, "CONFIG_PATH", cfg_path)
+
+        screen = setup_mod.SetupScreen()
+        screen._primary_model = {
+            "name": "primary",
+            "provider": "ollama",
+            "base_url": "http://localhost:11434",
+            "model": "qwen3:14b",
+            "api_key": "",
+            "roles": ["planner", "executor", "extractor", "verifier"],
+            "max_tokens": 4096,
+            "temperature": 0.1,
+        }
+        screen.dismiss = lambda _val: None
+
+        screen._save_and_dismiss()
+
+        assert cfg_path.exists()
+        assert mcp_path.read_text() == mcp_original
+
     def test_collect_model_all_roles_skips_utility(self):
         """When all roles are covered, skip the utility prompt."""
         from loom.tui.screens.setup import SetupScreen
