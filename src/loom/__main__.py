@@ -119,6 +119,8 @@ def _launch_tui(
             )
             sys.exit(1)
 
+    effective_process = process_name or config.process.default or None
+
     app = LoomApp(
         model=provider,
         tools=tools,
@@ -127,7 +129,7 @@ def _launch_tui(
         db=db,
         store=store,
         resume_session=resume_session,
-        process_name=process_name,
+        process_name=effective_process,
     )
     app.run()
 
@@ -238,14 +240,15 @@ def run(
     config = ctx.obj["config"]
     url = server_url or f"http://{config.server.host}:{config.server.port}"
     ws = str(workspace.resolve()) if workspace else None
+    effective_process = process_name or config.process.default or None
 
     click.echo(f"Submitting task to {url}: {goal}")
     if ws:
         click.echo(f"Workspace: {ws}")
-    if process_name:
-        click.echo(f"Process: {process_name}")
+    if effective_process:
+        click.echo(f"Process: {effective_process}")
 
-    asyncio.run(_run_task(url, goal, ws, process_name=process_name))
+    asyncio.run(_run_task(url, goal, ws, process_name=effective_process))
 
 
 def _validate_task_id(task_id: str) -> str:
