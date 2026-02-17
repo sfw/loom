@@ -243,6 +243,7 @@ class PromptAssembler:
         discoveries: list[str],
         errors: list[str],
         original_plan: Plan,
+        replan_reason: str = "",
     ) -> str:
         """Assemble prompt for re-planning."""
         template = self.get_template("replanner")
@@ -260,10 +261,15 @@ class PromptAssembler:
         original_plan_formatted = (
             "\n".join(plan_lines) if plan_lines else "No prior plan."
         )
+        process_replanning_triggers = "None provided."
+        if self._process and self._process.replanning_triggers.strip():
+            process_replanning_triggers = self._process.replanning_triggers.strip()
 
         instructions = template.get("instructions", "").format(
             goal=goal,
             current_state_yaml=current_state_yaml,
+            replan_reason=replan_reason or "subtask failures",
+            process_replanning_triggers=process_replanning_triggers,
             discoveries_formatted=(
                 "\n".join(f"- {d}" for d in discoveries) if discoveries
                 else "None."
@@ -401,8 +407,14 @@ class PromptAssembler:
                 ", ".join(phase.depends_on) if phase.depends_on
                 else "none"
             )
+            flags = []
+            if phase.is_critical_path:
+                flags.append("critical")
+            if phase.is_synthesis:
+                flags.append("synthesis")
+            flags_text = f", flags: {', '.join(flags)}" if flags else ""
             lines.append(f"- {phase.id} (depends: {deps}, "
-                         f"tier: {phase.model_tier})")
+                         f"tier: {phase.model_tier}{flags_text})")
             lines.append(f"  {phase.description.strip()}")
             if phase.acceptance_criteria:
                 lines.append(

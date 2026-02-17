@@ -1036,6 +1036,20 @@ class TestReplannerPromptWithProcess:
         )
         assert "DOMAIN-SPECIFIC REPLANNING GUIDANCE" not in prompt
 
+    def test_replanning_triggers_and_reason_injected(self, sample_task, full_process_defn):
+        assembler = PromptAssembler(process=full_process_defn)
+        prompt = assembler.build_replanner_prompt(
+            goal=sample_task.goal,
+            current_state_yaml="status: executing",
+            discoveries=[],
+            errors=["verification failed"],
+            original_plan=sample_task.plan,
+            replan_reason="verify phase failed due inconsistent metrics",
+        )
+        assert "PROCESS REPLANNING TRIGGERS" in prompt
+        assert "When tests fail unexpectedly" in prompt
+        assert "verify phase failed due inconsistent metrics" in prompt
+
 
 class TestBackwardCompatibility:
     """Ensure that with no process loaded, everything works exactly as before."""

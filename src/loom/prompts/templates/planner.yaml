@@ -45,6 +45,7 @@ instructions: |
         "model_tier": 1,
         "verification_tier": 1,
         "is_critical_path": true,
+        "is_synthesis": false,
         "acceptance_criteria": "How to verify this is done correctly"
       }}
     ]
@@ -58,3 +59,4 @@ constraints: |
   - Set model_tier: 1 for simple file ops, 2 for code generation, 3 for complex reasoning.
   - Set verification_tier: 1 for file checks, 2 for LLM review of complex output.
   - Mark is_critical_path: true if failure blocks all downstream work.
+  - Mark is_synthesis: true for final integration/synthesis subtasks.

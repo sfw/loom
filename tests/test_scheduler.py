@@ -11,13 +11,19 @@ def _plan(*subtasks: Subtask) -> Plan:
     return Plan(subtasks=list(subtasks), version=1)
 
 
-def _subtask(id: str, depends_on: list[str] | None = None, status: str = "pending") -> Subtask:
+def _subtask(
+    id: str,
+    depends_on: list[str] | None = None,
+    status: str = "pending",
+    is_synthesis: bool = False,
+) -> Subtask:
     """Create a subtask with defaults."""
     return Subtask(
         id=id,
         description=f"Do {id}",
         status=SubtaskStatus(status),
         depends_on=depends_on or [],
+        is_synthesis=is_synthesis,
     )
 
 
@@ -112,6 +118,26 @@ class TestSchedulerRunnableSubtasks:
             _subtask("b", depends_on=["a"]),
         )
         assert scheduler.runnable_subtasks(plan) == []
+
+    def test_synthesis_waits_for_all_non_synthesis_subtasks(self):
+        scheduler = Scheduler()
+        plan = _plan(
+            _subtask("prep-a", status="completed"),
+            _subtask("prep-b", status="pending"),
+            _subtask("synthesize", depends_on=["prep-a"], is_synthesis=True),
+        )
+        runnable = scheduler.runnable_subtasks(plan)
+        assert [s.id for s in runnable] == ["prep-b"]
+
+    def test_synthesis_runs_when_all_non_synthesis_complete(self):
+        scheduler = Scheduler()
+        plan = _plan(
+            _subtask("prep-a", status="completed"),
+            _subtask("prep-b", status="completed"),
+            _subtask("synthesize", is_synthesis=True),
+        )
+        runnable = scheduler.runnable_subtasks(plan)
+        assert [s.id for s in runnable] == ["synthesize"]
 
 
 class TestSchedulerHasPending:

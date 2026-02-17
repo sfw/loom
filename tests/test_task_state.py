@@ -203,6 +203,30 @@ class TestTaskStateManager:
         assert loaded.plan.subtasks[1].status == SubtaskStatus.RUNNING
         assert loaded.plan.subtasks[2].status == SubtaskStatus.PENDING
 
+    def test_roundtrip_preserves_phase_flags(self, tmp_path: Path):
+        mgr = TaskStateManager(tmp_path)
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="critical",
+                    description="Critical work",
+                    is_critical_path=True,
+                ),
+                Subtask(
+                    id="synthesis",
+                    description="Final synthesis",
+                    is_synthesis=True,
+                    depends_on=["critical"],
+                ),
+            ]
+        )
+        mgr.create(task)
+
+        loaded = mgr.load("test-123")
+        assert loaded.plan.subtasks[0].is_critical_path is True
+        assert loaded.plan.subtasks[1].is_synthesis is True
+
     def test_workspace_changes_roundtrip(self, tmp_path: Path):
         mgr = TaskStateManager(tmp_path)
         task = _make_task()

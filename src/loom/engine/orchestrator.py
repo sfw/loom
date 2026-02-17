@@ -375,8 +375,69 @@ class Orchestrator:
                 "feedback": verification.feedback if verification else None,
             })
         else:
-            # All retries exhausted — trigger re-planning
-            await self._replan_task(task)
+            # All retries exhausted.
+            # Critical-path failures abort the remaining plan.
+            if subtask.is_critical_path:
+                await self._abort_on_critical_path_failure(
+                    task, subtask, verification,
+                )
+                return
+
+            # Non-critical failures trigger re-planning.
+            await self._replan_task(
+                task,
+                reason=self._build_replan_reason(subtask, verification),
+                failed_subtask_id=subtask.id,
+                verification_feedback=verification.feedback,
+            )
+
+    async def _abort_on_critical_path_failure(
+        self,
+        task: Task,
+        subtask: Subtask,
+        verification: VerificationResult,
+    ) -> None:
+        """Abort remaining work when a critical-path subtask exhausts retries."""
+        block_summary = (
+            f"Skipped: blocked by critical-path failure in {subtask.id}"
+        )
+        async with self._state_lock:
+            for candidate in task.plan.subtasks:
+                if candidate.status == SubtaskStatus.PENDING:
+                    candidate.status = SubtaskStatus.SKIPPED
+                    candidate.summary = block_summary
+                    task.update_subtask(
+                        candidate.id,
+                        status=SubtaskStatus.SKIPPED,
+                        summary=candidate.summary,
+                    )
+
+            task.status = TaskStatus.FAILED
+            task.add_error(
+                subtask.id,
+                (
+                    "Critical-path subtask failed after retries: "
+                    + (verification.feedback or subtask.summary or "unknown failure")
+                ),
+            )
+            self._state.save(task)
+
+    @staticmethod
+    def _build_replan_reason(
+        subtask: Subtask,
+        verification: VerificationResult,
+    ) -> str:
+        """Build a concise, structured reason string for replanning prompts."""
+        feedback = (verification.feedback or "").strip()
+        if feedback:
+            return (
+                f"Subtask '{subtask.id}' failed verification tier "
+                f"{verification.tier}: {feedback}"
+            )
+        return (
+            f"Subtask '{subtask.id}' failed verification tier "
+            f"{verification.tier} with no feedback."
+        )
 
     async def _handle_success(
         self,
@@ -647,12 +708,23 @@ class Orchestrator:
             logger.warning("Process workspace scan failed: %s", e)
             return ""
 
-    async def _replan_task(self, task: Task) -> bool:
+    async def _replan_task(
+        self,
+        task: Task,
+        *,
+        reason: str = "subtask_failures",
+        failed_subtask_id: str = "",
+        verification_feedback: str | None = None,
+    ) -> bool:
         """Re-plan the task after subtask failures.
 
         Returns True if re-planning succeeded and execution can continue.
         """
-        self._emit(TASK_REPLANNING, task.id, {"reason": "subtask_failures"})
+        self._emit(TASK_REPLANNING, task.id, {
+            "reason": reason,
+            "failed_subtask_id": failed_subtask_id,
+            "verification_feedback": verification_feedback or "",
+        })
 
         discoveries = [d for d in task.decisions_log]
         errors = [
@@ -667,6 +739,7 @@ class Orchestrator:
                 discoveries=discoveries,
                 errors=errors,
                 original_plan=task.plan,
+                replan_reason=reason,
             )
 
             model = self._router.select(tier=2, role="planner")
@@ -727,6 +800,7 @@ class Orchestrator:
                 model_tier=s.get("model_tier", 1),
                 verification_tier=s.get("verification_tier", 1),
                 is_critical_path=s.get("is_critical_path", False),
+                is_synthesis=s.get("is_synthesis", False),
                 acceptance_criteria=s.get("acceptance_criteria", ""),
                 max_retries=self._config.execution.max_subtask_retries,
             ))
@@ -754,6 +828,7 @@ class Orchestrator:
                         model_tier=phase.model_tier,
                         verification_tier=phase.verification_tier,
                         is_critical_path=phase.is_critical_path,
+                        is_synthesis=phase.is_synthesis,
                         acceptance_criteria=phase.acceptance_criteria,
                         max_retries=self._config.execution.max_subtask_retries,
                     )
@@ -765,6 +840,7 @@ class Orchestrator:
             existing.model_tier = phase.model_tier
             existing.verification_tier = phase.verification_tier
             existing.is_critical_path = phase.is_critical_path
+            existing.is_synthesis = phase.is_synthesis
             if phase.acceptance_criteria:
                 existing.acceptance_criteria = phase.acceptance_criteria
             strict_subtasks.append(existing)

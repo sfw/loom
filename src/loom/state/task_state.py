@@ -47,6 +47,7 @@ class Subtask:
     model_tier: int = 1
     verification_tier: int = 1
     is_critical_path: bool = False
+    is_synthesis: bool = False
     acceptance_criteria: str = ""
     retry_count: int = 0
     max_retries: int = 3
@@ -222,6 +223,10 @@ class TaskStateManager:
                 entry["depends_on"] = s.depends_on
             if s.description:
                 entry["description"] = s.description
+            if s.is_critical_path:
+                entry["is_critical_path"] = True
+            if s.is_synthesis:
+                entry["is_synthesis"] = True
             subtasks_data.append(entry)
 
         errors_data = []
@@ -291,6 +296,8 @@ class TaskStateManager:
                 summary=s.get("summary", ""),
                 active_issue=s.get("active_issue", ""),
                 depends_on=s.get("depends_on", []),
+                is_critical_path=bool(s.get("is_critical_path", False)),
+                is_synthesis=bool(s.get("is_synthesis", False)),
             ))
 
         errors = []
