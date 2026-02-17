@@ -860,6 +860,28 @@ class TestDelegateBindingProcess:
         await app._delegate_tool._factory()
         assert captured["process"] is app._process_defn
 
+    def test_apply_process_tool_policy_reports_missing_required_tools(self):
+        """Missing required process tools should produce a visible warning."""
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        registry = MagicMock()
+        registry.has.return_value = False
+        app._tools = registry
+        app._process_defn = SimpleNamespace(
+            tools=SimpleNamespace(excluded=[], required=["missing-tool"]),
+        )
+        chat = MagicMock()
+
+        app._apply_process_tool_policy(chat)
+
+        chat.add_info.assert_called_once()
+        assert "missing-tool" in chat.add_info.call_args.args[0]
+
 
 class TestQuitConfirmation:
     @pytest.mark.asyncio

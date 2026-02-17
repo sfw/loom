@@ -302,13 +302,25 @@ class LoomApp(App):
                 f"'{self._process_name}': {e}[/]"
             )
 
-    def _apply_process_tool_policy(self) -> None:
+    def _apply_process_tool_policy(self, chat: ChatLog) -> None:
         """Apply process tool exclusions to the active registry."""
         if not self._process_defn:
             return
         if self._process_defn.tools.excluded:
             for tool_name in self._process_defn.tools.excluded:
                 self._tools.exclude(tool_name)
+        if self._process_defn.tools.required:
+            missing = [
+                tool_name
+                for tool_name in self._process_defn.tools.required
+                if not self._tools.has(tool_name)
+            ]
+            if missing:
+                joined = ", ".join(sorted(missing))
+                chat.add_info(
+                    f"[bold #f7768e]Process requires missing tool(s): "
+                    f"{joined}[/]"
+                )
 
     def _build_system_prompt(self) -> str:
         """Build cowork system prompt with optional process extensions."""
@@ -356,7 +368,7 @@ class LoomApp(App):
                 self._tools.register(self._delegate_tool)
 
         # Build system prompt
-        self._apply_process_tool_policy()
+        self._apply_process_tool_policy(chat)
         system_prompt = self._build_system_prompt()
 
         # Build approver

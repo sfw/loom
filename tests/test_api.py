@@ -566,3 +566,16 @@ class TestEngineOrchestratorFactory:
         assert task_orch._tools is not engine.tool_registry
         assert task_orch._prompts is not engine.prompt_assembler
         assert task_orch._process == process_def
+
+    def test_create_task_orchestrator_rejects_missing_required_tools(self, engine):
+        """Process-required tools must exist at orchestrator creation time."""
+        process_def = SimpleNamespace(
+            name="process",
+            tools=SimpleNamespace(
+                excluded=[],
+                required=["definitely-missing-tool"],
+            ),
+        )
+
+        with pytest.raises(ValueError, match="requires missing tool"):
+            engine.create_task_orchestrator(process=process_def)

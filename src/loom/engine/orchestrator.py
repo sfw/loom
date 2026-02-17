@@ -129,10 +129,25 @@ class Orchestrator:
         if process is not None:
             self._prompts.process = process
 
-        # Apply tool exclusions from process definition
-        if process and process.tools.excluded:
-            for tool_name in process.tools.excluded:
+        # Apply process tool policy
+        if process:
+            excluded_tools = list(getattr(process.tools, "excluded", []) or [])
+            for tool_name in excluded_tools:
                 self._tools.exclude(tool_name)
+
+            required_tools = list(getattr(process.tools, "required", []) or [])
+            if required_tools:
+                available = set(self._tools.list_tools())
+                missing = sorted(
+                    tool_name
+                    for tool_name in required_tools
+                    if tool_name not in available
+                )
+                if missing:
+                    joined = ", ".join(missing)
+                    raise ValueError(
+                        f"Process '{process.name}' requires missing tool(s): {joined}"
+                    )
 
         # Runner handles the inner subtask execution
         self._runner = SubtaskRunner(
