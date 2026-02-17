@@ -16,6 +16,59 @@ import pytest
 from loom.config import ConfigError, load_config
 from loom.models.base import ModelConnectionError
 
+
+class _StreamingHTTPErrorResponse:
+    """Simulate httpx streaming responses where .text is unavailable."""
+
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        body: str = "",
+        fail_aread: bool = False,
+    ) -> None:
+        self.status_code = status_code
+        self.headers = {}
+        self._body = body
+        self._fail_aread = fail_aread
+
+    async def aread(self) -> bytes:
+        if self._fail_aread:
+            raise RuntimeError("read failed")
+        return self._body.encode("utf-8")
+
+    @property
+    def text(self) -> str:
+        raise RuntimeError(
+            "Attempted to access streaming response content, "
+            "without having called `read()`.",
+        )
+
+    def raise_for_status(self) -> None:
+        raise httpx.HTTPStatusError(
+            str(self.status_code),
+            request=MagicMock(),
+            response=self,
+        )
+
+    @property
+    def is_error(self) -> bool:
+        return self.status_code >= 400
+
+
+class _ErrorStreamContext:
+    """Async context manager that yields a response raising HTTPStatusError."""
+
+    def __init__(self, response: _StreamingHTTPErrorResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _StreamingHTTPErrorResponse:
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # ModelConnectionError
 # ---------------------------------------------------------------------------
@@ -92,6 +145,26 @@ class TestOpenAIProviderErrors:
         with pytest.raises(ModelConnectionError, match="HTTP 429"):
             await provider.complete([{"role": "user", "content": "hi"}])
 
+    @pytest.mark.asyncio
+    async def test_stream_http_error_does_not_access_response_text(self):
+        """Streaming HTTP errors should be reported without .text access crashes."""
+        provider = self._make_provider()
+        provider._client = MagicMock()
+        response = _StreamingHTTPErrorResponse(
+            401, body="unauthorized",
+        )
+        provider._client.stream = MagicMock(
+            return_value=_ErrorStreamContext(response),
+        )
+
+        with pytest.raises(ModelConnectionError, match="HTTP 401") as exc:
+            async for _chunk in provider.stream(
+                [{"role": "user", "content": "hi"}],
+            ):
+                pass
+
+        assert "unauthorized" in str(exc.value)
+
 
 # ---------------------------------------------------------------------------
 # Ollama provider error handling
@@ -132,6 +205,24 @@ class TestOllamaProviderErrors:
 
         with pytest.raises(ModelConnectionError, match="timed out"):
             await provider.complete([{"role": "user", "content": "hi"}])
+
+    @pytest.mark.asyncio
+    async def test_stream_http_error_with_unreadable_body(self):
+        """Streaming HTTP errors should degrade gracefully when body is unreadable."""
+        provider = self._make_provider()
+        provider._client = MagicMock()
+        response = _StreamingHTTPErrorResponse(
+            503, fail_aread=True,
+        )
+        provider._client.stream = MagicMock(
+            return_value=_ErrorStreamContext(response),
+        )
+
+        with pytest.raises(ModelConnectionError, match="HTTP 503"):
+            async for _chunk in provider.stream(
+                [{"role": "user", "content": "hi"}],
+            ):
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +294,27 @@ class TestAnthropicProviderErrors:
             ModelConnectionError, match="rate limit exceeded",
         ):
             await provider.complete([{"role": "user", "content": "hi"}])
+
+    @pytest.mark.asyncio
+    async def test_stream_http_error_does_not_crash_on_response_text(self):
+        provider = self._make_provider()
+        provider._client = MagicMock()
+        response = _StreamingHTTPErrorResponse(
+            429, body="rate limited",
+        )
+        provider._client.stream = MagicMock(
+            return_value=_ErrorStreamContext(response),
+        )
+
+        with pytest.raises(
+            ModelConnectionError, match="rate limit exceeded",
+        ) as exc:
+            async for _chunk in provider.stream(
+                [{"role": "user", "content": "hi"}],
+            ):
+                pass
+
+        assert "rate limited" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ import pytest
 from loom.setup import (
     ROLE_PRESETS,
     _generate_toml,
+    discover_models,
     needs_setup,
     run_setup,
 )
@@ -163,6 +164,7 @@ class TestRunSetup:
         cfg_path = cfg_dir / "loom.toml"
         monkeypatch.setattr("loom.setup.CONFIG_DIR", cfg_dir)
         monkeypatch.setattr("loom.setup.CONFIG_PATH", cfg_path)
+        monkeypatch.setattr("loom.setup.discover_models", lambda *a, **kw: [])
 
         # Simulate user input: provider=3 (Ollama), url=default, model=qwen3:14b,
         # roles=1 (all), confirm write=yes
@@ -202,13 +204,14 @@ class TestRunSetup:
         cfg_path = cfg_dir / "loom.toml"
         monkeypatch.setattr("loom.setup.CONFIG_DIR", cfg_dir)
         monkeypatch.setattr("loom.setup.CONFIG_PATH", cfg_path)
+        monkeypatch.setattr("loom.setup.discover_models", lambda *a, **kw: [])
 
         inputs = iter([
             # Primary model
             1,                                   # provider: Anthropic
-            1,                                   # model: claude-sonnet-4-5
             "sk-ant-test-key",                   # api key
             "https://api.anthropic.com",         # base url (default)
+            "claude-sonnet-4-5-20250929",        # model name
             2,                                   # roles: primary
             # Utility model
             3,                                   # provider: Ollama
@@ -268,6 +271,94 @@ class TestRolePresets:
     def test_primary_and_utility_cover_all(self):
         combined = set(ROLE_PRESETS["primary"]) | set(ROLE_PRESETS["utility"])
         assert combined == set(ROLE_PRESETS["all"])
+
+
+class TestDiscoverModels:
+    def test_openai_fallbacks_to_v1_models(self, monkeypatch):
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.headers = kwargs.get("headers", {})
+                self.calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, endpoint):
+                self.calls.append(endpoint)
+                if endpoint == "/models":
+                    return FakeResponse(404, {})
+                if endpoint == "/v1/models":
+                    return FakeResponse(200, {"data": [{"id": "gpt-4o"}]})
+                return FakeResponse(404, {})
+
+        fake_client = None
+
+        def fake_client_factory(**kwargs):
+            nonlocal fake_client
+            fake_client = FakeClient(**kwargs)
+            return fake_client
+
+        monkeypatch.setattr("loom.setup.httpx.Client", fake_client_factory)
+
+        models = discover_models(
+            "openai_compatible",
+            "http://localhost:1234",
+            "sk-test",
+        )
+        assert models == ["gpt-4o"]
+        assert fake_client is not None
+        assert fake_client.calls == ["/models", "/v1/models"]
+        assert fake_client.headers["authorization"] == "Bearer sk-test"
+
+    def test_ollama_discovery_deduplicates_names(self, monkeypatch):
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, endpoint):
+                self.calls.append(endpoint)
+                return FakeResponse(200, {
+                    "models": [
+                        {"name": "qwen3:14b"},
+                        {"name": "qwen3:14b"},
+                        {"model": "llama3:8b"},
+                    ],
+                })
+
+        fake_client = FakeClient()
+        monkeypatch.setattr("loom.setup.httpx.Client", lambda **kwargs: fake_client)
+
+        models = discover_models(
+            "ollama",
+            "http://localhost:11434",
+        )
+        assert models == ["qwen3:14b", "llama3:8b"]
+        assert fake_client.calls == ["/api/tags"]
 
 
 class TestSetupScreen:
@@ -364,6 +455,195 @@ class TestSetupScreen:
 
         assert len(screen._models) == 1
         assert screen._step == _STEP_UTILITY
+
+    def test_collect_details_autodiscovers_when_model_missing(self, monkeypatch):
+        """If model is blank, details collection should auto-discover."""
+        from types import SimpleNamespace
+
+        from loom.tui.screens import setup as setup_mod
+        from loom.tui.screens.setup import (
+            _STEP_ROLES,
+            SetupScreen,
+        )
+
+        screen = SetupScreen()
+        screen._provider_key = "openai_compatible"
+
+        url_input = SimpleNamespace(value="http://localhost:1234/v1", focus=lambda: None)
+        api_input = SimpleNamespace(value="", focus=lambda: None)
+        model_input = SimpleNamespace(value="", focus=lambda: None)
+        discover_button = SimpleNamespace(disabled=False)
+        discovery_panel = SimpleNamespace(update=lambda *_: None)
+        selection_feedback = SimpleNamespace(update=lambda *_: None)
+
+        widgets = {
+            "#input-url": url_input,
+            "#input-apikey": api_input,
+            "#input-model": model_input,
+            "#btn-discover": discover_button,
+            "#discovery-results": discovery_panel,
+            "#selection-feedback": selection_feedback,
+        }
+        screen.query_one = lambda selector, *_args, **_kwargs: widgets[selector]
+        screen.notify = lambda *_args, **_kwargs: None
+
+        monkeypatch.setattr(
+            setup_mod,
+            "discover_models",
+            lambda *_a, **_kw: ["gpt-4o-mini", "gpt-4o"],
+        )
+
+        screen._collect_details()
+        assert screen._model_name == "gpt-4o-mini"
+        assert model_input.value == "gpt-4o-mini"
+        assert screen._step == _STEP_ROLES
+
+    def test_digit_selects_discovered_model(self):
+        """Digit key should pick discovered models in details step."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from loom.tui.screens.setup import (
+            _STEP_DETAILS,
+            SetupScreen,
+        )
+
+        screen = SetupScreen()
+        screen._show_step = MagicMock()
+        screen._step = _STEP_DETAILS
+        screen._discovered_models = ["model-a", "model-b"]
+        screen.notify = lambda *_args, **_kwargs: None
+
+        model_input = SimpleNamespace(value="", focus=lambda: None)
+        selection_feedback = SimpleNamespace(update=lambda *_: None)
+        widgets = {
+            "#input-model": model_input,
+            "#selection-feedback": selection_feedback,
+        }
+        screen.query_one = lambda selector, *_args, **_kwargs: widgets[selector]
+
+        event = MagicMock()
+        event.key = "2"
+        screen.on_key(event)
+
+        assert screen._model_name == "model-b"
+        assert model_input.value == "model-b"
+        event.prevent_default.assert_called_once()
+        event.stop.assert_called_once()
+
+    def test_discovery_requires_anthropic_key(self):
+        """Anthropic discovery should stay disabled until API key is provided."""
+        from types import SimpleNamespace
+
+        from loom.tui.screens.setup import SetupScreen
+
+        screen = SetupScreen()
+        screen._provider_key = "anthropic"
+
+        url_input = SimpleNamespace(value="https://api.anthropic.com")
+        api_input = SimpleNamespace(value="")
+        discover_button = SimpleNamespace(disabled=False)
+        panel_updates = []
+        discovery_panel = SimpleNamespace(update=lambda text: panel_updates.append(text))
+
+        widgets = {
+            "#input-url": url_input,
+            "#input-apikey": api_input,
+            "#btn-discover": discover_button,
+            "#discovery-results": discovery_panel,
+        }
+        screen.query_one = lambda selector, *_args, **_kwargs: widgets[selector]
+
+        screen._render_discovered_models([])
+        assert discover_button.disabled is True
+        assert any("API key" in text for text in panel_updates)
+
+        api_input.value = "sk-ant-test"
+        screen._render_discovered_models([])
+        assert discover_button.disabled is False
+
+    def test_discovery_render_limits_visible_entries(self):
+        """Discovery panel should cap visible entries to avoid overflow."""
+        from types import SimpleNamespace
+
+        from loom.tui.screens.setup import SetupScreen
+
+        screen = SetupScreen()
+        screen._provider_key = "openai_compatible"
+
+        url_input = SimpleNamespace(value="http://localhost:1234/v1")
+        api_input = SimpleNamespace(value="")
+        discover_button = SimpleNamespace(disabled=False)
+        panel_updates = []
+        discovery_panel = SimpleNamespace(update=lambda text: panel_updates.append(text))
+
+        widgets = {
+            "#input-url": url_input,
+            "#input-apikey": api_input,
+            "#btn-discover": discover_button,
+            "#discovery-results": discovery_panel,
+        }
+        screen.query_one = lambda selector, *_args, **_kwargs: widgets[selector]
+
+        models = [f"model-{i}" for i in range(1, 11)]
+        screen._render_discovered_models(models)
+
+        assert panel_updates
+        rendered = panel_updates[-1]
+        assert "Press 1-6 to pick" in rendered
+        assert "... 4 more" in rendered
+
+
+class TestSetupScreenConfirmHotkeys:
+    """Verify save-step keyboard shortcuts behave as documented."""
+
+    def test_confirm_save_hotkeys(self):
+        from unittest.mock import MagicMock
+
+        from loom.tui.screens.setup import (
+            _STEP_CONFIRM,
+            SetupScreen,
+        )
+
+        screen = SetupScreen()
+        screen._step = _STEP_CONFIRM
+
+        saved = []
+        screen._save_and_dismiss = lambda: saved.append(True)
+
+        for expected_calls, key in enumerate(("enter", "y", "Y", "s", "S"), start=1):
+            event = MagicMock()
+            event.key = key
+            screen.on_key(event)
+            assert len(saved) == expected_calls
+            event.prevent_default.assert_called_once()
+            event.stop.assert_called_once()
+
+        assert len(saved) == 5
+
+    def test_confirm_back_hotkeys(self):
+        from unittest.mock import MagicMock
+
+        from loom.tui.screens.setup import (
+            _STEP_CONFIRM,
+            SetupScreen,
+        )
+
+        screen = SetupScreen()
+        screen._step = _STEP_CONFIRM
+
+        back_calls = []
+        screen.action_back_or_cancel = lambda: back_calls.append(True)
+
+        for expected_calls, key in enumerate(("b", "B"), start=1):
+            event = MagicMock()
+            event.key = key
+            screen.on_key(event)
+            assert len(back_calls) == expected_calls
+            event.prevent_default.assert_called_once()
+            event.stop.assert_called_once()
+
+        assert len(back_calls) == 2
 
 
 class TestSetupScreenModelDrafts:

@@ -95,6 +95,49 @@ class AnthropicProvider(ModelProvider):
             )
         return self._client
 
+    @staticmethod
+    async def _http_error_body(response: httpx.Response, limit: int = 200) -> str:
+        """Safely extract an HTTP error body from normal or streaming responses."""
+        try:
+            body = await response.aread()
+            if body:
+                return body.decode("utf-8", errors="replace")[:limit]
+        except Exception:
+            pass
+
+        try:
+            return str(response.text)[:limit]
+        except Exception:
+            return "<response body unavailable>"
+
+    @staticmethod
+    def _anthropic_error_message(status: int, body_text: str, retry_after: str = "") -> str:
+        """Build a human-friendly Anthropic error message from status + body."""
+        parsed_message = ""
+        if body_text and body_text != "<response body unavailable>":
+            try:
+                data = json.loads(body_text)
+                if isinstance(data, dict):
+                    err = data.get("error", {})
+                    if isinstance(err, dict):
+                        parsed_message = str(err.get("message", "")).strip()
+            except Exception:
+                parsed_message = ""
+
+        if status == 401:
+            base = "Invalid Anthropic API key"
+        elif status == 429:
+            if retry_after:
+                base = f"Anthropic rate limit exceeded (retry-after: {retry_after}s)"
+            else:
+                base = "Anthropic rate limit exceeded"
+        else:
+            base = f"Anthropic returned HTTP {status}"
+
+        if parsed_message:
+            return f"{base}: {parsed_message}"
+        return f"{base}: {body_text}"
+
     async def close(self) -> None:
         if self._client:
             await self._client.aclose()
@@ -409,19 +452,11 @@ class AnthropicProvider(ModelProvider):
             ) from e
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            body_text = e.response.text[:200]
-            if status == 401:
-                msg = "Invalid Anthropic API key"
-            elif status == 429:
-                retry_after = e.response.headers.get("retry-after", "")
-                if retry_after:
-                    msg = f"Anthropic rate limit exceeded (retry-after: {retry_after}s)"
-                else:
-                    msg = "Anthropic rate limit exceeded"
-            else:
-                msg = f"Anthropic returned HTTP {status}"
+            body_text = await self._http_error_body(e.response)
+            retry_after = e.response.headers.get("retry-after", "")
+            msg = self._anthropic_error_message(status, body_text, retry_after)
             raise ModelConnectionError(
-                f"{msg}: {body_text}", original=e,
+                msg, original=e,
             ) from e
         return self._parse_response(response.json())
 
@@ -462,7 +497,13 @@ class AnthropicProvider(ModelProvider):
 
         try:
             async with client.stream("POST", "/v1/messages", json=body) as response:
-                response.raise_for_status()
+                if response.is_error:
+                    body_text = await self._http_error_body(response)
+                    retry_after = response.headers.get("retry-after", "")
+                    msg = self._anthropic_error_message(
+                        response.status_code, body_text, retry_after,
+                    )
+                    raise ModelConnectionError(msg)
 
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
@@ -546,18 +587,6 @@ class AnthropicProvider(ModelProvider):
                 f"Anthropic streaming timed out "
                 f"({self._model}): {e}",
                 original=e,
-            ) from e
-        except httpx.HTTPStatusError as e:
-            status = e.response.status_code
-            body_text = e.response.text[:200]
-            if status == 401:
-                msg = "Invalid Anthropic API key"
-            elif status == 429:
-                msg = "Anthropic rate limit exceeded"
-            else:
-                msg = f"Anthropic returned HTTP {status}"
-            raise ModelConnectionError(
-                f"{msg}: {body_text}", original=e,
             ) from e
         except httpx.ReadError as e:
             raise ModelConnectionError(
