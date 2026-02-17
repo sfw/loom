@@ -49,7 +49,7 @@ phases:
   - id: valuation-model
     description: >
       Build DCF with explicit assumptions. Cross-check with comparable
-      multiples (EV/EBITDA, P/E, EV/Revenue). Provide bear/base/bull range.
+      multiples (EV/EBITDA, P/E, EV/Revenue, PEG). Provide bear/base/bull range.
     depends_on: [financial-analysis]
     model_tier: 3
     verification_tier: 2

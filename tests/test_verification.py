@@ -103,6 +103,38 @@ class TestDeterministicVerifier:
         assert "Permission denied" in result.feedback
 
     @pytest.mark.asyncio
+    async def test_web_tool_transient_failure_is_advisory(self):
+        v = DeterministicVerifier()
+        tc = MockToolCallRecord(
+            tool="web_fetch",
+            args={"url": "https://example.com"},
+            result=ToolResult.fail("HTTP 403: https://example.com"),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert result.passed
+        assert any(
+            c.name == "tool_web_fetch_advisory" and c.passed
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_web_tool_safety_failure_still_blocks(self):
+        v = DeterministicVerifier()
+        tc = MockToolCallRecord(
+            tool="web_fetch",
+            args={"url": "http://localhost:8080"},
+            result=ToolResult.fail(
+                "Blocked host: localhost (private/internal network)",
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert any(
+            c.name == "tool_web_fetch_success" and not c.passed
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
     async def test_checks_file_nonempty(self, tmp_path):
         # Create a non-empty file
         test_file = tmp_path / "out.py"
@@ -353,21 +385,28 @@ def _make_process(
 
 
 class TestDeterministicVerifierDeliverables:
-    """Tests for deliverable checking — verifies the flattening fix."""
+    """Tests for phase-scoped deliverable checking."""
 
     @pytest.mark.asyncio
     async def test_deliverables_found_in_workspace(self, tmp_path):
-        """Deliverables that exist on disk should pass."""
+        """Only the active phase deliverables should be enforced."""
         (tmp_path / "report.md").write_text("Report content")
-        (tmp_path / "data.csv").write_text("a,b\n1,2")
 
         process = _make_process(deliverables={
             "research": ["report.md"],
             "analysis": ["data.csv"],
         })
         v = DeterministicVerifier(process=process)
-        result = await v.verify(_make_subtask(), "output", [], tmp_path)
+        result = await v.verify(
+            _make_subtask(subtask_id="research"),
+            "output",
+            [],
+            tmp_path,
+        )
         assert result.passed
+        check_names = {c.name for c in result.checks}
+        assert "deliverable_report.md" in check_names
+        assert "deliverable_data.csv" not in check_names
 
     @pytest.mark.asyncio
     async def test_deliverables_found_in_tool_calls(self, tmp_path):
@@ -381,7 +420,12 @@ class TestDeterministicVerifierDeliverables:
             result=ToolResult.ok("ok", files_changed=["output.txt"]),
         )
         v = DeterministicVerifier(process=process)
-        result = await v.verify(_make_subtask(), "output", [tc], tmp_path)
+        result = await v.verify(
+            _make_subtask(subtask_id="phase1"),
+            "output",
+            [tc],
+            tmp_path,
+        )
         assert result.passed
 
     @pytest.mark.asyncio
@@ -391,31 +435,50 @@ class TestDeterministicVerifierDeliverables:
             "phase1": ["missing.txt"],
         })
         v = DeterministicVerifier(process=process)
-        result = await v.verify(_make_subtask(), "output", [], tmp_path)
+        result = await v.verify(
+            _make_subtask(subtask_id="phase1"),
+            "output",
+            [],
+            tmp_path,
+        )
         assert not result.passed
         failed = [c for c in result.checks if not c.passed]
         assert any("missing.txt" in (c.detail or "") for c in failed)
 
     @pytest.mark.asyncio
-    async def test_deliverables_flattened_across_phases(self, tmp_path):
-        """All phases' deliverables are checked, not just the subtask's phase."""
+    async def test_deliverables_do_not_flatten_across_phases(self, tmp_path):
+        """Non-active phase deliverables should not fail the current phase."""
         (tmp_path / "file_a.md").write_text("content")
-        # file_b.md is NOT created — should fail
         process = _make_process(deliverables={
             "phase_a": ["file_a.md"],
             "phase_b": ["file_b.md"],
         })
         v = DeterministicVerifier(process=process)
-        # Use subtask_id that doesn't match any phase_id
         result = await v.verify(
-            _make_subtask(subtask_id="unrelated-id"),
+            _make_subtask(subtask_id="phase_a"),
             "output", [], tmp_path,
         )
-        assert not result.passed
-        # file_a.md should pass, file_b.md should fail
+        assert result.passed
         check_names = {c.name: c.passed for c in result.checks}
         assert check_names.get("deliverable_file_a.md") is True
-        assert check_names.get("deliverable_file_b.md") is False
+        assert "deliverable_file_b.md" not in check_names
+
+    @pytest.mark.asyncio
+    async def test_unmatched_subtask_id_skips_multi_phase_deliverables(self, tmp_path):
+        """Unmapped subtask IDs should not enforce unrelated phase outputs."""
+        process = _make_process(deliverables={
+            "phase_a": ["file_a.md"],
+            "phase_b": ["file_b.md"],
+        })
+        v = DeterministicVerifier(process=process)
+        result = await v.verify(
+            _make_subtask(subtask_id="planner-generated-id"),
+            "output",
+            [],
+            tmp_path,
+        )
+        assert result.passed
+        assert not any(c.name.startswith("deliverable_") for c in result.checks)
 
 
 class TestDeterministicVerifierRegexRules:

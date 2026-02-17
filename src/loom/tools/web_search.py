@@ -6,6 +6,8 @@ Parses DuckDuckGo HTML results to extract titles, URLs, and snippets.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 
 import httpx
@@ -15,6 +17,11 @@ from loom.tools.registry import Tool, ToolContext, ToolResult
 SEARCH_TIMEOUT = 15.0
 MAX_RESULTS = 10
 DDG_URL = "https://html.duckduckgo.com/html/"
+DDG_FALLBACK_URL = "https://duckduckgo.com/html/"
+MAX_SEARCH_ATTEMPTS = 3
+SEARCH_RETRY_BASE_DELAY = 0.4
+RETRYABLE_SEARCH_STATUS = frozenset({403, 408, 425, 429, 500, 502, 503, 504})
+DEFAULT_SEARCH_USER_AGENT = "Loom/1.0 (+https://github.com/sfw/loom)"
 
 
 class WebSearchTool(Tool):
@@ -84,27 +91,106 @@ class WebSearchTool(Tool):
 
 
 async def _search_ddg(query: str, max_results: int) -> list[dict]:
-    """Search DuckDuckGo HTML and parse results."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-    }
-
+    """Search DuckDuckGo HTML endpoints and parse results."""
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=httpx.Timeout(SEARCH_TIMEOUT),
-        headers=headers,
+        headers=_build_search_headers(),
     ) as client:
-        response = await client.post(
-            DDG_URL,
-            data={"q": query, "b": ""},
+        errors: list[str] = []
+        endpoints = (
+            ("POST", DDG_URL),
+            ("GET", DDG_URL),
+            ("GET", DDG_FALLBACK_URL),
         )
-        response.raise_for_status()
-        html = response.text
 
-    return _parse_ddg_html(html, max_results)
+        for method, endpoint in endpoints:
+            try:
+                html = await _query_search_endpoint(
+                    client=client,
+                    method=method,
+                    endpoint=endpoint,
+                    query=query,
+                )
+            except Exception as e:
+                errors.append(f"{endpoint}: {e}")
+                continue
+
+            parsed = _parse_ddg_html(html, max_results)
+            if parsed:
+                return parsed
+
+        if errors:
+            raise RuntimeError("All search endpoints failed: " + "; ".join(errors))
+
+    return []
+
+
+def _build_search_headers() -> dict[str, str]:
+    """Build default search headers for web search requests."""
+    user_agent = os.environ.get("LOOM_WEB_USER_AGENT", "").strip()
+    if not user_agent:
+        user_agent = DEFAULT_SEARCH_USER_AGENT
+    return {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://duckduckgo.com/",
+        "Cache-Control": "no-cache",
+    }
+
+
+def _is_retryable_search_status(status_code: int) -> bool:
+    """Return True if a search HTTP status is likely transient."""
+    return status_code in RETRYABLE_SEARCH_STATUS
+
+
+async def _query_search_endpoint(
+    client: httpx.AsyncClient,
+    method: str,
+    endpoint: str,
+    query: str,
+) -> str:
+    """Query a DDG endpoint with bounded retries and return HTML body."""
+    method = method.upper()
+    for attempt in range(MAX_SEARCH_ATTEMPTS):
+        try:
+            if method == "POST":
+                response = await client.post(endpoint, data={"q": query, "b": ""})
+            else:
+                response = await client.get(endpoint, params={"q": query})
+
+            if (
+                _is_retryable_search_status(response.status_code)
+                and attempt < MAX_SEARCH_ATTEMPTS - 1
+            ):
+                await asyncio.sleep(SEARCH_RETRY_BASE_DELAY * (2 ** attempt))
+                continue
+
+            response.raise_for_status()
+            return response.text
+        except (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+        ):
+            if attempt >= MAX_SEARCH_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(SEARCH_RETRY_BASE_DELAY * (2 ** attempt))
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response else None
+            if (
+                status is not None
+                and _is_retryable_search_status(status)
+                and attempt < MAX_SEARCH_ATTEMPTS - 1
+            ):
+                await asyncio.sleep(SEARCH_RETRY_BASE_DELAY * (2 ** attempt))
+                continue
+            raise
+
+    raise RuntimeError(
+        f"Search failed after {MAX_SEARCH_ATTEMPTS} attempts: {endpoint}"
+    )
 
 
 def _parse_ddg_html(html: str, max_results: int) -> list[dict]:

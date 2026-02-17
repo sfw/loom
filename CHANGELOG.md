@@ -37,8 +37,11 @@ All notable changes to Loom are documented in this file.
 - **README TUI docs updated for process controls** (`README.md`) -- interface section now documents in-session process commands (`/process list`, `/process use`, `/process off`).
 - **Process/package docs parity updates** (`README.md`, `docs/creating-packages.md`, `docs/agent-integration.md`) -- docs now reflect fail-fast `tools.required`, built-in phase modes, isolated dependency install mode, collision policy, and package troubleshooting/checklist guidance.
 - **Process/package system refactor plan documented** (`planning/refactors/2026-02-17-PROCESS-PACKAGE-SYSTEM-PLAN.md`) -- added a prioritized execution plan covering TUI/API parity, strictness enforcement, package hardening, and demo-readiness criteria.
+- **Web tool request resilience** (`tools/web.py`, `tools/web_search.py`) -- `web_fetch` and `web_search` now send explicit browser-compatible headers (with `LOOM_WEB_USER_AGENT` override), apply bounded retry/backoff for transient network/HTTP failures, and search now falls back across DuckDuckGo HTML endpoints before surfacing failure.
 
 ### Fixed
+- **Process deliverable verification scoping** (`engine/verification.py`) -- deterministic deliverable checks are now phase-scoped to the active subtask ID instead of flattening all process deliverables into every subtask verification, preventing early-phase false negatives in strict workflows.
+- **Web tool verification brittleness** (`engine/verification.py`) -- deterministic verification now treats transient `web_fetch`/`web_search` failures (403/429/5xx/timeouts/connectivity) as advisory while still failing on safety/policy violations and malformed tool usage.
 - **API process cross-task leakage** (`api/routes.py`, `api/engine.py`) -- process-backed task execution now uses an isolated per-task orchestrator instead of mutating shared orchestrator internals (`_process`, `_prompts`). Prevents process collisions and state bleed between concurrent tasks.
 - **API process configuration parity** (`api/routes.py`) -- process loading now honors `config.process.search_paths`, matching TUI/CLI resolution behavior.
 - **TUI files panel session bleed** (`tui/app.py`) -- file-change history/diff view is now reset on `/new` session creation and `/resume` session switching.

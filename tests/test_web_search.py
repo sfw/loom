@@ -8,8 +8,11 @@ import pytest
 
 from loom.tools.registry import ToolContext
 from loom.tools.web_search import (
+    DEFAULT_SEARCH_USER_AGENT,
     WebSearchTool,
+    _build_search_headers,
     _clean_ddg_url,
+    _is_retryable_search_status,
     _parse_ddg_html,
     _strip_tags,
 )
@@ -103,3 +106,22 @@ class TestWebSearchTool:
 
     def test_timeout(self, tool):
         assert tool.timeout_seconds == 30
+
+
+class TestSearchRequestDefaults:
+    def test_build_search_headers_default_ua(self, monkeypatch):
+        monkeypatch.delenv("LOOM_WEB_USER_AGENT", raising=False)
+        headers = _build_search_headers()
+        assert headers["User-Agent"] == DEFAULT_SEARCH_USER_AGENT
+        assert "Referer" in headers
+
+    def test_build_search_headers_env_override(self, monkeypatch):
+        monkeypatch.setenv("LOOM_WEB_USER_AGENT", "MyAgent/9.9")
+        headers = _build_search_headers()
+        assert headers["User-Agent"] == "MyAgent/9.9"
+
+    def test_retryable_search_status_codes(self):
+        assert _is_retryable_search_status(403)
+        assert _is_retryable_search_status(429)
+        assert _is_retryable_search_status(503)
+        assert not _is_retryable_search_status(404)

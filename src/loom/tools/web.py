@@ -6,7 +6,9 @@ timeout, max response size, and URL validation.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import os
 import re
 import socket
 
@@ -23,6 +25,10 @@ _BLOCKED_HOSTS = re.compile(
 
 MAX_RESPONSE_SIZE = 512 * 1024  # 512KB
 FETCH_TIMEOUT = 30.0
+MAX_FETCH_ATTEMPTS = 3
+FETCH_RETRY_BASE_DELAY = 0.4
+RETRYABLE_HTTP_STATUS = frozenset({403, 408, 425, 429, 500, 502, 503, 504})
+DEFAULT_WEB_USER_AGENT = "Loom/1.0 (+https://github.com/sfw/loom)"
 
 
 def _is_private_ip(ip_str: str) -> bool:
@@ -71,6 +77,58 @@ def is_safe_url(url: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _build_request_headers() -> dict[str, str]:
+    """Build default request headers for web requests.
+
+    `LOOM_WEB_USER_AGENT` can override the default user-agent.
+    """
+    user_agent = os.environ.get("LOOM_WEB_USER_AGENT", "").strip()
+    if not user_agent:
+        user_agent = DEFAULT_WEB_USER_AGENT
+    return {
+        "User-Agent": user_agent,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "text/plain;q=0.8,*/*;q=0.7"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+
+def _should_retry_status(status_code: int) -> bool:
+    """Return True if an HTTP status is likely transient."""
+    return status_code in RETRYABLE_HTTP_STATUS
+
+
+async def _get_with_retries(
+    client: httpx.AsyncClient,
+    url: str,
+) -> httpx.Response:
+    """GET URL with bounded retries for transient failures."""
+    for attempt in range(MAX_FETCH_ATTEMPTS):
+        try:
+            response = await client.get(url)
+            if (
+                _should_retry_status(response.status_code)
+                and attempt < MAX_FETCH_ATTEMPTS - 1
+            ):
+                await asyncio.sleep(FETCH_RETRY_BASE_DELAY * (2 ** attempt))
+                continue
+            return response
+        except (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+        ):
+            if attempt >= MAX_FETCH_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(FETCH_RETRY_BASE_DELAY * (2 ** attempt))
+
+    raise RuntimeError(f"Fetch failed after {MAX_FETCH_ATTEMPTS} attempts: {url}")
+
+
 class WebFetchTool(Tool):
     @property
     def name(self) -> str:
@@ -117,11 +175,13 @@ class WebFetchTool(Tool):
             return ToolResult.fail(reason)
 
         try:
+            headers = _build_request_headers()
             async with httpx.AsyncClient(
                 follow_redirects=False,
                 timeout=httpx.Timeout(FETCH_TIMEOUT),
+                headers=headers,
             ) as client:
-                response = await client.get(url)
+                response = await _get_with_retries(client, url)
 
                 # Follow redirects manually to validate each target against SSRF
                 redirect_count = 0
@@ -135,7 +195,10 @@ class WebFetchTool(Tool):
                     redir_safe, redir_reason = is_safe_url(location)
                     if not redir_safe:
                         return ToolResult.fail(f"Redirect blocked: {redir_reason}")
-                    response = await client.get(location)
+                    response = await _get_with_retries(client, location)
+
+                if response.is_redirect:
+                    return ToolResult.fail("Too many redirects (max 5)")
 
                 response.raise_for_status()
 
@@ -170,11 +233,14 @@ class WebFetchTool(Tool):
                     },
                 )
         except httpx.HTTPStatusError as e:
-            return ToolResult.fail(f"HTTP {e.response.status_code}: {url}")
+            target = str(e.request.url) if e.request else url
+            return ToolResult.fail(f"HTTP {e.response.status_code}: {target}")
         except httpx.TimeoutException:
             return ToolResult.fail(f"Timeout fetching: {url}")
         except httpx.ConnectError:
             return ToolResult.fail(f"Connection failed: {url}")
+        except httpx.RemoteProtocolError:
+            return ToolResult.fail(f"Protocol error fetching: {url}")
         except Exception as e:
             return ToolResult.fail(f"Fetch error: {e}")
 

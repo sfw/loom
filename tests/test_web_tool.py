@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from loom.tools.web import _strip_html, is_safe_url
+from loom.tools.web import (
+    DEFAULT_WEB_USER_AGENT,
+    _build_request_headers,
+    _should_retry_status,
+    _strip_html,
+    is_safe_url,
+)
 
 # --- URL Safety ---
 
@@ -113,3 +119,23 @@ class TestSSRFDnsResolution:
         assert _is_private_ip("172.16.0.1")
         assert _is_private_ip("::1")
         assert not _is_private_ip("8.8.8.8")
+
+
+class TestWebRequestDefaults:
+    def test_build_request_headers_default_ua(self, monkeypatch):
+        monkeypatch.delenv("LOOM_WEB_USER_AGENT", raising=False)
+        headers = _build_request_headers()
+        assert headers["User-Agent"] == DEFAULT_WEB_USER_AGENT
+        assert "Accept" in headers
+        assert "Accept-Language" in headers
+
+    def test_build_request_headers_env_override(self, monkeypatch):
+        monkeypatch.setenv("LOOM_WEB_USER_AGENT", "MyAgent/9.9")
+        headers = _build_request_headers()
+        assert headers["User-Agent"] == "MyAgent/9.9"
+
+    def test_retryable_status_codes(self):
+        assert _should_retry_status(403)
+        assert _should_retry_status(429)
+        assert _should_retry_status(503)
+        assert not _should_retry_status(404)
