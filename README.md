@@ -142,7 +142,7 @@ In the TUI, use `/learned` to open an interactive review screen where you can in
 
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), and learned pattern review (`/learned`).
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name>`, `/process off`), and learned pattern review (`/learned`).
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 

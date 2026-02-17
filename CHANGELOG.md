@@ -31,6 +31,7 @@ All notable changes to Loom are documented in this file.
 - **Installer now preserves full package assets with artifact filtering** (`processes/installer.py`) -- package installation now copies full process directories (templates/examples/docs and other assets), while excluding VCS/cache/bytecode artifacts such as `.git/`, `__pycache__/`, and `*.pyc`.
 - **Strict process phase-mode enforcement in planning** (`engine/orchestrator.py`) -- when a process declares `phase_mode: strict`, planner output is now normalized to the declared phase blueprint (IDs/order/dependencies/tier/acceptance), preventing drift from required process DAG structure.
 - **Google Analytics package install docs corrected** (`packages/google-analytics/README.md`) -- updated install example to a valid source format (`https://github.com/...`) accepted by `loom install`.
+- **README TUI docs updated for process controls** (`README.md`) -- interface section now documents in-session process commands (`/process list`, `/process use`, `/process off`).
 - **Process/package system refactor plan documented** (`planning/refactors/2026-02-17-PROCESS-PACKAGE-SYSTEM-PLAN.md`) -- added a prioritized execution plan covering TUI/API parity, strictness enforcement, package hardening, and demo-readiness criteria.
 
 ### Fixed
