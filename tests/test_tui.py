@@ -719,6 +719,147 @@ class TestFilesPanelReset:
         panel.clear_files.assert_called_once()
         panel.show_diff.assert_called_once_with("")
 
+    @pytest.mark.asyncio
+    async def test_new_session_uses_process_system_prompt(self):
+        """Creating a new session should preserve active process prompt text."""
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._model = MagicMock()
+        app._model.name = "test-model"
+        app._session = SimpleNamespace(session_id="old-session")
+        app._store = MagicMock()
+        app._store.update_session = AsyncMock()
+        app._store.create_session = AsyncMock(return_value="new-session")
+        app._bind_session_tools = MagicMock()
+        app._process_defn = SimpleNamespace(
+            persona="You are a process specialist.",
+            tool_guidance="Use process tool guidance.",
+        )
+        panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#files-panel":
+                return panel
+            return chat
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        await app._new_session()
+
+        create_kwargs = app._store.create_session.await_args.kwargs
+        prompt = create_kwargs["system_prompt"]
+        assert "DOMAIN ROLE" in prompt
+        assert "process specialist" in prompt
+        assert "DOMAIN TOOL GUIDANCE" in prompt
+
+    @pytest.mark.asyncio
+    async def test_switch_session_uses_process_system_prompt(self, monkeypatch):
+        """Switching sessions should keep process prompt extensions."""
+        from loom.tui.app import LoomApp
+
+        captured_prompt: dict[str, str] = {}
+
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                captured_prompt["value"] = kwargs["system_prompt"]
+                self.session_id = ""
+                self.session_state = SimpleNamespace(turn_count=3)
+                self.total_tokens = 99
+                self.workspace = Path("/tmp")
+
+            async def resume(self, session_id: str):
+                self.session_id = session_id
+
+        monkeypatch.setattr("loom.tui.app.CoworkSession", FakeSession)
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._model = MagicMock()
+        app._model.name = "test-model"
+        app._session = SimpleNamespace(session_id="old-session")
+        app._store = MagicMock()
+        app._store.update_session = AsyncMock()
+        app._bind_session_tools = MagicMock()
+        app._process_defn = SimpleNamespace(
+            persona="You are a process specialist.",
+            tool_guidance="Use process tool guidance.",
+        )
+        panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#files-panel":
+                return panel
+            return chat
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        await app._switch_to_session("new-session")
+
+        prompt = captured_prompt["value"]
+        assert "DOMAIN ROLE" in prompt
+        assert "process specialist" in prompt
+        assert "DOMAIN TOOL GUIDANCE" in prompt
+
+
+class TestDelegateBindingProcess:
+    @pytest.mark.asyncio
+    async def test_delegate_orchestrator_factory_includes_process(self, monkeypatch):
+        """delegate_task should spawn process-aware orchestrators when active."""
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tui.app import LoomApp
+
+        captured: dict[str, object] = {}
+
+        class FakeOrchestrator:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("loom.engine.orchestrator.Orchestrator", FakeOrchestrator)
+        monkeypatch.setattr("loom.events.bus.EventBus", lambda: MagicMock())
+        monkeypatch.setattr(
+            "loom.models.router.ModelRouter.from_config",
+            lambda _cfg: MagicMock(),
+        )
+        monkeypatch.setattr("loom.prompts.assembler.PromptAssembler", lambda: MagicMock())
+        monkeypatch.setattr("loom.state.memory.MemoryManager", lambda _db: MagicMock())
+        monkeypatch.setattr("loom.state.task_state.TaskStateManager", lambda _dir: MagicMock())
+        monkeypatch.setattr("loom.tools.create_default_registry", lambda: MagicMock())
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(
+            session_id="session-id",
+            session_state=SimpleNamespace(),
+        )
+        app._delegate_tool = DelegateTaskTool()
+        app._config = SimpleNamespace(
+            workspace=SimpleNamespace(scratch_dir="/tmp"),
+        )
+        app._db = MagicMock()
+        app._process_defn = SimpleNamespace(
+            name="marketing-strategy",
+            tools=SimpleNamespace(excluded=[]),
+        )
+
+        app._bind_session_tools()
+
+        assert app._delegate_tool._factory is not None
+        await app._delegate_tool._factory()
+        assert captured["process"] is app._process_defn
+
 
 class TestQuitConfirmation:
     @pytest.mark.asyncio

@@ -74,6 +74,7 @@ from loom.tui.widgets.tool_call import tool_args_preview
 
 if TYPE_CHECKING:
     from loom.config import Config
+    from loom.processes.schema import ProcessDefinition
     from loom.state.conversation_store import ConversationStore
     from loom.state.memory import Database
 
@@ -178,6 +179,7 @@ class LoomApp(App):
         self._store = store
         self._resume_session = resume_session
         self._process_name = process_name
+        self._process_defn: ProcessDefinition | None = None
         self._session: CoworkSession | None = None
         self._busy = False
         self._total_tokens = 0
@@ -266,6 +268,63 @@ class LoomApp(App):
 
         await self._initialize_session()
 
+    def _refresh_tool_registry(self) -> None:
+        """Reset registry to discovered tools."""
+        from loom.tools import create_default_registry
+
+        self._tools = create_default_registry()
+
+    def _load_process_definition(self, chat: ChatLog) -> None:
+        """Load active process definition and import bundled tools."""
+        self._process_defn = None
+        if not self._process_name or not self._config:
+            return
+
+        from loom.processes.schema import ProcessLoader
+
+        extra = [Path(p) for p in self._config.process.search_paths]
+        loader = ProcessLoader(
+            workspace=self._workspace,
+            extra_search_paths=extra,
+        )
+        try:
+            self._process_defn = loader.load(self._process_name)
+            # Process load may import bundled tool modules; rebuild to include
+            # them in the active registry.
+            self._refresh_tool_registry()
+            chat.add_info(
+                f"Process: [bold]{self._process_defn.name}[/bold] "
+                f"v{self._process_defn.version}"
+            )
+        except Exception as e:
+            chat.add_info(
+                f"[bold #f7768e]Failed to load process "
+                f"'{self._process_name}': {e}[/]"
+            )
+
+    def _apply_process_tool_policy(self) -> None:
+        """Apply process tool exclusions to the active registry."""
+        if not self._process_defn:
+            return
+        if self._process_defn.tools.excluded:
+            for tool_name in self._process_defn.tools.excluded:
+                self._tools.exclude(tool_name)
+
+    def _build_system_prompt(self) -> str:
+        """Build cowork system prompt with optional process extensions."""
+        system_prompt = build_cowork_system_prompt(self._workspace)
+        if self._process_defn:
+            if self._process_defn.persona:
+                system_prompt += (
+                    f"\n\nDOMAIN ROLE:\n{self._process_defn.persona.strip()}"
+                )
+            if self._process_defn.tool_guidance:
+                system_prompt += (
+                    f"\n\nDOMAIN TOOL GUIDANCE:\n"
+                    f"{self._process_defn.tool_guidance.strip()}"
+                )
+        return system_prompt
+
     async def _initialize_session(self) -> None:
         """Initialize tools, session, and welcome message.
 
@@ -274,55 +333,31 @@ class LoomApp(App):
         """
         chat = self.query_one("#chat-log", ChatLog)
 
+        # Start from a clean registry each initialization to avoid stale
+        # excludes/bindings when setup or process configuration changes.
+        self._refresh_tool_registry()
+
+        # Load process definition (imports bundled tools, then refreshes).
+        self._load_process_definition(chat)
+
         # Register extra tools if persistence is available
-        if self._store is not None and self._recall_tool is None:
+        if self._store is not None:
             from loom.tools.conversation_recall import ConversationRecallTool
             from loom.tools.delegate_task import DelegateTaskTool
 
-            self._recall_tool = ConversationRecallTool()
+            if self._recall_tool is None:
+                self._recall_tool = ConversationRecallTool()
             if not self._tools.has(self._recall_tool.name):
                 self._tools.register(self._recall_tool)
 
-            self._delegate_tool = DelegateTaskTool()
+            if self._delegate_tool is None:
+                self._delegate_tool = DelegateTaskTool()
             if not self._tools.has(self._delegate_tool.name):
                 self._tools.register(self._delegate_tool)
 
-        # Load process definition if specified
-        process_defn = None
-        if self._process_name and self._config:
-            from loom.processes.schema import ProcessLoader
-
-            extra = [Path(p) for p in self._config.process.search_paths]
-            loader = ProcessLoader(
-                workspace=self._workspace, extra_search_paths=extra,
-            )
-            try:
-                process_defn = loader.load(self._process_name)
-                chat.add_info(
-                    f"Process: [bold]{process_defn.name}[/bold] "
-                    f"v{process_defn.version}"
-                )
-                if process_defn.tools.excluded:
-                    for tool_name in process_defn.tools.excluded:
-                        self._tools.exclude(tool_name)
-            except Exception as e:
-                chat.add_info(
-                    f"[bold #f7768e]Failed to load process "
-                    f"'{self._process_name}': {e}[/]"
-                )
-
         # Build system prompt
-        system_prompt = build_cowork_system_prompt(self._workspace)
-        if process_defn:
-            if process_defn.persona:
-                system_prompt += (
-                    f"\n\nDOMAIN ROLE:\n{process_defn.persona.strip()}"
-                )
-            if process_defn.tool_guidance:
-                system_prompt += (
-                    f"\n\nDOMAIN TOOL GUIDANCE:\n"
-                    f"{process_defn.tool_guidance.strip()}"
-                )
+        self._apply_process_tool_policy()
+        system_prompt = self._build_system_prompt()
 
         # Build approver
         approver = ToolApprover(prompt_callback=self._approval_callback)
@@ -612,6 +647,7 @@ class LoomApp(App):
                         state_manager=TaskStateManager(data_dir),
                         event_bus=EventBus(),
                         config=config,
+                        process=self._process_defn,
                     )
 
                 self._delegate_tool.bind(_orchestrator_factory)
@@ -638,7 +674,7 @@ class LoomApp(App):
             self._session.session_id, is_active=False,
         )
 
-        system_prompt = build_cowork_system_prompt(self._workspace)
+        system_prompt = self._build_system_prompt()
         approver = ToolApprover(prompt_callback=self._approval_callback)
         session_id = await self._store.create_session(
             workspace=str(self._workspace),
@@ -667,7 +703,7 @@ class LoomApp(App):
             return
 
         old_id = self._session.session_id
-        system_prompt = build_cowork_system_prompt(self._workspace)
+        system_prompt = self._build_system_prompt()
         approver = ToolApprover(prompt_callback=self._approval_callback)
 
         new_session = CoworkSession(
