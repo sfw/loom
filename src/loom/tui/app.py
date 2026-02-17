@@ -2137,6 +2137,33 @@ class LoomApp(App):
         if command == "quit":
             self.action_request_quit()
             return
+        if command == "setup":
+            await self._handle_slash_command("/setup")
+            return
+        if command == "session_info":
+            await self._handle_slash_command("/session")
+            return
+        if command == "new_session":
+            await self._handle_slash_command("/new")
+            return
+        if command == "sessions_list":
+            await self._handle_slash_command("/sessions")
+            return
+        if command == "mcp_list":
+            await self._handle_slash_command("/mcp list")
+            return
+        if command == "learned_patterns":
+            await self._handle_slash_command("/learned")
+            return
+        if command == "process_use_prompt":
+            self._prefill_user_input("/process use ")
+            return
+        if command == "run_prompt":
+            self._prefill_user_input("/run ")
+            return
+        if command == "resume_prompt":
+            self._prefill_user_input("/resume ")
+            return
         if command == "process_off":
             chat = self.query_one("#chat-log", ChatLog)
             if not self._process_name and self._process_defn is None:
@@ -2164,6 +2191,14 @@ class LoomApp(App):
         action_fn = actions.get(command)
         if action_fn:
             action_fn()
+
+    def _prefill_user_input(self, text: str) -> None:
+        """Seed the chat input with a command template and focus it."""
+        input_widget = self.query_one("#user-input", Input)
+        input_widget.value = text
+        input_widget.cursor_position = len(text)
+        input_widget.focus()
+        self._set_slash_hint(self._render_slash_hint(text))
 
     def _show_tools(self) -> None:
         tools = self._tools.list_tools()

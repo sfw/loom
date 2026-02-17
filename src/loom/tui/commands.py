@@ -7,6 +7,7 @@ from functools import partial
 from textual.command import Hit, Hits, Provider
 
 _COMMANDS = [
+    ("Run setup wizard", "setup", "Open the setup flow"),
     ("Clear conversation", "clear_chat", "Clear the chat log"),
     ("Toggle sidebar", "toggle_sidebar", "Show or hide the sidebar"),
     (
@@ -19,9 +20,21 @@ _COMMANDS = [
     ("Switch to Events tab", "tab_events", "Focus the Events tab"),
     ("List tools", "list_tools", "Show all available tools"),
     ("Show model info", "model_info", "Display model details"),
+    ("Show session info", "session_info", "Display current session details"),
+    ("Start new session", "new_session", "Create a fresh session"),
+    ("List recent sessions", "sessions_list", "Show recent sessions"),
+    ("Resume session…", "resume_prompt", "Prefill /resume for session switch"),
+    ("List MCP servers", "mcp_list", "Show configured MCP servers"),
+    ("Show learned patterns", "learned_patterns", "Open learned pattern manager"),
     ("Show process info", "process_info", "Display active process"),
     ("List processes", "process_list", "Show available process definitions"),
+    (
+        "Use process…",
+        "process_use_prompt",
+        "Prefill /process use for process autocomplete",
+    ),
     ("Disable process", "process_off", "Disable active process"),
+    ("Run process goal…", "run_prompt", "Prefill /run for active process"),
     ("Show token usage", "token_info", "Display session token count"),
     ("Show help", "help", "List commands and keyboard shortcuts"),
     ("Quit", "quit", "Save session and exit"),

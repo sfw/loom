@@ -2254,6 +2254,73 @@ class TestCommandPaletteProcessActions:
         app._reload_session_for_process_change.assert_awaited_once()
         assert "Active process: none" in chat.add_info.call_args.args[0]
 
+    @pytest.mark.asyncio
+    async def test_palette_slash_backed_actions_delegate_to_slash_handler(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._handle_slash_command = AsyncMock(return_value=True)
+
+        await app.action_loom_command("setup")
+        await app.action_loom_command("session_info")
+        await app.action_loom_command("new_session")
+        await app.action_loom_command("sessions_list")
+        await app.action_loom_command("mcp_list")
+        await app.action_loom_command("learned_patterns")
+
+        calls = [c.args[0] for c in app._handle_slash_command.await_args_list]
+        assert calls == [
+            "/setup",
+            "/session",
+            "/new",
+            "/sessions",
+            "/mcp list",
+            "/learned",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_palette_prompt_actions_prefill_input(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._prefill_user_input = MagicMock()
+
+        await app.action_loom_command("process_use_prompt")
+        await app.action_loom_command("run_prompt")
+        await app.action_loom_command("resume_prompt")
+
+        calls = [c.args[0] for c in app._prefill_user_input.call_args_list]
+        assert calls == ["/process use ", "/run ", "/resume "]
+
+    def test_prefill_user_input_updates_value_and_hint(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        input_widget = SimpleNamespace(value="", cursor_position=0, focus=MagicMock())
+        app.query_one = MagicMock(return_value=input_widget)
+        app._render_slash_hint = MagicMock(return_value="hint text")
+        app._set_slash_hint = MagicMock()
+
+        app._prefill_user_input("/process use ")
+
+        assert input_widget.value == "/process use "
+        assert input_widget.cursor_position == len("/process use ")
+        input_widget.focus.assert_called_once()
+        app._render_slash_hint.assert_called_once_with("/process use ")
+        app._set_slash_hint.assert_called_once_with("hint text")
+
     def test_slash_tab_completion_cycles_forward(self):
         from loom.tui.app import LoomApp
 
