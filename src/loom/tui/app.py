@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -250,6 +252,9 @@ class LoomApp(App):
         self._slash_cycle_candidates: list[str] = []
         self._applying_slash_tab_completion = False
         self._skip_slash_cycle_reset_once = False
+        self._last_process_progress_message = ""
+        self._last_process_progress_at = 0.0
+        self._auto_resume_workspace_on_init = True
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -545,8 +550,10 @@ class LoomApp(App):
         # Build approver
         approver = ToolApprover(prompt_callback=self._approval_callback)
 
+        resume_target, auto_resume = await self._resolve_startup_resume_target()
+
         # Create or resume session
-        if self._store is not None and self._resume_session:
+        if self._store is not None and resume_target:
             # Resume existing session
             self._session = CoworkSession(
                 model=self._model,
@@ -557,10 +564,15 @@ class LoomApp(App):
                 store=self._store,
             )
             try:
-                await self._session.resume(self._resume_session)
+                await self._session.resume(resume_target)
                 self._total_tokens = self._session.total_tokens
+                resume_label = (
+                    "Resumed latest workspace session"
+                    if auto_resume
+                    else "Resumed session"
+                )
                 chat.add_info(
-                    f"Resumed session [dim]{self._resume_session}[/dim] "
+                    f"{resume_label} [dim]{resume_target}[/dim] "
                     f"({self._session.session_state.turn_count} turns)"
                 )
             except Exception as e:
@@ -624,10 +636,30 @@ class LoomApp(App):
         # Resume is a one-shot startup hint; subsequent reinitializations
         # should not keep trying to reopen the same prior session.
         self._resume_session = None
+        self._auto_resume_workspace_on_init = False
 
         self.query_one("#user-input", Input).focus()
         # Ensure command/footer bars are visible after any prior slash-hint state.
         self._set_slash_hint("")
+
+    async def _resolve_startup_resume_target(self) -> tuple[str | None, bool]:
+        """Resolve resume session for startup: explicit first, then workspace latest."""
+        if self._store is None:
+            return None, False
+        if self._resume_session:
+            return self._resume_session, False
+        if not self._auto_resume_workspace_on_init:
+            return None, False
+        try:
+            sessions = await self._store.list_sessions(workspace=str(self._workspace))
+        except Exception:
+            return None, False
+        if not sessions:
+            return None, False
+        session_id = str(sessions[0].get("id", "")).strip()
+        if not session_id:
+            return None, False
+        return session_id, True
 
     def _ensure_persistence_tools(self) -> None:
         """Ensure recall/delegate tools are registered and tracked.
@@ -755,22 +787,133 @@ class LoomApp(App):
                     seen.add(key)
         return candidates
 
+    def _process_use_completion_candidates(
+        self,
+        raw_input: str,
+    ) -> tuple[str, list[str]] | None:
+        """Return `/process use` tab-completion seed and candidates."""
+        text = raw_input.strip()
+        match = re.fullmatch(
+            r"/process\s+use(?:\s+(?P<prefix>\S*))?",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+
+        prefix = (match.group("prefix") or "").strip()
+        base = "/process use"
+        seed = f"{base} {prefix}" if prefix else base
+
+        try:
+            loader = self._create_process_loader()
+            available = loader.list_available()
+        except Exception:
+            return None
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+        prefix_lower = prefix.lower()
+        for proc in available:
+            name = str(proc.get("name", "")).strip()
+            if not name or name in seen:
+                continue
+            if prefix and not name.lower().startswith(prefix_lower):
+                continue
+            candidates.append(f"{base} {name}")
+            seen.add(name)
+        return seed, candidates
+
+    def _render_process_use_hint(self, raw_input: str) -> str | None:
+        """Render contextual hint rows for `/process use ...`."""
+        text = raw_input.strip()
+        match = re.fullmatch(
+            r"/process\s+use(?:\s+(?P<prefix>\S*))?",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+
+        prefix = (match.group("prefix") or "").strip()
+        try:
+            loader = self._create_process_loader()
+            available = loader.list_available()
+        except Exception:
+            return (
+                "[#f7768e]Failed to load process list.[/]  "
+                "[dim]Try /process list[/]"
+            )
+
+        if not available:
+            return (
+                "[#f7768e]No process definitions found.[/]  "
+                "[dim]Try /process list[/]"
+            )
+
+        active = self._process_defn.name if self._process_defn else ""
+        prefix_lower = prefix.lower()
+        rows: list[tuple[str, str, str]] = []
+        for proc in available:
+            name = str(proc.get("name", "")).strip()
+            if not name:
+                continue
+            if prefix and not name.lower().startswith(prefix_lower):
+                continue
+            version = str(proc.get("version", "?")).strip() or "?"
+            marker = " [cyan]<< active[/cyan]" if active and name == active else ""
+            rows.append((name, version, marker))
+
+        if not rows:
+            return (
+                f"[#f7768e]No processes match '{prefix}'.[/]  "
+                "[dim]Try /process list[/]"
+            )
+
+        title = (
+            "Available processes for /process use:"
+            if not prefix
+            else f"Process matches '{prefix}':"
+        )
+        lines = [f"[bold #7dcfff]{title}[/]"]
+        max_rows = 12
+        for name, version, marker in rows[:max_rows]:
+            lines.append(f"  [#73daca]{name:<30}[/] [dim]v{version}[/]{marker}")
+        remaining = len(rows) - max_rows
+        if remaining > 0:
+            lines.append(f"  [dim]... and {remaining} more[/dim]")
+        lines.append("[dim]Press Tab to autocomplete[/dim]")
+        return "\n".join(lines)
+
     def _apply_slash_tab_completion(self, *, reverse: bool = False) -> bool:
         """Apply slash tab completion (forward/backward)."""
         input_widget = self.query_one("#user-input", Input)
-        token = input_widget.value.strip()
-        if not token.startswith("/") or " " in token:
+        current = input_widget.value.strip()
+        if not current.startswith("/"):
             self._reset_slash_tab_cycle()
             return False
 
-        if token in self._slash_cycle_candidates:
+        completion_scope = "slash"
+        token = current
+        process_completion = self._process_use_completion_candidates(current)
+        if process_completion is not None:
+            completion_scope = "process_use"
+            token, scoped_candidates = process_completion
+        elif " " in current:
+            self._reset_slash_tab_cycle()
+            return False
+
+        if current in self._slash_cycle_candidates:
             candidates = self._slash_cycle_candidates
-            current_index = candidates.index(token)
+            current_index = candidates.index(current)
             next_index = (
                 (current_index - 1) if reverse else (current_index + 1)
             ) % len(candidates)
         else:
-            candidates = self._slash_completion_candidates(token)
+            if completion_scope == "process_use":
+                candidates = scoped_candidates
+            else:
+                candidates = self._slash_completion_candidates(token)
             if not candidates:
                 self._reset_slash_tab_cycle()
                 return False
@@ -790,6 +933,9 @@ class LoomApp(App):
 
     def _render_slash_hint(self, raw_input: str) -> str:
         """Build slash-command hint text for the current input."""
+        process_hint = self._render_process_use_hint(raw_input)
+        if process_hint is not None:
+            return process_hint
         if " " in raw_input.strip():
             return ""
         token, matches = self._matching_slash_commands(raw_input)
@@ -1566,6 +1712,8 @@ class LoomApp(App):
             return
 
         self._busy = True
+        self._last_process_progress_message = ""
+        self._last_process_progress_at = 0.0
         process_name = self._active_process_name()
         chat.add_user_message(f"/run {goal}")
         status.state = f"Running {process_name}..."
@@ -1607,19 +1755,172 @@ class LoomApp(App):
         finally:
             self._busy = False
             status.state = "Ready"
+            self._last_process_progress_message = ""
+            self._last_process_progress_at = 0.0
 
     def _on_process_progress_event(self, data: dict) -> None:
         """Handle incremental delegate_task progress events in /run flows."""
         if not isinstance(data, dict):
             return
         self._update_sidebar_tasks(data)
-        if data.get("event_type") in {
+        event_type = str(data.get("event_type") or "")
+        if event_type in {
             "subtask_completed",
             "subtask_failed",
             "task_completed",
             "task_failed",
         }:
             self._refresh_workspace_tree()
+        message = self._format_process_progress_event(data)
+        if not message:
+            return
+        event_type = str(data.get("event_type") or "")
+        now = time.monotonic()
+        if (
+            message == self._last_process_progress_message
+            and (now - self._last_process_progress_at) < 2.0
+        ):
+            return
+        self._last_process_progress_message = message
+        self._last_process_progress_at = now
+        try:
+            chat = self.query_one("#chat-log", ChatLog)
+            chat.add_info(message)
+        except Exception:
+            pass
+        try:
+            events_panel = self.query_one("#events-panel", EventPanel)
+            if event_type != "token_streamed":
+                events_panel.add_event(_now_str(), "process", message[:140])
+        except Exception:
+            pass
+
+    @staticmethod
+    def _one_line(text: object | None, max_len: int = 180) -> str:
+        """Normalize whitespace and cap a string for concise progress rows."""
+        if text is None:
+            return ""
+        compact = " ".join(str(text).split())
+        if len(compact) <= max_len:
+            return compact
+        return f"{compact[:max_len - 1].rstrip()}…"
+
+    @staticmethod
+    def _subtask_content(data: dict, subtask_id: str) -> str:
+        """Lookup subtask display content from progress payload."""
+        tasks = data.get("tasks")
+        if not subtask_id or not isinstance(tasks, list):
+            return ""
+        for row in tasks:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("id", "")) != subtask_id:
+                continue
+            content = str(row.get("content", "")).strip()
+            if content and content != subtask_id:
+                return content
+            return ""
+        return ""
+
+    def _format_process_progress_event(self, data: dict) -> str | None:
+        """Format orchestrator progress events into concise chat messages."""
+        event_type = str(data.get("event_type") or "")
+        event_data = data.get("event_data")
+        if not event_type:
+            return None
+        if not isinstance(event_data, dict):
+            event_data = {}
+
+        subtask_id = str(event_data.get("subtask_id", "")).strip()
+        subtask_content = self._subtask_content(data, subtask_id)
+        subtask_label = subtask_id or "subtask"
+        if subtask_content:
+            subtask_label = f"{subtask_label} - {self._one_line(subtask_content, 90)}"
+
+        if event_type == "task_planning":
+            return "Planning process run..."
+        if event_type == "task_plan_ready":
+            count = len(data.get("tasks", [])) if isinstance(data.get("tasks"), list) else 0
+            return f"Plan ready: {count} subtasks."
+        if event_type == "task_executing":
+            return "Executing subtasks..."
+        if event_type == "model_invocation":
+            phase = str(event_data.get("phase", "")).strip()
+            model_name = str(event_data.get("model", "")).strip()
+            label = subtask_label
+            if phase == "start":
+                if model_name:
+                    return f"Thinking on {label} with {model_name}..."
+                return f"Thinking on {label}..."
+            if phase == "done":
+                return None
+            return None
+        if event_type == "token_streamed":
+            count = event_data.get("token_count")
+            try:
+                token_count = int(count)
+            except (TypeError, ValueError):
+                token_count = 0
+            if token_count > 0:
+                return f"Working on {subtask_label}... ({token_count} streamed chunks)"
+            return None
+        if event_type == "tool_call_started":
+            tool = str(event_data.get("tool", "")).strip() or "tool"
+            return f"Using {tool} for {subtask_label}."
+        if event_type == "tool_call_completed":
+            tool = str(event_data.get("tool", "")).strip() or "tool"
+            success = event_data.get("success")
+            if success is True:
+                return f"Finished {tool} for {subtask_label}."
+            error = self._one_line(event_data.get("error", ""), 120)
+            if error:
+                return f"{tool} failed for {subtask_label}: {error}"
+            return f"{tool} failed for {subtask_label}."
+        if event_type == "subtask_started":
+            return f"Started {subtask_label}."
+        if event_type == "subtask_retrying":
+            attempt = event_data.get("attempt")
+            tier = event_data.get("escalated_tier")
+            reason = self._one_line(event_data.get("feedback", ""), 120)
+            msg = f"Retrying {subtask_label}"
+            if attempt:
+                msg += f" (attempt {attempt})"
+            if tier:
+                msg += f", tier {tier}"
+            if reason:
+                msg += f": {reason}"
+            return f"{msg}."
+        if event_type == "subtask_completed":
+            return f"Completed {subtask_label}."
+        if event_type == "subtask_failed":
+            reason = self._one_line(
+                event_data.get("feedback")
+                or event_data.get("reason")
+                or event_data.get("error")
+                or "",
+                140,
+            )
+            if reason:
+                return f"Failed {subtask_label}: {reason}"
+            return f"Failed {subtask_label}."
+        if event_type == "task_replanning":
+            reason = self._one_line(event_data.get("reason", ""), 140)
+            if reason:
+                return f"Replanning task: {reason}"
+            return "Replanning task..."
+        if event_type == "task_completed":
+            return "Process run completed."
+        if event_type == "task_failed":
+            reason = self._one_line(
+                event_data.get("reason")
+                or event_data.get("error")
+                or "",
+                140,
+            )
+            if reason:
+                return f"Process run failed: {reason}"
+            return "Process run failed."
+        return None
 
     def _mark_process_run_failed(self, error: str) -> None:
         """Reflect a failed /run execution in the progress panel."""

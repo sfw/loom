@@ -19,7 +19,12 @@ from pathlib import Path
 from loom.config import Config
 from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import EventBus
-from loom.events.types import TOKEN_STREAMED, TOOL_CALL_COMPLETED, TOOL_CALL_STARTED
+from loom.events.types import (
+    MODEL_INVOCATION,
+    TOKEN_STREAMED,
+    TOOL_CALL_COMPLETED,
+    TOOL_CALL_STARTED,
+)
 from loom.models.base import ModelResponse
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
@@ -145,6 +150,12 @@ class SubtaskRunner:
             # Wall-clock timeout check
             if time.monotonic() - start_time > self.MAX_SUBTASK_WALL_CLOCK:
                 break
+            self._emit_model_event(
+                task_id=task.id,
+                subtask_id=subtask.id,
+                model_name=model.name,
+                phase="start",
+            )
             if streaming:
                 response = await self._stream_completion(
                     model, messages, self._tools.all_schemas(),
@@ -154,6 +165,13 @@ class SubtaskRunner:
                 response = await model.complete(
                     messages, tools=self._tools.all_schemas()
                 )
+            self._emit_model_event(
+                task_id=task.id,
+                subtask_id=subtask.id,
+                model_name=model.name,
+                phase="done",
+                details={"tool_calls": len(response.tool_calls or [])},
+            )
             total_tokens += response.usage.total_tokens
 
             if response.has_tool_calls():
@@ -434,6 +452,33 @@ class SubtaskRunner:
                 ]
         self._event_bus.emit(Event(
             event_type=event_type, task_id=task_id, data=data,
+        ))
+
+    def _emit_model_event(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        model_name: str,
+        phase: str,
+        details: dict | None = None,
+    ) -> None:
+        """Emit model invocation lifecycle to the event bus."""
+        if not self._event_bus:
+            return
+        from loom.events.bus import Event
+
+        data: dict = {
+            "subtask_id": subtask_id,
+            "model": model_name,
+            "phase": phase,
+        }
+        if isinstance(details, dict) and details:
+            data.update(details)
+        self._event_bus.emit(Event(
+            event_type=MODEL_INVOCATION,
+            task_id=task_id,
+            data=data,
         ))
 
     @staticmethod

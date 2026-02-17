@@ -554,6 +554,55 @@ class TestDelegateTaskUnbound:
         assert result.data["tasks"][1]["status"] == "in_progress"
         assert result.data["tasks"][2]["status"] == "skipped"
 
+    @pytest.mark.asyncio
+    async def test_progress_callback_includes_event_metadata(self):
+        from loom.events.bus import Event, EventBus
+        from loom.events.types import SUBTASK_STARTED
+        from loom.state.task_state import Plan, Subtask, SubtaskStatus, TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        bus = EventBus()
+
+        async def _execute(_task):
+            _task.status = TaskStatus.EXECUTING
+            _task.plan = Plan(subtasks=[
+                Subtask(
+                    id="company-screening",
+                    description="Company screening",
+                    status=SubtaskStatus.RUNNING,
+                ),
+            ])
+            bus.emit(Event(
+                event_type=SUBTASK_STARTED,
+                task_id=_task.id,
+                data={"subtask_id": "company-screening"},
+            ))
+            _task.plan.subtasks[0].status = SubtaskStatus.COMPLETED
+            _task.status = TaskStatus.COMPLETED
+            return _task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator._events = bus
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        progress: list[dict] = []
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+
+        result = await tool.execute(
+            {"goal": "Analyze Tesla", "_progress_callback": progress.append},
+            ctx,
+        )
+
+        assert result.success is True
+        events = [p for p in progress if p.get("event_type") == SUBTASK_STARTED]
+        assert events, "Expected at least one streamed progress event"
+        payload = events[0]
+        assert payload["event_data"]["subtask_id"] == "company-screening"
+
     def test_delegate_timeout_default(self, monkeypatch):
         from loom.tools.delegate_task import DelegateTaskTool
 
@@ -1029,6 +1078,69 @@ class TestDelegateBindingProcess:
         assert "missing-tool" in chat.add_info.call_args.args[0]
 
 
+class TestStartupSessionResume:
+    @pytest.mark.asyncio
+    async def test_resolve_startup_resume_target_prefers_explicit(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            resume_session="explicit-session",
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock()
+
+        session_id, auto = await app._resolve_startup_resume_target()
+
+        assert session_id == "explicit-session"
+        assert auto is False
+        app._store.list_sessions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resolve_startup_resume_target_uses_latest_workspace(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock(return_value=[
+            {"id": "latest-session"},
+            {"id": "older-session"},
+        ])
+
+        session_id, auto = await app._resolve_startup_resume_target()
+
+        assert session_id == "latest-session"
+        assert auto is True
+        app._store.list_sessions.assert_awaited_once_with(workspace="/tmp")
+
+    @pytest.mark.asyncio
+    async def test_resolve_startup_resume_target_disabled_after_initial_start(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock(return_value=[
+            {"id": "latest-session"},
+        ])
+        app._auto_resume_workspace_on_init = False
+
+        session_id, auto = await app._resolve_startup_resume_target()
+
+        assert session_id is None
+        assert auto is False
+        app._store.list_sessions.assert_not_called()
+
+
 class TestQuitConfirmation:
     @pytest.mark.asyncio
     async def test_action_quit_confirmed_persists_and_exits(self):
@@ -1225,7 +1337,7 @@ class TestSlashCommandHints:
         assert "Matching /p:" in hint
         assert "/process" in hint
 
-    def test_hides_hint_after_command_argument_entry(self):
+    def test_process_use_hint_shows_available_processes(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -1233,8 +1345,35 @@ class TestSlashCommandHints:
             tools=MagicMock(),
             workspace=Path("/tmp"),
         )
-        hint = app._render_slash_hint("/process use investment-analysis")
-        assert hint == ""
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=[
+                {"name": "investment-analysis", "version": "1.0"},
+                {"name": "marketing-strategy", "version": "1.2"},
+            ])
+        ))
+        hint = app._render_slash_hint("/process use")
+        assert "Available processes for /process use:" in hint
+        assert "investment-analysis" in hint
+        assert "marketing-strategy" in hint
+
+    def test_process_use_hint_filters_by_prefix(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=[
+                {"name": "investment-analysis", "version": "1.0"},
+                {"name": "marketing-strategy", "version": "1.2"},
+            ])
+        ))
+        hint = app._render_slash_hint("/process use inv")
+        assert "Process matches 'inv':" in hint
+        assert "investment-analysis" in hint
+        assert "marketing-strategy" not in hint
 
     def test_prefix_r_matches_resume_and_run(self):
         from loom.tui.app import LoomApp
@@ -1713,6 +1852,46 @@ class TestProcessSlashCommands:
         sidebar.update_tasks.assert_called_once()
         sidebar.refresh_workspace_tree.assert_called_once()
 
+    def test_process_progress_event_streams_to_chat(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        sidebar = MagicMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._on_process_progress_event({
+            "event_type": "subtask_started",
+            "event_data": {"subtask_id": "company-screening"},
+            "tasks": [
+                {
+                    "id": "company-screening",
+                    "status": "in_progress",
+                    "content": "Build company overview",
+                },
+            ],
+        })
+
+        sidebar.update_tasks.assert_called_once()
+        chat.add_info.assert_called_once()
+        assert "Started company-screening" in chat.add_info.call_args.args[0]
+        events_panel.add_event.assert_called_once()
+
     def test_mark_process_run_failed_shows_timeout_guidance(self):
         from loom.tui.app import LoomApp
 
@@ -2125,6 +2304,71 @@ class TestCommandPaletteProcessActions:
         assert app._apply_slash_tab_completion(reverse=False) is False
 
         input_widget.value = "/resume abc"
+        assert app._apply_slash_tab_completion(reverse=False) is False
+
+    def test_slash_tab_completion_process_use_prefix(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=[
+                {"name": "investment-analysis"},
+                {"name": "marketing-strategy"},
+            ])
+        ))
+        input_widget = SimpleNamespace(value="/process use inv", cursor_position=0)
+        app.query_one = MagicMock(return_value=input_widget)
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/process use investment-analysis"
+
+    def test_slash_tab_completion_process_use_cycles(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=[
+                {"name": "marketing-strategy"},
+                {"name": "market-research"},
+                {"name": "investment-analysis"},
+            ])
+        ))
+        input_widget = SimpleNamespace(value="/process use m", cursor_position=0)
+        app.query_one = MagicMock(return_value=input_widget)
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/process use marketing-strategy"
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/process use market-research"
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/process use marketing-strategy"
+
+    def test_slash_tab_completion_process_use_no_matches(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=[
+                {"name": "investment-analysis"},
+            ])
+        ))
+        input_widget = SimpleNamespace(value="/process use zz", cursor_position=0)
+        app.query_one = MagicMock(return_value=input_widget)
+
         assert app._apply_slash_tab_completion(reverse=False) is False
 
     @pytest.mark.asyncio
