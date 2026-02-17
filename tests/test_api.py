@@ -496,6 +496,41 @@ class TestProcessField:
         assert captured["workspace"] == tmp_path
         assert captured["extra_search_paths"] == [extra_dir]
 
+    @pytest.mark.asyncio
+    async def test_create_task_rejects_missing_required_tools(
+        self,
+        client,
+        monkeypatch,
+    ):
+        """Process-required missing tools should return HTTP 400 immediately."""
+        captured: dict[str, object] = {}
+
+        class DummyLoader:
+            def __init__(self, workspace=None, extra_search_paths=None):
+                captured["workspace"] = workspace
+                captured["extra_search_paths"] = extra_search_paths
+
+            def load(self, name):
+                return SimpleNamespace(
+                    name=name,
+                    tools=SimpleNamespace(
+                        required=["definitely-missing-tool"],
+                        excluded=[],
+                    ),
+                )
+
+        monkeypatch.setattr("loom.processes.schema.ProcessLoader", DummyLoader)
+
+        response = await client.post("/tasks", json={
+            "goal": "Reject missing required tools",
+            "process": "demo-process",
+        })
+
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert "requires missing tool" in detail
+        assert "definitely-missing-tool" in detail
+
 
 class TestBackgroundExecution:
     @pytest.mark.asyncio

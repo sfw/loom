@@ -70,6 +70,25 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         except ProcessNotFoundError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    # Validate required tools early so clients get immediate feedback.
+    if process_def is not None:
+        tools_cfg = getattr(process_def, "tools", None)
+        required = list(getattr(tools_cfg, "required", []) or [])
+        excluded = set(getattr(tools_cfg, "excluded", []) or [])
+        if required:
+            from loom.tools import create_default_registry
+
+            available = set(create_default_registry().list_tools()) - excluded
+            missing = sorted(name for name in required if name not in available)
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Process '{getattr(process_def, 'name', body.process)}' "
+                        f"requires missing tool(s): {', '.join(missing)}"
+                    ),
+                )
+
     task = create_task(
         goal=body.goal,
         workspace=body.workspace or "",
