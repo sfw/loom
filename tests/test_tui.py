@@ -2096,6 +2096,54 @@ class TestFileViewer:
         assert screen._error is not None
         assert "No viewer renderer registered" in screen._error
 
+    def test_file_viewer_click_outside_dismisses(self, tmp_path):
+        from loom.tui.screens.file_viewer import FileViewerScreen
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        doc = workspace / "notes.md"
+        doc.write_text("# Hello\n", encoding="utf-8")
+
+        screen = FileViewerScreen(doc, workspace)
+        screen.dismiss = MagicMock()
+        dialog = MagicMock()
+        dialog.region.contains.return_value = False
+        screen.query_one = MagicMock(return_value=dialog)
+
+        event = MagicMock()
+        event.screen_x = 0
+        event.screen_y = 0
+
+        screen.on_mouse_down(event)
+
+        screen.dismiss.assert_called_once_with(None)
+        event.stop.assert_called_once()
+        event.prevent_default.assert_called_once()
+
+    def test_file_viewer_click_inside_does_not_dismiss(self, tmp_path):
+        from loom.tui.screens.file_viewer import FileViewerScreen
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        doc = workspace / "notes.md"
+        doc.write_text("# Hello\n", encoding="utf-8")
+
+        screen = FileViewerScreen(doc, workspace)
+        screen.dismiss = MagicMock()
+        dialog = MagicMock()
+        dialog.region.contains.return_value = True
+        screen.query_one = MagicMock(return_value=dialog)
+
+        event = MagicMock()
+        event.screen_x = 1
+        event.screen_y = 1
+
+        screen.on_mouse_down(event)
+
+        screen.dismiss.assert_not_called()
+        event.stop.assert_not_called()
+        event.prevent_default.assert_not_called()
+
     def test_workspace_file_selected_opens_viewer_modal(self, tmp_path):
         from textual.widgets import DirectoryTree
 

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from rich.syntax import Syntax
 from rich.table import Table
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -424,3 +425,12 @@ class FileViewerScreen(ModalScreen[None]):
 
     def action_close(self) -> None:
         self.dismiss(None)
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        """Close when clicking outside the centered dialog."""
+        dialog = self.query_one("#file-viewer-dialog")
+        if dialog.region.contains(event.screen_x, event.screen_y):
+            return
+        self.dismiss(None)
+        event.stop()
+        event.prevent_default()
