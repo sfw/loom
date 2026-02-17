@@ -192,6 +192,17 @@ class PromptAssembler:
                 or "Complete the described task."
             ),
         ).strip()
+        # PROCESS: enforce exact deliverable filenames for active phase/subtask.
+        if self._process:
+            deliverables = self._expected_deliverables_for_subtask(subtask.id)
+            if deliverables:
+                names = "\n".join(f"- {name}" for name in deliverables)
+                subtask_section += (
+                    "\n\nREQUIRED OUTPUT FILES (EXACT FILENAMES):\n"
+                    f"{names}\n"
+                    "You MUST create/update these exact filenames before "
+                    "finishing this subtask. Do not rename them."
+                )
 
         # 4. RETRIEVED CONTEXT (memory)
         if memory_entries:
@@ -235,6 +246,19 @@ class PromptAssembler:
         prompt = self.SECTION_SEPARATOR.join(s for s in sections if s)
 
         return self._trim_to_budget(prompt)
+
+    def _expected_deliverables_for_subtask(self, subtask_id: str) -> list[str]:
+        """Return expected deliverable filenames for the given subtask id."""
+        if not self._process:
+            return []
+        deliverables = self._process.get_deliverables()
+        if not deliverables:
+            return []
+        if subtask_id in deliverables:
+            return deliverables[subtask_id]
+        if len(deliverables) == 1:
+            return next(iter(deliverables.values()))
+        return []
 
     def build_replanner_prompt(
         self,

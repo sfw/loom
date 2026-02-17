@@ -75,6 +75,43 @@ class OpenAICompatibleProvider(ModelProvider):
         except Exception:
             return "<response body unavailable>"
 
+    @staticmethod
+    def _needs_reasoning_content_retry(status_code: int, body_text: str) -> bool:
+        """Detect providers that require reasoning_content on tool-call turns."""
+        body = body_text.lower()
+        return (
+            status_code == 400
+            and "reasoning_content" in body
+            and "tool call message" in body
+        )
+
+    @staticmethod
+    def _inject_reasoning_content(messages: list[dict]) -> tuple[list[dict], bool]:
+        """Add reasoning_content to assistant tool-call messages when missing."""
+        patched: list[dict] = []
+        changed = False
+
+        for msg in messages:
+            if (
+                msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and "reasoning_content" not in msg
+            ):
+                updated = dict(msg)
+                content = updated.get("content")
+                if isinstance(content, str) and content.strip():
+                    updated["reasoning_content"] = content
+                else:
+                    # Some reasoning-enabled OpenAI-compatible providers reject
+                    # empty reasoning_content on assistant tool-call turns.
+                    updated["reasoning_content"] = "Tool call required to continue."
+                patched.append(updated)
+                changed = True
+                continue
+            patched.append(msg)
+
+        return patched, changed
+
     async def complete(
         self,
         messages: list[dict],
@@ -114,12 +151,49 @@ class OpenAICompatibleProvider(ModelProvider):
             ) from e
         except httpx.HTTPStatusError as e:
             body_text = await self._http_error_body(e.response)
-            raise ModelConnectionError(
-                f"Model server returned HTTP "
-                f"{e.response.status_code}: "
-                f"{body_text}",
-                original=e,
-            ) from e
+            if self._needs_reasoning_content_retry(e.response.status_code, body_text):
+                patched_messages, changed = self._inject_reasoning_content(converted)
+                if changed:
+                    retry_payload = dict(payload)
+                    retry_payload["messages"] = patched_messages
+                    try:
+                        response = await self._client.post(
+                            "/chat/completions", json=retry_payload,
+                        )
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as retry_err:
+                        retry_body = await self._http_error_body(retry_err.response)
+                        raise ModelConnectionError(
+                            f"Model server returned HTTP "
+                            f"{retry_err.response.status_code}: "
+                            f"{retry_body}",
+                            original=retry_err,
+                        ) from retry_err
+                    except httpx.ConnectError as retry_err:
+                        raise ModelConnectionError(
+                            f"Cannot connect to model server at "
+                            f"{self._client.base_url}: {retry_err}",
+                            original=retry_err,
+                        ) from retry_err
+                    except httpx.TimeoutException as retry_err:
+                        raise ModelConnectionError(
+                            f"Model request timed out ({self._model}): {retry_err}",
+                            original=retry_err,
+                        ) from retry_err
+                else:
+                    raise ModelConnectionError(
+                        f"Model server returned HTTP "
+                        f"{e.response.status_code}: "
+                        f"{body_text}",
+                        original=e,
+                    ) from e
+            else:
+                raise ModelConnectionError(
+                    f"Model server returned HTTP "
+                    f"{e.response.status_code}: "
+                    f"{body_text}",
+                    original=e,
+                ) from e
         latency = int((time.monotonic() - start) * 1000)
 
         data = response.json()
@@ -184,101 +258,119 @@ class OpenAICompatibleProvider(ModelProvider):
         if tools:
             payload["tools"] = self._format_tools(tools)
 
+        request_payload = payload
+        tried_reasoning_retry = False
+
         try:
-            async with self._client.stream(
-                "POST", "/chat/completions", json=payload,
-            ) as response:
-                if response.is_error:
-                    body_text = await self._http_error_body(response)
-                    raise ModelConnectionError(
-                        f"Model server returned HTTP "
-                        f"{response.status_code}: "
-                        f"{body_text}",
-                    )
+            while True:
+                async with self._client.stream(
+                    "POST", "/chat/completions", json=request_payload,
+                ) as response:
+                    if response.is_error:
+                        body_text = await self._http_error_body(response)
+                        if (
+                            not tried_reasoning_retry
+                            and self._needs_reasoning_content_retry(
+                                response.status_code, body_text,
+                            )
+                        ):
+                            patched_messages, changed = self._inject_reasoning_content(
+                                request_payload.get("messages", []),
+                            )
+                            if changed:
+                                request_payload = dict(request_payload)
+                                request_payload["messages"] = patched_messages
+                                tried_reasoning_retry = True
+                                continue
+                        raise ModelConnectionError(
+                            f"Model server returned HTTP "
+                            f"{response.status_code}: "
+                            f"{body_text}",
+                        )
 
-                # Buffer tool call deltas until complete
-                tool_call_buffers: dict[int, dict] = {}
+                    # Buffer tool call deltas until complete
+                    tool_call_buffers: dict[int, dict] = {}
 
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[len("data:"):].strip()
-                    if data_str == "[DONE]":
-                        # Final chunk — assemble tool calls
-                        parsed_tools = None
-                        if tool_call_buffers:
-                            parsed_tools = []
-                            for idx in sorted(tool_call_buffers):
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[len("data:"):].strip()
+                        if data_str == "[DONE]":
+                            # Final chunk — assemble tool calls
+                            parsed_tools = None
+                            if tool_call_buffers:
+                                parsed_tools = []
+                                for idx in sorted(tool_call_buffers):
+                                    buf = tool_call_buffers[idx]
+                                    args_str = buf.get("arguments", "")
+                                    try:
+                                        args = (
+                                            json.loads(args_str)
+                                            if args_str
+                                            else {}
+                                        )
+                                    except json.JSONDecodeError:
+                                        args = {}
+                                    parsed_tools.append(ToolCall(
+                                        id=buf.get("id", ""),
+                                        name=buf.get("name", ""),
+                                        arguments=args,
+                                    ))
+                            yield StreamChunk(
+                                text="", done=True,
+                                tool_calls=parsed_tools,
+                            )
+                            return
+
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        choice = data.get("choices", [{}])[0]
+                        delta = choice.get("delta", {})
+                        text = delta.get("content") or ""
+
+                        # Accumulate tool call deltas
+                        if delta.get("tool_calls"):
+                            for tc_delta in delta["tool_calls"]:
+                                idx = tc_delta.get("index", 0)
+                                if idx not in tool_call_buffers:
+                                    tool_call_buffers[idx] = {
+                                        "id": "",
+                                        "name": "",
+                                        "arguments": "",
+                                    }
                                 buf = tool_call_buffers[idx]
-                                args_str = buf.get("arguments", "")
-                                try:
-                                    args = (
-                                        json.loads(args_str)
-                                        if args_str
-                                        else {}
-                                    )
-                                except json.JSONDecodeError:
-                                    args = {}
-                                parsed_tools.append(ToolCall(
-                                    id=buf.get("id", ""),
-                                    name=buf.get("name", ""),
-                                    arguments=args,
-                                ))
-                        yield StreamChunk(
-                            text="", done=True,
-                            tool_calls=parsed_tools,
-                        )
-                        return
+                                if tc_delta.get("id"):
+                                    buf["id"] = tc_delta["id"]
+                                func = tc_delta.get("function", {})
+                                if func.get("name"):
+                                    buf["name"] = func["name"]
+                                if func.get("arguments"):
+                                    buf["arguments"] += func["arguments"]
 
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                        # Check for usage in the chunk
+                        usage = None
+                        if data.get("usage"):
+                            u = data["usage"]
+                            usage = TokenUsage(
+                                input_tokens=u.get(
+                                    "prompt_tokens", 0,
+                                ),
+                                output_tokens=u.get(
+                                    "completion_tokens", 0,
+                                ),
+                                total_tokens=u.get(
+                                    "total_tokens", 0,
+                                ),
+                            )
 
-                    choice = data.get("choices", [{}])[0]
-                    delta = choice.get("delta", {})
-                    text = delta.get("content") or ""
-
-                    # Accumulate tool call deltas
-                    if delta.get("tool_calls"):
-                        for tc_delta in delta["tool_calls"]:
-                            idx = tc_delta.get("index", 0)
-                            if idx not in tool_call_buffers:
-                                tool_call_buffers[idx] = {
-                                    "id": "",
-                                    "name": "",
-                                    "arguments": "",
-                                }
-                            buf = tool_call_buffers[idx]
-                            if tc_delta.get("id"):
-                                buf["id"] = tc_delta["id"]
-                            func = tc_delta.get("function", {})
-                            if func.get("name"):
-                                buf["name"] = func["name"]
-                            if func.get("arguments"):
-                                buf["arguments"] += func["arguments"]
-
-                    # Check for usage in the chunk
-                    usage = None
-                    if data.get("usage"):
-                        u = data["usage"]
-                        usage = TokenUsage(
-                            input_tokens=u.get(
-                                "prompt_tokens", 0,
-                            ),
-                            output_tokens=u.get(
-                                "completion_tokens", 0,
-                            ),
-                            total_tokens=u.get(
-                                "total_tokens", 0,
-                            ),
-                        )
-
-                    if text:
-                        yield StreamChunk(
-                            text=text, done=False, usage=usage,
-                        )
+                        if text:
+                            yield StreamChunk(
+                                text=text, done=False, usage=usage,
+                            )
         except httpx.ConnectError as e:
             raise ModelConnectionError(
                 f"Cannot connect to model server at "

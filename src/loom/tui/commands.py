@@ -9,6 +9,11 @@ from textual.command import Hit, Hits, Provider
 _COMMANDS = [
     ("Clear conversation", "clear_chat", "Clear the chat log"),
     ("Toggle sidebar", "toggle_sidebar", "Show or hide the sidebar"),
+    (
+        "Reload workspace tree",
+        "reload_workspace",
+        "Reload workspace files in the sidebar",
+    ),
     ("Switch to Chat tab", "tab_chat", "Focus the Chat tab"),
     ("Switch to Files tab", "tab_files", "Focus the Files Changed tab"),
     ("Switch to Events tab", "tab_events", "Focus the Events tab"),

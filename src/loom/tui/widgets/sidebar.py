@@ -44,6 +44,10 @@ class TaskProgressPanel(Static):
                 icon = "[#9ece6a]\u2713[/]"
             elif status == "in_progress":
                 icon = "[#7dcfff]\u25c9[/]"
+            elif status == "failed":
+                icon = "[#f7768e]\u2717[/]"
+            elif status == "skipped":
+                icon = "[dim]-[/dim]"
             else:
                 icon = "[dim]\u25cb[/dim]"
             lines.append(f"{icon} {content}")
@@ -81,6 +85,8 @@ class Sidebar(Vertical):
     Sidebar TaskProgressPanel {
         padding: 0 1;
         height: auto;
+        max-height: 14;
+        overflow-y: auto;
     }
     Sidebar FilteredTree {
         height: 1fr;
@@ -93,7 +99,7 @@ class Sidebar(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Label("Workspace", id="sidebar-label")
-        yield FilteredTree(str(self._workspace))
+        yield FilteredTree(str(self._workspace), id="workspace-tree")
         divider = "\u2500" * 10
         yield Label(divider, id="sidebar-divider")
         yield Label("Progress", id="progress-label")
@@ -107,3 +113,11 @@ class Sidebar(Vertical):
         """Update the task progress panel with new task data."""
         panel = self.query_one("#task-progress", TaskProgressPanel)
         panel.tasks = tasks
+
+    def refresh_workspace_tree(self) -> None:
+        """Reload workspace tree so newly-created files become visible."""
+        try:
+            tree = self.query_one("#workspace-tree", FilteredTree)
+        except Exception:
+            return
+        tree.reload()

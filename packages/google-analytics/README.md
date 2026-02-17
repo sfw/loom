@@ -31,11 +31,18 @@ loom install /path/to/loom-process-google-analytics
 loom cowork --process google-analytics
 ```
 
-Then describe your analytics goal:
+Then force process orchestration from the chat input:
 
-> "Audit our GA4 implementation for our B2B SaaS free trial funnel. We think we're losing visibility on the trial-to-paid conversion step."
+```text
+/run Audit our GA4 implementation for our B2B SaaS free trial funnel. We think we're losing visibility on the trial-to-paid conversion step.
+```
 
-Loom will decompose this into phased subtasks following the process definition, using the calculator for conversion rate math and spreadsheets for data tables.
+`/run` executes the active process in-session via `delegate_task` (no `loom serve` required).
+For non-interactive execution, use:
+
+```bash
+loom run "Audit our GA4 implementation for our B2B SaaS free trial funnel" --workspace /tmp/ga-audit --process google-analytics
+```
 
 ## Deliverables
 

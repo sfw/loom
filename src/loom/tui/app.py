@@ -120,6 +120,11 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         usage="[list|use <name>|off]",
         description="inspect/switch active process",
     ),
+    SlashCommandSpec(
+        canonical="/run",
+        usage="<goal>",
+        description="run goal via active process orchestrator",
+    ),
 )
 _MAX_SLASH_HINT_LINES = 14
 
@@ -157,6 +162,7 @@ class LoomApp(App):
         Binding("ctrl+c", "request_quit", "Quit", show=True, priority=True),
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True),
         Binding("ctrl+l", "clear_chat", "Clear", show=True),
+        Binding("ctrl+r", "reload_workspace", "Reload", show=True),
         Binding("ctrl+1", "tab_chat", "Chat"),
         Binding("ctrl+2", "tab_files", "Files"),
         Binding("ctrl+3", "tab_events", "Events"),
@@ -407,20 +413,8 @@ class LoomApp(App):
         # Load process definition (imports bundled tools, then refreshes).
         self._load_process_definition(chat)
 
-        # Register extra tools if persistence is available
-        if self._store is not None:
-            from loom.tools.conversation_recall import ConversationRecallTool
-            from loom.tools.delegate_task import DelegateTaskTool
-
-            if self._recall_tool is None:
-                self._recall_tool = ConversationRecallTool()
-            if not self._tools.has(self._recall_tool.name):
-                self._tools.register(self._recall_tool)
-
-            if self._delegate_tool is None:
-                self._delegate_tool = DelegateTaskTool()
-            if not self._tools.has(self._delegate_tool.name):
-                self._tools.register(self._delegate_tool)
+        # Ensure persistence-dependent tools are present and tracked.
+        self._ensure_persistence_tools()
 
         # Build system prompt
         self._apply_process_tool_policy(chat)
@@ -511,6 +505,47 @@ class LoomApp(App):
 
         self.query_one("#user-input", Input).focus()
 
+    def _ensure_persistence_tools(self) -> None:
+        """Ensure recall/delegate tools are registered and tracked.
+
+        Tool auto-discovery may pre-register these tool names. We must bind
+        and use the *registered* instances, otherwise /run can hit an
+        unbound delegate_task instance ("no orchestrator configured").
+        """
+        self._recall_tool = None
+        self._delegate_tool = None
+        if self._store is None:
+            return
+
+        from loom.tools.conversation_recall import ConversationRecallTool
+        from loom.tools.delegate_task import DelegateTaskTool
+
+        recall = self._tools.get("conversation_recall")
+        if recall is not None and not isinstance(recall, ConversationRecallTool):
+            logger.warning(
+                "Replacing unexpected conversation_recall tool type: %s",
+                type(recall).__name__,
+            )
+            self._tools.exclude("conversation_recall")
+            recall = None
+        if recall is None:
+            recall = ConversationRecallTool()
+            self._tools.register(recall)
+        self._recall_tool = recall
+
+        delegate = self._tools.get("delegate_task")
+        if delegate is not None and not isinstance(delegate, DelegateTaskTool):
+            logger.warning(
+                "Replacing unexpected delegate_task tool type: %s",
+                type(delegate).__name__,
+            )
+            self._tools.exclude("delegate_task")
+            delegate = None
+        if delegate is None:
+            delegate = DelegateTaskTool()
+            self._tools.register(delegate)
+        self._delegate_tool = delegate
+
     def _slash_command_catalog(self) -> list[tuple[str, str]]:
         """Return canonical slash commands with optional alias annotations."""
         entries: list[tuple[str, str]] = []
@@ -541,7 +576,8 @@ class LoomApp(App):
                 label = f"{label} ({alias_str})"
             lines.append(f"  {label:<34} {spec.description}")
         lines.append(
-            "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette, Ctrl+1/2/3 tabs",
+            "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+R reload workspace, "
+            "Ctrl+P palette, Ctrl+1/2/3 tabs",
         )
         return lines
 
@@ -630,6 +666,8 @@ class LoomApp(App):
 
     def _render_slash_hint(self, raw_input: str) -> str:
         """Build slash-command hint text for the current input."""
+        if " " in raw_input.strip():
+            return ""
         token, matches = self._matching_slash_commands(raw_input)
         if not token:
             return ""
@@ -645,6 +683,14 @@ class LoomApp(App):
         for cmd, desc in matches:
             lines.append(f"  [#73daca]{cmd:<10}[/] {desc}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _strip_wrapping_quotes(value: str) -> str:
+        """Remove matching wrapping quotes from a command argument."""
+        text = value.strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+            return text[1:-1].strip()
+        return text
 
     def _set_slash_hint(self, hint_text: str) -> None:
         """Show or hide the slash-command hint panel."""
@@ -1018,6 +1064,19 @@ class LoomApp(App):
             )
             return True
 
+        if token == "/run":
+            goal = self._strip_wrapping_quotes(arg)
+            if not goal:
+                chat.add_info("Usage: /run <goal>")
+                return True
+            if self._process_defn is None:
+                chat.add_info(
+                    "No active process. Use /process use <name-or-path> first.",
+                )
+                return True
+            await self._run_process_goal(goal)
+            return True
+
         # Persistence-dependent commands
         if token == "/session":
             if not self._session:
@@ -1205,12 +1264,11 @@ class LoomApp(App):
                         f"{event.name} {event.elapsed_ms}ms",
                     )
 
-                    # Update sidebar tasks if task_tracker
                     if (
-                        event.name == "task_tracker"
+                        event.name in {"task_tracker", "delegate_task"}
                         and event.result.data
                     ):
-                        self._update_sidebar_tasks(event)
+                        self._update_sidebar_tasks(event.result.data)
 
                     # Handle ask_user
                     if (
@@ -1244,6 +1302,99 @@ class LoomApp(App):
                 # Update files panel
                 self._update_files_panel(event)
 
+    async def _run_process_goal(self, goal: str) -> None:
+        """Run a goal through delegate_task using the active process."""
+        chat = self.query_one("#chat-log", ChatLog)
+        status = self.query_one("#status-bar", StatusBar)
+        events_panel = self.query_one("#events-panel", EventPanel)
+
+        if self._busy:
+            chat.add_info(
+                "[bold #f7768e]Cannot run /run while another turn is running.[/]",
+            )
+            return
+
+        if not self._tools.has("delegate_task"):
+            chat.add_info(
+                "[bold #f7768e]Process orchestration is unavailable in this "
+                "session.[/]",
+            )
+            return
+
+        self._busy = True
+        process_name = self._active_process_name()
+        chat.add_user_message(f"/run {goal}")
+        status.state = f"Running {process_name}..."
+        events_panel.add_event(
+            _now_str(),
+            "process_run",
+            f"{process_name}: {goal[:120]}",
+        )
+
+        result = None
+        try:
+            result = await self._tools.execute(
+                "delegate_task",
+                {
+                    "goal": goal,
+                    "wait": True,
+                    "_progress_callback": self._on_process_progress_event,
+                },
+                workspace=self._workspace,
+            )
+            data = getattr(result, "data", None)
+            if isinstance(data, dict):
+                self._update_sidebar_tasks(data)
+            if result.success:
+                chat.add_model_text(result.output or "Process run completed.")
+                events_panel.add_event(_now_str(), "process_ok", process_name)
+            else:
+                error = result.error or result.output or "Process run failed."
+                chat.add_model_text(f"[bold #f7768e]Error:[/] {error}")
+                events_panel.add_event(_now_str(), "process_err", process_name)
+                self._mark_process_run_failed(error)
+                self.notify(error, severity="error", timeout=5)
+            self._refresh_workspace_tree()
+        except Exception as e:  # pragma: no cover - defensive guard
+            chat.add_model_text(f"[bold #f7768e]Error:[/] {e}")
+            events_panel.add_event(_now_str(), "process_err", process_name)
+            self._mark_process_run_failed(str(e))
+            self.notify(str(e), severity="error", timeout=5)
+        finally:
+            self._busy = False
+            status.state = "Ready"
+
+    def _on_process_progress_event(self, data: dict) -> None:
+        """Handle incremental delegate_task progress events in /run flows."""
+        if not isinstance(data, dict):
+            return
+        self._update_sidebar_tasks(data)
+        if data.get("event_type") in {
+            "subtask_completed",
+            "subtask_failed",
+            "task_completed",
+            "task_failed",
+        }:
+            self._refresh_workspace_tree()
+
+    def _mark_process_run_failed(self, error: str) -> None:
+        """Reflect a failed /run execution in the progress panel."""
+        message = error.strip() or "Process run failed."
+        if "timed out" in message.lower():
+            message = (
+                f"{message} Increase LOOM_DELEGATE_TIMEOUT_SECONDS for longer "
+                "runs."
+            )
+        self._update_sidebar_tasks({
+            "tasks": [
+                {
+                    "id": "process-run",
+                    "status": "failed",
+                    "content": f"/run failed: {message}",
+                },
+            ],
+        })
+
     async def _handle_ask_user(self, event: ToolCallEvent) -> str:
         """Show an ask_user modal and return the answer."""
         question = event.args.get("question", "")
@@ -1274,16 +1425,28 @@ class LoomApp(App):
     # Data panel updates
     # ------------------------------------------------------------------
 
-    def _update_sidebar_tasks(self, event: ToolCallEvent) -> None:
-        """Update sidebar task progress from task_tracker result."""
-        if not event.result or not event.result.data:
+    def _update_sidebar_tasks(self, data: dict) -> None:
+        """Update sidebar task progress from a tool result payload."""
+        if not data:
             return
-        data = event.result.data
+        if not isinstance(data, dict):
+            return
         tasks = data.get("tasks", [])
         if not tasks and "id" in data:
             tasks = [data]
-        sidebar = self.query_one("#sidebar", Sidebar)
+        try:
+            sidebar = self.query_one("#sidebar", Sidebar)
+        except Exception:
+            return
         sidebar.update_tasks(tasks)
+
+    def _refresh_workspace_tree(self) -> None:
+        """Reload sidebar workspace tree to pick up new files."""
+        try:
+            sidebar = self.query_one("#sidebar", Sidebar)
+        except Exception:
+            return
+        sidebar.refresh_workspace_tree()
 
     def _update_files_panel(self, turn: CoworkTurn) -> None:
         """Update the Files Changed panel from tool call events."""
@@ -1333,6 +1496,7 @@ class LoomApp(App):
             panel.update_files(file_entries)
             if last_diff:
                 panel.show_diff(last_diff)
+            self._refresh_workspace_tree()
             count = len(file_entries)
             s = "s" if count != 1 else ""
             self.notify(
@@ -1350,6 +1514,11 @@ class LoomApp(App):
         chat = self.query_one("#chat-log", ChatLog)
         for child in list(chat.children):
             child.remove()
+
+    def action_reload_workspace(self) -> None:
+        """Reload sidebar workspace tree to show external file changes."""
+        self._refresh_workspace_tree()
+        self.notify("Workspace reloaded", timeout=2)
 
     def action_tab_chat(self) -> None:
         tabs = self.query_one("#tabs", TabbedContent)
@@ -1421,6 +1590,7 @@ class LoomApp(App):
         actions = {
             "clear_chat": self.action_clear_chat,
             "toggle_sidebar": self.action_toggle_sidebar,
+            "reload_workspace": self.action_reload_workspace,
             "tab_chat": self.action_tab_chat,
             "tab_files": self.action_tab_files,
             "tab_events": self.action_tab_events,

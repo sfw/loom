@@ -24,6 +24,7 @@ _BLOCKED_HOSTS = re.compile(
 )
 
 MAX_RESPONSE_SIZE = 512 * 1024  # 512KB
+MAX_DOWNLOAD_BYTES = MAX_RESPONSE_SIZE * 4  # 2MB bounded download
 FETCH_TIMEOUT = 30.0
 MAX_FETCH_ATTEMPTS = 3
 FETCH_RETRY_BASE_DELAY = 0.4
@@ -105,15 +106,20 @@ def _should_retry_status(status_code: int) -> bool:
 async def _get_with_retries(
     client: httpx.AsyncClient,
     url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    stream: bool = False,
 ) -> httpx.Response:
     """GET URL with bounded retries for transient failures."""
     for attempt in range(MAX_FETCH_ATTEMPTS):
         try:
-            response = await client.get(url)
+            request = client.build_request("GET", url, headers=headers)
+            response = await client.send(request, stream=stream)
             if (
                 _should_retry_status(response.status_code)
                 and attempt < MAX_FETCH_ATTEMPTS - 1
             ):
+                await response.aclose()
                 await asyncio.sleep(FETCH_RETRY_BASE_DELAY * (2 ** attempt))
                 continue
             return response
@@ -127,6 +133,37 @@ async def _get_with_retries(
             await asyncio.sleep(FETCH_RETRY_BASE_DELAY * (2 ** attempt))
 
     raise RuntimeError(f"Fetch failed after {MAX_FETCH_ATTEMPTS} attempts: {url}")
+
+
+async def _read_response_limited(
+    response: httpx.Response,
+    max_bytes: int,
+) -> tuple[bytes, bool]:
+    """Read response body up to max_bytes and return (data, truncated)."""
+    data = bytearray()
+    truncated = False
+    async for chunk in response.aiter_bytes():
+        if not chunk:
+            continue
+        remaining = max_bytes - len(data)
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(chunk) > remaining:
+            data.extend(chunk[:remaining])
+            truncated = True
+            break
+        data.extend(chunk)
+    return bytes(data), truncated
+
+
+def _decode_response_bytes(response: httpx.Response, content: bytes) -> str:
+    """Decode response bytes using response charset with safe fallback."""
+    encoding = response.encoding or "utf-8"
+    try:
+        return content.decode(encoding, errors="replace")
+    except LookupError:
+        return content.decode("utf-8", errors="replace")
 
 
 class WebFetchTool(Tool):
@@ -181,7 +218,7 @@ class WebFetchTool(Tool):
                 timeout=httpx.Timeout(FETCH_TIMEOUT),
                 headers=headers,
             ) as client:
-                response = await _get_with_retries(client, url)
+                response = await _get_with_retries(client, url, stream=True)
 
                 # Follow redirects manually to validate each target against SSRF
                 redirect_count = 0
@@ -194,34 +231,58 @@ class WebFetchTool(Tool):
                     location = urljoin(str(response.url), location)
                     redir_safe, redir_reason = is_safe_url(location)
                     if not redir_safe:
+                        await response.aclose()
                         return ToolResult.fail(f"Redirect blocked: {redir_reason}")
-                    response = await _get_with_retries(client, location)
+                    await response.aclose()
+                    response = await _get_with_retries(
+                        client, location, stream=True,
+                    )
 
                 if response.is_redirect:
+                    await response.aclose()
                     return ToolResult.fail("Too many redirects (max 5)")
 
                 response.raise_for_status()
 
-                # Check Content-Length before reading body to prevent OOM
+                # Bounded streaming read to avoid huge response bodies.
+                # Keep only the first MAX_DOWNLOAD_BYTES bytes.
                 content_length = response.headers.get("content-length")
-                if content_length and int(content_length) > MAX_RESPONSE_SIZE * 4:
-                    return ToolResult.fail(
-                        f"Response too large ({int(content_length)} bytes). "
-                        f"Max: {MAX_RESPONSE_SIZE * 4}."
-                    )
-
                 content_type = response.headers.get("content-type", "")
-                content = response.text
+                declared_size = None
+                if content_length:
+                    try:
+                        declared_size = int(content_length)
+                    except ValueError:
+                        declared_size = None
+                content_bytes, stream_truncated = await _read_response_limited(
+                    response, MAX_DOWNLOAD_BYTES,
+                )
+                await response.aclose()
+                content = _decode_response_bytes(response, content_bytes)
 
-                # Truncate if too large (even after Content-Length check, since
-                # Content-Length can be absent or wrong)
+                # Truncate text output for prompt safety.
+                text_truncated = False
                 if len(content) > MAX_RESPONSE_SIZE:
                     content = content[:MAX_RESPONSE_SIZE]
-                    content += "\n\n... (content truncated)"
+                    text_truncated = True
 
                 # Strip HTML if requested
                 if extract_text and "html" in content_type.lower():
                     content = _strip_html(content)
+
+                truncation_notes = []
+                if stream_truncated or (
+                    declared_size is not None and declared_size > MAX_DOWNLOAD_BYTES
+                ):
+                    truncation_notes.append(
+                        f"download truncated to first {MAX_DOWNLOAD_BYTES} bytes"
+                    )
+                if text_truncated:
+                    truncation_notes.append(
+                        f"text output truncated to {MAX_RESPONSE_SIZE} chars"
+                    )
+                if truncation_notes:
+                    content += "\n\n... (" + "; ".join(truncation_notes) + ")"
 
                 return ToolResult.ok(
                     content,
@@ -230,6 +291,8 @@ class WebFetchTool(Tool):
                         "status_code": response.status_code,
                         "content_type": content_type,
                         "size_bytes": len(content),
+                        "declared_size_bytes": declared_size,
+                        "truncated": bool(truncation_notes),
                     },
                 )
         except httpx.HTTPStatusError as e:

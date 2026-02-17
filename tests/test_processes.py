@@ -1015,6 +1015,25 @@ class TestExecutorPromptWithProcess:
         assert "DOMAIN-SPECIFIC TOOL GUIDANCE" in prompt
         assert "read_file before editing" in prompt
 
+    def test_exact_deliverables_injected_for_matching_subtask(
+        self, sample_task, state_manager, full_process_defn,
+    ):
+        state_manager.create(sample_task)
+        assembler = PromptAssembler(process=full_process_defn)
+        subtask = Subtask(
+            id="implement",
+            description="Implement phase",
+            acceptance_criteria="Create implementation artifacts.",
+        )
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+        assert "REQUIRED OUTPUT FILES (EXACT FILENAMES)" in prompt
+        assert "main.py" in prompt
+        assert "Do not rename them" in prompt
+
 
 class TestVerifierPromptWithProcess:
     """Test verifier prompt assembly with process verification rules."""

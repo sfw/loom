@@ -52,7 +52,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Full undo.** Every file write is preceded by a snapshot. You can revert any individual change, all changes from a subtask, or the entire task. The changelog tracks creates, modifies, deletes, and renames with before-state snapshots.
 
-**21 built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch, web search (DuckDuckGo, no API key), code analysis (tree-sitter when installed, regex fallback), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, and ask_user for mid-execution questions. All tools auto-discovered via `__init_subclass__`.
+**21 built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch (bounded streaming + truncation for large pages), web search (DuckDuckGo, no API key), code analysis (tree-sitter when installed, regex fallback), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, and ask_user for mid-execution questions. All tools auto-discovered via `__init_subclass__`.
 
 **Inline diffs.** Every file edit produces a unified diff in the tool result. Diffs render with Rich markup syntax highlighting in the TUI -- green additions, red removals. You always see exactly what changed.
 
@@ -69,6 +69,10 @@ loom -w /path/to/workspace
 
 # With a process definition
 loom -w /path/to/workspace --process consulting-engagement
+
+# Force process orchestration from inside the TUI (no loom serve required)
+# /process use investment-analysis
+# /run Analyze Tesla for investment
 
 # Resume a previous session
 loom --resume <session-id>
@@ -121,6 +125,7 @@ NOTION_TOKEN = "your-token"
 
 Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor) so you can use a big model for planning and a small one for verification.
 Optional MCP servers are auto-discovered at startup and registered as namespaced tools (`mcp.<server>.<tool>`).
+`delegate_task` (used by `/run`) defaults to a 3600s timeout. Set `LOOM_DELEGATE_TIMEOUT_SECONDS` to increase/decrease for long workflows.
 
 ## Process Definitions
 
@@ -158,7 +163,7 @@ In the TUI, use `/learned` to open an interactive review screen where you can in
 
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name>`, `/process off`), and learned pattern review (`/learned`).
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal>`), and learned pattern review (`/learned`). `/run` executes in-process and does not require `loom serve`.
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 

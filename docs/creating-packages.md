@@ -176,6 +176,10 @@ phases:
 | `acceptance_criteria` | No | Concrete criteria for phase completion. |
 | `deliverables` | No | List of expected output files with descriptions. |
 
+Deliverables are enforced by exact filename at execution and verification time.
+If a phase declares `financial-summary.csv`, the model must create/update that
+exact path (not `tesla_financial_summary.csv` or other variants).
+
 **Dependency rules:**
 - Dependencies form a DAG (directed acyclic graph). Cycles are rejected at load time.
 - Independent phases (no shared dependencies) can run in parallel.

@@ -135,6 +135,23 @@ class TestDeterministicVerifier:
         )
 
     @pytest.mark.asyncio
+    async def test_web_tool_response_too_large_is_advisory(self):
+        v = DeterministicVerifier()
+        tc = MockToolCallRecord(
+            tool="web_fetch",
+            args={"url": "https://example.com/huge"},
+            result=ToolResult.fail(
+                "Response too large (11260600 bytes). Max: 2097152.",
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert result.passed
+        assert any(
+            c.name == "tool_web_fetch_advisory" and c.passed
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
     async def test_checks_file_nonempty(self, tmp_path):
         # Create a non-empty file
         test_file = tmp_path / "out.py"
