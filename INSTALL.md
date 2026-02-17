@@ -125,7 +125,13 @@ uv sync --extra mcp
 # PDF text extraction in read_file tool
 uv sync --extra pdf
 # or: pip install -e ".[pdf]"
+
+# Tree-sitter code analysis (replaces regex extractors)
+uv sync --extra treesitter
+# or: pip install -e ".[treesitter]"
 ```
+
+**Note:** Tree-sitter is optional — code analysis falls back to regex extractors when not installed.
 
 **Note:** Word document (.docx) and PowerPoint (.pptx) support is included out of the box — `python-docx` and `python-pptx` are required dependencies, no extras needed.
 
@@ -256,7 +262,7 @@ curl http://localhost:1234/v1/models
 
 ```bash
 pytest
-# Should show 1,234+ passed
+# Should show 1,278+ passed
 ```
 
 ### 4. Start the Server
