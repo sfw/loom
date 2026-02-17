@@ -1172,6 +1172,7 @@ class TestSlashCommandHints:
         hint = app._render_slash_hint("/")
         assert "Slash commands:" in hint
         assert "/quit" in hint
+        assert "/mcp" in hint
         assert "/setup" in hint
 
     def test_prefix_filters_matches(self):
@@ -1386,6 +1387,7 @@ class TestSlashCommandHints:
             "/sessions",
         ]
         assert app._slash_completion_candidates("/h") == ["/help"]
+        assert app._slash_completion_candidates("/m") == ["/model", "/mcp"]
         assert app._slash_completion_candidates("/t") == ["/tools", "/tokens"]
         assert app._slash_completion_candidates("/p") == ["/process"]
         assert app._slash_completion_candidates("/r") == ["/resume", "/run"]
@@ -1726,6 +1728,205 @@ class TestProcessSlashCommands:
         payload = sidebar.update_tasks.call_args.args[0]
         assert payload[0]["status"] == "failed"
         assert "LOOM_DELEGATE_TIMEOUT_SECONDS" in payload[0]["content"]
+
+
+class TestMCPSlashCommands:
+    @pytest.mark.asyncio
+    async def test_mcp_without_args_shows_usage(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/mcp")
+
+        assert handled is True
+        chat.add_info.assert_called_once()
+        assert "/mcp list" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_mcp_list_uses_manager(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        manager = MagicMock()
+        merged = MagicMock()
+        merged.as_views.return_value = [
+            SimpleNamespace(
+                alias="demo",
+                server=SimpleNamespace(enabled=True),
+                source="user",
+            )
+        ]
+        manager.load.return_value = merged
+        app._mcp_manager = MagicMock(return_value=manager)
+        app._render_mcp_list = MagicMock(return_value="mcp-catalog")
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/mcp list")
+
+        assert handled is True
+        manager.load.assert_called_once()
+        merged.as_views.assert_called_once()
+        app._render_mcp_list.assert_called_once()
+        chat.add_info.assert_called_once_with("mcp-catalog")
+
+    @pytest.mark.asyncio
+    async def test_mcp_list_shows_legacy_migration_hint(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        manager = MagicMock()
+        merged = MagicMock()
+        merged.as_views.return_value = [
+            SimpleNamespace(
+                alias="legacy_demo",
+                server=SimpleNamespace(enabled=True),
+                source="legacy",
+            )
+        ]
+        manager.load.return_value = merged
+        app._mcp_manager = MagicMock(return_value=manager)
+        app._render_mcp_list = MagicMock(return_value="mcp-catalog")
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/mcp list")
+
+        assert handled is True
+        chat.add_info.assert_called_once()
+        assert "loom mcp migrate" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_mcp_show_requires_alias(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._mcp_manager = MagicMock(return_value=MagicMock())
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/mcp show")
+
+        assert handled is True
+        chat.add_info.assert_called_once_with("Usage: /mcp show <alias>")
+
+    @pytest.mark.asyncio
+    async def test_mcp_show_missing_alias(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        manager = MagicMock()
+        manager.get_view.return_value = None
+        app._mcp_manager = MagicMock(return_value=manager)
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/mcp show missing")
+
+        assert handled is True
+        manager.get_view.assert_called_once_with("missing")
+        chat.add_info.assert_called_once()
+        assert "MCP server not found" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_mcp_enable_edits_and_reloads(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        manager = MagicMock()
+        manager.edit_server.return_value = (Path("/tmp/mcp.toml"), MagicMock())
+        app._mcp_manager = MagicMock(return_value=manager)
+        app._reload_mcp_runtime = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/mcp enable demo")
+
+        assert handled is True
+        manager.edit_server.assert_called_once()
+        app._reload_mcp_runtime.assert_awaited_once()
+        chat.add_info.assert_called_once()
+        assert "enabled" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_mcp_remove_edits_and_reloads(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        manager = MagicMock()
+        manager.remove_server.return_value = Path("/tmp/mcp.toml")
+        app._mcp_manager = MagicMock(return_value=manager)
+        app._reload_mcp_runtime = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/mcp remove demo")
+
+        assert handled is True
+        manager.remove_server.assert_called_once_with("demo")
+        app._reload_mcp_runtime.assert_awaited_once()
+        chat.add_info.assert_called_once()
+        assert "removed" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_mcp_test_reports_discovered_tools(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        manager = MagicMock()
+        view = SimpleNamespace(alias="demo")
+        manager.probe_server.return_value = (
+            view,
+            [{"name": "echo"}, {"name": "ping"}],
+        )
+        app._mcp_manager = MagicMock(return_value=manager)
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/mcp test demo")
+
+        assert handled is True
+        manager.probe_server.assert_called_once_with("demo")
+        chat.add_info.assert_called_once()
+        message = chat.add_info.call_args.args[0]
+        assert "Tools discovered: 2" in message
+        assert "echo" in message
+        assert "ping" in message
 
 
 class TestCommandPaletteProcessActions:

@@ -10,6 +10,7 @@ import pytest
 
 from loom.config import Config, MCPConfig, MCPServerConfig
 from loom.integrations.mcp_tools import register_mcp_tools
+from loom.mcp.config import apply_mcp_overrides
 from loom.tools import create_default_registry
 from loom.tools.registry import ToolRegistry
 
@@ -429,3 +430,85 @@ async def test_list_changed_notification_triggers_runtime_refresh(tmp_path):
     assert result.success
     assert "echo:refresh" in result.output
     assert registry.has("mcp.demo.ping")
+
+
+def test_create_registry_loads_mcp_from_external_mcp_toml(tmp_path):
+    script = _write_fake_mcp_server(
+        tmp_path,
+        tools=[
+            {"name": "echo", "description": "Echo tool", "inputSchema": {"type": "object"}}
+        ],
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    user_mcp = tmp_path / "user-mcp.toml"
+    user_mcp.write_text(
+        f"""
+[mcp.servers.demo]
+command = "{sys.executable}"
+args = ["{script}"]
+enabled = true
+"""
+    )
+
+    cfg = apply_mcp_overrides(
+        Config(),
+        workspace=workspace,
+        user_path=user_mcp,
+    )
+    registry = create_default_registry(cfg)
+    assert registry.has("mcp.demo.echo")
+
+
+def test_workspace_mcp_toml_overrides_user_layer(tmp_path):
+    user_script = _write_fake_mcp_server(
+        tmp_path,
+        tools=[
+            {
+                "name": "user_tool",
+                "description": "User-level",
+                "inputSchema": {"type": "object"},
+            }
+        ],
+    )
+    workspace_script = _write_fake_mcp_server(
+        tmp_path,
+        tools=[
+            {
+                "name": "workspace_tool",
+                "description": "Workspace-level",
+                "inputSchema": {"type": "object"},
+            }
+        ],
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    workspace_mcp = workspace / ".loom" / "mcp.toml"
+    workspace_mcp.parent.mkdir(parents=True)
+    workspace_mcp.write_text(
+        f"""
+[mcp.servers.demo]
+command = "{sys.executable}"
+args = ["{workspace_script}"]
+enabled = true
+"""
+    )
+
+    user_mcp = tmp_path / "user-mcp.toml"
+    user_mcp.write_text(
+        f"""
+[mcp.servers.demo]
+command = "{sys.executable}"
+args = ["{user_script}"]
+enabled = true
+"""
+    )
+
+    cfg = apply_mcp_overrides(
+        Config(),
+        workspace=workspace,
+        user_path=user_mcp,
+    )
+    registry = create_default_registry(cfg)
+    assert registry.has("mcp.demo.workspace_tool")
+    assert not registry.has("mcp.demo.user_tool")

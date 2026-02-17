@@ -1,7 +1,25 @@
 # MCP Tool Management and Config Separation Plan (2026-02-17)
 
 ## Execution Status (2026-02-17)
-Status: Proposed
+Status: Implemented and Audited
+
+## Implementation Review (2026-02-17)
+Completed against plan:
+- Phase 1 (core manager): implemented `src/loom/mcp/config.py` with layered merge, atomic writes, redaction helpers, and migration helpers.
+- Phase 2 (CLI): implemented `loom mcp` command group (`list/show/add/edit/remove/enable/disable/test/migrate`) with JSON output and redaction-by-default.
+- Phase 3 (runtime integration): CLI startup now applies merged MCP layers (`--mcp-config` + workspace/user/legacy), and MCP registry discovery continues to use merged runtime config. Added legacy-source migration guidance in list/show output.
+- Phase 4 (TUI): implemented `/mcp` command family (`list/show/test/enable/disable/remove`) with shared backend usage and runtime MCP tool refresh after mutations.
+- Phase 5 (docs): updated `README.md`, `docs/tutorial.html`, and `docs/agent-integration.md` with `mcp.toml` workflow, merge precedence, and migration examples.
+
+Validation added:
+- Unit tests for manager precedence/mutation/migration/redaction (`tests/test_mcp_config_manager.py`).
+- CLI tests for full `loom mcp` lifecycle and migration/probe flows (`tests/test_cli.py`).
+- Integration tests for loading MCP tools from external `mcp.toml` layers and workspace precedence (`tests/test_mcp_tools_bridge.py`).
+- TUI tests for `/mcp` slash parsing/dispatch/feedback/autocomplete coverage (`tests/test_tui.py`).
+- Regression test ensuring setup does not mutate separate MCP config (`tests/test_setup.py`).
+
+Deferred by design (from original plan’s “Phase 2 TUI enhancement”):
+- Modal add/edit MCP form in TUI (`/mcp add`, `/mcp edit`) remains deferred; CLI provides full mutation coverage.
 
 ## Scope
 - Add a first-class MCP management workflow for Loom users.

@@ -113,18 +113,24 @@ roles = ["extractor", "verifier"]
 max_subtask_retries = 3
 max_loop_iterations = 50
 max_parallel_subtasks = 3
+```
 
+Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor) so you can use a big model for planning and a small one for verification.
+Manage external MCP servers in `~/.loom/mcp.toml` (or workspace `./.loom/mcp.toml`):
+
+```toml
 [mcp.servers.notion]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-notion"]
 timeout_seconds = 30
+enabled = true
 
 [mcp.servers.notion.env]
-NOTION_TOKEN = "your-token"
+NOTION_TOKEN = "${NOTION_TOKEN}"
 ```
 
-Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor) so you can use a big model for planning and a small one for verification.
-Optional MCP servers are auto-discovered at startup and registered as namespaced tools (`mcp.<server>.<tool>`).
+MCP merge precedence is: `--mcp-config` > `./.loom/mcp.toml` > `~/.loom/mcp.toml` > legacy `[mcp]` in `loom.toml`.
+Configured MCP servers are auto-discovered at startup and registered as namespaced tools (`mcp.<server>.<tool>`).
 `delegate_task` (used by `/run`) defaults to a 3600s timeout. Set `LOOM_DELEGATE_TIMEOUT_SECONDS` to increase/decrease for long workflows.
 
 ## Process Definitions
@@ -164,7 +170,7 @@ In the TUI, use `/learned` to open an interactive review screen for learned beha
 
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal>`), learned pattern review (`/learned`), and click-to-open workspace file previews (Markdown, code/text with syntax highlighting including TypeScript/CSS, JSON, CSV/TSV, HTML, diff/patch, Office docs, PDF text, and image metadata). `/run` executes in-process and does not require `loom serve`.
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal>`), learned pattern review (`/learned`), MCP config controls (`/mcp list`, `/mcp show`, `/mcp test`, `/mcp enable`, `/mcp disable`, `/mcp remove`), and click-to-open workspace file previews (Markdown, code/text with syntax highlighting including TypeScript/CSS, JSON, CSV/TSV, HTML, diff/patch, Office docs, PDF text, and image metadata). `/run` executes in-process and does not require `loom serve`.
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
@@ -183,6 +189,7 @@ loom processes          List available process definitions
 loom install SOURCE     Install a process package
 loom uninstall NAME     Remove a process package
 loom process test NAME  Run process package test cases
+loom mcp ...            Manage MCP server config (list/show/add/edit/remove/test/migrate)
 loom mcp-serve          Start the MCP server (stdio transport)
 loom learned            Review learned patterns (behavioral by default)
 loom reset-learning     Clear all learned patterns
@@ -190,6 +197,7 @@ loom reset-learning     Clear all learned patterns
 
 Common flags for `loom` / `loom cowork`:
 - `-w /path` -- workspace directory
+- `--mcp-config /path/to/mcp.toml` -- explicit MCP config layer
 - `-m model` -- model name from config
 - `--resume <id>` -- resume a previous session
 - `--process <name>` -- load a process definition
@@ -202,6 +210,7 @@ Common flags for `loom` / `loom cowork`:
 src/loom/
   __main__.py            CLI (Click), TUI launcher (default command)
   config.py              TOML config loader
+  mcp/                   MCP config manager + merge/migration logic
   api/                   FastAPI server, REST routes, SSE streaming
   cowork/                Conversation session, approval, session state
   engine/                Orchestrator, subtask runner, scheduler, verification

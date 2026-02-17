@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -103,6 +103,11 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec(canonical="/help", description="show command help"),
     SlashCommandSpec(canonical="/setup", description="run setup wizard"),
     SlashCommandSpec(canonical="/model", description="show active model"),
+    SlashCommandSpec(
+        canonical="/mcp",
+        usage="[list|show <alias>|test <alias>|enable <alias>|disable <alias>|remove <alias>]",
+        description="inspect/manage MCP server config",
+    ),
     SlashCommandSpec(canonical="/tools", description="list available tools"),
     SlashCommandSpec(canonical="/tokens", description="show session token usage"),
     SlashCommandSpec(canonical="/session", description="show current session info"),
@@ -254,10 +259,19 @@ class LoomApp(App):
     @work
     async def _finalize_setup(self) -> None:
         """Reload config and initialize after setup wizard completes."""
-        from loom.config import load_config
+        from loom.config import Config, load_config
+        from loom.mcp.config import apply_mcp_overrides
         from loom.models.router import ModelRouter
 
-        self._config = load_config()
+        loaded = load_config()
+        if isinstance(loaded, Config):
+            self._config = apply_mcp_overrides(
+                loaded,
+                workspace=self._workspace,
+            )
+        else:
+            # Defensive fallback for mocked/non-standard config objects.
+            self._config = loaded
         router = ModelRouter.from_config(self._config)
         try:
             self._model = router.select(role="executor")
@@ -304,6 +318,31 @@ class LoomApp(App):
         if self._process_defn:
             return self._process_defn.name
         return "none"
+
+    def _mcp_manager(self):
+        """Build MCP config manager scoped to current app workspace."""
+        from loom.mcp.config import MCPConfigManager
+
+        return MCPConfigManager(
+            config=self._config,
+            workspace=self._workspace,
+        )
+
+    async def _reload_mcp_runtime(self) -> None:
+        """Reload merged MCP config and reconcile MCP tools in registry."""
+        if self._config is None:
+            return
+
+        from loom.integrations.mcp_tools import register_mcp_tools
+
+        manager = self._mcp_manager()
+        merged = await asyncio.to_thread(manager.load)
+        self._config = replace(self._config, mcp=merged.config)
+        await asyncio.to_thread(
+            register_mcp_tools,
+            self._tools,
+            mcp_config=merged.config,
+        )
 
     def _load_process_definition(self, chat: ChatLog) -> None:
         """Load active process definition and import bundled tools."""
@@ -362,6 +401,43 @@ class LoomApp(App):
             lines.append(f"  {name:30s} v{ver:6s}{marker}")
             if desc:
                 lines.append(f"    [dim]{desc[:80]}[/dim]")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_mcp_list(views: list) -> str:
+        """Build a readable MCP server list."""
+        if not views:
+            return "No MCP servers configured."
+        lines = ["[bold]MCP servers:[/bold]"]
+        for view in views:
+            status = "enabled" if view.server.enabled else "disabled"
+            lines.append(
+                f"  {view.alias:16s} {status:8s} [dim]source={view.source}[/dim]"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_mcp_view(view) -> str:
+        """Build a readable MCP server details block."""
+        from loom.mcp.config import redact_server_env
+
+        env = redact_server_env(view.server)
+        lines = [
+            f"[bold]{view.alias}[/bold]",
+            f"  source: {view.source}",
+            f"  source_path: {view.source_path or '-'}",
+            f"  enabled: {view.server.enabled}",
+            f"  command: {view.server.command}",
+            f"  args: {' '.join(view.server.args) if view.server.args else '-'}",
+            f"  cwd: {view.server.cwd or '-'}",
+            f"  timeout_seconds: {view.server.timeout_seconds}",
+            "  env:",
+        ]
+        if env:
+            for key, value in env.items():
+                lines.append(f"    {key}={value}")
+        else:
+            lines.append("    (none)")
         return "\n".join(lines)
 
     def _apply_process_tool_policy(self, chat: ChatLog) -> None:
@@ -1010,6 +1086,129 @@ class LoomApp(App):
         if token == "/model":
             name = self._model.name if self._model else "(not configured)"
             chat.add_info(f"Model: {name}")
+            return True
+        if token == "/mcp":
+            from loom.mcp.config import MCPConfigManagerError, ensure_valid_alias
+
+            manager = self._mcp_manager()
+            if not arg:
+                chat.add_info(
+                    "Usage:\n"
+                    "  /mcp list\n"
+                    "  /mcp show <alias>\n"
+                    "  /mcp test <alias>\n"
+                    "  /mcp enable <alias>\n"
+                    "  /mcp disable <alias>\n"
+                    "  /mcp remove <alias>"
+                )
+                return True
+
+            subparts = arg.split(None, 1)
+            subcmd = subparts[0].lower()
+            rest = subparts[1].strip() if len(subparts) > 1 else ""
+
+            if subcmd == "list":
+                try:
+                    merged = await asyncio.to_thread(manager.load)
+                    views = merged.as_views()
+                    output = self._render_mcp_list(views)
+                    if any(view.source == "legacy" for view in views):
+                        output += (
+                            "\n[dim]Legacy MCP config detected in loom.toml. "
+                            "Run `loom mcp migrate` from CLI.[/dim]"
+                        )
+                    chat.add_info(output)
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]MCP list failed: {e}[/]")
+                return True
+
+            if subcmd == "show":
+                if not rest:
+                    chat.add_info("Usage: /mcp show <alias>")
+                    return True
+                try:
+                    alias = ensure_valid_alias(rest)
+                    view = await asyncio.to_thread(manager.get_view, alias)
+                except MCPConfigManagerError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                if view is None:
+                    chat.add_info(
+                        f"[bold #f7768e]MCP server not found: {alias}[/]"
+                    )
+                    return True
+                output = self._render_mcp_view(view)
+                if view.source == "legacy":
+                    output += (
+                        "\n[dim]This alias comes from legacy loom.toml. "
+                        "Run `loom mcp migrate` from CLI to move it.[/dim]"
+                    )
+                chat.add_info(output)
+                return True
+
+            if subcmd == "test":
+                if not rest:
+                    chat.add_info("Usage: /mcp test <alias>")
+                    return True
+                try:
+                    alias = ensure_valid_alias(rest)
+                    view, tools = await asyncio.to_thread(
+                        manager.probe_server,
+                        alias,
+                    )
+                except Exception as e:
+                    chat.add_info(
+                        f"[bold #f7768e]MCP probe failed for '{rest}': {e}[/]"
+                    )
+                    return True
+                names = [str(tool.get("name", "")) for tool in tools]
+                lines = [
+                    f"MCP probe succeeded for [bold]{view.alias}[/bold].",
+                    f"Tools discovered: {len(names)}",
+                ]
+                for name in names:
+                    lines.append(f"  - {name}")
+                chat.add_info("\n".join(lines))
+                return True
+
+            if subcmd in {"enable", "disable"}:
+                if not rest:
+                    chat.add_info(f"Usage: /mcp {subcmd} <alias>")
+                    return True
+                try:
+                    alias = ensure_valid_alias(rest)
+                    enabled = subcmd == "enable"
+                    await asyncio.to_thread(
+                        manager.edit_server,
+                        alias,
+                        lambda current: replace(current, enabled=enabled),
+                    )
+                    await self._reload_mcp_runtime()
+                    chat.add_info(
+                        f"MCP server '{alias}' "
+                        f"{'enabled' if enabled else 'disabled'}."
+                    )
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                return True
+
+            if subcmd == "remove":
+                if not rest:
+                    chat.add_info("Usage: /mcp remove <alias>")
+                    return True
+                try:
+                    alias = ensure_valid_alias(rest)
+                    await asyncio.to_thread(manager.remove_server, alias)
+                    await self._reload_mcp_runtime()
+                    chat.add_info(f"MCP server '{alias}' removed.")
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                return True
+
+            chat.add_info(
+                "Usage: /mcp [list|show <alias>|test <alias>|enable <alias>|"
+                "disable <alias>|remove <alias>]"
+            )
             return True
         if token == "/setup":
             self.push_screen(

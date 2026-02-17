@@ -813,14 +813,35 @@ database_path = "~/.loom/loom.db"
 [workspace]
 default_path = "~/projects"
 scratch_dir = "~/.loom/scratch"
+```
 
+MCP server configuration is managed separately in `~/.loom/mcp.toml`
+(workspace override: `./.loom/mcp.toml`):
+
+```toml
 [mcp.servers.notion]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-notion"]
 timeout_seconds = 30
+enabled = true
 
 [mcp.servers.notion.env]
-NOTION_TOKEN = "your-token"
+NOTION_TOKEN = "${NOTION_TOKEN}"
+```
+
+Merge precedence is:
+1. `--mcp-config <path>`
+2. `./.loom/mcp.toml`
+3. `~/.loom/mcp.toml`
+4. legacy `[mcp]` sections in `loom.toml`
+
+Use the MCP CLI manager:
+
+```bash
+loom mcp list
+loom mcp add notion --command npx --arg -y --arg @modelcontextprotocol/server-notion --env-ref NOTION_TOKEN=NOTION_TOKEN
+loom mcp test notion
+loom mcp migrate
 ```
 
 Configured MCP servers are auto-discovered and exposed as namespaced tools:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sys
 from unittest.mock import MagicMock
 
 from click.testing import CliRunner
@@ -201,3 +203,282 @@ class TestCLI:
         )
         assert result.exit_code == 0
         assert "[PASS] case=smoke mode=deterministic" in result.output
+
+
+class TestMCPCli:
+    def test_mcp_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["mcp", "--help"])
+        assert result.exit_code == 0
+        assert "list" in result.output
+        assert "migrate" in result.output
+
+    def test_mcp_add_list_show_enable_disable_remove(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        mcp_cfg = tmp_path / "mcp.toml"
+        runner = CliRunner()
+
+        add_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "add",
+                "demo",
+                "--command",
+                "python",
+                "--arg",
+                "-m",
+                "--arg",
+                "demo.server",
+                "--env",
+                "API_KEY=super-secret",
+                "--env-ref",
+                "NOTION_TOKEN=NOTION_TOKEN",
+            ],
+        )
+        assert add_result.exit_code == 0
+
+        list_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "list",
+                "--json",
+            ],
+        )
+        assert list_result.exit_code == 0
+        listed = json.loads(list_result.output)
+        assert listed["legacy_sources_detected"] is False
+        assert listed["servers"][0]["alias"] == "demo"
+        assert listed["servers"][0]["env"]["API_KEY"] == "<redacted>"
+        assert listed["servers"][0]["env"]["NOTION_TOKEN"] == "${NOTION_TOKEN}"
+
+        show_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "show",
+                "demo",
+                "--json",
+            ],
+        )
+        assert show_result.exit_code == 0
+        shown = json.loads(show_result.output)
+        assert shown["alias"] == "demo"
+        assert shown["command"] == "python"
+        assert shown["enabled"] is True
+
+        disable_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "disable",
+                "demo",
+            ],
+        )
+        assert disable_result.exit_code == 0
+
+        show_disabled = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "show",
+                "demo",
+                "--json",
+            ],
+        )
+        assert show_disabled.exit_code == 0
+        assert json.loads(show_disabled.output)["enabled"] is False
+
+        enable_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "enable",
+                "demo",
+            ],
+        )
+        assert enable_result.exit_code == 0
+
+        remove_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "remove",
+                "demo",
+            ],
+        )
+        assert remove_result.exit_code == 0
+
+        list_empty = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "list",
+                "--json",
+            ],
+        )
+        assert list_empty.exit_code == 0
+        assert json.loads(list_empty.output)["servers"] == []
+
+    def test_mcp_migrate_moves_legacy_section(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text(
+            """
+[server]
+port = 9000
+
+[mcp.servers.demo]
+command = "python"
+args = ["-m", "demo"]
+enabled = true
+
+[mcp.servers.demo.env]
+TOKEN = "secret"
+"""
+        )
+        mcp_cfg = tmp_path / "mcp.toml"
+        runner = CliRunner()
+
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "migrate",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Migrated 1 MCP server" in result.output
+        assert "[mcp.servers.demo]" in mcp_cfg.read_text()
+        assert "[mcp" not in cfg.read_text()
+
+    def test_mcp_list_warns_on_legacy_sources(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text(
+            """
+[server]
+port = 9000
+
+[mcp.servers.legacy_demo]
+command = "python"
+"""
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--config", str(cfg), "mcp", "list"])
+        assert result.exit_code == 0
+        assert "legacy_demo" in result.output
+        assert "loom mcp migrate" in result.output
+
+    def test_mcp_test_probe(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        mcp_cfg = tmp_path / "mcp.toml"
+        fake_server = tmp_path / "fake_mcp.py"
+        fake_server.write_text(
+            """\
+import json
+import sys
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"capabilities": {"tools": {"listChanged": True}}},
+        }), flush=True)
+        continue
+    if method == "notifications/initialized":
+        continue
+    if method == "tools/list":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [
+                    {"name": "echo", "inputSchema": {"type": "object"}},
+                    {"name": "ping", "inputSchema": {"type": "object"}},
+                ]
+            },
+        }), flush=True)
+"""
+        )
+
+        runner = CliRunner()
+        add_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "add",
+                "demo",
+                "--command",
+                sys.executable,
+                "--arg",
+                str(fake_server),
+            ],
+        )
+        assert add_result.exit_code == 0
+
+        probe_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "test",
+                "demo",
+                "--json",
+            ],
+        )
+        assert probe_result.exit_code == 0
+        payload = json.loads(probe_result.output)
+        assert payload["tool_count"] == 2
+        assert payload["tools"] == ["echo", "ping"]
