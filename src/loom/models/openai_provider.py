@@ -55,6 +55,21 @@ class OpenAICompatibleProvider(ModelProvider):
             return 2
         return 1
 
+    @staticmethod
+    async def _http_error_body(response: httpx.Response, limit: int = 200) -> str:
+        """Safely extract an HTTP error body from normal or streaming responses."""
+        try:
+            body = await response.aread()
+            if body:
+                return body.decode("utf-8", errors="replace")[:limit]
+        except Exception:
+            pass
+
+        try:
+            return str(response.text)[:limit]
+        except Exception:
+            return "<response body unavailable>"
+
     async def complete(
         self,
         messages: list[dict],
@@ -93,10 +108,11 @@ class OpenAICompatibleProvider(ModelProvider):
                 original=e,
             ) from e
         except httpx.HTTPStatusError as e:
+            body_text = await self._http_error_body(e.response)
             raise ModelConnectionError(
                 f"Model server returned HTTP "
                 f"{e.response.status_code}: "
-                f"{e.response.text[:200]}",
+                f"{body_text}",
                 original=e,
             ) from e
         latency = int((time.monotonic() - start) * 1000)
@@ -167,7 +183,13 @@ class OpenAICompatibleProvider(ModelProvider):
             async with self._client.stream(
                 "POST", "/chat/completions", json=payload,
             ) as response:
-                response.raise_for_status()
+                if response.is_error:
+                    body_text = await self._http_error_body(response)
+                    raise ModelConnectionError(
+                        f"Model server returned HTTP "
+                        f"{response.status_code}: "
+                        f"{body_text}",
+                    )
 
                 # Buffer tool call deltas until complete
                 tool_call_buffers: dict[int, dict] = {}
@@ -261,13 +283,6 @@ class OpenAICompatibleProvider(ModelProvider):
         except httpx.TimeoutException as e:
             raise ModelConnectionError(
                 f"Streaming request timed out ({self._model}): {e}",
-                original=e,
-            ) from e
-        except httpx.HTTPStatusError as e:
-            raise ModelConnectionError(
-                f"Model server returned HTTP "
-                f"{e.response.status_code}: "
-                f"{e.response.text[:200]}",
                 original=e,
             ) from e
         except httpx.ReadError as e:

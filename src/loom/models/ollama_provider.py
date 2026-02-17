@@ -55,6 +55,21 @@ class OllamaProvider(ModelProvider):
             return 2
         return 1
 
+    @staticmethod
+    async def _http_error_body(response: httpx.Response, limit: int = 200) -> str:
+        """Safely extract an HTTP error body from normal or streaming responses."""
+        try:
+            body = await response.aread()
+            if body:
+                return body.decode("utf-8", errors="replace")[:limit]
+        except Exception:
+            pass
+
+        try:
+            return str(response.text)[:limit]
+        except Exception:
+            return "<response body unavailable>"
+
     async def complete(
         self,
         messages: list[dict],
@@ -96,9 +111,10 @@ class OllamaProvider(ModelProvider):
                 original=e,
             ) from e
         except httpx.HTTPStatusError as e:
+            body_text = await self._http_error_body(e.response)
             raise ModelConnectionError(
                 f"Ollama returned HTTP {e.response.status_code}: "
-                f"{e.response.text[:200]}",
+                f"{body_text}",
                 original=e,
             ) from e
         latency = int((time.monotonic() - start) * 1000)
@@ -172,7 +188,12 @@ class OllamaProvider(ModelProvider):
             async with self._client.stream(
                 "POST", "/api/chat", json=payload,
             ) as response:
-                response.raise_for_status()
+                if response.is_error:
+                    body_text = await self._http_error_body(response)
+                    raise ModelConnectionError(
+                        f"Ollama returned HTTP {response.status_code}: "
+                        f"{body_text}",
+                    )
 
                 accumulated_tool_calls: list[dict] = []
 
@@ -244,12 +265,6 @@ class OllamaProvider(ModelProvider):
         except httpx.TimeoutException as e:
             raise ModelConnectionError(
                 f"Ollama streaming timed out ({self._model}): {e}",
-                original=e,
-            ) from e
-        except httpx.HTTPStatusError as e:
-            raise ModelConnectionError(
-                f"Ollama returned HTTP {e.response.status_code}: "
-                f"{e.response.text[:200]}",
                 original=e,
             ) from e
         except httpx.ReadError as e:
@@ -350,5 +365,3 @@ class OllamaProvider(ModelProvider):
 
     async def close(self) -> None:
         await self._client.aclose()
-
-

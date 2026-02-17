@@ -27,11 +27,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -39,6 +40,7 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
+    Static,
     TabbedContent,
     TabPane,
 )
@@ -55,6 +57,7 @@ from loom.tools.registry import ToolRegistry
 from loom.tui.commands import LoomCommands
 from loom.tui.screens import (
     AskUserScreen,
+    ExitConfirmScreen,
     LearnedScreen,
     SetupScreen,
     ToolApprovalScreen,
@@ -77,6 +80,44 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class SlashCommandSpec:
+    """Definition for a slash command shown in help and autocomplete."""
+
+    canonical: str
+    description: str
+    aliases: tuple[str, ...] = ()
+    usage: str = ""
+
+
+_SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
+    SlashCommandSpec(
+        canonical="/quit",
+        aliases=("/exit", "/q"),
+        description="exit Loom",
+    ),
+    SlashCommandSpec(canonical="/clear", description="clear chat log"),
+    SlashCommandSpec(canonical="/help", description="show command help"),
+    SlashCommandSpec(canonical="/setup", description="run setup wizard"),
+    SlashCommandSpec(canonical="/model", description="show active model"),
+    SlashCommandSpec(canonical="/tools", description="list available tools"),
+    SlashCommandSpec(canonical="/tokens", description="show session token usage"),
+    SlashCommandSpec(canonical="/session", description="show current session info"),
+    SlashCommandSpec(canonical="/new", description="start a new session"),
+    SlashCommandSpec(canonical="/sessions", description="list recent sessions"),
+    SlashCommandSpec(
+        canonical="/resume",
+        usage="<session-id-prefix>",
+        description="resume session by ID prefix",
+    ),
+    SlashCommandSpec(
+        canonical="/learned",
+        description="review/delete learned patterns",
+    ),
+)
+_MAX_SLASH_HINT_LINES = 14
+
+
 class LoomApp(App):
     """Loom TUI — the unified interactive cowork interface."""
 
@@ -94,10 +135,20 @@ class LoomApp(App):
         dock: bottom;
         margin: 0;
     }
+    #slash-hint {
+        dock: bottom;
+        display: none;
+        min-height: 1;
+        max-height: 14;
+        padding: 0 1;
+        background: $panel;
+        color: $text-muted;
+        overflow-y: auto;
+    }
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit", show=True, priority=True),
+        Binding("ctrl+c", "request_quit", "Quit", show=True, priority=True),
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True),
         Binding("ctrl+l", "clear_chat", "Clear", show=True),
         Binding("ctrl+1", "tab_chat", "Chat"),
@@ -138,6 +189,11 @@ class LoomApp(App):
         # Tools that need late-binding to session
         self._recall_tool = None
         self._delegate_tool = None
+        self._confirm_exit_waiter: asyncio.Future[bool] | None = None
+        self._slash_cycle_seed: str = ""
+        self._slash_cycle_candidates: list[str] = []
+        self._applying_slash_tab_completion = False
+        self._skip_slash_cycle_reset_once = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -155,6 +211,7 @@ class LoomApp(App):
             placeholder="Type a message... (Enter to send)",
             id="user-input",
         )
+        yield Static("", id="slash-hint")
         yield StatusBar(id="status-bar")
         yield Footer()
 
@@ -346,6 +403,173 @@ class LoomApp(App):
             )
 
         self.query_one("#user-input", Input).focus()
+
+    def _slash_command_catalog(self) -> list[tuple[str, str]]:
+        """Return canonical slash commands with optional alias annotations."""
+        entries: list[tuple[str, str]] = []
+        for spec in _SLASH_COMMANDS:
+            label = spec.canonical
+            if spec.usage:
+                label = f"{label} {spec.usage}"
+            desc = spec.description
+            if spec.aliases:
+                desc = f"{desc} ({', '.join(spec.aliases)})"
+            entries.append((label, desc))
+        return entries
+
+    @staticmethod
+    def _slash_match_keys(spec: SlashCommandSpec) -> tuple[str, ...]:
+        """Return normalized command tokens used for prefix matching."""
+        return (spec.canonical.lower(), *(alias.lower() for alias in spec.aliases))
+
+    def _help_lines(self) -> list[str]:
+        """Build slash help lines from the shared command registry."""
+        lines = ["Slash commands:"]
+        for spec in _SLASH_COMMANDS:
+            label = spec.canonical
+            if spec.usage:
+                label = f"{label} {spec.usage}"
+            if spec.aliases:
+                alias_str = ", ".join(spec.aliases)
+                label = f"{label} ({alias_str})"
+            lines.append(f"  {label:<34} {spec.description}")
+        lines.append(
+            "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette, Ctrl+1/2/3 tabs",
+        )
+        return lines
+
+    def _matching_slash_commands(
+        self,
+        raw_input: str,
+    ) -> tuple[str, list[tuple[str, str]]]:
+        """Return current slash token and matching commands."""
+        text = raw_input.strip()
+        if not text.startswith("/"):
+            return "", []
+        token = text.split()[0].lower()
+        if token == "/":
+            return token, self._slash_command_catalog()
+
+        matches: list[tuple[str, str]] = []
+        fallback_matches: list[tuple[str, str]] = []
+        for spec in _SLASH_COMMANDS:
+            keys = self._slash_match_keys(spec)
+            label = spec.canonical
+            if spec.usage:
+                label = f"{label} {spec.usage}"
+            desc = spec.description
+            if spec.aliases:
+                desc = f"{desc} ({', '.join(spec.aliases)})"
+            entry = (label, desc)
+            if any(key.startswith(token) for key in keys):
+                matches.append(entry)
+            elif any(token in key for key in keys):
+                fallback_matches.append(entry)
+        if matches:
+            return token, matches
+        return token, fallback_matches
+
+    def _reset_slash_tab_cycle(self) -> None:
+        """Clear slash tab-completion cycle state."""
+        self._slash_cycle_seed = ""
+        self._slash_cycle_candidates = []
+
+    def _slash_completion_candidates(self, token: str) -> list[str]:
+        """Return slash command completions for a token prefix."""
+        if token == "/":
+            return [spec.canonical for spec in _SLASH_COMMANDS]
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for spec in _SLASH_COMMANDS:
+            for key in (spec.canonical, *spec.aliases):
+                if key.startswith(token) and key not in seen:
+                    candidates.append(key)
+                    seen.add(key)
+        return candidates
+
+    def _apply_slash_tab_completion(self, *, reverse: bool = False) -> bool:
+        """Apply slash tab completion (forward/backward)."""
+        input_widget = self.query_one("#user-input", Input)
+        token = input_widget.value.strip()
+        if not token.startswith("/") or " " in token:
+            self._reset_slash_tab_cycle()
+            return False
+
+        if token in self._slash_cycle_candidates:
+            candidates = self._slash_cycle_candidates
+            current_index = candidates.index(token)
+            next_index = (
+                (current_index - 1) if reverse else (current_index + 1)
+            ) % len(candidates)
+        else:
+            candidates = self._slash_completion_candidates(token)
+            if not candidates:
+                self._reset_slash_tab_cycle()
+                return False
+            self._slash_cycle_seed = token
+            self._slash_cycle_candidates = candidates
+            next_index = len(candidates) - 1 if reverse else 0
+
+        completion = candidates[next_index]
+        self._applying_slash_tab_completion = True
+        self._skip_slash_cycle_reset_once = True
+        try:
+            input_widget.value = completion
+            input_widget.cursor_position = len(completion)
+        finally:
+            self._applying_slash_tab_completion = False
+        return True
+
+    def _render_slash_hint(self, raw_input: str) -> str:
+        """Build slash-command hint text for the current input."""
+        token, matches = self._matching_slash_commands(raw_input)
+        if not token:
+            return ""
+
+        if not matches:
+            return (
+                f"[#f7768e]No command matches '{token}'[/]  "
+                "[dim]Try /help[/]"
+            )
+
+        title = "Slash commands:" if token == "/" else f"Matching {token}:"
+        lines = [f"[bold #7dcfff]{title}[/]"]
+        for cmd, desc in matches:
+            lines.append(f"  [#73daca]{cmd:<10}[/] {desc}")
+        return "\n".join(lines)
+
+    def _set_slash_hint(self, hint_text: str) -> None:
+        """Show or hide the slash-command hint panel."""
+        hint = self.query_one("#slash-hint", Static)
+        footer: Footer | None = None
+        status: StatusBar | None = None
+        try:
+            footer = self.query_one(Footer)
+        except Exception:
+            footer = None
+        try:
+            status = self.query_one("#status-bar", StatusBar)
+        except Exception:
+            status = None
+        if hint_text:
+            hint.update(hint_text)
+            hint.display = True
+            line_count = max(1, len(hint_text.splitlines()))
+            hint.styles.height = min(line_count, _MAX_SLASH_HINT_LINES)
+            hint.scroll_home(animate=False)
+            if footer is not None:
+                footer.display = False
+            if status is not None:
+                status.display = False
+        else:
+            hint.display = False
+            hint.styles.height = "auto"
+            hint.update("")
+            if footer is not None:
+                footer.display = True
+            if status is not None:
+                status.display = True
 
     def _bind_session_tools(self) -> None:
         """Bind tools that hold a reference to the active session."""
@@ -558,6 +782,8 @@ class LoomApp(App):
 
         input_widget = self.query_one("#user-input", Input)
         input_widget.value = ""
+        self._reset_slash_tab_cycle()
+        self._set_slash_hint("")
 
         # Handle slash commands
         if text.startswith("/"):
@@ -570,56 +796,67 @@ class LoomApp(App):
 
         self._run_turn(text)
 
+    @on(Input.Changed, "#user-input")
+    def on_user_input_changed(self, _event: Input.Changed) -> None:
+        """Show slash-command hints as the user types."""
+        if self._skip_slash_cycle_reset_once:
+            self._skip_slash_cycle_reset_once = False
+        elif not self._applying_slash_tab_completion:
+            self._reset_slash_tab_cycle()
+        # Use the widget's current value rather than event payload to avoid
+        # stale-value edge cases that can appear one keypress behind.
+        current = self.query_one("#user-input", Input).value
+        self._set_slash_hint(self._render_slash_hint(current))
+
+    def on_key(self, event: events.Key) -> None:
+        """Handle slash tab-completion from the user input."""
+        if event.key not in ("tab", "shift+tab"):
+            return
+        focused = self.focused
+        if not isinstance(focused, Input) or focused.id != "user-input":
+            return
+        if self._apply_slash_tab_completion(reverse=event.key == "shift+tab"):
+            event.stop()
+            event.prevent_default()
+
     async def _handle_slash_command(self, text: str) -> bool:
         """Handle slash commands. Returns True if handled."""
-        cmd = text.strip().lower()
+        raw = text.strip()
+        parts = raw.split(None, 1)
+        token = parts[0].lower() if parts else ""
+        arg = parts[1].strip() if len(parts) > 1 else ""
         chat = self.query_one("#chat-log", ChatLog)
 
-        if cmd in ("/quit", "/exit", "/q"):
-            if self._store and self._session and self._session.session_id:
-                await self._store.update_session(
-                    self._session.session_id, is_active=False,
-                )
-            self.exit()
+        if token in ("/quit", "/exit", "/q"):
+            self.action_request_quit()
             return True
-        if cmd == "/clear":
+        if token == "/clear":
             self.action_clear_chat()
             return True
-        if cmd == "/help":
-            lines = [
-                "Commands: /quit, /clear, /model, /tools, /tokens, "
-                "/learned, /setup, /help",
-                "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette, "
-                "Ctrl+1/2/3 tabs",
-            ]
-            if self._store:
-                lines.insert(1, "  /sessions — list and switch sessions")
-                lines.insert(2, "  /new — start a new session")
-                lines.insert(3, "  /session — current session info")
-                lines.insert(4, "  /learned — review/delete learned patterns")
-            chat.add_info("\n".join(lines))
+        if token == "/help":
+            self._show_help()
             return True
-        if cmd == "/model":
+        if token == "/model":
             name = self._model.name if self._model else "(not configured)"
             chat.add_info(f"Model: {name}")
             return True
-        if cmd == "/setup":
+        if token == "/setup":
             self.push_screen(
                 SetupScreen(), callback=self._on_setup_complete,
             )
             return True
-        if cmd == "/tools":
+        if token == "/tools":
             tools = self._tools.list_tools()
             chat.add_info(
                 f"{len(tools)} tools: " + ", ".join(tools)
             )
             return True
-        if cmd == "/tokens":
+        if token == "/tokens":
             chat.add_info(f"Session tokens: {self._total_tokens:,}")
             return True
 
         # Persistence-dependent commands
-        if cmd == "/session":
+        if token == "/session":
             if not self._session:
                 chat.add_info("No active session.")
                 return True
@@ -638,14 +875,14 @@ class LoomApp(App):
             chat.add_info(info)
             return True
 
-        if cmd == "/new":
+        if token == "/new":
             if self._store:
                 await self._new_session()
             else:
                 chat.add_info("No database — sessions are ephemeral.")
             return True
 
-        if cmd == "/sessions":
+        if token == "/sessions":
             if not self._store:
                 chat.add_info("No database — sessions are ephemeral.")
                 return True
@@ -674,15 +911,18 @@ class LoomApp(App):
             )
             return True
 
-        if cmd.startswith("/resume "):
-            prefix = cmd.split(None, 1)[1].strip()
+        if token == "/resume":
+            if not arg:
+                chat.add_info("Usage: /resume <session-id-prefix>")
+                return True
+            prefix = arg.lower()
             if not self._store:
                 chat.add_info("No database — sessions are ephemeral.")
                 return True
             all_sessions = await self._store.list_sessions()
             match = None
             for s in all_sessions:
-                if s["id"].startswith(prefix):
+                if s["id"].lower().startswith(prefix):
                     match = s
                     break
             if match:
@@ -694,7 +934,7 @@ class LoomApp(App):
                 chat.add_info(f"No session found matching '{prefix}'.")
             return True
 
-        if cmd == "/learned":
+        if token == "/learned":
             if not self._db:
                 chat.add_info("No database — learned patterns unavailable.")
                 return True
@@ -959,10 +1199,50 @@ class LoomApp(App):
         tabs = self.query_one("#tabs", TabbedContent)
         tabs.active = "tab-events"
 
+    async def action_quit(self) -> None:
+        """Compatibility action that runs the exit flow inline."""
+        await self._request_exit()
+
+    def action_request_quit(self) -> None:
+        """Start the exit flow without blocking key/event dispatch."""
+        self.run_worker(
+            self._request_exit(),
+            group="exit-flow",
+            exclusive=True,
+        )
+
+    async def _confirm_exit(self) -> bool:
+        """Show exit confirmation modal and return True when confirmed."""
+        if self._confirm_exit_waiter is not None:
+            return await self._confirm_exit_waiter
+
+        result_waiter: asyncio.Future[bool] = asyncio.Future()
+        self._confirm_exit_waiter = result_waiter
+
+        def handle_result(confirmed: bool) -> None:
+            if not result_waiter.done():
+                result_waiter.set_result(bool(confirmed))
+
+        self.push_screen(ExitConfirmScreen(), callback=handle_result)
+        try:
+            return await result_waiter
+        finally:
+            self._confirm_exit_waiter = None
+
+    async def _request_exit(self) -> None:
+        """Prompt for exit confirmation, then persist and quit when approved."""
+        if not await self._confirm_exit():
+            return
+        if self._store and self._session and self._session.session_id:
+            await self._store.update_session(
+                self._session.session_id, is_active=False,
+            )
+        self.exit()
+
     async def action_loom_command(self, command: str) -> None:
         """Dispatch command palette actions."""
         if command == "quit":
-            await self._palette_quit()
+            self.action_request_quit()
             return
         actions = {
             "clear_chat": self.action_clear_chat,
@@ -995,25 +1275,10 @@ class LoomApp(App):
 
     def _show_help(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)
-        lines = [
-            "Commands: /quit, /clear, /model, /tools, /tokens, "
-            "/learned, /setup, /help",
-            "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+P palette, "
-            "Ctrl+1/2/3 tabs",
-        ]
-        if self._store:
-            lines.insert(1, "  /sessions \u2014 list and switch sessions")
-            lines.insert(2, "  /new \u2014 start a new session")
-            lines.insert(3, "  /session \u2014 current session info")
-            lines.insert(4, "  /learned \u2014 review/delete learned patterns")
-        chat.add_info("\n".join(lines))
+        chat.add_info("\n".join(self._help_lines()))
 
     async def _palette_quit(self) -> None:
-        if self._store and self._session and self._session.session_id:
-            await self._store.update_session(
-                self._session.session_id, is_active=False,
-            )
-        self.exit()
+        await self._request_exit()
 
 
 def _now_str() -> str:

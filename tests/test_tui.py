@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -263,6 +264,44 @@ class TestAskUserScreen:
         assert screen._options == ["Python", "Rust"]
 
 
+class TestExitConfirmScreen:
+    def test_init(self):
+        from loom.tui.screens.confirm_exit import ExitConfirmScreen
+
+        screen = ExitConfirmScreen()
+        assert screen is not None
+
+    def test_on_key_confirm_paths(self):
+        from loom.tui.screens.confirm_exit import ExitConfirmScreen
+
+        screen = ExitConfirmScreen()
+        dismissed = []
+        screen.dismiss = lambda value: dismissed.append(value)
+
+        for key in ("y", "enter", "ctrl+c"):
+            event = MagicMock()
+            event.key = key
+            screen.on_key(event)
+            assert dismissed[-1] is True
+            event.stop.assert_called_once()
+            event.prevent_default.assert_called_once()
+
+    def test_on_key_cancel_paths(self):
+        from loom.tui.screens.confirm_exit import ExitConfirmScreen
+
+        screen = ExitConfirmScreen()
+        dismissed = []
+        screen.dismiss = lambda value: dismissed.append(value)
+
+        for key in ("n", "escape"):
+            event = MagicMock()
+            event.key = key
+            screen.on_key(event)
+            assert dismissed[-1] is False
+            event.stop.assert_called_once()
+            event.prevent_default.assert_called_once()
+
+
 # --- Theme tests ---
 
 
@@ -315,6 +354,39 @@ class TestTaskProgressPanel:
         assert "Read file" in rendered
         assert "Fix bug" in rendered
         assert "Run tests" in rendered
+
+
+class TestChatLogStreaming:
+    def test_flush_stream_buffer_uses_internal_text(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        widget = MagicMock()
+        log._stream_widget = widget
+        log._stream_text = "hello"
+        log._stream_buffer = [" ", "world"]
+
+        log._flush_stream_buffer()
+
+        widget.update.assert_called_once_with("hello world")
+        assert log._stream_text == "hello world"
+        assert log._stream_buffer == []
+
+    def test_flush_and_reset_stream_clears_state(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        widget = MagicMock()
+        log._stream_widget = widget
+        log._stream_text = "chunk"
+        log._stream_buffer = ["!"]
+
+        log._flush_and_reset_stream()
+
+        widget.update.assert_called_once_with("chunk!")
+        assert log._stream_widget is None
+        assert log._stream_text == ""
+        assert log._stream_buffer == []
 
 
 # --- CoworkSession total_tokens tests ---
@@ -646,3 +718,440 @@ class TestFilesPanelReset:
 
         panel.clear_files.assert_called_once()
         panel.show_diff.assert_called_once_with("")
+
+
+class TestQuitConfirmation:
+    @pytest.mark.asyncio
+    async def test_action_quit_confirmed_persists_and_exits(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._confirm_exit = AsyncMock(return_value=True)
+        app._store = MagicMock()
+        app._store.update_session = AsyncMock()
+        app._session = SimpleNamespace(session_id="sess-123")
+        app.exit = MagicMock()
+
+        await app.action_quit()
+
+        app._confirm_exit.assert_awaited_once()
+        app._store.update_session.assert_awaited_once_with(
+            "sess-123", is_active=False,
+        )
+        app.exit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_action_quit_cancelled_does_not_exit(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._confirm_exit = AsyncMock(return_value=False)
+        app._store = MagicMock()
+        app._store.update_session = AsyncMock()
+        app._session = SimpleNamespace(session_id="sess-123")
+        app.exit = MagicMock()
+
+        await app.action_quit()
+
+        app._confirm_exit.assert_awaited_once()
+        app._store.update_session.assert_not_called()
+        app.exit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_slash_quit_routes_through_request_exit(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app.action_request_quit = MagicMock()
+        app.query_one = MagicMock(return_value=MagicMock())
+
+        handled = await app._handle_slash_command("/quit")
+
+        assert handled is True
+        app.action_request_quit.assert_called_once()
+
+    def test_action_request_quit_starts_worker(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        captured: dict = {}
+
+        def fake_run_worker(coro, **kwargs):
+            captured["kwargs"] = kwargs
+            coro.close()
+            return MagicMock()
+
+        app.run_worker = fake_run_worker
+        app.action_request_quit()
+
+        assert captured["kwargs"]["group"] == "exit-flow"
+        assert captured["kwargs"]["exclusive"] is True
+
+    @pytest.mark.asyncio
+    async def test_ctrl_c_modal_accepts_y_and_exits(self):
+        from loom.tui.app import LoomApp
+        from loom.tui.screens.confirm_exit import ExitConfirmScreen
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+        app.exit = MagicMock()
+
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            assert isinstance(app.screen_stack[-1], ExitConfirmScreen)
+
+            await pilot.press("y")
+            await pilot.pause()
+            assert app.exit.called
+
+    @pytest.mark.asyncio
+    async def test_confirm_exit_reentrant_uses_single_modal(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        callbacks = []
+        app.push_screen = lambda _screen, callback: callbacks.append(callback)
+
+        first = asyncio.create_task(app._confirm_exit())
+        await asyncio.sleep(0)
+        second = asyncio.create_task(app._confirm_exit())
+        await asyncio.sleep(0)
+
+        assert len(callbacks) == 1
+        callbacks[0](True)
+
+        assert await first is True
+        assert await second is True
+
+
+class TestSlashCommandHints:
+    def test_root_slash_shows_catalog(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/")
+        assert "Slash commands:" in hint
+        assert "/quit" in hint
+        assert "/setup" in hint
+
+    def test_prefix_filters_matches(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/res")
+        assert "Matching /res:" in hint
+        assert "/resume" in hint
+        assert "/setup" not in hint
+
+    def test_prefix_h_matches_help(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/h")
+        assert "Matching /h:" in hint
+        assert "/help" in hint
+        assert "/new" not in hint
+
+    def test_prefix_n_matches_new(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/n")
+        assert "Matching /n:" in hint
+        assert "/new" in hint
+
+    def test_prefix_l_matches_learned(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/l")
+        assert "Matching /l:" in hint
+        assert "/learned" in hint
+
+    def test_alias_prefix_matches_canonical(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/e")
+        assert "Matching /e:" in hint
+        assert "/quit" in hint
+        assert "/exit" in hint
+
+    def test_no_match_shows_help(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/zzz")
+        assert "No command matches" in hint
+        assert "/help" in hint
+
+    def test_input_changed_uses_live_widget_value(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        user_input = SimpleNamespace(value="/h")
+        app.query_one = MagicMock(return_value=user_input)
+
+        captured = []
+        app._set_slash_hint = lambda text: captured.append(text)
+
+        stale_event = SimpleNamespace(value="/")
+        app.on_user_input_changed(stale_event)
+
+        assert captured
+        assert "/help" in captured[-1]
+
+    def test_set_slash_hint_sets_height_from_line_count(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        fake_hint = SimpleNamespace(
+            display=False,
+            styles=SimpleNamespace(height=None),
+            update=MagicMock(),
+            scroll_home=MagicMock(),
+        )
+        fake_footer = SimpleNamespace(display=True)
+        fake_status = SimpleNamespace(display=True)
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#slash-hint":
+                return fake_hint
+            if selector == "#status-bar":
+                return fake_status
+            return fake_footer
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._set_slash_hint("a\nb\nc")
+
+        assert fake_hint.display is True
+        assert fake_hint.styles.height == 3
+        fake_hint.scroll_home.assert_called_once_with(animate=False)
+        assert fake_footer.display is False
+        assert fake_status.display is False
+
+    def test_set_slash_hint_empty_resets_auto_height(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        fake_hint = SimpleNamespace(
+            display=True,
+            styles=SimpleNamespace(height=5),
+            update=MagicMock(),
+            scroll_home=MagicMock(),
+        )
+        fake_footer = SimpleNamespace(display=False)
+        fake_status = SimpleNamespace(display=False)
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#slash-hint":
+                return fake_hint
+            if selector == "#status-bar":
+                return fake_status
+            return fake_footer
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._set_slash_hint("")
+
+        assert fake_hint.display is False
+        assert fake_hint.styles.height == "auto"
+        assert fake_footer.display is True
+        assert fake_status.display is True
+
+    def test_slash_completion_candidates_prefix(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        assert app._slash_completion_candidates("/s") == [
+            "/setup",
+            "/session",
+            "/sessions",
+        ]
+        assert app._slash_completion_candidates("/h") == ["/help"]
+        assert app._slash_completion_candidates("/t") == ["/tools", "/tokens"]
+
+    def test_slash_tab_completion_cycles_forward(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        input_widget = SimpleNamespace(value="/s", cursor_position=0)
+        app.query_one = MagicMock(return_value=input_widget)
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/setup"
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/session"
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/sessions"
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/setup"
+
+    def test_slash_tab_completion_cycles_backward(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        input_widget = SimpleNamespace(value="/s", cursor_position=0)
+        app.query_one = MagicMock(return_value=input_widget)
+
+        assert app._apply_slash_tab_completion(reverse=True) is True
+        assert input_widget.value == "/sessions"
+
+    def test_slash_tab_completion_ignores_non_slash_or_args(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        input_widget = SimpleNamespace(value="hello", cursor_position=0)
+        app.query_one = MagicMock(return_value=input_widget)
+        assert app._apply_slash_tab_completion(reverse=False) is False
+
+        input_widget.value = "/resume abc"
+        assert app._apply_slash_tab_completion(reverse=False) is False
+
+    @pytest.mark.asyncio
+    async def test_tab_key_is_captured_for_slash_autocomplete(self):
+        from textual.widgets import Input
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test() as pilot:
+            await pilot.press("/")
+            await pilot.press("s")
+            await pilot.pause()
+
+            input_widget = app.query_one("#user-input", Input)
+            assert input_widget.value == "/s"
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert input_widget.value == "/setup"
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert input_widget.value == "/session"
+
+
+class TestSlashHelp:
+    def test_help_lines_include_resume_and_aliases(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        rendered = "\n".join(app._help_lines())
+        assert "/resume <session-id-prefix>" in rendered
+        assert "/quit (/exit, /q)" in rendered
+        assert "/setup" in rendered
+
+    @pytest.mark.asyncio
+    async def test_resume_without_arg_shows_usage(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/resume")
+
+        assert handled is True
+        chat.add_info.assert_called_once_with("Usage: /resume <session-id-prefix>")

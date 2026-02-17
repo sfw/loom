@@ -11,12 +11,12 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
 
 from loom.setup import (
-    ANTHROPIC_MODELS,
     CONFIG_DIR,
     CONFIG_PATH,
     PROVIDERS,
     ROLE_PRESETS,
     _generate_toml,
+    discover_models,
 )
 
 # Step indices
@@ -27,6 +27,8 @@ _STEP_UTILITY = 3
 _STEP_CONFIRM = 4
 
 _TOTAL_STEPS = 5
+_MAX_VISIBLE_DISCOVERED = 6
+_MAX_MODEL_LABEL_CHARS = 54
 
 
 class SetupScreen(ModalScreen[list[dict] | None]):
@@ -46,7 +48,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
     }
 
     #setup-dialog {
-        width: 64;
+        width: 72;
         min-height: 16;
         max-height: 36;
         border: solid $primary;
@@ -73,7 +75,8 @@ class SetupScreen(ModalScreen[list[dict] | None]):
     }
 
     .setup-hint {
-        color: $text-muted;
+        color: $primary;
+        text-style: bold;
         margin-top: 1;
     }
 
@@ -86,6 +89,26 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         margin: 1 0;
         padding: 1;
         background: $panel;
+        max-height: 10;
+        overflow-y: auto;
+    }
+
+    .setup-selection {
+        color: $success;
+        text-style: bold;
+        margin-top: 1;
+    }
+
+    #discovery-results {
+        max-height: 8;
+        overflow-y: auto;
+        background: $panel;
+        padding: 0 1;
+    }
+
+    #btn-discover {
+        margin-top: 1;
+        width: 100%;
     }
 
     #btn-next {
@@ -109,6 +132,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         self._primary_model: dict | None = None
         self._utility_model: dict | None = None
         self._adding_utility: bool = False
+        self._discovered_models: list[str] = []
 
     @property
     def _models(self) -> list[dict]:
@@ -147,29 +171,10 @@ class SetupScreen(ModalScreen[list[dict] | None]):
                 yield Static("─" * 40, classes="setup-divider")
                 yield Label("", id="details-provider-label")
 
-                yield Label("Model:", id="lbl-model-select")
-                for i, m in enumerate(ANTHROPIC_MODELS, 1):
-                    yield Label(
-                        f"  [{i}] {m}",
-                        id=f"lbl-anthropic-{i}",
-                        classes="setup-option",
-                    )
-                yield Label(
-                    "Press 1-3 to select model",
-                    id="lbl-anthropic-hint",
-                    classes="setup-hint",
-                )
-
                 yield Label("Base URL:", id="lbl-url")
                 yield Input(
                     placeholder="http://localhost:11434",
                     id="input-url",
-                    classes="setup-input",
-                )
-                yield Label("Model name:", id="lbl-model")
-                yield Input(
-                    placeholder="e.g. qwen3:14b",
-                    id="input-model",
                     classes="setup-input",
                 )
                 yield Label("API Key:", id="lbl-apikey")
@@ -177,6 +182,27 @@ class SetupScreen(ModalScreen[list[dict] | None]):
                     placeholder="sk-ant-...",
                     id="input-apikey",
                     password=True,
+                    classes="setup-input",
+                )
+                yield Button(
+                    "Discover Models",
+                    id="btn-discover",
+                    variant="default",
+                )
+                yield Static(
+                    "Press Discover Models to query available models.",
+                    id="discovery-results",
+                    classes="setup-hint",
+                )
+                yield Static(
+                    "No model selected yet.",
+                    id="selection-feedback",
+                    classes="setup-selection",
+                )
+                yield Label("Model name:", id="lbl-model")
+                yield Input(
+                    placeholder="e.g. qwen3:14b",
+                    id="input-model",
                     classes="setup-input",
                 )
                 yield Button("Next", id="btn-next", variant="primary")
@@ -215,6 +241,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
                     "  [n] Skip — use primary for everything",
                     classes="setup-option",
                 )
+                yield Label("Press Y to add, N to skip", classes="setup-hint")
 
             # -- Step 4: Confirm --
             with Vertical(id="step-confirm", classes="step-container"):
@@ -224,7 +251,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
                 yield Label(f"Config: {CONFIG_PATH}")
                 yield Label("")
                 yield Label(
-                    "  [Enter] Save and start    [Esc] Cancel",
+                    "  [Enter/Y/S] Save and start    [B/Esc] Back",
                     classes="setup-hint",
                 )
 
@@ -284,6 +311,35 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         inp.disabled = False
         return inp
 
+    def _provider_requires_api_key(self) -> bool:
+        """Return whether the selected provider needs an API key."""
+        return self._provider_key == "anthropic"
+
+    def _can_discover(self) -> bool:
+        """Return True when required fields are present for discovery."""
+        base_url = self.query_one("#input-url", Input).value.strip()
+        if not base_url:
+            return False
+        if self._provider_requires_api_key():
+            return bool(self.query_one("#input-apikey", Input).value.strip())
+        return True
+
+    @staticmethod
+    def _truncate_model_name(name: str) -> str:
+        """Limit rendered model labels so discovery UI stays compact."""
+        if len(name) <= _MAX_MODEL_LABEL_CHARS:
+            return name
+        return name[:_MAX_MODEL_LABEL_CHARS - 3] + "..."
+
+    def _set_selection_feedback(self, message: str) -> None:
+        """Update the prominent selection feedback text."""
+        self.query_one("#selection-feedback", Static).update(message)
+
+    def _update_discovery_button(self) -> None:
+        """Enable discover button only when discovery prerequisites are met."""
+        button = self.query_one("#btn-discover", Button)
+        button.disabled = not self._can_discover()
+
     def _configure_details_step(self) -> None:
         """Show/hide detail fields based on selected provider."""
         is_anthropic = self._provider_key == "anthropic"
@@ -295,12 +351,8 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         self.query_one("#details-provider-label", Label).update(
             f"Provider: {provider_display}"
         )
-
-        # Anthropic model selector
-        self.query_one("#lbl-model-select").display = is_anthropic
-        for i in range(1, len(ANTHROPIC_MODELS) + 1):
-            self.query_one(f"#lbl-anthropic-{i}").display = is_anthropic
-        self.query_one("#lbl-anthropic-hint").display = is_anthropic
+        self._discovered_models = []
+        self._set_selection_feedback("No model selected yet.")
 
         # P0-1: Start with all inputs disabled, then selectively enable
         self._disable_all_inputs()
@@ -311,13 +363,17 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         url_input.display = True
         url_input.value = default_url
 
-        # Model name input (non-Anthropic)
-        self.query_one("#lbl-model").display = not is_anthropic
-        model_input = self.query_one("#input-model", Input)
-        model_input.display = not is_anthropic
+        # Model name input
+        self.query_one("#lbl-model").display = True
+        model_input = self._enable_input("input-model")
+        model_input.display = True
         model_input.value = ""
-        if not is_anthropic:
-            model_input.disabled = False
+        if is_anthropic:
+            model_input.placeholder = "e.g. claude-sonnet-4-5-20250929"
+        elif is_openai:
+            model_input.placeholder = "e.g. gpt-4o, mistral-nemo"
+        else:
+            model_input.placeholder = "e.g. qwen3:14b, llama3:8b"
 
         # API key
         needs_key = is_anthropic
@@ -325,15 +381,95 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         apikey_input = self.query_one("#input-apikey", Input)
         apikey_input.display = needs_key or is_openai
         apikey_input.value = ""
+        apikey_input.disabled = True
         if needs_key or is_openai:
             apikey_input.disabled = False
+            if is_anthropic:
+                apikey_input.placeholder = "sk-ant-..."
+            else:
+                apikey_input.placeholder = "optional"
 
-        # Focus the right field
-        if is_anthropic:
-            # Wait for anthropic model number key — don't focus any input yet
-            self.set_focus(None)
-        else:
-            url_input.focus()
+        self._render_discovered_models([])
+        self._update_discovery_button()
+        url_input.focus()
+
+    def _render_discovered_models(self, models: list[str]) -> None:
+        """Render model discovery results in the details step."""
+        panel = self.query_one("#discovery-results", Static)
+        self._update_discovery_button()
+        if not models:
+            if self._can_discover():
+                panel.update(
+                    "Press Discover Models to query available models, "
+                    "or type a model name manually."
+                )
+            elif self._provider_requires_api_key():
+                panel.update("Enter Base URL + API key before discovery.")
+            else:
+                panel.update("Enter Base URL before discovery.")
+            return
+
+        visible = models[:_MAX_VISIBLE_DISCOVERED]
+        lines = ["Discovered models:"]
+        for i, model in enumerate(visible, 1):
+            lines.append(
+                f"  [{i}] {self._truncate_model_name(model)}"
+            )
+        if len(models) > len(visible):
+            lines.append(
+                f"  ... {len(models) - len(visible)} more "
+                f"(type model name manually)"
+            )
+        lines.append(
+            f"Press 1-{len(visible)} to pick, or edit Model name."
+        )
+        panel.update("\n".join(lines))
+
+    def _discover_models(self, *, quiet: bool = False) -> list[str]:
+        """Attempt endpoint model discovery and refresh the details UI."""
+        base_url = self.query_one("#input-url", Input).value.strip()
+        api_key = self.query_one("#input-apikey", Input).value.strip()
+
+        if not base_url:
+            self._discovered_models = []
+            self._render_discovered_models([])
+            if not quiet:
+                self.notify("Base URL is required for discovery.", severity="warning")
+            return []
+        if self._provider_key == "anthropic" and not api_key:
+            self._discovered_models = []
+            self._render_discovered_models([])
+            if not quiet:
+                self.notify(
+                    "Anthropic API key is required for discovery.",
+                    severity="warning",
+                )
+            return []
+
+        models = discover_models(self._provider_key, base_url, api_key)
+        self._discovered_models = models
+        self._render_discovered_models(models)
+
+        if models:
+            model_input = self.query_one("#input-model", Input)
+            if not model_input.value.strip():
+                model_input.value = models[0]
+                self._model_name = models[0]
+            selected = model_input.value.strip()
+            if selected:
+                self._set_selection_feedback(f"Selected model: {selected}")
+            if not quiet:
+                self.notify(
+                    f"Discovered {len(models)} models.",
+                    severity="information",
+                )
+        elif not quiet:
+            self._set_selection_feedback("No model discovered. Use manual model name.")
+            self.notify(
+                "No models discovered; enter model name manually.",
+                severity="warning",
+            )
+        return models
 
     # ------------------------------------------------------------------
     # Key handling
@@ -352,22 +488,46 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             self._provider_idx = idx
             self._provider_key = PROVIDERS[idx][1]
             self._step = _STEP_DETAILS
+            self.notify(
+                f"Selected provider: {PROVIDERS[idx][0]}",
+                severity="information",
+            )
             event.prevent_default()
             event.stop()
 
-        elif self._step == _STEP_DETAILS and self._provider_key == "anthropic":
-            if key.isdigit():
-                num = int(key)
-                if 1 <= num <= len(ANTHROPIC_MODELS):
-                    self._model_name = ANTHROPIC_MODELS[num - 1]
-                    # Focus the API key input
-                    self.query_one("#input-apikey", Input).focus()
-                    event.prevent_default()
-                    event.stop()
+        elif (
+            self._step == _STEP_DETAILS
+            and key.isdigit()
+            and self._discovered_models
+            and not isinstance(self.focused, Input)
+        ):
+            num = int(key)
+            max_selectable = min(
+                len(self._discovered_models), _MAX_VISIBLE_DISCOVERED,
+            )
+            if 1 <= num <= max_selectable:
+                selected = self._discovered_models[num - 1]
+                self._model_name = selected
+                model_input = self.query_one("#input-model", Input)
+                model_input.value = selected
+                model_input.focus()
+                self._set_selection_feedback(f"Selected [{num}] {selected}")
+                self.notify(f"Selected model: {selected}", severity="information")
+                event.prevent_default()
+                event.stop()
 
         elif self._step == _STEP_ROLES and key in ("1", "2", "3"):
             presets = ["all", "primary", "utility"]
             self._roles = list(ROLE_PRESETS[presets[int(key) - 1]])
+            role_labels = {
+                "1": "all roles",
+                "2": "primary roles",
+                "3": "utility roles",
+            }
+            self.notify(
+                f"Selected {role_labels[key]}",
+                severity="information",
+            )
             self._collect_model()
             event.prevent_default()
             event.stop()
@@ -379,17 +539,31 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             self._base_url = ""
             self._model_name = ""
             self._api_key = ""
+            self._discovered_models = []
             self._step = _STEP_PROVIDER
+            self.notify(
+                "Adding utility model. Select provider.",
+                severity="information",
+            )
             event.prevent_default()
             event.stop()
 
         elif self._step == _STEP_UTILITY and key in ("n", "N"):
+            self.notify(
+                "Skipping utility model.",
+                severity="information",
+            )
             self._prepare_confirm()
             event.prevent_default()
             event.stop()
 
-        elif self._step == _STEP_CONFIRM and key == "enter":
+        elif self._step == _STEP_CONFIRM and key in ("enter", "y", "Y", "s", "S"):
             self._save_and_dismiss()
+            event.prevent_default()
+            event.stop()
+
+        elif self._step == _STEP_CONFIRM and key in ("b", "B"):
+            self.action_back_or_cancel()
             event.prevent_default()
             event.stop()
 
@@ -399,6 +573,37 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         if self._step != _STEP_DETAILS:
             return
         self._collect_details()
+
+    @on(Button.Pressed, "#btn-discover")
+    def on_discover_pressed(self) -> None:
+        """Attempt model discovery with the current endpoint fields."""
+        if self._step != _STEP_DETAILS:
+            return
+        self._discover_models()
+
+    @on(Input.Changed, "#input-url")
+    @on(Input.Changed, "#input-apikey")
+    def on_discovery_fields_changed(self, _event: Input.Changed) -> None:
+        """Invalidate discovery when endpoint/auth changes."""
+        if self._step != _STEP_DETAILS:
+            return
+        if self._discovered_models:
+            self._discovered_models = []
+            self._set_selection_feedback(
+                "Connection changed. Discover models again.",
+            )
+        self._render_discovered_models([])
+
+    @on(Input.Changed, "#input-model")
+    def on_model_input_changed(self, _event: Input.Changed) -> None:
+        """Show visible feedback while model name is being edited."""
+        if self._step != _STEP_DETAILS:
+            return
+        model = self.query_one("#input-model", Input).value.strip()
+        if model:
+            self._set_selection_feedback(f"Using model: {model}")
+        else:
+            self._set_selection_feedback("No model selected yet.")
 
     @on(Input.Submitted)
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -411,51 +616,53 @@ class SetupScreen(ModalScreen[list[dict] | None]):
 
         input_id = event.input.id
 
-        if self._provider_key == "anthropic":
-            if input_id == "input-apikey":
-                # API key entered, try to advance
-                self._collect_details()
-            elif input_id == "input-url":
-                self.query_one("#input-apikey", Input).focus()
-        elif self._provider_key == "openai_compatible":
-            if input_id == "input-url":
+        if input_id == "input-url":
+            apikey_input = self.query_one("#input-apikey", Input)
+            if apikey_input.display:
+                apikey_input.focus()
+            else:
+                self._discover_models(quiet=True)
                 self.query_one("#input-model", Input).focus()
-            elif input_id == "input-model":
-                apikey_input = self.query_one("#input-apikey", Input)
-                if apikey_input.display:
-                    apikey_input.focus()
-                else:
-                    self._collect_details()
-            elif input_id == "input-apikey":
-                self._collect_details()
-        else:  # ollama
-            if input_id == "input-url":
-                self.query_one("#input-model", Input).focus()
-            elif input_id == "input-model":
-                self._collect_details()
+        elif input_id == "input-apikey":
+            self._discover_models(quiet=True)
+            self.query_one("#input-model", Input).focus()
+        elif input_id == "input-model":
+            self._collect_details()
 
     def _collect_details(self) -> None:
         """Collect values from detail inputs and advance to roles."""
         self._base_url = self.query_one("#input-url", Input).value.strip()
         self._api_key = self.query_one("#input-apikey", Input).value.strip()
-
-        if self._provider_key != "anthropic":
-            self._model_name = self.query_one(
-                "#input-model", Input,
-            ).value.strip()
+        self._model_name = self.query_one("#input-model", Input).value.strip()
 
         # Validate
-        if not self._model_name:
-            self.notify("Model name is required.", severity="error")
+        if not self._base_url:
+            self.notify("Base URL is required.", severity="error")
+            self.query_one("#input-url", Input).focus()
             return
         if self._provider_key == "anthropic" and not self._api_key:
             self.notify("API key is required for Anthropic.", severity="error")
             self.query_one("#input-apikey", Input).focus()
             return
-        if not self._base_url:
-            self.notify("Base URL is required.", severity="error")
-            self.query_one("#input-url", Input).focus()
-            return
+        if not self._model_name:
+            discovered = self._discover_models(quiet=True)
+            if discovered:
+                self._model_name = discovered[0]
+                self.query_one("#input-model", Input).value = self._model_name
+                self._set_selection_feedback(
+                    f"Auto-selected discovered model: {self._model_name}",
+                )
+                self.notify(
+                    f"Auto-selected discovered model: {self._model_name}",
+                    severity="information",
+                )
+            else:
+                self.notify(
+                    "Model name is required (discover or type manually).",
+                    severity="error",
+                )
+                self.query_one("#input-model", Input).focus()
+                return
 
         self._step = _STEP_ROLES
 
