@@ -9,6 +9,7 @@ Covers:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -1242,6 +1243,126 @@ class TestRegisterBundledTools:
         with caplog.at_level(logging.WARNING):
             ProcessLoader._register_bundled_tools(pkg)
         assert "Failed to load bundled tool" in caplog.text
+
+    def test_logs_warning_on_tool_name_collision(self, tmp_path, caplog):
+        """Conflicting bundled tool names should be diagnosed and skipped."""
+        import logging
+
+        from loom.tools import discover_tools
+        from loom.tools.registry import Tool
+
+        discover_tools()  # ensure built-ins are registered
+        before = set(Tool._registered_classes)
+
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        tools_dir = pkg / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "collision.py").write_text(
+            "from loom.tools.registry import Tool, ToolContext, ToolResult\n"
+            "class CollisionReadFile(Tool):\n"
+            "    @property\n"
+            "    def name(self):\n"
+            "        return 'read_file'\n"
+            "    @property\n"
+            "    def description(self):\n"
+            "        return 'bad collision'\n"
+            "    @property\n"
+            "    def parameters(self):\n"
+            "        return {'type': 'object', 'properties': {}}\n"
+            "    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:\n"
+            "        return ToolResult.ok('no-op')\n"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            ProcessLoader._register_bundled_tools(pkg)
+
+        after = set(Tool._registered_classes)
+        assert after == before
+        assert "conflicts with existing tool class" in caplog.text
+
+    def test_activate_isolated_dependencies(self, tmp_path):
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        if sys.platform.startswith("win"):
+            site_packages = (
+                tmp_path / ".deps" / "pkg" / "Lib" / "site-packages"
+            )
+        else:
+            site_packages = (
+                tmp_path / ".deps" / "pkg" / "lib" / "python3.14" / "site-packages"
+            )
+        site_packages.mkdir(parents=True)
+
+        site_path = str(site_packages)
+        if site_path in sys.path:
+            sys.path.remove(site_path)
+
+        ProcessLoader._activate_isolated_dependencies(pkg)
+        assert sys.path[0] == site_path
+
+        # Cleanup so later tests see a stable sys.path.
+        if site_path in sys.path:
+            sys.path.remove(site_path)
+
+    def test_skips_duplicate_bundled_tool_names_within_same_module(
+        self,
+        tmp_path,
+        caplog,
+    ):
+        """Duplicate tool names in bundled modules should be pruned safely."""
+        import logging
+
+        from loom.tools.registry import Tool
+
+        before = set(Tool._registered_classes)
+
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        tools_dir = pkg / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "dupes.py").write_text(
+            "from loom.tools.registry import Tool, ToolContext, ToolResult\n"
+            "class ToolA(Tool):\n"
+            "    @property\n"
+            "    def name(self):\n"
+            "        return 'pkg_duplicate'\n"
+            "    @property\n"
+            "    def description(self):\n"
+            "        return 'a'\n"
+            "    @property\n"
+            "    def parameters(self):\n"
+            "        return {'type': 'object', 'properties': {}}\n"
+            "    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:\n"
+            "        return ToolResult.ok('ok')\n"
+            "class ToolB(Tool):\n"
+            "    @property\n"
+            "    def name(self):\n"
+            "        return 'pkg_duplicate'\n"
+            "    @property\n"
+            "    def description(self):\n"
+            "        return 'b'\n"
+            "    @property\n"
+            "    def parameters(self):\n"
+            "        return {'type': 'object', 'properties': {}}\n"
+            "    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:\n"
+            "        return ToolResult.ok('ok')\n"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            ProcessLoader._register_bundled_tools(pkg)
+
+        after = set(Tool._registered_classes)
+        new_classes = [cls for cls in after if cls not in before]
+        duplicate_classes = [
+            cls for cls in new_classes
+            if ProcessLoader._tool_name_from_class(cls) == "pkg_duplicate"
+        ]
+        assert len(duplicate_classes) == 1
+        assert "conflicts with existing tool class" in caplog.text
+
+        for cls in new_classes:
+            Tool._registered_classes.discard(cls)
 
 
 # ===================================================================

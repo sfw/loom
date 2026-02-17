@@ -126,7 +126,7 @@ tools:
 ```
 
 - `tool_guidance` — free-text instructions injected into the system prompt
-- `tools.required` — tools that must be available (Loom warns if missing)
+- `tools.required` — tools that must be available (Loom fails fast if missing)
 - `tools.excluded` — tools the model should not use in this process
 
 The required and excluded lists must not overlap.
@@ -372,6 +372,12 @@ class MyDomainTool(Tool):
 6. **File names** in `tools/` must not start with `_` (those are skipped)
 7. **One class per file** is conventional but not required — all `Tool` subclasses in the module are registered
 
+### Tool naming and collision policy
+
+- Bundled tool names must be globally unique across built-in tools and all loaded packages.
+- If a bundled tool name collides with an existing tool, Loom logs a warning and skips loading the colliding bundled tool.
+- Use clear prefixes for package tools (for example, `ga_`, `fin_`, `crm_`) to avoid conflicts.
+
 ### ToolContext
 
 The `ctx` object provides:
@@ -402,6 +408,9 @@ loom install /path/to/my-process
 
 # Into a specific workspace (instead of global ~/.loom/processes/)
 loom install /path/to/my-process -w /path/to/project
+
+# Install dependencies in an isolated per-process environment
+loom install /path/to/my-process --isolated-deps
 ```
 
 ### Installing from GitHub
@@ -450,6 +459,10 @@ Risk levels:
 - **HIGH** — Has both dependencies and bundled code
 
 Users must explicitly approve before installation proceeds.
+
+Dependency install modes:
+- Default: dependencies install into the current Python environment.
+- Isolated: `--isolated-deps` installs dependencies into `<install-target>/.deps/<process-name>/`.
 
 ## Design patterns
 
@@ -548,7 +561,7 @@ See [`packages/google-analytics/`](../packages/google-analytics/) for a full pac
 - 2 planner examples
 - Replanning triggers and guidance
 
-## Checklist
+## Process Package Compatibility Checklist
 
 Before publishing a package:
 
@@ -562,7 +575,23 @@ Before publishing a package:
 - [ ] 2-3 planner examples with realistic goals
 - [ ] `replanning` section describes when to adapt
 - [ ] Bundled tools (if any) handle errors gracefully and return `ToolResult.fail`
+- [ ] Bundled tool names are unique (no collisions with built-ins or other packages)
 - [ ] Dependencies are version-pinned
 - [ ] `loom install /path/to/package` succeeds
+- [ ] `loom install /path/to/package --isolated-deps` succeeds (if dependencies are declared)
 - [ ] `loom -w /tmp/test --process my-process` loads without errors
 - [ ] README.md explains usage, deliverables, and input data
+
+## Troubleshooting
+
+- `Process '<name>' requires missing tool(s): ...`:
+Install or enable the required tools, or remove them from `tools.required`.
+
+- `Bundled tool '<name>' ... conflicts with existing tool class ...; skipping bundled tool`:
+Rename the bundled tool to a globally unique name and reinstall the package.
+
+- `Failed to create isolated dependency environment`:
+Ensure the selected Python executable can create virtual environments (`python -m venv`).
+
+- `Failed to install isolated dependencies`:
+Check package names/versions and network/index access in the isolated environment.

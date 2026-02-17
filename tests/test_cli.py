@@ -38,6 +38,13 @@ class TestCLI:
         assert result.exit_code == 0
         assert "--workspace" in result.output
 
+    def test_install_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["install", "--help"])
+        assert result.exit_code == 0
+        assert "--skip-deps" in result.output
+        assert "--isolated-deps" in result.output
+
     def test_status_help(self):
         runner = CliRunner()
         result = runner.invoke(cli, ["status", "--help"])

@@ -515,8 +515,8 @@ loom -w /tmp/project --process consulting-engagement
 | `investment-analysis` | 5 | strict | Financial due diligence and valuation |
 | `marketing-strategy` | 6 | guided | Go-to-market strategy and campaigns |
 | `research-report` | 4 | guided | Research synthesis and reporting |
-| `competitive-intel` | 3 | guided | Competitive landscape analysis |
-| `consulting-engagement` | 5 | guided | McKinsey-style issue tree consulting |
+| `competitive-intel` | 3 | suggestive | Competitive landscape analysis |
+| `consulting-engagement` | 5 | strict | McKinsey-style issue tree consulting |
 
 ### Using with REST API
 
@@ -628,6 +628,9 @@ loom install ./my-process -w /path/to/project
 # Skip auto-installing Python dependencies
 loom install acme/loom-analytics --skip-deps
 
+# Install dependencies in isolated per-process envs
+loom install acme/loom-analytics --isolated-deps
+
 # Uninstall
 loom uninstall google-analytics
 ```
@@ -644,6 +647,20 @@ dependencies:
   - pandas>=2.0
 # ... rest of process definition
 ```
+
+Notes:
+- `tools.required` is enforced at runtime. Missing required tools fail process activation/task creation.
+- Bundled tool name collisions are rejected at load time for the colliding tool (warning + skip).
+- `--isolated-deps` installs dependencies into `<install-target>/.deps/<process-name>/`.
+
+### Process package troubleshooting
+
+- `Process '<name>' requires missing tool(s): ...`:
+  ensure those tools are available in the active registry, or remove them from `tools.required`.
+- `Bundled tool '<name>' ... conflicts with existing tool class ...; skipping bundled tool`:
+  rename the bundled tool to a globally unique name and reinstall.
+- `Failed to install isolated dependencies`:
+  verify dependency names/versions and Python packaging access in the isolated environment.
 
 ---
 

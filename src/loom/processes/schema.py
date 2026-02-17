@@ -305,6 +305,8 @@ class ProcessLoader:
                 )
             defn = self._parse(yaml_path)
             defn.package_dir = path
+            # Activate per-package isolated dependencies if present.
+            self._activate_isolated_dependencies(path)
             # Register bundled tools if present
             self._register_bundled_tools(path)
             return defn
@@ -603,14 +605,67 @@ class ProcessLoader:
             return None
 
     @staticmethod
+    def _activate_isolated_dependencies(package_dir: Path) -> None:
+        """Add isolated package dependency paths to sys.path if available."""
+        deps_root = package_dir.parent / ".deps" / package_dir.name
+        if not deps_root.exists():
+            return
+
+        candidates: list[Path] = []
+        if sys.platform.startswith("win"):
+            candidates.append(deps_root / "Lib" / "site-packages")
+        else:
+            lib_root = deps_root / "lib"
+            for site_dir in sorted(lib_root.glob("python*/site-packages")):
+                candidates.append(site_dir)
+
+        for candidate in candidates:
+            if candidate.exists():
+                path_str = str(candidate)
+                if path_str not in sys.path:
+                    sys.path.insert(0, path_str)
+                    logger.info(
+                        "Activated isolated process dependencies: %s",
+                        candidate,
+                    )
+
+    @staticmethod
+    def _tool_name_from_class(tool_cls: type) -> str | None:
+        """Best-effort extraction of a Tool name from a Tool subclass."""
+        try:
+            tool = tool_cls()
+            name = getattr(tool, "name", "")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _registered_tool_name_map() -> dict[str, type]:
+        """Return {tool_name: class} for currently registered tool classes."""
+        from loom.tools.registry import Tool
+
+        name_map: dict[str, type] = {}
+        for cls in Tool._registered_classes:
+            name = ProcessLoader._tool_name_from_class(cls)
+            if name:
+                name_map[name] = cls
+        return name_map
+
+    @staticmethod
     def _register_bundled_tools(package_dir: Path) -> None:
         """Import and register tools from a package's tools/ directory."""
+        from loom.tools.registry import Tool
+
         tools_dir = package_dir / "tools"
         if not tools_dir.exists() or not tools_dir.is_dir():
             return
         for py_file in tools_dir.glob("*.py"):
             if py_file.name.startswith("_"):
                 continue
+            before_classes = set(Tool._registered_classes)
+            before_name_map = ProcessLoader._registered_tool_name_map()
             # Include package name to avoid collisions between processes
             safe_pkg = package_dir.name.replace("-", "_")
             module_name = f"loom.processes._bundled.{safe_pkg}.{py_file.stem}"
@@ -622,6 +677,33 @@ class ProcessLoader:
                     module = importlib.util.module_from_spec(spec)
                     sys.modules[module_name] = module
                     spec.loader.exec_module(module)
+
+                    # Detect and suppress bundled tools that collide on name
+                    # with already-registered tools.
+                    new_classes = [
+                        cls
+                        for cls in Tool._registered_classes
+                        if cls not in before_classes
+                    ]
+                    name_owner: dict[str, type] = dict(before_name_map)
+                    for cls in new_classes:
+                        tool_name = ProcessLoader._tool_name_from_class(cls)
+                        if not tool_name:
+                            continue
+                        existing = name_owner.get(tool_name)
+                        if existing is None:
+                            name_owner[tool_name] = cls
+                            continue
+                        Tool._registered_classes.discard(cls)
+                        logger.warning(
+                            "Bundled tool '%s' from %s conflicts with "
+                            "existing tool class %s.%s; skipping bundled tool. "
+                            "Rename bundled tools to unique names.",
+                            tool_name,
+                            py_file,
+                            existing.__module__,
+                            existing.__name__,
+                        )
             except Exception as e:
                 logger.warning(
                     "Failed to load bundled tool %s: %s", py_file, e,

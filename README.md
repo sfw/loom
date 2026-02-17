@@ -119,7 +119,11 @@ A process definition injects a persona, phase blueprint, verification rules, and
 loom processes                              # list available
 loom -w /tmp/acme --process consulting-engagement
 loom install user/repo                      # install from GitHub
+loom install user/repo --isolated-deps      # per-process dependency env
 ```
+
+Process-required tools are enforced at runtime: if `tools.required` contains
+missing tools, process activation/task creation fails fast with a clear error.
 
 ## Adaptive Learning
 

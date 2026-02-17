@@ -456,6 +456,13 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
     help="Skip installing Python dependencies.",
 )
 @click.option(
+    "--isolated-deps", is_flag=True, default=False,
+    help=(
+        "Install package dependencies into <target>/.deps/<process-name>/ "
+        "instead of the current Python environment."
+    ),
+)
+@click.option(
     "--yes", "-y", is_flag=True, default=False,
     help="Skip interactive review and approve automatically.",
 )
@@ -465,6 +472,7 @@ def install(
     source: str,
     install_workspace: Path | None,
     skip_deps: bool,
+    isolated_deps: bool,
     yes: bool,
 ) -> None:
     """Install a process package from a GitHub repo or local path.
@@ -491,6 +499,7 @@ def install(
       loom install acme/loom-google-analytics
       loom install ./my-local-process
       loom install ./my-local-process -w /path/to/project
+      loom install ./my-local-process --isolated-deps
     """
     from loom.processes.installer import (
         InstallError,
@@ -504,6 +513,15 @@ def install(
         target_dir = Path.home() / ".loom" / "processes"
 
     click.echo(f"Resolving source: {source}")
+    if isolated_deps and not skip_deps:
+        click.echo(
+            "Dependency mode: isolated "
+            "(per-process env under <target>/.deps/...)"
+        )
+    elif isolated_deps and skip_deps:
+        click.echo(
+            "Note: --isolated-deps has no effect when --skip-deps is set."
+        )
 
     def _review_and_prompt(review) -> bool:
         """Display review and ask user for confirmation."""
@@ -518,6 +536,7 @@ def install(
             source,
             target_dir=target_dir,
             skip_deps=skip_deps,
+            isolated_deps=isolated_deps,
             review_callback=_review_and_prompt,
         )
         click.echo(f"Installed to: {dest}")
