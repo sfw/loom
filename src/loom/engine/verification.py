@@ -388,7 +388,7 @@ class LLMVerifier:
                     passed=bool(assessment.get("passed", True)),
                     detail="; ".join(assessment.get("issues", [])),
                 )],
-                feedback=assessment.get("suggestion"),
+                feedback=assessment.get("feedback") or assessment.get("suggestion"),
             )
         except Exception as e:
             logger.warning("Verifier raised exception: %s", e)
