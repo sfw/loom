@@ -17,6 +17,12 @@ All notable changes to Loom are documented in this file.
 - **Unified TUI as default interface** (`tui/app.py`, `__main__.py`) -- `loom` with no subcommand now launches the Textual TUI with full cowork backend: session persistence (SQLite), conversation recall, task delegation, process definitions, and session management. The separate plain-text REPL is removed. `loom cowork` is an alias for the default TUI. New slash commands: `/sessions`, `/new`, `/session`, `/resume <id>`.
 - **Setup wizard moved into TUI** (`tui/screens/setup.py`, `__main__.py`) -- first-run configuration now launches as a multi-step modal inside the TUI instead of CLI prompts. Five-step keyboard-driven flow: provider selection, model details, role assignment, optional utility model, and confirmation. Reconfigure anytime with the `/setup` slash command. The `loom setup` CLI command is retained as a headless fallback.
 
+### Fixed
+- **API process cross-task leakage** (`api/routes.py`, `api/engine.py`) -- process-backed task execution now uses an isolated per-task orchestrator instead of mutating shared orchestrator internals (`_process`, `_prompts`). Prevents process collisions and state bleed between concurrent tasks.
+- **API process configuration parity** (`api/routes.py`) -- process loading now honors `config.process.search_paths`, matching TUI/CLI resolution behavior.
+- **TUI files panel session bleed** (`tui/app.py`) -- file-change history/diff view is now reset on `/new` session creation and `/resume` session switching.
+- **Tree-sitter CI gate** (`.github/workflows/ci.yml`) -- added a dedicated workflow job that installs `--extra treesitter`, asserts backend availability, and runs `tests/test_treesitter.py` so tree-sitter regressions are not silently skipped.
+
 ### Added
 - **Process definition plugin architecture** (`processes/schema.py`) -- YAML-based domain specialization. Process definitions inject personas, phase blueprints, verification rules, tool guidance, and memory extraction types into the engine without code changes. Multi-path discovery (builtin → user-global → workspace-local), comprehensive validation with dependency cycle detection, and support for process packages that bundle tools.
 - **5 built-in process definitions** (`processes/builtin/`) -- `investment-analysis` (5-phase strict financial workflow), `marketing-strategy` (6-phase guided GTM), `research-report` (4-phase research pipeline), `competitive-intel` (3-phase competitive analysis), `consulting-engagement` (5-phase McKinsey-style issue tree).

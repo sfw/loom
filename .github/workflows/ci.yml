@@ -45,3 +45,21 @@ jobs:
         with:
           name: coverage-report
           path: coverage.xml
+
+  test-treesitter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies (including tree-sitter)
+        run: uv sync --extra dev --extra treesitter
+      - name: Verify tree-sitter backend is available
+        run: uv run python -c "from loom.tools.treesitter import is_available; assert is_available(), 'tree-sitter backend unavailable'"
+      - name: Run tree-sitter tests
+        run: uv run pytest -q tests/test_treesitter.py

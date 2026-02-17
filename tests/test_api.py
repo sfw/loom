@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from loom.api.engine import Engine
-from loom.config import Config
+from loom.config import Config, ProcessConfig
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import EventBus
 from loom.events.webhook import WebhookDelivery
@@ -456,3 +457,112 @@ class TestProcessField:
             "goal": "No process",
         })
         assert response.status_code == 201
+
+    @pytest.mark.asyncio
+    async def test_create_task_uses_configured_process_search_paths(
+        self,
+        client,
+        engine,
+        tmp_path,
+        monkeypatch,
+    ):
+        """API process loader should honor config.process.search_paths."""
+        extra_dir = tmp_path / "custom-processes"
+        extra_dir.mkdir()
+        engine.config = Config(
+            process=ProcessConfig(search_paths=[str(extra_dir)]),
+        )
+
+        captured: dict[str, object] = {}
+
+        class DummyLoader:
+            def __init__(self, workspace=None, extra_search_paths=None):
+                captured["workspace"] = workspace
+                captured["extra_search_paths"] = extra_search_paths
+
+            def load(self, name):
+                # Any non-None object is fine for route wiring.
+                return {"name": name}
+
+        monkeypatch.setattr("loom.processes.schema.ProcessLoader", DummyLoader)
+
+        response = await client.post("/tasks", json={
+            "goal": "Test process search paths",
+            "workspace": str(tmp_path),
+            "process": "demo-process",
+        })
+
+        assert response.status_code == 201
+        assert captured["workspace"] == tmp_path
+        assert captured["extra_search_paths"] == [extra_dir]
+
+
+class TestBackgroundExecution:
+    @pytest.mark.asyncio
+    async def test_process_task_uses_isolated_orchestrator(self):
+        """Process-backed task execution should not mutate shared orchestrator."""
+        from loom.api.routes import _execute_in_background
+
+        shared_orch = MagicMock()
+        shared_orch._process = "BASE"
+        shared_orch._prompts = SimpleNamespace(process="BASE")
+        shared_orch.execute_task = AsyncMock()
+
+        isolated_orch = MagicMock()
+        result = SimpleNamespace(id="task-1", status=TaskStatus.COMPLETED)
+        isolated_orch.execute_task = AsyncMock(return_value=result)
+
+        engine = MagicMock()
+        engine.orchestrator = shared_orch
+        engine.create_task_orchestrator = MagicMock(return_value=isolated_orch)
+        engine.database.update_task_status = AsyncMock()
+        engine.state_manager.save = MagicMock()
+
+        task = SimpleNamespace(id="task-1", status=TaskStatus.PENDING)
+
+        await _execute_in_background(engine, task, process_def={"name": "proc"})
+
+        engine.create_task_orchestrator.assert_called_once_with({"name": "proc"})
+        isolated_orch.execute_task.assert_awaited_once_with(task)
+        shared_orch.execute_task.assert_not_awaited()
+        assert shared_orch._process == "BASE"
+        assert shared_orch._prompts.process == "BASE"
+
+    @pytest.mark.asyncio
+    async def test_non_process_task_uses_shared_orchestrator(self):
+        """Non-process task execution should keep using the shared orchestrator."""
+        from loom.api.routes import _execute_in_background
+
+        shared_orch = MagicMock()
+        result = SimpleNamespace(id="task-2", status=TaskStatus.COMPLETED)
+        shared_orch.execute_task = AsyncMock(return_value=result)
+
+        engine = MagicMock()
+        engine.orchestrator = shared_orch
+        engine.create_task_orchestrator = MagicMock()
+        engine.database.update_task_status = AsyncMock()
+        engine.state_manager.save = MagicMock()
+
+        task = SimpleNamespace(id="task-2", status=TaskStatus.PENDING)
+        await _execute_in_background(engine, task, process_def=None)
+
+        engine.create_task_orchestrator.assert_not_called()
+        shared_orch.execute_task.assert_awaited_once_with(task)
+        engine.database.update_task_status.assert_awaited_once_with(
+            "task-2", TaskStatus.COMPLETED.value,
+        )
+
+
+class TestEngineOrchestratorFactory:
+    def test_create_task_orchestrator_isolated_components(self, engine):
+        """Per-task factory should create fresh prompt/tools and pass process."""
+        process_def = SimpleNamespace(
+            name="process",
+            tools=SimpleNamespace(excluded=[]),
+        )
+        task_orch = engine.create_task_orchestrator(process=process_def)
+
+        assert task_orch is not engine.orchestrator
+        assert task_orch._tools is not engine.tool_registry
+        assert task_orch._prompts is not engine.prompt_assembler
+        assert task_orch._process == process_def

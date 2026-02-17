@@ -398,6 +398,12 @@ class LoomApp(App):
     # Session management helpers
     # ------------------------------------------------------------------
 
+    def _clear_files_panel(self) -> None:
+        """Reset file history/diff when changing sessions."""
+        panel = self.query_one("#files-panel", FilesChangedPanel)
+        panel.clear_files()
+        panel.show_diff("")
+
     async def _new_session(self) -> None:
         """Create a fresh session, replacing the current one."""
         if self._store is None or self._session is None or self._model is None:
@@ -426,6 +432,7 @@ class LoomApp(App):
         )
         self._total_tokens = 0
         self._bind_session_tools()
+        self._clear_files_panel()
 
         chat = self.query_one("#chat-log", ChatLog)
         chat.add_info(f"New session: [dim]{session_id}[/dim]")
@@ -455,6 +462,7 @@ class LoomApp(App):
         self._session = new_session
         self._total_tokens = new_session.total_tokens
         self._bind_session_tools()
+        self._clear_files_panel()
 
         chat = self.query_one("#chat-log", ChatLog)
         chat.add_info(

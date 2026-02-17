@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -532,3 +533,85 @@ class TestFinalizeSetupResetsSession:
         assert app._session is not None
         app._session = None  # Simulate what _finalize_setup does
         assert app._session is None
+
+
+class TestFilesPanelReset:
+    def test_clear_files_panel(self):
+        """Session changes should reset the files panel and clear the diff."""
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=None,
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        panel = MagicMock()
+        app.query_one = MagicMock(return_value=panel)
+
+        app._clear_files_panel()
+
+        panel.clear_files.assert_called_once()
+        panel.show_diff.assert_called_once_with("")
+
+    @pytest.mark.asyncio
+    async def test_new_session_clears_files_panel(self):
+        """Creating a new session should clear stale file history."""
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._model = MagicMock()
+        app._model.name = "test-model"
+        app._session = SimpleNamespace(session_id="old-session")
+        app._store = MagicMock()
+        app._store.update_session = AsyncMock()
+        app._store.create_session = AsyncMock(return_value="new-session")
+        app._bind_session_tools = MagicMock()
+        app._clear_files_panel = MagicMock()
+
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._new_session()
+
+        app._clear_files_panel.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_switch_session_clears_files_panel(self, monkeypatch):
+        """Switching sessions should clear stale file history."""
+        from loom.tui.app import LoomApp
+
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                self.session_id = ""
+                self.session_state = SimpleNamespace(turn_count=3)
+                self.total_tokens = 99
+                self.workspace = Path("/tmp")
+
+            async def resume(self, session_id: str):
+                self.session_id = session_id
+
+        monkeypatch.setattr("loom.tui.app.CoworkSession", FakeSession)
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._model = MagicMock()
+        app._model.name = "test-model"
+        app._session = SimpleNamespace(session_id="old-session")
+        app._store = MagicMock()
+        app._store.update_session = AsyncMock()
+        app._bind_session_tools = MagicMock()
+        app._clear_files_panel = MagicMock()
+
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._switch_to_session("new-session")
+
+        app._clear_files_panel.assert_called_once()

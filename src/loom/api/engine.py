@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loom.config import Config
 from loom.engine.orchestrator import Orchestrator
@@ -16,6 +17,9 @@ from loom.state.memory import Database, MemoryManager
 from loom.state.task_state import TaskStateManager
 from loom.tools import create_default_registry
 from loom.tools.registry import ToolRegistry
+
+if TYPE_CHECKING:
+    from loom.processes.schema import ProcessDefinition
 
 
 class Engine:
@@ -53,6 +57,27 @@ class Engine:
         """Graceful cleanup."""
         await self.model_router.close()
         await self.database.close()
+
+    def create_task_orchestrator(
+        self, process: ProcessDefinition | None = None,
+    ) -> Orchestrator:
+        """Create an isolated orchestrator for a single task execution.
+
+        A fresh prompt assembler and tool registry avoid cross-task mutation
+        when a process definition applies tool exclusions or prompt overrides.
+        """
+        return Orchestrator(
+            model_router=self.model_router,
+            tool_registry=create_default_registry(),
+            memory_manager=self.memory_manager,
+            prompt_assembler=PromptAssembler(),
+            state_manager=self.state_manager,
+            event_bus=self.event_bus,
+            config=self.config,
+            approval_manager=self.approval_manager,
+            learning_manager=self.learning_manager,
+            process=process,
+        )
 
 
 async def create_engine(config: Config) -> Engine:
