@@ -1384,6 +1384,83 @@ class TestProcessSlashCommands:
         app._reload_session_for_process_change.assert_awaited_once()
         assert "Active process: none" in chat.add_info.call_args.args[0]
 
+
+class TestCommandPaletteProcessActions:
+    @pytest.mark.asyncio
+    async def test_process_info_action(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._process_defn = SimpleNamespace(name="marketing-strategy")
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        await app.action_loom_command("process_info")
+
+        chat.add_info.assert_called_once_with("Active process: marketing-strategy")
+
+    @pytest.mark.asyncio
+    async def test_process_list_action(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._render_process_catalog = MagicMock(return_value="catalog")
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        await app.action_loom_command("process_list")
+
+        app._render_process_catalog.assert_called_once()
+        chat.add_info.assert_called_once_with("catalog")
+
+    @pytest.mark.asyncio
+    async def test_process_off_action_no_active(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._process_name = None
+        app._process_defn = None
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        await app.action_loom_command("process_off")
+
+        chat.add_info.assert_called_once_with("No active process.")
+
+    @pytest.mark.asyncio
+    async def test_process_off_action_reloads(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._process_name = "marketing-strategy"
+        app._process_defn = SimpleNamespace(name="marketing-strategy")
+        app._reload_session_for_process_change = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        await app.action_loom_command("process_off")
+
+        assert app._process_name is None
+        assert app._process_defn is None
+        app._reload_session_for_process_change.assert_awaited_once()
+        assert "Active process: none" in chat.add_info.call_args.args[0]
+
     def test_slash_tab_completion_cycles_forward(self):
         from loom.tui.app import LoomApp
 

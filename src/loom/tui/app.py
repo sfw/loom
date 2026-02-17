@@ -1408,6 +1408,16 @@ class LoomApp(App):
         if command == "quit":
             self.action_request_quit()
             return
+        if command == "process_off":
+            chat = self.query_one("#chat-log", ChatLog)
+            if not self._process_name and self._process_defn is None:
+                chat.add_info("No active process.")
+                return
+            self._process_name = None
+            self._process_defn = None
+            await self._reload_session_for_process_change(chat)
+            chat.add_info("Active process: none")
+            return
         actions = {
             "clear_chat": self.action_clear_chat,
             "toggle_sidebar": self.action_toggle_sidebar,
@@ -1416,6 +1426,8 @@ class LoomApp(App):
             "tab_events": self.action_tab_events,
             "list_tools": self._show_tools,
             "model_info": self._show_model_info,
+            "process_info": self._show_process_info,
+            "process_list": self._show_process_list,
             "token_info": self._show_token_info,
             "help": self._show_help,
         }
@@ -1432,6 +1444,14 @@ class LoomApp(App):
         chat = self.query_one("#chat-log", ChatLog)
         name = self._model.name if self._model else "(not configured)"
         chat.add_info(f"Model: {name}")
+
+    def _show_process_info(self) -> None:
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(f"Active process: {self._active_process_name()}")
+
+    def _show_process_list(self) -> None:
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(self._render_process_catalog())
 
     def _show_token_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)
