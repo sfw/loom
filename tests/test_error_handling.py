@@ -6,6 +6,7 @@ graceful degradation paths.
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -93,7 +94,7 @@ class TestModelConnectionError:
 
 
 class TestOpenAIProviderErrors:
-    def _make_provider(self):
+    def _make_provider(self, *, api_key: str = ""):
         from loom.config import ModelConfig
         from loom.models.openai_provider import OpenAICompatibleProvider
 
@@ -101,8 +102,23 @@ class TestOpenAIProviderErrors:
             provider="openai_compatible",
             base_url="http://localhost:9999",
             model="test-model",
+            api_key=api_key,
         )
         return OpenAICompatibleProvider(config)
+
+    def test_constructor_applies_bearer_auth_header_when_api_key_is_set(self):
+        provider = self._make_provider(api_key="test-key")
+        try:
+            assert provider._client.headers.get("authorization") == "Bearer test-key"
+        finally:
+            asyncio.run(provider._client.aclose())
+
+    def test_constructor_omits_auth_header_when_api_key_is_empty(self):
+        provider = self._make_provider(api_key="")
+        try:
+            assert provider._client.headers.get("authorization") is None
+        finally:
+            asyncio.run(provider._client.aclose())
 
     @pytest.mark.asyncio
     async def test_complete_connect_error(self):
@@ -172,7 +188,7 @@ class TestOpenAIProviderErrors:
 
 
 class TestOllamaProviderErrors:
-    def _make_provider(self):
+    def _make_provider(self, *, api_key: str = ""):
         from loom.config import ModelConfig
         from loom.models.ollama_provider import OllamaProvider
 
@@ -180,8 +196,23 @@ class TestOllamaProviderErrors:
             provider="ollama",
             base_url="http://localhost:11434",
             model="llama3",
+            api_key=api_key,
         )
         return OllamaProvider(config)
+
+    def test_constructor_applies_bearer_auth_header_when_api_key_is_set(self):
+        provider = self._make_provider(api_key="test-key")
+        try:
+            assert provider._client.headers.get("authorization") == "Bearer test-key"
+        finally:
+            asyncio.run(provider._client.aclose())
+
+    def test_constructor_omits_auth_header_when_api_key_is_empty(self):
+        provider = self._make_provider(api_key="")
+        try:
+            assert provider._client.headers.get("authorization") is None
+        finally:
+            asyncio.run(provider._client.aclose())
 
     @pytest.mark.asyncio
     async def test_complete_connect_error(self):
