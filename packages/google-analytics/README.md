@@ -16,7 +16,7 @@ This process guides Loom through a structured GA4 audit:
 ## Installation
 
 ```bash
-loom install github.com/sfw/loom-process-google-analytics
+loom install https://github.com/sfw/loom-process-google-analytics
 ```
 
 Or install from a local directory:
