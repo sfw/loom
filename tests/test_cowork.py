@@ -196,7 +196,7 @@ class TestBuildSystemPrompt:
     def test_with_workspace(self, workspace):
         prompt = build_cowork_system_prompt(workspace)
         assert str(workspace) in prompt
-        assert "collaborative coding assistant" in prompt.lower()
+        assert "collaborative assistant for complex tasks" in prompt.lower()
 
     def test_without_workspace(self):
         prompt = build_cowork_system_prompt(None)
