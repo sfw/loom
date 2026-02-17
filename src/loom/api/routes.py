@@ -48,6 +48,7 @@ def _get_engine(request: Request) -> Engine:
 async def create_new_task(request: Request, body: TaskCreateRequest):
     """Create and start a new task."""
     engine = _get_engine(request)
+    effective_process = body.process or engine.config.process.default or None
 
     # Validate workspace if provided
     if body.workspace:
@@ -57,7 +58,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
 
     # Resolve process definition if specified
     process_def = None
-    if body.process:
+    if effective_process:
         from loom.processes.schema import ProcessLoader, ProcessNotFoundError
 
         extra = [Path(p) for p in engine.config.process.search_paths]
@@ -66,7 +67,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
             extra_search_paths=extra,
         )
         try:
-            process_def = loader.load(body.process)
+            process_def = loader.load(effective_process)
         except ProcessNotFoundError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -96,7 +97,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         callback_url=body.callback_url or "",
         context=body.context,
     )
-    task.metadata["process"] = body.process or ""
+    task.metadata["process"] = effective_process or ""
 
     engine.state_manager.save(task)
 

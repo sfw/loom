@@ -459,6 +459,73 @@ class TestProcessField:
         assert response.status_code == 201
 
     @pytest.mark.asyncio
+    async def test_create_task_uses_default_process_when_omitted(
+        self,
+        client,
+        engine,
+        monkeypatch,
+    ):
+        """When request omits process, config.process.default should apply."""
+        engine.config = Config(
+            process=ProcessConfig(default="default-process"),
+        )
+        captured: dict[str, object] = {}
+
+        class DummyLoader:
+            def __init__(self, workspace=None, extra_search_paths=None):
+                captured["workspace"] = workspace
+                captured["extra_search_paths"] = extra_search_paths
+
+            def load(self, name):
+                captured["name"] = name
+                return SimpleNamespace(
+                    name=name,
+                    tools=SimpleNamespace(required=[], excluded=[]),
+                )
+
+        monkeypatch.setattr("loom.processes.schema.ProcessLoader", DummyLoader)
+
+        response = await client.post("/tasks", json={"goal": "Use default process"})
+
+        assert response.status_code == 201
+        assert captured["name"] == "default-process"
+
+    @pytest.mark.asyncio
+    async def test_create_task_explicit_process_overrides_default(
+        self,
+        client,
+        engine,
+        monkeypatch,
+    ):
+        """Explicit request process should override config.process.default."""
+        engine.config = Config(
+            process=ProcessConfig(default="default-process"),
+        )
+        captured: dict[str, object] = {}
+
+        class DummyLoader:
+            def __init__(self, workspace=None, extra_search_paths=None):
+                captured["workspace"] = workspace
+                captured["extra_search_paths"] = extra_search_paths
+
+            def load(self, name):
+                captured["name"] = name
+                return SimpleNamespace(
+                    name=name,
+                    tools=SimpleNamespace(required=[], excluded=[]),
+                )
+
+        monkeypatch.setattr("loom.processes.schema.ProcessLoader", DummyLoader)
+
+        response = await client.post("/tasks", json={
+            "goal": "Use explicit process",
+            "process": "explicit-process",
+        })
+
+        assert response.status_code == 201
+        assert captured["name"] == "explicit-process"
+
+    @pytest.mark.asyncio
     async def test_create_task_uses_configured_process_search_paths(
         self,
         client,
