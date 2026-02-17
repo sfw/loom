@@ -546,30 +546,36 @@ class TestFilesChangedPanelAccumulation:
     """P1-6: Files panel should accumulate entries across turns."""
 
     def test_update_files_accumulates(self):
+        from unittest.mock import MagicMock
+
         from loom.tui.widgets.file_panel import FilesChangedPanel
 
         panel = FilesChangedPanel()
-        panel._all_entries = []
+        panel._refresh_table = MagicMock()
 
         entries_1 = [{"operation": "create", "path": "a.py", "timestamp": "10:00:00"}]
         entries_2 = [{"operation": "modify", "path": "b.py", "timestamp": "10:01:00"}]
 
-        # Simulate update_files without table (just check _all_entries)
-        panel._all_entries.extend(entries_1)
-        panel._all_entries.extend(entries_2)
+        panel.update_files(entries_1)
+        panel.update_files(entries_2)
+        assert panel._refresh_table.call_count == 2
 
         assert len(panel._all_entries) == 2
         assert panel._all_entries[0]["path"] == "a.py"
         assert panel._all_entries[1]["path"] == "b.py"
 
     def test_clear_files_resets(self):
+        from unittest.mock import MagicMock
+
         from loom.tui.widgets.file_panel import FilesChangedPanel
 
         panel = FilesChangedPanel()
+        panel._refresh_table = MagicMock()
         panel._all_entries = [
             {"operation": "create", "path": "a.py", "timestamp": "10:00:00"},
         ]
-        panel._all_entries.clear()
+        panel.clear_files()
+        panel._refresh_table.assert_called_once()
         assert len(panel._all_entries) == 0
 
 

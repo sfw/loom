@@ -185,6 +185,7 @@ class TestEventPersistence:
         )
         # Should not raise
         await persister.handle(event)
+        db.insert_event.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_multiple_events_persisted(self, tmp_path):

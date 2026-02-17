@@ -394,10 +394,11 @@ class TestFormatReviewForTerminal:
 
 
 class TestInstallDependencies:
-    def test_no_deps_does_nothing(self, tmp_path):
+    @patch("subprocess.run")
+    def test_no_deps_does_nothing(self, mock_run, tmp_path):
         pkg = _make_package(tmp_path)
-        # Should not raise or call subprocess
         _install_dependencies(pkg, "python3")
+        mock_run.assert_not_called()
 
     @patch("subprocess.run")
     def test_installs_deps_with_uv(self, mock_run, tmp_path):
@@ -437,24 +438,26 @@ class TestInstallDependencies:
         with pytest.raises(InstallError, match="timed out"):
             _install_dependencies(pkg, "python3")
 
-    def test_non_list_deps_ignored(self, tmp_path):
+    @patch("subprocess.run")
+    def test_non_list_deps_ignored(self, mock_run, tmp_path):
         """dependencies: 'not-a-list' should be silently ignored."""
         pkg = _make_package(
             tmp_path,
             "name: test-process\nversion: '1.0'\ndependencies: not-a-list\n",
         )
-        # Should not raise
         _install_dependencies(pkg, "python3")
+        mock_run.assert_not_called()
 
-    def test_empty_string_deps_ignored(self, tmp_path):
+    @patch("subprocess.run")
+    def test_empty_string_deps_ignored(self, mock_run, tmp_path):
         """Empty strings in deps list should be filtered out."""
         yaml_content = (
             "name: test-process\nversion: '1.0'\n"
             "dependencies:\n  - ''\n  - '  '\n"
         )
         pkg = _make_package(tmp_path, yaml_content)
-        # Should not raise or call pip (no valid deps)
         _install_dependencies(pkg, "python3")
+        mock_run.assert_not_called()
 
 
 # ===================================================================
