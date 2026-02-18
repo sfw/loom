@@ -243,10 +243,27 @@ class TestDeterministicVerifier:
 
 
 class TestLLMVerifier:
+    class _FakeCompactor:
+        async def compact(self, text: str, *, max_chars: int, label: str = "") -> str:
+            value = str(text or "").strip()
+            if len(value) <= max_chars:
+                return value
+            words = value.split()
+            if len(words) <= 1:
+                return f"[compacted {len(value)} chars]"
+            compacted = ""
+            for word in words:
+                candidate = f"{compacted} {word}".strip()
+                if compacted and len(candidate) > max_chars:
+                    break
+                compacted = candidate
+            return compacted or value
+
     @pytest.mark.asyncio
     async def test_passes_when_model_says_pass(self):
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
         model.complete = AsyncMock(return_value=ModelResponse(
             text=json.dumps({"passed": True, "issues": [], "confidence": 0.9}),
             usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
@@ -257,6 +274,7 @@ class TestLLMVerifier:
         prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
 
         v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
         result = await v.verify(_make_subtask(), "output", [], None)
         assert result.passed
         assert result.tier == 2
@@ -266,6 +284,7 @@ class TestLLMVerifier:
     async def test_fails_when_model_says_fail(self):
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
         model.complete = AsyncMock(return_value=ModelResponse(
             text=json.dumps({
                 "passed": False,
@@ -281,6 +300,7 @@ class TestLLMVerifier:
         prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
 
         v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
         result = await v.verify(_make_subtask(), "output", [], None)
         assert not result.passed
         assert result.feedback == "Add try/except blocks"
@@ -289,6 +309,7 @@ class TestLLMVerifier:
     async def test_verifier_parses_json_wrapped_in_text(self):
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
         model.complete = AsyncMock(return_value=ModelResponse(
             text=(
                 "Assessment complete.\n"
@@ -304,6 +325,7 @@ class TestLLMVerifier:
         prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
 
         v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
         result = await v.verify(_make_subtask(), "output", [], None)
         assert result.passed
         assert result.confidence == 0.74
@@ -313,6 +335,7 @@ class TestLLMVerifier:
     async def test_verifier_uses_feedback_field(self):
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
         model.complete = AsyncMock(return_value=ModelResponse(
             text=json.dumps({
                 "passed": False,
@@ -328,6 +351,7 @@ class TestLLMVerifier:
         prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
 
         v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
         result = await v.verify(_make_subtask(), "output", [], None)
         assert not result.passed
         assert result.feedback == "Add source links for each claim"
@@ -339,11 +363,127 @@ class TestLLMVerifier:
 
         prompts = MagicMock(spec=PromptAssembler)
         v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
         result = await v.verify(_make_subtask(), "output", [], None)
         assert result.passed
         assert result.tier == 0
         assert result.confidence == 0.5
         assert "Verification skipped" in result.feedback
+
+    @pytest.mark.asyncio
+    async def test_compacts_large_tool_args_in_verifier_prompt(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
+        model.complete = AsyncMock(return_value=ModelResponse(
+            text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
+            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+        ))
+        router.select = MagicMock(return_value=model)
+
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.build_verifier_prompt = MagicMock(
+            side_effect=lambda **kw: kw["tool_calls_formatted"]
+        )
+
+        large_markdown = "# Section\n" + ("x" * 20_000)
+        tool_calls = [
+            MockToolCallRecord(
+                tool="document_write",
+                args={"path": "report.md", "content": large_markdown},
+                result=ToolResult.ok("wrote file", files_changed=["report.md"]),
+            )
+        ]
+
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
+        result = await v.verify(_make_subtask(), "output", tool_calls, None)
+
+        assert result.passed
+        sent_prompt = model.complete.await_args.args[0][0]["content"]
+        assert "x" * 1000 not in sent_prompt
+        assert len(sent_prompt) < 2000
+
+    @pytest.mark.asyncio
+    async def test_retries_verifier_with_compact_prompt_after_exception(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
+        model.complete = AsyncMock(side_effect=[
+            RuntimeError("token limit exceeded"),
+            ModelResponse(
+                text=json.dumps({"passed": True, "issues": [], "confidence": 0.7}),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            ),
+        ])
+        router.select = MagicMock(return_value=model)
+
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.build_verifier_prompt = MagicMock(
+            side_effect=lambda **kw: f"VERIFY\n{kw['tool_calls_formatted']}"
+        )
+
+        large_content = "y" * 15_000
+        tool_calls = [
+            MockToolCallRecord(
+                tool="document_write",
+                args={"path": "brief.md", "content": large_content},
+                result=ToolResult.ok("done"),
+            )
+            for _ in range(30)
+        ]
+
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
+        result = await v.verify(_make_subtask(), "output", tool_calls, None)
+
+        assert result.passed
+        assert model.complete.await_count == 2
+        first_prompt = model.complete.await_args_list[0].args[0][0]["content"]
+        second_prompt = model.complete.await_args_list[1].args[0][0]["content"]
+        assert len(second_prompt) <= len(first_prompt)
+
+    @pytest.mark.asyncio
+    async def test_verifier_exception_feedback_includes_error_detail(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
+        model.complete = AsyncMock(side_effect=RuntimeError("token budget exceeded"))
+        router.select = MagicMock(return_value=model)
+
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
+
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
+        result = await v.verify(_make_subtask(), "output", [], None)
+        assert not result.passed
+        assert "token budget exceeded" in (result.feedback or "")
+
+    @pytest.mark.asyncio
+    async def test_verifier_caps_result_summary_before_prompt(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
+        model.complete = AsyncMock(return_value=ModelResponse(
+            text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
+            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+        ))
+        router.select = MagicMock(return_value=model)
+
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.build_verifier_prompt = MagicMock(
+            side_effect=lambda **kw: kw["result_summary"]
+        )
+
+        long_summary = "A" * 12_000
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
+        result = await v.verify(_make_subtask(), long_summary, [], None)
+
+        assert result.passed
+        sent = model.complete.await_args.args[0][0]["content"]
+        assert len(sent) < len(long_summary)
 
 
 # --- VotingVerifier ---

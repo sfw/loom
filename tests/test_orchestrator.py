@@ -764,3 +764,124 @@ class TestOrchestratorTodoReminder:
         assert "step-1" in reminder
         assert "Create main.py" in reminder
         assert "Do NOT move to the next subtask" in reminder
+
+
+class TestSubtaskRunnerContextBudget:
+    class _FakeCompactor:
+        async def compact(self, text: str, *, max_chars: int, label: str = "") -> str:
+            value = str(text or "")
+            if len(value) <= max_chars:
+                return value
+            words = value.split()
+            if not words:
+                return value
+            if len(words) == 1 and len(words[0]) > max_chars:
+                return f"[compacted {len(value)} chars]"
+            compacted = ""
+            for word in words:
+                candidate = f"{compacted} {word}".strip()
+                if compacted and len(candidate) > max_chars:
+                    break
+                compacted = candidate
+            return compacted or value
+
+    @staticmethod
+    def _make_runner_for_compaction():
+        from loom.engine.runner import SubtaskRunner
+
+        runner = SubtaskRunner.__new__(SubtaskRunner)
+        runner._compactor = TestSubtaskRunnerContextBudget._FakeCompactor()
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_serialize_tool_result_for_model_compacts_output_and_data(self):
+        runner = self._make_runner_for_compaction()
+
+        result = ToolResult.ok(
+            "x" * 20_000,
+            data={
+                "url": "https://example.com/really/long/path",
+                "nested": {"a": 1, "b": 2},
+                "results": [1, 2, 3],
+            },
+            files_changed=["report.md"],
+        )
+
+        payload = await runner._serialize_tool_result_for_model("web_fetch", result)
+        parsed = json.loads(payload)
+
+        assert parsed["success"] is True
+        assert len(parsed["output"]) < len(result.output)
+        assert parsed["files_changed"] == ["report.md"]
+        assert parsed["data"]["url"].startswith("https://example.com/")
+        assert "a" in parsed["data"]["nested"]
+        assert "1" in parsed["data"]["results"]
+
+    @pytest.mark.asyncio
+    async def test_compact_messages_for_model_keeps_structure_and_reduces_tokens(self):
+        runner = self._make_runner_for_compaction()
+
+        messages = [{"role": "user", "content": "Goal: perform market research"}]
+        for idx in range(24):
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": f"call_{idx}",
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "arguments": "{\"url\": \"https://example.com\"}",
+                    },
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": f"call_{idx}",
+                "content": json.dumps({
+                    "success": True,
+                    "output": "A" * 8_000,
+                    "error": None,
+                    "files_changed": [],
+                }),
+            })
+            messages.append({
+                "role": "user",
+                "content": (
+                    "CURRENT TASK STATE:\n"
+                    "Goal: market research\n"
+                    "Current subtask: analyze\n"
+                    "Do NOT move to the next subtask."
+                ),
+            })
+
+        before = runner._estimate_message_tokens(messages)
+        compacted = await runner._compact_messages_for_model(messages)
+        after = runner._estimate_message_tokens(compacted)
+
+        assert after < before
+        assert after <= runner.MAX_MODEL_CONTEXT_TOKENS
+        assert compacted[0]["role"] == "user"
+        assert any(
+            isinstance(msg, dict) and msg.get("role") == "tool"
+            and msg.get("tool_call_id") == "call_23"
+            for msg in compacted
+        )
+
+    @pytest.mark.asyncio
+    async def test_summarize_model_output_uses_semantic_compaction(self):
+        runner = self._make_runner_for_compaction()
+
+        text = (
+            "First sentence is complete. "
+            "Second sentence is also complete. "
+            "Third sentence should be cut near boundary."
+        )
+        summary = await runner._summarize_model_output(
+            text,
+            max_chars=60,
+            label="test summary",
+        )
+
+        assert "First sentence is complete." in summary
+        assert len(summary) <= 60

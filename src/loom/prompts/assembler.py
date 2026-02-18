@@ -512,21 +512,9 @@ class PromptAssembler:
     def _trim_to_budget(
         self, prompt: str, max_tokens: int = 8000,
     ) -> str:
-        """Trim prompt if it exceeds the token budget.
+        """Return prompt as-is.
 
-        Priority (highest to lowest): role, task_state, subtask,
-        constraints, output_format, tools, memory.
-        Currently does a simple truncation.
+        Model-facing compaction is handled semantically at runtime by the
+        engine (LLM-based compactor). Avoid hard truncation during assembly.
         """
-        estimated = self.estimate_tokens(prompt)
-        if estimated <= max_tokens:
-            return prompt
-
-        # Simple truncation to fit budget
-        max_chars = max_tokens * 4
-        if len(prompt) > max_chars:
-            return (
-                prompt[:max_chars]
-                + "\n\n[... prompt trimmed to fit context window ...]"
-            )
         return prompt

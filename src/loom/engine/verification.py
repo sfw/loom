@@ -18,9 +18,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loom.config import VerificationConfig
+from loom.engine.semantic_compactor import SemanticCompactor
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.state.task_state import Subtask
+from loom.utils.tokens import estimate_tokens
 
 if TYPE_CHECKING:
     from loom.processes.schema import ProcessDefinition
@@ -335,6 +337,171 @@ class LLMVerifier:
         self._router = model_router
         self._prompts = prompt_assembler
         self._validator = validator
+        self._compactor = SemanticCompactor(model_router, role="extractor", tier=1)
+
+    _MAX_TOOL_ARGS_CHARS = 240
+    _MAX_TOOL_STATUS_CHARS = 220
+    _MAX_TOOL_CALLS_TOKENS = 2500
+    _MAX_VERIFIER_PROMPT_TOKENS = 8000
+    _MAX_RESULT_SUMMARY_CHARS = 5000
+    _COMPACT_RESULT_SUMMARY_CHARS = 1800
+
+    async def _compact_text(self, text: str, *, max_chars: int, label: str) -> str:
+        return await self._compactor.compact(
+            str(text or ""),
+            max_chars=max_chars,
+            label=label,
+        )
+
+    async def _summarize_arg_value(
+        self,
+        value: object,
+        *,
+        max_chars: int = 80,
+    ) -> object:
+        if isinstance(value, str):
+            return await self._compact_text(
+                value,
+                max_chars=max_chars,
+                label="tool argument value",
+            )
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        if isinstance(value, dict):
+            return await self._compact_text(
+                json.dumps(value, ensure_ascii=False, default=str),
+                max_chars=max_chars,
+                label="tool argument object",
+            )
+        if isinstance(value, list):
+            return await self._compact_text(
+                json.dumps(value, ensure_ascii=False, default=str),
+                max_chars=max_chars,
+                label="tool argument list",
+            )
+        return await self._compact_text(
+            str(value),
+            max_chars=max_chars,
+            label="tool argument scalar",
+        )
+
+    async def _summarize_tool_args(self, args: object, *, max_chars: int) -> str:
+        if not isinstance(args, dict):
+            return await self._compact_text(
+                json.dumps(args, default=str),
+                max_chars=max_chars,
+                label="tool call args",
+            )
+
+        preferred = (
+            "path", "file_path", "url", "query", "pattern", "command",
+            "operation", "source", "destination", "name", "column_name",
+            "row_index", "action", "subtask_id",
+        )
+        summary: dict[str, object] = {}
+        for key in preferred:
+            if key in args:
+                summary[key] = await self._summarize_arg_value(args.get(key))
+        if not summary:
+            for key, value in args.items():
+                summary[str(key)] = await self._summarize_arg_value(value)
+
+        text = json.dumps(summary, ensure_ascii=False, sort_keys=True)
+        if len(text) <= max_chars:
+            return text
+        return await self._compact_text(
+            text,
+            max_chars=max_chars,
+            label="tool call args summary",
+        )
+
+    async def _format_tool_calls_compact(self, tool_calls: list) -> str:
+        if not tool_calls:
+            return "No tool calls."
+
+        detailed = await self._format_tool_calls_for_prompt(tool_calls)
+        return await self._compact_text(
+            detailed,
+            max_chars=2_400,
+            label="verification compact tool-call history",
+        )
+
+    async def _format_tool_calls_for_prompt(self, tool_calls: list) -> str:
+        if not tool_calls:
+            return "No tool calls."
+
+        lines: list[str] = []
+        for tc in tool_calls:
+            args_text = await self._summarize_tool_args(
+                getattr(tc, "args", {}),
+                max_chars=self._MAX_TOOL_ARGS_CHARS,
+            )
+            result = getattr(tc, "result", None)
+            if getattr(result, "success", False):
+                status = "OK"
+            else:
+                status = "FAILED: " + await self._compact_text(
+                    str(getattr(result, "error", "") or "unknown error"),
+                    max_chars=self._MAX_TOOL_STATUS_CHARS,
+                    label="tool status detail",
+                )
+            tool_name = str(getattr(tc, "tool", "") or "unknown")
+            lines.append(f"- {tool_name}({args_text}) -> {status}")
+
+        formatted = "\n".join(lines) if lines else "No tool calls."
+        if estimate_tokens(formatted) > self._MAX_TOOL_CALLS_TOKENS:
+            return await self._compact_text(
+                formatted,
+                max_chars=self._MAX_TOOL_CALLS_TOKENS * 4,
+                label="verification tool-call history",
+            )
+        return formatted
+
+    def _build_prompt(
+        self,
+        subtask: Subtask,
+        result_summary: str,
+        tool_calls_formatted: str,
+    ) -> str:
+        return self._prompts.build_verifier_prompt(
+            subtask=subtask,
+            result_summary=result_summary,
+            tool_calls_formatted=tool_calls_formatted,
+        )
+
+    async def _invoke_and_parse(self, model, prompt: str) -> VerificationResult:
+        response = await model.complete([{"role": "user", "content": prompt}])
+        validation = self._validator.validate_json_response(
+            response, expected_keys=["passed"]
+        )
+
+        if not validation.valid or validation.parsed is None:
+            return VerificationResult(
+                tier=2, passed=False, confidence=0.3,
+                feedback="Verification inconclusive: could not parse verifier output.",
+            )
+
+        assessment = validation.parsed
+        return VerificationResult(
+            tier=2,
+            passed=bool(assessment.get("passed", True)),
+            confidence=float(assessment.get("confidence", 0.5)),
+            checks=[Check(
+                name="llm_assessment",
+                passed=bool(assessment.get("passed", True)),
+                detail="; ".join(assessment.get("issues", [])),
+            )],
+            feedback=assessment.get("feedback") or assessment.get("suggestion"),
+        )
+
+    @staticmethod
+    def _exception_feedback(error: Exception) -> str:
+        detail = str(error) or type(error).__name__
+        detail = " ".join(detail.split())
+        return (
+            "Verification inconclusive: verifier raised an exception: "
+            f"{detail}"
+        )
 
     async def verify(
         self,
@@ -352,50 +519,51 @@ class LLMVerifier:
                 feedback="Verification skipped: verifier model not configured",
             )
 
-        # Format tool calls
-        tool_lines = []
-        for tc in tool_calls:
-            status = "OK" if tc.result.success else f"FAILED: {tc.result.error}"
-            tool_lines.append(f"- {tc.tool}({json.dumps(tc.args)}) → {status}")
-        tool_calls_formatted = "\n".join(tool_lines) if tool_lines else "No tool calls."
-
-        prompt = self._prompts.build_verifier_prompt(
-            subtask=subtask,
-            result_summary=result_summary,
-            tool_calls_formatted=tool_calls_formatted,
+        summary_for_prompt = await self._compact_text(
+            result_summary,
+            max_chars=self._MAX_RESULT_SUMMARY_CHARS,
+            label="verification result summary",
         )
+        tool_calls_formatted = await self._format_tool_calls_for_prompt(tool_calls)
+        prompt = self._build_prompt(subtask, summary_for_prompt, tool_calls_formatted)
+        if estimate_tokens(prompt) > self._MAX_VERIFIER_PROMPT_TOKENS:
+            summary_for_prompt = await self._compact_text(
+                summary_for_prompt,
+                max_chars=self._COMPACT_RESULT_SUMMARY_CHARS,
+                label="verification compact summary",
+            )
+            tool_calls_formatted = await self._format_tool_calls_compact(tool_calls)
+            prompt = self._build_prompt(
+                subtask, summary_for_prompt, tool_calls_formatted,
+            )
 
         try:
-            response = await model.complete([{"role": "user", "content": prompt}])
-            validation = self._validator.validate_json_response(
-                response, expected_keys=["passed"]
-            )
-
-            if not validation.valid or validation.parsed is None:
-                # Can't parse verifier output — fail to be safe
-                return VerificationResult(
-                    tier=2, passed=False, confidence=0.3,
-                    feedback="Verification inconclusive: could not parse verifier output.",
-                )
-
-            assessment = validation.parsed
-            return VerificationResult(
-                tier=2,
-                passed=bool(assessment.get("passed", True)),
-                confidence=float(assessment.get("confidence", 0.5)),
-                checks=[Check(
-                    name="llm_assessment",
-                    passed=bool(assessment.get("passed", True)),
-                    detail="; ".join(assessment.get("issues", [])),
-                )],
-                feedback=assessment.get("feedback") or assessment.get("suggestion"),
-            )
+            return await self._invoke_and_parse(model, prompt)
         except Exception as e:
             logger.warning("Verifier raised exception: %s", e)
-            return VerificationResult(
-                tier=2, passed=False, confidence=0.3,
-                feedback="Verification inconclusive: verifier raised an exception.",
+            compact_tool_calls = await self._format_tool_calls_compact(tool_calls)
+            compact_prompt = self._build_prompt(
+                subtask,
+                await self._compact_text(
+                    summary_for_prompt,
+                    max_chars=self._COMPACT_RESULT_SUMMARY_CHARS,
+                    label="verification retry summary",
+                ),
+                compact_tool_calls,
             )
+            try:
+                return await self._invoke_and_parse(model, compact_prompt)
+            except Exception as retry_error:
+                logger.warning(
+                    "Verifier compact retry raised exception: %s",
+                    retry_error,
+                )
+                return VerificationResult(
+                    tier=2,
+                    passed=False,
+                    confidence=0.3,
+                    feedback=self._exception_feedback(retry_error),
+                )
 
 
 class VotingVerifier:

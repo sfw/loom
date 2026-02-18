@@ -2285,6 +2285,114 @@ class TestProcessSlashCommands:
         chat.add_info.assert_called_once()
         assert "cancelled" in chat.add_info.call_args.args[0]
 
+    @pytest.mark.asyncio
+    async def test_persist_process_run_ui_state_serializes_run_tabs(self):
+        from loom.cowork.session_state import SessionState
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        state = SessionState(session_id="sess-123", workspace="/tmp", model_name="m")
+        app._session = SimpleNamespace(session_id="sess-123", session_state=state)
+        app._store = MagicMock()
+        app._store.update_session = AsyncMock()
+        app._process_runs = {
+            "abc123": SimpleNamespace(
+                run_id="abc123",
+                process_name="market-research",
+                goal="Analyze EPCOR",
+                status="completed",
+                task_id="cowork-1",
+                started_at=0.0,
+                ended_at=12.0,
+                tasks=[{"id": "scope", "status": "completed", "content": "Scope"}],
+                task_labels={"scope": "Scope"},
+                activity_log=["Run started.", "Completed scope."],
+                result_log=[{"text": "done", "success": True}],
+                closed=False,
+                pane_id="tab-run-abc123",
+                pane=MagicMock(),
+            ),
+        }
+        app.query_one = MagicMock(return_value=SimpleNamespace(active="tab-run-abc123"))
+
+        await app._persist_process_run_ui_state()
+
+        app._store.update_session.assert_awaited_once()
+        payload = app._store.update_session.await_args.kwargs["session_state"]
+        tabs = payload["ui_state"]["process_tabs"]
+        assert tabs["active_run_id"] == "abc123"
+        assert tabs["runs"][0]["process_name"] == "market-research"
+        assert tabs["runs"][0]["goal"] == "Analyze EPCOR"
+
+    @pytest.mark.asyncio
+    async def test_restore_process_run_tabs_from_session_state(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(
+            session_state=SimpleNamespace(
+                ui_state={
+                    "process_tabs": {
+                        "active_run_id": "abc123",
+                        "runs": [
+                            {
+                                "run_id": "abc123",
+                                "process_name": "market-research",
+                                "goal": "Analyze EPCOR",
+                                "status": "running",
+                                "task_id": "cowork-9",
+                                "elapsed_seconds": 42.0,
+                                "tasks": [
+                                    {
+                                        "id": "scope",
+                                        "status": "in_progress",
+                                        "content": "Scope companies",
+                                    },
+                                ],
+                                "task_labels": {"scope": "Scope companies"},
+                                "activity_log": ["Run started."],
+                                "result_log": [],
+                            },
+                        ],
+                    },
+                },
+            ),
+        )
+        app._process_runs = {}
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._refresh_process_run_outputs = MagicMock()
+        app._update_process_run_visuals = MagicMock()
+        loader = MagicMock()
+        loader.load.return_value = SimpleNamespace(
+            name="market-research",
+            phases=[],
+            get_deliverables=lambda: {},
+        )
+        app._create_process_loader = MagicMock(return_value=loader)
+
+        tabs = SimpleNamespace(active="tab-chat", add_pane=AsyncMock(), remove_pane=AsyncMock())
+        app.query_one = MagicMock(return_value=tabs)
+        chat = MagicMock()
+
+        await app._restore_process_run_tabs(chat)
+
+        assert len(app._process_runs) == 1
+        run = app._process_runs["abc123"]
+        assert run.process_name == "market-research"
+        assert run.status == "failed"  # interrupted running runs cannot be resumed
+        tabs.add_pane.assert_awaited_once()
+        assert tabs.active == run.pane_id
+        chat.add_info.assert_called_once()
+        assert "Restored 1 process run tab" in chat.add_info.call_args.args[0]
+
     def test_process_progress_event_scoped_to_run_tab(self):
         from loom.tui.app import LoomApp
 
@@ -3263,6 +3371,32 @@ class TestCommandPaletteProcessActions:
             await pilot.pause()
             assert input_widget.value == "/session"
 
+    @pytest.mark.asyncio
+    async def test_ctrl_w_closes_process_tab_from_input_focus(self):
+        from textual.widgets import Input
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+        called = {"count": 0}
+        app.action_close_process_tab = lambda: called.__setitem__(  # noqa: B023
+            "count", called["count"] + 1,
+        )
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#user-input", Input)
+            input_widget.focus()
+            await pilot.pause()
+            await pilot.press("ctrl+w")
+            await pilot.pause()
+
+        assert called["count"] == 1
+
 
 class TestSlashHelp:
     def test_help_lines_include_resume_and_aliases(self):
@@ -3279,6 +3413,7 @@ class TestSlashHelp:
         assert "/quit (/exit, /q)" in rendered
         assert "/setup" in rendered
         assert "Ctrl+R reload workspace" in rendered
+        assert "Ctrl+W close run tab" in rendered
 
     @pytest.mark.asyncio
     async def test_resume_without_arg_shows_usage(self):

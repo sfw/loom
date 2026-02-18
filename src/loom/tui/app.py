@@ -155,6 +155,9 @@ _PROCESS_STATUS_LABEL = {
     "cancelled": "Cancelled",
 }
 _MAX_CONCURRENT_PROCESS_RUNS = 4
+_MAX_PERSISTED_PROCESS_RUNS = 12
+_MAX_PERSISTED_PROCESS_ACTIVITY = 300
+_MAX_PERSISTED_PROCESS_RESULTS = 120
 
 
 class ProcessRunPane(Vertical):
@@ -245,6 +248,10 @@ class ProcessRunPane(Vertical):
         meta = f"[dim]Goal:[/] {goal_preview}"
         if task_id:
             meta += f"\n[dim]Task:[/] {task_id}"
+        meta += (
+            "\n[dim]Close: Ctrl+W | /run close [run-id-prefix] | "
+            "Ctrl+P: Close process run tab[/dim]"
+        )
         self._meta.update(meta)
 
     def set_tasks(self, tasks: list[dict]) -> None:
@@ -327,6 +334,8 @@ class ProcessRunState:
     task_labels: dict[str, str] = field(default_factory=dict)
     last_progress_message: str = ""
     last_progress_at: float = 0.0
+    activity_log: list[str] = field(default_factory=list)
+    result_log: list[dict] = field(default_factory=list)
     worker: object | None = None
     closed: bool = False
 
@@ -401,7 +410,7 @@ class LoomApp(App):
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True),
         Binding("ctrl+l", "clear_chat", "Clear", show=True),
         Binding("ctrl+r", "reload_workspace", "Reload", show=True),
-        Binding("ctrl+w", "close_process_tab", "Close Run", show=False),
+        Binding("ctrl+w", "close_process_tab", "Close Run", show=True),
         Binding("ctrl+1", "tab_chat", "Chat"),
         Binding("ctrl+2", "tab_files", "Files"),
         Binding("ctrl+3", "tab_events", "Events"),
@@ -452,6 +461,7 @@ class LoomApp(App):
         self._blocked_process_commands: list[str] = []
         self._cached_process_catalog: list[dict[str, str]] = []
         self._sidebar_cowork_tasks: list[dict] = []
+        self._process_close_hint_shown = False
         self._auto_resume_workspace_on_init = True
 
     def compose(self) -> ComposeResult:
@@ -926,6 +936,8 @@ class LoomApp(App):
             chat.add_info(
                 f"[dim]session: {self._session.session_id}[/dim]"
             )
+        await self._restore_process_run_tabs(chat)
+        self._process_close_hint_shown = bool(self._process_runs)
 
         # Resume is a one-shot startup hint; subsequent reinitializations
         # should not keep trying to reopen the same prior session.
@@ -977,6 +989,368 @@ class LoomApp(App):
         """Return elapsed seconds for a run (live or finalized)."""
         end = run.ended_at if run.ended_at is not None else time.monotonic()
         return max(0.0, end - run.started_at)
+
+    def _append_process_run_activity(
+        self, run: ProcessRunState, message: str,
+    ) -> None:
+        """Record and render one process-run activity line."""
+        text = self._one_line(message, 1200)
+        if not text:
+            return
+        log = getattr(run, "activity_log", None)
+        if not isinstance(log, list):
+            try:
+                run.activity_log = []
+                log = run.activity_log
+            except Exception:
+                log = None
+        if isinstance(log, list):
+            log.append(text)
+            if len(log) > _MAX_PERSISTED_PROCESS_ACTIVITY:
+                del log[:-_MAX_PERSISTED_PROCESS_ACTIVITY]
+        try:
+            run.pane.add_activity(text)
+        except Exception:
+            pass
+
+    def _append_process_run_result(
+        self, run: ProcessRunState, text: str, *, success: bool,
+    ) -> None:
+        """Record and render one process-run final result line."""
+        message = str(text or "").strip()
+        if not message:
+            message = "Process run completed." if success else "Process run failed."
+        records = getattr(run, "result_log", None)
+        if not isinstance(records, list):
+            try:
+                run.result_log = []
+                records = run.result_log
+            except Exception:
+                records = None
+        if isinstance(records, list):
+            records.append({"text": message, "success": bool(success)})
+            if len(records) > _MAX_PERSISTED_PROCESS_RESULTS:
+                del records[:-_MAX_PERSISTED_PROCESS_RESULTS]
+        try:
+            run.pane.add_result(message, success=success)
+        except Exception:
+            pass
+
+    def _serialize_process_run_state(self, run: ProcessRunState) -> dict:
+        """Serialize one in-memory process run for session UI persistence."""
+        tasks = [
+            dict(row)
+            for row in getattr(run, "tasks", [])
+            if isinstance(row, dict)
+        ][-_MAX_PERSISTED_PROCESS_ACTIVITY:]
+        labels = getattr(run, "task_labels", {})
+        if not isinstance(labels, dict):
+            labels = {}
+        activity = [
+            self._one_line(line, 1200)
+            for line in getattr(run, "activity_log", [])
+            if self._one_line(line, 1200)
+        ][-_MAX_PERSISTED_PROCESS_ACTIVITY:]
+        result_log: list[dict] = []
+        for item in getattr(run, "result_log", []):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            result_log.append({"text": text, "success": bool(item.get("success", False))})
+        result_log = result_log[-_MAX_PERSISTED_PROCESS_RESULTS:]
+        status = str(getattr(run, "status", "completed")).strip()
+        if status not in _PROCESS_STATUS_LABEL:
+            status = "completed"
+        return {
+            "run_id": str(getattr(run, "run_id", "")).strip(),
+            "process_name": str(getattr(run, "process_name", "")).strip(),
+            "goal": str(getattr(run, "goal", "")).strip(),
+            "status": status,
+            "task_id": str(getattr(run, "task_id", "")).strip(),
+            "elapsed_seconds": float(self._elapsed_seconds_for_run(run)),
+            "tasks": tasks,
+            "task_labels": {str(k): str(v) for k, v in labels.items()},
+            "activity_log": activity,
+            "result_log": result_log,
+        }
+
+    def _sync_process_runs_into_session_state(self) -> None:
+        """Mirror process-run tab state into SessionState.ui_state."""
+        session = self._session
+        if session is None:
+            return
+        state = getattr(session, "session_state", None)
+        if state is None:
+            return
+        ui_state = getattr(state, "ui_state", None)
+        if not isinstance(ui_state, dict):
+            ui_state = {}
+            try:
+                state.ui_state = ui_state
+            except Exception:
+                return
+
+        serialized_runs = [
+            self._serialize_process_run_state(run)
+            for run in sorted(self._process_runs.values(), key=lambda r: r.started_at)
+            if not getattr(run, "closed", False)
+        ][-_MAX_PERSISTED_PROCESS_RUNS:]
+
+        active_run_id = ""
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+            active_tab = str(getattr(tabs, "active", "") or "")
+            for run in self._process_runs.values():
+                if getattr(run, "pane_id", "") == active_tab:
+                    active_run_id = str(getattr(run, "run_id", "")).strip()
+                    break
+        except Exception:
+            pass
+
+        ui_state["process_tabs"] = {
+            "version": 1,
+            "active_run_id": active_run_id,
+            "runs": serialized_runs,
+        }
+
+    async def _persist_process_run_ui_state(
+        self, *, is_active: bool | None = None,
+    ) -> None:
+        """Persist SessionState (including process-tab UI state) to storage."""
+        session = self._session
+        store = self._store
+        if session is None or store is None:
+            return
+        session_id = str(getattr(session, "session_id", "") or "").strip()
+        if not session_id:
+            return
+
+        self._sync_process_runs_into_session_state()
+        payload: dict = {}
+        state = getattr(session, "session_state", None)
+        to_dict = getattr(state, "to_dict", None)
+        if callable(to_dict):
+            try:
+                payload["session_state"] = to_dict()
+            except Exception:
+                pass
+        if is_active is not None:
+            payload["is_active"] = is_active
+        if not payload:
+            return
+        try:
+            await store.update_session(session_id, **payload)
+        except Exception as e:
+            logger.debug("Failed to persist process UI state: %s", e)
+
+    def _persisted_process_tabs_payload(self) -> tuple[list[dict], str]:
+        """Return persisted process-tab payload from SessionState.ui_state."""
+        session = self._session
+        if session is None:
+            return [], ""
+        state = getattr(session, "session_state", None)
+        if state is None:
+            return [], ""
+        ui_state = getattr(state, "ui_state", None)
+        if not isinstance(ui_state, dict):
+            return [], ""
+
+        payload = ui_state.get("process_tabs")
+        if isinstance(payload, dict):
+            runs = payload.get("runs", [])
+            active = str(payload.get("active_run_id", "")).strip()
+            if isinstance(runs, list):
+                return runs, active
+        legacy_runs = ui_state.get("process_runs")
+        if isinstance(legacy_runs, list):
+            return legacy_runs, ""
+        return [], ""
+
+    async def _drop_process_run_tabs(self) -> None:
+        """Remove all process run panes from the UI and clear in-memory state."""
+        if not self._process_runs:
+            return
+        tabs = None
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            tabs = None
+
+        for run in list(self._process_runs.values()):
+            worker = getattr(run, "worker", None)
+            if worker is not None and hasattr(worker, "cancel"):
+                try:
+                    worker.cancel()
+                except Exception:
+                    pass
+            pane_id = str(getattr(run, "pane_id", "") or "").strip()
+            if tabs is not None and pane_id:
+                try:
+                    await tabs.remove_pane(pane_id)
+                except Exception:
+                    pass
+        self._process_runs.clear()
+        if tabs is not None:
+            try:
+                if not tabs.active:
+                    tabs.active = "tab-chat"
+            except Exception:
+                pass
+        self._refresh_sidebar_progress_summary()
+
+    async def _restore_process_run_tabs(self, chat: ChatLog | None = None) -> None:
+        """Restore process run tabs for the current resumed session."""
+        runs_payload, active_run_id = self._persisted_process_tabs_payload()
+        await self._drop_process_run_tabs()
+        if not runs_payload:
+            self._refresh_sidebar_progress_summary()
+            return
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            self._refresh_sidebar_progress_summary()
+            return
+
+        loader = None
+        try:
+            loader = self._create_process_loader()
+        except Exception:
+            loader = None
+
+        restored = 0
+        interrupted = 0
+        seen_ids: set[str] = set()
+
+        for raw in runs_payload[:_MAX_PERSISTED_PROCESS_RUNS]:
+            if not isinstance(raw, dict):
+                continue
+
+            run_id = str(raw.get("run_id", "")).strip()[:12]
+            if not run_id:
+                run_id = self._new_process_run_id()
+            while run_id in seen_ids or run_id in self._process_runs:
+                run_id = self._new_process_run_id()
+            seen_ids.add(run_id)
+
+            process_name = str(raw.get("process_name", "")).strip() or "process"
+            goal = str(raw.get("goal", "")).strip() or "(restored run)"
+            status = str(raw.get("status", "completed")).strip()
+            if status not in _PROCESS_STATUS_LABEL:
+                status = "completed"
+            task_id = str(raw.get("task_id", "")).strip()
+            try:
+                elapsed_seconds = max(0.0, float(raw.get("elapsed_seconds", 0.0)))
+            except (TypeError, ValueError):
+                elapsed_seconds = 0.0
+            started_at = time.monotonic() - elapsed_seconds
+            ended_at = (
+                None
+                if status in {"queued", "running"}
+                else time.monotonic()
+            )
+
+            tasks = [
+                dict(row)
+                for row in raw.get("tasks", [])
+                if isinstance(row, dict)
+            ]
+            labels_raw = raw.get("task_labels", {})
+            task_labels = (
+                {str(k): str(v) for k, v in labels_raw.items()}
+                if isinstance(labels_raw, dict)
+                else {}
+            )
+            activity_log = [
+                self._one_line(line, 1200)
+                for line in raw.get("activity_log", [])
+                if self._one_line(line, 1200)
+            ][-_MAX_PERSISTED_PROCESS_ACTIVITY:]
+            result_log: list[dict] = []
+            for item in raw.get("result_log", []):
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text", "")).strip()
+                if not text:
+                    continue
+                result_log.append({"text": text, "success": bool(item.get("success", False))})
+            result_log = result_log[-_MAX_PERSISTED_PROCESS_RESULTS:]
+
+            process_defn = None
+            if loader is not None:
+                try:
+                    process_defn = loader.load(process_name)
+                except Exception:
+                    process_defn = None
+
+            pane_id = f"tab-run-{run_id}"
+            pane = ProcessRunPane(
+                run_id=run_id,
+                process_name=process_name,
+                goal=goal,
+            )
+            run = ProcessRunState(
+                run_id=run_id,
+                process_name=process_name,
+                goal=goal,
+                process_defn=process_defn,
+                pane_id=pane_id,
+                pane=pane,
+                status=status,
+                task_id=task_id,
+                started_at=started_at,
+                ended_at=ended_at,
+                tasks=tasks,
+                task_labels=task_labels,
+                activity_log=activity_log,
+                result_log=result_log,
+            )
+
+            if run.status in {"queued", "running"}:
+                interrupted += 1
+                run.status = "failed"
+                run.ended_at = time.monotonic()
+                note = "Run interrupted before session resume; marked failed."
+                run.activity_log.append(note)
+                run.result_log.append({"text": note, "success": False})
+
+            self._process_runs[run_id] = run
+            await tabs.add_pane(
+                TabPane(
+                    self._format_process_run_tab_title(run),
+                    pane,
+                    id=pane_id,
+                ),
+                after="tab-events",
+            )
+            run.pane.set_tasks(run.tasks)
+            self._refresh_process_run_outputs(run)
+            for line in run.activity_log:
+                run.pane.add_activity(line)
+            for item in run.result_log:
+                run.pane.add_result(
+                    str(item.get("text", "")),
+                    success=bool(item.get("success", False)),
+                )
+            if run.activity_log:
+                run.last_progress_message = run.activity_log[-1]
+                run.last_progress_at = time.monotonic()
+            self._update_process_run_visuals(run)
+            restored += 1
+
+        if active_run_id and active_run_id in self._process_runs:
+            tabs.active = self._process_runs[active_run_id].pane_id
+        self._refresh_sidebar_progress_summary()
+
+        if restored and chat is not None:
+            info = f"Restored {restored} process run tab(s) for this session."
+            if interrupted:
+                info += (
+                    f" {interrupted} interrupted run(s) were marked failed "
+                    "because execution cannot resume after restart."
+                )
+            chat.add_info(info)
 
     def _format_process_run_tab_title(self, run: ProcessRunState) -> str:
         """Build tab title with status indicator and elapsed timer."""
@@ -1119,8 +1493,10 @@ class LoomApp(App):
         if was_running:
             run.status = "failed"
             run.ended_at = time.monotonic()
-            run.pane.add_activity("Run cancelled: tab closed by user.")
-            run.pane.add_result("Run cancelled: tab closed by user.", success=False)
+            self._append_process_run_activity(run, "Run cancelled: tab closed by user.")
+            self._append_process_run_result(
+                run, "Run cancelled: tab closed by user.", success=False,
+            )
             self._update_process_run_visuals(run)
             events_panel.add_event(
                 _now_str(),
@@ -1145,6 +1521,7 @@ class LoomApp(App):
             pass
         self._process_runs.pop(run.run_id, None)
         self._refresh_sidebar_progress_summary()
+        await self._persist_process_run_ui_state()
         if not tabs.active:
             tabs.active = "tab-chat"
         return True
@@ -1235,7 +1612,13 @@ class LoomApp(App):
             f"Started process run [dim]{run_id}[/dim] "
             f"([bold]{process_name}[/bold])."
         )
-        run.pane.add_activity("Queued process run.")
+        self._append_process_run_activity(run, "Queued process run.")
+        if not self._process_close_hint_shown:
+            chat.add_info(
+                "[dim]Tip: close process tabs with Ctrl+W, /run close "
+                "[run-id-prefix], or Ctrl+P -> Close process run tab.[/]"
+            )
+            self._process_close_hint_shown = True
         events_panel.add_event(
             _now_str(),
             "process_run",
@@ -1248,6 +1631,7 @@ class LoomApp(App):
             group=f"process-run-{run_id}",
             exclusive=False,
         )
+        await self._persist_process_run_ui_state()
 
     async def _execute_process_run(self, run_id: str) -> None:
         """Execute one process run and stream updates into its dedicated tab."""
@@ -1264,7 +1648,7 @@ class LoomApp(App):
         run.ended_at = None
         self._update_process_run_visuals(run)
         self._refresh_sidebar_progress_summary()
-        run.pane.add_activity("Run started.")
+        self._append_process_run_activity(run, "Run started.")
 
         try:
             result = await self._tools.execute(
@@ -1296,7 +1680,7 @@ class LoomApp(App):
 
             if result.success:
                 output = result.output or "Process run completed."
-                run.pane.add_result(output, success=True)
+                self._append_process_run_result(run, output, success=True)
                 run.status = "completed"
                 run.ended_at = time.monotonic()
                 self._update_process_run_visuals(run)
@@ -1307,7 +1691,7 @@ class LoomApp(App):
                 chat.add_info(f"Process run [dim]{run.run_id}[/dim] completed.")
             else:
                 error = result.error or result.output or "Process run failed."
-                run.pane.add_result(error, success=False)
+                self._append_process_run_result(run, error, success=False)
                 run.status = "failed"
                 run.ended_at = time.monotonic()
                 self._update_process_run_visuals(run)
@@ -1325,7 +1709,7 @@ class LoomApp(App):
                 return
             run.status = "cancelled"
             run.ended_at = time.monotonic()
-            run.pane.add_result("Process run cancelled.", success=False)
+            self._append_process_run_result(run, "Process run cancelled.", success=False)
             self._update_process_run_visuals(run)
             self._refresh_sidebar_progress_summary()
             events_panel.add_event(
@@ -1334,7 +1718,7 @@ class LoomApp(App):
             chat.add_info(f"[bold #f7768e]Process run {run.run_id} cancelled.[/]")
             raise
         except Exception as e:  # pragma: no cover - defensive guard
-            run.pane.add_result(str(e), success=False)
+            self._append_process_run_result(run, str(e), success=False)
             run.status = "failed"
             run.ended_at = time.monotonic()
             self._update_process_run_visuals(run)
@@ -1346,6 +1730,7 @@ class LoomApp(App):
             self.notify(str(e), severity="error", timeout=5)
         finally:
             run.worker = None
+            await self._persist_process_run_ui_state()
 
     def _ensure_persistence_tools(self) -> None:
         """Ensure recall/delegate tools are registered and tracked.
@@ -1434,7 +1819,7 @@ class LoomApp(App):
             )
         lines.append(
             "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+R reload workspace, "
-            "Ctrl+P palette, Ctrl+1/2/3 tabs",
+            "Ctrl+W close run tab, Ctrl+P palette, Ctrl+1/2/3 tabs",
         )
         return lines
 
@@ -1757,10 +2142,8 @@ class LoomApp(App):
         if self._store is None or self._session is None or self._model is None:
             return
 
-        # Mark old session inactive
-        await self._store.update_session(
-            self._session.session_id, is_active=False,
-        )
+        # Persist any UI state for the old session before rotating.
+        await self._persist_process_run_ui_state(is_active=False)
 
         system_prompt = self._build_system_prompt()
         approver = ToolApprover(prompt_callback=self._approval_callback)
@@ -1781,8 +2164,9 @@ class LoomApp(App):
         self._total_tokens = 0
         self._bind_session_tools()
         self._clear_files_panel()
-
         chat = self.query_one("#chat-log", ChatLog)
+        await self._restore_process_run_tabs(chat)
+        self._process_close_hint_shown = bool(self._process_runs)
         chat.add_info(f"New session: [dim]{session_id}[/dim]")
 
     async def _switch_to_session(self, session_id: str) -> None:
@@ -1790,9 +2174,11 @@ class LoomApp(App):
         if self._store is None or self._session is None or self._model is None:
             return
 
-        old_id = self._session.session_id
         system_prompt = self._build_system_prompt()
         approver = ToolApprover(prompt_callback=self._approval_callback)
+
+        # Persist outgoing session UI state before switching.
+        await self._persist_process_run_ui_state(is_active=False)
 
         new_session = CoworkSession(
             model=self._model,
@@ -1804,15 +2190,13 @@ class LoomApp(App):
         )
         await new_session.resume(session_id)
 
-        # Mark old session inactive
-        await self._store.update_session(old_id, is_active=False)
-
         self._session = new_session
         self._total_tokens = new_session.total_tokens
         self._bind_session_tools()
         self._clear_files_panel()
-
         chat = self.query_one("#chat-log", ChatLog)
+        await self._restore_process_run_tabs(chat)
+        self._process_close_hint_shown = bool(self._process_runs)
         chat.add_info(
             f"Switched to session [dim]{session_id}[/dim] "
             f"({new_session.session_state.turn_count} turns)"
@@ -1933,7 +2317,15 @@ class LoomApp(App):
         self._set_slash_hint(self._render_slash_hint(current))
 
     def on_key(self, event: events.Key) -> None:
-        """Handle slash tab-completion from the user input."""
+        """Handle user-input key captures (autocomplete + close-run shortcut)."""
+        if event.key == "ctrl+w":
+            focused = self.focused
+            if isinstance(focused, Input) and focused.id == "user-input":
+                event.stop()
+                event.prevent_default()
+                self.action_close_process_tab()
+            return
+
         if event.key not in ("tab", "shift+tab"):
             return
         focused = self.focused
@@ -2515,7 +2907,7 @@ class LoomApp(App):
                 return
             run.last_progress_message = message
             run.last_progress_at = now
-            run.pane.add_activity(message)
+            self._append_process_run_activity(run, message)
             try:
                 events_panel = self.query_one("#events-panel", EventPanel)
                 if event_type != "token_streamed":
@@ -2958,6 +3350,7 @@ class LoomApp(App):
             })
         rows.extend(self._summarize_cowork_tasks())
         sidebar.update_tasks(rows)
+        self._sync_process_runs_into_session_state()
 
     def _refresh_workspace_tree(self) -> None:
         """Reload sidebar workspace tree to pick up new files."""
@@ -3115,10 +3508,7 @@ class LoomApp(App):
         """Prompt for exit confirmation, then persist and quit when approved."""
         if not await self._confirm_exit():
             return
-        if self._store and self._session and self._session.session_id:
-            await self._store.update_session(
-                self._session.session_id, is_active=False,
-            )
+        await self._persist_process_run_ui_state(is_active=False)
         self.exit()
 
     async def action_loom_command(self, command: str) -> None:
