@@ -98,6 +98,7 @@ class TestSessionState:
         )
         state.record_file("a.py", "created", 1)
         state.record_decision("use JWT", 2)
+        state.ui_state = {"process_tabs": {"runs": [{"run_id": "abc123"}]}}
 
         d = state.to_dict()
         restored = SessionState.from_dict(d)
@@ -108,6 +109,7 @@ class TestSessionState:
         assert len(restored.files_touched) == 1
         assert restored.files_touched[0].path == "a.py"
         assert len(restored.key_decisions) == 1
+        assert restored.ui_state["process_tabs"]["runs"][0]["run_id"] == "abc123"
 
     def test_from_json(self):
         state = SessionState(session_id="x", workspace="/tmp", model_name="m")

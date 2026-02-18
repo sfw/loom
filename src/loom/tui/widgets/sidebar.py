@@ -31,10 +31,11 @@ class TaskProgressPanel(Static):
     """Displays task_tracker progress in the sidebar."""
 
     tasks: reactive[list[dict]] = reactive(list, layout=True)
+    empty_message: reactive[str] = reactive("No tasks tracked")
 
     def render(self) -> str:
         if not self.tasks:
-            return "[dim]No tasks tracked[/dim]"
+            return f"[dim]{self.empty_message}[/dim]"
 
         lines: list[str] = []
         for t in self.tasks:

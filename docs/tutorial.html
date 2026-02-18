@@ -955,16 +955,18 @@
   </div>
 
   <h3>Built-in Processes</h3>
-  <p>Loom ships with 5 domain-specific process definitions:</p>
+  <p>Loom ships with 6 domain-specific process definitions:</p>
 
   <table>
     <tr><th>Process</th><th>Phases</th><th>Mode</th><th>Domain</th></tr>
-    <tr><td><code>investment-analysis</code></td><td>5</td><td>strict</td><td>Financial due diligence and valuation</td></tr>
-    <tr><td><code>marketing-strategy</code></td><td>6</td><td>guided</td><td>Go-to-market strategy and campaigns</td></tr>
-    <tr><td><code>research-report</code></td><td>4</td><td>guided</td><td>Research synthesis and reporting</td></tr>
-    <tr><td><code>competitive-intel</code></td><td>3</td><td>guided</td><td>Competitive landscape analysis</td></tr>
-    <tr><td><code>consulting-engagement</code></td><td>5</td><td>guided</td><td>McKinsey-style issue tree consulting</td></tr>
+    <tr><td><code>investment-analysis</code></td><td>8</td><td>strict</td><td>Financial due diligence, valuation, and investment memo synthesis</td></tr>
+    <tr><td><code>marketing-strategy</code></td><td>8</td><td>strict</td><td>Go-to-market strategy, channel planning, and execution roadmap</td></tr>
+    <tr><td><code>research-report</code></td><td>6</td><td>strict</td><td>Evidence-first research synthesis and quality-controlled reporting</td></tr>
+    <tr><td><code>competitive-intel</code></td><td>6</td><td>strict</td><td>Competitive landscape analysis and response playbooks</td></tr>
+    <tr><td><code>consulting-engagement</code></td><td>7</td><td>strict</td><td>Structured consulting workflow with issue-tree problem solving</td></tr>
+    <tr><td><code>market-research</code></td><td>8</td><td>strict</td><td>Geography-aware market scans, trend analysis, and risk-aware competitor intelligence</td></tr>
   </table>
+  <p>All built-in processes currently use <code>strict</code> mode to enforce the declared phase DAG and deliverables.</p>
 
   <h3>Using a Process</h3>
 
@@ -1455,7 +1457,7 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
   processes/
     schema.py            <span class="cmt"># Process definition loader + validation</span>
     installer.py         <span class="cmt"># Install/uninstall from GitHub or local path</span>
-    builtin/             <span class="cmt"># 5 built-in YAML process definitions</span>
+    builtin/             <span class="cmt"># 6 built-in YAML process definitions</span>
   prompts/
     assembler.py         <span class="cmt"># 7-section builder + process injection</span>
     constraints.py       <span class="cmt"># Safety rules</span>

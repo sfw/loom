@@ -2285,6 +2285,114 @@ class TestProcessSlashCommands:
         chat.add_info.assert_called_once()
         assert "cancelled" in chat.add_info.call_args.args[0]
 
+    @pytest.mark.asyncio
+    async def test_persist_process_run_ui_state_serializes_run_tabs(self):
+        from loom.cowork.session_state import SessionState
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        state = SessionState(session_id="sess-123", workspace="/tmp", model_name="m")
+        app._session = SimpleNamespace(session_id="sess-123", session_state=state)
+        app._store = MagicMock()
+        app._store.update_session = AsyncMock()
+        app._process_runs = {
+            "abc123": SimpleNamespace(
+                run_id="abc123",
+                process_name="market-research",
+                goal="Analyze EPCOR",
+                status="completed",
+                task_id="cowork-1",
+                started_at=0.0,
+                ended_at=12.0,
+                tasks=[{"id": "scope", "status": "completed", "content": "Scope"}],
+                task_labels={"scope": "Scope"},
+                activity_log=["Run started.", "Completed scope."],
+                result_log=[{"text": "done", "success": True}],
+                closed=False,
+                pane_id="tab-run-abc123",
+                pane=MagicMock(),
+            ),
+        }
+        app.query_one = MagicMock(return_value=SimpleNamespace(active="tab-run-abc123"))
+
+        await app._persist_process_run_ui_state()
+
+        app._store.update_session.assert_awaited_once()
+        payload = app._store.update_session.await_args.kwargs["session_state"]
+        tabs = payload["ui_state"]["process_tabs"]
+        assert tabs["active_run_id"] == "abc123"
+        assert tabs["runs"][0]["process_name"] == "market-research"
+        assert tabs["runs"][0]["goal"] == "Analyze EPCOR"
+
+    @pytest.mark.asyncio
+    async def test_restore_process_run_tabs_from_session_state(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(
+            session_state=SimpleNamespace(
+                ui_state={
+                    "process_tabs": {
+                        "active_run_id": "abc123",
+                        "runs": [
+                            {
+                                "run_id": "abc123",
+                                "process_name": "market-research",
+                                "goal": "Analyze EPCOR",
+                                "status": "running",
+                                "task_id": "cowork-9",
+                                "elapsed_seconds": 42.0,
+                                "tasks": [
+                                    {
+                                        "id": "scope",
+                                        "status": "in_progress",
+                                        "content": "Scope companies",
+                                    },
+                                ],
+                                "task_labels": {"scope": "Scope companies"},
+                                "activity_log": ["Run started."],
+                                "result_log": [],
+                            },
+                        ],
+                    },
+                },
+            ),
+        )
+        app._process_runs = {}
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._refresh_process_run_outputs = MagicMock()
+        app._update_process_run_visuals = MagicMock()
+        loader = MagicMock()
+        loader.load.return_value = SimpleNamespace(
+            name="market-research",
+            phases=[],
+            get_deliverables=lambda: {},
+        )
+        app._create_process_loader = MagicMock(return_value=loader)
+
+        tabs = SimpleNamespace(active="tab-chat", add_pane=AsyncMock(), remove_pane=AsyncMock())
+        app.query_one = MagicMock(return_value=tabs)
+        chat = MagicMock()
+
+        await app._restore_process_run_tabs(chat)
+
+        assert len(app._process_runs) == 1
+        run = app._process_runs["abc123"]
+        assert run.process_name == "market-research"
+        assert run.status == "failed"  # interrupted running runs cannot be resumed
+        tabs.add_pane.assert_awaited_once()
+        assert tabs.active == run.pane_id
+        chat.add_info.assert_called_once()
+        assert "Restored 1 process run tab" in chat.add_info.call_args.args[0]
+
     def test_process_progress_event_scoped_to_run_tab(self):
         from loom.tui.app import LoomApp
 
@@ -2350,6 +2458,194 @@ class TestProcessSlashCommands:
         assert "investment-analysis #abc123 Running" in summary_rows[0]["content"]
         chat.add_info.assert_not_called()
         events_panel.add_event.assert_called_once()
+
+    def test_process_progress_keeps_stable_phase_labels(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        process_defn = SimpleNamespace(
+            phases=[
+                SimpleNamespace(
+                    id="scope-companies",
+                    description=(
+                        "Interpret requested company name(s), normalize legal/entity "
+                        "naming, and define product/service lines."
+                    ),
+                ),
+            ],
+            get_deliverables=lambda: {},
+        )
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="market-research",
+            goal="Analyze market",
+            process_defn=process_defn,
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            task_labels={},
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc123": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#chat-log":
+                return chat
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._on_process_progress_event(
+            {
+                "event_type": "subtask_started",
+                "event_data": {"subtask_id": "scope-companies"},
+                "tasks": [
+                    {
+                        "id": "scope-companies",
+                        "status": "in_progress",
+                        "content": "Short working label",
+                    },
+                ],
+            },
+            run_id="abc123",
+        )
+        app._on_process_progress_event(
+            {
+                "event_type": "subtask_completed",
+                "event_data": {"subtask_id": "scope-companies"},
+                "tasks": [
+                    {
+                        "id": "scope-companies",
+                        "status": "completed",
+                        "content": (
+                            "**Subtask Complete** Created research-scope.md and "
+                            "company-service-map.csv with long narrative summary."
+                        ),
+                    },
+                ],
+            },
+            run_id="abc123",
+        )
+
+        final_tasks = pane.set_tasks.call_args.args[0]
+        assert final_tasks[0]["id"] == "scope-companies"
+        assert final_tasks[0]["status"] == "completed"
+        assert "normalize legal/entity naming" in final_tasks[0]["content"]
+        assert "Subtask Complete" not in final_tasks[0]["content"]
+
+    def test_process_progress_updates_outputs_panel(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        (tmp_path / "research-scope.md").write_text("ok")
+
+        pane = MagicMock()
+        process_defn = SimpleNamespace(
+            phases=[
+                SimpleNamespace(id="scope-companies", description="Scope companies"),
+                SimpleNamespace(id="map-geographies", description="Map geographies"),
+            ],
+            get_deliverables=lambda: {
+                "scope-companies": ["research-scope.md"],
+                "map-geographies": ["geography-footprint.csv"],
+            },
+        )
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="market-research",
+            goal="Analyze market",
+            process_defn=process_defn,
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            task_labels={},
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc123": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#chat-log":
+                return chat
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._on_process_progress_event(
+            {
+                "event_type": "subtask_completed",
+                "event_data": {"subtask_id": "map-geographies"},
+                "tasks": [
+                    {
+                        "id": "scope-companies",
+                        "status": "completed",
+                        "content": "Scope companies",
+                    },
+                    {
+                        "id": "map-geographies",
+                        "status": "completed",
+                        "content": "Map geographies",
+                    },
+                ],
+            },
+            run_id="abc123",
+        )
+
+        output_rows = pane.set_outputs.call_args.args[0]
+        by_content = {row["content"]: row for row in output_rows}
+        assert "research-scope.md [dim](scope-companies)[/]" in by_content
+        assert by_content["research-scope.md [dim](scope-companies)[/]"]["status"] == (
+            "completed"
+        )
+        assert (
+            "geography-footprint.csv [dim](map-geographies)[/] [#f7768e](missing)[/]"
+            in by_content
+        )
+        assert by_content[
+            "geography-footprint.csv [dim](map-geographies)[/] [#f7768e](missing)[/]"
+        ]["status"] == "failed"
 
     def test_process_progress_event_refreshes_tree_on_subtask_completion(self):
         from loom.tui.app import LoomApp
@@ -3075,6 +3371,32 @@ class TestCommandPaletteProcessActions:
             await pilot.pause()
             assert input_widget.value == "/session"
 
+    @pytest.mark.asyncio
+    async def test_ctrl_w_closes_process_tab_from_input_focus(self):
+        from textual.widgets import Input
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+        called = {"count": 0}
+        app.action_close_process_tab = lambda: called.__setitem__(  # noqa: B023
+            "count", called["count"] + 1,
+        )
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#user-input", Input)
+            input_widget.focus()
+            await pilot.pause()
+            await pilot.press("ctrl+w")
+            await pilot.pause()
+
+        assert called["count"] == 1
+
 
 class TestSlashHelp:
     def test_help_lines_include_resume_and_aliases(self):
@@ -3091,6 +3413,7 @@ class TestSlashHelp:
         assert "/quit (/exit, /q)" in rendered
         assert "/setup" in rendered
         assert "Ctrl+R reload workspace" in rendered
+        assert "Ctrl+W close run tab" in rendered
 
     @pytest.mark.asyncio
     async def test_resume_without_arg_shows_usage(self):

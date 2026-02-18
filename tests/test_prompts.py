@@ -337,7 +337,7 @@ class TestConstraints:
 
 
 class TestTokenBudget:
-    """Test token estimation and trimming."""
+    """Test token estimation and budget handling."""
 
     def test_estimate_tokens(self, assembler: PromptAssembler):
         text = "Hello world"  # 11 chars ~= 2-3 tokens
@@ -352,5 +352,6 @@ class TestTokenBudget:
     def test_trim_exceeds_budget(self, assembler: PromptAssembler):
         long_text = "x" * 40000  # ~10000 tokens
         result = assembler._trim_to_budget(long_text, max_tokens=1000)
-        assert len(result) < len(long_text)
-        assert "trimmed" in result
+        # Prompt assembly no longer hard-trims; semantic compaction is handled
+        # in the runtime engine before model invocation.
+        assert result == long_text

@@ -184,13 +184,27 @@ class TestOpenAIProviderErrors:
 
             normalized = provider._build_openai_messages(messages)
 
-            assert normalized[0]["content"] == ""
+            assert normalized[0]["content"] == "Tool call required to continue."
             assert normalized[0]["tool_calls"][0]["id"].startswith("call_")
             assert isinstance(
                 normalized[0]["tool_calls"][0]["function"]["arguments"], str,
             )
             assert normalized[1]["content"] == ""
             assert normalized[1]["tool_call_id"] == normalized[0]["tool_calls"][0]["id"]
+        finally:
+            asyncio.run(provider._client.aclose())
+
+    def test_build_messages_normalizes_empty_assistant_content_without_tool_calls(self):
+        provider = self._make_provider()
+        try:
+            messages = [
+                {"role": "assistant", "content": "   "},
+                {"role": "user", "content": "next"},
+            ]
+
+            normalized = provider._build_openai_messages(messages)
+
+            assert normalized[0]["content"] == "Tool call required to continue."
         finally:
             asyncio.run(provider._client.aclose())
 

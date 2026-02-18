@@ -188,8 +188,8 @@ class TestTaskStateManager:
         )
         compact = mgr.to_compact_yaml(task)
         data = yaml.safe_load(compact)
-        # Should be compacted: 1 completed count + 1 running + 3 pending = 5
-        assert len(data["subtasks"]) < 20
+        # Large plans are no longer lossy-compacted here.
+        assert len(data["subtasks"]) == 20
 
     def test_roundtrip_preserves_status(self, tmp_path: Path):
         mgr = TaskStateManager(tmp_path)
@@ -239,7 +239,7 @@ class TestTaskStateManager:
         assert loaded.workspace_changes.files_created == 2
         assert loaded.workspace_changes.files_modified == 5
 
-    def test_summary_truncation_in_yaml(self, tmp_path: Path):
+    def test_summary_not_hard_truncated_in_yaml(self, tmp_path: Path):
         mgr = TaskStateManager(tmp_path)
         task = _make_task()
         task.plan = Plan(subtasks=[
@@ -247,9 +247,7 @@ class TestTaskStateManager:
         ])
         yaml_str = mgr.to_yaml(task)
         data = yaml.safe_load(yaml_str)
-        # Truncated to 200 chars + "..."
-        assert len(data["subtasks"][0]["summary"]) == 203
-        assert data["subtasks"][0]["summary"].endswith("...")
+        assert data["subtasks"][0]["summary"] == "x" * 300
 
     def test_roundtrip_preserves_metadata_fields(self, tmp_path: Path):
         """All externally visible fields survive YAML round-trip."""

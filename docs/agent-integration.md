@@ -512,11 +512,12 @@ loom -w /tmp/project --process consulting-engagement
 
 | Process | Phases | Mode | Domain |
 |---------|--------|------|--------|
-| `investment-analysis` | 5 | strict | Financial due diligence and valuation |
-| `marketing-strategy` | 6 | guided | Go-to-market strategy and campaigns |
-| `research-report` | 4 | guided | Research synthesis and reporting |
-| `competitive-intel` | 3 | suggestive | Competitive landscape analysis |
-| `consulting-engagement` | 5 | strict | McKinsey-style issue tree consulting |
+| `investment-analysis` | 8 | strict | Financial due diligence, valuation, and investment memo synthesis |
+| `marketing-strategy` | 8 | strict | Go-to-market strategy, channel planning, and execution roadmap |
+| `research-report` | 6 | strict | Evidence-first research synthesis and quality-controlled reporting |
+| `competitive-intel` | 6 | strict | Competitive landscape analysis and response playbooks |
+| `consulting-engagement` | 7 | strict | Structured consulting workflow with issue-tree problem solving |
+| `market-research` | 8 | strict | Geography-aware market scans, trend analysis, and risk-aware competitor intelligence |
 
 ### Using with REST API
 

@@ -38,6 +38,8 @@ class SessionState:
     key_decisions: list[str] = field(default_factory=list)
     current_focus: str = ""
     errors_resolved: list[str] = field(default_factory=list)
+    # UI-only metadata (not injected into prompts), e.g. restored TUI tab state.
+    ui_state: dict = field(default_factory=dict)
 
     # Pruning limits
     MAX_FILES: int = 20
@@ -119,6 +121,7 @@ class SessionState:
             "key_decisions": self.key_decisions,
             "current_focus": self.current_focus,
             "errors_resolved": self.errors_resolved,
+            "ui_state": self.ui_state,
         }
 
     @classmethod
@@ -133,6 +136,11 @@ class SessionState:
             current_focus=data.get("current_focus", ""),
             key_decisions=data.get("key_decisions", []),
             errors_resolved=data.get("errors_resolved", []),
+            ui_state=(
+                data.get("ui_state", {})
+                if isinstance(data.get("ui_state"), dict)
+                else {}
+            ),
         )
         for f in data.get("files_touched", []):
             if isinstance(f, dict) and "path" in f and "action" in f:

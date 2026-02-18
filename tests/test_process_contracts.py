@@ -14,6 +14,7 @@ BUILTIN_PROCESSES = (
     "research-report",
     "competitive-intel",
     "consulting-engagement",
+    "market-research",
 )
 
 

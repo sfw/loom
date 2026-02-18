@@ -189,22 +189,8 @@ class TaskStateManager:
         return yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
     def to_compact_yaml(self, task: Task) -> str:
-        """Render a compact version for prompt injection.
-
-        If >15 subtasks, only show completed count + current + next 3 pending.
-        """
+        """Render YAML for prompt injection without lossy hard compaction."""
         data = self._to_dict(task)
-
-        subtasks = data.get("subtasks", [])
-        if len(subtasks) > task.MAX_SUBTASKS_DISPLAY:
-            completed = [s for s in subtasks if s["status"] == "completed"]
-            current = [s for s in subtasks if s["status"] in ("running", "blocked")]
-            pending = [s for s in subtasks if s["status"] == "pending"][:3]
-
-            data["subtasks"] = (
-                [{"_completed_count": len(completed)}] + current + pending
-            )
-
         return yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
     def _to_dict(self, task: Task) -> dict:
@@ -213,10 +199,7 @@ class TaskStateManager:
         for s in task.plan.subtasks:
             entry: dict = {"id": s.id, "status": s.status.value}
             if s.summary:
-                summary = s.summary[:200]
-                if len(s.summary) > 200:
-                    summary += "..."
-                entry["summary"] = summary
+                entry["summary"] = s.summary
             if s.active_issue:
                 entry["active_issue"] = s.active_issue
             if s.depends_on:
