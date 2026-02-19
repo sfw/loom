@@ -145,6 +145,7 @@ verification:
         pricing datapoint, review signal, hiring signal, or comparable source).
       severity: error
       type: llm
+      applies_to_phases: [research-competitors, build-comparison, response-playbook, monitoring-plan]
 
     - name: subject-alignment
       description: "Comparison must align to subject buying criteria"
@@ -153,6 +154,7 @@ verification:
         subject baseline and buying criteria.
       severity: error
       type: llm
+      applies_to_phases: [build-comparison, response-playbook]
 
     - name: freshness-stated
       description: "Time-sensitive datapoints must include recency"
@@ -161,6 +163,7 @@ verification:
         recency marker where applicable.
       severity: warning
       type: llm
+      applies_to_phases: [research-competitors, monitoring-plan]
 
     - name: recommendations-actionable
       description: "Response recommendations must be specific and assignable"
@@ -169,12 +172,14 @@ verification:
         and update triggers.
       severity: error
       type: llm
+      applies_to_phases: [response-playbook, monitoring-plan]
 
     - name: no-placeholders
       description: "No placeholder text left in deliverables"
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
       severity: error
       type: regex
+      applies_to_phases: ["*"]
 
 memory:
   extract_types:

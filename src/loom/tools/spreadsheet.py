@@ -165,15 +165,12 @@ class SpreadsheetTool(Tool):
 
         # Format as readable table
         lines = []
-        for i, row in enumerate(rows[:101]):  # Cap at 100 data rows + header
+        for i, row in enumerate(rows):
             lines.append(" | ".join(row))
             if i == 0:
                 lines.append("-" * len(lines[0]))
 
-        output = "\n".join(lines)
-        if len(rows) > 101:
-            output += f"\n... ({len(rows) - 1} total rows, showing first 100)"
-        return ToolResult.ok(output)
+        return ToolResult.ok("\n".join(lines))
 
     async def _add_rows(
         self, filepath: Path, args: dict, ctx: ToolContext,
@@ -321,12 +318,12 @@ class SpreadsheetTool(Tool):
             f"Rows: {len(data_rows)}",
         ]
 
-        # Sample first 3 data rows
+        # Include data rows
         if data_rows:
-            lines.append("\nSample data (first 3 rows):")
+            lines.append("\nData rows:")
             lines.append(" | ".join(headers))
             lines.append("-" * 40)
-            for row in data_rows[:3]:
+            for row in data_rows:
                 lines.append(" | ".join(row))
 
         return ToolResult.ok("\n".join(lines))

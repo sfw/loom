@@ -26,6 +26,7 @@ from loom.engine.scheduler import Scheduler
 from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
+    MODEL_INVOCATION,
     SUBTASK_COMPLETED,
     SUBTASK_FAILED,
     SUBTASK_RETRYING,
@@ -40,11 +41,13 @@ from loom.events.types import (
 )
 from loom.learning.manager import LearningManager
 from loom.models.base import ModelResponse
+from loom.models.request_diagnostics import collect_request_diagnostics
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.recovery.approval import ApprovalDecision, ApprovalManager, ApprovalRequest
 from loom.recovery.confidence import ConfidenceScorer
-from loom.recovery.retry import AttemptRecord, RetryManager
+from loom.recovery.retry import AttemptRecord, RetryManager, RetryStrategy
+from loom.state.evidence import merge_evidence_records
 from loom.state.memory import MemoryManager
 from loom.state.task_state import (
     Plan,
@@ -116,6 +119,7 @@ class Orchestrator:
             prompt_assembler=prompt_assembler,
             config=config.verification,
             process=process,
+            event_bus=event_bus,
         )
         self._confidence = ConfidenceScorer()
         self._approval = approval_manager or ApprovalManager(event_bus)
@@ -158,6 +162,7 @@ class Orchestrator:
             state_manager=state_manager,
             verification=self._verification,
             config=config,
+            event_bus=event_bus,
         )
 
     async def execute_task(self, task: Task) -> Task:
@@ -297,6 +302,20 @@ class Orchestrator:
 
         # Determine escalation tier
         attempts = attempts_by_subtask.get(subtask.id, [])
+        prior_successful_tool_calls: list[ToolCallRecord] = []
+        prior_evidence_records = self._evidence_for_subtask(task.id, subtask.id)
+        for attempt in attempts:
+            raw_calls = getattr(attempt, "successful_tool_calls", [])
+            if isinstance(raw_calls, list):
+                for call in raw_calls:
+                    if isinstance(call, ToolCallRecord):
+                        prior_successful_tool_calls.append(call)
+            raw_evidence = getattr(attempt, "evidence_records", [])
+            if isinstance(raw_evidence, list):
+                prior_evidence_records = merge_evidence_records(
+                    prior_evidence_records,
+                    [item for item in raw_evidence if isinstance(item, dict)],
+                )
         escalated_tier = self._retry.get_escalation_tier(
             attempt=len(attempts),
             original_tier=subtask.model_tier,
@@ -309,6 +328,8 @@ class Orchestrator:
             model_tier=escalated_tier,
             retry_context=retry_context,
             changelog=changelog,
+            prior_successful_tool_calls=prior_successful_tool_calls,
+            prior_evidence_records=prior_evidence_records,
         )
 
         return subtask, result, verification
@@ -326,17 +347,82 @@ class Orchestrator:
         attempts_by_subtask: dict[str, list[AttemptRecord]],
     ) -> None:
         """Process a failed subtask: record attempt, retry or replan."""
+        self._persist_subtask_evidence(task.id, subtask.id, result.evidence_records)
         attempt_list = attempts_by_subtask.setdefault(subtask.id, [])
-        attempt_list.append(
-            AttemptRecord(
-                attempt=len(attempt_list) + 1,
-                tier=self._retry.get_escalation_tier(
-                    len(attempt_list), subtask.model_tier,
-                ),
-                feedback=verification.feedback if verification else None,
-                error=result.summary,
-            )
+        strategy, missing_markets = self._retry.classify_failure(
+            verification_feedback=verification.feedback,
+            execution_error=result.summary,
         )
+        combined_error = " | ".join(
+            part for part in [verification.feedback, result.summary] if part
+        )
+        attempt_record = AttemptRecord(
+            attempt=len(attempt_list) + 1,
+            tier=self._retry.get_escalation_tier(
+                len(attempt_list), subtask.model_tier,
+            ),
+            feedback=verification.feedback if verification else None,
+            error=combined_error or None,
+            successful_tool_calls=[
+                call for call in result.tool_calls
+                if getattr(getattr(call, "result", None), "success", False)
+            ],
+            evidence_records=[
+                item for item in result.evidence_records
+                if isinstance(item, dict)
+            ],
+            retry_strategy=strategy,
+            missing_markets=missing_markets,
+        )
+        attempt_list.append(attempt_record)
+
+        # Parse failures in verifier output should retry verification only
+        # instead of re-running full subtask execution.
+        if (
+            strategy == RetryStrategy.VERIFIER_PARSE
+            and subtask.retry_count < subtask.max_retries
+        ):
+            verification_retry = await self._retry_verification_only(
+                task=task,
+                subtask=subtask,
+                result=result,
+                attempts=attempt_list,
+            )
+            if verification_retry.passed:
+                await self._handle_success(task, subtask, result, verification_retry)
+                return
+            verification = verification_retry
+            attempt_record.feedback = verification_retry.feedback or attempt_record.feedback
+            if verification_retry.feedback:
+                attempt_record.error = " | ".join(
+                    part for part in [attempt_record.error, verification_retry.feedback]
+                    if part
+                )
+
+        if strategy == RetryStrategy.UNCONFIRMED_DATA and not subtask.is_critical_path:
+            await self._queue_remediation_work_item(
+                task=task,
+                subtask=subtask,
+                verification=verification,
+                strategy=strategy,
+                blocking=False,
+            )
+            verification.passed = True
+            if verification.outcome == "fail":
+                verification.outcome = (
+                    "partial_verified"
+                    if self._config.verification.allow_partial_verified
+                    else "pass_with_warnings"
+                )
+            if not verification.reason_code:
+                verification.reason_code = "unconfirmed_noncritical"
+            note = "Remediation queued for unconfirmed claims (non-critical path)."
+            verification.feedback = (
+                f"{verification.feedback}\n{note}" if verification.feedback else note
+            )
+            result.status = SubtaskResultStatus.SUCCESS
+            await self._handle_success(task, subtask, result, verification)
+            return
 
         async with self._state_lock:
             subtask.status = SubtaskStatus.FAILED
@@ -353,6 +439,8 @@ class Orchestrator:
             "subtask_id": subtask.id,
             "verification_tier": verification.tier,
             "feedback": verification.feedback,
+            "verification_outcome": verification.outcome,
+            "reason_code": verification.reason_code,
         })
 
         if subtask.retry_count < subtask.max_retries:
@@ -373,11 +461,27 @@ class Orchestrator:
                     subtask.retry_count, subtask.model_tier,
                 ),
                 "feedback": verification.feedback if verification else None,
+                "retry_strategy": strategy.value,
             })
         else:
             # All retries exhausted.
             # Critical-path failures abort the remaining plan.
             if subtask.is_critical_path:
+                if strategy == RetryStrategy.UNCONFIRMED_DATA:
+                    remediation_recovered = await self._run_confirm_or_prune_remediation(
+                        task=task,
+                        subtask=subtask,
+                        attempts=attempt_list,
+                    )
+                    if remediation_recovered:
+                        return
+                    await self._queue_remediation_work_item(
+                        task=task,
+                        subtask=subtask,
+                        verification=verification,
+                        strategy=strategy,
+                        blocking=True,
+                    )
                 await self._abort_on_critical_path_failure(
                     task, subtask, verification,
                 )
@@ -422,6 +526,145 @@ class Orchestrator:
             )
             self._state.save(task)
 
+    async def _queue_remediation_work_item(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        verification: VerificationResult,
+        strategy: RetryStrategy,
+        blocking: bool,
+    ) -> None:
+        queue = task.metadata.get("remediation_queue")
+        if not isinstance(queue, list):
+            queue = []
+        queue.append({
+            "subtask_id": subtask.id,
+            "strategy": strategy.value,
+            "reason_code": verification.reason_code,
+            "verification_outcome": verification.outcome,
+            "feedback": verification.feedback or "",
+            "blocking": bool(blocking),
+            "created_at": datetime.now().isoformat(),
+            "status": "queued",
+        })
+        async with self._state_lock:
+            task.metadata["remediation_queue"] = queue
+            task.add_decision(
+                "Queued remediation for "
+                f"{subtask.id} ({strategy.value}, blocking={blocking})."
+            )
+            self._state.save(task)
+
+    async def _run_confirm_or_prune_remediation(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        attempts: list[AttemptRecord],
+    ) -> bool:
+        if not self._config.verification.auto_confirm_prune_critical_path:
+            return False
+
+        attempted_map = task.metadata.get("confirm_or_prune_attempted")
+        if not isinstance(attempted_map, dict):
+            attempted_map = {}
+        if attempted_map.get(subtask.id):
+            return False
+        attempted_map[subtask.id] = datetime.now().isoformat()
+        async with self._state_lock:
+            task.metadata["confirm_or_prune_attempted"] = attempted_map
+            self._state.save(task)
+
+        self._emit(SUBTASK_RETRYING, task.id, {
+            "subtask_id": subtask.id,
+            "mode": "confirm_or_prune",
+            "reason": "critical_unconfirmed_data",
+        })
+
+        prior_successful_tool_calls: list[ToolCallRecord] = []
+        prior_evidence_records = self._evidence_for_subtask(task.id, subtask.id)
+        for attempt in attempts:
+            raw_calls = getattr(attempt, "successful_tool_calls", [])
+            if isinstance(raw_calls, list):
+                for call in raw_calls:
+                    if isinstance(call, ToolCallRecord):
+                        prior_successful_tool_calls.append(call)
+            raw_evidence = getattr(attempt, "evidence_records", [])
+            if isinstance(raw_evidence, list):
+                prior_evidence_records = merge_evidence_records(
+                    prior_evidence_records,
+                    [item for item in raw_evidence if isinstance(item, dict)],
+                )
+
+        remediation_context = (
+            "CONFIRM-OR-PRUNE REMEDIATION:\n"
+            "- Keep existing confirmed findings; do not redo solved work.\n"
+            "- Confirm currently unconfirmed claims with explicit evidence.\n"
+            "- If a claim cannot be confirmed, remove it or label it as "
+            "unconfirmed in non-recommendation sections.\n"
+            "- Recommendations must remain fully confirmed (0 unconfirmed claims).\n"
+            "- For final synthesis, separate `Verified Findings` and "
+            "`Unconfirmed Appendix`."
+        )
+        escalated_tier = self._retry.get_escalation_tier(
+            attempt=len(attempts),
+            original_tier=subtask.model_tier,
+        )
+        changelog = self._get_changelog(task)
+        remediation_result, remediation_verification = await self._runner.run(
+            task,
+            subtask,
+            model_tier=escalated_tier,
+            retry_context=remediation_context,
+            changelog=changelog,
+            prior_successful_tool_calls=prior_successful_tool_calls,
+            prior_evidence_records=prior_evidence_records,
+        )
+        self._persist_subtask_evidence(
+            task.id,
+            subtask.id,
+            remediation_result.evidence_records,
+        )
+
+        if remediation_verification.passed:
+            await self._handle_success(
+                task,
+                subtask,
+                remediation_result,
+                remediation_verification,
+            )
+            return True
+
+        remediation_strategy, missing_markets = self._retry.classify_failure(
+            verification_feedback=remediation_verification.feedback,
+            execution_error=remediation_result.summary,
+        )
+        attempts.append(AttemptRecord(
+            attempt=len(attempts) + 1,
+            tier=escalated_tier,
+            feedback=remediation_verification.feedback or None,
+            error=" | ".join(
+                part
+                for part in [
+                    remediation_verification.feedback,
+                    remediation_result.summary,
+                ]
+                if part
+            ) or None,
+            successful_tool_calls=[
+                call for call in remediation_result.tool_calls
+                if getattr(getattr(call, "result", None), "success", False)
+            ],
+            evidence_records=[
+                item for item in remediation_result.evidence_records
+                if isinstance(item, dict)
+            ],
+            retry_strategy=remediation_strategy,
+            missing_markets=missing_markets,
+        ))
+        return False
+
     @staticmethod
     def _build_replan_reason(
         subtask: Subtask,
@@ -429,14 +672,65 @@ class Orchestrator:
     ) -> str:
         """Build a concise, structured reason string for replanning prompts."""
         feedback = (verification.feedback or "").strip()
+        reason = f"reason_code={verification.reason_code}" if verification.reason_code else ""
+        outcome = (
+            f"outcome={verification.outcome}"
+            if verification.outcome else ""
+        )
+        suffix = ", ".join(part for part in [outcome, reason] if part)
+        suffix_text = f" ({suffix})" if suffix else ""
         if feedback:
             return (
                 f"Subtask '{subtask.id}' failed verification tier "
-                f"{verification.tier}: {feedback}"
+                f"{verification.tier}{suffix_text}: {feedback}"
             )
         return (
             f"Subtask '{subtask.id}' failed verification tier "
-            f"{verification.tier} with no feedback."
+            f"{verification.tier}{suffix_text} with no feedback."
+        )
+
+    async def _retry_verification_only(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        result: SubtaskResult,
+        attempts: list[AttemptRecord],
+    ) -> VerificationResult:
+        """Retry verifier path only (no executor/tool rerun)."""
+        self._emit(SUBTASK_RETRYING, task.id, {
+            "subtask_id": subtask.id,
+            "mode": "verification_only",
+            "reason": "verifier_parse_error",
+        })
+        prior_calls: list[ToolCallRecord] = []
+        prior_evidence = self._evidence_for_subtask(task.id, subtask.id)
+        for attempt in attempts:
+            raw_calls = getattr(attempt, "successful_tool_calls", [])
+            if isinstance(raw_calls, list):
+                for call in raw_calls:
+                    if isinstance(call, ToolCallRecord):
+                        prior_calls.append(call)
+            raw_evidence = getattr(attempt, "evidence_records", [])
+            if isinstance(raw_evidence, list):
+                prior_evidence = merge_evidence_records(
+                    prior_evidence,
+                    [item for item in raw_evidence if isinstance(item, dict)],
+                )
+        prior_evidence = merge_evidence_records(
+            prior_evidence,
+            [item for item in result.evidence_records if isinstance(item, dict)],
+        )
+        workspace = Path(task.workspace) if task.workspace else None
+        return await self._verification.verify(
+            subtask=subtask,
+            result_summary=result.summary or "",
+            tool_calls=result.tool_calls,
+            evidence_tool_calls=prior_calls,
+            evidence_records=prior_evidence,
+            workspace=workspace,
+            tier=max(2, subtask.verification_tier),
+            task_id=task.id,
         )
 
     async def _handle_success(
@@ -447,6 +741,7 @@ class Orchestrator:
         verification: VerificationResult,
     ) -> None:
         """Process a successful subtask: update state, check approval."""
+        self._persist_subtask_evidence(task.id, subtask.id, result.evidence_records)
         summary = result.summary
 
         # Update state
@@ -466,11 +761,31 @@ class Orchestrator:
 
             self._state.save(task)
 
+        remediation_mode = ""
+        remediation_required = False
+        if verification and isinstance(verification.metadata, dict):
+            remediation_mode = str(
+                verification.metadata.get("remediation_mode", ""),
+            ).strip().lower()
+            remediation_required = bool(
+                verification.metadata.get("remediation_required", False),
+            )
+        if verification and remediation_required and remediation_mode == "queue_follow_up":
+            await self._queue_remediation_work_item(
+                task=task,
+                subtask=subtask,
+                verification=verification,
+                strategy=RetryStrategy.UNCONFIRMED_DATA,
+                blocking=False,
+            )
+
         self._emit(SUBTASK_COMPLETED, task.id, {
             "subtask_id": subtask.id,
             "status": result.status,
             "summary": summary,
             "duration": result.duration_seconds,
+            "verification_outcome": verification.outcome if verification else "",
+            "reason_code": verification.reason_code if verification else "",
         })
 
         # Confidence scoring and approval check
@@ -575,7 +890,28 @@ class Orchestrator:
         )
 
         model = self._router.select(tier=2, role="planner")
-        response = await model.complete([{"role": "user", "content": prompt}])
+        request_messages = [{"role": "user", "content": prompt}]
+        request_diag = collect_request_diagnostics(
+            messages=request_messages,
+            origin="orchestrator.plan_task.complete",
+        )
+        self._emit(MODEL_INVOCATION, task.id, {
+            "subtask_id": "planning",
+            "model": model.name,
+            "phase": "start",
+            "operation": "complete",
+            **request_diag.to_event_payload(),
+        })
+        response = await model.complete(request_messages)
+        self._emit(MODEL_INVOCATION, task.id, {
+            "subtask_id": "planning",
+            "model": model.name,
+            "phase": "done",
+            "operation": "complete",
+            "origin": request_diag.origin,
+            "response_tokens": response.usage.total_tokens,
+            "response_chars": len(response.text or ""),
+        })
 
         plan = self._parse_plan(response, goal=task.goal)
         return self._apply_process_phase_mode(plan)
@@ -743,7 +1079,28 @@ class Orchestrator:
             )
 
             model = self._router.select(tier=2, role="planner")
-            response = await model.complete([{"role": "user", "content": prompt}])
+            request_messages = [{"role": "user", "content": prompt}]
+            request_diag = collect_request_diagnostics(
+                messages=request_messages,
+                origin="orchestrator.replan_task.complete",
+            )
+            self._emit(MODEL_INVOCATION, task.id, {
+                "subtask_id": failed_subtask_id or "replanning",
+                "model": model.name,
+                "phase": "start",
+                "operation": "complete",
+                **request_diag.to_event_payload(),
+            })
+            response = await model.complete(request_messages)
+            self._emit(MODEL_INVOCATION, task.id, {
+                "subtask_id": failed_subtask_id or "replanning",
+                "model": model.name,
+                "phase": "done",
+                "operation": "complete",
+                "origin": request_diag.origin,
+                "response_tokens": response.usage.total_tokens,
+                "response_chars": len(response.text or ""),
+            })
             new_plan = self._apply_process_phase_mode(
                 self._parse_plan(response, goal=task.goal),
             )
@@ -854,6 +1211,46 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _evidence_for_subtask(self, task_id: str, subtask_id: str) -> list[dict]:
+        """Load persisted evidence records scoped to one subtask."""
+        try:
+            records = self._state.load_evidence_records(task_id)
+        except Exception as e:
+            logger.warning("Failed loading evidence ledger for %s: %s", task_id, e)
+            return []
+        scoped: list[dict] = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("subtask_id", "")).strip() != subtask_id:
+                continue
+            scoped.append(item)
+        return scoped
+
+    def _persist_subtask_evidence(
+        self,
+        task_id: str,
+        subtask_id: str,
+        evidence_records: list[dict] | None,
+    ) -> None:
+        """Persist newly captured evidence records."""
+        if not evidence_records:
+            return
+        scoped: list[dict] = []
+        for item in evidence_records:
+            if not isinstance(item, dict):
+                continue
+            normalized = dict(item)
+            normalized["subtask_id"] = subtask_id
+            normalized.setdefault("task_id", task_id)
+            scoped.append(normalized)
+        if not scoped:
+            return
+        try:
+            self._state.append_evidence_records(task_id, scoped)
+        except Exception as e:
+            logger.warning("Failed persisting evidence ledger for %s: %s", task_id, e)
 
     def _get_changelog(self, task: Task) -> ChangeLog | None:
         """Get or create a ChangeLog for the task's workspace."""

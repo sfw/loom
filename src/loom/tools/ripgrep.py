@@ -12,7 +12,6 @@ from pathlib import Path
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
-MAX_OUTPUT_BYTES = 30_000
 DEFAULT_MAX_MATCHES = 200
 
 
@@ -149,10 +148,6 @@ class RipgrepSearchTool(Tool):
 
             output = stdout.decode("utf-8", errors="replace")
 
-            # Truncate if too large
-            if len(output) > MAX_OUTPUT_BYTES:
-                output = output[:MAX_OUTPUT_BYTES] + "\n\n(output truncated)"
-
             if proc.returncode == 0:
                 match_count = output.count("\n")
                 return ToolResult(
@@ -208,9 +203,6 @@ class RipgrepSearchTool(Tool):
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
             output = stdout.decode("utf-8", errors="replace")
 
-            if len(output) > MAX_OUTPUT_BYTES:
-                output = output[:MAX_OUTPUT_BYTES] + "\n\n(output truncated)"
-
             if proc.returncode == 0:
                 return ToolResult(success=True, output=output or "Matches found.")
             elif proc.returncode == 1:
@@ -261,9 +253,6 @@ class RipgrepSearchTool(Tool):
             return ToolResult(success=True, output="No matches found.")
 
         output = "\n".join(matches)
-        if len(output) > MAX_OUTPUT_BYTES:
-            output = output[:MAX_OUTPUT_BYTES] + "\n\n(output truncated)"
-
         return ToolResult(
             success=True,
             output=output,

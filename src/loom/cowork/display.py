@@ -159,7 +159,7 @@ def _summarize_args(tool_name: str, args: dict) -> str:
         pattern = args.get("pattern", "")
         return _truncate(pattern, 60)
 
-    if tool_name == "web_fetch":
+    if tool_name in ("web_fetch", "web_fetch_html"):
         url = args.get("url", "")
         return _truncate(url, 60)
 

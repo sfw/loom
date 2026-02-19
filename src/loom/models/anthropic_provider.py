@@ -25,6 +25,10 @@ from loom.models.base import (
     TokenUsage,
     ToolCall,
 )
+from loom.models.request_diagnostics import (
+    collect_request_diagnostics,
+    log_request_diagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -435,6 +439,18 @@ class AnthropicProvider(ModelProvider):
         temp = temperature if temperature is not None else self._temperature
         if temp > 0:
             body["temperature"] = temp
+        diagnostics = collect_request_diagnostics(
+            messages=body.get("messages", []),
+            tools=body.get("tools", []),
+            payload=body,
+        )
+        log_request_diagnostics(
+            logger=logger,
+            provider_name=self._name,
+            model_name=self._model,
+            operation="complete",
+            diagnostics=diagnostics,
+        )
 
         try:
             response = await client.post("/v1/messages", json=body)
@@ -486,6 +502,18 @@ class AnthropicProvider(ModelProvider):
         temp = temperature if temperature is not None else self._temperature
         if temp > 0:
             body["temperature"] = temp
+        diagnostics = collect_request_diagnostics(
+            messages=body.get("messages", []),
+            tools=body.get("tools", []),
+            payload=body,
+        )
+        log_request_diagnostics(
+            logger=logger,
+            provider_name=self._name,
+            model_name=self._model,
+            operation="stream",
+            diagnostics=diagnostics,
+        )
 
         # Accumulate tool calls from streaming events
         current_tool_calls: list[ToolCall] = []

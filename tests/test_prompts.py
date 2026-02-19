@@ -225,6 +225,41 @@ class TestExecutorPrompt:
         subtask_pos = prompt.find("YOUR CURRENT SUBTASK")
         assert role_pos < state_pos < subtask_pos
 
+    def test_executor_includes_evidence_contract_and_ledger_snapshot(
+        self,
+        assembler: PromptAssembler,
+        state_manager: TaskStateManager,
+    ):
+        subtask = Subtask(
+            id="environmental-scan",
+            description="Perform environmental scans for each market and synthesize risk.",
+            acceptance_criteria="Deliver evidence-backed implications with source citations.",
+            status=SubtaskStatus.PENDING,
+        )
+        task = Task(
+            id="task-evidence",
+            goal="Assess market risks",
+            status=TaskStatus.EXECUTING,
+            workspace="/tmp/market",
+            plan=Plan(subtasks=[subtask], version=1),
+        )
+        state_manager.create(task)
+
+        prompt = assembler.build_executor_prompt(
+            task=task,
+            subtask=subtask,
+            state_manager=state_manager,
+            evidence_ledger_summary=(
+                "- EV-1234 | market=Alberta Retail Energy | "
+                "dimension=economic | quality=0.85 | source=https://example.com/ab"
+            ),
+        )
+
+        assert "EVIDENCE CONTRACT" in prompt
+        assert "UNSUPPORTED_NO_EVIDENCE" in prompt
+        assert "EVIDENCE LEDGER SNAPSHOT (PERSISTED)" in prompt
+        assert "EV-1234" in prompt
+
 
 class TestReplannerPrompt:
     """Test replanner prompt assembly."""
@@ -309,6 +344,14 @@ class TestVerifierPrompt:
         prompt = assembler.build_verifier_prompt(subtask, "Done.", "")
         assert '"passed"' in prompt
         assert '"confidence"' in prompt
+
+    def test_verifier_handles_plural_wording_without_forced_minimum(
+        self, assembler: PromptAssembler,
+    ):
+        subtask = Subtask(id="scope-companies", description="Interpret company name(s)")
+        prompt = assembler.build_verifier_prompt(subtask, "Done.", "")
+        assert "cardinality-agnostic" in prompt
+        assert "company name(s)" in prompt
 
 
 class TestConstraints:

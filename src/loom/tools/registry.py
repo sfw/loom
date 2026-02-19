@@ -27,16 +27,15 @@ class ToolResult:
     files_changed: list[str] = field(default_factory=list)
     error: str | None = None
 
-    MAX_OUTPUT_SIZE = 30720  # 30KB
-
     def to_json(self) -> str:
         from loom.content import serialize_block
 
         payload: dict = {
             "success": self.success,
-            "output": self.output[:self.MAX_OUTPUT_SIZE],
+            "output": self.output,
             "error": self.error,
             "files_changed": self.files_changed,
+            "data": self.data,
         }
         if self.content_blocks:
             payload["content_blocks"] = [
@@ -67,6 +66,7 @@ class ToolResult:
             output=parsed.get("output", ""),
             error=parsed.get("error"),
             files_changed=parsed.get("files_changed", []),
+            data=parsed.get("data"),
             content_blocks=blocks or None,
         )
 

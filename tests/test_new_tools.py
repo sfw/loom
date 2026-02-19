@@ -698,7 +698,7 @@ class TestSpreadsheetSummary:
         assert "Rows: 3" in result.output
         assert "Name" in result.output
         assert "Score" in result.output
-        assert "Sample data" in result.output
+        assert "Data rows" in result.output
 
     async def test_summary_file_not_found(self, sheet, ctx):
         result = await sheet.execute(

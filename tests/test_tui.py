@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -122,6 +123,12 @@ class TestToolArgsPreview:
     def test_web_fetch(self):
         result = tool_args_preview(
             "web_fetch", {"url": "https://example.com"},
+        )
+        assert result == "https://example.com"
+
+    def test_web_fetch_html(self):
+        result = tool_args_preview(
+            "web_fetch_html", {"url": "https://example.com"},
         )
         assert result == "https://example.com"
 
@@ -553,6 +560,114 @@ class TestDelegateTaskUnbound:
         assert result.data["tasks"][0]["status"] == "completed"
         assert result.data["tasks"][1]["status"] == "in_progress"
         assert result.data["tasks"][2]["status"] == "skipped"
+
+    @pytest.mark.asyncio
+    async def test_failed_task_returns_failure_and_task_failed_progress(self):
+        from loom.state.task_state import TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        async def _execute(task):
+            task.status = TaskStatus.FAILED
+            return task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        progress: list[dict] = []
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+        result = await tool.execute(
+            {"goal": "Analyze Tesla", "_progress_callback": progress.append},
+            ctx,
+        )
+
+        assert result.success is False
+        assert result.error == "Task execution failed."
+        assert isinstance(result.data, dict)
+        assert result.data.get("status") == "failed"
+        assert any(p.get("event_type") == "task_failed" for p in progress)
+
+    @pytest.mark.asyncio
+    async def test_delegate_logs_detailed_event_stream_when_configured(self, tmp_path):
+        from loom.config import Config, LoggingConfig
+        from loom.events.bus import Event, EventBus
+        from loom.events.types import TASK_EXECUTING
+        from loom.state.task_state import TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        bus = EventBus()
+
+        async def _execute(task):
+            task.status = TaskStatus.EXECUTING
+            bus.emit(Event(
+                event_type=TASK_EXECUTING,
+                task_id=task.id,
+                data={"note": "running"},
+            ))
+            task.status = TaskStatus.COMPLETED
+            return task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator._events = bus
+            orchestrator._config = Config(
+                logging=LoggingConfig(
+                    event_log_path=str(tmp_path / "loom-logs"),
+                )
+            )
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+        result = await tool.execute({"goal": "Analyze Tesla"}, ctx)
+
+        assert result.success is True
+        assert isinstance(result.data, dict)
+        event_log_path = str(result.data.get("event_log_path", "")).strip()
+        assert event_log_path
+        log_path = Path(event_log_path)
+        assert log_path.exists()
+
+        records = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert any(record.get("kind") == "meta" for record in records)
+        assert any(record.get("kind") == "event_bus" for record in records)
+        assert any(record.get("kind") == "progress_snapshot" for record in records)
+
+    @pytest.mark.asyncio
+    async def test_delegate_ignores_non_pathlike_log_config(self, tmp_path, monkeypatch):
+        from loom.state.task_state import TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        monkeypatch.chdir(tmp_path)
+
+        async def _execute(task):
+            task.status = TaskStatus.COMPLETED
+            return task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator._config = MagicMock()
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+        result = await tool.execute({"goal": "Analyze Tesla"}, ctx)
+
+        assert result.success is True
+        assert isinstance(result.data, dict)
+        assert "event_log_path" not in result.data
+        assert not list(tmp_path.glob("<MagicMock*"))
 
     @pytest.mark.asyncio
     async def test_progress_callback_includes_event_metadata(self):
@@ -2147,6 +2262,67 @@ class TestProcessSlashCommands:
         assert payload["context"]["requested_goal"] == "Analyze Tesla"
         assert execute_call.kwargs["workspace"] == Path("/tmp")
 
+    @pytest.mark.asyncio
+    async def test_execute_process_run_treats_failed_delegate_status_as_failure(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        process_defn = SimpleNamespace(name="market-research")
+        pane = MagicMock()
+        app._process_runs = {
+            "abc123": SimpleNamespace(
+                run_id="abc123",
+                process_name="market-research",
+                goal="Analyze market",
+                process_defn=process_defn,
+                pane_id="tab-run-abc123",
+                pane=pane,
+                status="queued",
+                task_id="",
+                started_at=0.0,
+                ended_at=None,
+                tasks=[],
+                task_labels={},
+                last_progress_message="",
+                last_progress_at=0.0,
+                worker=None,
+                closed=False,
+            ),
+        }
+        app._tools.execute = AsyncMock(return_value=SimpleNamespace(
+            success=True,
+            output='Task failed: "Analyze market"',
+            error=None,
+            data={"task_id": "cowork-1", "status": "failed", "tasks": []},
+        ))
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._refresh_workspace_tree = MagicMock()
+        app.notify = MagicMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        await app._execute_process_run("abc123")
+
+        run = app._process_runs["abc123"]
+        assert run.status == "failed"
+        chat.add_info.assert_any_call(
+            "[bold #f7768e]Process run abc123 failed:[/] Process run failed."
+        )
+
     def test_build_process_run_context_includes_recent_cowork_messages(self):
         from loom.tui.app import LoomApp
 
@@ -2751,6 +2927,65 @@ class TestProcessSlashCommands:
         chat.add_info.assert_called_once()
         assert "Started company-screening" in chat.add_info.call_args.args[0]
         events_panel.add_event.assert_called_once()
+
+    def test_process_progress_event_uses_stable_run_label_for_messages(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="market-research",
+            goal="Analyze market",
+            process_defn=None,
+            pane_id="tab-run-abc123",
+            pane=MagicMock(),
+            status="running",
+            task_id="task-1",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[
+                {
+                    "id": "environmental-scan",
+                    "status": "in_progress",
+                    "content": "Perform environmental scans for priority markets",
+                },
+            ],
+            task_labels={
+                "environmental-scan": "Perform environmental scans for priority markets",
+            },
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+        )
+
+        message = app._format_process_progress_event(
+            {
+                "event_type": "tool_call_started",
+                "event_data": {
+                    "subtask_id": "environmental-scan",
+                    "tool": "web_search",
+                },
+                "tasks": [
+                    {
+                        "id": "environmental-scan",
+                        "status": "in_progress",
+                        "content": (
+                            "Verification inconclusive: could not parse verifier output."
+                        ),
+                    },
+                ],
+            },
+            run=run,
+        )
+
+        assert message is not None
+        assert "Verification inconclusive" not in message
+        assert "environmental-scan - Perform environmental scans" in message
 
     def test_mark_process_run_failed_shows_timeout_guidance(self):
         from loom.tui.app import LoomApp

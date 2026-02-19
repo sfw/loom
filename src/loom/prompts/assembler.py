@@ -161,6 +161,7 @@ class PromptAssembler:
         state_manager: TaskStateManager,
         memory_entries: list[MemoryEntry] | None = None,
         available_tools: list[dict] | None = None,
+        evidence_ledger_summary: str = "",
     ) -> str:
         """Assemble the full prompt for subtask execution.
 
@@ -204,6 +205,19 @@ class PromptAssembler:
                     "finishing this subtask. Do not rename them."
                 )
 
+        if self._requires_evidence_contract(subtask):
+            subtask_section += (
+                "\n\nEVIDENCE CONTRACT:\n"
+                "- Every factual claim in deliverables must include supporting evidence.\n"
+                "- For CSV deliverables, include an `evidence_id` column and at least one "
+                "source/citation field (`source`, `source_url`, or `citation`).\n"
+                "- For narrative Markdown claims, append evidence references like "
+                "`[evidence: EV-XXXX]` or explicit source URLs.\n"
+                "- Reuse `evidence_ids` returned by tools whenever possible.\n"
+                "- If evidence is unavailable, label the claim/row as "
+                "`UNSUPPORTED_NO_EVIDENCE` instead of guessing."
+            )
+
         # 4. RETRIEVED CONTEXT (memory)
         if memory_entries:
             memory_text = self._format_memory(memory_entries)
@@ -213,6 +227,13 @@ class PromptAssembler:
             "memory",
             "RELEVANT CONTEXT FROM PRIOR WORK:\n{memory_entries_formatted}",
         ).format(memory_entries_formatted=memory_text).strip()
+        evidence_section = ""
+        evidence_summary = str(evidence_ledger_summary or "").strip()
+        if evidence_summary:
+            evidence_section = (
+                "EVIDENCE LEDGER SNAPSHOT (PERSISTED):\n"
+                + evidence_summary
+            )
 
         # 5. AVAILABLE TOOLS
         tools_section = ""
@@ -239,6 +260,7 @@ class PromptAssembler:
             task_state,
             subtask_section,
             memory_section,
+            evidence_section,
             tools_section,
             output_format,
             constraints,
@@ -259,6 +281,25 @@ class PromptAssembler:
         if len(deliverables) == 1:
             return next(iter(deliverables.values()))
         return []
+
+    @staticmethod
+    def _requires_evidence_contract(subtask: Subtask) -> bool:
+        """Return True when subtask language implies evidence-backed output."""
+        haystack = " ".join([
+            str(subtask.description or ""),
+            str(subtask.acceptance_criteria or ""),
+        ]).lower()
+        required_markers = (
+            "evidence",
+            "citation",
+            "source",
+            "research",
+            "market",
+            "trend",
+            "risk",
+            "verify",
+        )
+        return any(marker in haystack for marker in required_markers)
 
     def build_replanner_prompt(
         self,
@@ -364,6 +405,9 @@ class PromptAssembler:
         subtask: Subtask,
         result_summary: str,
         tool_calls_formatted: str,
+        *,
+        llm_rules: list | None = None,
+        phase_scope_default: str = "current_phase",
     ) -> str:
         """Assemble prompt for Tier 2 LLM verification."""
         template = self.get_template("verifier")
@@ -383,11 +427,20 @@ class PromptAssembler:
 
         # PROCESS: inject LLM verification rules
         if self._process and self._process.has_verification_rules():
-            llm_rules = self._process.llm_rules()
-            if llm_rules:
+            selected_rules = llm_rules
+            if selected_rules is None:
+                selected_rules = self._process.llm_rules_for_subtask(
+                    subtask.id,
+                    phase_scope_default=phase_scope_default,
+                )
+            if selected_rules:
                 rules_text = "\n".join(
-                    f"- [{r.severity.upper()}] {r.name}: {r.check}"
-                    for r in llm_rules
+                    (
+                        f"- [{r.severity.upper()} | "
+                        f"{(r.enforcement or 'advisory').upper()}] "
+                        f"{r.name}: {r.check}"
+                    )
+                    for r in selected_rules
                 )
                 instructions += (
                     "\n\nADDITIONAL DOMAIN-SPECIFIC CHECKS:\n"

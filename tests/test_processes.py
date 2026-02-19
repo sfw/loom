@@ -1067,6 +1067,72 @@ class TestVerifierPromptWithProcess:
         prompt = assembler.build_verifier_prompt(subtask, "Done.", "")
         assert "DOMAIN-SPECIFIC CHECKS" not in prompt
 
+    def test_phase_scoped_llm_rules_only_include_current_phase(self):
+        defn = ProcessDefinition(
+            name="scoped-rules",
+            phases=[
+                PhaseTemplate(id="phase-a", description="A"),
+                PhaseTemplate(id="phase-b", description="B"),
+            ],
+            verification_rules=[
+                VerificationRule(
+                    name="rule-a",
+                    description="A only",
+                    check="Check A",
+                    severity="error",
+                    type="llm",
+                    applies_to_phases=["phase-a"],
+                ),
+                VerificationRule(
+                    name="rule-b",
+                    description="B only",
+                    check="Check B",
+                    severity="error",
+                    type="llm",
+                    applies_to_phases=["phase-b"],
+                ),
+            ],
+        )
+        assembler = PromptAssembler(process=defn)
+        prompt = assembler.build_verifier_prompt(
+            Subtask(id="phase-a", description="A"),
+            "Done.",
+            "",
+            phase_scope_default="current_phase",
+        )
+        assert "rule-a" in prompt
+        assert "rule-b" not in prompt
+
+    def test_phase_scope_global_mode_includes_all_rules(self):
+        defn = ProcessDefinition(
+            name="global-rules",
+            verification_rules=[
+                VerificationRule(
+                    name="rule-a",
+                    description="A",
+                    check="Check A",
+                    severity="warning",
+                    type="llm",
+                ),
+                VerificationRule(
+                    name="rule-b",
+                    description="B",
+                    check="Check B",
+                    severity="warning",
+                    type="llm",
+                ),
+            ],
+        )
+        assembler = PromptAssembler(process=defn)
+        prompt = assembler.build_verifier_prompt(
+            Subtask(id="phase-a", description="A"),
+            "Done.",
+            "",
+            phase_scope_default="global",
+        )
+        assert "rule-a" in prompt
+        assert "rule-b" in prompt
+
 
 class TestExtractorPromptWithProcess:
     """Test extractor prompt assembly with process memory configuration."""
@@ -1516,6 +1582,33 @@ class TestProcessDefinitionEdgeCases:
         assert phase.is_synthesis is False
         assert phase.acceptance_criteria == ""
         assert phase.deliverables == []
+
+    def test_legacy_rule_applies_in_current_phase_migration_mode(self):
+        rule = VerificationRule(
+            name="legacy",
+            description="legacy",
+            check="x",
+            type="llm",
+        )
+        assert ProcessDefinition._rule_applies_to_subtask(
+            rule,
+            "phase-a",
+            phase_scope_default="current_phase",
+        ) is True
+
+    def test_phase_scope_without_phase_list_applies_to_current_subtask(self):
+        rule = VerificationRule(
+            name="phase-scope",
+            description="phase",
+            check="x",
+            type="llm",
+            scope="phase",
+        )
+        assert ProcessDefinition._rule_applies_to_subtask(
+            rule,
+            "phase-a",
+            phase_scope_default="current_phase",
+        ) is True
 
 
 class TestToolOverlapValidation:

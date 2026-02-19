@@ -118,6 +118,14 @@ class VerificationConfig:
     tier2_enabled: bool = True
     tier3_enabled: bool = False
     tier3_vote_count: int = 3
+    policy_engine_enabled: bool = True
+    regex_default_advisory: bool = True
+    strict_output_protocol: bool = True
+    shadow_compare_enabled: bool = False
+    phase_scope_default: str = "current_phase"  # "current_phase" | "global"
+    allow_partial_verified: bool = True
+    unconfirmed_supporting_threshold: float = 0.30
+    auto_confirm_prune_critical_path: bool = True
 
 
 @dataclass(frozen=True)
@@ -272,11 +280,30 @@ def load_config(path: Path | None = None) -> Config:
     )
 
     verif_data = raw.get("verification", {})
+    threshold_raw = verif_data.get("unconfirmed_supporting_threshold", 0.30)
+    try:
+        threshold = float(threshold_raw)
+    except (TypeError, ValueError):
+        threshold = 0.30
+    threshold = max(0.0, min(1.0, threshold))
     verification = VerificationConfig(
         tier1_enabled=verif_data.get("tier1_enabled", True),
         tier2_enabled=verif_data.get("tier2_enabled", True),
         tier3_enabled=verif_data.get("tier3_enabled", False),
         tier3_vote_count=verif_data.get("tier3_vote_count", 3),
+        policy_engine_enabled=verif_data.get("policy_engine_enabled", True),
+        regex_default_advisory=verif_data.get("regex_default_advisory", True),
+        strict_output_protocol=verif_data.get("strict_output_protocol", True),
+        shadow_compare_enabled=verif_data.get("shadow_compare_enabled", False),
+        phase_scope_default=str(
+            verif_data.get("phase_scope_default", "current_phase"),
+        ),
+        allow_partial_verified=verif_data.get("allow_partial_verified", True),
+        unconfirmed_supporting_threshold=threshold,
+        auto_confirm_prune_critical_path=verif_data.get(
+            "auto_confirm_prune_critical_path",
+            True,
+        ),
     )
 
     mem_data = raw.get("memory", {})

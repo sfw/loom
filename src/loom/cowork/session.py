@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 from loom.cowork.approval import ApprovalDecision, ToolApprover
 from loom.cowork.session_state import SessionState, extract_state_from_tool_events
+from loom.engine.semantic_compactor import SemanticCompactor
 from loom.models.base import ModelProvider, ToolCall
 from loom.tools.registry import ToolRegistry, ToolResult
 from loom.utils.tokens import estimate_tokens as _estimate_tokens
@@ -69,6 +70,19 @@ class CoworkTurn:
 _USER_INTERACTION_TOOLS = frozenset({"ask_user"})
 
 MAX_TOOL_ITERATIONS = 40
+DEFAULT_TOOL_RESULT_OUTPUT_CHARS = 3_000
+HEAVY_TOOL_RESULT_OUTPUT_CHARS = 1_200
+_HEAVY_OUTPUT_TOOLS = frozenset({
+    "web_fetch",
+    "web_fetch_html",
+    "web_search",
+    "read_file",
+    "search_files",
+    "ripgrep_search",
+    "list_directory",
+    "glob_find",
+    "conversation_recall",
+})
 
 # Phrases that suggest the user is referencing earlier context.
 _DANGLING_REF_INDICATORS = [
@@ -163,6 +177,7 @@ class CoworkSession:
             session_id=session_id,
         )
         self._static_system_prompt = system_prompt
+        self._compactor = SemanticCompactor(model=model)
 
         # Learned behaviors section (injected into system prompt)
         self._behaviors_section = ""
@@ -195,6 +210,10 @@ class CoworkSession:
     @property
     def session_state(self) -> SessionState:
         return self._session_state
+
+    @property
+    def compactor(self) -> SemanticCompactor:
+        return self._compactor
 
     # ------------------------------------------------------------------
     # Public API
@@ -608,16 +627,140 @@ class CoworkSession:
         self, tool_call_id: str, tool_name: str, result: ToolResult,
     ) -> None:
         """Append a tool result message and persist it."""
-        content = result.to_json()
+        content = await self._serialize_tool_result_for_model(tool_name, result)
         self._messages.append({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "content": content,
         })
+        persisted_content = result.to_json()
         await self._persist_turn(
-            "tool", content=content,
+            "tool", content=persisted_content,
             tool_call_id=tool_call_id, tool_name=tool_name,
         )
+
+    @staticmethod
+    def _tool_output_limit(tool_name: str) -> int:
+        if tool_name in _HEAVY_OUTPUT_TOOLS:
+            return HEAVY_TOOL_RESULT_OUTPUT_CHARS
+        return DEFAULT_TOOL_RESULT_OUTPUT_CHARS
+
+    async def _compact_text(self, text: str, *, max_chars: int, label: str) -> str:
+        return await self._compactor.compact(
+            str(text or ""),
+            max_chars=max_chars,
+            label=label,
+        )
+
+    async def _summarize_tool_data(self, data: dict | None) -> dict | None:
+        if not isinstance(data, dict) or not data:
+            return None
+
+        if len(data) > 12:
+            packed = json.dumps(data, ensure_ascii=False, default=str)
+            summary_text = await self._compact_text(
+                packed,
+                max_chars=900,
+                label="cowork tool data payload",
+            )
+            return {
+                "summary": summary_text,
+                "key_count": len(data),
+            }
+
+        summary: dict = {}
+        for key, value in data.items():
+            if isinstance(value, str):
+                summary[key] = await self._compact_text(
+                    value,
+                    max_chars=180,
+                    label=f"cowork tool data {key}",
+                )
+            elif isinstance(value, (int, float, bool)) or value is None:
+                summary[key] = value
+            elif isinstance(value, (list, dict)):
+                packed = json.dumps(value, ensure_ascii=False, default=str)
+                summary[key] = await self._compact_text(
+                    packed,
+                    max_chars=220,
+                    label=f"cowork tool data {key}",
+                )
+            else:
+                summary[key] = str(type(value).__name__)
+        return summary or None
+
+    async def _serialize_content_blocks_for_model(
+        self,
+        blocks: list | None,
+        *,
+        max_chars: int,
+    ) -> list[dict] | None:
+        if not blocks:
+            return None
+
+        from loom.content import serialize_block
+
+        serialized_blocks: list[dict] = []
+        for block in blocks:
+            try:
+                payload = serialize_block(block)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+
+            compact = dict(payload)
+            for key in ("text", "text_fallback", "extracted_text", "thinking"):
+                value = compact.get(key)
+                if isinstance(value, str):
+                    compact[key] = await self._compact_text(
+                        value,
+                        max_chars=max_chars,
+                        label=f"cowork content block {key}",
+                    )
+            serialized_blocks.append(compact)
+        return serialized_blocks or None
+
+    async def _serialize_tool_result_for_model(
+        self,
+        tool_name: str,
+        result: ToolResult,
+    ) -> str:
+        limit = self._tool_output_limit(tool_name)
+        output_text = await self._compact_text(
+            result.output,
+            max_chars=limit,
+            label=f"cowork {tool_name} tool output",
+        )
+        payload: dict = {
+            "success": result.success,
+            "output": output_text,
+            "error": result.error,
+            "files_changed": list(result.files_changed),
+        }
+
+        if len(payload["files_changed"]) > 20:
+            files_text = "\n".join(payload["files_changed"])
+            payload["files_changed_summary"] = await self._compact_text(
+                files_text,
+                max_chars=380,
+                label=f"cowork {tool_name} files changed",
+            )
+            payload["files_changed_count"] = len(payload["files_changed"])
+            payload.pop("files_changed", None)
+
+        data_summary = await self._summarize_tool_data(result.data)
+        if data_summary:
+            payload["data"] = data_summary
+
+        blocks = await self._serialize_content_blocks_for_model(
+            result.content_blocks,
+            max_chars=min(limit, 400),
+        )
+        if blocks:
+            payload["content_blocks"] = blocks
+
+        return json.dumps(payload)
 
     @staticmethod
     def _tool_calls_to_dicts(tool_calls: list[ToolCall]) -> list[dict]:
@@ -705,6 +848,7 @@ TOOL USAGE:
 - Use ripgrep_search for content search (much faster than search_files).
 - Use web_search to find documentation, solutions, or package information online.
 - Use web_fetch to read a specific URL's content.
+- Use web_fetch_html when you explicitly need raw page source markup.
 - Use shell_execute for running tests, builds, linters, etc.
 - Use git_command for version control operations (including push).
 - Use task_tracker to organize multi-step work and show progress.

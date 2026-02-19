@@ -144,6 +144,7 @@ verification:
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]|XX%|N/A"
       severity: error
       type: regex
+      applies_to_phases: ["*"]
     - name: metrics-quantified
       description: "All recommendations must include quantified expected impact"
       check: >
@@ -152,6 +153,7 @@ verification:
         range). Flag any recommendation that says "improve" without a number.
       severity: warning
       type: llm
+      applies_to_phases: [recommendations]
     - name: ga4-specific
       description: "Recommendations must reference specific GA4 features"
       check: >
@@ -160,6 +162,7 @@ verification:
         data layer pushes). Flag generic advice that could apply to any tool.
       severity: warning
       type: llm
+      applies_to_phases: [tracking-audit, recommendations]
     - name: funnel-math-check
       description: "Funnel conversion rates must be mathematically consistent"
       check: >
@@ -168,6 +171,7 @@ verification:
         inconsistency greater than 1%.
       severity: error
       type: llm
+      applies_to_phases: [funnel-analysis, recommendations]
 
 memory:
   extract_types:

@@ -68,10 +68,11 @@ class TestToolResult:
         assert '"success": true' in j
         assert "a.py" in j
 
-    def test_output_truncation(self):
+    def test_output_preserved_in_json(self):
         r = ToolResult.ok("x" * 50000)
         j = r.to_json()
-        assert len(j) < 50000
+        restored = ToolResult.from_json(j)
+        assert len(restored.output) == 50000
 
 
 # --- Registry ---
@@ -90,6 +91,7 @@ class TestRegistry:
         assert "list_directory" in tools
         assert "analyze_code" in tools
         assert "web_fetch" in tools
+        assert "web_fetch_html" in tools
 
     def test_register_duplicate_raises(self):
         reg = ToolRegistry()
@@ -113,7 +115,7 @@ class TestRegistry:
             "ReadFileTool", "WriteFileTool", "EditFileTool",
             "DeleteFileTool", "MoveFileTool", "ShellExecuteTool",
             "GitCommandTool", "SearchFilesTool", "ListDirectoryTool",
-            "AnalyzeCodeTool", "WebFetchTool",
+            "AnalyzeCodeTool", "WebFetchTool", "WebFetchHtmlTool",
         }
         assert expected.issubset(names), f"Missing: {expected - names}"
 

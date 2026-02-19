@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -269,3 +270,64 @@ class TestTaskStateManager:
         assert loaded.metadata == {"source": "api"}
         assert loaded.created_at == "2026-01-01T00:00:00"
         assert loaded.completed_at == "2026-01-01T01:00:00"
+
+    def test_evidence_ledger_save_and_load(self, tmp_path: Path):
+        mgr = TaskStateManager(tmp_path)
+        task = _make_task()
+        mgr.create(task)
+
+        records = [
+            {
+                "evidence_id": "EV-ALBERTA-1",
+                "task_id": task.id,
+                "subtask_id": "environmental-scan",
+                "market": "Alberta Retail Energy",
+                "source_url": "https://example.com/alberta",
+            }
+        ]
+        mgr.save_evidence_records(task.id, records)
+
+        loaded = mgr.load_evidence_records(task.id)
+        assert loaded == records
+
+    def test_evidence_ledger_append_dedupes(self, tmp_path: Path):
+        mgr = TaskStateManager(tmp_path)
+        task = _make_task()
+        mgr.create(task)
+
+        initial = [
+            {"evidence_id": "EV-1", "subtask_id": "s1", "source_url": "https://a.example"}
+        ]
+        mgr.save_evidence_records(task.id, initial)
+
+        merged = mgr.append_evidence_records(task.id, [
+            {"evidence_id": "EV-1", "subtask_id": "s1", "source_url": "https://a.example"},
+            {"evidence_id": "EV-2", "subtask_id": "s1", "source_url": "https://b.example"},
+        ])
+
+        assert [item["evidence_id"] for item in merged] == ["EV-1", "EV-2"]
+        assert [item["evidence_id"] for item in mgr.load_evidence_records(task.id)] == [
+            "EV-1",
+            "EV-2",
+        ]
+
+    def test_evidence_ledger_load_handles_invalid_json(self, tmp_path: Path):
+        mgr = TaskStateManager(tmp_path)
+        task = _make_task()
+        mgr.create(task)
+
+        evidence_path = tmp_path / "tasks" / task.id / "evidence-ledger.json"
+        evidence_path.write_text("{not-json", encoding="utf-8")
+        assert mgr.load_evidence_records(task.id) == []
+
+    def test_evidence_ledger_load_handles_non_list_payload(self, tmp_path: Path):
+        mgr = TaskStateManager(tmp_path)
+        task = _make_task()
+        mgr.create(task)
+
+        evidence_path = tmp_path / "tasks" / task.id / "evidence-ledger.json"
+        evidence_path.write_text(
+            json.dumps({"unexpected": "object"}),
+            encoding="utf-8",
+        )
+        assert mgr.load_evidence_records(task.id) == []

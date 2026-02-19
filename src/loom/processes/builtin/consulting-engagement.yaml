@@ -168,6 +168,7 @@ verification:
         Flag duplicate/redundant sub-hypotheses.
       severity: error
       type: llm
+      applies_to_phases: [define-issue-tree, assign-workstreams]
 
     - name: recommendation-traceability
       description: "Recommendations must trace to explicit evidence"
@@ -175,6 +176,7 @@ verification:
         Each recommendation should cite supporting findings and exhibits.
       severity: error
       type: llm
+      applies_to_phases: [synthesize-recommendations, build-presentation]
 
     - name: stakeholder-feasibility
       description: "Recommendations must account for stakeholder adoption risk"
@@ -183,6 +185,7 @@ verification:
         actions are reflected in sequencing and ownership.
       severity: error
       type: llm
+      applies_to_phases: [stakeholder-alignment, implementation-roadmap, build-presentation]
 
     - name: action-titles
       description: "Headings must be conclusion sentences, not topic labels"
@@ -190,12 +193,14 @@ verification:
         Each heading should contain subject and verb stating a finding.
       severity: warning
       type: llm
+      applies_to_phases: [build-presentation]
 
     - name: no-placeholders
       description: "No placeholder text in deliverables"
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
       severity: error
       type: regex
+      applies_to_phases: ["*"]
 
 memory:
   extract_types:

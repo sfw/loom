@@ -191,6 +191,7 @@ verification:
         not contradict presented numbers.
       severity: error
       type: llm
+      applies_to_phases: [financial-analysis, valuation-model, investment-memo]
 
     - name: method-fit
       description: "Valuation method must fit company stage and data quality"
@@ -199,6 +200,7 @@ verification:
         early-stage context, and that limitations are disclosed.
       severity: error
       type: llm
+      applies_to_phases: [valuation-approach, valuation-model]
 
     - name: expectations-gap-present
       description: "Memo must explicitly include expectations vs variant thesis"
@@ -207,6 +209,7 @@ verification:
         analyst view differs, including disconfirming signals.
       severity: error
       type: llm
+      applies_to_phases: [expectations-and-variant-view, investment-memo]
 
     - name: probability-weighted-returns
       description: "Scenario probabilities and expected return math are required"
@@ -216,6 +219,7 @@ verification:
         outputs.
       severity: error
       type: llm
+      applies_to_phases: [valuation-model, investment-memo]
 
     - name: capital-structure-risk
       description: "Balance-sheet and dilution risks must be assessed"
@@ -224,6 +228,7 @@ verification:
         implications are covered when material.
       severity: error
       type: llm
+      applies_to_phases: [financial-analysis, risk-assessment, investment-memo]
 
     - name: terminal-value-check
       description: "Terminal value dominance should be flagged in DCF cases"
@@ -232,6 +237,7 @@ verification:
         assumptions appear unrealistic relative to long-run growth context.
       severity: warning
       type: llm
+      applies_to_phases: [valuation-model]
 
     - name: memo-completeness
       description: "Investment memo must include all required decision sections"
@@ -240,12 +246,14 @@ verification:
         return framing, catalysts, risks, thesis-breakers, and monitoring plan.
       severity: error
       type: llm
+      applies_to_phases: [investment-memo]
 
     - name: no-placeholders
       description: "No placeholder text in deliverables"
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
       severity: error
       type: regex
+      applies_to_phases: ["*"]
 
 memory:
   extract_types:

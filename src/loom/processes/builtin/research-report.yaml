@@ -153,6 +153,7 @@ verification:
         inline citation mapping to references.
       severity: error
       type: llm
+      applies_to_phases: [synthesize-findings, draft-report, red-team-review, quality-assurance]
 
     - name: assumptions-explicit
       description: "Assumptions must be explicit and separated from facts"
@@ -160,6 +161,7 @@ verification:
         Verify assumptions are labeled and not presented as factual conclusions.
       severity: warning
       type: llm
+      applies_to_phases: [frame-question, synthesize-findings, draft-report, quality-assurance]
 
     - name: conclusion-traceability
       description: "Conclusions must trace to evidence"
@@ -168,6 +170,7 @@ verification:
         is represented in synthesis outputs.
       severity: error
       type: llm
+      applies_to_phases: [synthesize-findings, draft-report, quality-assurance]
 
     - name: counterarguments-addressed
       description: "Strong counterarguments must be handled"
@@ -176,12 +179,14 @@ verification:
         explicitly states unresolved uncertainty.
       severity: error
       type: llm
+      applies_to_phases: [red-team-review, quality-assurance]
 
     - name: no-placeholders
       description: "No placeholder text in deliverables"
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
       severity: error
       type: regex
+      applies_to_phases: ["*"]
 
 memory:
   extract_types:

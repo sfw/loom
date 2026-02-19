@@ -81,6 +81,11 @@ class VerificationRule:
     severity: str = "warning"  # "warning" | "error"
     type: str = "llm"  # "llm" | "regex"
     target: str = "output"  # "output" | "deliverables"
+    enforcement: str = ""  # "" | "hard" | "advisory"
+    scope: str = ""  # "" | "phase" | "global"
+    applies_to_phases: list[str] = field(default_factory=list)  # [] | ["phase-a"] | ["*"]
+    requires_exact_cardinality: bool = False
+    min_count: int | None = None
 
 
 @dataclass
@@ -185,6 +190,75 @@ class ProcessDefinition:
     def llm_rules(self) -> list[VerificationRule]:
         """Return only LLM-type verification rules."""
         return [r for r in self.verification_rules if r.type == "llm"]
+
+    @staticmethod
+    def _rule_applies_to_subtask(
+        rule: VerificationRule,
+        subtask_id: str,
+        *,
+        phase_scope_default: str = "global",
+    ) -> bool:
+        """Return True when rule should apply to current subtask."""
+        normalized_scope_default = str(phase_scope_default or "global").strip().lower()
+        if normalized_scope_default not in {"global", "current_phase"}:
+            normalized_scope_default = "global"
+
+        normalized_subtask = str(subtask_id or "").strip()
+        if not normalized_subtask:
+            return False
+
+        applies = [str(p or "").strip() for p in (rule.applies_to_phases or [])]
+        applies = [p for p in applies if p]
+        if applies:
+            if "*" in applies:
+                return True
+            return normalized_subtask in applies
+
+        scope = str(rule.scope or "").strip().lower()
+        if scope == "global":
+            return True
+        if scope == "phase":
+            # Rule is explicitly phase-scoped but no explicit phase list exists.
+            # Interpret as "apply to the currently executing phase/subtask".
+            return bool(normalized_subtask)
+
+        # Legacy rule (no scope metadata)
+        if normalized_scope_default == "global":
+            return True
+        # Migration mode: treat legacy rules as current-phase checks.
+        return bool(normalized_subtask)
+
+    def regex_rules_for_subtask(
+        self,
+        subtask_id: str,
+        *,
+        phase_scope_default: str = "global",
+    ) -> list[VerificationRule]:
+        """Return regex rules applicable to the current subtask."""
+        return [
+            r for r in self.regex_rules()
+            if self._rule_applies_to_subtask(
+                r,
+                subtask_id,
+                phase_scope_default=phase_scope_default,
+            )
+        ]
+
+    def llm_rules_for_subtask(
+        self,
+        subtask_id: str,
+        *,
+        phase_scope_default: str = "global",
+    ) -> list[VerificationRule]:
+        """Return llm rules applicable to the current subtask."""
+        return [
+            r for r in self.llm_rules()
+            if self._rule_applies_to_subtask(
+                r,
+                subtask_id,
+                phase_scope_default=phase_scope_default,
+            )
+        ]
 
     def get_deliverables(self) -> dict[str, list[str]]:
         """Return {phase_id: [deliverable_filenames]} for all phases."""
@@ -376,6 +450,11 @@ class ProcessLoader:
         rules = []
         verif = raw.get("verification", {})
         for r in verif.get("rules", []) if isinstance(verif, dict) else []:
+            applies_to = r.get("applies_to_phases", [])
+            if isinstance(applies_to, str):
+                applies_to = [applies_to]
+            if not isinstance(applies_to, list):
+                applies_to = []
             rules.append(VerificationRule(
                 name=r.get("name", ""),
                 description=r.get("description", ""),
@@ -383,6 +462,13 @@ class ProcessLoader:
                 severity=r.get("severity", "warning"),
                 type=r.get("type", "llm"),
                 target=r.get("target", "output"),
+                enforcement=r.get("enforcement", ""),
+                scope=r.get("scope", ""),
+                applies_to_phases=[str(p).strip() for p in applies_to if str(p).strip()],
+                requires_exact_cardinality=bool(
+                    r.get("requires_exact_cardinality", False)
+                ),
+                min_count=r.get("min_count"),
             ))
 
         # Memory types
@@ -642,6 +728,34 @@ class ProcessLoader:
                 errors.append(
                     f"Rule {rule.name!r}: invalid type {rule.type!r}",
                 )
+            if rule.enforcement and rule.enforcement not in ("hard", "advisory"):
+                errors.append(
+                    f"Rule {rule.name!r}: invalid enforcement {rule.enforcement!r}",
+                )
+            if rule.scope and rule.scope not in ("phase", "global"):
+                errors.append(
+                    f"Rule {rule.name!r}: invalid scope {rule.scope!r}",
+                )
+            for phase_id in rule.applies_to_phases:
+                if phase_id == "*":
+                    continue
+                if phase_id not in phase_ids:
+                    errors.append(
+                        f"Rule {rule.name!r}: applies_to_phases contains unknown phase "
+                        f"{phase_id!r}",
+                    )
+            if rule.min_count is not None:
+                try:
+                    min_count = int(rule.min_count)
+                except (TypeError, ValueError):
+                    errors.append(
+                        f"Rule {rule.name!r}: min_count must be an integer",
+                    )
+                else:
+                    if min_count < 0:
+                        errors.append(
+                            f"Rule {rule.name!r}: min_count must be >= 0",
+                        )
             # Validate regex rules compile
             if rule.type == "regex":
                 try:

@@ -184,7 +184,7 @@ class TestOpenAIProviderErrors:
 
             normalized = provider._build_openai_messages(messages)
 
-            assert normalized[0]["content"] == "Tool call required to continue."
+            assert normalized[0]["content"] == "Tool call context omitted."
             assert normalized[0]["tool_calls"][0]["id"].startswith("call_")
             assert isinstance(
                 normalized[0]["tool_calls"][0]["function"]["arguments"], str,
@@ -204,7 +204,7 @@ class TestOpenAIProviderErrors:
 
             normalized = provider._build_openai_messages(messages)
 
-            assert normalized[0]["content"] == "Tool call required to continue."
+            assert normalized[0]["content"] == "Tool call context omitted."
         finally:
             asyncio.run(provider._client.aclose())
 
@@ -376,7 +376,7 @@ class TestOpenAIProviderErrors:
         retry_payload = provider._client.post.await_args_list[1].kwargs["json"]
         assert (
             retry_payload["messages"][1]["reasoning_content"]
-            == "Tool call required to continue."
+            == "Tool call context omitted."
         )
 
     @pytest.mark.asyncio
@@ -454,7 +454,7 @@ class TestOpenAIProviderErrors:
         assert "reasoning_content" not in first_payload["messages"][1]
         assert (
             second_payload["messages"][1]["reasoning_content"]
-            == "Tool call required to continue."
+            == "Tool call context omitted."
         )
 
     @pytest.mark.asyncio

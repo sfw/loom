@@ -26,7 +26,7 @@ def tool_args_preview(tool_name: str, args: dict) -> str:
         return _trunc(f"/{args.get('pattern', '')}/", 60)
     if tool_name == "glob_find":
         return _trunc(args.get("pattern", ""), 60)
-    if tool_name in ("web_fetch", "web_search"):
+    if tool_name in ("web_fetch", "web_fetch_html", "web_search"):
         return _trunc(args.get("url", args.get("query", "")), 60)
     if tool_name == "task_tracker":
         action = args.get("action", "")
