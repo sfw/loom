@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import textwrap
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -159,6 +160,7 @@ _MAX_CONCURRENT_PROCESS_RUNS = 4
 _MAX_PERSISTED_PROCESS_RUNS = 12
 _MAX_PERSISTED_PROCESS_ACTIVITY = 300
 _MAX_PERSISTED_PROCESS_RESULTS = 120
+_INFO_WRAP_WIDTH = 108
 
 
 class ProcessRunPane(Vertical):
@@ -742,32 +744,183 @@ class LoomApp(App):
                 "and were skipped in TUI.[/dim]"
             )
 
+    @staticmethod
+    def _escape_markup(value: object | None) -> str:
+        """Escape Rich markup control chars in user/content-provided text."""
+        if value is None:
+            return ""
+        return str(value).replace("[", "\\[")
+
+    @staticmethod
+    def _wrap_info_text(
+        text: str,
+        *,
+        initial_indent: str = "",
+        subsequent_indent: str = "",
+    ) -> str:
+        """Wrap long informational text for chat readability."""
+        if not text:
+            return ""
+        return textwrap.fill(
+            " ".join(text.split()),
+            width=_INFO_WRAP_WIDTH,
+            initial_indent=initial_indent,
+            subsequent_indent=subsequent_indent,
+        )
+
+    def _render_process_usage(self) -> str:
+        """Render `/process` usage with clear hierarchy."""
+        active = self._escape_markup(self._active_process_name())
+        return "\n".join([
+            "[bold #7dcfff]Process Controls[/bold #7dcfff]",
+            f"  [bold]Active:[/] {active}",
+            "  [bold]Commands:[/]",
+            "    /process list",
+            "    /process use <name-or-path>",
+            "    /process off",
+            "    /<process-name> <goal>",
+        ])
+
+    def _render_tools_catalog(self) -> str:
+        """Render `/tools` output as a wrapped catalog."""
+        tools = self._tools.list_tools()
+        lines = [f"[bold #7dcfff]Tools[/bold #7dcfff] [dim]({len(tools)})[/dim]"]
+        if not tools:
+            lines.append("  [dim](none)[/dim]")
+            return "\n".join(lines)
+        joined = ", ".join(self._escape_markup(tool) for tool in tools)
+        lines.append(
+            self._wrap_info_text(
+                joined,
+                initial_indent="  ",
+                subsequent_indent="  ",
+            )
+        )
+        return "\n".join(lines)
+
+    def _render_session_info(self, state) -> str:
+        """Render `/session` output with compact sections."""
+        session_id = self._escape_markup(self._session.session_id if self._session else "?")
+        workspace = self._escape_markup(self._session.workspace if self._session else "?")
+        process_name = self._escape_markup(self._active_process_name())
+        focus = self._escape_markup(state.current_focus or "(none)")
+
+        lines = [
+            "[bold #7dcfff]Current Session[/bold #7dcfff]",
+            f"  [bold]ID:[/] [dim]{session_id}[/dim]",
+            f"  [bold]Workspace:[/] [dim]{workspace}[/dim]",
+            f"  [bold]Process:[/] {process_name}",
+            f"  [bold]Turns:[/] {state.turn_count}",
+            f"  [bold]Tokens:[/] {state.total_tokens:,}",
+            f"  [bold]Focus:[/] {focus}",
+        ]
+        if state.key_decisions:
+            lines.append("  [bold]Recent Decisions:[/]")
+            for decision in state.key_decisions[-5:]:
+                lines.append(
+                    self._wrap_info_text(
+                        self._escape_markup(decision),
+                        initial_indent="    - ",
+                        subsequent_indent="      ",
+                    )
+                )
+        return "\n".join(lines)
+
+    def _render_sessions_list(self, sessions: list[dict]) -> str:
+        """Render `/sessions` output with readable per-session rows."""
+        lines = [
+            "[bold #7dcfff]Recent Sessions[/bold #7dcfff]",
+            "[dim]Use /resume <session-id-prefix> to switch[/dim]",
+        ]
+        for row in sessions[:10]:
+            sid = self._escape_markup(str(row.get("id", "")))
+            turns = int(row.get("turn_count", 0) or 0)
+            started = self._escape_markup(str(row.get("started_at", "?"))[:16])
+            ws = self._escape_markup(row.get("workspace_path", "?"))
+
+            badges: list[str] = []
+            if row.get("is_active"):
+                badges.append("[green]active[/green]")
+            if self._session and sid == self._session.session_id:
+                badges.append("[cyan]current[/cyan]")
+            badge_text = f" [dim]({' | '.join(badges)})[/dim]" if badges else ""
+
+            lines.append(
+                f"  [bold]{sid[:12]}...[/bold]  [dim]{started}[/dim]  "
+                f"{turns} turns{badge_text}"
+            )
+            lines.append(
+                self._wrap_info_text(
+                    ws,
+                    initial_indent="    ",
+                    subsequent_indent="    ",
+                )
+            )
+        return "\n".join(lines)
+
+    def _render_startup_summary(self, *, tool_count: int, persisted: str) -> str:
+        """Render startup summary block with workspace/session details."""
+        workspace = self._escape_markup(self._workspace)
+        process_name = self._escape_markup(self._active_process_name())
+        lines = [
+            f"[bold #7dcfff]Loom[/bold #7dcfff]  [dim]({self._model.name})[/dim]",
+            f"  [bold]Workspace:[/] [dim]{workspace}[/dim]",
+            f"  [bold]Tools:[/] {tool_count}",
+            f"  [bold]Session Mode:[/] {persisted}",
+            f"  [bold]Process:[/] {process_name}",
+        ]
+        if self._session and self._session.session_id:
+            lines.append(
+                f"  [bold]Session ID:[/] [dim]{self._escape_markup(self._session.session_id)}[/dim]"
+            )
+        return "\n".join(lines)
+
     def _render_process_catalog(self) -> str:
         """Build a human-readable process list."""
         self._refresh_process_command_index()
         available = self._cached_process_catalog
         if not available:
             if self._blocked_process_commands:
-                blocked = ", ".join(self._blocked_process_commands)
-                return (
-                    "No selectable process definitions found.\n"
-                    f"[dim]Blocked (name collisions): {blocked}[/dim]"
+                blocked = ", ".join(
+                    self._escape_markup(name) for name in self._blocked_process_commands
                 )
-            return "No process definitions found."
+                return (
+                    "[bold #7dcfff]Available Processes[/bold #7dcfff]\n"
+                    "  [dim]No selectable process definitions found.[/dim]\n"
+                    f"  [#f7768e]Blocked (name collisions): {blocked}[/]"
+                )
+            return (
+                "[bold #7dcfff]Available Processes[/bold #7dcfff]\n"
+                "  [dim]No process definitions found.[/dim]"
+            )
 
         active = self._process_defn.name if self._process_defn else ""
-        lines = ["[bold]Available processes:[/bold]"]
+        lines = [
+            "[bold #7dcfff]Available Processes[/bold #7dcfff]",
+            "[dim]Run directly with /<process-name> <goal> "
+            "or set active with /process use <name-or-path>[/dim]",
+        ]
         for proc in available:
-            name = proc["name"]
-            ver = proc["version"]
-            desc = proc.get("description", "").strip().split("\n")[0]
-            marker = " [cyan]<< active[/cyan]" if name == active else ""
-            lines.append(f"  {name:30s} v{ver:6s}{marker}")
+            name = str(proc.get("name", "")).strip()
+            ver = str(proc.get("version", "")).strip()
+            desc = str(proc.get("description", "")).strip().split("\n")[0]
+            marker = " [cyan](active)[/cyan]" if name == active else ""
+            safe_name = self._escape_markup(name)
+            safe_ver = self._escape_markup(ver)
+            lines.append(f"  [bold]{safe_name}[/bold] [dim]v{safe_ver}[/dim]{marker}")
             if desc:
-                lines.append(f"    [dim]{desc[:80]}[/dim]")
+                lines.append(
+                    self._wrap_info_text(
+                        self._escape_markup(desc),
+                        initial_indent="    ",
+                        subsequent_indent="    ",
+                    )
+                )
         if self._blocked_process_commands:
-            blocked = ", ".join(self._blocked_process_commands)
-            lines.append(f"[dim]Blocked (name collisions): {blocked}[/dim]")
+            blocked = ", ".join(
+                f"/{self._escape_markup(name)}" for name in self._blocked_process_commands
+            )
+            lines.append(f"  [#f7768e]Blocked (name collisions): {blocked}[/]")
         return "\n".join(lines)
 
     @staticmethod
@@ -898,8 +1051,9 @@ class LoomApp(App):
                     else "Resumed session"
                 )
                 chat.add_info(
-                    f"{resume_label} [dim]{resume_target}[/dim] "
-                    f"({self._session.session_state.turn_count} turns)"
+                    f"[bold #7dcfff]{resume_label}[/bold #7dcfff]\n"
+                    f"  [bold]Session ID:[/] [dim]{self._escape_markup(resume_target)}[/dim]\n"
+                    f"  [bold]Turns:[/] {self._session.session_state.turn_count}"
                 )
             except Exception as e:
                 chat.add_info(
@@ -949,17 +1103,9 @@ class LoomApp(App):
         status.process_name = self._active_process_name()
 
         # Welcome message
-        chat.add_info(
-            f"[bold]Loom[/bold]  [dim]({self._model.name})[/dim]"
-        )
-        chat.add_info(f"workspace: {self._workspace}")
         tool_count = len(self._tools.list_tools())
         persisted = "persisted" if self._store else "ephemeral"
-        chat.add_info(f"{tool_count} tools loaded. Session: {persisted}.")
-        if self._session and self._session.session_id:
-            chat.add_info(
-                f"[dim]session: {self._session.session_id}[/dim]"
-            )
+        chat.add_info(self._render_startup_summary(tool_count=tool_count, persisted=persisted))
         await self._restore_process_run_tabs(chat)
         self._process_close_hint_shown = bool(self._process_runs)
 
@@ -1376,11 +1522,15 @@ class LoomApp(App):
         self._refresh_sidebar_progress_summary()
 
         if restored and chat is not None:
-            info = f"Restored {restored} process run tab(s) for this session."
+            info = (
+                "[bold #7dcfff]Restored Process Tabs[/bold #7dcfff]\n"
+                f"  [bold]Count:[/] {restored}"
+            )
             if interrupted:
                 info += (
-                    f" {interrupted} interrupted run(s) were marked failed "
-                    "because execution cannot resume after restart."
+                    "\n"
+                    f"  [#f7768e]{interrupted} interrupted run(s) were marked failed "
+                    "because execution cannot resume after restart.[/]"
                 )
             chat.add_info(info)
 
@@ -1925,33 +2075,61 @@ class LoomApp(App):
 
     def _help_lines(self) -> list[str]:
         """Build slash help lines from the shared command registry."""
-        lines = ["Slash commands:"]
+        lines = ["[bold #7dcfff]Slash Commands[/bold #7dcfff]"]
         for spec in _SLASH_COMMANDS:
             label = spec.canonical
             if spec.usage:
                 label = f"{label} {spec.usage}"
             if spec.aliases:
                 alias_str = ", ".join(spec.aliases)
-                label = f"{label} ({alias_str})"
-            lines.append(f"  {label:<34} {spec.description}")
+                label = f"{label} (aliases: {alias_str})"
+            lines.append(f"  [bold]{self._escape_markup(label)}[/bold]")
+            lines.append(
+                self._wrap_info_text(
+                    self._escape_markup(spec.description),
+                    initial_indent="    ",
+                    subsequent_indent="    ",
+                )
+            )
         if self._process_command_map:
             lines.append("")
-            lines.append("Process slash commands:")
+            lines.append("[bold #7dcfff]Process Slash Commands[/bold #7dcfff]")
             for token, process_name in sorted(self._process_command_map.items()):
+                lines.append(f"  [bold]{self._escape_markup(token)} <goal>[/bold]")
                 lines.append(
-                    f"  {f'{token} <goal>':<34} run goal via process '{process_name}'"
+                    self._wrap_info_text(
+                        self._escape_markup(
+                            f"Run goal via process '{process_name}'"
+                        ),
+                        initial_indent="    ",
+                        subsequent_indent="    ",
+                    )
                 )
         if self._blocked_process_commands:
             blocked = ", ".join(f"/{name}" for name in self._blocked_process_commands)
             lines.append("")
             lines.append(
-                f"[#f7768e]Blocked process commands (name collisions): {blocked}[/]"
+                "[#f7768e]Blocked process commands (name collisions): "
+                f"{self._escape_markup(blocked)}[/]"
             )
-        lines.append(
-            "Keys: Ctrl+B sidebar, Ctrl+L clear, Ctrl+R reload workspace, "
-            "Ctrl+W close run tab, Ctrl+P palette, Ctrl+1/2/3 tabs",
-        )
+        lines.extend([
+            "",
+            "[bold #7dcfff]Keys[/bold #7dcfff]",
+            self._wrap_info_text(
+                "Ctrl+B sidebar, Ctrl+L clear, Ctrl+R reload workspace, "
+                "Ctrl+W close run tab, Ctrl+P palette, Ctrl+1/2/3 tabs",
+                initial_indent="  ",
+                subsequent_indent="  ",
+            ),
+        ])
         return lines
+
+    def _render_slash_command_usage(self, command: str, usage: str) -> str:
+        """Render a usage error block for slash commands."""
+        return (
+            f"[bold #7dcfff]Usage[/bold #7dcfff]\n"
+            f"  [bold]{self._escape_markup(command)}[/bold] {self._escape_markup(usage)}"
+        )
 
     def _matching_slash_commands(
         self,
@@ -2299,7 +2477,10 @@ class LoomApp(App):
         chat = self.query_one("#chat-log", ChatLog)
         await self._restore_process_run_tabs(chat)
         self._process_close_hint_shown = bool(self._process_runs)
-        chat.add_info(f"New session: [dim]{session_id}[/dim]")
+        chat.add_info(
+            "[bold #7dcfff]New Session Created[/bold #7dcfff]\n"
+            f"  [bold]Session ID:[/] [dim]{self._escape_markup(session_id)}[/dim]"
+        )
 
     async def _switch_to_session(self, session_id: str) -> None:
         """Resume a different session by ID."""
@@ -2331,8 +2512,9 @@ class LoomApp(App):
         await self._restore_process_run_tabs(chat)
         self._process_close_hint_shown = bool(self._process_runs)
         chat.add_info(
-            f"Switched to session [dim]{session_id}[/dim] "
-            f"({new_session.session_state.turn_count} turns)"
+            "[bold #7dcfff]Switched Session[/bold #7dcfff]\n"
+            f"  [bold]Session ID:[/] [dim]{self._escape_markup(session_id)}[/dim]\n"
+            f"  [bold]Turns:[/] {new_session.session_state.turn_count}"
         )
 
     # ------------------------------------------------------------------
@@ -2516,7 +2698,7 @@ class LoomApp(App):
             manager = self._mcp_manager()
             if not arg:
                 chat.add_info(
-                    "Usage:\n"
+                    "[bold #7dcfff]MCP Commands[/bold #7dcfff]\n"
                     "  /mcp list\n"
                     "  /mcp show <alias>\n"
                     "  /mcp test <alias>\n"
@@ -2547,7 +2729,7 @@ class LoomApp(App):
 
             if subcmd == "show":
                 if not rest:
-                    chat.add_info("Usage: /mcp show <alias>")
+                    chat.add_info(self._render_slash_command_usage("/mcp show", "<alias>"))
                     return True
                 try:
                     alias = ensure_valid_alias(rest)
@@ -2571,7 +2753,7 @@ class LoomApp(App):
 
             if subcmd == "test":
                 if not rest:
-                    chat.add_info("Usage: /mcp test <alias>")
+                    chat.add_info(self._render_slash_command_usage("/mcp test", "<alias>"))
                     return True
                 try:
                     alias = ensure_valid_alias(rest)
@@ -2596,7 +2778,7 @@ class LoomApp(App):
 
             if subcmd in {"enable", "disable"}:
                 if not rest:
-                    chat.add_info(f"Usage: /mcp {subcmd} <alias>")
+                    chat.add_info(self._render_slash_command_usage(f"/mcp {subcmd}", "<alias>"))
                     return True
                 try:
                     alias = ensure_valid_alias(rest)
@@ -2617,7 +2799,7 @@ class LoomApp(App):
 
             if subcmd == "remove":
                 if not rest:
-                    chat.add_info("Usage: /mcp remove <alias>")
+                    chat.add_info(self._render_slash_command_usage("/mcp remove", "<alias>"))
                     return True
                 try:
                     alias = ensure_valid_alias(rest)
@@ -2629,8 +2811,13 @@ class LoomApp(App):
                 return True
 
             chat.add_info(
-                "Usage: /mcp [list|show <alias>|test <alias>|enable <alias>|"
-                "disable <alias>|remove <alias>]"
+                self._render_slash_command_usage(
+                    "/mcp",
+                    (
+                        "[list|show <alias>|test <alias>|enable <alias>|"
+                        "disable <alias>|remove <alias>]"
+                    ),
+                )
             )
             return True
         if token == "/setup":
@@ -2639,10 +2826,7 @@ class LoomApp(App):
             )
             return True
         if token == "/tools":
-            tools = self._tools.list_tools()
-            chat.add_info(
-                f"{len(tools)} tools: " + ", ".join(tools)
-            )
+            chat.add_info(self._render_tools_catalog())
             return True
         if token == "/tokens":
             chat.add_info(f"Session tokens: {self._total_tokens:,}")
@@ -2650,14 +2834,7 @@ class LoomApp(App):
         if token == "/process":
             self._refresh_process_command_index()
             if not arg:
-                active = self._active_process_name()
-                chat.add_info(
-                    f"Active process: {active}\n"
-                    "Usage:\n"
-                    "  /process list\n"
-                    "  /process use <name-or-path>\n"
-                    "  /process off"
-                )
+                chat.add_info(self._render_process_usage())
                 return True
 
             subparts = arg.split(None, 1)
@@ -2670,7 +2847,12 @@ class LoomApp(App):
 
             if subcmd == "use":
                 if not rest:
-                    chat.add_info("Usage: /process use <name-or-path>")
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/process use",
+                            "<name-or-path>",
+                        )
+                    )
                     return True
                 loader = self._create_process_loader()
                 try:
@@ -2692,7 +2874,9 @@ class LoomApp(App):
                 await self._reload_session_for_process_change(chat)
                 self._refresh_process_command_index(chat=chat, notify_conflicts=True)
                 chat.add_info(
-                    f"Active process: [bold]{loaded.name}[/bold] v{loaded.version}"
+                    "[bold #7dcfff]Active Process Updated[/bold #7dcfff]\n"
+                    f"  [bold]Name:[/] [bold]{self._escape_markup(loaded.name)}[/bold]\n"
+                    f"  [bold]Version:[/] [dim]v{self._escape_markup(loaded.version)}[/dim]"
                 )
                 return True
 
@@ -2703,11 +2887,17 @@ class LoomApp(App):
                 self._process_name = None
                 self._process_defn = None
                 await self._reload_session_for_process_change(chat)
-                chat.add_info("Active process: none")
+                chat.add_info(
+                    "[bold #7dcfff]Active Process Updated[/bold #7dcfff]\n"
+                    "  [bold]Name:[/] none"
+                )
                 return True
 
             chat.add_info(
-                "Usage: /process [list|use <name-or-path>|off]"
+                self._render_slash_command_usage(
+                    "/process",
+                    "[list|use <name-or-path>|off]",
+                )
             )
             return True
 
@@ -2719,7 +2909,7 @@ class LoomApp(App):
                     return True
             goal = self._strip_wrapping_quotes(arg)
             if not goal:
-                chat.add_info("Usage: /run <goal>")
+                chat.add_info(self._render_slash_command_usage("/run", "<goal>"))
                 return True
             if self._process_defn is None:
                 chat.add_info(
@@ -2733,7 +2923,9 @@ class LoomApp(App):
         if process_name:
             goal = self._strip_wrapping_quotes(arg)
             if not goal:
-                chat.add_info(f"Usage: /{process_name} <goal>")
+                chat.add_info(
+                    self._render_slash_command_usage(f"/{process_name}", "<goal>")
+                )
                 return True
             loader = self._create_process_loader()
             try:
@@ -2763,19 +2955,7 @@ class LoomApp(App):
                 chat.add_info("No active session.")
                 return True
             state = self._session.session_state
-            info = (
-                f"Session: {self._session.session_id}\n"
-                f"Workspace: {self._session.workspace}\n"
-                f"Process: {self._active_process_name()}\n"
-                f"Turns: {state.turn_count}\n"
-                f"Tokens: {state.total_tokens}\n"
-                f"Focus: {state.current_focus or '(none)'}"
-            )
-            if state.key_decisions:
-                info += "\nDecisions:"
-                for d in state.key_decisions[-5:]:
-                    info += f"\n  - {d}"
-            chat.add_info(info)
+            chat.add_info(self._render_session_info(state))
             return True
 
         if token == "/new":
@@ -2793,30 +2973,14 @@ class LoomApp(App):
             if not all_sessions:
                 chat.add_info("No previous sessions.")
                 return True
-            lines = ["[bold]Sessions:[/bold]"]
-            for s in all_sessions[:10]:
-                sid = s["id"]
-                turns = s.get("turn_count", 0)
-                started = s.get("started_at", "?")[:16]
-                ws = s.get("workspace_path", "?")
-                active = " [green](active)[/green]" if s.get("is_active") else ""
-                current = " [cyan]<< current[/cyan]" if (
-                    self._session and sid == self._session.session_id
-                ) else ""
-                lines.append(
-                    f"  [dim]{started}[/dim] {turns} turns "
-                    f"[dim]{sid[:12]}...[/dim]{active}{current}"
-                )
-                lines.append(f"    [dim]{ws}[/dim]")
-            chat.add_info("\n".join(lines))
-            chat.add_info(
-                "[dim]To switch: type the session ID prefix after /resume[/dim]"
-            )
+            chat.add_info(self._render_sessions_list(all_sessions))
             return True
 
         if token == "/resume":
             if not arg:
-                chat.add_info("Usage: /resume <session-id-prefix>")
+                chat.add_info(
+                    self._render_slash_command_usage("/resume", "<session-id-prefix>")
+                )
                 return True
             prefix = arg.lower()
             if not self._store:
@@ -3805,9 +3969,8 @@ class LoomApp(App):
         self._set_slash_hint(self._render_slash_hint(text))
 
     def _show_tools(self) -> None:
-        tools = self._tools.list_tools()
         chat = self.query_one("#chat-log", ChatLog)
-        chat.add_info(f"{len(tools)} tools: " + ", ".join(tools))
+        chat.add_info(self._render_tools_catalog())
 
     def _show_model_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)

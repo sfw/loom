@@ -425,6 +425,36 @@ class TestChatLogStreaming:
         assert log._stream_text == ""
         assert log._stream_buffer == []
 
+    def test_static_messages_expand_to_available_width(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_user_message("hello")
+        log.add_model_text("world")
+        log.add_info("info")
+        log.add_turn_separator(tool_count=1, tokens=42, model="test-model")
+
+        assert mounted
+        assert all(getattr(widget, "expand", False) for widget in mounted)
+
+    def test_streaming_widget_expands_to_available_width(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_streaming_text("hello")
+
+        assert log._stream_widget is not None
+        assert log._stream_widget.expand is True
+        assert mounted == [log._stream_widget]
+
 
 # --- CoworkSession total_tokens tests ---
 
@@ -1797,6 +1827,37 @@ class TestSlashCommandHints:
         ]
 
 
+class TestProcessCatalogRendering:
+    def test_process_catalog_renders_full_description_without_truncation(self):
+        from loom.tui.app import LoomApp
+
+        description = (
+            "End-to-end market research workflow across geography, demand, "
+            "competitor mapping, environmental risk, and synthesis deliverables."
+        )
+        assert len(description) > 80
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=[
+                {
+                    "name": "market-research",
+                    "version": "1.0",
+                    "description": description,
+                },
+            ])
+        ))
+
+        rendered = app._render_process_catalog()
+
+        assert "End-to-end market research workflow across geography" in rendered
+        assert "and synthesis deliverables." in rendered
+
+
 class TestProcessSlashCommands:
     @pytest.mark.asyncio
     async def test_process_without_args_shows_usage(self):
@@ -1816,7 +1877,8 @@ class TestProcessSlashCommands:
         assert handled is True
         chat.add_info.assert_called_once()
         message = chat.add_info.call_args.args[0]
-        assert "Active process: marketing-strategy" in message
+        assert "Process Controls" in message
+        assert "Active:[/] marketing-strategy" in message
         assert "/process use <name-or-path>" in message
 
     @pytest.mark.asyncio
@@ -1853,7 +1915,11 @@ class TestProcessSlashCommands:
         handled = await app._handle_slash_command("/process use")
 
         assert handled is True
-        chat.add_info.assert_called_once_with("Usage: /process use <name-or-path>")
+        chat.add_info.assert_called_once()
+        message = chat.add_info.call_args.args[0]
+        assert "Usage" in message
+        assert "/process use" in message
+        assert "<name-or-path>" in message
 
     @pytest.mark.asyncio
     async def test_process_use_load_error(self):
@@ -1902,9 +1968,10 @@ class TestProcessSlashCommands:
         assert handled is True
         assert app._process_name == "marketing-strategy"
         app._reload_session_for_process_change.assert_awaited_once()
-        assert "Active process: [bold]marketing-strategy[/bold] v1.0" in (
-            chat.add_info.call_args.args[0]
-        )
+        message = chat.add_info.call_args.args[0]
+        assert "Active Process Updated" in message
+        assert "Name:[/] [bold]marketing-strategy[/bold]" in message
+        assert "Version:[/] [dim]v1.0[/dim]" in message
 
     @pytest.mark.asyncio
     async def test_process_use_blocks_reserved_command_name(self):
@@ -1972,7 +2039,7 @@ class TestProcessSlashCommands:
         assert app._process_name is None
         assert app._process_defn is None
         app._reload_session_for_process_change.assert_awaited_once()
-        assert "Active process: none" in chat.add_info.call_args.args[0]
+        assert "Name:[/] none" in chat.add_info.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_run_requires_goal(self):
@@ -1989,7 +2056,11 @@ class TestProcessSlashCommands:
         handled = await app._handle_slash_command("/run")
 
         assert handled is True
-        chat.add_info.assert_called_once_with("Usage: /run <goal>")
+        chat.add_info.assert_called_once()
+        message = chat.add_info.call_args.args[0]
+        assert "Usage" in message
+        assert "/run" in message
+        assert "<goal>" in message
 
     @pytest.mark.asyncio
     async def test_run_requires_active_process(self):
@@ -2713,7 +2784,9 @@ class TestProcessSlashCommands:
         tabs.add_pane.assert_awaited_once()
         assert tabs.active == run.pane_id
         chat.add_info.assert_called_once()
-        assert "Restored 1 process run tab" in chat.add_info.call_args.args[0]
+        message = chat.add_info.call_args.args[0]
+        assert "Restored Process Tabs" in message
+        assert "Count:[/] 1" in message
 
     def test_process_progress_event_scoped_to_run_tab(self):
         from loom.tui.app import LoomApp
@@ -3344,7 +3417,11 @@ class TestMCPSlashCommands:
         handled = await app._handle_slash_command("/mcp show")
 
         assert handled is True
-        chat.add_info.assert_called_once_with("Usage: /mcp show <alias>")
+        chat.add_info.assert_called_once()
+        message = chat.add_info.call_args.args[0]
+        assert "Usage" in message
+        assert "/mcp show" in message
+        assert "<alias>" in message
 
     @pytest.mark.asyncio
     async def test_mcp_show_missing_alias(self):
@@ -3885,8 +3962,9 @@ class TestSlashHelp:
         )
         rendered = "\n".join(app._help_lines())
         assert "/resume <session-id-prefix>" in rendered
-        assert "/run <goal|close [run-id-prefix]>" in rendered
-        assert "/quit (/exit, /q)" in rendered
+        assert "/run <goal|close" in rendered
+        assert "run-id-prefix" in rendered
+        assert "/quit (aliases: /exit, /q)" in rendered
         assert "/setup" in rendered
         assert "Ctrl+R reload workspace" in rendered
         assert "Ctrl+W close run tab" in rendered
@@ -3906,7 +3984,11 @@ class TestSlashHelp:
         handled = await app._handle_slash_command("/resume")
 
         assert handled is True
-        chat.add_info.assert_called_once_with("Usage: /resume <session-id-prefix>")
+        chat.add_info.assert_called_once()
+        message = chat.add_info.call_args.args[0]
+        assert "Usage" in message
+        assert "/resume" in message
+        assert "<session-id-prefix>" in message
 
 
 class TestFileViewer:

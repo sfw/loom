@@ -24,13 +24,22 @@ class ChatLog(VerticalScroll):
     ChatLog .user-msg {
         margin: 1 0 0 0;
         padding: 0;
+        width: 100%;
     }
     ChatLog .model-text {
         margin: 0;
         padding: 0;
+        width: 100%;
     }
     ChatLog .turn-separator {
         margin: 1 0;
+        color: $text-muted;
+        width: 100%;
+    }
+    ChatLog .info-msg {
+        margin: 0;
+        padding: 0;
+        width: 100%;
         color: $text-muted;
     }
     """
@@ -49,6 +58,7 @@ class ChatLog(VerticalScroll):
             Static(
                 f"[bold #73daca]> {text}[/]",
                 classes="user-msg",
+                expand=True,
             )
         )
         self._scroll_to_end()
@@ -56,7 +66,7 @@ class ChatLog(VerticalScroll):
     def add_model_text(self, text: str) -> None:
         """Append model response text."""
         self._flush_and_reset_stream()
-        self.mount(Static(text, classes="model-text"))
+        self.mount(Static(text, classes="model-text", expand=True))
         self._scroll_to_end()
 
     def add_streaming_text(self, text: str) -> None:
@@ -69,7 +79,7 @@ class ChatLog(VerticalScroll):
 
         if self._stream_widget is None:
             self._stream_text = ""
-            self._stream_widget = Static("", classes="model-text")
+            self._stream_widget = Static("", classes="model-text", expand=True)
             self.mount(self._stream_widget)
 
         # Flush every 5 chunks or when text is large
@@ -131,13 +141,13 @@ class ChatLog(VerticalScroll):
             parts.append(model)
         detail = " | ".join(parts)
         line = f"[dim]\u2500\u2500\u2500 {detail} \u2500\u2500\u2500[/dim]"
-        self.mount(Static(line, classes="turn-separator"))
+        self.mount(Static(line, classes="turn-separator", expand=True))
         self._scroll_to_end()
 
     def add_info(self, text: str) -> None:
         """Add an informational message (e.g. welcome text)."""
         self._flush_and_reset_stream()
-        self.mount(Static(f"[dim]{text}[/dim]", classes="model-text"))
+        self.mount(Static(text, classes="info-msg", expand=True))
         self._scroll_to_end()
 
     def add_content_indicator(self, content_blocks: list) -> None:
@@ -163,6 +173,7 @@ class ChatLog(VerticalScroll):
                 self.mount(Static(
                     f"  [#bb9af7]\\[image: {label}][/]",
                     classes="model-text",
+                    expand=True,
                 ))
             elif isinstance(block, DocumentBlock):
                 name = _esc(block.source_path.rsplit("/", 1)[-1]) if block.source_path else ""
@@ -174,6 +185,7 @@ class ChatLog(VerticalScroll):
                 self.mount(Static(
                     f"  [#7dcfff]\\[document: {label}][/]",
                     classes="model-text",
+                    expand=True,
                 ))
         if content_blocks:
             self._scroll_to_end()
