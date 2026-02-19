@@ -9,14 +9,15 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+from loom.engine.semantic_compactor import SemanticCompactor
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
 if TYPE_CHECKING:
     from loom.state.conversation_store import ConversationStore
 
 
-# Max output size in characters (~8K tokens at 4 chars/token).
 MAX_OUTPUT_CHARS = 32_000
+MAX_TURN_CONTENT_CHARS = 2_200
 
 
 class ConversationRecallTool(Tool):
@@ -81,21 +82,25 @@ class ConversationRecallTool(Tool):
         store: ConversationStore | None = None,
         session_id: str = "",
         session_state: object | None = None,
+        compactor: SemanticCompactor | None = None,
     ):
         self._store = store
         self._session_id = session_id
         self._session_state = session_state
+        self._compactor = compactor
 
     def bind(
         self,
         store: ConversationStore,
         session_id: str,
         session_state: object | None = None,
+        compactor: SemanticCompactor | None = None,
     ) -> None:
         """Bind to a specific session after construction."""
         self._store = store
         self._session_id = session_id
         self._session_state = session_state
+        self._compactor = compactor
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         if self._store is None or not self._session_id:
@@ -128,7 +133,7 @@ class ConversationRecallTool(Tool):
         if not rows:
             return ToolResult.ok(f"No messages found matching '{query}'.")
 
-        return ToolResult.ok(_format_turns(rows))
+        return ToolResult.ok(await self._format_turns(rows))
 
     async def _range(self, start: int, end: int) -> ToolResult:
         if end < start:
@@ -138,7 +143,7 @@ class ConversationRecallTool(Tool):
         if not rows:
             return ToolResult.ok(f"No turns found in range {start}-{end}.")
 
-        return ToolResult.ok(_format_turns(rows))
+        return ToolResult.ok(await self._format_turns(rows))
 
     async def _tool_calls(self, tool_name: str, limit: int) -> ToolResult:
         if not tool_name:
@@ -150,18 +155,31 @@ class ConversationRecallTool(Tool):
         if not rows:
             return ToolResult.ok(f"No calls to '{tool_name}' found in archive.")
 
-        return ToolResult.ok(_format_turns(rows))
+        return ToolResult.ok(await self._format_turns(rows))
 
     def _summary(self) -> ToolResult:
         if self._session_state and hasattr(self._session_state, "to_yaml"):
             return ToolResult.ok(self._session_state.to_yaml())
         return ToolResult.ok("No session state available.")
 
+    async def _format_turns(self, rows: list[dict]) -> str:
+        rendered = await _format_turns(rows, compactor=self._compactor)
+        if self._compactor and len(rendered) > MAX_OUTPUT_CHARS:
+            return await self._compactor.compact(
+                rendered,
+                max_chars=MAX_OUTPUT_CHARS,
+                label="conversation recall results",
+            )
+        return rendered
 
-def _format_turns(rows: list[dict]) -> str:
+
+async def _format_turns(
+    rows: list[dict],
+    *,
+    compactor: SemanticCompactor | None,
+) -> str:
     """Format turn rows as compact text for the model."""
     parts = []
-    total_len = 0
 
     for row in rows:
         turn = row.get("turn_number", "?")
@@ -183,18 +201,13 @@ def _format_turns(rows: list[dict]) -> str:
         else:
             header = f"[Turn {turn}] {role}"
 
-        # Truncate very large content (e.g. file reads)
-        if len(content) > 2000:
-            content = content[:2000] + f"\n  [... truncated, {len(content)} chars total]"
+        if compactor and len(content) > MAX_TURN_CONTENT_CHARS:
+            content = await compactor.compact(
+                content,
+                max_chars=MAX_TURN_CONTENT_CHARS,
+                label=f"conversation recall turn {turn}",
+            )
 
-        entry = f"{header}:\n  {content}" if content else header
-        entry_len = len(entry)
-
-        if total_len + entry_len > MAX_OUTPUT_CHARS:
-            parts.append(f"[... {len(rows) - len(parts)} more turns truncated]")
-            break
-
-        parts.append(entry)
-        total_len += entry_len
+        parts.append(f"{header}:\n  {content}" if content else header)
 
     return "\n\n".join(parts)

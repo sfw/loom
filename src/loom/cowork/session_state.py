@@ -75,7 +75,7 @@ class SessionState:
 
     def set_focus(self, focus: str) -> None:
         """Update the current focus from the user's most recent message."""
-        self.current_focus = focus[:100] if focus else ""
+        self.current_focus = _normalize_inline(focus)
 
     def to_yaml(self) -> str:
         """Render as compact YAML for system prompt injection."""
@@ -208,12 +208,20 @@ def extract_state_from_tool_events(
                         msg = git_args[i + 1]
                         break
                 if msg:
-                    state.record_decision(f"git commit: {msg[:80]}", turn_number)
+                    state.record_decision(
+                        f"git commit: {_normalize_inline(msg)}",
+                        turn_number,
+                    )
 
         elif name == "shell_execute":
             if result and not result.success:
-                cmd = args.get("command", "")[:60]
-                error_msg = (result.error or "")[:80]
+                cmd = _normalize_inline(str(args.get("command", "")))
+                error_msg = _normalize_inline(result.error or "")
                 state.record_error(
                     f"Command failed: {cmd} — {error_msg}", turn_number,
                 )
+
+
+def _normalize_inline(value: str) -> str:
+    """Collapse whitespace for inline session-state fields."""
+    return " ".join(str(value or "").split())

@@ -65,7 +65,7 @@ class LearningManager:
                         "success": success,
                         "retries": subtask.retry_count,
                         "model_tier": subtask.model_tier,
-                        "description": subtask.description[:100],
+                        "description": subtask.description,
                     },
                 ))
 
@@ -104,7 +104,7 @@ class LearningManager:
                 pattern_key=f"error-{error.subtask}",
                 data={
                     "subtask": error.subtask,
-                    "error": error.error[:200],
+                    "error": error.error,
                     "resolution": error.resolution or "",
                 },
             ))

@@ -25,6 +25,10 @@ from loom.models.base import (
     TokenUsage,
     ToolCall,
 )
+from loom.models.request_diagnostics import (
+    collect_request_diagnostics,
+    log_request_diagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +36,7 @@ logger = logging.getLogger(__name__)
 class OpenAICompatibleProvider(ModelProvider):
     """Provider for OpenAI-compatible API endpoints."""
 
-    ASSISTANT_CONTENT_FALLBACK = "Tool call required to continue."
+    ASSISTANT_CONTENT_FALLBACK = "Tool call context omitted."
 
     def __init__(self, config: ModelConfig, provider_name: str = "", tier_override: int = 0):
         self._config = config
@@ -135,6 +139,18 @@ class OpenAICompatibleProvider(ModelProvider):
             payload["tools"] = self._format_tools(tools)
         if response_format:
             payload["response_format"] = response_format
+        diagnostics = collect_request_diagnostics(
+            messages=payload.get("messages", []),
+            tools=payload.get("tools", []),
+            payload=payload,
+        )
+        log_request_diagnostics(
+            logger=logger,
+            provider_name=self._provider_name,
+            model_name=self._model,
+            operation="complete",
+            diagnostics=diagnostics,
+        )
 
         start = time.monotonic()
         try:
@@ -262,6 +278,18 @@ class OpenAICompatibleProvider(ModelProvider):
         }
         if tools:
             payload["tools"] = self._format_tools(tools)
+        diagnostics = collect_request_diagnostics(
+            messages=payload.get("messages", []),
+            tools=payload.get("tools", []),
+            payload=payload,
+        )
+        log_request_diagnostics(
+            logger=logger,
+            provider_name=self._provider_name,
+            model_name=self._model,
+            operation="stream",
+            diagnostics=diagnostics,
+        )
 
         request_payload = payload
         tried_reasoning_retry = False

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from loom.recovery.retry import AttemptRecord, RetryManager
+from loom.recovery.retry import AttemptRecord, RetryManager, RetryStrategy
 
 
 class TestRetryManager:
@@ -77,3 +77,87 @@ class TestRetryManager:
     def test_max_retries_property(self):
         mgr = RetryManager(max_retries=5)
         assert mgr.max_retries == 5
+
+    def test_classify_failure_verifier_parse(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="Verification inconclusive: could not parse verifier output.",
+            execution_error="",
+        )
+        assert strategy == RetryStrategy.VERIFIER_PARSE
+        assert markets == []
+
+    def test_classify_failure_verifier_exception_is_verifier_parse(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback=(
+                "Verification inconclusive: verifier raised an exception: timeout"
+            ),
+            execution_error="",
+        )
+        assert strategy == RetryStrategy.VERIFIER_PARSE
+        assert markets == []
+
+    def test_classify_failure_rate_limit(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="Execution encountered a critical tool failure (HTTP 429).",
+            execution_error="",
+        )
+        assert strategy == RetryStrategy.RATE_LIMIT
+        assert markets == []
+
+    def test_classify_failure_evidence_gap_extracts_markets(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback=(
+                "Verification failed: No successful tool-call evidence found for market "
+                "'Arizona Water/Wastewater'. No successful tool-call evidence found for "
+                "market 'New Mexico Water/Wastewater'."
+            ),
+            execution_error="",
+        )
+        assert strategy == RetryStrategy.EVIDENCE_GAP
+        assert markets == ["Arizona Water/Wastewater", "New Mexico Water/Wastewater"]
+
+    def test_build_retry_context_includes_evidence_gap_plan(self):
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback=(
+                    "No successful tool-call evidence found for market "
+                    "'Arizona Water/Wastewater'."
+                ),
+                retry_strategy=RetryStrategy.EVIDENCE_GAP,
+                missing_markets=["Arizona Water/Wastewater"],
+            )
+        ]
+        context = mgr.build_retry_context(attempts)
+
+        assert "TARGETED RETRY PLAN" in context
+        assert "missing evidence coverage" in context
+        assert "Arizona Water/Wastewater" in context
+
+    def test_classify_failure_unconfirmed_data(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback=(
+                "Recommendations include unconfirmed claims; confirm-or-prune "
+                "remediation is required."
+            ),
+            execution_error="",
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    def test_build_retry_context_includes_unconfirmed_plan(self):
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="recommendation_unconfirmed",
+                retry_strategy=RetryStrategy.UNCONFIRMED_DATA,
+            ),
+        ]
+        context = mgr.build_retry_context(attempts)
+
+        assert "TARGETED RETRY PLAN" in context
+        assert "confirm-or-prune" in context

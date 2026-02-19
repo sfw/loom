@@ -35,6 +35,11 @@ class TestDefaultConfig:
         assert config.verification.tier2_enabled is True
         assert config.verification.tier3_enabled is False
         assert config.verification.tier3_vote_count == 3
+        assert config.verification.policy_engine_enabled is True
+        assert config.verification.regex_default_advisory is True
+        assert config.verification.phase_scope_default == "current_phase"
+        assert config.verification.allow_partial_verified is True
+        assert config.verification.unconfirmed_supporting_threshold == 0.30
 
     def test_database_path_expands_user(self):
         config = Config()
@@ -124,6 +129,25 @@ enable_streaming = true
     def test_enable_streaming_default_false(self):
         config = Config()
         assert config.execution.enable_streaming is False
+
+    def test_verification_policy_flags_loaded(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[verification]
+policy_engine_enabled = false
+regex_default_advisory = false
+phase_scope_default = "global"
+allow_partial_verified = false
+unconfirmed_supporting_threshold = 0.55
+auto_confirm_prune_critical_path = false
+""")
+        config = load_config(toml_file)
+        assert config.verification.policy_engine_enabled is False
+        assert config.verification.regex_default_advisory is False
+        assert config.verification.phase_scope_default == "global"
+        assert config.verification.allow_partial_verified is False
+        assert config.verification.unconfirmed_supporting_threshold == 0.55
+        assert config.verification.auto_confirm_prune_critical_path is False
 
     def test_load_mcp_servers(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

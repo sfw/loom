@@ -186,6 +186,7 @@ verification:
         Review numerical claims and ensure each has named source and date.
       severity: error
       type: llm
+      applies_to_phases: [market-sizing, competitive-analysis, customer-segmentation, measurement-plan, campaign-plan]
 
     - name: segments-mece
       description: "Segments should be distinct and decision-usable"
@@ -194,6 +195,7 @@ verification:
         target selection is justified.
       severity: warning
       type: llm
+      applies_to_phases: [customer-segmentation]
 
     - name: positioning-consistency
       description: "Positioning, channels, and campaign choices must align"
@@ -202,6 +204,7 @@ verification:
         positioning, and economics.
       severity: error
       type: llm
+      applies_to_phases: [positioning, channel-strategy, go-to-market-operating-plan, campaign-plan]
 
     - name: funnel-coherence
       description: "Funnel assumptions must be internally coherent"
@@ -210,6 +213,7 @@ verification:
         mathematically and operationally consistent.
       severity: error
       type: llm
+      applies_to_phases: [measurement-plan, go-to-market-operating-plan, campaign-plan]
 
     - name: ownership-clarity
       description: "Execution plan must have clear owners"
@@ -218,12 +222,14 @@ verification:
         cadence.
       severity: error
       type: llm
+      applies_to_phases: [go-to-market-operating-plan, campaign-plan]
 
     - name: no-placeholders
       description: "No placeholder text in deliverables"
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
       severity: error
       type: regex
+      applies_to_phases: ["*"]
 
 memory:
   extract_types:

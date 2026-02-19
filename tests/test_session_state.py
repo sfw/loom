@@ -37,10 +37,10 @@ class TestSessionState:
         state.set_focus("Implement user registration")
         assert state.current_focus == "Implement user registration"
 
-    def test_set_focus_truncation(self):
+    def test_set_focus_preserves_content(self):
         state = SessionState()
         state.set_focus("x" * 200)
-        assert len(state.current_focus) == 100
+        assert state.current_focus == "x" * 200
 
     def test_pruning_files(self):
         state = SessionState()

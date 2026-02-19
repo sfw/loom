@@ -9,10 +9,20 @@ Implements structured retry and escalation for failed subtasks:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 
 from loom.recovery.errors import ErrorCategory, categorize_error
+
+
+class RetryStrategy(StrEnum):
+    GENERIC = "generic"
+    RATE_LIMIT = "rate_limit"
+    VERIFIER_PARSE = "verifier_parse"
+    EVIDENCE_GAP = "evidence_gap"
+    UNCONFIRMED_DATA = "unconfirmed_data"
 
 
 @dataclass
@@ -23,6 +33,10 @@ class AttemptRecord:
     tier: int
     feedback: str | None = None
     error: str | None = None
+    successful_tool_calls: list = field(default_factory=list)
+    evidence_records: list[dict] = field(default_factory=list)
+    retry_strategy: RetryStrategy = RetryStrategy.GENERIC
+    missing_markets: list[str] = field(default_factory=list)
     error_category: ErrorCategory | None = None
     timestamp: str = ""
 
@@ -86,16 +100,110 @@ class RetryManager:
                 lines.append(f"  Verification feedback: {a.feedback}")
             if a.error:
                 lines.append(f"  Error: {a.error}")
+            if a.retry_strategy and a.retry_strategy != RetryStrategy.GENERIC:
+                lines.append(f"  Retry strategy: {a.retry_strategy.value}")
+            if a.missing_markets:
+                lines.append(
+                    "  Missing markets: " + ", ".join(a.missing_markets)
+                )
             if a.error_category and a.error_category != ErrorCategory.UNKNOWN:
                 categorized = categorize_error(a.error or "")
                 lines.append(f"  Error type: {a.error_category.value}")
                 lines.append(f"  Recovery hint: {categorized.recovery_hint}")
+
+        strategy = attempts[-1].retry_strategy if attempts else RetryStrategy.GENERIC
+        if strategy == RetryStrategy.RATE_LIMIT:
+            lines.append(
+                "\nTARGETED RETRY PLAN:\n"
+                "- Prior attempts hit rate limits/transient upstream errors.\n"
+                "- Reuse existing evidence and outputs; do not redo solved work.\n"
+                "- Fill only missing coverage gaps with minimal additional fetches.\n"
+                "- Prefer alternate sources and lighter requests."
+            )
+        elif strategy == RetryStrategy.EVIDENCE_GAP:
+            markets = attempts[-1].missing_markets
+            if markets:
+                market_list = ", ".join(markets)
+            else:
+                market_list = "missing markets from verifier feedback"
+            lines.append(
+                "\nTARGETED RETRY PLAN:\n"
+                "- Focus only on missing evidence coverage.\n"
+                f"- Gather evidence for: {market_list}.\n"
+                "- Keep existing validated evidence; avoid broad reruns.\n"
+                "- Update only rows/claims that currently lack evidence."
+            )
+        elif strategy == RetryStrategy.UNCONFIRMED_DATA:
+            lines.append(
+                "\nTARGETED RETRY PLAN:\n"
+                "- Run confirm-or-prune on unconfirmed claims.\n"
+                "- Preserve already confirmed findings.\n"
+                "- Remove or relabel any claim that cannot be confirmed.\n"
+                "- Keep recommendations fully confirmed."
+            )
 
         lines.append(
             "\nFix the issues identified above. "
             "Take a different approach if needed."
         )
         return "\n".join(lines)
+
+    @staticmethod
+    def classify_failure(
+        *,
+        verification_feedback: str | None,
+        execution_error: str | None,
+    ) -> tuple[RetryStrategy, list[str]]:
+        """Classify failure type and extract optional targeting details."""
+        feedback = str(verification_feedback or "")
+        error = str(execution_error or "")
+        haystack = " ".join([feedback, error]).lower()
+
+        if "could not parse verifier output" in haystack:
+            return RetryStrategy.VERIFIER_PARSE, []
+        if any(marker in haystack for marker in (
+            "parse_inconclusive",
+            "infra_verifier_error",
+            "verifier raised an exception",
+            "verification inconclusive:",
+        )):
+            return RetryStrategy.VERIFIER_PARSE, []
+
+        if any(marker in haystack for marker in (
+            "recommendation_unconfirmed",
+            "unconfirmed supporting",
+            "unconfirmed claims",
+            "confirm-or-prune",
+            "partial_verified",
+        )):
+            return RetryStrategy.UNCONFIRMED_DATA, []
+
+        if any(marker in haystack for marker in (
+            "http 429",
+            "rate limit",
+            "rate-limited",
+            "too many requests",
+        )):
+            return RetryStrategy.RATE_LIMIT, []
+
+        if "no successful tool-call evidence found for market" in haystack:
+            markets = RetryManager._extract_missing_markets(feedback)
+            return RetryStrategy.EVIDENCE_GAP, markets
+
+        return RetryStrategy.GENERIC, []
+
+    @staticmethod
+    def _extract_missing_markets(feedback: str) -> list[str]:
+        markets: list[str] = []
+        for match in re.finditer(
+            r"market\s+'([^']+)'",
+            str(feedback or ""),
+            flags=re.IGNORECASE,
+        ):
+            market = str(match.group(1)).strip()
+            if market and market not in markets:
+                markets.append(market)
+        return markets
 
     def should_flag_for_human(self, attempt: int) -> bool:
         """Check if all retries are exhausted and human review is needed."""

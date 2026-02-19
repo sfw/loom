@@ -1671,14 +1671,25 @@ class LoomApp(App):
                 return
             if isinstance(data, dict):
                 run.task_id = str(data.get("task_id", "") or run.task_id)
+                event_log_path = str(data.get("event_log_path", "")).strip()
+                if event_log_path:
+                    self._append_process_run_activity(
+                        run,
+                        f"Detailed log: {event_log_path}",
+                    )
                 tasks = data.get("tasks", [])
                 if isinstance(tasks, list):
                     normalized = self._normalize_process_run_tasks(run, tasks)
                     run.tasks = normalized
                     run.pane.set_tasks(normalized)
                     self._refresh_process_run_outputs(run)
+            delegated_status = ""
+            if isinstance(data, dict):
+                delegated_status = str(data.get("status", "")).strip().lower()
+            failed_terminal_status = delegated_status in {"failed", "cancelled"}
+            run_succeeded = bool(result.success) and not failed_terminal_status
 
-            if result.success:
+            if run_succeeded:
                 output = result.output or "Process run completed."
                 self._append_process_run_result(run, output, success=True)
                 run.status = "completed"
@@ -1690,8 +1701,13 @@ class LoomApp(App):
                 )
                 chat.add_info(f"Process run [dim]{run.run_id}[/dim] completed.")
             else:
-                error = result.error or result.output or "Process run failed."
-                self._append_process_run_result(run, error, success=False)
+                if result.success and failed_terminal_status:
+                    detail = result.output or f"Process run {delegated_status}."
+                    error = f"Process run {delegated_status}."
+                    self._append_process_run_result(run, detail, success=False)
+                else:
+                    error = result.error or result.output or "Process run failed."
+                    self._append_process_run_result(run, error, success=False)
                 run.status = "failed"
                 run.ended_at = time.monotonic()
                 self._update_process_run_visuals(run)
@@ -2086,6 +2102,7 @@ class LoomApp(App):
                 store=self._store,
                 session_id=self._session.session_id,
                 session_state=self._session.session_state,
+                compactor=getattr(self._session, "compactor", None),
             )
         if self._delegate_tool and self._config and self._db:
             try:
@@ -2896,7 +2913,7 @@ class LoomApp(App):
 
             self._update_process_run_visuals(run)
             self._refresh_sidebar_progress_summary()
-            message = self._format_process_progress_event(data)
+            message = self._format_process_progress_event(data, run=run)
             if not message:
                 return
             now = time.monotonic()
@@ -3097,23 +3114,53 @@ class LoomApp(App):
             return
 
     @staticmethod
-    def _subtask_content(data: dict, subtask_id: str) -> str:
-        """Lookup subtask display content from progress payload."""
+    def _subtask_content(
+        data: dict,
+        subtask_id: str,
+        run: ProcessRunState | None = None,
+    ) -> str:
+        """Lookup subtask label, preferring stable run-normalized labels."""
+        if not subtask_id:
+            return ""
+
+        if run is not None:
+            labels = getattr(run, "task_labels", {})
+            if isinstance(labels, dict):
+                label = str(labels.get(subtask_id, "")).strip()
+                if label and label != subtask_id:
+                    return label
+
+            run_tasks = getattr(run, "tasks", [])
+            if isinstance(run_tasks, list):
+                for row in run_tasks:
+                    if not isinstance(row, dict):
+                        continue
+                    if str(row.get("id", "")) != subtask_id:
+                        continue
+                    content = str(row.get("content", "")).strip()
+                    if content and content != subtask_id:
+                        return content
+                    break
+
         tasks = data.get("tasks")
-        if not subtask_id or not isinstance(tasks, list):
-            return ""
-        for row in tasks:
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("id", "")) != subtask_id:
-                continue
-            content = str(row.get("content", "")).strip()
-            if content and content != subtask_id:
-                return content
-            return ""
+        if isinstance(tasks, list):
+            for row in tasks:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("id", "")) != subtask_id:
+                    continue
+                content = str(row.get("content", "")).strip()
+                if content and content != subtask_id:
+                    return content
+                break
         return ""
 
-    def _format_process_progress_event(self, data: dict) -> str | None:
+    def _format_process_progress_event(
+        self,
+        data: dict,
+        *,
+        run: ProcessRunState | None = None,
+    ) -> str | None:
         """Format orchestrator progress events into concise chat messages."""
         event_type = str(data.get("event_type") or "")
         event_data = data.get("event_data")
@@ -3123,7 +3170,7 @@ class LoomApp(App):
             event_data = {}
 
         subtask_id = str(event_data.get("subtask_id", "")).strip()
-        subtask_content = self._subtask_content(data, subtask_id)
+        subtask_content = self._subtask_content(data, subtask_id, run)
         subtask_label = subtask_id or "subtask"
         if subtask_content:
             subtask_label = f"{subtask_label} - {self._one_line(subtask_content, 90)}"
@@ -3139,9 +3186,59 @@ class LoomApp(App):
             phase = str(event_data.get("phase", "")).strip()
             model_name = str(event_data.get("model", "")).strip()
             label = subtask_label
+
+            def _int_value(value: object) -> int:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+
+            request_bytes = _int_value(event_data.get("request_bytes"))
+            request_tokens = _int_value(event_data.get("request_est_tokens"))
+            message_count = _int_value(event_data.get("message_count"))
+            assistant_tool_calls = _int_value(event_data.get("assistant_tool_calls"))
+            origin = str(event_data.get("origin", "")).strip()
+
+            details: list[str] = []
+            if request_tokens > 0:
+                details.append(f"{request_tokens:,} est tokens")
+            if request_bytes > 0:
+                if request_bytes >= 1024 * 1024:
+                    details.append(f"{request_bytes / (1024 * 1024):.2f} MB")
+                else:
+                    details.append(f"{request_bytes / 1024:.0f} KB")
+            if message_count > 0:
+                details.append(f"{message_count} msgs")
+            if assistant_tool_calls > 0:
+                details.append(f"{assistant_tool_calls} tool calls in ctx")
+            if origin and not origin.startswith("runner.execute_subtask."):
+                details.append(origin)
+
             if phase == "start":
+                if request_bytes >= 3_500_000:
+                    size_text = (
+                        f"{request_bytes / (1024 * 1024):.2f} MB"
+                        if request_bytes > 0
+                        else "oversize"
+                    )
+                    token_text = (
+                        f"{request_tokens:,} est tokens"
+                        if request_tokens > 0
+                        else "estimated tokens unavailable"
+                    )
+                    return (
+                        f"Request-size risk for {label}: {size_text}, {token_text}. "
+                        "Compaction/plumbing needed."
+                    )
                 if model_name:
+                    if details:
+                        return (
+                            f"Thinking on {label} with {model_name} "
+                            f"({', '.join(details)})..."
+                        )
                     return f"Thinking on {label} with {model_name}..."
+                if details:
+                    return f"Thinking on {label} ({', '.join(details)})..."
                 return f"Thinking on {label}..."
             if phase == "done":
                 return None

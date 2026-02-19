@@ -29,6 +29,7 @@ import enum
 import logging
 from dataclasses import dataclass
 
+from loom.engine.semantic_compactor import SemanticCompactor
 from loom.learning.manager import LearnedPattern, LearningManager
 
 logger = logging.getLogger(__name__)
@@ -283,6 +284,7 @@ class GapAnalysisEngine:
     ):
         self._learning = learning
         self._model = model
+        self._compactor = SemanticCompactor(model=model)
 
         # State: the last completion point
         self._pending_completion: str | None = None  # summary of completed work
@@ -364,9 +366,19 @@ class GapAnalysisEngine:
         completed_summary: str,
     ) -> FollowupType:
         """Use LLM to classify the follow-up type."""
+        compact_summary = await self._compact_for_prompt(
+            completed_summary,
+            max_chars=1_200,
+            label="gap follow-up completed summary",
+        )
+        compact_followup = await self._compact_for_prompt(
+            user_message,
+            max_chars=1_200,
+            label="gap follow-up user message",
+        )
         prompt = _FOLLOWUP_CLASSIFICATION_PROMPT.format(
-            completed_summary=completed_summary[:500],
-            user_followup=user_message[:500],
+            completed_summary=compact_summary,
+            user_followup=compact_followup,
         )
         try:
             response = await self._model.complete(
@@ -400,11 +412,13 @@ class GapAnalysisEngine:
 
         # No LLM: store the follow-up directly as a rough pattern.
         # Less precise than LLM extraction but still captures the signal.
+        normalized_completed = _normalize_text(completed_summary)
+        normalized_followup = _normalize_text(user_followup)
         return GapSignal(
             followup_type=followup_type,
-            rule=user_followup[:200],
-            completed_summary=completed_summary[:200],
-            user_followup=user_followup[:200],
+            rule=normalized_followup,
+            completed_summary=normalized_completed,
+            user_followup=normalized_followup,
             confidence=0.4,
         )
 
@@ -415,9 +429,19 @@ class GapAnalysisEngine:
         followup_type: FollowupType,
     ) -> GapSignal | None:
         """Use LLM to extract a general behavioral rule from the gap."""
+        compact_summary = await self._compact_for_prompt(
+            completed_summary,
+            max_chars=1_200,
+            label="gap extraction completed summary",
+        )
+        compact_followup = await self._compact_for_prompt(
+            user_followup,
+            max_chars=1_200,
+            label="gap extraction follow-up",
+        )
         prompt = _GAP_EXTRACTION_PROMPT.format(
-            completed_summary=completed_summary[:500],
-            user_followup=user_followup[:500],
+            completed_summary=compact_summary,
+            user_followup=compact_followup,
         )
         try:
             response = await self._model.complete(
@@ -429,11 +453,27 @@ class GapAnalysisEngine:
             if not text or text.upper() == "NONE":
                 return None
 
+            compact_rule = await self._compact_for_prompt(
+                text,
+                max_chars=500,
+                label="gap extraction rule",
+            )
+            compact_completed = await self._compact_for_prompt(
+                completed_summary,
+                max_chars=900,
+                label="gap extraction completed summary store",
+            )
+            compact_followup_store = await self._compact_for_prompt(
+                user_followup,
+                max_chars=900,
+                label="gap extraction follow-up store",
+            )
+
             return GapSignal(
                 followup_type=followup_type,
-                rule=text[:300],
-                completed_summary=completed_summary[:200],
-                user_followup=user_followup[:200],
+                rule=compact_rule,
+                completed_summary=compact_completed,
+                user_followup=compact_followup_store,
                 confidence=0.7,
             )
         except Exception as e:
@@ -463,8 +503,8 @@ class GapAnalysisEngine:
                 "confidence": signal.confidence,
                 "source": "gap_analysis",
                 "session_id": session_id,
-                "completed_summary": signal.completed_summary[:200],
-                "user_followup": signal.user_followup[:200],
+                "completed_summary": signal.completed_summary,
+                "user_followup": signal.user_followup,
             },
         )
 
@@ -479,20 +519,28 @@ class GapAnalysisEngine:
     def _summarize_completion(assistant_response: str) -> str:
         """Create a concise summary of what the model delivered.
 
-        Takes the first ~300 chars of the response as a proxy.
-        A proper implementation could use the LLM to summarize,
-        but this is good enough for gap analysis prompting.
+        Preserve full details and normalize whitespace only. Prompt-size
+        control is handled later via semantic compaction.
         """
-        text = assistant_response.strip()
-        if len(text) <= 300:
-            return text
-        # Take the first 300 chars and cut at the last sentence boundary
-        truncated = text[:300]
-        for sep in (".\n", ". ", ".\t"):
-            last = truncated.rfind(sep)
-            if last > 100:
-                return truncated[: last + 1]
-        return truncated + "..."
+        return _normalize_text(assistant_response)
+
+    async def _compact_for_prompt(
+        self,
+        text: str,
+        *,
+        max_chars: int,
+        label: str,
+    ) -> str:
+        value = _normalize_text(text)
+        if not value:
+            return ""
+        if len(value) <= max_chars:
+            return value
+        return await self._compactor.compact(
+            value,
+            max_chars=max_chars,
+            label=label,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -509,8 +557,13 @@ def _pattern_key(text: str) -> str:
     text = text.strip().lower()
     if not text:
         return ""
-    words = [w for w in text.split() if w not in _FILLER_WORDS][:8]
+    words = [w for w in text.split() if w not in _FILLER_WORDS]
     return "-".join(words)
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize whitespace while preserving full content."""
+    return " ".join(str(text or "").split())
 
 
 # ---------------------------------------------------------------------------

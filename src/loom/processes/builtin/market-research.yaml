@@ -183,6 +183,7 @@ verification:
         scoped service/product lines, not generic aggregate summaries.
       severity: error
       type: llm
+      applies_to_phases: [map-geographies, environmental-scan, analyze-market-trends, map-competition, deep-competitor-research, assess-market-risks, synthesize-recommendations]
 
     - name: competition-depth
       description: "Competitor analysis must include strategic depth"
@@ -191,6 +192,7 @@ verification:
         GTM signals, and at least one concrete implication per major competitor.
       severity: error
       type: llm
+      applies_to_phases: [map-competition, deep-competitor-research, synthesize-recommendations]
 
     - name: public-perception-evidence
       description: "Public perception claims must be source-backed"
@@ -199,6 +201,7 @@ verification:
         unsupported sentiment assertions.
       severity: error
       type: llm
+      applies_to_phases: [deep-competitor-research, synthesize-recommendations]
 
     - name: multi-factor-risk-coverage
       description: "Risk analysis must cover social/economic/political dimensions"
@@ -207,6 +210,7 @@ verification:
         regulatory factors, with explicit impact/probability framing.
       severity: error
       type: llm
+      applies_to_phases: [assess-market-risks, synthesize-recommendations]
 
     - name: recency-markers-present
       description: "Time-sensitive claims should include recency markers"
@@ -215,12 +219,14 @@ verification:
         context or explicit recency statements.
       severity: warning
       type: llm
+      applies_to_phases: [analyze-market-trends, deep-competitor-research, synthesize-recommendations]
 
     - name: no-placeholders
       description: "No placeholder text in deliverables"
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
       severity: error
       type: regex
+      applies_to_phases: ["*"]
 
 memory:
   extract_types:

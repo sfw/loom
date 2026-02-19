@@ -130,10 +130,6 @@ class GitCommandTool(Tool):
 
         output = "\n".join(output_parts)
 
-        max_size = ToolResult.MAX_OUTPUT_SIZE
-        if len(output) > max_size:
-            output = output[:max_size] + "\n... (output truncated)"
-
         return ToolResult(
             success=process.returncode == 0,
             output=output,

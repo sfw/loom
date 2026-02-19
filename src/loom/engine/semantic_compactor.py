@@ -34,12 +34,14 @@ class SemanticCompactor:
 
     def __init__(
         self,
-        model_router: ModelRouter,
+        model_router: ModelRouter | None = None,
         *,
+        model: ModelProvider | None = None,
         role: str = "extractor",
         tier: int = 1,
     ):
         self._router = model_router
+        self._model = model
         self._role = role
         self._tier = tier
         self._cache: dict[_CacheKey, str] = {}
@@ -87,6 +89,12 @@ class SemanticCompactor:
 
     def _select_model(self) -> ModelProvider | None:
         """Resolve the configured compactor model, if available."""
+        if self._model is not None:
+            return self._model
+
+        if self._router is None:
+            return None
+
         candidate_roles = (self._role, "verifier", "executor")
         for role in candidate_roles:
             try:

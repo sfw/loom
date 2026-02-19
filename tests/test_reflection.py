@@ -325,16 +325,15 @@ class TestCompletionSummary:
         text = "I've fixed the bug."
         assert GapAnalysisEngine._summarize_completion(text) == text
 
-    def test_long_response_truncated(self):
+    def test_long_response_preserved(self):
         text = "A" * 500
         summary = GapAnalysisEngine._summarize_completion(text)
-        assert len(summary) <= 304  # 300 + "..."
+        assert summary == text
 
-    def test_truncates_at_sentence_boundary(self):
-        sentences = "First sentence. " * 25  # >300 chars
+    def test_normalizes_whitespace_without_truncation(self):
+        sentences = "First sentence.\n\nSecond sentence.\tThird sentence."
         summary = GapAnalysisEngine._summarize_completion(sentences)
-        assert summary.endswith(".")
-        assert len(summary) <= 300
+        assert summary == "First sentence. Second sentence. Third sentence."
 
 
 # --- Pattern key ---
@@ -353,9 +352,9 @@ class TestPatternKey:
         assert "you" not in key
         assert "the" not in key
 
-    def test_truncates_to_8_words(self):
+    def test_preserves_all_non_filler_words(self):
         key = _pattern_key("one two three four five six seven eight nine ten")
-        assert len(key.split("-")) <= 8
+        assert key == "one-two-three-four-five-six-seven-eight-nine-ten"
 
     def test_empty_input(self):
         assert _pattern_key("") == ""

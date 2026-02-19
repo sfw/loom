@@ -68,7 +68,7 @@ class TestAutoApprovedTools:
     def test_read_only_tools(self):
         for t in ("read_file", "search_files", "list_directory",
                    "glob_find", "ripgrep_search", "analyze_code",
-                   "ask_user", "web_search", "web_fetch"):
+                   "ask_user", "web_search", "web_fetch", "web_fetch_html"):
             assert t in AUTO_APPROVED_TOOLS
 
     def test_write_tools_excluded(self):

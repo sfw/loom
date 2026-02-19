@@ -22,6 +22,7 @@ from loom.models.base import ModelResponse, TokenUsage, ToolCall
 from loom.models.router import ModelRouter
 from loom.processes.schema import PhaseTemplate, ProcessDefinition
 from loom.prompts.assembler import PromptAssembler
+from loom.recovery.retry import AttemptRecord
 from loom.state.task_state import (
     Subtask,
     SubtaskStatus,
@@ -442,6 +443,299 @@ class TestOrchestratorExecution:
     """Tests for the subtask execution phase."""
 
     @pytest.mark.asyncio
+    async def test_dispatch_subtask_carries_prior_successful_tool_calls(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "First"}]
+        })
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="First")
+        task.plan.subtasks = [subtask]
+
+        successful_call = ToolCallRecord(
+            tool="web_search",
+            args={"query": "Arizona water market evidence"},
+            result=ToolResult.ok("Arizona data found"),
+        )
+        attempts = {
+            "s1": [
+                AttemptRecord(
+                    attempt=1,
+                    tier=1,
+                    feedback="retry",
+                    error="prior verification failed",
+                    successful_tool_calls=[successful_call, "ignore-non-tool-call"],
+                )
+            ]
+        }
+
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="ok"),
+            VerificationResult(tier=1, passed=True),
+        ))
+
+        await orch._dispatch_subtask(task, subtask, attempts)
+
+        _, kwargs = orch._runner.run.await_args
+        assert kwargs["prior_successful_tool_calls"] == [successful_call]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_carries_prior_evidence_records(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "First"}]
+        })
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="First")
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        state_manager.append_evidence_records(task.id, [{
+            "evidence_id": "EV-PERSISTED-1",
+            "task_id": task.id,
+            "subtask_id": "s1",
+            "market": "Arizona Water/Wastewater",
+            "source_url": "https://example.com/az",
+        }])
+
+        attempts = {
+            "s1": [
+                AttemptRecord(
+                    attempt=1,
+                    tier=1,
+                    feedback="retry",
+                    error="prior verification failed",
+                    evidence_records=[{
+                        "evidence_id": "EV-ATTEMPT-1",
+                        "task_id": task.id,
+                        "subtask_id": "s1",
+                        "market": "Alberta Retail Energy",
+                        "source_url": "https://example.com/ab",
+                    }],
+                )
+            ]
+        }
+
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="ok"),
+            VerificationResult(tier=1, passed=True),
+        ))
+
+        await orch._dispatch_subtask(task, subtask, attempts)
+
+        _, kwargs = orch._runner.run.await_args
+        evidence_ids = {
+            str(item.get("evidence_id", ""))
+            for item in kwargs["prior_evidence_records"]
+            if isinstance(item, dict)
+        }
+        assert "EV-PERSISTED-1" in evidence_ids
+        assert "EV-ATTEMPT-1" in evidence_ids
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_uses_verification_only_retry_for_parse_errors(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "First"}]
+        })
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="First")
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+
+        result = SubtaskResult(
+            status="failed",
+            summary="Execution summary",
+            evidence_records=[{
+                "evidence_id": "EV-1",
+                "task_id": task.id,
+                "subtask_id": "s1",
+            }],
+        )
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            feedback="Verification inconclusive: could not parse verifier output.",
+        )
+        attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
+
+        orch._retry_verification_only = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=True,
+            confidence=0.8,
+        ))
+        orch._handle_success = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask,
+        )
+
+        orch._retry_verification_only.assert_awaited_once()
+        orch._handle_success.assert_awaited_once()
+        attempts = attempts_by_subtask.get("s1", [])
+        assert len(attempts) == 1
+        assert attempts[0].error is not None
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_queues_noncritical_unconfirmed_for_follow_up(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "First"}]
+        })
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="First", is_critical_path=False)
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+
+        result = SubtaskResult(
+            status="failed",
+            summary="Execution summary",
+            evidence_records=[],
+        )
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            feedback=(
+                "Recommendations include unconfirmed claims; "
+                "confirm-or-prune remediation is required."
+            ),
+            outcome="fail",
+            reason_code="recommendation_unconfirmed",
+        )
+        attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
+
+        orch._handle_success = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask,
+        )
+
+        orch._handle_success.assert_awaited_once()
+        queue = task.metadata.get("remediation_queue", [])
+        assert isinstance(queue, list)
+        assert queue
+        assert queue[0]["subtask_id"] == "s1"
+        assert queue[0]["blocking"] is False
+        attempts = attempts_by_subtask.get("s1", [])
+        assert attempts
+        assert attempts[0].retry_strategy.value == "unconfirmed_data"
+
+    @pytest.mark.asyncio
+    async def test_critical_unconfirmed_triggers_confirm_or_prune_before_abort(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "Critical"}]
+        })
+        state_manager = _make_state_manager(tmp_path)
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=50,
+            max_parallel_subtasks=3,
+            auto_approve_confidence_threshold=0.8,
+            enable_streaming=False,
+        ))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=cfg,
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="s1",
+            description="Critical",
+            is_critical_path=True,
+            max_retries=0,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+
+        result = SubtaskResult(
+            status="failed",
+            summary="Execution summary",
+            evidence_records=[],
+        )
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            feedback=(
+                "Recommendations include unconfirmed claims; "
+                "confirm-or-prune remediation is required."
+            ),
+            outcome="fail",
+            reason_code="recommendation_unconfirmed",
+        )
+        attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
+
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="remediated"),
+            VerificationResult(tier=2, passed=True, outcome="pass"),
+        ))
+        orch._handle_success = AsyncMock()
+        orch._abort_on_critical_path_failure = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask,
+        )
+
+        orch._runner.run.assert_awaited_once()
+        _, kwargs = orch._runner.run.await_args
+        assert "CONFIRM-OR-PRUNE REMEDIATION" in kwargs["retry_context"]
+        orch._handle_success.assert_awaited_once()
+        orch._abort_on_critical_path_failure.assert_not_awaited()
+        attempted = task.metadata.get("confirm_or_prune_attempted", {})
+        assert isinstance(attempted, dict)
+        assert "s1" in attempted
+
+    @pytest.mark.asyncio
     async def test_executes_subtasks_in_order(self, tmp_path):
         plan_json = json.dumps({
             "subtasks": [
@@ -793,6 +1087,10 @@ class TestSubtaskRunnerContextBudget:
         runner._compactor = TestSubtaskRunnerContextBudget._FakeCompactor()
         return runner
 
+    class _NoopCompactor:
+        async def compact(self, text: str, *, max_chars: int, label: str = "") -> str:
+            return str(text or "")
+
     @pytest.mark.asyncio
     async def test_serialize_tool_result_for_model_compacts_output_and_data(self):
         runner = self._make_runner_for_compaction()
@@ -885,3 +1183,72 @@ class TestSubtaskRunnerContextBudget:
 
         assert "First sentence is complete." in summary
         assert len(summary) <= 60
+
+    @pytest.mark.asyncio
+    async def test_compact_text_hard_caps_when_compactor_returns_oversize(self):
+        runner = self._make_runner_for_compaction()
+        runner._compactor = self._NoopCompactor()
+
+        value = "A" * 5000
+        compacted = await runner._compact_text(
+            value,
+            max_chars=120,
+            label="oversize guard",
+        )
+
+        assert len(compacted) <= 120
+        assert compacted.startswith("A")
+        assert compacted.endswith("A")
+
+    @pytest.mark.asyncio
+    async def test_compacts_recent_assistant_tool_call_arguments(self):
+        runner = self._make_runner_for_compaction()
+        huge_args = json.dumps({
+            "path": "report.md",
+            "content": "A" * 400_000,
+        })
+        messages = [
+            {"role": "user", "content": "Goal: write report"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_recent",
+                    "type": "function",
+                    "function": {
+                        "name": "document_write",
+                        "arguments": huge_args,
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_recent",
+                "content": json.dumps({
+                    "success": True,
+                    "output": "ok",
+                    "error": None,
+                    "files_changed": ["report.md"],
+                }),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "CURRENT TASK STATE:\nGoal: report\nCurrent subtask: s1\n"
+                    "Do NOT move to next subtask"
+                ),
+            },
+        ]
+
+        compacted = await runner._compact_messages_for_model(messages)
+        assistant = next(
+            msg for msg in compacted
+            if isinstance(msg, dict) and msg.get("role") == "assistant"
+        )
+        args_text = (
+            assistant.get("tool_calls", [{}])[0]
+            .get("function", {})
+            .get("arguments", "")
+        )
+        assert len(args_text) <= 500
+        assert "A" * 200 not in args_text
