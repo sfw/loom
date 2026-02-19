@@ -21,7 +21,7 @@ from loom.tools import create_default_registry
 class MockProvider(ModelProvider):
     """A mock model provider for testing."""
 
-    def __init__(self, responses: list[ModelResponse]):
+    def __init__(self, responses: list[ModelResponse | Exception]):
         self._responses = list(responses)
         self._call_count = 0
 
@@ -29,6 +29,8 @@ class MockProvider(ModelProvider):
         if self._call_count < len(self._responses):
             resp = self._responses[self._call_count]
             self._call_count += 1
+            if isinstance(resp, Exception):
+                raise resp
             return resp
         return ModelResponse(text="No more responses.", usage=TokenUsage())
 
@@ -190,6 +192,40 @@ class TestCoworkSession:
         assert len(context) < 20  # less than all 20 messages
         # System prompt should always be preserved
         assert context[0]["role"] == "system"
+
+    async def test_send_retries_transient_model_failure(self, workspace, tools):
+        provider = MockProvider([
+            RuntimeError("transient model failure"),
+            ModelResponse(text="Recovered response.", usage=TokenUsage(total_tokens=7)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        async for event in session.send("Retry please"):
+            events.append(event)
+
+        turns = [e for e in events if isinstance(e, CoworkTurn)]
+        assert len(turns) == 1
+        assert turns[0].text == "Recovered response."
+        assert provider._call_count == 2
+
+    async def test_send_streaming_retries_transient_model_failure(self, workspace, tools):
+        provider = MockProvider([
+            RuntimeError("stream setup failed"),
+            ModelResponse(text="Recovered stream.", usage=TokenUsage(total_tokens=4)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        async for event in session.send_streaming("Retry stream please"):
+            events.append(event)
+
+        chunks = [e for e in events if isinstance(e, str)]
+        turns = [e for e in events if isinstance(e, CoworkTurn)]
+        assert "".join(chunks) == "Recovered stream."
+        assert len(turns) == 1
+        assert turns[0].text == "Recovered stream."
+        assert provider._call_count == 2
 
 
 class TestBuildSystemPrompt:

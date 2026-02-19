@@ -21,6 +21,7 @@ from loom.engine.semantic_compactor import SemanticCompactor
 from loom.engine.verification import Check, VerificationGates, VerificationResult
 from loom.events.bus import EventBus
 from loom.events.types import (
+    ARTIFACT_CONFINEMENT_VIOLATION,
     MODEL_INVOCATION,
     TOKEN_STREAMED,
     TOOL_CALL_COMPLETED,
@@ -28,6 +29,7 @@ from loom.events.types import (
 )
 from loom.models.base import ModelResponse
 from loom.models.request_diagnostics import collect_request_diagnostics
+from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.state.evidence import (
@@ -212,46 +214,103 @@ class SubtaskRunner:
             messages = await self._compact_messages_for_model(messages)
             tool_schemas = self._tools.all_schemas()
             operation = "stream" if streaming else "complete"
-            request_diag = collect_request_diagnostics(
-                messages=messages,
-                tools=tool_schemas,
-                origin=f"runner.execute_subtask.{operation}",
-            )
-            self._emit_model_event(
-                task_id=task.id,
-                subtask_id=subtask.id,
-                model_name=model.name,
-                phase="start",
-                details={
-                    **request_diag.to_event_payload(),
-                    "iteration": iteration + 1,
-                    "operation": operation,
-                },
-            )
-            if streaming:
-                response = await self._stream_completion(
-                    model, messages, tool_schemas,
-                    task_id=task.id, subtask_id=subtask.id,
+            response = None
+            policy = ModelRetryPolicy.from_execution_config(self._config.execution)
+            invocation_attempt = 0
+            request_diag = None
+
+            async def _invoke_model():
+                nonlocal invocation_attempt, request_diag
+                invocation_attempt += 1
+                request_diag = collect_request_diagnostics(
+                    messages=messages,
+                    tools=tool_schemas,
+                    origin=f"runner.execute_subtask.{operation}",
                 )
+                self._emit_model_event(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    model_name=model.name,
+                    phase="start",
+                    details={
+                        **request_diag.to_event_payload(),
+                        "iteration": iteration + 1,
+                        "operation": operation,
+                        "invocation_attempt": invocation_attempt,
+                        "invocation_max_attempts": policy.max_attempts,
+                    },
+                )
+                if streaming:
+                    return await self._stream_completion(
+                        model,
+                        messages,
+                        tool_schemas,
+                        task_id=task.id,
+                        subtask_id=subtask.id,
+                    )
+                return await model.complete(messages, tools=tool_schemas)
+
+            def _on_invocation_failure(
+                attempt: int,
+                max_attempts: int,
+                error: BaseException,
+                remaining: int,
+            ) -> None:
+                self._emit_model_event(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    model_name=model.name,
+                    phase="done",
+                    details={
+                        "origin": request_diag.origin if request_diag else "",
+                        "iteration": iteration + 1,
+                        "operation": operation,
+                        "invocation_attempt": attempt,
+                        "invocation_max_attempts": max_attempts,
+                        "retry_queue_remaining": remaining,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    },
+                )
+
+            try:
+                response = await call_with_model_retry(
+                    _invoke_model,
+                    policy=policy,
+                    on_failure=_on_invocation_failure,
+                )
+            except Exception as e:
+                interruption_reason = (
+                    "Model invocation failed after "
+                    f"{invocation_attempt} attempt(s): {type(e).__name__}: {e}"
+                )
+                response = None
             else:
-                response = await model.complete(
-                    messages, tools=tool_schemas,
+                self._emit_model_event(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    model_name=model.name,
+                    phase="done",
+                    details={
+                        "origin": request_diag.origin if request_diag else "",
+                        "iteration": iteration + 1,
+                        "operation": operation,
+                        "invocation_attempt": invocation_attempt,
+                        "invocation_max_attempts": policy.max_attempts,
+                        "response_tool_calls": len(response.tool_calls or []),
+                        "response_tokens": response.usage.total_tokens,
+                        "response_chars": len(response.text or ""),
+                    },
                 )
-            self._emit_model_event(
-                task_id=task.id,
-                subtask_id=subtask.id,
-                model_name=model.name,
-                phase="done",
-                details={
-                    "origin": request_diag.origin,
-                    "iteration": iteration + 1,
-                    "operation": operation,
-                    "response_tool_calls": len(response.tool_calls or []),
-                    "response_tokens": response.usage.total_tokens,
-                    "response_chars": len(response.text or ""),
-                },
-            )
-            total_tokens += response.usage.total_tokens
+                total_tokens += response.usage.total_tokens
+
+            if interruption_reason:
+                break
+            if response is None:
+                interruption_reason = (
+                    "Execution ended before receiving a model response."
+                )
+                break
 
             if response.has_tool_calls():
                 # Validate tool calls before execution
@@ -328,6 +387,7 @@ class SubtaskRunner:
                         TOOL_CALL_COMPLETED, task.id, subtask.id,
                         tc.name, tc.arguments,
                         result=tool_result,
+                        workspace=workspace,
                     )
                     messages.append({
                         "role": "tool",
@@ -494,7 +554,11 @@ class SubtaskRunner:
                 phase="start",
                 details=request_diag.to_event_payload(),
             )
-            response = await model.complete(request_messages)
+            policy = ModelRetryPolicy.from_execution_config(self._config.execution)
+            response = await call_with_model_retry(
+                lambda: model.complete(request_messages),
+                policy=policy,
+            )
             self._emit_model_event(
                 task_id=task_id,
                 subtask_id=subtask_id,
@@ -618,6 +682,7 @@ class SubtaskRunner:
         tool_args: dict,
         *,
         result: ToolResult | None = None,
+        workspace: Path | None = None,
     ) -> None:
         """Emit a tool call event to the event bus."""
         if not self._event_bus:
@@ -640,6 +705,33 @@ class SubtaskRunner:
         self._event_bus.emit(Event(
             event_type=event_type, task_id=task_id, data=data,
         ))
+
+        if (
+            result is not None
+            and not result.success
+            and self._is_artifact_confinement_violation(result.error)
+        ):
+            violation_data: dict[str, object] = {
+                "subtask_id": subtask_id,
+                "tool": tool_name,
+                "args": tool_args,
+                "error": result.error or "",
+            }
+            if workspace is not None:
+                violation_data["workspace"] = str(workspace)
+            attempted_path = str(tool_args.get("path", "")).strip()
+            if attempted_path:
+                violation_data["attempted_path"] = attempted_path
+            self._event_bus.emit(Event(
+                event_type=ARTIFACT_CONFINEMENT_VIOLATION,
+                task_id=task_id,
+                data=violation_data,
+            ))
+
+    @staticmethod
+    def _is_artifact_confinement_violation(error: str | None) -> bool:
+        text = str(error or "").lower()
+        return "safety violation" in text and "escapes workspace" in text
 
     def _emit_model_event(
         self,

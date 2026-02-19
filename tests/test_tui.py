@@ -749,6 +749,35 @@ class TestDelegateTaskUnbound:
         created[0].execute_task.assert_awaited_once()
         created[1].execute_task.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_delegate_applies_internal_approval_mode_override(self):
+        from loom.state.task_state import TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        observed_modes: list[str] = []
+
+        async def _execute(task):
+            observed_modes.append(task.approval_mode)
+            task.status = TaskStatus.COMPLETED
+            return task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+
+        result = await tool.execute(
+            {"goal": "Analyze Tesla", "_approval_mode": "disabled"},
+            ctx,
+        )
+
+        assert result.success is True
+        assert observed_modes == ["disabled"]
+
     def test_delegate_timeout_default(self, monkeypatch):
         from loom.tools.delegate_task import DelegateTaskTool
 
@@ -762,6 +791,13 @@ class TestDelegateTaskUnbound:
         monkeypatch.setenv("LOOM_DELEGATE_TIMEOUT_SECONDS", "7200")
         tool = DelegateTaskTool()
         assert tool.timeout_seconds == 7200
+
+    def test_delegate_timeout_constructor_override(self, monkeypatch):
+        from loom.tools.delegate_task import DelegateTaskTool
+
+        monkeypatch.delenv("LOOM_DELEGATE_TIMEOUT_SECONDS", raising=False)
+        tool = DelegateTaskTool(timeout_seconds=5400)
+        assert tool.timeout_seconds == 5400
 
 
 # --- Sad-path: session resume failures --------------------------------------
@@ -2105,6 +2141,9 @@ class TestProcessSlashCommands:
 
         app.query_one = MagicMock(side_effect=_query_one)
         captured = {}
+        app._prepare_process_run_workspace = AsyncMock(
+            return_value=Path("/tmp/process-run"),
+        )
 
         def fake_run_worker(coro, **kwargs):
             captured["kwargs"] = kwargs
@@ -2121,6 +2160,7 @@ class TestProcessSlashCommands:
         assert len(app._process_runs) == 1
         run = next(iter(app._process_runs.values()))
         assert run.status == "queued"
+        assert run.run_workspace == Path("/tmp/process-run")
         assert tabs.active == run.pane_id
         chat.add_user_message.assert_called_once_with("/run Analyze Tesla")
 
@@ -2150,6 +2190,9 @@ class TestProcessSlashCommands:
             raise AssertionError(f"Unexpected selector: {selector}")
 
         app.query_one = MagicMock(side_effect=_query_one)
+        app._prepare_process_run_workspace = AsyncMock(
+            side_effect=[Path("/tmp/process-run-a"), Path("/tmp/process-run-b")],
+        )
         app.run_worker = MagicMock()
 
         await app._start_process_run("Analyze Tesla")
@@ -2200,6 +2243,103 @@ class TestProcessSlashCommands:
         assert chat.add_user_message.call_count == 2
 
     @pytest.mark.asyncio
+    async def test_prepare_process_run_workspace_uses_collision_suffix(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        existing = tmp_path / "investment-analysis-analyze-tesla"
+        existing.mkdir()
+
+        app = LoomApp(
+            model=None,
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        path = await app._prepare_process_run_workspace(
+            "investment-analysis",
+            "Analyze Tesla",
+        )
+
+        assert path.parent == tmp_path
+        assert path.name == "investment-analysis-analyze-tesla-2"
+        assert path.exists()
+
+    @pytest.mark.asyncio
+    async def test_prepare_process_run_workspace_respects_disable_flag(self, tmp_path):
+        from loom.config import Config, ProcessConfig
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=None,
+            tools=MagicMock(),
+            workspace=tmp_path,
+            config=Config(
+                process=ProcessConfig(
+                    tui_run_scoped_workspace_enabled=False,
+                ),
+            ),
+        )
+        path = await app._prepare_process_run_workspace(
+            "investment-analysis",
+            "Analyze Tesla",
+        )
+
+        assert path == tmp_path
+
+    @pytest.mark.asyncio
+    async def test_llm_process_run_folder_name_retries_transient_failure(self, tmp_path):
+        from loom.config import Config, ExecutionConfig
+        from loom.tui.app import LoomApp
+
+        model = MagicMock(name="model")
+        model.complete = AsyncMock(side_effect=[
+            RuntimeError("temporary model error"),
+            SimpleNamespace(text="market-scan-encor"),
+        ])
+
+        app = LoomApp(
+            model=model,
+            tools=MagicMock(),
+            workspace=tmp_path,
+            config=Config(
+                execution=ExecutionConfig(
+                    model_call_max_attempts=3,
+                    model_call_retry_base_delay_seconds=0.0,
+                    model_call_retry_max_delay_seconds=0.0,
+                    model_call_retry_jitter_seconds=0.0,
+                ),
+            ),
+        )
+
+        slug = await app._llm_process_run_folder_name(
+            "market-research",
+            "Analyze Encor",
+        )
+
+        assert slug == "market-scan-encor"
+        assert model.complete.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_prepare_process_run_workspace_falls_back_when_llm_name_invalid(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        model = MagicMock(name="model")
+        model.complete = AsyncMock(return_value=SimpleNamespace(text="///"))
+
+        app = LoomApp(
+            model=model,
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        path = await app._prepare_process_run_workspace(
+            "market-research",
+            "Analyze Encor",
+        )
+
+        assert path.parent == tmp_path
+        assert path.name == "market-research-analyze-encor"
+        assert path.exists()
+
+    @pytest.mark.asyncio
     async def test_execute_process_run_passes_workspace_and_process_override(self):
         from loom.tui.app import LoomApp
 
@@ -2215,6 +2355,7 @@ class TestProcessSlashCommands:
                 run_id="abc123",
                 process_name="investment-analysis",
                 goal="Analyze Tesla",
+                run_workspace=Path("/tmp/process-run"),
                 process_defn=process_defn,
                 pane_id="tab-run-abc123",
                 pane=pane,
@@ -2258,9 +2399,10 @@ class TestProcessSlashCommands:
         assert execute_call.args[0] == "delegate_task"
         payload = execute_call.args[1]
         assert payload["_process_override"] is process_defn
-        assert payload["context"]["workspace"] == "/tmp"
+        assert payload["_approval_mode"] == "disabled"
+        assert payload["context"]["workspace"] == "/tmp/process-run"
         assert payload["context"]["requested_goal"] == "Analyze Tesla"
-        assert execute_call.kwargs["workspace"] == Path("/tmp")
+        assert execute_call.kwargs["workspace"] == Path("/tmp/process-run")
 
     @pytest.mark.asyncio
     async def test_execute_process_run_treats_failed_delegate_status_as_failure(self):
@@ -2278,6 +2420,7 @@ class TestProcessSlashCommands:
                 run_id="abc123",
                 process_name="market-research",
                 goal="Analyze market",
+                run_workspace=Path("/tmp/process-run"),
                 process_defn=process_defn,
                 pane_id="tab-run-abc123",
                 pane=pane,
@@ -2344,7 +2487,10 @@ class TestProcessSlashCommands:
             ],
         )
 
-        context = app._build_process_run_context("Analyze Tesla")
+        context = app._build_process_run_context(
+            "Analyze Tesla",
+            workspace=Path("/tmp"),
+        )
 
         assert context["workspace"] == "/tmp"
         assert context["requested_goal"] == "Analyze Tesla"
@@ -2823,6 +2969,100 @@ class TestProcessSlashCommands:
             "geography-footprint.csv [dim](map-geographies)[/] [#f7768e](missing)[/]"
         ]["status"] == "failed"
 
+    def test_process_progress_outputs_use_run_workspace(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        run_workspace = tmp_path / "market-research-run"
+        run_workspace.mkdir(parents=True, exist_ok=True)
+        (run_workspace / "market-trends.md").write_text("ok")
+
+        pane = MagicMock()
+        process_defn = SimpleNamespace(
+            phases=[
+                SimpleNamespace(
+                    id="analyze-market-trends",
+                    description="Analyze market trends",
+                ),
+            ],
+            get_deliverables=lambda: {
+                "analyze-market-trends": [
+                    "market-trends.md",
+                    "trend-dataset.csv",
+                ],
+            },
+        )
+        run = SimpleNamespace(
+            run_id="abc124",
+            process_name="market-research",
+            goal="Analyze trends",
+            run_workspace=run_workspace,
+            process_defn=process_defn,
+            pane_id="tab-run-abc124",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            task_labels={},
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc124": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#chat-log":
+                return chat
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._on_process_progress_event(
+            {
+                "event_type": "subtask_completed",
+                "event_data": {"subtask_id": "analyze-market-trends"},
+                "tasks": [
+                    {
+                        "id": "analyze-market-trends",
+                        "status": "completed",
+                        "content": "Analyze market trends",
+                    },
+                ],
+            },
+            run_id="abc124",
+        )
+
+        output_rows = pane.set_outputs.call_args.args[0]
+        by_content = {row["content"]: row for row in output_rows}
+        assert "market-trends.md [dim](analyze-market-trends)[/]" in by_content
+        assert by_content[
+            "market-trends.md [dim](analyze-market-trends)[/]"
+        ]["status"] == "completed"
+        assert (
+            "trend-dataset.csv [dim](analyze-market-trends)[/] [#f7768e](missing)[/]"
+            in by_content
+        )
+        assert by_content[
+            "trend-dataset.csv [dim](analyze-market-trends)[/] [#f7768e](missing)[/]"
+        ]["status"] == "failed"
+
     def test_process_progress_event_refreshes_tree_on_subtask_completion(self):
         from loom.tui.app import LoomApp
 
@@ -3003,7 +3243,8 @@ class TestProcessSlashCommands:
         sidebar.update_tasks.assert_called_once()
         payload = sidebar.update_tasks.call_args.args[0]
         assert payload[0]["status"] == "failed"
-        assert "LOOM_DELEGATE_TIMEOUT_SECONDS" in payload[0]["content"]
+        assert "delegate_task_timeout_seconds" in payload[0]["content"]
+        assert "LOOM_DELE" in payload[0]["content"]
 
 
 class TestMCPSlashCommands:

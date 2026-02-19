@@ -74,7 +74,12 @@ _PATTERNS: list[tuple[re.Pattern, ErrorCategory, str]] = [
         "Response validation failed. Ensure output matches the expected format.",
     ),
     (
-        re.compile(r"ConnectError|HTTPStatusError|model.*error|503|502|500", re.IGNORECASE),
+        re.compile(
+            r"ConnectError|HTTPStatusError|ModelConnectionError|"
+            r"model server returned http|http\s+[45]\d\d|model.*error|"
+            r"\b503\b|\b502\b|\b500\b|\b522\b|\b521\b|\b520\b",
+            re.IGNORECASE,
+        ),
         ErrorCategory.MODEL_ERROR,
         "Model or API error. This may be transient — retry should help.",
     ),

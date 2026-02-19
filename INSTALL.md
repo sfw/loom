@@ -306,7 +306,8 @@ To run a process from the TUI without starting the API server:
 ```
 
 `/run` uses in-process orchestration (`delegate_task`) and does not require
-`loom serve`.
+`loom serve`. Timeout is configurable with
+`[execution].delegate_task_timeout_seconds` in `loom.toml`.
 
 ### Autonomous Task Mode
 
@@ -373,6 +374,13 @@ Common causes:
 - Model server went down mid-task
 
 If you see `delegate_task timed out`, increase the orchestration timeout:
+
+```toml
+[execution]
+delegate_task_timeout_seconds = 7200
+```
+
+Or set an environment override:
 
 ```bash
 export LOOM_DELEGATE_TIMEOUT_SECONDS=7200

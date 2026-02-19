@@ -497,7 +497,7 @@ event_bus.subscribe_all(log_all)
 
 ## 4. Process Definitions
 
-Process definitions inject domain expertise into Loom without changing engine code. They're YAML files that specify personas, phase blueprints, verification rules, tool guidance, and memory extraction types.
+Process definitions inject domain expertise into Loom without changing engine code. Use process contract v2 (`schema_version: 2`) so verification, evidence, remediation, and prompt constraints are declared in YAML instead of runtime code.
 
 ### Built-in Processes
 
@@ -553,6 +553,7 @@ Create a YAML file in `~/.loom/processes/` or `<workspace>/.loom/processes/`:
 ```yaml
 name: my-custom-process
 version: "1.0"
+schema_version: 2
 description: "Custom domain process"
 persona: |
   You are a domain expert specializing in...
@@ -579,12 +580,30 @@ phases:
     acceptance_criteria: "Report is comprehensive and actionable"
 
 verification:
+  policy:
+    mode: llm_first
+    output_contract:
+      required_fields: [passed, outcome, reason_code, severity_class, confidence, feedback, issues, metadata]
+  remediation:
+    default_strategy: targeted-remediation
   rules:
     - name: no-placeholders
       description: "No placeholder text in output"
       check: "(?i)(TODO|PLACEHOLDER|TBD|INSERT HERE)"
       severity: error
       type: regex
+
+evidence:
+  record_schema:
+    required_fields: [evidence_id, tool, source_url, created_at, quality]
+    facets: [target, entity, subject, region, category]
+
+prompt_contracts:
+  evidence_contract:
+    enabled: true
+    applies_to_phases: ["*"]
+  verifier_constraints: |
+    Apply process rules and return metadata keys only when inferable.
 
 memory:
   extract_types:
@@ -595,6 +614,10 @@ tool_guidance: |
   Use the calculator tool for any quantitative analysis.
   Use the spreadsheet tool for data organization.
 ```
+
+Legacy v1 process YAML still loads in compatibility mode, but new packages
+should target `schema_version: 2`. Compatibility removal is targeted for
+June 30, 2026.
 
 ### Process Packages
 
@@ -801,6 +824,7 @@ max_subtask_retries = 3
 max_loop_iterations = 50
 max_parallel_subtasks = 3     # Independent subtasks run concurrently
 auto_approve_confidence_threshold = 0.8
+delegate_task_timeout_seconds = 3600  # /run delegation timeout budget
 
 [verification]
 tier1_enabled = true    # Deterministic checks (free, instant)
@@ -815,6 +839,9 @@ database_path = "~/.loom/loom.db"
 default_path = "~/projects"
 scratch_dir = "~/.loom/scratch"
 ```
+
+`delegate_task_timeout_seconds` controls `/run` (delegated orchestration) timeout.
+Environment variable `LOOM_DELEGATE_TIMEOUT_SECONDS` overrides it when set.
 
 MCP server configuration is managed separately in `~/.loom/mcp.toml`
 (workspace override: `./.loom/mcp.toml`):

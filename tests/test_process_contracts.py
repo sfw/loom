@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from loom.config import Config
@@ -16,6 +18,10 @@ BUILTIN_PROCESSES = (
     "consulting-engagement",
     "market-research",
 )
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.asyncio
@@ -44,3 +50,21 @@ async def test_builtin_process_contracts_deterministic(process_name: str, tmp_pa
             f"  - {detail}" for detail in result.details
         )
     assert not failed, "\n".join(failure_lines)
+
+
+def test_package_processes_require_scope_metadata():
+    """All package process definitions should pass strict scope-metadata lint."""
+    packages_dir = _repo_root() / "packages"
+    process_files = sorted(packages_dir.glob("*/process.yaml"))
+    assert process_files, "No package process definitions found."
+
+    for process_file in process_files:
+        loader = ProcessLoader(
+            workspace=packages_dir,
+            extra_search_paths=[packages_dir],
+            require_rule_scope_metadata=True,
+        )
+        # Load by package name to mirror runtime package resolution.
+        package_name = process_file.parent.name
+        definition = loader.load(package_name)
+        assert definition.name

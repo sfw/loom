@@ -56,7 +56,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Inline diffs.** Every file edit produces a unified diff in the tool result. Diffs render with Rich markup syntax highlighting in the TUI -- green additions, red removals. You always see exactly what changed.
 
-**Process definitions.** YAML-based domain specialization lets you define personas, phase blueprints, verification rules, and tool guidance for any workflow. A process can represent a consulting methodology, an investment analysis framework, a research protocol, or a coding standard -- the engine doesn't care. Loom ships with 6 built-in processes and supports installing more from GitHub.
+**Process definitions.** YAML-based domain specialization lets you define personas, phase blueprints, verification/remediation policy, evidence contracts, and prompt constraints for any workflow (`schema_version: 2`). A process can represent a consulting methodology, an investment analysis framework, a research protocol, or a coding standard -- the engine doesn't care. Loom ships with 6 built-in processes and supports installing more from GitHub.
 
 ## Quick Start
 
@@ -115,6 +115,7 @@ roles = ["extractor", "verifier"]
 max_subtask_retries = 3
 max_loop_iterations = 50
 max_parallel_subtasks = 3
+delegate_task_timeout_seconds = 3600
 ```
 
 Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor) so you can use a big model for planning and a small one for verification.
@@ -133,11 +134,13 @@ NOTION_TOKEN = "${NOTION_TOKEN}"
 
 MCP merge precedence is: `--mcp-config` > `./.loom/mcp.toml` > `~/.loom/mcp.toml` > legacy `[mcp]` in `loom.toml`.
 Configured MCP servers are auto-discovered at startup and registered as namespaced tools (`mcp.<server>.<tool>`).
-`delegate_task` (used by `/run`) defaults to a 3600s timeout. Set `LOOM_DELEGATE_TIMEOUT_SECONDS` to increase/decrease for long workflows.
+`delegate_task` (used by `/run`) defaults to a 3600s timeout. Configure this in
+`loom.toml` under `[execution].delegate_task_timeout_seconds`; env override
+`LOOM_DELEGATE_TIMEOUT_SECONDS` still applies when set.
 
 ## Process Definitions
 
-A process definition injects a persona, phase blueprint, verification rules, and tool guidance without changing engine code. Loom ships with 6 built-in processes: investment analysis, marketing strategy, research report, competitive intelligence, consulting engagement, and market research. You can [create your own](docs/creating-packages.md) or install them from GitHub:
+A process definition injects a persona, phase blueprint, verification/remediation policy, evidence schema, and prompt constraints without changing engine code. Loom ships with 6 built-in processes: investment analysis, marketing strategy, research report, competitive intelligence, consulting engagement, and market research. You can [create your own](docs/creating-packages.md) or install them from GitHub:
 
 ```bash
 loom processes                              # list available
@@ -149,6 +152,11 @@ loom process test consulting-engagement     # run process test cases
 
 Process-required tools are enforced at runtime: if `tools.required` contains
 missing tools, process activation/task creation fails fast with a clear error.
+
+Process contract v2 is the recommended authoring format (`schema_version: 2`),
+with behavior declared under `verification.policy`, `verification.remediation`,
+`evidence`, and `prompt_contracts`. v1 definitions still load in compatibility
+mode, with compatibility removal targeted for June 30, 2026.
 
 ## Adaptive Learning
 

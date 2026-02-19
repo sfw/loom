@@ -34,6 +34,7 @@ from loom.events.types import (
     VERIFICATION_SHADOW_DIFF,
 )
 from loom.models.request_diagnostics import collect_request_diagnostics
+from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.state.task_state import Subtask
@@ -49,6 +50,19 @@ _VALID_OUTCOMES = {
     "pass_with_warnings",
     "partial_verified",
     "fail",
+}
+
+_VALID_SEVERITY_CLASSES = {
+    "hard_invariant",
+    "semantic",
+    "inconclusive",
+    "infra",
+}
+
+_REASON_CODE_SEVERITY: dict[str, str] = {
+    "hard_invariant_failed": "hard_invariant",
+    "parse_inconclusive": "inconclusive",
+    "infra_verifier_error": "infra",
 }
 
 
@@ -89,6 +103,7 @@ class VerificationResult:
     feedback: str | None = None
     outcome: str = "pass"
     reason_code: str = ""
+    severity_class: str = ""
     metadata: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -96,6 +111,32 @@ class VerificationResult:
         self.outcome = normalized if normalized in _VALID_OUTCOMES else "pass"
         if self.outcome == "fail":
             self.passed = False
+        severity = str(self.severity_class or "").strip().lower()
+        if severity not in _VALID_SEVERITY_CLASSES:
+            severity = self._infer_severity_class(
+                reason_code=self.reason_code,
+                outcome=self.outcome,
+                tier=self.tier,
+                passed=self.passed,
+            )
+        self.severity_class = severity
+
+    @staticmethod
+    def _infer_severity_class(
+        *,
+        reason_code: str,
+        outcome: str,
+        tier: int,
+        passed: bool,
+    ) -> str:
+        normalized_reason = str(reason_code or "").strip().lower()
+        if normalized_reason in _REASON_CODE_SEVERITY:
+            return _REASON_CODE_SEVERITY[normalized_reason]
+        if outcome == "fail" and tier <= 1:
+            return "hard_invariant"
+        if not passed and outcome == "fail":
+            return "semantic"
+        return "semantic"
 
 
 class DeterministicVerifier:
@@ -276,6 +317,7 @@ class DeterministicVerifier:
             ),
             outcome=outcome,
             reason_code="hard_invariant_failed" if hard_failures else "",
+            severity_class="hard_invariant" if hard_failures else "semantic",
             metadata={
                 "hard_failure_count": len(hard_failures),
                 "advisory_count": len(advisory_hits),
@@ -675,6 +717,24 @@ class LLMVerifier:
             return normalized
         return "current_phase"
 
+    def _expected_verifier_response_keys(self) -> list[str]:
+        process = getattr(self._prompts, "process", None)
+        if process is None:
+            return ["passed"]
+        getter = getattr(process, "verifier_required_response_fields", None)
+        if callable(getter):
+            keys = getter()
+            if isinstance(keys, list):
+                normalized = [
+                    str(item).strip()
+                    for item in keys
+                    if str(item).strip()
+                ]
+                if "passed" not in normalized:
+                    normalized.insert(0, "passed")
+                return normalized
+        return ["passed"]
+
     def _emit_rule_scope_event(
         self,
         *,
@@ -821,8 +881,8 @@ class LLMVerifier:
         if not records:
             return ""
 
-        markets: set[str] = set()
-        dimensions: set[str] = set()
+        facet_keys: set[str] = set()
+        facet_examples: set[str] = set()
         domains: set[str] = set()
         tools: set[str] = set()
 
@@ -831,10 +891,16 @@ class LLMVerifier:
                 continue
             tool = cls._normalized_text(item.get("tool")).lower() or "unknown"
             tools.add(tool)
-            market = cls._normalized_text(item.get("market")) or "unspecified"
-            dimension = cls._normalized_text(item.get("dimension")) or "unspecified"
-            markets.add(market)
-            dimensions.add(dimension)
+
+            facets = item.get("facets", {})
+            if isinstance(facets, dict):
+                for key, value in facets.items():
+                    facet_key = cls._normalized_text(key).lower()
+                    facet_val = cls._normalized_text(value)
+                    if facet_key:
+                        facet_keys.add(facet_key)
+                    if facet_key and facet_val:
+                        facet_examples.add(f"{facet_key}={facet_val}")
 
             source_url = cls._normalize_url(item.get("source_url"))
             if source_url:
@@ -852,15 +918,15 @@ class LLMVerifier:
         )
         if tools:
             lines.append("- observed_tools: " + ", ".join(sorted(tools)[:10]))
-        if markets:
+        if facet_keys:
             lines.append(
-                "- observed_market_examples: "
-                + ", ".join(sorted(markets, key=str.lower)[:10])
+                "- observed_facet_keys: "
+                + ", ".join(sorted(facet_keys)[:12])
             )
-        if dimensions:
+        if facet_examples:
             lines.append(
-                "- observed_dimension_examples: "
-                + ", ".join(sorted(dimensions, key=str.lower)[:10])
+                "- observed_facet_examples: "
+                + ", ".join(sorted(facet_examples)[:12])
             )
         if domains:
             lines.append(
@@ -881,8 +947,21 @@ class LLMVerifier:
             if not isinstance(item, dict):
                 continue
             evidence_id = cls._normalized_text(item.get("evidence_id")) or "EV-UNKNOWN"
-            market = cls._normalized_text(item.get("market")) or "unspecified"
-            dimension = cls._normalized_text(item.get("dimension")) or "unspecified"
+            facets = {}
+            raw_facets = item.get("facets", {})
+            if isinstance(raw_facets, dict):
+                facets = {
+                    cls._normalized_text(key): cls._normalized_text(value)
+                    for key, value in raw_facets.items()
+                    if cls._normalized_text(key) and cls._normalized_text(value)
+                }
+            facet_preview = "none"
+            if facets:
+                facet_preview = ", ".join(
+                    f"{key}={value}" for key, value in sorted(facets.items())
+                )
+                if len(facet_preview) > 96:
+                    facet_preview = facet_preview[:93] + "..."
             source = (
                 cls._normalize_url(item.get("source_url"))
                 or cls._normalized_text(item.get("query"))
@@ -891,8 +970,7 @@ class LLMVerifier:
             if len(source) > 96:
                 source = source[:93] + "..."
             lines.append(
-                f"  - {evidence_id} | market={market} | "
-                f"dimension={dimension} | source={source}"
+                f"  - {evidence_id} | facets={facet_preview} | source={source}"
             )
 
         return cls._hard_cap_text("\n".join(lines), max_chars=max_chars)
@@ -1087,6 +1165,20 @@ class LLMVerifier:
         )
         return str(match.group(1)).strip().lower() if match else ""
 
+    @staticmethod
+    def _extract_severity_class_from_text(text: str) -> str:
+        match = re.search(
+            r"\b(?:severity_class|severity)\b\s*[:=]\s*([a-z_]+)",
+            str(text or ""),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        severity = str(match.group(1)).strip().lower()
+        if severity in _VALID_SEVERITY_CLASSES:
+            return severity
+        return ""
+
     @classmethod
     def _extract_outcome_from_text(cls, text: str, *, passed: bool) -> str:
         match = re.search(
@@ -1134,30 +1226,45 @@ class LLMVerifier:
             or normalized.get("failure_reason")
             or "",
         ).strip().lower()
+        severity_class = str(
+            normalized.get("severity_class")
+            or normalized.get("severity")
+            or "",
+        ).strip().lower()
+        if severity_class not in _VALID_SEVERITY_CLASSES:
+            severity_class = ""
+        metadata: dict[str, object] = {}
+        metadata_raw = normalized.get("metadata", {})
+        if isinstance(metadata_raw, dict):
+            metadata = {
+                str(key).strip(): value
+                for key, value in metadata_raw.items()
+                if str(key).strip()
+            }
 
-        recommendation_unconfirmed = cls._to_int(
-            normalized.get("recommendation_unconfirmed_count")
-            if "recommendation_unconfirmed_count" in normalized
-            else normalized.get("unconfirmed_recommendation_count"),
-        ) or 0
-        recommendation_total = cls._to_int(
-            normalized.get("recommendation_claim_count")
-            if "recommendation_claim_count" in normalized
-            else normalized.get("recommendation_total_count"),
-        ) or 0
-        supporting_unconfirmed = cls._to_int(
-            normalized.get("supporting_unconfirmed_count")
-            if "supporting_unconfirmed_count" in normalized
-            else normalized.get("unconfirmed_supporting_count"),
-        ) or 0
-        supporting_total = cls._to_int(
-            normalized.get("supporting_claim_count")
-            if "supporting_claim_count" in normalized
-            else normalized.get("supporting_total_count"),
-        ) or 0
-        synthesis_partition_present = cls._to_bool(
-            normalized.get("synthesis_partition_present")
-        )
+        base_keys = {
+            "passed",
+            "pass",
+            "result",
+            "confidence",
+            "feedback",
+            "suggestion",
+            "reason",
+            "rationale",
+            "issues",
+            "outcome",
+            "reason_code",
+            "failure_reason",
+            "severity_class",
+            "severity",
+            "metadata",
+        }
+        for key, value in normalized.items():
+            if key in base_keys:
+                continue
+            if key in metadata:
+                continue
+            metadata[key] = value
 
         return {
             "passed": passed,
@@ -1166,11 +1273,8 @@ class LLMVerifier:
             "issues": issues,
             "outcome": outcome,
             "reason_code": reason_code,
-            "recommendation_unconfirmed_count": recommendation_unconfirmed,
-            "recommendation_claim_count": recommendation_total,
-            "supporting_unconfirmed_count": supporting_unconfirmed,
-            "supporting_claim_count": supporting_total,
-            "synthesis_partition_present": bool(synthesis_partition_present),
+            "severity_class": severity_class,
+            "metadata": metadata,
         }
 
     @staticmethod
@@ -1317,11 +1421,8 @@ class LLMVerifier:
             "issues": issues,
             "outcome": cls._extract_outcome_from_text(raw, passed=passed),
             "reason_code": cls._extract_reason_code_from_text(raw),
-            "recommendation_unconfirmed_count": 0,
-            "recommendation_claim_count": 0,
-            "supporting_unconfirmed_count": 0,
-            "supporting_claim_count": 0,
-            "synthesis_partition_present": False,
+            "severity_class": cls._extract_severity_class_from_text(raw),
+            "metadata": {},
         }
 
     @staticmethod
@@ -1337,8 +1438,14 @@ class LLMVerifier:
             passed=passed,
         )
         reason_code = str(assessment.get("reason_code") or "").strip().lower()
+        severity_class = str(assessment.get("severity_class") or "").strip().lower()
+        if severity_class not in _VALID_SEVERITY_CLASSES:
+            severity_class = ""
         if passed and outcome == "pass" and issues:
             outcome = "pass_with_warnings"
+        metadata = assessment.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
         return VerificationResult(
             tier=2,
             passed=passed,
@@ -1351,24 +1458,8 @@ class LLMVerifier:
             feedback=feedback_text,
             outcome=outcome,
             reason_code=reason_code,
-            metadata={
-                "issues": issues,
-                "recommendation_unconfirmed_count": int(
-                    assessment.get("recommendation_unconfirmed_count", 0) or 0,
-                ),
-                "recommendation_claim_count": int(
-                    assessment.get("recommendation_claim_count", 0) or 0,
-                ),
-                "supporting_unconfirmed_count": int(
-                    assessment.get("supporting_unconfirmed_count", 0) or 0,
-                ),
-                "supporting_claim_count": int(
-                    assessment.get("supporting_claim_count", 0) or 0,
-                ),
-                "synthesis_partition_present": bool(
-                    assessment.get("synthesis_partition_present", False),
-                ),
-            },
+            severity_class=severity_class,
+            metadata={"issues": issues, **metadata},
         )
 
     def _inconclusive_result(self) -> VerificationResult:
@@ -1379,11 +1470,13 @@ class LLMVerifier:
             feedback="Verification inconclusive: could not parse verifier output.",
             outcome="fail",
             reason_code="parse_inconclusive",
+            severity_class="inconclusive",
         )
 
     def _parse_verifier_response(self, response) -> VerificationResult | None:
         validation = self._validator.validate_json_response(
-            response, expected_keys=["passed"]
+            response,
+            expected_keys=self._expected_verifier_response_keys(),
         )
         if validation.valid and validation.parsed is not None:
             assessment = self._coerce_assessment_mapping(validation.parsed)
@@ -1400,21 +1493,42 @@ class LLMVerifier:
         model,
         raw_text: str,
     ) -> VerificationResult | None:
+        expected_keys = self._expected_verifier_response_keys()
+        expected_display = ", ".join(f'"{key}"' for key in expected_keys)
+        metadata_hint = ""
+        process = getattr(self._prompts, "process", None)
+        if process is not None:
+            metadata_getter = getattr(process, "verifier_metadata_fields", None)
+            if callable(metadata_getter):
+                metadata_fields = metadata_getter()
+                if isinstance(metadata_fields, list) and metadata_fields:
+                    names = ", ".join(
+                        str(item).strip()
+                        for item in metadata_fields
+                        if str(item).strip()
+                    )
+                    if names:
+                        metadata_hint = (
+                            "\nWhen inferable, include these metadata keys: "
+                            f"{names}."
+                        )
         repair_prompt = (
             "Repair the following verifier output into a strict JSON object with keys:\n"
             "{"
-            '"passed", "confidence", "feedback", "issues", "outcome", "reason_code", '
-            '"recommendation_unconfirmed_count", "recommendation_claim_count", '
-            '"supporting_unconfirmed_count", "supporting_claim_count", '
-            '"synthesis_partition_present"'
-            "}\n"
+            + expected_display
+            + "}\n"
             "Use only values directly inferable from the text. If unknown, use empty "
-            "strings, [] or 0. Respond with JSON only.\n\n"
+            "strings, [] or {}. Respond with JSON only."
+            + metadata_hint
+            + "\n\n"
             "RAW OUTPUT:\n"
             f"{raw_text}"
         )
         try:
-            response = await model.complete([{"role": "user", "content": repair_prompt}])
+            response = await call_with_model_retry(
+                lambda: model.complete([{"role": "user", "content": repair_prompt}]),
+                policy=ModelRetryPolicy(),
+            )
         except Exception:
             return None
         return self._parse_verifier_response(response)
@@ -1429,126 +1543,11 @@ class LLMVerifier:
             return None
         return await self._repair_assessment_with_model(alternate, raw_text)
 
-    def _append_feedback(self, existing: str | None, extra: str) -> str:
-        base = str(existing or "").strip()
-        if not base:
-            return extra
-        if extra in base:
-            return base
-        return f"{base}\n{extra}"
-
-    def _apply_unconfirmed_policy(
-        self,
-        subtask: Subtask,
-        result: VerificationResult,
-    ) -> VerificationResult:
-        metadata = dict(result.metadata or {})
-        rec_unconfirmed = int(metadata.get("recommendation_unconfirmed_count", 0) or 0)
-        support_unconfirmed = int(metadata.get("supporting_unconfirmed_count", 0) or 0)
-        support_total = int(metadata.get("supporting_claim_count", 0) or 0)
-        synthesis_partition_present = bool(
-            metadata.get("synthesis_partition_present", False),
-        )
-
-        threshold = float(
-            getattr(self._config, "unconfirmed_supporting_threshold", 0.30) or 0.30
-        )
-        threshold = max(0.0, min(1.0, threshold))
-        support_ratio = (
-            float(support_unconfirmed) / float(support_total)
-            if support_total > 0 else 0.0
-        )
-        metadata["supporting_unconfirmed_ratio"] = support_ratio
-
-        if rec_unconfirmed > 0:
-            result.passed = False
-            result.outcome = "fail"
-            result.reason_code = "recommendation_unconfirmed"
-            result.feedback = self._append_feedback(
-                result.feedback,
-                (
-                    "Recommendations include unconfirmed claims; "
-                    "confirm-or-prune remediation is required."
-                ),
-            )
-            metadata["remediation_required"] = True
-            metadata["remediation_mode"] = "confirm_or_prune"
-            result.metadata = metadata
-            return result
-
-        if support_ratio > threshold:
-            if subtask.is_critical_path and bool(
-                getattr(self._config, "auto_confirm_prune_critical_path", True),
-            ):
-                result.passed = False
-                result.outcome = "fail"
-                result.reason_code = "unconfirmed_critical_path"
-                result.feedback = self._append_feedback(
-                    result.feedback,
-                    (
-                        "Unconfirmed supporting content exceeds threshold on a "
-                        "critical-path subtask; remediation required."
-                    ),
-                )
-                metadata["remediation_required"] = True
-                metadata["remediation_mode"] = "confirm_or_prune"
-            elif bool(getattr(self._config, "allow_partial_verified", True)):
-                result.passed = True
-                result.outcome = "partial_verified"
-                result.reason_code = (
-                    result.reason_code or "unconfirmed_supporting_threshold"
-                )
-                result.feedback = self._append_feedback(
-                    result.feedback,
-                    (
-                        "Supporting unconfirmed claims exceed threshold; "
-                        "output marked partial_verified."
-                    ),
-                )
-                metadata["remediation_required"] = True
-                metadata["remediation_mode"] = "queue_follow_up"
-            else:
-                result.passed = False
-                result.outcome = "fail"
-                result.reason_code = "unconfirmed_supporting_threshold"
-                metadata["remediation_required"] = True
-                metadata["remediation_mode"] = "confirm_or_prune"
-
-        if subtask.is_synthesis and support_unconfirmed > 0 and rec_unconfirmed == 0:
-            metadata["synthesis_partition_required"] = True
-            if not synthesis_partition_present:
-                result.passed = False
-                result.outcome = "fail"
-                result.reason_code = "synthesis_partition_missing"
-                result.feedback = self._append_feedback(
-                    result.feedback,
-                    (
-                        "Synthesis with unconfirmed supporting claims must include "
-                        "`Verified Findings` and `Unconfirmed Appendix` sections."
-                    ),
-                )
-                metadata["remediation_required"] = True
-                metadata["remediation_mode"] = "confirm_or_prune"
-                result.metadata = metadata
-                return result
-            result.feedback = self._append_feedback(
-                result.feedback,
-                (
-                    "Final synthesis must separate `Verified Findings` from an "
-                    "`Unconfirmed Appendix`; keep recommendations fully confirmed."
-                ),
-            )
-            if result.outcome == "pass":
-                result.outcome = "pass_with_warnings"
-            if "remediation_mode" not in metadata:
-                metadata["remediation_required"] = True
-                metadata["remediation_mode"] = "queue_follow_up"
-
-        result.metadata = metadata
-        return result
-
     async def _invoke_and_parse(self, model, prompt: str) -> VerificationResult:
-        response = await model.complete([{"role": "user", "content": prompt}])
+        response = await call_with_model_retry(
+            lambda: model.complete([{"role": "user", "content": prompt}]),
+            policy=ModelRetryPolicy(),
+        )
         parsed = self._parse_verifier_response(response)
         if parsed is not None:
             return parsed
@@ -1600,6 +1599,7 @@ class LLMVerifier:
                 feedback="Verification skipped: verifier model not configured",
                 outcome="pass_with_warnings",
                 reason_code="infra_verifier_error",
+                severity_class="infra",
             )
 
         summary_for_prompt = await self._compact_text(
@@ -1679,7 +1679,6 @@ class LLMVerifier:
         )
         try:
             first_result = await self._invoke_and_parse(model, prompt)
-            first_result = self._apply_unconfirmed_policy(subtask, first_result)
             if not first_result.reason_code and not first_result.passed:
                 first_result.reason_code = "llm_semantic_failed"
             self._emit_model_event(
@@ -1740,7 +1739,6 @@ class LLMVerifier:
             )
             try:
                 retry_result = await self._invoke_and_parse(model, compact_prompt)
-                retry_result = self._apply_unconfirmed_policy(subtask, retry_result)
                 if not retry_result.reason_code and not retry_result.passed:
                     retry_result.reason_code = "llm_semantic_failed"
                 self._emit_model_event(
@@ -1783,6 +1781,7 @@ class LLMVerifier:
                     feedback=self._exception_feedback(retry_error),
                     outcome="fail",
                     reason_code="infra_verifier_error",
+                    severity_class="infra",
                 )
 
 
@@ -1885,9 +1884,27 @@ class VerificationGates:
                 "passed": result.passed,
                 "outcome": result.outcome,
                 "reason_code": result.reason_code,
+                "severity_class": result.severity_class,
                 "confidence": result.confidence,
             },
         ))
+
+    @staticmethod
+    def classify_shadow_diff(
+        legacy_result: VerificationResult,
+        result: VerificationResult,
+    ) -> str:
+        if not legacy_result.passed and result.passed:
+            return "old_fail_new_pass"
+        if legacy_result.passed and not result.passed:
+            return "old_pass_new_fail"
+        if (
+            not legacy_result.passed
+            and not result.passed
+            and legacy_result.reason_code != result.reason_code
+        ):
+            return "both_fail_reason_diff"
+        return "no_diff"
 
     def _emit_instrumentation_events(
         self,
@@ -1952,9 +1969,8 @@ class VerificationGates:
         if legacy_result is None:
             return
 
-        classification = "no_diff"
-        if not legacy_result.passed and result.passed:
-            classification = "old_fail_new_pass"
+        classification = self.classify_shadow_diff(legacy_result, result)
+        if classification == "old_fail_new_pass":
             self._event_bus.emit(Event(
                 event_type=VERIFICATION_FALSE_NEGATIVE_CANDIDATE,
                 task_id=task_id,
@@ -1964,11 +1980,6 @@ class VerificationGates:
                     "new_outcome": result.outcome,
                 },
             ))
-        elif legacy_result.passed and not result.passed:
-            classification = "old_pass_new_fail"
-        elif (not legacy_result.passed and not result.passed and
-              legacy_result.reason_code != result.reason_code):
-            classification = "both_fail_reason_diff"
 
         self._event_bus.emit(Event(
             event_type=VERIFICATION_SHADOW_DIFF,

@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass
 
 from loom.models.base import ModelProvider
+from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter
 
 logger = logging.getLogger(__name__)
@@ -242,13 +243,16 @@ class SemanticCompactor:
             "- Return compact plain text only.\n\n"
             f"Source text:\n{text}"
         )
-        response = await model.complete(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.0,
-            max_tokens=max(256, target // 2 + 128),
+        response = await call_with_model_retry(
+            lambda: model.complete(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.0,
+                max_tokens=max(256, target // 2 + 128),
+            ),
+            policy=ModelRetryPolicy(),
         )
         return str(response.text or "").strip()
 

@@ -57,6 +57,10 @@ class TestCategorizeError:
         assert result.category == ErrorCategory.MODEL_ERROR
         assert "transient" in result.recovery_hint.lower()
 
+    def test_model_error_http_522(self):
+        result = categorize_error("Model server returned HTTP 522: gateway timeout")
+        assert result.category in {ErrorCategory.TIMEOUT, ErrorCategory.MODEL_ERROR}
+
     def test_runtime_error(self):
         result = categorize_error("RuntimeError: some unexpected thing")
         assert result.category == ErrorCategory.RUNTIME_ERROR

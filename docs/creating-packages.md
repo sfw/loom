@@ -27,6 +27,7 @@ Create `process.yaml`:
 ```yaml
 name: my-process
 version: "1.0"
+schema_version: 2
 description: >
   One-paragraph description of what this process does and when to use it.
 author: "Your Name"
@@ -74,6 +75,52 @@ Install it globally:
 loom install /path/to/my-process
 ```
 
+## Process contract v2 (recommended)
+
+Set `schema_version: 2` in `process.yaml` and declare behavior in data blocks
+instead of runtime code:
+
+- `verification.policy` -- LLM-first/static-first mode, static safety checks, semantic checks, verifier output contract.
+- `verification.remediation` -- strategy metadata, retry budget, critical-path behavior.
+- `evidence` -- record schema, extraction mappings, and summarization controls.
+- `prompt_contracts` -- process-specific executor/verifier/remediation instructions and evidence-contract activation.
+
+Minimal v2 structure:
+
+```yaml
+schema_version: 2
+
+verification:
+  policy:
+    mode: llm_first
+    output_contract:
+      required_fields: [passed, outcome, reason_code, severity_class, confidence, feedback, issues, metadata]
+  remediation:
+    default_strategy: targeted-remediation
+
+evidence:
+  record_schema:
+    required_fields: [evidence_id, tool, source_url, created_at, quality]
+    facets: [target, entity, subject, region, category]
+
+prompt_contracts:
+  evidence_contract:
+    enabled: true
+    applies_to_phases: ["*"]
+```
+
+### Migrating v1 to v2
+
+1. Add `schema_version: 2`.
+2. Keep existing `verification.rules` as-is.
+3. Add `verification.policy.output_contract.required_fields` including `passed`.
+4. Move remediation wording into `prompt_contracts.remediation_instructions`.
+5. Add `evidence.record_schema`/`evidence.extraction` and enable `prompt_contracts.evidence_contract`.
+
+Legacy v1 compatibility remains available during the transition window and is
+scheduled for removal on June 30, 2026. New or updated packages should migrate
+to `schema_version: 2` now.
+
 ## process.yaml reference
 
 ### Metadata
@@ -81,6 +128,7 @@ loom install /path/to/my-process
 ```yaml
 name: kebab-case-name          # Required. Lowercase alphanumeric + hyphens.
 version: "1.0"                 # Semver string.
+schema_version: 2              # Process contract version (v2 recommended).
 description: >                 # What the process does, when to use it.
   Multi-line description.
 author: "Name or Org"
@@ -192,8 +240,17 @@ exact path (not `tesla_financial_summary.csv` or other variants).
 
 ### Verification rules
 
+In contract v2, keep rule definitions in `verification.rules`, and add
+`verification.policy`/`verification.remediation` for runtime behavior.
+
 ```yaml
 verification:
+  policy:
+    mode: llm_first
+    output_contract:
+      required_fields: [passed, outcome, reason_code, severity_class, confidence, feedback, issues, metadata]
+  remediation:
+    default_strategy: targeted-remediation
   rules:
     - name: no-placeholders
       description: "No placeholder text in deliverables"

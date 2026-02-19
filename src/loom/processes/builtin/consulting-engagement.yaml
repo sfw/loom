@@ -1,5 +1,6 @@
 name: consulting-engagement
 version: "1.2"
+schema_version: 2
 description: >
   Structured consulting workflow for decomposing a business problem into a
   MECE issue tree, executing workstreams, synthesizing recommendations,
@@ -160,6 +161,47 @@ tests:
     requires_network: true
 
 verification:
+  policy:
+    mode: llm_first
+    static_checks:
+      tool_success_policy: safety_integrity_only
+      file_integrity_policy: enforce_nonempty_changed_files
+      syntax_policy: enforce_parseable_artifacts
+      deliverable_existence_policy: enforce_declared_deliverables
+    semantic_checks:
+      - id: process-rules
+        check: "Apply process-defined verification rules and acceptance criteria."
+        severity: error
+        enforcement: hard
+        scope: phase
+    output_contract:
+      required_fields:
+        - passed
+        - outcome
+        - reason_code
+        - severity_class
+        - confidence
+        - feedback
+        - issues
+        - metadata
+      metadata_fields:
+        - remediation_required
+        - remediation_mode
+        - missing_targets
+    outcome_policy:
+      pass_states: [pass, pass_with_warnings, partial_verified]
+      fail_states: [fail]
+  remediation:
+    strategies:
+      - id: targeted-remediation
+        retry_strategy: unconfirmed_data
+        description: "Perform targeted follow-up based on verifier reason_code/metadata."
+    default_strategy: targeted-remediation
+    critical_path_behavior: block
+    retry_budget:
+      max_attempts: 2
+    transient_retry_policy:
+      retry_on_transient: true
   rules:
     - name: mece-structure
       description: "Issue tree branches must be MECE"
@@ -201,6 +243,35 @@ verification:
       severity: error
       type: regex
       applies_to_phases: ["*"]
+
+evidence:
+  record_schema:
+    required_fields: [evidence_id, tool, source_url, created_at, quality]
+    facets: [target, entity, subject, region, category, segment, topic]
+  extraction:
+    include_result_facets: true
+    arg_mappings:
+      target: [target, entity, subject, company, market]
+      region: [region, geography, country]
+      category: [category, dimension, theme]
+  summarization:
+    max_entries: 12
+    include_facets: true
+
+prompt_contracts:
+  evidence_contract:
+    enabled: true
+    applies_to_phases: ["*"]
+  executor_constraints: |
+    Keep factual claims traceable to evidence IDs or source URLs.
+    If a claim cannot be verified, label it explicitly as unverified.
+  verifier_constraints: |
+    Evaluate acceptance criteria and process verification rules without assuming
+    a fixed output schema. Use metadata keys only when inferable.
+  remediation_instructions:
+    default: |
+      Perform targeted remediation only for failing checks. Preserve validated
+      work, add missing evidence links, and avoid broad reruns.
 
 memory:
   extract_types:

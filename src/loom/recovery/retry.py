@@ -36,7 +36,7 @@ class AttemptRecord:
     successful_tool_calls: list = field(default_factory=list)
     evidence_records: list[dict] = field(default_factory=list)
     retry_strategy: RetryStrategy = RetryStrategy.GENERIC
-    missing_markets: list[str] = field(default_factory=list)
+    missing_targets: list[str] = field(default_factory=list)
     error_category: ErrorCategory | None = None
     timestamp: str = ""
 
@@ -102,9 +102,9 @@ class RetryManager:
                 lines.append(f"  Error: {a.error}")
             if a.retry_strategy and a.retry_strategy != RetryStrategy.GENERIC:
                 lines.append(f"  Retry strategy: {a.retry_strategy.value}")
-            if a.missing_markets:
+            if a.missing_targets:
                 lines.append(
-                    "  Missing markets: " + ", ".join(a.missing_markets)
+                    "  Missing targets: " + ", ".join(a.missing_targets)
                 )
             if a.error_category and a.error_category != ErrorCategory.UNKNOWN:
                 categorized = categorize_error(a.error or "")
@@ -121,25 +121,26 @@ class RetryManager:
                 "- Prefer alternate sources and lighter requests."
             )
         elif strategy == RetryStrategy.EVIDENCE_GAP:
-            markets = attempts[-1].missing_markets
-            if markets:
-                market_list = ", ".join(markets)
+            missing_targets = attempts[-1].missing_targets
+            if missing_targets:
+                target_list = ", ".join(missing_targets)
             else:
-                market_list = "missing markets from verifier feedback"
+                target_list = "missing targets from verifier feedback"
             lines.append(
                 "\nTARGETED RETRY PLAN:\n"
                 "- Focus only on missing evidence coverage.\n"
-                f"- Gather evidence for: {market_list}.\n"
+                f"- Gather evidence for: {target_list}.\n"
                 "- Keep existing validated evidence; avoid broad reruns.\n"
                 "- Update only rows/claims that currently lack evidence."
             )
         elif strategy == RetryStrategy.UNCONFIRMED_DATA:
             lines.append(
                 "\nTARGETED RETRY PLAN:\n"
-                "- Run confirm-or-prune on unconfirmed claims.\n"
-                "- Preserve already confirmed findings.\n"
-                "- Remove or relabel any claim that cannot be confirmed.\n"
-                "- Keep recommendations fully confirmed."
+                "- Resolve verification findings using process remediation guidance.\n"
+                "- Preserve already validated findings.\n"
+                "- Confirm unsupported claims with evidence or relabel them as "
+                "unverified according to process policy.\n"
+                "- Avoid broad reruns when only targeted remediation is needed."
             )
 
         lines.append(
@@ -153,11 +154,56 @@ class RetryManager:
         *,
         verification_feedback: str | None,
         execution_error: str | None,
+        verification: object | None = None,
     ) -> tuple[RetryStrategy, list[str]]:
         """Classify failure type and extract optional targeting details."""
         feedback = str(verification_feedback or "")
         error = str(execution_error or "")
         haystack = " ".join([feedback, error]).lower()
+        reason_code = RetryManager._extract_reason_code(verification)
+        remediation_mode = RetryManager._extract_remediation_mode(verification)
+        severity_class = RetryManager._extract_severity_class(verification)
+        missing_targets = RetryManager._extract_missing_targets_from_verification(
+            verification,
+        )
+
+        # Prefer structured verification contract when available.
+        if reason_code in {"parse_inconclusive", "infra_verifier_error"}:
+            return RetryStrategy.VERIFIER_PARSE, []
+        if reason_code in {
+            "evidence_gap",
+            "missing_evidence",
+            "insufficient_evidence_targets",
+        }:
+            return RetryStrategy.EVIDENCE_GAP, missing_targets
+        if reason_code in {
+            "policy_remediation_required",
+            "unconfirmed_claims",
+            "insufficient_evidence",
+            "pending_remediation",
+        }:
+            return RetryStrategy.UNCONFIRMED_DATA, []
+        if "unconfirmed" in reason_code or "remediation" in reason_code:
+            return RetryStrategy.UNCONFIRMED_DATA, []
+        if remediation_mode in {
+            "confirm_or_prune",
+            "queue_follow_up",
+            "targeted_remediation",
+            "remediate_and_retry",
+        }:
+            return RetryStrategy.UNCONFIRMED_DATA, []
+        if severity_class == "inconclusive":
+            return RetryStrategy.VERIFIER_PARSE, []
+        if severity_class == "infra":
+            if RetryManager._is_rate_limit_haystack(haystack):
+                return RetryStrategy.RATE_LIMIT, []
+            return RetryStrategy.VERIFIER_PARSE, []
+        if severity_class == "hard_invariant":
+            return RetryStrategy.GENERIC, []
+
+        # Compatibility fallback path for legacy/non-structured failures.
+        if RetryManager._is_rate_limit_haystack(haystack):
+            return RetryStrategy.RATE_LIMIT, []
 
         if "could not parse verifier output" in haystack:
             return RetryStrategy.VERIFIER_PARSE, []
@@ -170,40 +216,125 @@ class RetryManager:
             return RetryStrategy.VERIFIER_PARSE, []
 
         if any(marker in haystack for marker in (
-            "recommendation_unconfirmed",
-            "unconfirmed supporting",
-            "unconfirmed claims",
-            "confirm-or-prune",
+            "unconfirmed",
+            "insufficiently confirmed",
+            "remediation required",
+            "queue follow-up",
+            "queue_follow_up",
+            "confirm_or_prune",
             "partial_verified",
         )):
             return RetryStrategy.UNCONFIRMED_DATA, []
 
         if any(marker in haystack for marker in (
-            "http 429",
-            "rate limit",
-            "rate-limited",
-            "too many requests",
+            "no successful tool-call evidence found for target",
+            "missing evidence for",
+            "missing evidence coverage",
+            "insufficient evidence for",
         )):
-            return RetryStrategy.RATE_LIMIT, []
-
-        if "no successful tool-call evidence found for market" in haystack:
-            markets = RetryManager._extract_missing_markets(feedback)
-            return RetryStrategy.EVIDENCE_GAP, markets
+            return RetryStrategy.EVIDENCE_GAP, RetryManager._extract_missing_targets(
+                feedback,
+            )
 
         return RetryStrategy.GENERIC, []
 
     @staticmethod
-    def _extract_missing_markets(feedback: str) -> list[str]:
-        markets: list[str] = []
+    def _extract_reason_code(verification: object | None) -> str:
+        if verification is None:
+            return ""
+        if isinstance(verification, dict):
+            raw = verification.get("reason_code", "")
+        else:
+            raw = getattr(verification, "reason_code", "")
+        return str(raw or "").strip().lower()
+
+    @staticmethod
+    def _extract_remediation_mode(verification: object | None) -> str:
+        if verification is None:
+            return ""
+        metadata = {}
+        if isinstance(verification, dict):
+            candidate = verification.get("metadata", {})
+            if isinstance(candidate, dict):
+                metadata = candidate
+        else:
+            candidate = getattr(verification, "metadata", {})
+            if isinstance(candidate, dict):
+                metadata = candidate
+        raw = metadata.get("remediation_mode", "")
+        return str(raw or "").strip().lower()
+
+    @staticmethod
+    def _extract_missing_targets_from_verification(
+        verification: object | None,
+    ) -> list[str]:
+        if verification is None:
+            return []
+        metadata = {}
+        if isinstance(verification, dict):
+            candidate = verification.get("metadata", {})
+            if isinstance(candidate, dict):
+                metadata = candidate
+        else:
+            candidate = getattr(verification, "metadata", {})
+            if isinstance(candidate, dict):
+                metadata = candidate
+
+        targets = metadata.get("missing_targets", [])
+        if isinstance(targets, str):
+            text = targets.strip()
+            return [text] if text else []
+        if isinstance(targets, list):
+            normalized = []
+            for item in targets:
+                text = str(item or "").strip()
+                if text and text not in normalized:
+                    normalized.append(text)
+            return normalized
+        return []
+
+    @staticmethod
+    def _extract_severity_class(verification: object | None) -> str:
+        if verification is None:
+            return ""
+        if isinstance(verification, dict):
+            raw = verification.get("severity_class", "")
+        else:
+            raw = getattr(verification, "severity_class", "")
+        return str(raw or "").strip().lower()
+
+    @staticmethod
+    def _is_rate_limit_haystack(haystack: str) -> bool:
+        return any(marker in haystack for marker in (
+            "http 429",
+            "rate limit",
+            "rate-limited",
+            "too many requests",
+        ))
+
+    @staticmethod
+    def _extract_missing_targets(feedback: str) -> list[str]:
+        targets: list[str] = []
         for match in re.finditer(
-            r"market\s+'([^']+)'",
+            r"(?:target|entity|item)\s+'([^']+)'",
             str(feedback or ""),
             flags=re.IGNORECASE,
         ):
-            market = str(match.group(1)).strip()
-            if market and market not in markets:
-                markets.append(market)
-        return markets
+            target = str(match.group(1)).strip()
+            if target and target not in targets:
+                targets.append(target)
+        if targets:
+            return targets
+
+        for match in re.finditer(
+            r"for\s+'([^']+)'",
+            str(feedback or ""),
+            flags=re.IGNORECASE,
+        ):
+            target = str(match.group(1)).strip()
+            if target and target not in targets:
+                targets.append(target)
+        return targets
 
     def should_flag_for_human(self, attempt: int) -> bool:
         """Check if all retries are exhausted and human review is needed."""

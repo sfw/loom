@@ -120,6 +120,7 @@ class TestGenerateToml:
         parsed = tomllib.loads(toml)
         assert parsed["models"]["test"]["provider"] == "ollama"
         assert parsed["server"]["port"] == 9000
+        assert parsed["execution"]["delegate_task_timeout_seconds"] == 3600
         assert parsed["memory"]["database_path"] == "~/.loom/loom.db"
 
     def test_generated_toml_loads_as_config(self):
@@ -153,6 +154,7 @@ class TestGenerateToml:
         assert config.models["primary"].api_key == "sk-ant-fake"
         assert config.models["primary"].roles == ["planner", "executor"]
         assert config.server.port == 9000
+        assert config.execution.delegate_task_timeout_seconds == 3600
 
 
 class TestRunSetup:
@@ -194,6 +196,7 @@ class TestRunSetup:
         content = cfg_path.read_text()
         assert 'provider = "ollama"' in content
         assert 'model = "qwen3:14b"' in content
+        assert "delegate_task_timeout_seconds = 3600" in content
         assert (cfg_dir / "scratch").is_dir()
         assert (cfg_dir / "logs").is_dir()
         assert (cfg_dir / "processes").is_dir()

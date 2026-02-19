@@ -91,6 +91,11 @@ class ApprovalManager:
         if approval_mode == "manual":
             return ApprovalDecision.WAIT
 
+        if approval_mode in {"disabled", "none", "off"}:
+            if self._is_always_gated(result):
+                return ApprovalDecision.WAIT
+            return ApprovalDecision.PROCEED
+
         if approval_mode == "auto":
             if self._is_always_gated(result):
                 return ApprovalDecision.WAIT
