@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from loom.config import Config, ExecutionConfig
 from loom.tools import create_default_registry, discover_tools
 from loom.tools.file_ops import (
     DeleteFileTool,
@@ -123,6 +124,16 @@ class TestRegistry:
         a = [cls.__name__ for cls in discover_tools()]
         b = [cls.__name__ for cls in discover_tools()]
         assert a == b
+
+    def test_delegate_task_tool_uses_configured_timeout(self, monkeypatch):
+        monkeypatch.delenv("LOOM_DELEGATE_TIMEOUT_SECONDS", raising=False)
+        config = Config(
+            execution=ExecutionConfig(delegate_task_timeout_seconds=7200),
+        )
+        registry = create_default_registry(config)
+        delegate = registry.get("delegate_task")
+        assert delegate is not None
+        assert delegate.timeout_seconds == 7200
 
     async def test_execute_unknown_tool(self, registry: ToolRegistry):
         result = await registry.execute("nonexistent", {})

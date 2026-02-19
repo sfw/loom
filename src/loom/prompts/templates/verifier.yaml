@@ -25,14 +25,13 @@ instructions: |
     "passed": true|false,
     "outcome": "pass|pass_with_warnings|partial_verified|fail",
     "reason_code": "short_machine_readable_reason_or_empty",
+    "severity_class": "hard_invariant|semantic|inconclusive|infra",
     "confidence": 0.0-1.0,
     "feedback": "Brief explanation of your assessment",
     "issues": ["list of specific issues found, if any"],
-    "recommendation_unconfirmed_count": 0,
-    "recommendation_claim_count": 0,
-    "supporting_unconfirmed_count": 0,
-    "supporting_claim_count": 0,
-    "synthesis_partition_present": true|false
+    "metadata": {{
+      "optional_process_fields": "include process-defined counters/flags only when inferable"
+    }}
   }}
 
 constraints: |
@@ -48,15 +47,8 @@ constraints: |
   - Treat advisory web-source failures (including 4xx/5xx, timeouts, and
     connection failures) as non-fatal when acceptance criteria are satisfied
     with other evidence.
-  - Recommendations must contain zero unconfirmed claims. If any recommendation
-    claim is unsupported, set `passed=false`, `outcome="fail"`, and set
-    `reason_code` to indicate recommendation unconfirmed content.
-  - Supporting sections may contain some unconfirmed claims if explicitly
-    labeled. When supporting unconfirmed content is high but recommendations
-    are clean, use `outcome="partial_verified"` and keep `passed=true`.
-  - For synthesis subtasks containing unconfirmed supporting claims, require
-    two clear sections: `Verified Findings` and `Unconfirmed Appendix`. Set
-    `synthesis_partition_present=true` only when both are present.
+  - If process-specific verifier constraints or output metadata fields are provided,
+    apply them exactly and return inferred values in `metadata`.
   - If the result mentions errors or blockers, that is a failure.
   - A partially completed subtask is a failure.
   - Respond with ONLY the JSON object. No explanation outside the JSON.

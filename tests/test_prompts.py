@@ -227,9 +227,19 @@ class TestExecutorPrompt:
 
     def test_executor_includes_evidence_contract_and_ledger_snapshot(
         self,
-        assembler: PromptAssembler,
         state_manager: TaskStateManager,
     ):
+        from loom.processes.schema import ProcessDefinition, PromptContracts
+
+        assembler = PromptAssembler(
+            process=ProcessDefinition(
+                name="evidence-process",
+                schema_version=2,
+                prompt_contracts=PromptContracts(
+                    evidence_contract={"enabled": True, "applies_to_phases": ["*"]},
+                ),
+            ),
+        )
         subtask = Subtask(
             id="environmental-scan",
             description="Perform environmental scans for each market and synthesize risk.",

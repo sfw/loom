@@ -28,6 +28,11 @@ from loom.cowork.approval import ApprovalDecision, ToolApprover
 from loom.cowork.session_state import SessionState, extract_state_from_tool_events
 from loom.engine.semantic_compactor import SemanticCompactor
 from loom.models.base import ModelProvider, ToolCall
+from loom.models.retry import (
+    ModelRetryPolicy,
+    call_with_model_retry,
+    stream_with_model_retry,
+)
 from loom.tools.registry import ToolRegistry, ToolResult
 from loom.utils.tokens import estimate_tokens as _estimate_tokens
 
@@ -152,6 +157,7 @@ class CoworkSession:
         session_state: SessionState | None = None,
         max_context_tokens: int = 180_000,
         reflection: GapAnalysisEngine | None = None,
+        model_retry_policy: ModelRetryPolicy | None = None,
     ):
         self._model = model
         self._tools = tools
@@ -178,6 +184,7 @@ class CoworkSession:
         )
         self._static_system_prompt = system_prompt
         self._compactor = SemanticCompactor(model=model)
+        self._model_retry_policy = model_retry_policy or ModelRetryPolicy()
 
         # Learned behaviors section (injected into system prompt)
         self._behaviors_section = ""
@@ -252,9 +259,12 @@ class CoworkSession:
 
         for _ in range(MAX_TOOL_ITERATIONS):
             # Call the model
-            response = await self._model.complete(
-                self._context_window(),
-                tools=self._tools.all_schemas() or None,
+            response = await call_with_model_retry(
+                lambda: self._model.complete(
+                    self._context_window(),
+                    tools=self._tools.all_schemas() or None,
+                ),
+                policy=self._model_retry_policy,
             )
             total_tokens += response.usage.total_tokens
 
@@ -370,9 +380,12 @@ class CoworkSession:
             final_tool_calls: list[ToolCall] | None = None
             final_usage = None
 
-            async for chunk in self._model.stream(
-                self._context_window(),
-                tools=self._tools.all_schemas() or None,
+            async for chunk in stream_with_model_retry(
+                lambda: self._model.stream(
+                    self._context_window(),
+                    tools=self._tools.all_schemas() or None,
+                ),
+                policy=self._model_retry_policy,
             ):
                 if chunk.text:
                     iter_text_parts.append(chunk.text)

@@ -138,6 +138,47 @@ class ToolRequirements:
 
 
 @dataclass
+class VerificationPolicyContract:
+    """Structured verification policy from process contract v2."""
+
+    mode: str = "llm_first"  # "llm_first" | "static_first"
+    static_checks: dict[str, Any] = field(default_factory=dict)
+    semantic_checks: list[dict[str, Any]] = field(default_factory=list)
+    output_contract: dict[str, Any] = field(default_factory=dict)
+    outcome_policy: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class VerificationRemediationContract:
+    """Remediation strategy contract from process contract v2."""
+
+    strategies: list[dict[str, Any]] = field(default_factory=list)
+    default_strategy: str = ""
+    critical_path_behavior: str = ""
+    retry_budget: dict[str, Any] = field(default_factory=dict)
+    transient_retry_policy: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EvidenceContract:
+    """Evidence extraction and schema contract from process contract v2."""
+
+    record_schema: dict[str, Any] = field(default_factory=dict)
+    extraction: dict[str, Any] = field(default_factory=dict)
+    summarization: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PromptContracts:
+    """Prompt-level behavioral constraints from process contract v2."""
+
+    executor_constraints: str = ""
+    verifier_constraints: str = ""
+    remediation_instructions: str | dict[str, Any] = ""
+    evidence_contract: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ProcessDefinition:
     """Complete process definition — the unit of domain specialization.
 
@@ -147,6 +188,7 @@ class ProcessDefinition:
 
     # Metadata
     name: str
+    schema_version: int = 1
     version: str = "1.0"
     description: str = ""
     author: str = ""
@@ -169,6 +211,14 @@ class ProcessDefinition:
     tests: list[ProcessTestCase] = field(default_factory=list)
     replanning_triggers: str = ""
     replanning_guidance: str = ""
+    verification_policy: VerificationPolicyContract = field(
+        default_factory=VerificationPolicyContract,
+    )
+    verification_remediation: VerificationRemediationContract = field(
+        default_factory=VerificationRemediationContract,
+    )
+    evidence: EvidenceContract = field(default_factory=EvidenceContract)
+    prompt_contracts: PromptContracts = field(default_factory=PromptContracts)
 
     # Package metadata
     dependencies: list[str] = field(default_factory=list)
@@ -182,6 +232,108 @@ class ProcessDefinition:
 
     def has_verification_rules(self) -> bool:
         return bool(self.verification_rules)
+
+    def is_contract_v2(self) -> bool:
+        return int(self.schema_version or 1) >= 2
+
+    def verifier_output_contract(self) -> dict[str, Any]:
+        output = self.verification_policy.output_contract
+        if isinstance(output, dict):
+            return output
+        return {}
+
+    def verifier_required_response_fields(self) -> list[str]:
+        if not self.is_contract_v2():
+            return ["passed"]
+
+        required = [
+            "passed",
+            "outcome",
+            "reason_code",
+            "severity_class",
+            "confidence",
+            "feedback",
+            "issues",
+            "metadata",
+        ]
+        output = self.verifier_output_contract()
+        extra = output.get("required_fields", [])
+        if isinstance(extra, list):
+            for field_name in extra:
+                text = str(field_name or "").strip()
+                if text:
+                    required.append(text)
+        metadata_fields = output.get("metadata_fields", [])
+        if isinstance(metadata_fields, list) and metadata_fields and "metadata" not in required:
+            required.append("metadata")
+        return list(dict.fromkeys(required))
+
+    def verifier_metadata_fields(self) -> list[str]:
+        output = self.verifier_output_contract()
+        fields: list[str] = []
+        for key in ("metadata_fields", "counters", "flags"):
+            raw = output.get(key, [])
+            if not isinstance(raw, list):
+                continue
+            for item in raw:
+                text = str(item or "").strip()
+                if text:
+                    fields.append(text)
+        return list(dict.fromkeys(fields))
+
+    def evidence_facets(self) -> list[str]:
+        record_schema = self.evidence.record_schema
+        if not isinstance(record_schema, dict):
+            return []
+        raw = record_schema.get("facets", [])
+        if not isinstance(raw, list):
+            return []
+        return [
+            str(item).strip()
+            for item in raw
+            if isinstance(item, str) and str(item).strip()
+        ]
+
+    def requires_evidence_contract(self, subtask_id: str) -> bool:
+        evidence_contract = self.prompt_contracts.evidence_contract
+        if isinstance(evidence_contract, dict) and evidence_contract:
+            enabled = bool(evidence_contract.get("enabled", True))
+            if not enabled:
+                return False
+            applies = evidence_contract.get("applies_to_phases", [])
+            if isinstance(applies, str):
+                applies = [applies]
+            if isinstance(applies, list) and applies:
+                normalized = [str(item or "").strip() for item in applies]
+                normalized = [item for item in normalized if item]
+                if "*" in normalized:
+                    return True
+                return subtask_id in normalized
+            return True
+        if self.is_contract_v2():
+            return bool(self.evidence.record_schema or self.evidence.extraction)
+        return False
+
+    def prompt_executor_constraints(self) -> str:
+        return str(self.prompt_contracts.executor_constraints or "").strip()
+
+    def prompt_verifier_constraints(self) -> str:
+        return str(self.prompt_contracts.verifier_constraints or "").strip()
+
+    def prompt_remediation_instructions(self, strategy: str = "") -> str:
+        raw = self.prompt_contracts.remediation_instructions
+        if isinstance(raw, str):
+            return raw.strip()
+        if isinstance(raw, dict):
+            preferred = str(strategy or "").strip().lower()
+            if preferred:
+                candidate = raw.get(preferred)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+            default = raw.get("default")
+            if isinstance(default, str):
+                return default.strip()
+        return ""
 
     def regex_rules(self) -> list[VerificationRule]:
         """Return only regex-type verification rules."""
@@ -295,9 +447,14 @@ class ProcessLoader:
         self,
         workspace: Path | None = None,
         extra_search_paths: list[Path] | None = None,
+        *,
+        require_rule_scope_metadata: bool = False,
+        require_v2_contract: bool = False,
     ):
         self._workspace = workspace
         self._extra = extra_search_paths or []
+        self._require_rule_scope_metadata = bool(require_rule_scope_metadata)
+        self._require_v2_contract = bool(require_v2_contract)
 
     @property
     def search_paths(self) -> list[Path]:
@@ -431,6 +588,14 @@ class ProcessLoader:
 
     def _build_definition(self, raw: dict[str, Any]) -> ProcessDefinition:
         """Construct a ProcessDefinition from parsed YAML."""
+        schema_version_raw = raw.get("schema_version", 1)
+        try:
+            schema_version = int(schema_version_raw)
+        except (TypeError, ValueError):
+            schema_version = 1
+        if schema_version < 1:
+            schema_version = 1
+
         # Phases
         phases = []
         for p in raw.get("phases", []):
@@ -446,10 +611,12 @@ class ProcessLoader:
                 deliverables=p.get("deliverables", []),
             ))
 
-        # Verification rules
+        # Verification rules + contract v2 verification blocks
         rules = []
         verif = raw.get("verification", {})
-        for r in verif.get("rules", []) if isinstance(verif, dict) else []:
+        if not isinstance(verif, dict):
+            verif = {}
+        for r in verif.get("rules", []):
             applies_to = r.get("applies_to_phases", [])
             if isinstance(applies_to, str):
                 applies_to = [applies_to]
@@ -470,6 +637,61 @@ class ProcessLoader:
                 ),
                 min_count=r.get("min_count"),
             ))
+
+        policy_raw = verif.get("policy", {})
+        if not isinstance(policy_raw, dict):
+            policy_raw = {}
+        static_checks = policy_raw.get("static_checks", {})
+        if not isinstance(static_checks, dict):
+            static_checks = {}
+        semantic_checks = policy_raw.get("semantic_checks", [])
+        if not isinstance(semantic_checks, list):
+            semantic_checks = []
+        semantic_checks = [
+            item for item in semantic_checks
+            if isinstance(item, dict)
+        ]
+        output_contract = policy_raw.get("output_contract", {})
+        if not isinstance(output_contract, dict):
+            output_contract = {}
+        outcome_policy = policy_raw.get("outcome_policy", {})
+        if not isinstance(outcome_policy, dict):
+            outcome_policy = {}
+        verification_policy = VerificationPolicyContract(
+            mode=str(policy_raw.get("mode", "llm_first") or "llm_first")
+            .strip()
+            .lower(),
+            static_checks=static_checks,
+            semantic_checks=semantic_checks,
+            output_contract=output_contract,
+            outcome_policy=outcome_policy,
+        )
+
+        remediation_raw = verif.get("remediation", {})
+        if not isinstance(remediation_raw, dict):
+            remediation_raw = {}
+        strategies = remediation_raw.get("strategies", [])
+        if not isinstance(strategies, list):
+            strategies = []
+        strategies = [
+            item for item in strategies
+            if isinstance(item, dict)
+        ]
+        retry_budget = remediation_raw.get("retry_budget", {})
+        if not isinstance(retry_budget, dict):
+            retry_budget = {}
+        transient_retry_policy = remediation_raw.get("transient_retry_policy", {})
+        if not isinstance(transient_retry_policy, dict):
+            transient_retry_policy = {}
+        verification_remediation = VerificationRemediationContract(
+            strategies=strategies,
+            default_strategy=str(remediation_raw.get("default_strategy", "") or "").strip(),
+            critical_path_behavior=str(
+                remediation_raw.get("critical_path_behavior", "") or "",
+            ).strip(),
+            retry_budget=retry_budget,
+            transient_retry_policy=transient_retry_policy,
+        )
 
         # Memory types
         memory_raw = raw.get("memory", {})
@@ -577,6 +799,51 @@ class ProcessLoader:
             replan_raw, dict,
         ) else ""
 
+        # Evidence contract v2
+        evidence_raw = raw.get("evidence", {})
+        if not isinstance(evidence_raw, dict):
+            evidence_raw = {}
+        evidence_record_schema = evidence_raw.get("record_schema", {})
+        if not isinstance(evidence_record_schema, dict):
+            evidence_record_schema = {}
+        evidence_extraction = evidence_raw.get("extraction", {})
+        if not isinstance(evidence_extraction, dict):
+            evidence_extraction = {}
+        evidence_summarization = evidence_raw.get("summarization", {})
+        if not isinstance(evidence_summarization, dict):
+            evidence_summarization = {}
+        evidence_contract = EvidenceContract(
+            record_schema=evidence_record_schema,
+            extraction=evidence_extraction,
+            summarization=evidence_summarization,
+        )
+
+        # Prompt contracts v2
+        prompt_contracts_raw = raw.get("prompt_contracts", {})
+        if not isinstance(prompt_contracts_raw, dict):
+            prompt_contracts_raw = {}
+        remediation_instructions_raw = prompt_contracts_raw.get(
+            "remediation_instructions",
+            "",
+        )
+        if not isinstance(remediation_instructions_raw, (str, dict)):
+            remediation_instructions_raw = str(remediation_instructions_raw)
+        evidence_contract_raw = prompt_contracts_raw.get("evidence_contract", {})
+        if isinstance(evidence_contract_raw, bool):
+            evidence_contract_raw = {"enabled": evidence_contract_raw}
+        if not isinstance(evidence_contract_raw, dict):
+            evidence_contract_raw = {}
+        prompt_contracts = PromptContracts(
+            executor_constraints=str(
+                prompt_contracts_raw.get("executor_constraints", "") or "",
+            ).strip(),
+            verifier_constraints=str(
+                prompt_contracts_raw.get("verifier_constraints", "") or "",
+            ).strip(),
+            remediation_instructions=remediation_instructions_raw,
+            evidence_contract=evidence_contract_raw,
+        )
+
         # Top-level tool_guidance (legacy compat — also check tools.guidance)
         tool_guidance = raw.get("tool_guidance", "") or tools.guidance
 
@@ -585,8 +852,24 @@ class ProcessLoader:
         if not isinstance(deps_raw, list):
             deps_raw = []
 
+        if not verification_policy.output_contract:
+            verification_policy.output_contract = {
+                "required_fields": [
+                    "passed",
+                    "outcome",
+                    "reason_code",
+                    "severity_class",
+                    "confidence",
+                    "feedback",
+                    "issues",
+                    "metadata",
+                ],
+                "metadata_fields": [],
+            }
+
         return ProcessDefinition(
             name=raw.get("name", ""),
+            schema_version=schema_version,
             version=str(raw.get("version", "1.0")),
             description=raw.get("description", ""),
             author=raw.get("author", ""),
@@ -607,6 +890,10 @@ class ProcessLoader:
             tests=tests,
             replanning_triggers=replan_triggers,
             replanning_guidance=replan_guidance,
+            verification_policy=verification_policy,
+            verification_remediation=verification_remediation,
+            evidence=evidence_contract,
+            prompt_contracts=prompt_contracts,
             dependencies=deps_raw,
         )
 
@@ -617,6 +904,14 @@ class ProcessLoader:
         # Required fields
         if not defn.name:
             errors.append("Missing required field: name")
+
+        if int(defn.schema_version or 1) < 1:
+            errors.append("schema_version must be >= 1")
+
+        if self._require_v2_contract and not defn.is_contract_v2():
+            errors.append(
+                "schema_version must be 2 when strict contract-v2 validation is enabled",
+            )
 
         # Name format
         if defn.name and not re.match(r"^[a-z0-9][a-z0-9-]*$", defn.name):
@@ -632,6 +927,37 @@ class ProcessLoader:
                 f"Invalid phase_mode {defn.phase_mode!r}: "
                 f"must be one of {valid_modes}",
             )
+
+        if defn.is_contract_v2() or self._require_v2_contract:
+            policy_mode = str(defn.verification_policy.mode or "").strip().lower()
+            if policy_mode not in {"llm_first", "static_first"}:
+                errors.append(
+                    "verification.policy.mode must be one of "
+                    "{'llm_first', 'static_first'} for schema_version >= 2",
+                )
+
+            required_fields = defn.verifier_required_response_fields()
+            if "passed" not in required_fields:
+                errors.append(
+                    "verification.policy.output_contract.required_fields "
+                    "must include 'passed'",
+                )
+            if "metadata" not in required_fields and defn.verifier_metadata_fields():
+                errors.append(
+                    "verification.policy.output_contract.required_fields must include "
+                    "'metadata' when metadata_fields/counters/flags are declared",
+                )
+
+            evidence_required = defn.evidence.record_schema.get("required_fields", [])
+            if evidence_required and not isinstance(evidence_required, list):
+                errors.append(
+                    "evidence.record_schema.required_fields must be a list when provided",
+                )
+            evidence_facets = defn.evidence.record_schema.get("facets", [])
+            if evidence_facets and not isinstance(evidence_facets, list):
+                errors.append(
+                    "evidence.record_schema.facets must be a list when provided",
+                )
 
         # Phase validation
         phase_ids = set()
@@ -736,6 +1062,16 @@ class ProcessLoader:
                 errors.append(
                     f"Rule {rule.name!r}: invalid scope {rule.scope!r}",
                 )
+            if self._require_rule_scope_metadata:
+                has_scope = bool(str(rule.scope or "").strip())
+                has_explicit_phases = bool(
+                    [p for p in (rule.applies_to_phases or []) if str(p).strip()]
+                )
+                if not has_scope and not has_explicit_phases:
+                    errors.append(
+                        f"Rule {rule.name!r}: missing scope metadata "
+                        "(set scope or applies_to_phases)",
+                    )
             for phase_id in rule.applies_to_phases:
                 if phase_id == "*":
                     continue

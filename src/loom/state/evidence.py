@@ -19,27 +19,35 @@ _EVIDENCE_TOOLS = frozenset({
 })
 _SOURCE_TOOLS = frozenset({"web_fetch", "web_fetch_html"})
 
-_DIMENSION_HINTS: tuple[tuple[str, str], ...] = (
-    ("politic", "political"),
-    ("regulat", "political"),
-    ("policy", "political"),
-    ("econom", "economic"),
-    ("inflation", "economic"),
-    ("cost", "economic"),
-    ("social", "social"),
-    ("demograph", "social"),
-    ("customer", "social"),
-    ("tech", "technological"),
-    ("digital", "technological"),
-    ("automation", "technological"),
-    ("legal", "legal"),
-    ("compliance", "legal"),
-    ("environment", "environmental"),
-    ("climate", "environmental"),
-    ("emission", "environmental"),
+_DEFAULT_FACET_KEYS = (
+    "target",
+    "entity",
+    "subject",
+    "topic",
+    "region",
+    "category",
+    "segment",
+    "dimension",
+    "geography",
 )
 
-_MARKET_KEYS = ("market", "geography", "region", "state", "province", "country")
+_EXCLUDED_FACET_KEYS = frozenset({
+    "q",
+    "query",
+    "search_query",
+    "url",
+    "path",
+    "file_path",
+    "source_url",
+    "call_id",
+    "timeout",
+    "limit",
+    "offset",
+    "page",
+    "headers",
+    "body",
+    "content",
+})
 
 
 def _normalize_text(value: object) -> str:
@@ -52,40 +60,6 @@ def _safe_json(value: object) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
         return str(value)
-
-
-def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> str:
-    for key in keys:
-        if key in mapping:
-            text = _normalize_text(mapping.get(key))
-            if text:
-                return text
-    return ""
-
-
-def _infer_dimension(text: str) -> str:
-    lowered = text.lower()
-    for needle, label in _DIMENSION_HINTS:
-        if needle in lowered:
-            return label
-    return ""
-
-
-def _infer_market(args: dict[str, Any], context_text: str) -> str:
-    market = _first_present(args, _MARKET_KEYS)
-    if market:
-        return market
-
-    lowered = context_text.lower()
-    for marker in (" in ", " for ", " across ", " within "):
-        idx = lowered.find(marker)
-        if idx == -1:
-            continue
-        candidate = _normalize_text(context_text[idx + len(marker) : idx + len(marker) + 48])
-        candidate = re.split(r"[.,;:|()\[\]]", candidate)[0].strip()
-        if len(candidate) >= 3:
-            return candidate
-    return ""
 
 
 def _snippet(text: str, *, limit: int = 280) -> str:
@@ -158,12 +132,110 @@ def _record_payload(call: Any) -> tuple[str, dict[str, Any], Any]:
     return tool, args, result
 
 
+def _coerce_scalar_facet(value: object) -> str:
+    if isinstance(value, (str, int, float, bool)):
+        return _normalize_text(value)
+    return ""
+
+
+def _coerce_facets(value: object) -> dict[str, str]:
+    facets: dict[str, str] = {}
+    if not isinstance(value, dict):
+        return facets
+    for key, raw in value.items():
+        key_text = str(key or "").strip().lower().replace(" ", "_")
+        if not key_text:
+            continue
+        val = _coerce_scalar_facet(raw)
+        if val:
+            facets[key_text] = val[:120]
+    return facets
+
+
+def _collect_facets(
+    *,
+    args: dict[str, Any],
+    result_data: dict[str, Any],
+    context_text: str,
+    facet_hints: list[str] | None = None,
+    facet_mappings: dict[str, list[str]] | None = None,
+) -> dict[str, str]:
+    facets: dict[str, str] = {}
+    facets.update(_coerce_facets(result_data.get("facets")))
+    facets.update(_coerce_facets(args.get("facets")))
+
+    mappings = facet_mappings if isinstance(facet_mappings, dict) else {}
+    for facet_name, source_keys in mappings.items():
+        facet_key = str(facet_name or "").strip().lower().replace(" ", "_")
+        if not facet_key:
+            continue
+        keys = source_keys if isinstance(source_keys, list) else []
+        for source_key in keys:
+            lookup = str(source_key or "").strip()
+            if not lookup or lookup not in args:
+                continue
+            val = _coerce_scalar_facet(args.get(lookup))
+            if val:
+                facets[facet_key] = val[:120]
+                break
+
+    hints: list[str] = []
+    if isinstance(facet_hints, list):
+        hints = [str(item or "").strip() for item in facet_hints if str(item or "").strip()]
+    if not hints:
+        hints = list(_DEFAULT_FACET_KEYS)
+
+    for key in hints:
+        if key in facets:
+            continue
+        if key not in args:
+            continue
+        val = _coerce_scalar_facet(args.get(key))
+        if val:
+            facets[key] = val[:120]
+
+    for key, raw in args.items():
+        key_text = str(key or "").strip().lower().replace(" ", "_")
+        if (
+            not key_text
+            or key_text in facets
+            or key_text in _EXCLUDED_FACET_KEYS
+        ):
+            continue
+        val = _coerce_scalar_facet(raw)
+        if not val:
+            continue
+        if len(val) > 120:
+            continue
+        facets[key_text] = val
+        if len(facets) >= 10:
+            break
+
+    if not facets and context_text:
+        topic = _normalize_text(context_text)[:120]
+        if topic:
+            facets["context"] = topic
+
+    return facets
+
+
+def _normalized_facet_summary(record: dict[str, Any]) -> str:
+    facets = _coerce_facets(record.get("facets"))
+    if not facets:
+        return "none"
+    parts = [f"{key}={value}" for key, value in sorted(facets.items())]
+    preview = ", ".join(parts)
+    return preview if len(preview) <= 140 else preview[:137] + "..."
+
+
 def extract_evidence_records(
     *,
     task_id: str,
     subtask_id: str,
     tool_calls: list[Any],
     existing_ids: set[str] | None = None,
+    facet_hints: list[str] | None = None,
+    facet_mappings: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Extract normalized evidence records from successful tool calls."""
     seen_ids = set(existing_ids or set())
@@ -206,8 +278,13 @@ def extract_evidence_records(
         if not context_text:
             continue
 
-        market = _infer_market(args, context_text)
-        dimension = _infer_dimension(context_text)
+        facets = _collect_facets(
+            args=args,
+            result_data=result_data,
+            context_text=context_text,
+            facet_hints=facet_hints,
+            facet_mappings=facet_mappings,
+        )
         quality = _score_quality(source_url, snippet_text, query_text)
         evidence_id = _next_evidence_id(
             tool_name=tool,
@@ -231,8 +308,7 @@ def extract_evidence_records(
             "tool_call_id": _normalize_text(getattr(call, "call_id", "")),
             "source_url": source_url,
             "query": query_text,
-            "market": market,
-            "dimension": dimension,
+            "facets": facets,
             "snippet": snippet_text,
             "context_text": context_text[:1200],
             "quality": quality,
@@ -283,8 +359,7 @@ def summarize_evidence_records(
         if not isinstance(item, dict):
             continue
         evidence_id = _normalize_text(item.get("evidence_id")) or "EV-UNKNOWN"
-        market = _normalize_text(item.get("market")) or "unspecified"
-        dimension = _normalize_text(item.get("dimension")) or "unspecified"
+        facets = _normalized_facet_summary(item)
         source = _normalize_text(item.get("source_url")) or _normalize_text(item.get("query"))
         quality_raw = item.get("quality", 0.0)
         try:
@@ -293,7 +368,7 @@ def summarize_evidence_records(
             quality = 0.0
         source_preview = source[:80] + "..." if len(source) > 83 else source
         lines.append(
-            f"- {evidence_id} | market={market} | dimension={dimension} | "
+            f"- {evidence_id} | facets={facets} | "
             f"quality={quality:.2f} | source={source_preview or 'n/a'}"
         )
 

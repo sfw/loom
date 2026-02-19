@@ -253,6 +253,14 @@ class PromptAssembler:
                 + self._process.tool_guidance.strip()
             )
             constraints = constraints + tool_guidance
+        if self._process:
+            executor_constraints = self._process.prompt_executor_constraints()
+            if executor_constraints:
+                constraints = (
+                    constraints
+                    + "\n\nPROCESS EXECUTION CONSTRAINTS:\n"
+                    + executor_constraints
+                )
 
         sections = [
             role,
@@ -282,24 +290,11 @@ class PromptAssembler:
             return next(iter(deliverables.values()))
         return []
 
-    @staticmethod
-    def _requires_evidence_contract(subtask: Subtask) -> bool:
-        """Return True when subtask language implies evidence-backed output."""
-        haystack = " ".join([
-            str(subtask.description or ""),
-            str(subtask.acceptance_criteria or ""),
-        ]).lower()
-        required_markers = (
-            "evidence",
-            "citation",
-            "source",
-            "research",
-            "market",
-            "trend",
-            "risk",
-            "verify",
-        )
-        return any(marker in haystack for marker in required_markers)
+    def _requires_evidence_contract(self, subtask: Subtask) -> bool:
+        """Return True only when process contract explicitly enables it."""
+        if not self._process:
+            return False
+        return self._process.requires_evidence_contract(subtask.id)
 
     def build_replanner_prompt(
         self,
@@ -446,6 +441,27 @@ class PromptAssembler:
                     "\n\nADDITIONAL DOMAIN-SPECIFIC CHECKS:\n"
                     + rules_text
                 )
+        if self._process:
+            verifier_constraints = self._process.prompt_verifier_constraints()
+            if verifier_constraints:
+                instructions += (
+                    "\n\nPROCESS VERIFIER CONSTRAINTS:\n"
+                    + verifier_constraints
+                )
+            output_contract = self._process.verifier_output_contract()
+            metadata_fields = output_contract.get("metadata_fields", [])
+            if isinstance(metadata_fields, list) and metadata_fields:
+                metadata_list = "\n".join(
+                    f"- {str(item).strip()}"
+                    for item in metadata_fields
+                    if str(item).strip()
+                )
+                if metadata_list:
+                    instructions += (
+                        "\n\nPROCESS OUTPUT METADATA FIELDS:\n"
+                        "Include these keys under `metadata` when inferable:\n"
+                        + metadata_list
+                    )
 
         sections = [role, instructions, constraints]
         return self.SECTION_SEPARATOR.join(s for s in sections if s)

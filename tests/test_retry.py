@@ -104,17 +104,17 @@ class TestRetryManager:
         assert strategy == RetryStrategy.RATE_LIMIT
         assert markets == []
 
-    def test_classify_failure_evidence_gap_extracts_markets(self):
-        strategy, markets = RetryManager.classify_failure(
+    def test_classify_failure_evidence_gap_extracts_targets(self):
+        strategy, targets = RetryManager.classify_failure(
             verification_feedback=(
-                "Verification failed: No successful tool-call evidence found for market "
+                "Verification failed: No successful tool-call evidence found for target "
                 "'Arizona Water/Wastewater'. No successful tool-call evidence found for "
-                "market 'New Mexico Water/Wastewater'."
+                "target 'New Mexico Water/Wastewater'."
             ),
             execution_error="",
         )
         assert strategy == RetryStrategy.EVIDENCE_GAP
-        assert markets == ["Arizona Water/Wastewater", "New Mexico Water/Wastewater"]
+        assert targets == ["Arizona Water/Wastewater", "New Mexico Water/Wastewater"]
 
     def test_build_retry_context_includes_evidence_gap_plan(self):
         mgr = RetryManager()
@@ -123,11 +123,11 @@ class TestRetryManager:
                 attempt=1,
                 tier=2,
                 feedback=(
-                    "No successful tool-call evidence found for market "
+                    "No successful tool-call evidence found for target "
                     "'Arizona Water/Wastewater'."
                 ),
                 retry_strategy=RetryStrategy.EVIDENCE_GAP,
-                missing_markets=["Arizona Water/Wastewater"],
+                missing_targets=["Arizona Water/Wastewater"],
             )
         ]
         context = mgr.build_retry_context(attempts)
@@ -147,6 +147,51 @@ class TestRetryManager:
         assert strategy == RetryStrategy.UNCONFIRMED_DATA
         assert markets == []
 
+    def test_classify_failure_prefers_structured_reason_code(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="Totally unrelated text",
+            execution_error="",
+            verification={"reason_code": "recommendation_unconfirmed"},
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    def test_classify_failure_prefers_structured_remediation_mode(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="No obvious markers",
+            execution_error="",
+            verification={"metadata": {"remediation_mode": "queue_follow_up"}},
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    def test_classify_failure_structured_fields_override_text_markers(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="HTTP 429 rate limit while running verifier",
+            execution_error="",
+            verification={"reason_code": "recommendation_unconfirmed"},
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    def test_classify_failure_uses_structured_severity_inconclusive(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="No obvious markers",
+            execution_error="",
+            verification={"severity_class": "inconclusive"},
+        )
+        assert strategy == RetryStrategy.VERIFIER_PARSE
+        assert markets == []
+
+    def test_classify_failure_uses_structured_severity_infra_rate_limit(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="HTTP 429 from upstream",
+            execution_error="",
+            verification={"severity_class": "infra"},
+        )
+        assert strategy == RetryStrategy.RATE_LIMIT
+        assert markets == []
+
     def test_build_retry_context_includes_unconfirmed_plan(self):
         mgr = RetryManager()
         attempts = [
@@ -160,4 +205,4 @@ class TestRetryManager:
         context = mgr.build_retry_context(attempts)
 
         assert "TARGETED RETRY PLAN" in context
-        assert "confirm-or-prune" in context
+        assert "Resolve verification findings" in context

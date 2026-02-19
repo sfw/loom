@@ -57,6 +57,7 @@ from loom.cowork.session import (
     build_cowork_system_prompt,
 )
 from loom.models.base import ModelProvider
+from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.tools.registry import ToolRegistry
 from loom.tui.commands import LoomCommands
 from loom.tui.screens import (
@@ -323,6 +324,7 @@ class ProcessRunState:
     run_id: str
     process_name: str
     goal: str
+    run_workspace: Path
     process_defn: ProcessDefinition | None
     pane_id: str
     pane: ProcessRunPane
@@ -572,6 +574,20 @@ class LoomApp(App):
         return ProcessLoader(
             workspace=self._workspace,
             extra_search_paths=extra,
+            require_rule_scope_metadata=bool(
+                getattr(
+                    getattr(self._config, "process", None),
+                    "require_rule_scope_metadata",
+                    False,
+                ),
+            ),
+            require_v2_contract=bool(
+                getattr(
+                    getattr(self._config, "process", None),
+                    "require_v2_contract",
+                    False,
+                ),
+            ),
         )
 
     def _active_process_name(self) -> str:
@@ -826,6 +842,11 @@ class LoomApp(App):
                 )
         return system_prompt
 
+    def _model_retry_policy(self) -> ModelRetryPolicy:
+        if self._config is None:
+            return ModelRetryPolicy()
+        return ModelRetryPolicy.from_execution_config(self._config.execution)
+
     async def _initialize_session(self) -> None:
         """Initialize tools, session, and welcome message.
 
@@ -866,6 +887,7 @@ class LoomApp(App):
                 system_prompt=system_prompt,
                 approver=approver,
                 store=self._store,
+                model_retry_policy=self._model_retry_policy(),
             )
             try:
                 await self._session.resume(resume_target)
@@ -904,6 +926,7 @@ class LoomApp(App):
                 approver=approver,
                 store=self._store,
                 session_id=session_id,
+                model_retry_policy=self._model_retry_policy(),
             )
         else:
             # Ephemeral session (no database)
@@ -913,6 +936,7 @@ class LoomApp(App):
                 workspace=self._workspace,
                 system_prompt=system_prompt,
                 approver=approver,
+                model_retry_policy=self._model_retry_policy(),
             )
 
         # Bind session-dependent tools
@@ -1067,6 +1091,7 @@ class LoomApp(App):
             "run_id": str(getattr(run, "run_id", "")).strip(),
             "process_name": str(getattr(run, "process_name", "")).strip(),
             "goal": str(getattr(run, "goal", "")).strip(),
+            "run_workspace": str(getattr(run, "run_workspace", self._workspace)),
             "status": status,
             "task_id": str(getattr(run, "task_id", "")).strip(),
             "elapsed_seconds": float(self._elapsed_seconds_for_run(run)),
@@ -1290,10 +1315,17 @@ class LoomApp(App):
                 process_name=process_name,
                 goal=goal,
             )
+            run_workspace_raw = str(raw.get("run_workspace", "")).strip()
+            run_workspace = Path(run_workspace_raw or str(self._workspace)).expanduser()
+            try:
+                run_workspace.resolve().relative_to(self._workspace.resolve())
+            except Exception:
+                run_workspace = self._workspace
             run = ProcessRunState(
                 run_id=run_id,
                 process_name=process_name,
                 goal=goal,
+                run_workspace=run_workspace,
                 process_defn=process_defn,
                 pane_id=pane_id,
                 pane=pane,
@@ -1386,17 +1418,17 @@ class LoomApp(App):
         if active:
             self._refresh_sidebar_progress_summary()
 
-    def _build_process_run_context(self, goal: str) -> dict:
+    def _build_process_run_context(self, goal: str, *, workspace: Path) -> dict:
         """Build compact cowork context to pass into delegated process runs."""
         if self._session is None:
             return {
                 "requested_goal": goal,
-                "workspace": str(self._workspace),
+                "workspace": str(workspace),
             }
         state = self._session.session_state
         context: dict = {
             "requested_goal": goal,
-            "workspace": str(self._workspace),
+            "workspace": str(workspace),
             "cowork": {
                 "turn_count": state.turn_count,
                 "current_focus": state.current_focus,
@@ -1418,6 +1450,78 @@ class LoomApp(App):
             recent_messages.reverse()
             context["cowork"]["recent_messages"] = recent_messages
         return context
+
+    @staticmethod
+    def _slugify_process_run_folder(value: str, *, max_len: int = 48) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower())
+        slug = slug.strip("-")
+        if not slug:
+            return ""
+        if len(slug) > max_len:
+            slug = slug[:max_len].strip("-")
+        return slug
+
+    def _fallback_process_run_folder_name(self, process_name: str, goal: str) -> str:
+        merged = f"{process_name} {goal}".strip().lower()
+        tokens = re.findall(r"[a-z0-9]+", merged)
+        base = "-".join(tokens[:6])
+        slug = self._slugify_process_run_folder(base)
+        return slug or "process-run"
+
+    async def _llm_process_run_folder_name(self, process_name: str, goal: str) -> str:
+        process_cfg = getattr(self._config, "process", None)
+        if not bool(getattr(process_cfg, "llm_run_folder_naming_enabled", True)):
+            return ""
+        if self._model is None:
+            return ""
+        prompt = (
+            "Return one concise kebab-case folder name for this process run. "
+            "Use 2-6 words, only lowercase letters/numbers/hyphens, no slashes, "
+            "no punctuation, no explanation.\n"
+            f"Process: {process_name}\n"
+            f"Goal: {goal}\n"
+            "Folder name:"
+        )
+        try:
+            response = await call_with_model_retry(
+                lambda: self._model.complete(
+                    [{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=24,
+                ),
+                policy=self._model_retry_policy(),
+            )
+        except Exception as e:
+            logger.warning("LLM run-folder naming failed: %s", e)
+            return ""
+        text = str(getattr(response, "text", "") or "")
+        first_line = text.strip().splitlines()[0] if text.strip() else ""
+        first_line = first_line.strip().strip("`")
+        return self._slugify_process_run_folder(first_line)
+
+    async def _prepare_process_run_workspace(self, process_name: str, goal: str) -> Path:
+        process_cfg = getattr(self._config, "process", None)
+        if not bool(getattr(process_cfg, "tui_run_scoped_workspace_enabled", True)):
+            return self._workspace
+
+        root = self._workspace.resolve()
+        slug = await self._llm_process_run_folder_name(process_name, goal)
+        if not slug:
+            slug = self._fallback_process_run_folder_name(process_name, goal)
+
+        for suffix in range(1, 1000):
+            candidate_name = slug if suffix == 1 else f"{slug}-{suffix}"
+            candidate = root / candidate_name
+            try:
+                candidate.mkdir(parents=True, exist_ok=False)
+                return candidate
+            except FileExistsError:
+                continue
+            except OSError as e:
+                logger.warning("Failed to create run workspace %s: %s", candidate, e)
+                break
+
+        return self._workspace
 
     def _current_process_run(self) -> ProcessRunState | None:
         """Return run associated with currently active tab, if any."""
@@ -1573,9 +1677,10 @@ class LoomApp(App):
             )
             return
 
+        process_name = selected_process.name
+        run_workspace = await self._prepare_process_run_workspace(process_name, goal)
         run_id = self._new_process_run_id()
         pane_id = f"tab-run-{run_id}"
-        process_name = selected_process.name
         pane = ProcessRunPane(
             run_id=run_id,
             process_name=process_name,
@@ -1585,6 +1690,7 @@ class LoomApp(App):
             run_id=run_id,
             process_name=process_name,
             goal=goal,
+            run_workspace=run_workspace,
             process_defn=selected_process,
             pane_id=pane_id,
             pane=pane,
@@ -1611,6 +1717,10 @@ class LoomApp(App):
         chat.add_info(
             f"Started process run [dim]{run_id}[/dim] "
             f"([bold]{process_name}[/bold])."
+        )
+        self._append_process_run_activity(
+            run,
+            f"Run workspace: {run_workspace}",
         )
         self._append_process_run_activity(run, "Queued process run.")
         if not self._process_close_hint_shown:
@@ -1655,8 +1765,12 @@ class LoomApp(App):
                 "delegate_task",
                 {
                     "goal": run.goal,
-                    "context": self._build_process_run_context(run.goal),
+                    "context": self._build_process_run_context(
+                        run.goal,
+                        workspace=run.run_workspace,
+                    ),
                     "wait": True,
+                    "_approval_mode": "disabled",
                     "_process_override": run.process_defn,
                     "_progress_callback": (
                         lambda data, rid=run_id: self._on_process_progress_event(
@@ -1664,7 +1778,7 @@ class LoomApp(App):
                         )
                     ),
                 },
-                workspace=self._workspace,
+                workspace=run.run_workspace,
             )
             data = getattr(result, "data", None)
             if run.closed:
@@ -2177,6 +2291,7 @@ class LoomApp(App):
             approver=approver,
             store=self._store,
             session_id=session_id,
+            model_retry_policy=self._model_retry_policy(),
         )
         self._total_tokens = 0
         self._bind_session_tools()
@@ -2204,6 +2319,7 @@ class LoomApp(App):
             system_prompt=system_prompt,
             approver=approver,
             store=self._store,
+            model_retry_policy=self._model_retry_policy(),
         )
         await new_session.resume(session_id)
 
@@ -3073,11 +3189,15 @@ class LoomApp(App):
             phase_state = subtask_status.get(phase_id, "pending")
             if phase_state == "pending":
                 continue
+            run_workspace = getattr(run, "run_workspace", None)
+            workspace_root = (
+                Path(run_workspace) if run_workspace else self._workspace
+            )
             for path in phase_deliverables:
                 rel_path = str(path).strip()
                 if not rel_path:
                     continue
-                exists = (self._workspace / rel_path).exists()
+                exists = (workspace_root / rel_path).exists()
                 if exists:
                     status = "completed"
                     suffix = ""
@@ -3315,8 +3435,8 @@ class LoomApp(App):
         message = error.strip() or "Process run failed."
         if "timed out" in message.lower():
             message = (
-                f"{message} Increase LOOM_DELEGATE_TIMEOUT_SECONDS for longer "
-                "runs."
+                f"{message} Increase [execution].delegate_task_timeout_seconds "
+                "(or LOOM_DELEGATE_TIMEOUT_SECONDS) for longer runs."
             )
         self._sidebar_cowork_tasks = [
             {

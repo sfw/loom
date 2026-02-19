@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 from loom.engine.semantic_compactor import SemanticCompactor
 from loom.learning.manager import LearnedPattern, LearningManager
+from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 
 logger = logging.getLogger(__name__)
 
@@ -281,10 +282,12 @@ class GapAnalysisEngine:
         self,
         learning: LearningManager,
         model=None,  # ModelProvider, optional for LLM-assisted extraction
+        model_retry_policy: ModelRetryPolicy | None = None,
     ):
         self._learning = learning
         self._model = model
         self._compactor = SemanticCompactor(model=model)
+        self._model_retry_policy = model_retry_policy or ModelRetryPolicy()
 
         # State: the last completion point
         self._pending_completion: str | None = None  # summary of completed work
@@ -381,8 +384,11 @@ class GapAnalysisEngine:
             user_followup=compact_followup,
         )
         try:
-            response = await self._model.complete(
-                [{"role": "user", "content": prompt}],
+            response = await call_with_model_retry(
+                lambda: self._model.complete(
+                    [{"role": "user", "content": prompt}],
+                ),
+                policy=self._model_retry_policy,
             )
             text = (response.text or "").strip().upper()
             if "NEW_TASK" in text:
@@ -444,8 +450,11 @@ class GapAnalysisEngine:
             user_followup=compact_followup,
         )
         try:
-            response = await self._model.complete(
-                [{"role": "user", "content": prompt}],
+            response = await call_with_model_retry(
+                lambda: self._model.complete(
+                    [{"role": "user", "content": prompt}],
+                ),
+                policy=self._model_retry_policy,
             )
             text = (response.text or "").strip()
 

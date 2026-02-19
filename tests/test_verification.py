@@ -66,6 +66,26 @@ class TestDataStructures:
         assert r.confidence == 1.0
         assert r.checks == []
         assert r.feedback is None
+        assert r.severity_class == "semantic"
+
+    def test_verification_result_infers_severity_class_from_reason_code(self):
+        r = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="parse_inconclusive",
+        )
+        assert r.severity_class == "inconclusive"
+
+    def test_verification_result_respects_explicit_severity_class(self):
+        r = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="llm_semantic_failed",
+            severity_class="infra",
+        )
+        assert r.severity_class == "infra"
 
 
 # --- DeterministicVerifier ---
@@ -324,6 +344,33 @@ class TestLLMVerifier:
         result = await v.verify(_make_subtask(), "output", [], None)
         assert not result.passed
         assert result.feedback == "Add try/except blocks"
+
+    @pytest.mark.asyncio
+    async def test_verifier_preserves_structured_severity_class(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
+        model.complete = AsyncMock(return_value=ModelResponse(
+            text=json.dumps({
+                "passed": False,
+                "issues": ["Verifier backend unavailable"],
+                "confidence": 0.2,
+                "outcome": "fail",
+                "reason_code": "infra_verifier_error",
+                "severity_class": "infra",
+            }),
+            usage=TokenUsage(input_tokens=20, output_tokens=18, total_tokens=38),
+        ))
+        router.select = MagicMock(return_value=model)
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
+
+        verifier = LLMVerifier(router, prompts, ResponseValidator())
+        verifier._compactor = self._FakeCompactor()
+        result = await verifier.verify(_make_subtask(), "output", [], None)
+        assert not result.passed
+        assert result.reason_code == "infra_verifier_error"
+        assert result.severity_class == "infra"
 
     @pytest.mark.asyncio
     async def test_verifier_parses_json_wrapped_in_text(self):
@@ -713,7 +760,7 @@ class TestLLMVerifier:
         assert "rule-b" not in sent
 
     @pytest.mark.asyncio
-    async def test_recommendation_unconfirmed_forces_failure(self):
+    async def test_verifier_preserves_model_metadata_without_static_policy_override(self):
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
@@ -722,10 +769,41 @@ class TestLLMVerifier:
                 "passed": True,
                 "confidence": 0.82,
                 "issues": [],
-                "recommendation_unconfirmed_count": 1,
-                "recommendation_claim_count": 3,
-                "supporting_unconfirmed_count": 0,
-                "supporting_claim_count": 5,
+                "metadata": {
+                    "primary_unconfirmed_count": 1,
+                    "remediation_mode": "confirm_or_prune",
+                },
+            }),
+            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+        ))
+        router.select = MagicMock(return_value=model)
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.process = None
+        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
+
+        result = await v.verify(_make_subtask(), "output", [], None)
+        assert result.passed
+        assert result.outcome == "pass"
+        assert result.metadata.get("primary_unconfirmed_count") == 1
+        assert result.metadata.get("remediation_mode") == "confirm_or_prune"
+
+    @pytest.mark.asyncio
+    async def test_verifier_respects_model_declared_failure_and_reason_code(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
+        model.complete = AsyncMock(return_value=ModelResponse(
+            text=json.dumps({
+                "passed": False,
+                "outcome": "fail",
+                "reason_code": "policy_remediation_required",
+                "severity_class": "semantic",
+                "confidence": 0.45,
+                "feedback": "Insufficient evidence linkage",
+                "issues": ["claim-to-evidence map missing"],
+                "metadata": {"remediation_mode": "targeted_remediation"},
             }),
             usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
         ))
@@ -738,165 +816,8 @@ class TestLLMVerifier:
 
         result = await v.verify(_make_subtask(), "output", [], None)
         assert not result.passed
-        assert result.outcome == "fail"
-        assert result.reason_code == "recommendation_unconfirmed"
-        assert result.metadata.get("remediation_mode") == "confirm_or_prune"
-
-    @pytest.mark.asyncio
-    async def test_supporting_unconfirmed_becomes_partial_verified_for_non_critical(self):
-        router = MagicMock(spec=ModelRouter)
-        model = AsyncMock()
-        model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "passed": True,
-                "confidence": 0.79,
-                "issues": [],
-                "recommendation_unconfirmed_count": 0,
-                "recommendation_claim_count": 2,
-                "supporting_unconfirmed_count": 4,
-                "supporting_claim_count": 10,
-            }),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
-        router.select = MagicMock(return_value=model)
-        prompts = MagicMock(spec=PromptAssembler)
-        prompts.process = None
-        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
-        config = VerificationConfig(
-            unconfirmed_supporting_threshold=0.30,
-            allow_partial_verified=True,
-            auto_confirm_prune_critical_path=True,
-        )
-        v = LLMVerifier(
-            router,
-            prompts,
-            ResponseValidator(),
-            verification_config=config,
-        )
-        v._compactor = self._FakeCompactor()
-
-        result = await v.verify(_make_subtask(), "output", [], None)
-        assert result.passed
-        assert result.outcome == "partial_verified"
-        assert result.reason_code == "unconfirmed_supporting_threshold"
-        assert result.metadata.get("remediation_mode") == "queue_follow_up"
-
-    @pytest.mark.asyncio
-    async def test_supporting_unconfirmed_fails_for_critical_path(self):
-        router = MagicMock(spec=ModelRouter)
-        model = AsyncMock()
-        model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "passed": True,
-                "confidence": 0.79,
-                "issues": [],
-                "recommendation_unconfirmed_count": 0,
-                "recommendation_claim_count": 2,
-                "supporting_unconfirmed_count": 4,
-                "supporting_claim_count": 10,
-            }),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
-        router.select = MagicMock(return_value=model)
-        prompts = MagicMock(spec=PromptAssembler)
-        prompts.process = None
-        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
-        config = VerificationConfig(
-            unconfirmed_supporting_threshold=0.30,
-            allow_partial_verified=True,
-            auto_confirm_prune_critical_path=True,
-        )
-        v = LLMVerifier(
-            router,
-            prompts,
-            ResponseValidator(),
-            verification_config=config,
-        )
-        v._compactor = self._FakeCompactor()
-        critical_subtask = Subtask(
-            id="critical-phase",
-            description="Critical",
-            is_critical_path=True,
-        )
-
-        result = await v.verify(critical_subtask, "output", [], None)
-        assert not result.passed
-        assert result.outcome == "fail"
-        assert result.reason_code == "unconfirmed_critical_path"
-        assert result.metadata.get("remediation_mode") == "confirm_or_prune"
-
-    @pytest.mark.asyncio
-    async def test_synthesis_with_unconfirmed_requires_partition_sections(self):
-        router = MagicMock(spec=ModelRouter)
-        model = AsyncMock()
-        model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "passed": True,
-                "confidence": 0.81,
-                "issues": [],
-                "recommendation_unconfirmed_count": 0,
-                "recommendation_claim_count": 2,
-                "supporting_unconfirmed_count": 1,
-                "supporting_claim_count": 10,
-                "synthesis_partition_present": False,
-            }),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
-        router.select = MagicMock(return_value=model)
-        prompts = MagicMock(spec=PromptAssembler)
-        prompts.process = None
-        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
-        v = LLMVerifier(router, prompts, ResponseValidator())
-        v._compactor = self._FakeCompactor()
-        synthesis_subtask = Subtask(
-            id="synthesize",
-            description="Synthesis",
-            is_synthesis=True,
-        )
-
-        result = await v.verify(synthesis_subtask, "output", [], None)
-        assert not result.passed
-        assert result.reason_code == "synthesis_partition_missing"
-        assert result.metadata.get("remediation_mode") == "confirm_or_prune"
-
-    @pytest.mark.asyncio
-    async def test_synthesis_partition_present_allows_pass_with_warnings(self):
-        router = MagicMock(spec=ModelRouter)
-        model = AsyncMock()
-        model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "passed": True,
-                "confidence": 0.81,
-                "issues": [],
-                "recommendation_unconfirmed_count": 0,
-                "recommendation_claim_count": 2,
-                "supporting_unconfirmed_count": 1,
-                "supporting_claim_count": 10,
-                "synthesis_partition_present": True,
-            }),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
-        router.select = MagicMock(return_value=model)
-        prompts = MagicMock(spec=PromptAssembler)
-        prompts.process = None
-        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
-        v = LLMVerifier(router, prompts, ResponseValidator())
-        v._compactor = self._FakeCompactor()
-        synthesis_subtask = Subtask(
-            id="synthesize",
-            description="Synthesis",
-            is_synthesis=True,
-        )
-
-        result = await v.verify(synthesis_subtask, "output", [], None)
-        assert result.passed
-        assert result.outcome == "pass_with_warnings"
-        assert result.metadata.get("synthesis_partition_required") is True
-        assert result.metadata.get("remediation_mode") == "queue_follow_up"
+        assert result.reason_code == "policy_remediation_required"
+        assert result.metadata.get("remediation_mode") == "targeted_remediation"
 
 
 # --- VotingVerifier ---
@@ -1053,6 +974,23 @@ class TestVerificationGates:
         event_types = [event.event_type for event in events]
         assert "verification_shadow_diff" in event_types
         assert "verification_false_negative_candidate" in event_types
+
+    def test_classify_shadow_diff_reason_diff(self):
+        classification = VerificationGates.classify_shadow_diff(
+            VerificationResult(
+                tier=2,
+                passed=False,
+                outcome="fail",
+                reason_code="unconfirmed_critical_path",
+            ),
+            VerificationResult(
+                tier=2,
+                passed=False,
+                outcome="fail",
+                reason_code="recommendation_unconfirmed",
+            ),
+        )
+        assert classification == "both_fail_reason_diff"
 
 
 # --- DeterministicVerifier with process definitions ---

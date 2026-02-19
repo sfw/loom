@@ -893,7 +893,16 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
     config = _effective_config(ctx, workspace)
     ws = (workspace or Path.cwd()).resolve()
     extra = [Path(p) for p in config.process.search_paths]
-    loader = ProcessLoader(workspace=ws, extra_search_paths=extra)
+    loader = ProcessLoader(
+        workspace=ws,
+        extra_search_paths=extra,
+        require_rule_scope_metadata=bool(
+            getattr(config.process, "require_rule_scope_metadata", False),
+        ),
+        require_v2_contract=bool(
+            getattr(config.process, "require_v2_contract", False),
+        ),
+    )
     available = loader.list_available()
 
     if not available:
@@ -962,7 +971,16 @@ def process_test(
     ws = (workspace or Path.cwd()).resolve()
     config = _effective_config(ctx, ws)
     extra = [Path(p) for p in config.process.search_paths]
-    loader = ProcessLoader(workspace=ws, extra_search_paths=extra)
+    loader = ProcessLoader(
+        workspace=ws,
+        extra_search_paths=extra,
+        require_rule_scope_metadata=bool(
+            getattr(config.process, "require_rule_scope_metadata", False),
+        ),
+        require_v2_contract=bool(
+            getattr(config.process, "require_v2_contract", False),
+        ),
+    )
 
     try:
         process_def = loader.load(name_or_path)

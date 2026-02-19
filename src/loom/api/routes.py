@@ -65,6 +65,12 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         loader = ProcessLoader(
             workspace=Path(body.workspace) if body.workspace else None,
             extra_search_paths=extra,
+            require_rule_scope_metadata=bool(
+                getattr(engine.config.process, "require_rule_scope_metadata", False),
+            ),
+            require_v2_contract=bool(
+                getattr(engine.config.process, "require_v2_contract", False),
+            ),
         )
         try:
             process_def = loader.load(effective_process)

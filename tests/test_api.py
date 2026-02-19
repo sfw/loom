@@ -472,9 +472,10 @@ class TestProcessField:
         captured: dict[str, object] = {}
 
         class DummyLoader:
-            def __init__(self, workspace=None, extra_search_paths=None):
+            def __init__(self, workspace=None, extra_search_paths=None, **kwargs):
                 captured["workspace"] = workspace
                 captured["extra_search_paths"] = extra_search_paths
+                captured["kwargs"] = kwargs
 
             def load(self, name):
                 captured["name"] = name
@@ -504,9 +505,10 @@ class TestProcessField:
         captured: dict[str, object] = {}
 
         class DummyLoader:
-            def __init__(self, workspace=None, extra_search_paths=None):
+            def __init__(self, workspace=None, extra_search_paths=None, **kwargs):
                 captured["workspace"] = workspace
                 captured["extra_search_paths"] = extra_search_paths
+                captured["kwargs"] = kwargs
 
             def load(self, name):
                 captured["name"] = name
@@ -543,9 +545,10 @@ class TestProcessField:
         captured: dict[str, object] = {}
 
         class DummyLoader:
-            def __init__(self, workspace=None, extra_search_paths=None):
+            def __init__(self, workspace=None, extra_search_paths=None, **kwargs):
                 captured["workspace"] = workspace
                 captured["extra_search_paths"] = extra_search_paths
+                captured["kwargs"] = kwargs
 
             def load(self, name):
                 # Any non-None object is fine for route wiring.
@@ -573,9 +576,10 @@ class TestProcessField:
         captured: dict[str, object] = {}
 
         class DummyLoader:
-            def __init__(self, workspace=None, extra_search_paths=None):
+            def __init__(self, workspace=None, extra_search_paths=None, **kwargs):
                 captured["workspace"] = workspace
                 captured["extra_search_paths"] = extra_search_paths
+                captured["kwargs"] = kwargs
 
             def load(self, name):
                 return SimpleNamespace(

@@ -19,6 +19,7 @@ SUBTASK_BLOCKED = "subtask_blocked"
 # Tool events
 TOOL_CALL_STARTED = "tool_call_started"
 TOOL_CALL_COMPLETED = "tool_call_completed"
+ARTIFACT_CONFINEMENT_VIOLATION = "artifact_confinement_violation"
 
 # Model events
 MODEL_INVOCATION = "model_invocation"
@@ -43,6 +44,12 @@ STEER_INSTRUCTION = "steer_instruction"
 
 # Retry events
 SUBTASK_RETRYING = "subtask_retrying"
+REMEDIATION_QUEUED = "remediation_queued"
+REMEDIATION_STARTED = "remediation_started"
+REMEDIATION_ATTEMPT = "remediation_attempt"
+REMEDIATION_RESOLVED = "remediation_resolved"
+REMEDIATION_FAILED = "remediation_failed"
+REMEDIATION_EXPIRED = "remediation_expired"
 
 # Streaming events
 TOKEN_STREAMED = "token_streamed"

@@ -134,6 +134,31 @@ class TestApprovalDecisions:
         )
         assert decision == ApprovalDecision.WAIT
 
+    def test_disabled_mode_proceeds_without_human_gate(self):
+        mgr = ApprovalManager(EventBus())
+        decision = mgr.check_approval(
+            approval_mode="disabled",
+            confidence=0.0,
+            result=MockSubtaskResult(),
+        )
+        assert decision == ApprovalDecision.PROCEED
+
+    def test_disabled_mode_still_gates_destructive_operations(self):
+        mgr = ApprovalManager(EventBus())
+        result = MockSubtaskResult(
+            tool_calls=[MockToolCallRecord(
+                tool="shell_execute",
+                args={"command": "rm -rf /tmp/data"},
+                result=ToolResult.ok("ok"),
+            )],
+        )
+        decision = mgr.check_approval(
+            approval_mode="disabled",
+            confidence=1.0,
+            result=result,
+        )
+        assert decision == ApprovalDecision.WAIT
+
     def test_unknown_mode_defaults_to_proceed_at_high_confidence(self):
         mgr = ApprovalManager(EventBus())
         decision = mgr.check_approval(

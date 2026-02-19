@@ -31,16 +31,21 @@ DEFAULT_DELEGATE_TIMEOUT_SECONDS = 3600
 logger = logging.getLogger(__name__)
 
 
-def _delegate_timeout_seconds() -> int:
+def _normalize_timeout_seconds(value: object, *, default: int) -> int:
+    """Normalize timeout input to a positive integer."""
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return default
+    return normalized if normalized > 0 else default
+
+
+def _delegate_timeout_seconds(default_timeout: int) -> int:
     """Resolve delegate timeout from env with safe fallback."""
     raw = os.environ.get("LOOM_DELEGATE_TIMEOUT_SECONDS", "").strip()
     if not raw:
-        return DEFAULT_DELEGATE_TIMEOUT_SECONDS
-    try:
-        value = int(raw)
-    except ValueError:
-        return DEFAULT_DELEGATE_TIMEOUT_SECONDS
-    return value if value > 0 else DEFAULT_DELEGATE_TIMEOUT_SECONDS
+        return default_timeout
+    return _normalize_timeout_seconds(raw, default=default_timeout)
 
 
 class DelegateTaskTool(Tool):
@@ -94,16 +99,25 @@ class DelegateTaskTool(Tool):
         "required": ["goal"],
     }
 
-    @property
-    def timeout_seconds(self) -> int:
-        # Long-running orchestration can exceed simple tool time budgets.
-        return _delegate_timeout_seconds()
-
     def __init__(
         self,
         orchestrator_factory: Callable[..., Awaitable[Orchestrator]] | None = None,
+        timeout_seconds: int | None = None,
     ):
         self._factory = orchestrator_factory
+        self._configured_timeout_seconds = _normalize_timeout_seconds(
+            (
+                timeout_seconds
+                if timeout_seconds is not None
+                else DEFAULT_DELEGATE_TIMEOUT_SECONDS
+            ),
+            default=DEFAULT_DELEGATE_TIMEOUT_SECONDS,
+        )
+
+    @property
+    def timeout_seconds(self) -> int:
+        # Long-running orchestration can exceed simple tool time budgets.
+        return _delegate_timeout_seconds(self._configured_timeout_seconds)
 
     def bind(
         self,
@@ -126,6 +140,9 @@ class DelegateTaskTool(Tool):
         wait = args.get("wait", True)
         progress_callback = args.get("_progress_callback")
         process_override = args.get("_process_override")
+        approval_mode = str(
+            args.get("_approval_mode", "confidence_threshold"),
+        ).strip() or "confidence_threshold"
         workspace = str(ctx.workspace) if ctx.workspace else ""
 
         # Fresh orchestrator per call to isolate concurrent delegated runs.
@@ -144,7 +161,12 @@ class DelegateTaskTool(Tool):
             return ToolResult.fail(f"Failed to initialize orchestrator: {e}")
 
         # Build task
-        task = _create_task(goal, workspace, context)
+        task = _create_task(
+            goal,
+            workspace,
+            context,
+            approval_mode=approval_mode,
+        )
         event_bus = getattr(orchestrator, "_events", None)
         event_log_handle = None
         event_log_path = ""
@@ -209,6 +231,7 @@ class DelegateTaskTool(Tool):
                 "wait": bool(wait),
                 "has_progress_callback": bool(callable(progress_callback)),
                 "process_override": bool(process_override),
+                "approval_mode": approval_mode,
             },
             event_log_path=event_log_path,
         )

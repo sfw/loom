@@ -3,26 +3,29 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from loom.config import Config, ExecutionConfig
+from loom.config import Config, ExecutionConfig, VerificationConfig
 from loom.engine.orchestrator import Orchestrator, SubtaskResult, ToolCallRecord, create_task
 from loom.engine.verification import VerificationResult
 from loom.events.bus import EventBus
 from loom.events.types import (
+    ARTIFACT_CONFINEMENT_VIOLATION,
     TASK_COMPLETED,
     TASK_EXECUTING,
     TASK_FAILED,
     TASK_PLAN_READY,
     TASK_PLANNING,
+    TOOL_CALL_COMPLETED,
 )
-from loom.models.base import ModelResponse, TokenUsage, ToolCall
+from loom.models.base import ModelConnectionError, ModelResponse, TokenUsage, ToolCall
 from loom.models.router import ModelRouter
 from loom.processes.schema import PhaseTemplate, ProcessDefinition
 from loom.prompts.assembler import PromptAssembler
-from loom.recovery.retry import AttemptRecord
+from loom.recovery.retry import AttemptRecord, RetryStrategy
 from loom.state.task_state import (
     Subtask,
     SubtaskStatus,
@@ -488,6 +491,109 @@ class TestOrchestratorExecution:
         assert kwargs["prior_successful_tool_calls"] == [successful_call]
 
     @pytest.mark.asyncio
+    async def test_single_subtask_exception_retries_instead_of_fatal_abort(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "First"}]
+        })
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=1,
+            max_loop_iterations=50,
+            max_parallel_subtasks=3,
+            auto_approve_confidence_threshold=0.5,
+            enable_streaming=False,
+        ))
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda e: events.append(e))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=cfg,
+        )
+        orch._runner.run = AsyncMock(side_effect=[
+            ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
+            (
+                SubtaskResult(status="success", summary="ok"),
+                VerificationResult(tier=1, passed=True),
+            ),
+        ])
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert orch._runner.run.await_count == 2
+        fatal_task_failed = [
+            e for e in events
+            if e.event_type == TASK_FAILED and isinstance(e.data, dict) and "error_type" in e.data
+        ]
+        assert not fatal_task_failed
+        assert all(err.subtask != "orchestrator" for err in result.errors_encountered)
+
+    @pytest.mark.asyncio
+    async def test_runner_retries_model_connection_errors_within_single_attempt(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "First"}]
+        })
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=50,
+            max_parallel_subtasks=3,
+            auto_approve_confidence_threshold=0.5,
+            enable_streaming=False,
+            model_call_max_attempts=3,
+            model_call_retry_base_delay_seconds=0.0,
+            model_call_retry_max_delay_seconds=0.0,
+            model_call_retry_jitter_seconds=0.0,
+        ))
+        router = MagicMock(spec=ModelRouter)
+        planner_model = AsyncMock()
+        planner_model.name = "mock-planner"
+        planner_model.complete = AsyncMock(return_value=ModelResponse(
+            text=plan_json,
+            usage=TokenUsage(input_tokens=100, output_tokens=50, total_tokens=150),
+        ))
+        executor_model = AsyncMock()
+        executor_model.name = "mock-executor"
+        executor_model.complete = AsyncMock(side_effect=[
+            ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
+            ModelResponse(
+                text="Subtask completed successfully.",
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            ),
+        ])
+
+        def select_fn(tier=1, role="executor"):
+            if role == "planner":
+                return planner_model
+            return executor_model
+
+        router.select = MagicMock(side_effect=select_fn)
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda e: events.append(e))
+        orch = Orchestrator(
+            model_router=router,
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=cfg,
+        )
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert executor_model.complete.await_count == 2
+        event_types = [e.event_type for e in events]
+        assert TASK_FAILED not in event_types
+
+    @pytest.mark.asyncio
     async def test_dispatch_subtask_carries_prior_evidence_records(self, tmp_path):
         plan_json = json.dumps({
             "subtasks": [{"id": "s1", "description": "First"}]
@@ -728,12 +834,192 @@ class TestOrchestratorExecution:
 
         orch._runner.run.assert_awaited_once()
         _, kwargs = orch._runner.run.await_args
-        assert "CONFIRM-OR-PRUNE REMEDIATION" in kwargs["retry_context"]
+        assert "TARGETED REMEDIATION:" in kwargs["retry_context"]
         orch._handle_success.assert_awaited_once()
         orch._abort_on_critical_path_failure.assert_not_awaited()
-        attempted = task.metadata.get("confirm_or_prune_attempted", {})
+        attempted = task.metadata.get("confirm_or_prune_attempts", {})
         assert isinstance(attempted, dict)
         assert "s1" in attempted
+        assert isinstance(attempted["s1"], list)
+        assert attempted["s1"]
+
+    @pytest.mark.asyncio
+    async def test_confirm_or_prune_retries_transient_failures_before_abort(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "Critical"}]
+        })
+        state_manager = _make_state_manager(tmp_path)
+        cfg = Config(
+            execution=ExecutionConfig(
+                max_subtask_retries=0,
+                max_loop_iterations=50,
+                max_parallel_subtasks=3,
+                auto_approve_confidence_threshold=0.8,
+                enable_streaming=False,
+            ),
+            verification=VerificationConfig(
+                confirm_or_prune_max_attempts=3,
+                confirm_or_prune_backoff_seconds=0.0,
+                confirm_or_prune_retry_on_transient=True,
+            ),
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=cfg,
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="s1",
+            description="Critical",
+            is_critical_path=True,
+            max_retries=0,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+
+        result = SubtaskResult(
+            status="failed",
+            summary="Execution summary",
+            evidence_records=[],
+        )
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            feedback=(
+                "Recommendations include unconfirmed claims; "
+                "confirm-or-prune remediation is required."
+            ),
+            outcome="fail",
+            reason_code="recommendation_unconfirmed",
+        )
+        attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
+
+        orch._runner.run = AsyncMock(side_effect=[
+            (
+                SubtaskResult(status="failed", summary="HTTP 429 from upstream"),
+                VerificationResult(
+                    tier=2,
+                    passed=False,
+                    outcome="fail",
+                    feedback="rate limited while confirming evidence",
+                    reason_code="infra_verifier_error",
+                ),
+            ),
+            (
+                SubtaskResult(status="success", summary="remediated"),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            ),
+        ])
+        orch._handle_success = AsyncMock()
+        orch._abort_on_critical_path_failure = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask,
+        )
+
+        assert orch._runner.run.await_count == 2
+        orch._handle_success.assert_awaited_once()
+        orch._abort_on_critical_path_failure.assert_not_awaited()
+
+        attempted = task.metadata.get("confirm_or_prune_attempts", {})
+        assert isinstance(attempted, dict)
+        rows = attempted.get("s1", [])
+        assert isinstance(rows, list)
+        assert len(rows) >= 2
+        assert rows[0]["status"] == "failed"
+        assert rows[-1]["status"] == "resolved"
+
+    @pytest.mark.asyncio
+    async def test_remediation_queue_dedupes_and_promotes_blocking(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="First")
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="recommendation_unconfirmed",
+            feedback="confirm-or-prune needed",
+        )
+
+        await orch._queue_remediation_work_item(
+            task=task,
+            subtask=subtask,
+            verification=verification,
+            strategy=RetryStrategy.UNCONFIRMED_DATA,
+            blocking=False,
+        )
+        await orch._queue_remediation_work_item(
+            task=task,
+            subtask=subtask,
+            verification=verification,
+            strategy=RetryStrategy.UNCONFIRMED_DATA,
+            blocking=True,
+        )
+
+        queue = task.metadata.get("remediation_queue", [])
+        assert isinstance(queue, list)
+        assert len(queue) == 1
+        assert queue[0]["blocking"] is True
+
+    @pytest.mark.asyncio
+    async def test_finalizing_remediation_queue_fails_unresolved_blocking_items(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        task.plan.subtasks = [Subtask(id="s1", description="First")]
+        task.metadata["remediation_queue"] = [{
+            "id": "rem-1",
+            "task_id": task.id,
+            "subtask_id": "s1",
+            "strategy": "unsupported",
+            "reason_code": "x",
+            "blocking": True,
+            "state": "queued",
+            "attempt_count": 0,
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+            "next_attempt_at": "2026-01-01T00:00:00",
+        }]
+        state_manager.create(task)
+
+        await orch._process_remediation_queue(
+            task=task,
+            attempts_by_subtask={},
+            finalizing=True,
+        )
+
+        queue = task.metadata.get("remediation_queue", [])
+        assert isinstance(queue, list)
+        assert queue[0]["state"] == "failed"
 
     @pytest.mark.asyncio
     async def test_executes_subtasks_in_order(self, tmp_path):
@@ -951,6 +1237,58 @@ class TestOrchestratorFinalize:
         assert len(result.errors_encountered) > 0
         event_types = [e.event_type for e in events]
         assert TASK_FAILED in event_types
+
+    @pytest.mark.asyncio
+    async def test_planning_model_connection_errors_fallback_to_safe_plan(self, tmp_path):
+        router = MagicMock(spec=ModelRouter)
+        planner_model = AsyncMock()
+        planner_model.name = "mock-planner"
+        planner_model.complete = AsyncMock(side_effect=[
+            ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
+            ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
+            ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
+        ])
+        executor_model = AsyncMock()
+        executor_model.name = "mock-executor"
+        executor_model.complete = AsyncMock(return_value=ModelResponse(
+            text="Subtask completed successfully.",
+            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+        ))
+
+        def select_fn(tier=1, role="executor"):
+            if role == "planner":
+                return planner_model
+            return executor_model
+
+        router.select = MagicMock(side_effect=select_fn)
+
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=50,
+            max_parallel_subtasks=3,
+            auto_approve_confidence_threshold=0.5,
+            enable_streaming=False,
+            model_call_max_attempts=3,
+            model_call_retry_base_delay_seconds=0.0,
+            model_call_retry_max_delay_seconds=0.0,
+            model_call_retry_jitter_seconds=0.0,
+        ))
+        orch = Orchestrator(
+            model_router=router,
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=cfg,
+        )
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert planner_model.complete.await_count == 3
+        assert result.plan.subtasks[0].id == "execute-goal"
+        assert result.status == TaskStatus.COMPLETED
 
 
 class TestWorkspaceDocumentScan:
@@ -1252,3 +1590,34 @@ class TestSubtaskRunnerContextBudget:
         )
         assert len(args_text) <= 500
         assert "A" * 200 not in args_text
+
+    def test_emit_tool_event_emits_artifact_confinement_violation(self):
+        from loom.engine.runner import SubtaskRunner
+
+        bus = EventBus()
+        events = []
+        bus.subscribe_all(lambda event: events.append(event))
+
+        runner = SubtaskRunner.__new__(SubtaskRunner)
+        runner._event_bus = bus
+
+        runner._emit_tool_event(
+            TOOL_CALL_COMPLETED,
+            "task-1",
+            "subtask-1",
+            "write_file",
+            {"path": "../outside.md"},
+            result=ToolResult.fail(
+                "Safety violation: Path '/tmp/outside.md' escapes workspace '/tmp/run'."
+            ),
+            workspace=Path("/tmp/run"),
+        )
+
+        event_types = [event.event_type for event in events]
+        assert TOOL_CALL_COMPLETED in event_types
+        assert ARTIFACT_CONFINEMENT_VIOLATION in event_types
+        violation = next(
+            event for event in events
+            if event.event_type == ARTIFACT_CONFINEMENT_VIOLATION
+        )
+        assert violation.data["attempted_path"] == "../outside.md"

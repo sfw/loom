@@ -1,0 +1,41 @@
+{
+  "id": "verifier-parse-inconclusive-stable",
+  "description": "Verifier output parsing failed consistently; routing should remain verifier_parse.",
+  "source": {
+    "event_log": "20260217-110000-cowork-parsefail.events.jsonl",
+    "sql_snapshot": "task:cowork-parsefail"
+  },
+  "context": {
+    "process": "research-report",
+    "phase_id": "quality-assurance",
+    "raw_verifier_output": "Assessment: maybe pass, maybe fail",
+    "tool_calls": [
+      {"tool": "read_file", "status": "ok", "path": "draft-report.md"}
+    ]
+  },
+  "legacy": {
+    "tier": 2,
+    "passed": false,
+    "outcome": "fail",
+    "reason_code": "parse_inconclusive",
+    "severity_class": "inconclusive"
+  },
+  "policy": {
+    "tier": 2,
+    "passed": false,
+    "outcome": "fail",
+    "reason_code": "parse_inconclusive",
+    "severity_class": "inconclusive"
+  },
+  "verification_contract": {
+    "reason_code": "parse_inconclusive",
+    "severity_class": "inconclusive",
+    "metadata": {
+      "remediation_mode": "none"
+    }
+  },
+  "expected": {
+    "shadow_classification": "no_diff",
+    "retry_strategy": "verifier_parse"
+  }
+}

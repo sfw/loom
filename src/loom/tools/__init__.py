@@ -52,6 +52,20 @@ def create_default_registry(config: Config | None = None) -> ToolRegistry:
     """
     registry = ToolRegistry()
     for tool_cls in discover_tools():
+        if (
+            config is not None
+            and getattr(tool_cls, "name", "") == "delegate_task"
+        ):
+            timeout_seconds = int(
+                getattr(
+                    config.execution,
+                    "delegate_task_timeout_seconds",
+                    3600,
+                ) or 3600
+            )
+            timeout_seconds = max(1, timeout_seconds)
+            registry.register(tool_cls(timeout_seconds=timeout_seconds))
+            continue
         registry.register(tool_cls())
 
     if config and config.mcp.servers:

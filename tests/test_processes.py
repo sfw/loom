@@ -728,11 +728,13 @@ class TestProcessLoaderLoad:
 class TestProcessLoaderValidation:
     """Tests for ProcessLoader._validate and related validation."""
 
-    def _load_yaml_str(self, tmp_path, content):
+    def _load_yaml_str(self, tmp_path, content, *, require_rule_scope_metadata=False):
         """Helper: write YAML content to a file and load it."""
         f = tmp_path / "test.yaml"
         f.write_text(content)
-        loader = ProcessLoader()
+        loader = ProcessLoader(
+            require_rule_scope_metadata=require_rule_scope_metadata,
+        )
         return loader.load(str(f))
 
     def test_valid_process_passes(self, tmp_path):
@@ -828,6 +830,60 @@ class TestProcessLoaderValidation:
         with pytest.raises(ProcessValidationError) as exc_info:
             loader.load(str(f))
         assert exc_info.value.path == f
+
+    def test_scope_metadata_required_rejects_legacy_rules(self, tmp_path):
+        yaml_text = """
+name: scoped-process
+version: "1.0"
+description: test
+persona: test
+tool_guidance: test
+phase_mode: guided
+phases:
+  - id: phase-a
+    description: First
+verification:
+  rules:
+    - name: legacy
+      description: old rule
+      type: llm
+      severity: warning
+      check: "Do quality checks"
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(
+                tmp_path,
+                yaml_text,
+                require_rule_scope_metadata=True,
+            )
+        assert any("missing scope metadata" in e for e in exc_info.value.errors)
+
+    def test_scope_metadata_required_accepts_explicit_scope(self, tmp_path):
+        yaml_text = """
+name: scoped-process
+version: "1.0"
+description: test
+persona: test
+tool_guidance: test
+phase_mode: guided
+phases:
+  - id: phase-a
+    description: First
+verification:
+  rules:
+    - name: scoped
+      description: scoped rule
+      type: llm
+      severity: warning
+      scope: phase
+      check: "Do quality checks"
+"""
+        defn = self._load_yaml_str(
+            tmp_path,
+            yaml_text,
+            require_rule_scope_metadata=True,
+        )
+        assert defn.name == "scoped-process"
 
 
 class TestDetectCycles:
