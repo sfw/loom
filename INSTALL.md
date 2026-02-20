@@ -262,7 +262,7 @@ curl http://localhost:1234/v1/models
 
 ```bash
 pytest
-# Should show 1,278+ passed
+# Should show ~1,648 collected (with some skipped depending on environment)
 ```
 
 ### 4. Start the Server
