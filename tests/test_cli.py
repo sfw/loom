@@ -113,7 +113,8 @@ class TestCLI:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
-            def run(self):
+            def run(self, **kwargs):
+                captured["run_kwargs"] = kwargs
                 return None
 
         monkeypatch.setattr(main_mod, "_init_persistence", lambda _cfg: (None, None))
@@ -133,6 +134,7 @@ class TestCLI:
         )
 
         assert captured["process_name"] == "marketing-strategy"
+        assert captured["run_kwargs"] == {"mouse": True}
 
     def test_run_uses_default_process(self, tmp_path, monkeypatch):
         """`loom run` should send process.default when flag is omitted."""
