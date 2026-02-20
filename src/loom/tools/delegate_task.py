@@ -143,6 +143,15 @@ class DelegateTaskTool(Tool):
         approval_mode = str(
             args.get("_approval_mode", "confidence_threshold"),
         ).strip() or "confidence_threshold"
+        read_roots_raw = args.get("_read_roots", [])
+        if isinstance(read_roots_raw, str):
+            read_roots_raw = [read_roots_raw]
+        read_roots: list[str] = []
+        if isinstance(read_roots_raw, list):
+            for item in read_roots_raw:
+                text = str(item or "").strip()
+                if text:
+                    read_roots.append(text)
         workspace = str(ctx.workspace) if ctx.workspace else ""
 
         # Fresh orchestrator per call to isolate concurrent delegated runs.
@@ -167,6 +176,8 @@ class DelegateTaskTool(Tool):
             context,
             approval_mode=approval_mode,
         )
+        if read_roots:
+            task.metadata["read_roots"] = read_roots
         event_bus = getattr(orchestrator, "_events", None)
         event_log_handle = None
         event_log_path = ""
@@ -232,6 +243,7 @@ class DelegateTaskTool(Tool):
                 "has_progress_callback": bool(callable(progress_callback)),
                 "process_override": bool(process_override),
                 "approval_mode": approval_mode,
+                "read_roots_count": len(read_roots),
             },
             event_log_path=event_log_path,
         )

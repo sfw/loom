@@ -147,6 +147,43 @@ class SubtaskRunner:
         self._event_bus = event_bus
         self._compactor = SemanticCompactor(model_router, role="extractor", tier=1)
 
+    @staticmethod
+    def _read_roots_for_task(task: Task, workspace: Path | None) -> list[Path]:
+        """Resolve additional read-only roots for this task.
+
+        Only accepts roots that are ancestors of the task workspace so reads
+        can widen safely to parent trees without becoming arbitrary.
+        """
+        if workspace is None:
+            return []
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        raw_roots = metadata.get("read_roots", [])
+        if isinstance(raw_roots, str):
+            raw_roots = [raw_roots]
+        if not isinstance(raw_roots, list):
+            return []
+
+        resolved_workspace = workspace.resolve()
+        roots: list[Path] = []
+        seen: set[Path] = set()
+        for raw in raw_roots:
+            try:
+                candidate = Path(str(raw)).expanduser().resolve()
+            except Exception:
+                continue
+            # Disallow filesystem-root grants.
+            if candidate == Path(candidate.anchor):
+                continue
+            try:
+                resolved_workspace.relative_to(candidate)
+            except ValueError:
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            roots.append(candidate)
+        return roots
+
     async def run(
         self,
         task: Task,
@@ -165,6 +202,7 @@ class SubtaskRunner:
         """
         start_time = time.monotonic()
         workspace = Path(task.workspace) if task.workspace else None
+        read_roots = self._read_roots_for_task(task, workspace)
 
         # 1. Assemble prompt
         memory_entries = await self._memory.query_relevant(task.id, subtask.id)
@@ -350,6 +388,7 @@ class SubtaskRunner:
                     tool_result = await self._tools.execute(
                         tc.name, tc.arguments,
                         workspace=workspace,
+                        read_roots=read_roots,
                         changelog=changelog,
                         subtask_id=subtask.id,
                     )

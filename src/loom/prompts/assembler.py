@@ -262,6 +262,42 @@ class PromptAssembler:
                     + executor_constraints
                 )
 
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        raw_read_roots = metadata.get("read_roots", [])
+        if isinstance(raw_read_roots, str):
+            raw_read_roots = [raw_read_roots]
+        read_roots: list[str] = []
+        if isinstance(raw_read_roots, list):
+            for item in raw_read_roots:
+                text = str(item or "").strip()
+                if text:
+                    read_roots.append(text)
+        if read_roots:
+            workspace_name = ""
+            try:
+                workspace_name = Path(str(task.workspace or "")).name
+            except Exception:
+                workspace_name = ""
+            roots_text = "\n".join(f"- {root}" for root in read_roots[:6])
+            constraints += (
+                "\n\nREAD/WRITE SCOPE:\n"
+                f"- Write scope: ONLY files inside the task workspace root "
+                f"({task.workspace}).\n"
+                "- Write paths must be workspace-relative and should usually be just "
+                "filenames (for example, `brief-normalized.md`).\n"
+            )
+            if workspace_name:
+                constraints += (
+                    f"- Do NOT prefix write paths with `{workspace_name}/`.\n"
+                )
+            constraints += (
+                "- Read scope: you may inspect these additional reference roots using "
+                "read-only tools when needed:\n"
+                f"{roots_text}\n"
+                "- Use explicit `path` when exploring reference roots so reads are "
+                "unambiguous."
+            )
+
         sections = [
             role,
             self._behaviors_section,  # Learned behaviors (from ALM reflection)

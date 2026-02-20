@@ -640,6 +640,56 @@ class TestLLMVerifier:
         assert "-> ADVISORY_FAILURE:" in formatted
 
     @pytest.mark.asyncio
+    async def test_llm_tool_call_format_includes_read_output_excerpt(self):
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
+
+        tool_calls = [
+            MockToolCallRecord(
+                tool="read_file",
+                args={"path": "slogan-shortlist.md"},
+                result=ToolResult.ok("Top line: Your dentist sees more than cavities."),
+            ),
+        ]
+        formatted = await v._format_tool_calls_for_prompt(tool_calls)
+
+        assert "output_excerpt:" in formatted
+        assert "Top line: Your dentist sees more than cavities." in formatted
+
+    @pytest.mark.asyncio
+    async def test_llm_tool_call_format_includes_document_write_excerpt(self):
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
+
+        tool_calls = [
+            MockToolCallRecord(
+                tool="document_write",
+                args={
+                    "path": "slogan-shortlist.md",
+                    "title": "Shortlist",
+                    "sections": [
+                        {
+                            "heading": "Winner",
+                            "body": "Your dentist sees more than cavities.",
+                        },
+                    ],
+                },
+                result=ToolResult.ok(
+                    "Created slogan-shortlist.md (~120 words)",
+                    files_changed=["slogan-shortlist.md"],
+                ),
+            ),
+        ]
+        formatted = await v._format_tool_calls_for_prompt(tool_calls)
+
+        assert "output_excerpt:" in formatted
+        assert "Your dentist sees more than cavities." in formatted
+
+    @pytest.mark.asyncio
     async def test_verifier_caps_result_summary_before_prompt(self):
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
@@ -705,6 +755,95 @@ class TestLLMVerifier:
         assert "EVIDENCE CONTEXT SNAPSHOT (advisory, non-binding):" in sent
         assert "observed_tools:" in sent
         assert "sample_records:" in sent
+
+    @pytest.mark.asyncio
+    async def test_verifier_extracts_file_based_evidence_records(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
+        model.complete = AsyncMock(return_value=ModelResponse(
+            text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
+            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+        ))
+        router.select = MagicMock(return_value=model)
+
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
+
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
+        result = await v.verify(
+            _make_subtask(subtask_id="shortlist-and-polish"),
+            "output",
+            tool_calls=[],
+            workspace=None,
+            evidence_tool_calls=[
+                MockToolCallRecord(
+                    tool="read_file",
+                    args={"path": "slogan-shortlist.md"},
+                    result=ToolResult.ok(
+                        "Top lines:\n- Your dentist sees more than cavities."
+                    ),
+                ),
+                MockToolCallRecord(
+                    tool="document_write",
+                    args={
+                        "path": "shortlist-scorecard.md",
+                        "content": "Rank 1: Your dentist sees more than cavities.",
+                    },
+                    result=ToolResult.ok("Created shortlist-scorecard.md"),
+                ),
+            ],
+        )
+
+        assert result.passed
+        sent = model.complete.await_args.args[0][0]["content"]
+        assert "EVIDENCE CONTEXT SNAPSHOT (advisory, non-binding):" in sent
+        assert "observed_tools:" in sent
+        assert "read_file" in sent
+        assert "document_write" in sent
+
+    @pytest.mark.asyncio
+    async def test_verifier_appends_changed_artifact_content_snapshot(self, tmp_path):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
+        model.complete = AsyncMock(return_value=ModelResponse(
+            text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
+            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+        ))
+        router.select = MagicMock(return_value=model)
+
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
+
+        (tmp_path / "slogan-shortlist.md").write_text(
+            "## Winners\n- Your dentist sees more than cavities.\n"
+        )
+        tool_calls = [
+            MockToolCallRecord(
+                tool="write_file",
+                args={"path": "slogan-shortlist.md"},
+                result=ToolResult.ok(
+                    "Wrote slogan-shortlist.md",
+                    files_changed=["slogan-shortlist.md"],
+                ),
+            ),
+        ]
+
+        v = LLMVerifier(router, prompts, ResponseValidator())
+        v._compactor = self._FakeCompactor()
+        result = await v.verify(
+            _make_subtask(subtask_id="shortlist-and-polish"),
+            "output",
+            tool_calls=tool_calls,
+            workspace=tmp_path,
+        )
+
+        assert result.passed
+        sent = model.complete.await_args.args[0][0]["content"]
+        assert "ARTIFACT CONTENT SNAPSHOT (for semantic review):" in sent
+        assert "Your dentist sees more than cavities." in sent
 
     @pytest.mark.asyncio
     async def test_verifier_injects_only_phase_scoped_rules(self):

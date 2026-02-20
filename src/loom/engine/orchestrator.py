@@ -1261,23 +1261,28 @@ class Orchestrator:
         workspace_listing = ""
         code_analysis = ""
         workspace_analysis = ""
+        read_roots = self._read_roots_for_task(task)
         if task.workspace:
             workspace_path = Path(task.workspace)
             if workspace_path.exists():
                 # Run listing and analysis in parallel
                 async def _do_listing():
                     return await self._tools.execute(
-                        "list_directory", {}, workspace=workspace_path,
+                        "list_directory",
+                        {},
+                        workspace=workspace_path,
+                        read_roots=read_roots,
                     )
 
                 async def _do_analysis():
+                    analysis_path = read_roots[0] if read_roots else workspace_path
                     if self._process and self._process.workspace_scan:
                         result = await self._analyze_workspace_for_process(
-                            workspace_path,
+                            analysis_path,
                         )
                         return ("workspace", result)
                     return ("code", await self._analyze_workspace(
-                        workspace_path,
+                        analysis_path,
                     ))
 
                 listing_result, analysis_result = await asyncio.gather(
@@ -1378,6 +1383,46 @@ class Orchestrator:
 
         plan = self._parse_plan(response, goal=task.goal)
         return self._apply_process_phase_mode(plan)
+
+    @staticmethod
+    def _read_roots_for_task(task: Task) -> list[Path]:
+        """Resolve additional read roots from task metadata.
+
+        Only parent roots of the task workspace are accepted.
+        """
+        workspace_text = str(task.workspace or "").strip()
+        if not workspace_text:
+            return []
+        try:
+            workspace = Path(workspace_text).resolve()
+        except Exception:
+            return []
+
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        raw_roots = metadata.get("read_roots", [])
+        if isinstance(raw_roots, str):
+            raw_roots = [raw_roots]
+        if not isinstance(raw_roots, list):
+            return []
+
+        roots: list[Path] = []
+        seen: set[Path] = set()
+        for raw in raw_roots:
+            try:
+                candidate = Path(str(raw)).expanduser().resolve()
+            except Exception:
+                continue
+            if candidate == Path(candidate.anchor):
+                continue
+            try:
+                workspace.relative_to(candidate)
+            except ValueError:
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            roots.append(candidate)
+        return roots
 
     # Document extensions grouped by category for workspace scanning.
     _DOC_EXTENSIONS: dict[str, tuple[str, ...]] = {

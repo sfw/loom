@@ -100,3 +100,28 @@ class TestGlobFind:
         assert result.success
         assert "main.py" in result.output
         assert "test_main.py" not in result.output
+
+    async def test_defaults_to_workspace_even_with_read_root(self, tool, tmp_path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        root.mkdir()
+        run_ws.mkdir()
+        (root / "creative-brief.md").write_text("brief")
+
+        ctx = ToolContext(workspace=run_ws, read_roots=[root])
+        result = await tool.execute({"pattern": "*.md"}, ctx)
+        assert result.success
+        assert "No files matched" in result.output
+
+    async def test_relative_path_falls_back_to_read_root(self, tool, tmp_path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        docs = root / "docs"
+        docs.mkdir(parents=True)
+        run_ws.mkdir()
+        (docs / "creative-brief.md").write_text("brief")
+
+        ctx = ToolContext(workspace=run_ws, read_roots=[root])
+        result = await tool.execute({"pattern": "*.md", "path": "docs"}, ctx)
+        assert result.success
+        assert "creative-brief.md" in result.output

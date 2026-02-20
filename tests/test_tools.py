@@ -180,6 +180,35 @@ class TestReadFile:
         with pytest.raises(ToolSafetyError, match="escapes workspace"):
             await tool.execute({"path": "../../../etc/passwd"}, ctx)
 
+    async def test_read_file_allows_parent_workspace_when_read_root_granted(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        root.mkdir()
+        run_ws.mkdir()
+        (root / "creative-brief.md").write_text("Campaign brief")
+
+        tool = ReadFileTool()
+        ctx = ToolContext(workspace=run_ws, read_roots=[root])
+        result = await tool.execute(
+            {"path": str(root / "creative-brief.md")},
+            ctx,
+        )
+        assert result.success
+        assert "Campaign brief" in result.output
+
+    async def test_read_file_relative_path_resolves_from_read_root(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        root.mkdir()
+        run_ws.mkdir()
+        (root / "creative-brief.md").write_text("Campaign brief")
+
+        tool = ReadFileTool()
+        ctx = ToolContext(workspace=run_ws, read_roots=[root])
+        result = await tool.execute({"path": "creative-brief.md"}, ctx)
+        assert result.success
+        assert "Campaign brief" in result.output
+
     async def test_read_image_returns_metadata(self, ctx: ToolContext, workspace: Path):
         # Create a dummy image file
         img_path = workspace / "logo.png"
@@ -244,6 +273,31 @@ class TestWriteFile:
             ToolContext(workspace=None),
         )
         assert not result.success
+
+    async def test_write_remains_confined_even_with_read_roots(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        root.mkdir()
+        run_ws.mkdir()
+
+        tool = WriteFileTool()
+        ctx = ToolContext(workspace=run_ws, read_roots=[root])
+        with pytest.raises(ToolSafetyError, match="escapes workspace"):
+            await tool.execute(
+                {"path": str(root / "outside.txt"), "content": "nope"},
+                ctx,
+            )
+
+    async def test_write_strips_redundant_workspace_prefix(self, ctx: ToolContext, workspace: Path):
+        tool = WriteFileTool()
+        redundant_path = f"{workspace.name}/normalized.txt"
+        result = await tool.execute(
+            {"path": redundant_path, "content": "normalized"},
+            ctx,
+        )
+        assert result.success
+        assert (workspace / "normalized.txt").read_text() == "normalized"
+        assert not (workspace / workspace.name / "normalized.txt").exists()
 
 
 # --- EditFileTool ---
@@ -394,6 +448,33 @@ class TestSearchFiles:
         result = await tool.execute({"pattern": "def", "path": "src"}, ctx)
         assert result.success
 
+    async def test_search_defaults_to_workspace_even_with_read_root(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        root.mkdir()
+        run_ws.mkdir()
+        (root / "notes.txt").write_text("parent-only sentinel\n")
+
+        tool = SearchFilesTool()
+        ctx = ToolContext(workspace=run_ws, read_roots=[root])
+        result = await tool.execute({"pattern": "parent-only sentinel"}, ctx)
+        assert result.success
+        assert "No matches" in result.output
+
+    async def test_search_relative_path_falls_back_to_read_root(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        src = root / "src"
+        src.mkdir(parents=True)
+        run_ws.mkdir()
+        (src / "notes.txt").write_text("creative brief source\n")
+
+        tool = SearchFilesTool()
+        ctx = ToolContext(workspace=run_ws, read_roots=[root])
+        result = await tool.execute({"pattern": "creative brief", "path": "src"}, ctx)
+        assert result.success
+        assert "notes.txt" in result.output
+
 
 # --- ListDirectoryTool ---
 
@@ -422,6 +503,33 @@ class TestListDirectory:
         tool = ListDirectoryTool()
         result = await tool.execute({}, ctx)
         assert ".git" not in result.output
+
+    async def test_list_defaults_to_workspace_even_with_read_root(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        root.mkdir()
+        run_ws.mkdir()
+        (root / "creative-brief.md").write_text("brief")
+
+        tool = ListDirectoryTool()
+        ctx = ToolContext(workspace=run_ws, read_roots=[root])
+        result = await tool.execute({}, ctx)
+        assert result.success
+        assert "creative-brief.md" not in result.output
+
+    async def test_list_relative_path_falls_back_to_read_root(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        docs = root / "docs"
+        docs.mkdir(parents=True)
+        run_ws.mkdir()
+        (docs / "brief.md").write_text("brief")
+
+        tool = ListDirectoryTool()
+        ctx = ToolContext(workspace=run_ws, read_roots=[root])
+        result = await tool.execute({"path": "docs"}, ctx)
+        assert result.success
+        assert "brief.md" in result.output
 
 
 # --- DeleteFileTool ---
@@ -512,6 +620,25 @@ class TestMoveFile:
             ToolContext(workspace=None),
         )
         assert not result.success
+
+    async def test_move_strips_redundant_workspace_prefix(
+        self,
+        ctx: ToolContext,
+        workspace: Path,
+    ):
+        (workspace / "from.txt").write_text("payload")
+        tool = MoveFileTool()
+        result = await tool.execute(
+            {
+                "source": f"{workspace.name}/from.txt",
+                "destination": f"{workspace.name}/to.txt",
+            },
+            ctx,
+        )
+        assert result.success
+        assert not (workspace / "from.txt").exists()
+        assert (workspace / "to.txt").read_text() == "payload"
+        assert not (workspace / workspace.name / "to.txt").exists()
 
 
 # --- GitCommandTool ---
