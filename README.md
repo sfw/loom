@@ -10,7 +10,7 @@ It handles anything a capable assistant should: writing and editing code, resear
 
 It also works with Claude and any OpenAI-compatible API, so you can mix local and cloud models in the same task.
 
-**Claude cowork, but local.** Tools like Claude Code and Claude cowork deliver exceptional agentic experiences -- but they require cloud models. Point them at a local model and the quality collapses. Local models drift on whitespace, hallucinate tool schemas, lose track of multi-step plans, and silently corrupt file edits. The interaction quality you get from a cloud-backed agent simply doesn't survive the switch to local inference. Loom was built specifically to close that gap. Fuzzy edit matching catches the whitespace drift. Harness-driven execution keeps multi-step plans on track regardless of model quality. Independent verification catches mistakes before they land. Lossless memory means nothing gets summarized away. The result is an agentic experience that rivals cloud-quality tools while running entirely on your hardware. And it's not just for business workflows -- Loom is a strong coding agent too: it reads, writes, edits, searches, runs tests, and iterates on code with the same scaffolding that powers everything else.
+**Claude-class cowork UX, local-first.** Tools like Claude Code and Claude cowork deliver strong agentic experiences, and Claude Code can be paired with local model stacks depending on your setup. Loom's focus is different: a model-agnostic harness designed to keep local and mixed local/cloud execution reliable with structured planning, tool safety, independent verification, and persistent memory. Loom is also cross-platform, while Claude cowork is currently macOS + Claude-model oriented. The result is an agentic workflow that stays robust on your own hardware without locking you to one provider.
 
 Loom also exposes a REST API and an MCP server built for agentic systems. Orchestrators like OpenClaw can call Loom's 19 REST endpoints -- or connect via the Model Context Protocol -- to offload complex multi-step tasks: decomposition, tool calling, verification, and memory. Most orchestrators are largely inept at executing these on their own. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive. The MCP integration also means any MCP-compatible agent or IDE can use Loom as a tool provider out of the box.
 
@@ -214,7 +214,7 @@ Common flags for `loom` / `loom cowork`:
 
 ## Architecture
 
-20,200 lines of Python. 1,278 tests. No frameworks (no LangChain, no CrewAI).
+35,135 lines of Python in `src/`. 1,648 tests collected. No frameworks (no LangChain, no CrewAI).
 
 ```
 src/loom/
@@ -240,7 +240,7 @@ src/loom/
 
 ```bash
 uv sync --extra dev     # or: pip install -e ".[dev]"
-pytest                  # 1,278 tests
+pytest                  # 1,648 tests collected
 ruff check src/ tests/  # lint
 ```
 

@@ -171,11 +171,17 @@ class ProcessRunList(VerticalScroll):
         *,
         empty_message: str,
         auto_follow: bool = True,
+        follow_mode: str = "tail",
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self._auto_follow = bool(auto_follow)
         self._empty_message = str(empty_message or "No items")
+        self._follow_mode = (
+            str(follow_mode).strip().lower()
+            if str(follow_mode).strip().lower() in {"tail", "active"}
+            else "tail"
+        )
         self._rows: list[dict] = []
         self._pending_rows: list[dict] | None = None
         self._body = Static("", classes="process-run-list-body", expand=True)
@@ -232,7 +238,39 @@ class ProcessRunList(VerticalScroll):
     def _scroll_to_latest(self) -> None:
         if not self._auto_follow or not self.is_attached:
             return
+        if self._follow_mode == "active":
+            focus_index = self._active_focus_index()
+            if focus_index is None:
+                return
+
+            # Keep the most relevant in-flight / recently-finished rows in view.
+            target_line = max(focus_index - 2, 0)
+
+            def _focus() -> None:
+                self.scroll_to(y=target_line, animate=False, force=True)
+
+            self.call_after_refresh(_focus)
+            return
         self.call_after_refresh(self.scroll_end, animate=False)
+
+    def _active_focus_index(self) -> int | None:
+        """Return the output row index that should stay in view for active-follow."""
+        active_idx: int | None = None
+        complete_idx: int | None = None
+        terminal_idx: int | None = None
+        for idx, row in enumerate(self._rows):
+            status = str(row.get("status", "pending")).strip()
+            if status == "in_progress":
+                active_idx = idx
+            elif status == "completed":
+                complete_idx = idx
+            elif status in {"failed", "skipped"}:
+                terminal_idx = idx
+        if active_idx is not None:
+            return active_idx
+        if complete_idx is not None:
+            return complete_idx
+        return terminal_idx
 
 
 class ProcessRunPane(Vertical):
@@ -307,6 +345,7 @@ class ProcessRunPane(Vertical):
             id="process-run-outputs",
             classes="process-run-list",
             auto_follow=True,
+            follow_mode="active",
             empty_message="No outputs yet",
         )
         self._log_label = Static("Activity", classes="process-run-section")
