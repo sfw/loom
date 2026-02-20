@@ -249,7 +249,9 @@ def _launch_tui(
         resume_session=resume_session,
         process_name=effective_process,
     )
-    app.run()
+    # Explicitly enable mouse support so click/scroll interactions stay
+    # available even if Textual changes defaults across versions.
+    app.run(mouse=True)
 
 
 def _init_persistence(config: Config):
