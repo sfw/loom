@@ -2,6 +2,9 @@
 
 A [Loom](https://github.com/sfw/loom) process package for auditing and optimizing Google Analytics 4 implementations.
 
+This package uses process contract v2 (`schema_version: 2`) with explicit
+verification policy/remediation, evidence contracts, and prompt constraints.
+
 ## What it does
 
 This process guides Loom through a structured GA4 audit:

@@ -33,6 +33,10 @@ class TaskProgressPanel(Static):
     tasks: reactive[list[dict]] = reactive(list, layout=True)
     empty_message: reactive[str] = reactive("No tasks tracked")
 
+    def __init__(self, *, auto_follow: bool = False, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._auto_follow = bool(auto_follow)
+
     def render(self) -> str:
         if not self.tasks:
             return f"[dim]{self.empty_message}[/dim]"
@@ -53,6 +57,18 @@ class TaskProgressPanel(Static):
                 icon = "[dim]\u25cb[/dim]"
             lines.append(f"{icon} {content}")
         return "\n".join(lines)
+
+    def watch_tasks(self, _tasks: list[dict]) -> None:
+        self._scroll_to_latest()
+
+    def watch_empty_message(self, _message: str) -> None:
+        self._scroll_to_latest()
+
+    def _scroll_to_latest(self) -> None:
+        """Keep the newest rows visible for streaming process-run updates."""
+        if not self._auto_follow or not self.is_attached:
+            return
+        self.call_after_refresh(self.scroll_end, animate=False)
 
 
 class Sidebar(Vertical):

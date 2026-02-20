@@ -12,12 +12,10 @@ import re
 from datetime import datetime
 from typing import Any
 
-_EVIDENCE_TOOLS = frozenset({
-    "web_fetch",
-    "web_fetch_html",
-    "web_search",
-})
 _SOURCE_TOOLS = frozenset({"web_fetch", "web_fetch_html"})
+_DISCOVERY_TOOLS = frozenset({"web_search"})
+_FILE_EVIDENCE_TOOLS = frozenset({"read_file", "spreadsheet", "document_write"})
+_EVIDENCE_TOOLS = _SOURCE_TOOLS | _DISCOVERY_TOOLS | _FILE_EVIDENCE_TOOLS
 
 _DEFAULT_FACET_KEYS = (
     "target",
@@ -90,9 +88,29 @@ def _first_url(text: str) -> str:
 def _evidence_kind(tool_name: str) -> str:
     if tool_name in _SOURCE_TOOLS:
         return "source"
-    if tool_name == "web_search":
+    if tool_name in _DISCOVERY_TOOLS:
         return "discovery"
+    if tool_name in _FILE_EVIDENCE_TOOLS:
+        return "artifact"
     return "context"
+
+
+def _should_capture_tool_evidence(tool_name: str, args: dict[str, Any]) -> bool:
+    if tool_name not in _EVIDENCE_TOOLS:
+        return False
+    if tool_name == "spreadsheet":
+        operation = _normalize_text(args.get("operation", "")).lower()
+        return operation in {"read", "summary"}
+    if tool_name == "document_write":
+        if not _normalize_text(args.get("path", "")):
+            return False
+        if _normalize_text(args.get("content", "")):
+            return True
+        if _normalize_text(args.get("title", "")):
+            return True
+        sections = args.get("sections")
+        return isinstance(sections, list) and len(sections) > 0
+    return True
 
 
 def _next_evidence_id(
@@ -243,9 +261,9 @@ def extract_evidence_records(
 
     for call in tool_calls:
         tool, args, result = _record_payload(call)
-        if tool not in _EVIDENCE_TOOLS:
-            continue
         if result is None or not getattr(result, "success", False):
+            continue
+        if not _should_capture_tool_evidence(tool, args):
             continue
 
         result_data = getattr(result, "data", None)
@@ -262,6 +280,9 @@ def extract_evidence_records(
             args.get("query")
             or args.get("q")
             or args.get("search_query")
+            or args.get("path")
+            or args.get("file_path")
+            or result_data.get("path")
             or result_data.get("query")
             or ""
         )
@@ -285,6 +306,14 @@ def extract_evidence_records(
             facet_hints=facet_hints,
             facet_mappings=facet_mappings,
         )
+        artifact_path = _normalize_text(
+            args.get("path")
+            or args.get("file_path")
+            or result_data.get("path")
+            or ""
+        )
+        if artifact_path:
+            facets.setdefault("artifact_path", artifact_path[:120])
         quality = _score_quality(source_url, snippet_text, query_text)
         evidence_id = _next_evidence_id(
             tool_name=tool,

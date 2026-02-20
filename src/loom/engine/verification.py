@@ -507,8 +507,29 @@ class LLMVerifier:
     _COMPACT_RESULT_SUMMARY_CHARS = 1800
     _MAX_EVIDENCE_SECTION_CHARS = 2600
     _MAX_EVIDENCE_SECTION_COMPACT_CHARS = 1300
+    _MAX_ARTIFACT_SECTION_CHARS = 2400
+    _MAX_ARTIFACT_SECTION_COMPACT_CHARS = 1200
+    _MAX_TOOL_OUTPUT_EXCERPT_CHARS = 700
+    _MAX_ARTIFACT_FILE_EXCERPT_CHARS = 420
     _ADVISORY_TOOL_FAILURES = frozenset({"web_fetch", "web_fetch_html", "web_search"})
     _SOURCE_ATTRIBUTION_TOOLS = frozenset({"web_fetch", "web_fetch_html"})
+    _TOOL_OUTPUT_EVIDENCE_TOOLS = frozenset({
+        "read_file",
+        "spreadsheet",
+        "document_write",
+    })
+    _ARTIFACT_PREVIEW_SUFFIXES = frozenset({
+        ".md",
+        ".txt",
+        ".csv",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".xml",
+        ".html",
+        ".htm",
+        ".rst",
+    })
 
     @staticmethod
     def _hard_cap_text(text: str, max_chars: int) -> str:
@@ -650,7 +671,28 @@ class LLMVerifier:
                 else:
                     status = f"FAILED: {compact_error}"
             tool_name = str(getattr(tc, "tool", "") or "unknown")
-            lines.append(f"- {tool_name}({args_text}) -> {status}")
+            line = f"- {tool_name}({args_text}) -> {status}"
+            if getattr(result, "success", False):
+                files_changed = [
+                    str(item).strip()
+                    for item in (getattr(result, "files_changed", []) or [])
+                    if str(item).strip()
+                ]
+                if files_changed:
+                    preview = ", ".join(files_changed[:4])
+                    line += f"\n  files_changed: {preview}"
+                excerpt = await self._tool_output_excerpt(
+                    tool_name=tool_name,
+                    args=getattr(tc, "args", {}),
+                    result=result,
+                )
+                if excerpt:
+                    indented_excerpt = self._indent_text_block(
+                        excerpt,
+                        prefix="    ",
+                    )
+                    line += f"\n  output_excerpt:\n{indented_excerpt}"
+            lines.append(line)
 
         formatted = "\n".join(lines) if lines else "No tool calls."
         if estimate_tokens(formatted) > self._MAX_TOOL_CALLS_TOKENS:
@@ -660,6 +702,132 @@ class LLMVerifier:
                 label="verification tool-call history",
             )
         return formatted
+
+    @staticmethod
+    def _indent_text_block(text: str, *, prefix: str = "  ") -> str:
+        if not text:
+            return ""
+        return "\n".join(f"{prefix}{line}" for line in str(text).splitlines())
+
+    async def _tool_output_excerpt(
+        self,
+        *,
+        tool_name: str,
+        args: object,
+        result: object,
+    ) -> str:
+        """Return bounded tool output excerpts that help semantic verification."""
+        if tool_name not in self._TOOL_OUTPUT_EVIDENCE_TOOLS:
+            return ""
+
+        normalized_args = args if isinstance(args, dict) else {}
+        if tool_name == "spreadsheet":
+            operation = str(normalized_args.get("operation", "")).strip().lower()
+            if operation not in {"read", "summary"}:
+                return ""
+        if tool_name == "document_write":
+            parts: list[str] = []
+            title = str(normalized_args.get("title", "")).strip()
+            if title:
+                parts.append(f"Title: {title}")
+            raw_content = str(normalized_args.get("content", "")).strip()
+            if raw_content:
+                parts.append(raw_content)
+            sections = normalized_args.get("sections", [])
+            if isinstance(sections, list):
+                for section in sections[:4]:
+                    if not isinstance(section, dict):
+                        continue
+                    heading = str(section.get("heading", "")).strip()
+                    body = str(section.get("body", "")).strip()
+                    if heading:
+                        parts.append(f"## {heading}")
+                    if body:
+                        parts.append(body)
+            output = "\n\n".join(part for part in parts if part).strip()
+            if not output:
+                output = str(getattr(result, "output", "") or "").strip()
+            if not output:
+                return ""
+            compacted = await self._compact_text(
+                output,
+                max_chars=self._MAX_TOOL_OUTPUT_EXCERPT_CHARS,
+                label="verification tool output excerpt (document_write)",
+            )
+            return compacted.strip()
+
+        output = str(getattr(result, "output", "") or "").strip()
+        if not output:
+            return ""
+        compacted = await self._compact_text(
+            output,
+            max_chars=self._MAX_TOOL_OUTPUT_EXCERPT_CHARS,
+            label=f"verification tool output excerpt ({tool_name})",
+        )
+        return compacted.strip()
+
+    async def _build_artifact_content_section(
+        self,
+        *,
+        workspace: Path | None,
+        tool_calls: list | None,
+        max_chars: int,
+    ) -> str:
+        """Build bounded excerpts from changed artifacts for semantic review."""
+        if workspace is None or not tool_calls:
+            return ""
+
+        workspace_resolved = workspace.resolve()
+        changed_files: list[tuple[str, Path]] = []
+        seen: set[str] = set()
+
+        for tc in tool_calls:
+            result = getattr(tc, "result", None)
+            if result is None or not getattr(result, "success", False):
+                continue
+            files_changed = getattr(result, "files_changed", []) or []
+            for rel_path in files_changed:
+                rel = str(rel_path or "").strip()
+                if not rel or rel in seen:
+                    continue
+                seen.add(rel)
+                candidate = (workspace / rel).resolve()
+                try:
+                    candidate.relative_to(workspace_resolved)
+                except ValueError:
+                    continue
+                if not candidate.exists() or not candidate.is_file():
+                    continue
+                suffix = candidate.suffix.lower()
+                if suffix and suffix not in self._ARTIFACT_PREVIEW_SUFFIXES:
+                    continue
+                changed_files.append((rel, candidate))
+
+        if not changed_files:
+            return ""
+
+        lines = [
+            "ARTIFACT CONTENT SNAPSHOT (for semantic review):",
+            "- Excerpts from files changed in this subtask. Use these to judge output quality.",
+        ]
+        for rel, path in changed_files[:6]:
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:
+                continue
+            if not content:
+                continue
+            excerpt = await self._compact_text(
+                content,
+                max_chars=self._MAX_ARTIFACT_FILE_EXCERPT_CHARS,
+                label=f"verification artifact excerpt ({path.name})",
+            )
+            lines.append(f"- {rel}:")
+            lines.append(self._indent_text_block(excerpt, prefix="    "))
+
+        if len(lines) <= 2:
+            return ""
+        return self._hard_cap_text("\n".join(lines), max_chars=max_chars)
 
     def _is_advisory_tool_failure(
         self,
@@ -1622,6 +1790,11 @@ class LLMVerifier:
             tool_calls=tool_calls,
             max_chars=self._MAX_EVIDENCE_SECTION_CHARS,
         )
+        artifact_section = await self._build_artifact_content_section(
+            workspace=workspace,
+            tool_calls=tool_calls,
+            max_chars=self._MAX_ARTIFACT_SECTION_CHARS,
+        )
         phase_scope_default = self._phase_scope_default()
         selected_rules = self._select_phase_scoped_rules(
             subtask,
@@ -1636,6 +1809,8 @@ class LLMVerifier:
         )
         if evidence_section:
             prompt = prompt + "\n\n" + evidence_section
+        if artifact_section:
+            prompt = prompt + "\n\n" + artifact_section
         if estimate_tokens(prompt) > self._MAX_VERIFIER_PROMPT_TOKENS:
             summary_for_prompt = await self._compact_text(
                 summary_for_prompt,
@@ -1657,6 +1832,15 @@ class LLMVerifier:
                     + self._hard_cap_text(
                         evidence_section,
                         self._MAX_EVIDENCE_SECTION_COMPACT_CHARS,
+                    )
+                )
+            if artifact_section:
+                prompt = (
+                    prompt
+                    + "\n\n"
+                    + self._hard_cap_text(
+                        artifact_section,
+                        self._MAX_ARTIFACT_SECTION_COMPACT_CHARS,
                     )
                 )
 
@@ -1718,6 +1902,15 @@ class LLMVerifier:
                     + self._hard_cap_text(
                         evidence_section,
                         self._MAX_EVIDENCE_SECTION_COMPACT_CHARS,
+                    )
+                )
+            if artifact_section:
+                compact_prompt = (
+                    compact_prompt
+                    + "\n\n"
+                    + self._hard_cap_text(
+                        artifact_section,
+                        self._MAX_ARTIFACT_SECTION_COMPACT_CHARS,
                     )
                 )
             retry_messages = [{"role": "user", "content": compact_prompt}]

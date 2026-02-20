@@ -1,5 +1,6 @@
 name: google-analytics
 version: "1.0"
+schema_version: 2
 description: >
   End-to-end Google Analytics audit and optimization. Covers tracking audit,
   data quality assessment, funnel analysis, audience segmentation, attribution
@@ -137,13 +138,75 @@ phases:
       - "recommendation-matrix.csv — impact vs effort scoring"
       - "implementation-roadmap.md — phased rollout plan"
 
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Run the google-analytics workflow and produce all declared deliverables."
+    timeout_seconds: 900
+    acceptance:
+      phases:
+        must_include: [tracking-audit, data-quality, funnel-analysis, audience-segmentation, attribution-analysis, recommendations]
+      deliverables:
+        must_exist: [tracking-audit.md, event-inventory.csv, data-quality.md, quality-metrics.csv, funnel-analysis.md, funnel-metrics.csv, audience-segments.md, segment-comparison.csv, attribution-analysis.md, attribution-comparison.csv, recommendations.md, recommendation-matrix.csv, implementation-roadmap.md]
+      verification:
+        forbidden_patterns: ["Expected deliverable '.*' not found", "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"]
+
+  - id: live-canary
+    mode: live
+    goal: "Audit and optimize a GA4 setup and produce a recommendation package."
+    timeout_seconds: 1200
+    requires_network: true
+
 verification:
+  policy:
+    mode: llm_first
+    static_checks:
+      tool_success_policy: safety_integrity_only
+      file_integrity_policy: enforce_nonempty_changed_files
+      syntax_policy: enforce_parseable_artifacts
+      deliverable_existence_policy: enforce_declared_deliverables
+    semantic_checks:
+      - id: process-rules
+        check: "Apply process-defined verification rules and acceptance criteria."
+        severity: error
+        enforcement: hard
+        scope: phase
+    output_contract:
+      required_fields:
+        - passed
+        - outcome
+        - reason_code
+        - severity_class
+        - confidence
+        - feedback
+        - issues
+        - metadata
+      metadata_fields:
+        - coverage_gaps
+        - evidence_quality
+        - quantified_recommendation_count
+    outcome_policy:
+      pass_states: [pass, pass_with_warnings, partial_verified]
+      fail_states: [fail]
+  remediation:
+    strategies:
+      - id: targeted-remediation
+        retry_strategy: unconfirmed_data
+        description: "Address failing checks with minimal targeted edits."
+    default_strategy: targeted-remediation
+    critical_path_behavior: block
+    retry_budget:
+      max_attempts: 2
+    transient_retry_policy:
+      retry_on_transient: true
   rules:
     - name: no-placeholders
       description: "No placeholder text in deliverables"
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]|XX%|N/A"
       severity: error
       type: regex
+      target: deliverables
+      enforcement: hard
       applies_to_phases: ["*"]
     - name: metrics-quantified
       description: "All recommendations must include quantified expected impact"
@@ -172,6 +235,36 @@ verification:
       severity: error
       type: llm
       applies_to_phases: [funnel-analysis, recommendations]
+
+evidence:
+  record_schema:
+    required_fields: [evidence_id, tool, source_url, created_at, quality]
+    facets: [target, entity, subject, region, category, segment]
+  extraction:
+    include_result_facets: true
+    arg_mappings:
+      target: [target, entity, property, account]
+      region: [region, geography, country]
+      category: [category, dimension, theme]
+  summarization:
+    max_entries: 12
+    include_facets: true
+
+prompt_contracts:
+  evidence_contract:
+    enabled: true
+    applies_to_phases: ["*"]
+  executor_constraints: |
+    Keep claims traceable to GA4 evidence and sources.
+    Quantify impact in recommendations whenever possible.
+    If evidence is unavailable, label assumptions explicitly.
+  verifier_constraints: |
+    Apply process rules and acceptance criteria. Use metadata fields only
+    when inferable from artifacts and evidence.
+  remediation_instructions:
+    default: |
+      Preserve validated work and patch only failing sections.
+      Prioritize evidence linkage and quantified recommendation gaps.
 
 memory:
   extract_types:

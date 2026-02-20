@@ -379,6 +379,35 @@ class TestTaskProgressPanel:
         assert "Handle failure" in rendered
         assert "Skip optional step" in rendered
 
+    def test_task_update_triggers_scroll_hook(self):
+        from loom.tui.widgets.sidebar import TaskProgressPanel
+
+        panel = TaskProgressPanel(auto_follow=True)
+        panel._scroll_to_latest = MagicMock()
+        panel.tasks = [{"content": "Read file", "status": "completed"}]
+        assert panel._scroll_to_latest.call_count >= 1
+
+    def test_empty_message_update_triggers_scroll_hook(self):
+        from loom.tui.widgets.sidebar import TaskProgressPanel
+
+        panel = TaskProgressPanel(auto_follow=True)
+        panel._scroll_to_latest = MagicMock()
+        panel.empty_message = "No outputs yet"
+        assert panel._scroll_to_latest.call_count >= 1
+
+
+class TestProcessRunPane:
+    def test_process_run_panels_enable_auto_follow(self):
+        from loom.tui.app import ProcessRunPane
+
+        pane = ProcessRunPane(
+            run_id="abc123",
+            process_name="campaign-slogans",
+            goal="Generate campaign slogans",
+        )
+        assert pane._progress._auto_follow is True
+        assert pane._outputs._auto_follow is True
+
 
 class TestSidebarWidget:
     def test_refresh_workspace_tree_calls_reload(self):
@@ -2471,7 +2500,9 @@ class TestProcessSlashCommands:
         payload = execute_call.args[1]
         assert payload["_process_override"] is process_defn
         assert payload["_approval_mode"] == "disabled"
+        assert payload["_read_roots"] == [str(Path("/tmp").resolve())]
         assert payload["context"]["workspace"] == "/tmp/process-run"
+        assert payload["context"]["source_workspace_root"] == str(Path("/tmp").resolve())
         assert payload["context"]["requested_goal"] == "Analyze Tesla"
         assert execute_call.kwargs["workspace"] == Path("/tmp/process-run")
 
@@ -2564,6 +2595,7 @@ class TestProcessSlashCommands:
         )
 
         assert context["workspace"] == "/tmp"
+        assert context["source_workspace_root"] == str(Path("/tmp").resolve())
         assert context["requested_goal"] == "Analyze Tesla"
         assert context["cowork"]["turn_count"] == 7
         assert context["cowork"]["recent_messages"] == [
@@ -3135,6 +3167,96 @@ class TestProcessSlashCommands:
         assert by_content[
             "trend-dataset.csv [dim](analyze-market-trends)[/] [#f7768e](missing)[/]"
         ]["status"] == "failed"
+
+    def test_process_progress_outputs_detect_existing_file_when_task_id_drifts(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        run_workspace = tmp_path / "campaign-slogans-run"
+        run_workspace.mkdir(parents=True, exist_ok=True)
+        (run_workspace / "slogan-longlist.csv").write_text("ok")
+
+        pane = MagicMock()
+        process_defn = SimpleNamespace(
+            phases=[
+                SimpleNamespace(
+                    id="slogan-divergence",
+                    description=(
+                        "Generate a high-volume longlist of slogan/tagline options "
+                        "across all territories and devices before filtering."
+                    ),
+                ),
+            ],
+            get_deliverables=lambda: {
+                "slogan-divergence": ["slogan-longlist.csv"],
+            },
+        )
+        run = SimpleNamespace(
+            run_id="abc125",
+            process_name="campaign-slogans",
+            goal="Generate campaign slogans",
+            run_workspace=run_workspace,
+            process_defn=process_defn,
+            pane_id="tab-run-abc125",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            task_labels={},
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc125": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#chat-log":
+                return chat
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._on_process_progress_event(
+            {
+                "event_type": "subtask_started",
+                "event_data": {"subtask_id": "generate-slogan-longlist"},
+                "tasks": [
+                    {
+                        "id": "generate-slogan-longlist",
+                        "status": "in_progress",
+                        "content": (
+                            "Generate a high-volume longlist of slogan/tagline options "
+                            "across all territories and devices before filtering."
+                        ),
+                    },
+                ],
+            },
+            run_id="abc125",
+        )
+
+        output_rows = pane.set_outputs.call_args.args[0]
+        by_content = {row["content"]: row for row in output_rows}
+        assert "slogan-longlist.csv [dim](slogan-divergence)[/]" in by_content
+        assert by_content["slogan-longlist.csv [dim](slogan-divergence)[/]"]["status"] == (
+            "completed"
+        )
 
     def test_process_progress_event_refreshes_tree_on_subtask_completion(self):
         from loom.tui.app import LoomApp

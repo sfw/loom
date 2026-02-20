@@ -204,6 +204,26 @@ class TestExecutorPrompt:
         assert "write_file" in prompt
         assert "read_file" in prompt
 
+    def test_executor_includes_read_write_scope_when_read_roots_present(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+        state_manager: TaskStateManager,
+    ):
+        state_manager.create(sample_task)
+        sample_task.metadata["read_roots"] = ["/tmp/source-workspace"]
+        subtask = sample_task.get_subtask("add-tsconfig")
+
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+
+        assert "READ/WRITE SCOPE" in prompt
+        assert "source-workspace" in prompt
+        assert "Do NOT prefix write paths with `myapp/`" in prompt
+
     def test_executor_section_order(
         self,
         assembler: PromptAssembler,

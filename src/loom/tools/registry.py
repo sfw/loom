@@ -91,6 +91,7 @@ class ToolContext:
     """Context passed to tool execution."""
 
     workspace: Path | None
+    read_roots: list[Path] = field(default_factory=list)
     scratch_dir: Path | None = None
     changelog: Any | None = None  # ChangeLog instance for tracking file modifications
     subtask_id: str = ""
@@ -154,20 +155,135 @@ class Tool(ABC):
 
     def _resolve_path(self, raw_path: str, workspace: Path) -> Path:
         """Resolve a path relative to workspace with safety check."""
-        path = Path(raw_path)
+        path = Path(raw_path).expanduser()
         if not path.is_absolute():
+            path = self._strip_redundant_workspace_prefix(path, workspace)
             path = workspace / path
         resolved = path.resolve()
         self._verify_within_workspace(resolved, workspace)
         return resolved
 
+    def _resolve_read_path(
+        self,
+        raw_path: str,
+        workspace: Path,
+        read_roots: list[Path] | None = None,
+    ) -> Path:
+        """Resolve a read path allowing optional parent/root read scopes.
+
+        Relative read paths prefer the task workspace, then fall back to each
+        allowed read root so callers don't need to guess ``../`` prefixes.
+        """
+        path = Path(raw_path).expanduser()
+        if path.is_absolute():
+            resolved = path.resolve()
+            self._verify_within_allowed_roots(resolved, workspace, read_roots)
+            return resolved
+
+        candidates: list[Path] = [workspace / path]
+        normalized = self._strip_redundant_workspace_prefix(path, workspace)
+        if normalized != path:
+            candidates.append(workspace / normalized)
+        seen_roots: set[Path] = set()
+        for root in read_roots or []:
+            try:
+                root_path = Path(root).expanduser().resolve()
+            except Exception:
+                continue
+            if root_path in seen_roots:
+                continue
+            seen_roots.add(root_path)
+            candidates.append(root_path / path)
+            if normalized != path:
+                candidates.append(root_path / normalized)
+
+        first_valid: Path | None = None
+        first_error: ToolSafetyError | None = None
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            try:
+                self._verify_within_allowed_roots(resolved, workspace, read_roots)
+            except ToolSafetyError as e:
+                if first_error is None:
+                    first_error = e
+                continue
+            if first_valid is None:
+                first_valid = resolved
+            if resolved.exists():
+                return resolved
+
+        if first_valid is not None:
+            return first_valid
+        if first_error is not None:
+            raise first_error
+
+        resolved = (workspace / path).resolve()
+        self._verify_within_allowed_roots(resolved, workspace, read_roots)
+        return resolved
+
+    @staticmethod
+    def _strip_redundant_workspace_prefix(path: Path, workspace: Path) -> Path:
+        """Collapse leading ``<workspace_name>/`` segments in relative paths.
+
+        Models sometimes prepend the workspace folder name to workspace-relative
+        paths (for example ``run-abc/output.md``). Without normalization that
+        creates a nested duplicate workspace directory.
+        """
+        if path.is_absolute():
+            return path
+        workspace_name = str(workspace.name or "").strip()
+        if not workspace_name:
+            return path
+
+        parts = [part for part in path.parts if part not in {"", "."}]
+        if not parts:
+            return path
+
+        # Strip repeated workspace-name prefixes while preserving non-trivial
+        # relative targets (leave plain "workspace_name" untouched).
+        removed = 0
+        while len(parts) > 1 and parts[0] == workspace_name:
+            parts = parts[1:]
+            removed += 1
+        if removed == 0:
+            return path
+        return Path(*parts)
+
     @staticmethod
     def _verify_within_workspace(path: Path, workspace: Path) -> None:
         """Ensure the resolved path is within the workspace."""
+        Tool._verify_within_allowed_roots(path, workspace, None)
+
+    @staticmethod
+    def _verify_within_allowed_roots(
+        path: Path,
+        workspace: Path,
+        extra_roots: list[Path] | None,
+    ) -> None:
+        """Ensure path stays inside workspace or one of allowed read roots."""
+        roots: list[Path] = [workspace.resolve()]
+        if extra_roots:
+            for root in extra_roots:
+                try:
+                    roots.append(Path(root).expanduser().resolve())
+                except Exception:
+                    continue
+
+        for root in roots:
+            try:
+                path.relative_to(root)
+                return
+            except ValueError:
+                continue
+        roots_text = ", ".join(str(root) for root in roots)
         try:
-            path.relative_to(workspace.resolve())
-        except ValueError:
-            raise ToolSafetyError(f"Path '{path}' escapes workspace '{workspace}'")
+            workspace_text = str(workspace.resolve())
+        except Exception:
+            workspace_text = str(workspace)
+        raise ToolSafetyError(
+            f"Path '{path}' escapes workspace '{workspace_text}'. "
+            f"Allowed roots: {roots_text}"
+        )
 
 
 class ToolRegistry:
@@ -239,6 +355,7 @@ class ToolRegistry:
         name: str,
         arguments: dict,
         workspace: Path | None = None,
+        read_roots: list[Path] | None = None,
         scratch_dir: Path | None = None,
         changelog: Any = None,
         subtask_id: str = "",
@@ -252,8 +369,17 @@ class ToolRegistry:
         if tool is None:
             return ToolResult.fail(f"Unknown tool: {name}")
 
+        normalized_read_roots: list[Path] = []
+        for raw in read_roots or []:
+            try:
+                normalized = Path(raw).expanduser().resolve()
+            except Exception:
+                continue
+            normalized_read_roots.append(normalized)
+
         ctx = ToolContext(
             workspace=workspace,
+            read_roots=normalized_read_roots,
             scratch_dir=scratch_dir,
             changelog=changelog,
             subtask_id=subtask_id,

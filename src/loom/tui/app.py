@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
     DirectoryTree,
     Footer,
@@ -78,7 +78,6 @@ from loom.tui.widgets import (
     Sidebar,
     StatusBar,
 )
-from loom.tui.widgets.sidebar import TaskProgressPanel
 from loom.tui.widgets.tool_call import tool_args_preview
 
 if TYPE_CHECKING:
@@ -163,6 +162,72 @@ _MAX_PERSISTED_PROCESS_RESULTS = 120
 _INFO_WRAP_WIDTH = 108
 
 
+class ProcessRunList(VerticalScroll):
+    """Scrollable checklist list used by process-run Progress/Outputs panes."""
+
+    def __init__(
+        self,
+        *,
+        empty_message: str,
+        auto_follow: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._auto_follow = bool(auto_follow)
+        self._empty_message = str(empty_message or "No items")
+        self._rows: list[dict] = []
+        self._pending_rows: list[dict] | None = None
+        self._body = Static("", classes="process-run-list-body", expand=True)
+
+    def compose(self) -> ComposeResult:
+        yield self._body
+
+    def set_rows(self, rows: list[dict]) -> None:
+        """Replace rendered rows and keep the newest rows visible."""
+        normalized = [row for row in rows if isinstance(row, dict)]
+        if not self.is_attached:
+            self._pending_rows = normalized
+            return
+        self._rows = normalized
+        self._body.update(self._render_rows())
+        self._scroll_to_latest()
+
+    def on_mount(self) -> None:
+        """Flush pre-mount row updates once the widget is attached."""
+        if self._pending_rows is not None:
+            pending = list(self._pending_rows)
+            self._pending_rows = None
+            self.set_rows(pending)
+            return
+        self._body.update(self._render_rows())
+
+    def _render_rows(self) -> str:
+        if not self._rows:
+            return f"[dim]{self._empty_message}[/dim]"
+
+        lines: list[str] = []
+        for row in self._rows:
+            status = str(row.get("status", "pending")).strip()
+            content = str(row.get("content", "?")).strip() or "?"
+            if status == "completed":
+                icon = "[#9ece6a]\u2713[/]"
+            elif status == "in_progress":
+                icon = "[#7dcfff]\u25c9[/]"
+            elif status == "failed":
+                icon = "[#f7768e]\u2717[/]"
+            elif status == "skipped":
+                icon = "[dim]-[/dim]"
+            else:
+                icon = "[dim]\u25cb[/dim]"
+            lines.append(f"{icon} {content}")
+        return "\n".join(lines)
+
+    def _scroll_to_latest(self) -> None:
+        if not self._auto_follow or not self.is_attached:
+            return
+        self.call_after_refresh(self.scroll_end, animate=False)
+
+
 class ProcessRunPane(Vertical):
     """A per-run process pane with status, progress rows, and run log."""
 
@@ -170,7 +235,7 @@ class ProcessRunPane(Vertical):
     ProcessRunPane {
         height: 1fr;
         padding: 0 1;
-        overflow-y: auto;
+        overflow: hidden;
     }
     ProcessRunPane .process-run-header {
         color: $text;
@@ -186,15 +251,24 @@ class ProcessRunPane(Vertical):
         text-style: bold;
         margin: 1 0 0 0;
     }
+    ProcessRunPane .process-run-list {
+        border: round $surface-lighten-1;
+        margin: 0;
+        padding: 0 1;
+        scrollbar-size: 1 1;
+    }
+    ProcessRunPane .process-run-list-body {
+        width: 100%;
+    }
     ProcessRunPane #process-run-progress {
-        max-height: 12;
-        height: auto;
-        overflow-y: auto;
+        height: 11;
+        min-height: 7;
+        max-height: 16;
     }
     ProcessRunPane #process-run-outputs {
-        max-height: 8;
-        height: auto;
-        overflow-y: auto;
+        height: 9;
+        min-height: 5;
+        max-height: 14;
     }
     ProcessRunPane ChatLog {
         height: 1fr;
@@ -215,10 +289,19 @@ class ProcessRunPane(Vertical):
         self._header = Static(classes="process-run-header")
         self._meta = Static(classes="process-run-meta")
         self._progress_label = Static("Progress", classes="process-run-section")
-        self._progress = TaskProgressPanel(id="process-run-progress")
+        self._progress = ProcessRunList(
+            id="process-run-progress",
+            classes="process-run-list",
+            auto_follow=True,
+            empty_message="No progress yet",
+        )
         self._outputs_label = Static("Outputs", classes="process-run-section")
-        self._outputs = TaskProgressPanel(id="process-run-outputs")
-        self._outputs.empty_message = "No outputs yet"
+        self._outputs = ProcessRunList(
+            id="process-run-outputs",
+            classes="process-run-list",
+            auto_follow=True,
+            empty_message="No outputs yet",
+        )
         self._log_label = Static("Activity", classes="process-run-section")
         self._log = ChatLog()
 
@@ -245,10 +328,7 @@ class ProcessRunPane(Vertical):
             f"[bold]{self._process_name}[/bold] [dim]#{self._run_id}[/dim]  "
             f"[{self._status_color(status)}]{label}[/]  [dim]{elapsed}[/dim]"
         )
-        goal_preview = self._goal
-        if len(goal_preview) > 140:
-            goal_preview = f"{goal_preview[:139].rstrip()}\u2026"
-        meta = f"[dim]Goal:[/] {goal_preview}"
+        meta = f"[dim]Goal:[/] {self._goal}"
         if task_id:
             meta += f"\n[dim]Task:[/] {task_id}"
         meta += (
@@ -262,14 +342,14 @@ class ProcessRunPane(Vertical):
         if not self.is_attached:
             self._pending_tasks = list(tasks)
             return
-        self._progress.tasks = tasks
+        self._progress.set_rows(tasks)
 
     def set_outputs(self, outputs: list[dict]) -> None:
         """Replace output rows shown in the outputs section."""
         if not self.is_attached:
             self._pending_outputs = list(outputs)
             return
-        self._outputs.tasks = outputs
+        self._outputs.set_rows(outputs)
 
     def add_activity(self, text: str) -> None:
         """Append informational activity text."""
@@ -291,10 +371,10 @@ class ProcessRunPane(Vertical):
     def on_mount(self) -> None:
         """Flush updates queued before the pane was attached to the DOM."""
         if self._pending_tasks is not None:
-            self._progress.tasks = self._pending_tasks
+            self._progress.set_rows(self._pending_tasks)
             self._pending_tasks = None
         if self._pending_outputs is not None:
-            self._outputs.tasks = self._pending_outputs
+            self._outputs.set_rows(self._pending_outputs)
             self._pending_outputs = None
         if self._pending_activity:
             for line in self._pending_activity:
@@ -1574,11 +1654,13 @@ class LoomApp(App):
             return {
                 "requested_goal": goal,
                 "workspace": str(workspace),
+                "source_workspace_root": str(self._workspace.resolve()),
             }
         state = self._session.session_state
         context: dict = {
             "requested_goal": goal,
             "workspace": str(workspace),
+            "source_workspace_root": str(self._workspace.resolve()),
             "cowork": {
                 "turn_count": state.turn_count,
                 "current_focus": state.current_focus,
@@ -1649,7 +1731,11 @@ class LoomApp(App):
         first_line = first_line.strip().strip("`")
         return self._slugify_process_run_folder(first_line)
 
-    async def _prepare_process_run_workspace(self, process_name: str, goal: str) -> Path:
+    async def _prepare_process_run_workspace(
+        self,
+        process_name: str,
+        goal: str,
+    ) -> Path:
         process_cfg = getattr(self._config, "process", None)
         if not bool(getattr(process_cfg, "tui_run_scoped_workspace_enabled", True)):
             return self._workspace
@@ -1922,6 +2008,7 @@ class LoomApp(App):
                     "wait": True,
                     "_approval_mode": "disabled",
                     "_process_override": run.process_defn,
+                    "_read_roots": [str(self._workspace.resolve())],
                     "_progress_callback": (
                         lambda data, rid=run_id: self._on_process_progress_event(
                             data, run_id=rid,
@@ -3246,11 +3333,13 @@ class LoomApp(App):
             pass
 
     @staticmethod
-    def _one_line(text: object | None, max_len: int = 180) -> str:
+    def _one_line(text: object | None, max_len: int | None = 180) -> str:
         """Normalize whitespace and cap a string for concise progress rows."""
         if text is None:
             return ""
         compact = " ".join(str(text).split())
+        if max_len is None or max_len <= 0:
+            return compact
         if len(compact) <= max_len:
             return compact
         return f"{compact[:max_len - 1].rstrip()}…"
@@ -3266,7 +3355,10 @@ class LoomApp(App):
                 phase_id = str(getattr(phase, "id", "")).strip()
                 if not phase_id:
                     continue
-                phase_desc = self._one_line(getattr(phase, "description", ""), 110)
+                phase_desc = self._one_line(
+                    getattr(phase, "description", ""),
+                    max_len=None,
+                )
                 phase_labels[phase_id] = phase_desc or phase_id
 
         task_labels = getattr(run, "task_labels", None)
@@ -3286,7 +3378,7 @@ class LoomApp(App):
             status = raw_status if raw_status in {
                 "pending", "in_progress", "completed", "failed", "skipped",
             } else "pending"
-            candidate = self._one_line(row.get("content", ""), 140)
+            candidate = self._one_line(row.get("content", ""), max_len=None)
             if not candidate:
                 candidate = subtask_id or "subtask"
 
@@ -3328,35 +3420,49 @@ class LoomApp(App):
             return []
 
         subtask_status: dict[str, str] = {}
+        content_status: dict[str, str] = {}
         for row in getattr(run, "tasks", []):
             if not isinstance(row, dict):
                 continue
             subtask_id = str(row.get("id", "")).strip()
-            if not subtask_id:
-                continue
-            subtask_status[subtask_id] = str(row.get("status", "pending")).strip()
+            status = str(row.get("status", "pending")).strip()
+            if subtask_id:
+                subtask_status[subtask_id] = status
+            content_text = self._one_line(row.get("content", ""), max_len=None)
+            if content_text:
+                content_status[content_text] = status
 
         ordered_phase_ids: list[str] = []
+        phase_labels: dict[str, str] = {}
         for phase in getattr(process, "phases", []):
             phase_id = str(getattr(phase, "id", "")).strip()
             if phase_id:
                 ordered_phase_ids.append(phase_id)
+                phase_label = self._one_line(
+                    getattr(phase, "description", ""),
+                    max_len=None,
+                )
+                if phase_label:
+                    phase_labels[phase_id] = phase_label
         for phase_id in deliverables_by_phase.keys():
             if phase_id not in ordered_phase_ids:
                 ordered_phase_ids.append(phase_id)
+
+        run_workspace = getattr(run, "run_workspace", None)
+        workspace_root = Path(run_workspace) if run_workspace else self._workspace
 
         rows: list[dict] = []
         for phase_id in ordered_phase_ids:
             phase_deliverables = deliverables_by_phase.get(phase_id) or []
             if not isinstance(phase_deliverables, list):
                 continue
-            phase_state = subtask_status.get(phase_id, "pending")
-            if phase_state == "pending":
-                continue
-            run_workspace = getattr(run, "run_workspace", None)
-            workspace_root = (
-                Path(run_workspace) if run_workspace else self._workspace
-            )
+            phase_state = subtask_status.get(phase_id, "").strip()
+            if not phase_state:
+                phase_label = phase_labels.get(phase_id, "")
+                if phase_label:
+                    phase_state = content_status.get(phase_label, "").strip()
+            if phase_state not in {"pending", "in_progress", "completed", "failed", "skipped"}:
+                phase_state = "pending"
             for path in phase_deliverables:
                 rel_path = str(path).strip()
                 if not rel_path:
@@ -3379,7 +3485,7 @@ class LoomApp(App):
                     suffix = " [dim](skipped)[/]"
                 else:
                     status = "pending"
-                    suffix = ""
+                    suffix = " [dim](planned)[/]"
                 rows.append({
                     "id": f"{phase_id}:{rel_path}",
                     "status": status,
