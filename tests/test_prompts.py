@@ -204,6 +204,26 @@ class TestExecutorPrompt:
         assert "write_file" in prompt
         assert "read_file" in prompt
 
+    def test_executor_includes_read_write_scope_when_read_roots_present(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+        state_manager: TaskStateManager,
+    ):
+        state_manager.create(sample_task)
+        sample_task.metadata["read_roots"] = ["/tmp/source-workspace"]
+        subtask = sample_task.get_subtask("add-tsconfig")
+
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+
+        assert "READ/WRITE SCOPE" in prompt
+        assert "source-workspace" in prompt
+        assert "Do NOT prefix write paths with `myapp/`" in prompt
+
     def test_executor_section_order(
         self,
         assembler: PromptAssembler,
@@ -224,6 +244,51 @@ class TestExecutorPrompt:
         state_pos = prompt.find("CURRENT TASK STATE")
         subtask_pos = prompt.find("YOUR CURRENT SUBTASK")
         assert role_pos < state_pos < subtask_pos
+
+    def test_executor_includes_evidence_contract_and_ledger_snapshot(
+        self,
+        state_manager: TaskStateManager,
+    ):
+        from loom.processes.schema import ProcessDefinition, PromptContracts
+
+        assembler = PromptAssembler(
+            process=ProcessDefinition(
+                name="evidence-process",
+                schema_version=2,
+                prompt_contracts=PromptContracts(
+                    evidence_contract={"enabled": True, "applies_to_phases": ["*"]},
+                ),
+            ),
+        )
+        subtask = Subtask(
+            id="environmental-scan",
+            description="Perform environmental scans for each market and synthesize risk.",
+            acceptance_criteria="Deliver evidence-backed implications with source citations.",
+            status=SubtaskStatus.PENDING,
+        )
+        task = Task(
+            id="task-evidence",
+            goal="Assess market risks",
+            status=TaskStatus.EXECUTING,
+            workspace="/tmp/market",
+            plan=Plan(subtasks=[subtask], version=1),
+        )
+        state_manager.create(task)
+
+        prompt = assembler.build_executor_prompt(
+            task=task,
+            subtask=subtask,
+            state_manager=state_manager,
+            evidence_ledger_summary=(
+                "- EV-1234 | market=Alberta Retail Energy | "
+                "dimension=economic | quality=0.85 | source=https://example.com/ab"
+            ),
+        )
+
+        assert "EVIDENCE CONTRACT" in prompt
+        assert "UNSUPPORTED_NO_EVIDENCE" in prompt
+        assert "EVIDENCE LEDGER SNAPSHOT (PERSISTED)" in prompt
+        assert "EV-1234" in prompt
 
 
 class TestReplannerPrompt:
@@ -310,6 +375,14 @@ class TestVerifierPrompt:
         assert '"passed"' in prompt
         assert '"confidence"' in prompt
 
+    def test_verifier_handles_plural_wording_without_forced_minimum(
+        self, assembler: PromptAssembler,
+    ):
+        subtask = Subtask(id="scope-companies", description="Interpret company name(s)")
+        prompt = assembler.build_verifier_prompt(subtask, "Done.", "")
+        assert "cardinality-agnostic" in prompt
+        assert "company name(s)" in prompt
+
 
 class TestConstraints:
     """Test constraint library."""
@@ -337,7 +410,7 @@ class TestConstraints:
 
 
 class TestTokenBudget:
-    """Test token estimation and trimming."""
+    """Test token estimation and budget handling."""
 
     def test_estimate_tokens(self, assembler: PromptAssembler):
         text = "Hello world"  # 11 chars ~= 2-3 tokens
@@ -352,5 +425,6 @@ class TestTokenBudget:
     def test_trim_exceeds_budget(self, assembler: PromptAssembler):
         long_text = "x" * 40000  # ~10000 tokens
         result = assembler._trim_to_budget(long_text, max_tokens=1000)
-        assert len(result) < len(long_text)
-        assert "trimmed" in result
+        # Prompt assembly no longer hard-trims; semantic compaction is handled
+        # in the runtime engine before model invocation.
+        assert result == long_text

@@ -1,4 +1,6 @@
 # Loom
+[![CI](https://github.com/sfw/loom/actions/workflows/ci.yml/badge.svg)](https://github.com/sfw/loom/actions/workflows/ci.yml)
+[![Process Canary](https://github.com/sfw/loom/actions/workflows/process-canary.yml/badge.svg)](https://github.com/sfw/loom/actions/workflows/process-canary.yml)
 
 **Local model orchestration engine** -- task decomposition, execution, and verification using local LLMs.
 
@@ -50,11 +52,11 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Full undo.** Every file write is preceded by a snapshot. You can revert any individual change, all changes from a subtask, or the entire task. The changelog tracks creates, modifies, deletes, and renames with before-state snapshots.
 
-**21 built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch, web search (DuckDuckGo, no API key), code analysis (tree-sitter when installed, regex fallback), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, and ask_user for mid-execution questions. All tools auto-discovered via `__init_subclass__`.
+**21 built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch (bounded streaming + truncation for large pages), web search (DuckDuckGo, no API key), code analysis (tree-sitter when installed, regex fallback), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, and ask_user for mid-execution questions. All tools auto-discovered via `__init_subclass__`.
 
 **Inline diffs.** Every file edit produces a unified diff in the tool result. Diffs render with Rich markup syntax highlighting in the TUI -- green additions, red removals. You always see exactly what changed.
 
-**Process definitions.** YAML-based domain specialization lets you define personas, phase blueprints, verification rules, and tool guidance for any workflow. A process can represent a consulting methodology, an investment analysis framework, a research protocol, or a coding standard -- the engine doesn't care. Loom ships with 5 built-in processes and supports installing more from GitHub.
+**Process definitions.** YAML-based domain specialization lets you define personas, phase blueprints, verification/remediation policy, evidence contracts, and prompt constraints for any workflow (`schema_version: 2`). A process can represent a consulting methodology, an investment analysis framework, a research protocol, or a coding standard -- the engine doesn't care. Loom ships with 6 built-in processes and supports installing more from GitHub.
 
 ## Quick Start
 
@@ -67,6 +69,12 @@ loom -w /path/to/workspace
 
 # With a process definition
 loom -w /path/to/workspace --process consulting-engagement
+
+# Force process orchestration from inside the TUI (no loom serve required)
+# /process use investment-analysis
+# /run Analyze Tesla for investment
+# /run close                 # close current run tab (with confirmation)
+# /investment-analysis Analyze Tesla for investment
 
 # Resume a previous session
 loom --resume <session-id>
@@ -107,19 +115,48 @@ roles = ["extractor", "verifier"]
 max_subtask_retries = 3
 max_loop_iterations = 50
 max_parallel_subtasks = 3
+delegate_task_timeout_seconds = 3600
 ```
 
 Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor) so you can use a big model for planning and a small one for verification.
+Manage external MCP servers in `~/.loom/mcp.toml` (or workspace `./.loom/mcp.toml`):
+
+```toml
+[mcp.servers.notion]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-notion"]
+timeout_seconds = 30
+enabled = true
+
+[mcp.servers.notion.env]
+NOTION_TOKEN = "${NOTION_TOKEN}"
+```
+
+MCP merge precedence is: `--mcp-config` > `./.loom/mcp.toml` > `~/.loom/mcp.toml` > legacy `[mcp]` in `loom.toml`.
+Configured MCP servers are auto-discovered at startup and registered as namespaced tools (`mcp.<server>.<tool>`).
+`delegate_task` (used by `/run`) defaults to a 3600s timeout. Configure this in
+`loom.toml` under `[execution].delegate_task_timeout_seconds`; env override
+`LOOM_DELEGATE_TIMEOUT_SECONDS` still applies when set.
 
 ## Process Definitions
 
-A process definition injects a persona, phase blueprint, verification rules, and tool guidance without changing engine code. Loom ships with 5 built-in processes: investment analysis, marketing strategy, research report, competitive intelligence, and consulting engagement. You can [create your own](docs/creating-packages.md) or install them from GitHub:
+A process definition injects a persona, phase blueprint, verification/remediation policy, evidence schema, and prompt constraints without changing engine code. Loom ships with 6 built-in processes: investment analysis, marketing strategy, research report, competitive intelligence, consulting engagement, and market research. You can [create your own](docs/creating-packages.md) or install them from GitHub:
 
 ```bash
 loom processes                              # list available
 loom -w /tmp/acme --process consulting-engagement
 loom install user/repo                      # install from GitHub
+loom install user/repo --isolated-deps      # per-process dependency env
+loom process test consulting-engagement     # run process test cases
 ```
+
+Process-required tools are enforced at runtime: if `tools.required` contains
+missing tools, process activation/task creation fails fast with a clear error.
+
+Process contract v2 is the recommended authoring format (`schema_version: 2`),
+with behavior declared under `verification.policy`, `verification.remediation`,
+`evidence`, and `prompt_contracts`. v1 definitions still load in compatibility
+mode, with compatibility removal targeted for June 30, 2026.
 
 ## Adaptive Learning
 
@@ -132,17 +169,18 @@ Loom learns from your interactions so you never repeat yourself. Two learning mo
 Patterns are frequency-weighted -- the more a pattern is observed, the higher it ranks. High-frequency patterns persist indefinitely; low-frequency ones are pruned after 90 days. All data stays local in your SQLite database.
 
 ```bash
-loom learned                              # review all patterns
+loom learned                              # review learned behavioral patterns
+loom learned --all                        # include internal operational patterns
 loom learned --type behavioral_gap        # filter by type
 loom learned --delete 5                   # remove a specific pattern
 loom reset-learning                       # clear everything
 ```
 
-In the TUI, use `/learned` to open an interactive review screen where you can inspect and delete individual patterns.
+In the TUI, use `/learned` to open an interactive review screen for learned behavioral patterns, where you can inspect and delete individual items.
 
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), and learned pattern review (`/learned`).
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal|close [run-id-prefix]>`), dynamic direct process commands (`/<process-name> <goal>`), learned pattern review (`/learned`), MCP config controls (`/mcp list`, `/mcp show`, `/mcp test`, `/mcp enable`, `/mcp disable`, `/mcp remove`), and click-to-open workspace file previews (Markdown, code/text with syntax highlighting including TypeScript/CSS, JSON, CSV/TSV, HTML, diff/patch, Office docs, PDF text, and image metadata). `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `loom serve`.
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
@@ -160,13 +198,16 @@ loom models             List configured models
 loom processes          List available process definitions
 loom install SOURCE     Install a process package
 loom uninstall NAME     Remove a process package
+loom process test NAME  Run process package test cases
+loom mcp ...            Manage MCP server config (list/show/add/edit/remove/test/migrate)
 loom mcp-serve          Start the MCP server (stdio transport)
-loom learned            Review learned patterns (list, filter, delete)
+loom learned            Review learned patterns (behavioral by default)
 loom reset-learning     Clear all learned patterns
 ```
 
 Common flags for `loom` / `loom cowork`:
 - `-w /path` -- workspace directory
+- `--mcp-config /path/to/mcp.toml` -- explicit MCP config layer
 - `-m model` -- model name from config
 - `--resume <id>` -- resume a previous session
 - `--process <name>` -- load a process definition
@@ -179,6 +220,7 @@ Common flags for `loom` / `loom cowork`:
 src/loom/
   __main__.py            CLI (Click), TUI launcher (default command)
   config.py              TOML config loader
+  mcp/                   MCP config manager + merge/migration logic
   api/                   FastAPI server, REST routes, SSE streaming
   cowork/                Conversation session, approval, session state
   engine/                Orchestrator, subtask runner, scheduler, verification
@@ -186,7 +228,7 @@ src/loom/
   integrations/          MCP server
   learning/              Pattern extraction from execution history
   models/                Provider ABC + Ollama, OpenAI, Anthropic backends
-  processes/             Process definition loader + 5 built-in YAML processes
+  processes/             Process definition loader + 6 built-in YAML processes
   prompts/               7-section prompt assembler with budget trimming
   recovery/              Approval gates, confidence scoring, retry escalation
   state/                 Task state, SQLite memory archive, conversation store

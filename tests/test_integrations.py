@@ -6,7 +6,6 @@ and response validation are properly wired together.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -163,8 +162,8 @@ class TestEventPersistence:
         )
         bus.emit(event)
 
-        # Give async handler time to run
-        await asyncio.sleep(0.1)
+        # Wait deterministically for async handler completion
+        await bus.drain(timeout=1.0)
 
         # Check database
         rows = await db.query_events("t1")
@@ -204,7 +203,7 @@ class TestEventPersistence:
                 data={"index": i},
             ))
 
-        await asyncio.sleep(0.2)
+        await bus.drain(timeout=1.0)
 
         rows = await db.query_events("t1")
         assert len(rows) == 5

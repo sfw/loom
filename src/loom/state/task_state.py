@@ -6,6 +6,7 @@ The YAML state object is included in every prompt. It must stay compact
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -14,6 +15,8 @@ from enum import StrEnum
 from pathlib import Path
 
 import yaml
+
+from loom.state.evidence import merge_evidence_records
 
 
 class TaskStatus(StrEnum):
@@ -47,6 +50,7 @@ class Subtask:
     model_tier: int = 1
     verification_tier: int = 1
     is_critical_path: bool = False
+    is_synthesis: bool = False
     acceptance_criteria: str = ""
     retry_count: int = 0
     max_retries: int = 3
@@ -146,6 +150,9 @@ class TaskStateManager:
     def _state_path(self, task_id: str) -> Path:
         return self._task_dir(task_id) / "state.yaml"
 
+    def _evidence_path(self, task_id: str) -> Path:
+        return self._task_dir(task_id) / "evidence-ledger.json"
+
     def create(self, task: Task) -> None:
         """Create initial state file for a new task."""
         if not task.created_at:
@@ -182,28 +189,59 @@ class TaskStateManager:
     def exists(self, task_id: str) -> bool:
         return self._state_path(task_id).exists()
 
+    def load_evidence_records(self, task_id: str) -> list[dict]:
+        """Load persisted evidence records for a task.
+
+        Returns an empty list when no evidence ledger exists.
+        """
+        evidence_path = self._evidence_path(task_id)
+        if not evidence_path.exists():
+            return []
+        try:
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    def save_evidence_records(self, task_id: str, records: list[dict]) -> None:
+        """Persist evidence records atomically."""
+        evidence_path = self._evidence_path(task_id)
+        safe_records = [item for item in records if isinstance(item, dict)]
+        content = json.dumps(
+            safe_records,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        )
+        fd, tmp_path = tempfile.mkstemp(
+            dir=evidence_path.parent,
+            suffix=".json.tmp",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp_path, evidence_path)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+
+    def append_evidence_records(self, task_id: str, records: list[dict]) -> list[dict]:
+        """Merge and persist additional evidence records for a task."""
+        existing = self.load_evidence_records(task_id)
+        merged = merge_evidence_records(existing, records)
+        self.save_evidence_records(task_id, merged)
+        return merged
+
     def to_yaml(self, task: Task) -> str:
         """Render task state as YAML for prompt injection."""
         data = self._to_dict(task)
         return yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
     def to_compact_yaml(self, task: Task) -> str:
-        """Render a compact version for prompt injection.
-
-        If >15 subtasks, only show completed count + current + next 3 pending.
-        """
+        """Render YAML for prompt injection without lossy hard compaction."""
         data = self._to_dict(task)
-
-        subtasks = data.get("subtasks", [])
-        if len(subtasks) > task.MAX_SUBTASKS_DISPLAY:
-            completed = [s for s in subtasks if s["status"] == "completed"]
-            current = [s for s in subtasks if s["status"] in ("running", "blocked")]
-            pending = [s for s in subtasks if s["status"] == "pending"][:3]
-
-            data["subtasks"] = (
-                [{"_completed_count": len(completed)}] + current + pending
-            )
-
         return yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
     def _to_dict(self, task: Task) -> dict:
@@ -212,16 +250,17 @@ class TaskStateManager:
         for s in task.plan.subtasks:
             entry: dict = {"id": s.id, "status": s.status.value}
             if s.summary:
-                summary = s.summary[:200]
-                if len(s.summary) > 200:
-                    summary += "..."
-                entry["summary"] = summary
+                entry["summary"] = s.summary
             if s.active_issue:
                 entry["active_issue"] = s.active_issue
             if s.depends_on:
                 entry["depends_on"] = s.depends_on
             if s.description:
                 entry["description"] = s.description
+            if s.is_critical_path:
+                entry["is_critical_path"] = True
+            if s.is_synthesis:
+                entry["is_synthesis"] = True
             subtasks_data.append(entry)
 
         errors_data = []
@@ -291,6 +330,8 @@ class TaskStateManager:
                 summary=s.get("summary", ""),
                 active_issue=s.get("active_issue", ""),
                 depends_on=s.get("depends_on", []),
+                is_critical_path=bool(s.get("is_critical_path", False)),
+                is_synthesis=bool(s.get("is_synthesis", False)),
             ))
 
         errors = []

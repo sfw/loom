@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,6 +26,13 @@ from loom.engine.scheduler import Scheduler
 from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
+    MODEL_INVOCATION,
+    REMEDIATION_ATTEMPT,
+    REMEDIATION_EXPIRED,
+    REMEDIATION_FAILED,
+    REMEDIATION_QUEUED,
+    REMEDIATION_RESOLVED,
+    REMEDIATION_STARTED,
     SUBTASK_COMPLETED,
     SUBTASK_FAILED,
     SUBTASK_RETRYING,
@@ -40,11 +47,15 @@ from loom.events.types import (
 )
 from loom.learning.manager import LearningManager
 from loom.models.base import ModelResponse
+from loom.models.request_diagnostics import collect_request_diagnostics
+from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.recovery.approval import ApprovalDecision, ApprovalManager, ApprovalRequest
 from loom.recovery.confidence import ConfidenceScorer
-from loom.recovery.retry import AttemptRecord, RetryManager
+from loom.recovery.errors import ErrorCategory, categorize_error
+from loom.recovery.retry import AttemptRecord, RetryManager, RetryStrategy
+from loom.state.evidence import merge_evidence_records
 from loom.state.memory import MemoryManager
 from loom.state.task_state import (
     Plan,
@@ -58,6 +69,8 @@ from loom.tools.registry import ToolRegistry
 from loom.tools.workspace import ChangeLog
 
 logger = logging.getLogger(__name__)
+
+_REMEDIATION_TERMINAL_STATES = frozenset({"resolved", "failed", "expired"})
 
 # Re-export dataclasses that existing code imports from here
 __all__ = [
@@ -116,6 +129,7 @@ class Orchestrator:
             prompt_assembler=prompt_assembler,
             config=config.verification,
             process=process,
+            event_bus=event_bus,
         )
         self._confidence = ConfidenceScorer()
         self._approval = approval_manager or ApprovalManager(event_bus)
@@ -129,10 +143,25 @@ class Orchestrator:
         if process is not None:
             self._prompts.process = process
 
-        # Apply tool exclusions from process definition
-        if process and process.tools.excluded:
-            for tool_name in process.tools.excluded:
+        # Apply process tool policy
+        if process:
+            excluded_tools = list(getattr(process.tools, "excluded", []) or [])
+            for tool_name in excluded_tools:
                 self._tools.exclude(tool_name)
+
+            required_tools = list(getattr(process.tools, "required", []) or [])
+            if required_tools:
+                available = set(self._tools.list_tools())
+                missing = sorted(
+                    tool_name
+                    for tool_name in required_tools
+                    if tool_name not in available
+                )
+                if missing:
+                    joined = ", ".join(missing)
+                    raise ValueError(
+                        f"Process '{process.name}' requires missing tool(s): {joined}"
+                    )
 
         # Runner handles the inner subtask execution
         self._runner = SubtaskRunner(
@@ -143,6 +172,7 @@ class Orchestrator:
             state_manager=state_manager,
             verification=self._verification,
             config=config,
+            event_bus=event_bus,
         )
 
     async def execute_task(self, task: Task) -> Task:
@@ -184,9 +214,14 @@ class Orchestrator:
                 # Dispatch batch
                 if len(batch) == 1:
                     # Single subtask — no gather overhead
-                    outcomes = [await self._dispatch_subtask(
-                        task, batch[0], attempts_by_subtask,
-                    )]
+                    try:
+                        outcomes = [await self._dispatch_subtask(
+                            task, batch[0], attempts_by_subtask,
+                        )]
+                    except BaseException as item:
+                        outcomes = [
+                            self._build_subtask_exception_outcome(batch[0], item),
+                        ]
                 else:
                     # Parallel dispatch — use return_exceptions so one
                     # failure doesn't abort the entire batch.
@@ -202,23 +237,11 @@ class Orchestrator:
                     outcomes = []
                     for i, item in enumerate(raw_outcomes):
                         if isinstance(item, BaseException):
-                            # Convert exception into a failed result
-                            from loom.engine.runner import SubtaskResult
-
-                            logger.error(
-                                "Subtask %s raised exception: %s",
-                                batch[i].id, item, exc_info=item,
-                            )
-                            failed = SubtaskResult(
-                                status=SubtaskResultStatus.FAILED,
-                                summary=f"{type(item).__name__}: {item}",
-                            )
-                            no_verif = VerificationResult(
-                                tier=0, passed=False,
-                                feedback=f"Exception during execution: {item}",
-                            )
                             outcomes.append(
-                                (batch[i], failed, no_verif),
+                                self._build_subtask_exception_outcome(
+                                    batch[i],
+                                    item,
+                                ),
                             )
                         else:
                             outcomes.append(item)
@@ -235,7 +258,20 @@ class Orchestrator:
                             task, subtask, result, verification,
                         )
 
+                # Opportunistically execute queued remediation work between
+                # scheduling batches so non-blocking follow-ups can converge.
+                await self._process_remediation_queue(
+                    task=task,
+                    attempts_by_subtask=attempts_by_subtask,
+                    finalizing=False,
+                )
+
             # 3. Completion
+            await self._process_remediation_queue(
+                task=task,
+                attempts_by_subtask=attempts_by_subtask,
+                finalizing=True,
+            )
             result_task = self._finalize_task(task)
 
             # 4. Learn from execution (best-effort)
@@ -257,6 +293,29 @@ class Orchestrator:
             })
             await self._learn_from_task(task)
             return task
+
+    def _build_subtask_exception_outcome(
+        self,
+        subtask: Subtask,
+        error: BaseException,
+    ) -> tuple[Subtask, SubtaskResult, VerificationResult]:
+        """Convert a dispatch exception into a normal failed subtask outcome."""
+        logger.error(
+            "Subtask %s raised exception: %s",
+            subtask.id,
+            error,
+            exc_info=error,
+        )
+        failed = SubtaskResult(
+            status=SubtaskResultStatus.FAILED,
+            summary=f"{type(error).__name__}: {error}",
+        )
+        no_verif = VerificationResult(
+            tier=0,
+            passed=False,
+            feedback=f"Exception during execution: {error}",
+        )
+        return subtask, failed, no_verif
 
     # ------------------------------------------------------------------
     # Subtask dispatch
@@ -282,6 +341,20 @@ class Orchestrator:
 
         # Determine escalation tier
         attempts = attempts_by_subtask.get(subtask.id, [])
+        prior_successful_tool_calls: list[ToolCallRecord] = []
+        prior_evidence_records = self._evidence_for_subtask(task.id, subtask.id)
+        for attempt in attempts:
+            raw_calls = getattr(attempt, "successful_tool_calls", [])
+            if isinstance(raw_calls, list):
+                for call in raw_calls:
+                    if isinstance(call, ToolCallRecord):
+                        prior_successful_tool_calls.append(call)
+            raw_evidence = getattr(attempt, "evidence_records", [])
+            if isinstance(raw_evidence, list):
+                prior_evidence_records = merge_evidence_records(
+                    prior_evidence_records,
+                    [item for item in raw_evidence if isinstance(item, dict)],
+                )
         escalated_tier = self._retry.get_escalation_tier(
             attempt=len(attempts),
             original_tier=subtask.model_tier,
@@ -294,6 +367,8 @@ class Orchestrator:
             model_tier=escalated_tier,
             retry_context=retry_context,
             changelog=changelog,
+            prior_successful_tool_calls=prior_successful_tool_calls,
+            prior_evidence_records=prior_evidence_records,
         )
 
         return subtask, result, verification
@@ -311,17 +386,83 @@ class Orchestrator:
         attempts_by_subtask: dict[str, list[AttemptRecord]],
     ) -> None:
         """Process a failed subtask: record attempt, retry or replan."""
+        self._persist_subtask_evidence(task.id, subtask.id, result.evidence_records)
         attempt_list = attempts_by_subtask.setdefault(subtask.id, [])
-        attempt_list.append(
-            AttemptRecord(
-                attempt=len(attempt_list) + 1,
-                tier=self._retry.get_escalation_tier(
-                    len(attempt_list), subtask.model_tier,
-                ),
-                feedback=verification.feedback if verification else None,
-                error=result.summary,
-            )
+        strategy, missing_targets = self._retry.classify_failure(
+            verification_feedback=verification.feedback,
+            execution_error=result.summary,
+            verification=verification,
         )
+        combined_error = " | ".join(
+            part for part in [verification.feedback, result.summary] if part
+        )
+        attempt_record = AttemptRecord(
+            attempt=len(attempt_list) + 1,
+            tier=self._retry.get_escalation_tier(
+                len(attempt_list), subtask.model_tier,
+            ),
+            feedback=verification.feedback if verification else None,
+            error=combined_error or None,
+            successful_tool_calls=[
+                call for call in result.tool_calls
+                if getattr(getattr(call, "result", None), "success", False)
+            ],
+            evidence_records=[
+                item for item in result.evidence_records
+                if isinstance(item, dict)
+            ],
+            retry_strategy=strategy,
+            missing_targets=missing_targets,
+        )
+        attempt_list.append(attempt_record)
+
+        # Parse failures in verifier output should retry verification only
+        # instead of re-running full subtask execution.
+        if (
+            strategy == RetryStrategy.VERIFIER_PARSE
+            and subtask.retry_count < subtask.max_retries
+        ):
+            verification_retry = await self._retry_verification_only(
+                task=task,
+                subtask=subtask,
+                result=result,
+                attempts=attempt_list,
+            )
+            if verification_retry.passed:
+                await self._handle_success(task, subtask, result, verification_retry)
+                return
+            verification = verification_retry
+            attempt_record.feedback = verification_retry.feedback or attempt_record.feedback
+            if verification_retry.feedback:
+                attempt_record.error = " | ".join(
+                    part for part in [attempt_record.error, verification_retry.feedback]
+                    if part
+                )
+
+        if strategy == RetryStrategy.UNCONFIRMED_DATA and not subtask.is_critical_path:
+            await self._queue_remediation_work_item(
+                task=task,
+                subtask=subtask,
+                verification=verification,
+                strategy=strategy,
+                blocking=False,
+            )
+            verification.passed = True
+            if verification.outcome == "fail":
+                verification.outcome = (
+                    "partial_verified"
+                    if self._config.verification.allow_partial_verified
+                    else "pass_with_warnings"
+                )
+            if not verification.reason_code:
+                verification.reason_code = "unconfirmed_noncritical"
+            note = "Remediation queued for follow-up (non-critical path)."
+            verification.feedback = (
+                f"{verification.feedback}\n{note}" if verification.feedback else note
+            )
+            result.status = SubtaskResultStatus.SUCCESS
+            await self._handle_success(task, subtask, result, verification)
+            return
 
         async with self._state_lock:
             subtask.status = SubtaskStatus.FAILED
@@ -338,6 +479,8 @@ class Orchestrator:
             "subtask_id": subtask.id,
             "verification_tier": verification.tier,
             "feedback": verification.feedback,
+            "verification_outcome": verification.outcome,
+            "reason_code": verification.reason_code,
         })
 
         if subtask.retry_count < subtask.max_retries:
@@ -358,10 +501,646 @@ class Orchestrator:
                     subtask.retry_count, subtask.model_tier,
                 ),
                 "feedback": verification.feedback if verification else None,
+                "retry_strategy": strategy.value,
             })
         else:
-            # All retries exhausted — trigger re-planning
-            await self._replan_task(task)
+            # All retries exhausted.
+            # Critical-path failures abort the remaining plan.
+            if subtask.is_critical_path:
+                if strategy == RetryStrategy.UNCONFIRMED_DATA:
+                    remediation_recovered, _ = await self._run_confirm_or_prune_remediation(
+                        task=task,
+                        subtask=subtask,
+                        attempts=attempt_list,
+                    )
+                    if remediation_recovered:
+                        return
+                    await self._queue_remediation_work_item(
+                        task=task,
+                        subtask=subtask,
+                        verification=verification,
+                        strategy=strategy,
+                        blocking=True,
+                    )
+                await self._abort_on_critical_path_failure(
+                    task, subtask, verification,
+                )
+                return
+
+            # Non-critical failures trigger re-planning.
+            await self._replan_task(
+                task,
+                reason=self._build_replan_reason(subtask, verification),
+                failed_subtask_id=subtask.id,
+                verification_feedback=verification.feedback,
+            )
+
+    async def _abort_on_critical_path_failure(
+        self,
+        task: Task,
+        subtask: Subtask,
+        verification: VerificationResult,
+    ) -> None:
+        """Abort remaining work when a critical-path subtask exhausts retries."""
+        block_summary = (
+            f"Skipped: blocked by critical-path failure in {subtask.id}"
+        )
+        async with self._state_lock:
+            for candidate in task.plan.subtasks:
+                if candidate.status == SubtaskStatus.PENDING:
+                    candidate.status = SubtaskStatus.SKIPPED
+                    candidate.summary = block_summary
+                    task.update_subtask(
+                        candidate.id,
+                        status=SubtaskStatus.SKIPPED,
+                        summary=candidate.summary,
+                    )
+
+            task.status = TaskStatus.FAILED
+            task.add_error(
+                subtask.id,
+                (
+                    "Critical-path subtask failed after retries: "
+                    + (verification.feedback or subtask.summary or "unknown failure")
+                ),
+            )
+            self._state.save(task)
+
+    async def _queue_remediation_work_item(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        verification: VerificationResult,
+        strategy: RetryStrategy,
+        blocking: bool,
+    ) -> None:
+        queue = self._remediation_queue(task)
+        reason_code = str(verification.reason_code or "").strip().lower()
+        strategy_value = strategy.value
+        now = datetime.now()
+
+        for item in queue:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("subtask_id", "")).strip() != subtask.id:
+                continue
+            if str(item.get("strategy", "")).strip() != strategy_value:
+                continue
+            if str(item.get("reason_code", "")).strip().lower() != reason_code:
+                continue
+            state = str(item.get("state", "queued")).strip().lower()
+            if state in _REMEDIATION_TERMINAL_STATES:
+                continue
+
+            if blocking and not bool(item.get("blocking", False)):
+                item["blocking"] = True
+            item["updated_at"] = now.isoformat()
+            async with self._state_lock:
+                self._state.save(task)
+            return
+
+        item = {
+            "id": f"rem-{uuid.uuid4().hex[:10]}",
+            "task_id": task.id,
+            "subtask_id": subtask.id,
+            "strategy": strategy_value,
+            "reason_code": reason_code,
+            "verification_outcome": verification.outcome,
+            "feedback": verification.feedback or "",
+            "blocking": bool(blocking),
+            "state": "queued",
+            "attempt_count": 0,
+            "last_error": "",
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "next_attempt_at": now.isoformat(),
+            "ttl_at": (now + timedelta(hours=6)).isoformat(),
+        }
+        queue.append(item)
+        async with self._state_lock:
+            task.add_decision(
+                "Queued remediation for "
+                f"{subtask.id} ({strategy.value}, blocking={blocking})."
+            )
+            self._state.save(task)
+        self._emit(REMEDIATION_QUEUED, task.id, {
+            "remediation_id": item["id"],
+            "subtask_id": subtask.id,
+            "strategy": strategy_value,
+            "reason_code": reason_code,
+            "blocking": bool(blocking),
+        })
+
+    def _build_remediation_retry_context(self, *, strategy: RetryStrategy) -> str:
+        lines = [
+            "TARGETED REMEDIATION:",
+            "- Keep already validated work; avoid redoing solved sections.",
+            "- Resolve only failing verification findings and missing evidence links.",
+            "- Use explicit evidence to confirm uncertain claims; otherwise relabel "
+            "or remove unsupported claims per process policy.",
+            "- Make the smallest safe edits needed to satisfy acceptance criteria.",
+        ]
+        process = self._process
+        if process is not None:
+            instructions = process.prompt_remediation_instructions(strategy.value)
+            if instructions:
+                lines.append("PROCESS REMEDIATION INSTRUCTIONS:")
+                lines.append(instructions)
+        return "\n".join(lines)
+
+    async def _run_confirm_or_prune_remediation(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        attempts: list[AttemptRecord],
+        remediation_id: str | None = None,
+    ) -> tuple[bool, str]:
+        if not self._config.verification.auto_confirm_prune_critical_path:
+            return False, "auto_confirm_prune_critical_path disabled"
+
+        max_attempts = max(
+            1,
+            int(
+                getattr(
+                    self._config.verification,
+                    "confirm_or_prune_max_attempts",
+                    2,
+                ) or 2
+            ),
+        )
+        backoff_seconds = max(
+            0.0,
+            float(
+                getattr(
+                    self._config.verification,
+                    "confirm_or_prune_backoff_seconds",
+                    2.0,
+                ) or 0.0
+            ),
+        )
+        retry_on_transient = bool(
+            getattr(
+                self._config.verification,
+                "confirm_or_prune_retry_on_transient",
+                True,
+            ),
+        )
+        last_failure = "process remediation failed"
+
+        for attempt_number in range(1, max_attempts + 1):
+            self._emit(SUBTASK_RETRYING, task.id, {
+                "subtask_id": subtask.id,
+                "mode": "confirm_or_prune",
+                "reason": "critical_unconfirmed_data",
+                "attempt": attempt_number,
+                "max_attempts": max_attempts,
+            })
+            self._emit(REMEDIATION_ATTEMPT, task.id, {
+                "remediation_id": remediation_id or "",
+                "subtask_id": subtask.id,
+                "attempt": attempt_number,
+                "max_attempts": max_attempts,
+                "phase": "start",
+            })
+
+            prior_successful_tool_calls: list[ToolCallRecord] = []
+            prior_evidence_records = self._evidence_for_subtask(task.id, subtask.id)
+            for attempt in attempts:
+                raw_calls = getattr(attempt, "successful_tool_calls", [])
+                if isinstance(raw_calls, list):
+                    for call in raw_calls:
+                        if isinstance(call, ToolCallRecord):
+                            prior_successful_tool_calls.append(call)
+                raw_evidence = getattr(attempt, "evidence_records", [])
+                if isinstance(raw_evidence, list):
+                    prior_evidence_records = merge_evidence_records(
+                        prior_evidence_records,
+                        [item for item in raw_evidence if isinstance(item, dict)],
+                    )
+
+            remediation_context = (
+                self._build_remediation_retry_context(
+                    strategy=RetryStrategy.UNCONFIRMED_DATA,
+                )
+            )
+            escalated_tier = self._retry.get_escalation_tier(
+                attempt=len(attempts),
+                original_tier=subtask.model_tier,
+            )
+            changelog = self._get_changelog(task)
+            remediation_result, remediation_verification = await self._runner.run(
+                task,
+                subtask,
+                model_tier=escalated_tier,
+                retry_context=remediation_context,
+                changelog=changelog,
+                prior_successful_tool_calls=prior_successful_tool_calls,
+                prior_evidence_records=prior_evidence_records,
+            )
+            self._persist_subtask_evidence(
+                task.id,
+                subtask.id,
+                remediation_result.evidence_records,
+            )
+
+            if remediation_verification.passed:
+                await self._handle_success(
+                    task,
+                    subtask,
+                    remediation_result,
+                    remediation_verification,
+                )
+                self._emit(REMEDIATION_ATTEMPT, task.id, {
+                    "remediation_id": remediation_id or "",
+                    "subtask_id": subtask.id,
+                    "attempt": attempt_number,
+                    "max_attempts": max_attempts,
+                    "phase": "done",
+                    "outcome": "resolved",
+                })
+                self._record_confirm_or_prune_attempt(
+                    task=task,
+                    subtask_id=subtask.id,
+                    status="resolved",
+                    attempt=attempt_number,
+                    max_attempts=max_attempts,
+                    transient=False,
+                    reason_code=remediation_verification.reason_code,
+                    retry_strategy="resolved",
+                    error="",
+                )
+                return True, ""
+
+            remediation_strategy, missing_targets = self._retry.classify_failure(
+                verification_feedback=remediation_verification.feedback,
+                execution_error=remediation_result.summary,
+                verification=remediation_verification,
+            )
+            combined_error = " | ".join(
+                part
+                for part in [
+                    remediation_verification.feedback,
+                    remediation_result.summary,
+                ]
+                if part
+            ) or "process remediation failed"
+            categorized = categorize_error(combined_error)
+            transient = (
+                remediation_strategy == RetryStrategy.RATE_LIMIT
+                or categorized.category in {
+                    ErrorCategory.MODEL_ERROR,
+                    ErrorCategory.TIMEOUT,
+                }
+            )
+            attempts.append(AttemptRecord(
+                attempt=len(attempts) + 1,
+                tier=escalated_tier,
+                feedback=remediation_verification.feedback or None,
+                error=combined_error,
+                successful_tool_calls=[
+                    call for call in remediation_result.tool_calls
+                    if getattr(getattr(call, "result", None), "success", False)
+                ],
+                evidence_records=[
+                    item for item in remediation_result.evidence_records
+                    if isinstance(item, dict)
+                ],
+                retry_strategy=remediation_strategy,
+                missing_targets=missing_targets,
+                error_category=categorized.category,
+            ))
+            self._record_confirm_or_prune_attempt(
+                task=task,
+                subtask_id=subtask.id,
+                status="failed",
+                attempt=attempt_number,
+                max_attempts=max_attempts,
+                transient=transient,
+                reason_code=remediation_verification.reason_code,
+                retry_strategy=remediation_strategy.value,
+                error=combined_error,
+            )
+            self._emit(REMEDIATION_ATTEMPT, task.id, {
+                "remediation_id": remediation_id or "",
+                "subtask_id": subtask.id,
+                "attempt": attempt_number,
+                "max_attempts": max_attempts,
+                "phase": "done",
+                "outcome": "failed",
+                "retry_strategy": remediation_strategy.value,
+                "transient": transient,
+            })
+            last_failure = combined_error
+
+            more_attempts_remain = attempt_number < max_attempts
+            if remediation_strategy == RetryStrategy.RATE_LIMIT and more_attempts_remain:
+                if backoff_seconds > 0:
+                    await asyncio.sleep(backoff_seconds)
+                continue
+            if retry_on_transient and transient and more_attempts_remain:
+                if backoff_seconds > 0:
+                    await asyncio.sleep(backoff_seconds)
+                continue
+            break
+
+        return False, last_failure
+
+    def _record_confirm_or_prune_attempt(
+        self,
+        *,
+        task: Task,
+        subtask_id: str,
+        status: str,
+        attempt: int,
+        max_attempts: int,
+        transient: bool,
+        reason_code: str,
+        retry_strategy: str,
+        error: str,
+    ) -> None:
+        attempts_map = task.metadata.get("confirm_or_prune_attempts")
+        if not isinstance(attempts_map, dict):
+            attempts_map = {}
+            task.metadata["confirm_or_prune_attempts"] = attempts_map
+        rows = attempts_map.get(subtask_id)
+        if not isinstance(rows, list):
+            rows = []
+            attempts_map[subtask_id] = rows
+        rows.append({
+            "attempt": int(attempt),
+            "max_attempts": int(max_attempts),
+            "status": str(status),
+            "transient": bool(transient),
+            "reason_code": str(reason_code or "").strip().lower(),
+            "retry_strategy": str(retry_strategy or "").strip().lower(),
+            "error": str(error or ""),
+            "at": datetime.now().isoformat(),
+        })
+        if len(rows) > 25:
+            del rows[:-25]
+
+    def _remediation_queue(self, task: Task) -> list[dict]:
+        queue = task.metadata.get("remediation_queue")
+        if not isinstance(queue, list):
+            queue = []
+            task.metadata["remediation_queue"] = queue
+        queue[:] = [item for item in queue if isinstance(item, dict)]
+        return queue
+
+    @staticmethod
+    def _parse_iso_datetime(raw: object) -> datetime | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
+
+    def _remediation_item_due(self, item: dict, now: datetime) -> bool:
+        due_at = self._parse_iso_datetime(item.get("next_attempt_at"))
+        if due_at is None:
+            return True
+        return now >= due_at
+
+    def _remediation_item_expired(self, item: dict, now: datetime) -> bool:
+        ttl_at = self._parse_iso_datetime(item.get("ttl_at"))
+        if ttl_at is None:
+            return False
+        return now >= ttl_at
+
+    async def _process_remediation_queue(
+        self,
+        *,
+        task: Task,
+        attempts_by_subtask: dict[str, list[AttemptRecord]],
+        finalizing: bool,
+    ) -> None:
+        queue = task.metadata.get("remediation_queue")
+        if not isinstance(queue, list) or not queue:
+            return
+
+        max_attempts = max(
+            1,
+            int(
+                getattr(
+                    self._config.verification,
+                    "confirm_or_prune_max_attempts",
+                    2,
+                ) or 2
+            ),
+        )
+        backoff_seconds = max(
+            0.0,
+            float(
+                getattr(
+                    self._config.verification,
+                    "confirm_or_prune_backoff_seconds",
+                    2.0,
+                ) or 0.0
+            ),
+        )
+        changed = False
+        now = datetime.now()
+
+        for item in queue:
+            if not isinstance(item, dict):
+                continue
+            state = str(item.get("state", "queued")).strip().lower()
+            if state in _REMEDIATION_TERMINAL_STATES:
+                continue
+
+            remediation_id = str(item.get("id", "")).strip() or f"rem-{uuid.uuid4().hex[:10]}"
+            item["id"] = remediation_id
+            subtask_id = str(item.get("subtask_id", "")).strip()
+
+            if self._remediation_item_expired(item, now):
+                item["state"] = "expired"
+                item["updated_at"] = now.isoformat()
+                item["last_error"] = (
+                    str(item.get("last_error", "")).strip()
+                    or "remediation ttl exceeded"
+                )
+                changed = True
+                self._emit(REMEDIATION_EXPIRED, task.id, {
+                    "remediation_id": remediation_id,
+                    "subtask_id": subtask_id,
+                    "strategy": str(item.get("strategy", "")),
+                })
+                continue
+
+            if not self._remediation_item_due(item, now):
+                continue
+
+            item["state"] = "running"
+            item["updated_at"] = now.isoformat()
+            changed = True
+            self._emit(REMEDIATION_STARTED, task.id, {
+                "remediation_id": remediation_id,
+                "subtask_id": subtask_id,
+                "strategy": str(item.get("strategy", "")),
+                "blocking": bool(item.get("blocking", False)),
+            })
+
+            resolved, error = await self._execute_remediation_item(
+                task=task,
+                item=item,
+                attempts_by_subtask=attempts_by_subtask,
+            )
+            if resolved:
+                item["state"] = "resolved"
+                item["updated_at"] = datetime.now().isoformat()
+                item["last_error"] = ""
+                changed = True
+                self._emit(REMEDIATION_RESOLVED, task.id, {
+                    "remediation_id": remediation_id,
+                    "subtask_id": subtask_id,
+                    "strategy": str(item.get("strategy", "")),
+                })
+                continue
+
+            attempt_count = int(item.get("attempt_count", 0) or 0) + 1
+            item["attempt_count"] = attempt_count
+            item["last_error"] = str(error or "").strip()
+            item["updated_at"] = datetime.now().isoformat()
+            exhausted = attempt_count >= max_attempts
+            if exhausted or (finalizing and bool(item.get("blocking", False))):
+                item["state"] = "failed"
+                self._emit(REMEDIATION_FAILED, task.id, {
+                    "remediation_id": remediation_id,
+                    "subtask_id": subtask_id,
+                    "strategy": str(item.get("strategy", "")),
+                    "attempt_count": attempt_count,
+                    "error": item["last_error"],
+                })
+            else:
+                item["state"] = "queued"
+                item["next_attempt_at"] = (
+                    datetime.now() + timedelta(seconds=backoff_seconds)
+                ).isoformat()
+            changed = True
+
+        if finalizing:
+            for item in queue:
+                if not isinstance(item, dict):
+                    continue
+                if not bool(item.get("blocking", False)):
+                    continue
+                state = str(item.get("state", "queued")).strip().lower()
+                if state in _REMEDIATION_TERMINAL_STATES:
+                    continue
+                item["state"] = "failed"
+                item["updated_at"] = datetime.now().isoformat()
+                item["last_error"] = (
+                    str(item.get("last_error", "")).strip()
+                    or "blocking remediation unresolved at task finalization"
+                )
+                changed = True
+                self._emit(REMEDIATION_FAILED, task.id, {
+                    "remediation_id": str(item.get("id", "")).strip(),
+                    "subtask_id": str(item.get("subtask_id", "")).strip(),
+                    "strategy": str(item.get("strategy", "")),
+                    "attempt_count": int(item.get("attempt_count", 0) or 0),
+                    "error": item["last_error"],
+                })
+
+        if changed:
+            async with self._state_lock:
+                self._state.save(task)
+
+    async def _execute_remediation_item(
+        self,
+        *,
+        task: Task,
+        item: dict,
+        attempts_by_subtask: dict[str, list[AttemptRecord]],
+    ) -> tuple[bool, str]:
+        strategy_value = str(item.get("strategy", "")).strip()
+        subtask_id = str(item.get("subtask_id", "")).strip()
+        subtask = task.get_subtask(subtask_id)
+        if subtask is None:
+            return False, f"subtask not found: {subtask_id}"
+
+        if strategy_value != RetryStrategy.UNCONFIRMED_DATA.value:
+            return False, f"unsupported remediation strategy: {strategy_value}"
+
+        attempts = attempts_by_subtask.setdefault(subtask.id, [])
+        return await self._run_confirm_or_prune_remediation(
+            task=task,
+            subtask=subtask,
+            attempts=attempts,
+            remediation_id=str(item.get("id", "")).strip() or None,
+        )
+
+    @staticmethod
+    def _build_replan_reason(
+        subtask: Subtask,
+        verification: VerificationResult,
+    ) -> str:
+        """Build a concise, structured reason string for replanning prompts."""
+        feedback = (verification.feedback or "").strip()
+        reason = f"reason_code={verification.reason_code}" if verification.reason_code else ""
+        outcome = (
+            f"outcome={verification.outcome}"
+            if verification.outcome else ""
+        )
+        suffix = ", ".join(part for part in [outcome, reason] if part)
+        suffix_text = f" ({suffix})" if suffix else ""
+        if feedback:
+            return (
+                f"Subtask '{subtask.id}' failed verification tier "
+                f"{verification.tier}{suffix_text}: {feedback}"
+            )
+        return (
+            f"Subtask '{subtask.id}' failed verification tier "
+            f"{verification.tier}{suffix_text} with no feedback."
+        )
+
+    async def _retry_verification_only(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        result: SubtaskResult,
+        attempts: list[AttemptRecord],
+    ) -> VerificationResult:
+        """Retry verifier path only (no executor/tool rerun)."""
+        self._emit(SUBTASK_RETRYING, task.id, {
+            "subtask_id": subtask.id,
+            "mode": "verification_only",
+            "reason": "verifier_parse_error",
+        })
+        prior_calls: list[ToolCallRecord] = []
+        prior_evidence = self._evidence_for_subtask(task.id, subtask.id)
+        for attempt in attempts:
+            raw_calls = getattr(attempt, "successful_tool_calls", [])
+            if isinstance(raw_calls, list):
+                for call in raw_calls:
+                    if isinstance(call, ToolCallRecord):
+                        prior_calls.append(call)
+            raw_evidence = getattr(attempt, "evidence_records", [])
+            if isinstance(raw_evidence, list):
+                prior_evidence = merge_evidence_records(
+                    prior_evidence,
+                    [item for item in raw_evidence if isinstance(item, dict)],
+                )
+        prior_evidence = merge_evidence_records(
+            prior_evidence,
+            [item for item in result.evidence_records if isinstance(item, dict)],
+        )
+        workspace = Path(task.workspace) if task.workspace else None
+        return await self._verification.verify(
+            subtask=subtask,
+            result_summary=result.summary or "",
+            tool_calls=result.tool_calls,
+            evidence_tool_calls=prior_calls,
+            evidence_records=prior_evidence,
+            workspace=workspace,
+            tier=max(2, subtask.verification_tier),
+            task_id=task.id,
+        )
 
     async def _handle_success(
         self,
@@ -371,6 +1150,7 @@ class Orchestrator:
         verification: VerificationResult,
     ) -> None:
         """Process a successful subtask: update state, check approval."""
+        self._persist_subtask_evidence(task.id, subtask.id, result.evidence_records)
         summary = result.summary
 
         # Update state
@@ -390,11 +1170,31 @@ class Orchestrator:
 
             self._state.save(task)
 
+        remediation_mode = ""
+        remediation_required = False
+        if verification and isinstance(verification.metadata, dict):
+            remediation_mode = str(
+                verification.metadata.get("remediation_mode", ""),
+            ).strip().lower()
+            remediation_required = bool(
+                verification.metadata.get("remediation_required", False),
+            )
+        if verification and remediation_required and remediation_mode == "queue_follow_up":
+            await self._queue_remediation_work_item(
+                task=task,
+                subtask=subtask,
+                verification=verification,
+                strategy=RetryStrategy.UNCONFIRMED_DATA,
+                blocking=False,
+            )
+
         self._emit(SUBTASK_COMPLETED, task.id, {
             "subtask_id": subtask.id,
             "status": result.status,
             "summary": summary,
             "duration": result.duration_seconds,
+            "verification_outcome": verification.outcome if verification else "",
+            "reason_code": verification.reason_code if verification else "",
         })
 
         # Confidence scoring and approval check
@@ -461,23 +1261,28 @@ class Orchestrator:
         workspace_listing = ""
         code_analysis = ""
         workspace_analysis = ""
+        read_roots = self._read_roots_for_task(task)
         if task.workspace:
             workspace_path = Path(task.workspace)
             if workspace_path.exists():
                 # Run listing and analysis in parallel
                 async def _do_listing():
                     return await self._tools.execute(
-                        "list_directory", {}, workspace=workspace_path,
+                        "list_directory",
+                        {},
+                        workspace=workspace_path,
+                        read_roots=read_roots,
                     )
 
                 async def _do_analysis():
+                    analysis_path = read_roots[0] if read_roots else workspace_path
                     if self._process and self._process.workspace_scan:
                         result = await self._analyze_workspace_for_process(
-                            workspace_path,
+                            analysis_path,
                         )
                         return ("workspace", result)
                     return ("code", await self._analyze_workspace(
-                        workspace_path,
+                        analysis_path,
                     ))
 
                 listing_result, analysis_result = await asyncio.gather(
@@ -499,9 +1304,125 @@ class Orchestrator:
         )
 
         model = self._router.select(tier=2, role="planner")
-        response = await model.complete([{"role": "user", "content": prompt}])
+        request_messages = [{"role": "user", "content": prompt}]
+        policy = ModelRetryPolicy.from_execution_config(self._config.execution)
+        invocation_attempt = 0
+        request_diag = None
 
-        return self._parse_plan(response, goal=task.goal)
+        async def _invoke_model():
+            nonlocal invocation_attempt, request_diag
+            invocation_attempt += 1
+            request_diag = collect_request_diagnostics(
+                messages=request_messages,
+                origin="orchestrator.plan_task.complete",
+            )
+            self._emit(MODEL_INVOCATION, task.id, {
+                "subtask_id": "planning",
+                "model": model.name,
+                "phase": "start",
+                "operation": "complete",
+                "invocation_attempt": invocation_attempt,
+                "invocation_max_attempts": policy.max_attempts,
+                **request_diag.to_event_payload(),
+            })
+            return await model.complete(request_messages)
+
+        def _on_failure(
+            attempt: int,
+            max_attempts: int,
+            error: BaseException,
+            remaining: int,
+        ) -> None:
+            self._emit(MODEL_INVOCATION, task.id, {
+                "subtask_id": "planning",
+                "model": model.name,
+                "phase": "done",
+                "operation": "complete",
+                "invocation_attempt": attempt,
+                "invocation_max_attempts": max_attempts,
+                "retry_queue_remaining": remaining,
+                "origin": request_diag.origin if request_diag else "",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            })
+
+        try:
+            response = await call_with_model_retry(
+                _invoke_model,
+                policy=policy,
+                on_failure=_on_failure,
+            )
+        except Exception as e:
+            logger.warning(
+                "Planning model call failed after %s attempts for task %s; using fallback plan: %s",
+                policy.max_attempts,
+                task.id,
+                e,
+            )
+            fallback = Plan(
+                subtasks=[Subtask(
+                    id="execute-goal",
+                    description=task.goal or "Execute the task goal directly",
+                    model_tier=2,
+                    max_retries=self._config.execution.max_subtask_retries,
+                )],
+                version=1,
+            )
+            return self._apply_process_phase_mode(fallback)
+        self._emit(MODEL_INVOCATION, task.id, {
+            "subtask_id": "planning",
+            "model": model.name,
+            "phase": "done",
+            "operation": "complete",
+            "invocation_attempt": invocation_attempt,
+            "invocation_max_attempts": policy.max_attempts,
+            "origin": request_diag.origin if request_diag else "",
+            "response_tokens": response.usage.total_tokens,
+            "response_chars": len(response.text or ""),
+        })
+
+        plan = self._parse_plan(response, goal=task.goal)
+        return self._apply_process_phase_mode(plan)
+
+    @staticmethod
+    def _read_roots_for_task(task: Task) -> list[Path]:
+        """Resolve additional read roots from task metadata.
+
+        Only parent roots of the task workspace are accepted.
+        """
+        workspace_text = str(task.workspace or "").strip()
+        if not workspace_text:
+            return []
+        try:
+            workspace = Path(workspace_text).resolve()
+        except Exception:
+            return []
+
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        raw_roots = metadata.get("read_roots", [])
+        if isinstance(raw_roots, str):
+            raw_roots = [raw_roots]
+        if not isinstance(raw_roots, list):
+            return []
+
+        roots: list[Path] = []
+        seen: set[Path] = set()
+        for raw in raw_roots:
+            try:
+                candidate = Path(str(raw)).expanduser().resolve()
+            except Exception:
+                continue
+            if candidate == Path(candidate.anchor):
+                continue
+            try:
+                workspace.relative_to(candidate)
+            except ValueError:
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            roots.append(candidate)
+        return roots
 
     # Document extensions grouped by category for workspace scanning.
     _DOC_EXTENSIONS: dict[str, tuple[str, ...]] = {
@@ -631,12 +1552,23 @@ class Orchestrator:
             logger.warning("Process workspace scan failed: %s", e)
             return ""
 
-    async def _replan_task(self, task: Task) -> bool:
+    async def _replan_task(
+        self,
+        task: Task,
+        *,
+        reason: str = "subtask_failures",
+        failed_subtask_id: str = "",
+        verification_feedback: str | None = None,
+    ) -> bool:
         """Re-plan the task after subtask failures.
 
         Returns True if re-planning succeeded and execution can continue.
         """
-        self._emit(TASK_REPLANNING, task.id, {"reason": "subtask_failures"})
+        self._emit(TASK_REPLANNING, task.id, {
+            "reason": reason,
+            "failed_subtask_id": failed_subtask_id,
+            "verification_feedback": verification_feedback or "",
+        })
 
         discoveries = [d for d in task.decisions_log]
         errors = [
@@ -651,11 +1583,71 @@ class Orchestrator:
                 discoveries=discoveries,
                 errors=errors,
                 original_plan=task.plan,
+                replan_reason=reason,
             )
 
             model = self._router.select(tier=2, role="planner")
-            response = await model.complete([{"role": "user", "content": prompt}])
-            new_plan = self._parse_plan(response, goal=task.goal)
+            request_messages = [{"role": "user", "content": prompt}]
+            policy = ModelRetryPolicy.from_execution_config(self._config.execution)
+            invocation_attempt = 0
+            request_diag = None
+
+            async def _invoke_replanner():
+                nonlocal invocation_attempt, request_diag
+                invocation_attempt += 1
+                request_diag = collect_request_diagnostics(
+                    messages=request_messages,
+                    origin="orchestrator.replan_task.complete",
+                )
+                self._emit(MODEL_INVOCATION, task.id, {
+                    "subtask_id": failed_subtask_id or "replanning",
+                    "model": model.name,
+                    "phase": "start",
+                    "operation": "complete",
+                    "invocation_attempt": invocation_attempt,
+                    "invocation_max_attempts": policy.max_attempts,
+                    **request_diag.to_event_payload(),
+                })
+                return await model.complete(request_messages)
+
+            def _on_replanner_failure(
+                attempt: int,
+                max_attempts: int,
+                error: BaseException,
+                remaining: int,
+            ) -> None:
+                self._emit(MODEL_INVOCATION, task.id, {
+                    "subtask_id": failed_subtask_id or "replanning",
+                    "model": model.name,
+                    "phase": "done",
+                    "operation": "complete",
+                    "invocation_attempt": attempt,
+                    "invocation_max_attempts": max_attempts,
+                    "retry_queue_remaining": remaining,
+                    "origin": request_diag.origin if request_diag else "",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                })
+
+            response = await call_with_model_retry(
+                _invoke_replanner,
+                policy=policy,
+                on_failure=_on_replanner_failure,
+            )
+            self._emit(MODEL_INVOCATION, task.id, {
+                "subtask_id": failed_subtask_id or "replanning",
+                "model": model.name,
+                "phase": "done",
+                "operation": "complete",
+                "invocation_attempt": invocation_attempt,
+                "invocation_max_attempts": policy.max_attempts,
+                "origin": request_diag.origin if request_diag else "",
+                "response_tokens": response.usage.total_tokens,
+                "response_chars": len(response.text or ""),
+            })
+            new_plan = self._apply_process_phase_mode(
+                self._parse_plan(response, goal=task.goal),
+            )
 
             # Preserve completed subtask state
             completed_ids = {
@@ -709,15 +1701,100 @@ class Orchestrator:
                 model_tier=s.get("model_tier", 1),
                 verification_tier=s.get("verification_tier", 1),
                 is_critical_path=s.get("is_critical_path", False),
+                is_synthesis=s.get("is_synthesis", False),
                 acceptance_criteria=s.get("acceptance_criteria", ""),
                 max_retries=self._config.execution.max_subtask_retries,
             ))
 
         return Plan(subtasks=subtasks, version=1)
 
+    def _apply_process_phase_mode(self, plan: Plan) -> Plan:
+        """Apply process phase-mode constraints to the planner output."""
+        if not self._process or not self._process.phases:
+            return plan
+        if self._process.phase_mode != "strict":
+            return plan
+
+        planner_subtasks = {s.id: s for s in plan.subtasks}
+        strict_subtasks: list[Subtask] = []
+
+        for phase in self._process.phases:
+            existing = planner_subtasks.get(phase.id)
+            if existing is None:
+                strict_subtasks.append(
+                    Subtask(
+                        id=phase.id,
+                        description=phase.description,
+                        depends_on=list(phase.depends_on),
+                        model_tier=phase.model_tier,
+                        verification_tier=phase.verification_tier,
+                        is_critical_path=phase.is_critical_path,
+                        is_synthesis=phase.is_synthesis,
+                        acceptance_criteria=phase.acceptance_criteria,
+                        max_retries=self._config.execution.max_subtask_retries,
+                    )
+                )
+                continue
+
+            existing.description = phase.description or existing.description
+            existing.depends_on = list(phase.depends_on)
+            existing.model_tier = phase.model_tier
+            existing.verification_tier = phase.verification_tier
+            existing.is_critical_path = phase.is_critical_path
+            existing.is_synthesis = phase.is_synthesis
+            if phase.acceptance_criteria:
+                existing.acceptance_criteria = phase.acceptance_criteria
+            strict_subtasks.append(existing)
+
+        return Plan(
+            subtasks=strict_subtasks,
+            version=plan.version,
+            last_replanned=plan.last_replanned,
+        )
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _evidence_for_subtask(self, task_id: str, subtask_id: str) -> list[dict]:
+        """Load persisted evidence records scoped to one subtask."""
+        try:
+            records = self._state.load_evidence_records(task_id)
+        except Exception as e:
+            logger.warning("Failed loading evidence ledger for %s: %s", task_id, e)
+            return []
+        scoped: list[dict] = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("subtask_id", "")).strip() != subtask_id:
+                continue
+            scoped.append(item)
+        return scoped
+
+    def _persist_subtask_evidence(
+        self,
+        task_id: str,
+        subtask_id: str,
+        evidence_records: list[dict] | None,
+    ) -> None:
+        """Persist newly captured evidence records."""
+        if not evidence_records:
+            return
+        scoped: list[dict] = []
+        for item in evidence_records:
+            if not isinstance(item, dict):
+                continue
+            normalized = dict(item)
+            normalized["subtask_id"] = subtask_id
+            normalized.setdefault("task_id", task_id)
+            scoped.append(normalized)
+        if not scoped:
+            return
+        try:
+            self._state.append_evidence_records(task_id, scoped)
+        except Exception as e:
+            logger.warning("Failed persisting evidence ledger for %s: %s", task_id, e)
 
     def _get_changelog(self, task: Task) -> ChangeLog | None:
         """Get or create a ChangeLog for the task's workspace."""
@@ -735,7 +1812,25 @@ class Orchestrator:
     def _finalize_task(self, task: Task) -> Task:
         """Finalize task: set status, emit events."""
         completed, total = task.progress
-        all_done = completed == total and total > 0
+        blocking_remediation_failures: list[str] = []
+        queue = task.metadata.get("remediation_queue")
+        if isinstance(queue, list):
+            for item in queue:
+                if not isinstance(item, dict):
+                    continue
+                if not bool(item.get("blocking", False)):
+                    continue
+                state = str(item.get("state", "queued")).strip().lower()
+                if state != "resolved":
+                    blocking_remediation_failures.append(
+                        str(item.get("subtask_id", "")).strip(),
+                    )
+
+        all_done = (
+            completed == total
+            and total > 0
+            and not blocking_remediation_failures
+        )
 
         if task.status == TaskStatus.CANCELLED:
             for s in task.plan.subtasks:
@@ -752,10 +1847,17 @@ class Orchestrator:
         else:
             task.status = TaskStatus.FAILED
             failed = [s for s in task.plan.subtasks if s.status == SubtaskStatus.FAILED]
+            if blocking_remediation_failures:
+                task.add_error(
+                    "remediation",
+                    "Blocking remediation unresolved for: "
+                    + ", ".join(blocking_remediation_failures),
+                )
             self._emit(TASK_FAILED, task.id, {
                 "completed": completed,
                 "total": total,
                 "failed_subtasks": [s.id for s in failed],
+                "blocking_remediation_failures": blocking_remediation_failures,
             })
 
         self._state.save(task)

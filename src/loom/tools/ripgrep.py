@@ -12,7 +12,6 @@ from pathlib import Path
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
-MAX_OUTPUT_BYTES = 30_000
 DEFAULT_MAX_MATCHES = 200
 
 
@@ -78,11 +77,13 @@ class RipgrepSearchTool(Tool):
 
         raw_path = args.get("path")
         if raw_path:
-            p = Path(raw_path)
-            if not p.is_absolute() and ctx.workspace:
-                search_path = (ctx.workspace / p).resolve()
-            else:
-                search_path = p.expanduser().resolve()
+            if ctx.workspace is None:
+                return ToolResult(success=False, output="No workspace or path specified.")
+            search_path = self._resolve_read_path(
+                str(raw_path),
+                ctx.workspace,
+                ctx.read_roots,
+            )
         else:
             search_path = ctx.workspace
         if not search_path:
@@ -92,14 +93,21 @@ class RipgrepSearchTool(Tool):
         if not search_path.exists():
             return ToolResult(success=False, output=f"Path not found: {search_path}")
 
-        # Workspace containment check
+        # Workspace/read-root containment check
         if ctx.workspace:
             try:
-                search_path.relative_to(ctx.workspace.resolve())
-            except ValueError:
+                self._verify_within_allowed_roots(
+                    search_path,
+                    ctx.workspace,
+                    ctx.read_roots,
+                )
+            except Exception:
                 return ToolResult(
                     success=False,
-                    output=f"Path '{search_path}' is outside workspace '{ctx.workspace}'.",
+                    output=(
+                        f"Path '{search_path}' is outside workspace/read roots. "
+                        f"Workspace: '{ctx.workspace}'."
+                    ),
                 )
 
         # Try ripgrep first, fall back to grep
@@ -148,10 +156,6 @@ class RipgrepSearchTool(Tool):
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
 
             output = stdout.decode("utf-8", errors="replace")
-
-            # Truncate if too large
-            if len(output) > MAX_OUTPUT_BYTES:
-                output = output[:MAX_OUTPUT_BYTES] + "\n\n(output truncated)"
 
             if proc.returncode == 0:
                 match_count = output.count("\n")
@@ -208,9 +212,6 @@ class RipgrepSearchTool(Tool):
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
             output = stdout.decode("utf-8", errors="replace")
 
-            if len(output) > MAX_OUTPUT_BYTES:
-                output = output[:MAX_OUTPUT_BYTES] + "\n\n(output truncated)"
-
             if proc.returncode == 0:
                 return ToolResult(success=True, output=output or "Matches found.")
             elif proc.returncode == 1:
@@ -261,9 +262,6 @@ class RipgrepSearchTool(Tool):
             return ToolResult(success=True, output="No matches found.")
 
         output = "\n".join(matches)
-        if len(output) > MAX_OUTPUT_BYTES:
-            output = output[:MAX_OUTPUT_BYTES] + "\n\n(output truncated)"
-
         return ToolResult(
             success=True,
             output=output,

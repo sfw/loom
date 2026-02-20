@@ -632,6 +632,7 @@
 <span class="key">[execution]</span>
 <span class="key">max_subtask_retries</span>  = <span class="val">3</span>
 <span class="key">max_loop_iterations</span> = <span class="val">50</span>
+<span class="key">delegate_task_timeout_seconds</span> = <span class="val">3600</span>
 
 <span class="cmt"># Verification gates</span>
 <span class="key">[verification]</span>
@@ -641,7 +642,24 @@
 
 <span class="cmt"># Memory storage</span>
 <span class="key">[memory]</span>
-<span class="key">database_path</span> = <span class="str">"~/.loom/loom.db"</span></code></pre>
+<span class="key">database_path</span> = <span class="str">"~/.loom/loom.db"</span>
+
+<span class="cmt"># MCP servers are managed in ~/.loom/mcp.toml (or ./.loom/mcp.toml)</span></code></pre>
+
+  <pre><code><span class="cmt"># ~/.loom/mcp.toml</span>
+<span class="key">[mcp.servers.notion]</span>
+<span class="key">command</span> = <span class="str">"npx"</span>
+<span class="key">args</span> = <span class="str">["-y", "@modelcontextprotocol/server-notion"]</span>
+<span class="key">timeout_seconds</span> = <span class="val">30</span>
+<span class="key">enabled</span> = <span class="val">true</span>
+
+<span class="key">[mcp.servers.notion.env]</span>
+<span class="key">NOTION_TOKEN</span> = <span class="str">"${NOTION_TOKEN}"</span></code></pre>
+
+  <div class="callout callout-info">
+    <strong>External MCP tools</strong>
+    Configured MCP servers are auto-discovered and exposed as namespaced tools in Loom (for example <code>mcp.notion.search</code>). Merge precedence is <code>--mcp-config</code> &gt; workspace <code>./.loom/mcp.toml</code> &gt; user <code>~/.loom/mcp.toml</code> &gt; legacy <code>[mcp]</code> in <code>loom.toml</code>.
+  </div>
 
   <div class="callout callout-warn">
     <strong>Single model?</strong>
@@ -858,6 +876,10 @@
 <span class="cmt"># With a process definition</span>
 <span class="cmd">loom</span> <span class="flag">-w</span> /path/to/project <span class="flag">--process</span> consulting-engagement
 
+<span class="cmt"># Activate/switch process at runtime, then force orchestration</span>
+<span class="cmd">/process use</span> investment-analysis
+<span class="cmd">/run</span> Analyze Tesla for investment
+
 <span class="cmt"># Resume a previous session</span>
 <span class="cmd">loom</span> <span class="flag">--resume</span> a1b2c3d4
 
@@ -865,15 +887,19 @@
 <span class="cmd">loom cowork</span> <span class="flag">-w</span> /path/to/project</code></pre>
 
   <h3>Layout</h3>
-  <p>The TUI has a sidebar with workspace browser and task progress, a main area with tabbed content (Chat, Files Changed, Events), and a status bar showing workspace, model, and token count.</p>
+  <p>The TUI has a sidebar with workspace browser and task progress, a main area with tabbed content (Chat, Files Changed, Events), and a status bar showing workspace, model, and token count. Selecting a file in the workspace tree opens a read-only preview modal with renderer support for Markdown, code/text (including TypeScript and CSS with syntax highlighting), JSON, CSV/TSV, HTML, diff/patch, Word/PowerPoint, PDF text extraction, and image metadata.</p>
 
   <h3>Keyboard Shortcuts</h3>
   <table>
     <tr><th>Key</th><th>Action</th></tr>
     <tr><td><code>Ctrl+B</code></td><td>Toggle sidebar</td></tr>
     <tr><td><code>Ctrl+L</code></td><td>Clear chat</td></tr>
+    <tr><td><code>Ctrl+R</code></td><td>Reload workspace tree</td></tr>
+    <tr><td><code>Ctrl+W</code></td><td>Close active process-run tab (with confirmation)</td></tr>
     <tr><td><code>Ctrl+P</code></td><td>Command palette</td></tr>
     <tr><td><code>Ctrl+1/2/3</code></td><td>Switch tabs (Chat / Files / Events)</td></tr>
+    <tr><td><code>Tab</code></td><td>Cycle slash-command autocomplete (when input starts with <code>/</code>)</td></tr>
+    <tr><td><code>Shift+Tab</code></td><td>Cycle slash-command autocomplete backward</td></tr>
     <tr><td><code>Ctrl+C</code></td><td>Quit</td></tr>
   </table>
 
@@ -889,13 +915,28 @@
     <tr><td><code>/model</code></td><td>Show current model</td></tr>
     <tr><td><code>/tools</code></td><td>List available tools</td></tr>
     <tr><td><code>/tokens</code></td><td>Show session token usage</td></tr>
+    <tr><td><code>/mcp list</code></td><td>List merged MCP server config entries</td></tr>
+    <tr><td><code>/mcp show &lt;alias&gt;</code></td><td>Show one MCP config entry (redacted env values)</td></tr>
+    <tr><td><code>/mcp test &lt;alias&gt;</code></td><td>Run a <code>tools/list</code> probe against one MCP server</td></tr>
+    <tr><td><code>/mcp enable|disable|remove &lt;alias&gt;</code></td><td>Mutate MCP config and refresh runtime MCP tools</td></tr>
+    <tr><td><code>/process list</code></td><td>List discovered process definitions</td></tr>
+    <tr><td><code>/process use &lt;name-or-path&gt;</code></td><td>Activate a process in the current session</td></tr>
+    <tr><td><code>/process off</code></td><td>Disable the active process</td></tr>
+    <tr><td><code>/run &lt;goal&gt;</code></td><td>Force orchestration through the active process</td></tr>
+    <tr><td><code>/run close [run-id-prefix]</code></td><td>Close/cancel a process-run tab with confirmation</td></tr>
+    <tr><td><code>/&lt;process-name&gt; &lt;goal&gt;</code></td><td>Run a discovered process directly without changing the active process</td></tr>
     <tr><td><code>/setup</code></td><td>Reconfigure models and settings</td></tr>
     <tr><td><code>/clear</code></td><td>Clear the chat display</td></tr>
-    <tr><td><code>/quit</code></td><td>Exit Loom</td></tr>
+    <tr><td><code>/quit</code> (<code>/exit</code>, <code>/q</code>)</td><td>Exit Loom</td></tr>
   </table>
 
   <h3>Session Persistence</h3>
   <p>Every conversation turn is persisted to SQLite. Sessions survive restarts. The model has access to a <code>conversation_recall</code> tool to search past context that has fallen out of the context window, and a <code>delegate_task</code> tool to spawn autonomous sub-agents for complex work.</p>
+
+  <div class="callout callout-info">
+    <strong>About /run</strong>
+    <code>/run &lt;goal&gt;</code> uses in-process orchestration via <code>delegate_task</code>. You do not need to run <code>loom serve</code> for this flow. Use <code>/run close</code> (or <code>Ctrl+W</code> on a process tab) to cancel and close a running tab.
+  </div>
 
   <div class="callout callout-info">
     <strong>Tool approval</strong>
@@ -915,16 +956,18 @@
   </div>
 
   <h3>Built-in Processes</h3>
-  <p>Loom ships with 5 domain-specific process definitions:</p>
+  <p>Loom ships with 6 domain-specific process definitions:</p>
 
   <table>
     <tr><th>Process</th><th>Phases</th><th>Mode</th><th>Domain</th></tr>
-    <tr><td><code>investment-analysis</code></td><td>5</td><td>strict</td><td>Financial due diligence and valuation</td></tr>
-    <tr><td><code>marketing-strategy</code></td><td>6</td><td>guided</td><td>Go-to-market strategy and campaigns</td></tr>
-    <tr><td><code>research-report</code></td><td>4</td><td>guided</td><td>Research synthesis and reporting</td></tr>
-    <tr><td><code>competitive-intel</code></td><td>3</td><td>guided</td><td>Competitive landscape analysis</td></tr>
-    <tr><td><code>consulting-engagement</code></td><td>5</td><td>guided</td><td>McKinsey-style issue tree consulting</td></tr>
+    <tr><td><code>investment-analysis</code></td><td>8</td><td>strict</td><td>Financial due diligence, valuation, and investment memo synthesis</td></tr>
+    <tr><td><code>marketing-strategy</code></td><td>8</td><td>strict</td><td>Go-to-market strategy, channel planning, and execution roadmap</td></tr>
+    <tr><td><code>research-report</code></td><td>6</td><td>strict</td><td>Evidence-first research synthesis and quality-controlled reporting</td></tr>
+    <tr><td><code>competitive-intel</code></td><td>6</td><td>strict</td><td>Competitive landscape analysis and response playbooks</td></tr>
+    <tr><td><code>consulting-engagement</code></td><td>7</td><td>strict</td><td>Structured consulting workflow with issue-tree problem solving</td></tr>
+    <tr><td><code>market-research</code></td><td>8</td><td>strict</td><td>Geography-aware market scans, trend analysis, and risk-aware competitor intelligence</td></tr>
   </table>
+  <p>All built-in processes currently use <code>strict</code> mode to enforce the declared phase DAG and deliverables.</p>
 
   <h3>Using a Process</h3>
 
@@ -935,7 +978,38 @@
 <span class="cmd">loom run</span> <span class="str">"Analyze Tesla for investment"</span> <span class="flag">--workspace</span> /tmp/tesla <span class="flag">--process</span> investment-analysis
 
 <span class="cmt"># Interactive session with a process</span>
-<span class="cmd">loom</span> <span class="flag">-w</span> /tmp/project <span class="flag">--process</span> consulting-engagement</code></pre>
+<span class="cmd">loom</span> <span class="flag">-w</span> /tmp/project <span class="flag">--process</span> consulting-engagement
+
+<span class="cmt"># Inside the TUI: force the active process</span>
+<span class="cmd">/run</span> Analyze Tesla for investment</code></pre>
+
+  <p>In interactive mode, plain chat stays conversational. Use <code>/run &lt;goal&gt;</code> when you want explicit process orchestration for the active process.</p>
+
+  <h3>Testing a Process Package</h3>
+  <pre><code><span class="cmt"># Run all declared deterministic test cases</span>
+<span class="cmd">loom process test</span> investment-analysis
+
+<span class="cmt"># Run one specific case</span>
+<span class="cmd">loom process test</span> ./my-local-process <span class="flag">--case</span> smoke
+
+<span class="cmt"># Run only live cases (real providers + external tools)</span>
+<span class="cmd">loom process test</span> ./my-local-process <span class="flag">--live</span></code></pre>
+
+  <p>Declare test cases in your <code>process.yaml</code> using a <code>tests:</code> manifest with a unique case ID, mode (<code>deterministic</code> or <code>live</code>), and acceptance checks.</p>
+
+  <pre><code><span class="key">tests</span>:
+  - <span class="key">id</span>: <span class="str">smoke</span>
+    <span class="key">mode</span>: <span class="str">deterministic</span>
+    <span class="key">goal</span>: <span class="str">"Analyze Tesla for investment"</span>
+    <span class="key">acceptance</span>:
+      <span class="key">deliverables</span>:
+        <span class="key">must_exist</span>:
+          - <span class="str">company-overview.md</span></code></pre>
+
+  <div class="callout callout-warn">
+    <strong>Deliverable names are exact</strong>
+    If a process phase declares <code>financial-summary.csv</code>, verification expects that exact filename. Variant names (for example prefixed/suffixed alternatives) will fail deterministic checks.
+  </div>
 
   <h3>What a Process Injects</h3>
   <div class="card-grid">
@@ -1148,8 +1222,11 @@
   <p>Patterns are frequency-weighted &mdash; the more a pattern is observed, the higher it ranks. High-frequency patterns persist indefinitely; low-frequency ones are pruned after 90 days. All data stays local in your SQLite database.</p>
 
   <h3>Reviewing and Managing Patterns</h3>
-  <pre><code><span class="cmt"># List all learned patterns</span>
+  <pre><code><span class="cmt"># List learned behavioral patterns (default)</span>
 <span class="cmd">loom learned</span>
+
+<span class="cmt"># Include internal operational patterns</span>
+<span class="cmd">loom learned</span> <span class="flag">--all</span>
 
 <span class="cmt"># Filter by type</span>
 <span class="cmd">loom learned</span> <span class="flag">--type</span> behavioral_gap
@@ -1160,7 +1237,7 @@
 <span class="cmt"># Clear all learned patterns (start fresh)</span>
 <span class="cmd">loom reset-learning</span></code></pre>
 
-  <p>In the TUI, use <code>/learned</code> to open an interactive review screen where you can inspect each pattern's type, description, frequency count, and last-seen date, and delete individual patterns with a single click.</p>
+  <p>In the TUI, use <code>/learned</code> to open an interactive review screen for behavioral patterns, where you can inspect each pattern's type, description, frequency count, and last-seen date, and delete individual patterns with a single click.</p>
 
   <div class="callout callout-info">
     <strong>How gap detection works</strong>
@@ -1178,7 +1255,13 @@
 <span class="cmd">loom mcp-serve</span>
 
 <span class="cmt"># Connect to a different Loom API</span>
-<span class="cmd">loom mcp-serve</span> <span class="flag">--base-url</span> http://localhost:8080</code></pre>
+<span class="cmd">loom mcp-serve</span> <span class="flag">--server</span> http://localhost:8080</code></pre>
+
+  <pre><code><span class="cmt"># Manage external MCP server configs</span>
+<span class="cmd">loom mcp list</span>
+<span class="cmd">loom mcp add notion</span> <span class="flag">--command</span> npx <span class="flag">--arg</span> -y <span class="flag">--arg</span> @modelcontextprotocol/server-notion <span class="flag">--env-ref</span> NOTION_TOKEN=NOTION_TOKEN
+<span class="cmd">loom mcp test notion</span>
+<span class="cmd">loom mcp migrate</span></code></pre>
 
   <div class="callout callout-info">
     <strong>Requires extra</strong>
@@ -1375,7 +1458,7 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
   processes/
     schema.py            <span class="cmt"># Process definition loader + validation</span>
     installer.py         <span class="cmt"># Install/uninstall from GitHub or local path</span>
-    builtin/             <span class="cmt"># 5 built-in YAML process definitions</span>
+    builtin/             <span class="cmt"># 6 built-in YAML process definitions</span>
   prompts/
     assembler.py         <span class="cmt"># 7-section builder + process injection</span>
     constraints.py       <span class="cmt"># Safety rules</span>
@@ -1419,30 +1502,105 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
 <section id="config-ref">
   <h2>Configuration Reference</h2>
 
+  <p>This section summarizes all runtime config keys. For a full, copyable reference with defaults and normalization rules, see <a href="CONFIG.md"><code>docs/CONFIG.md</code></a>.</p>
+
+  <h3>Server</h3>
   <table>
     <tr><th>Key</th><th>Default</th><th>Description</th></tr>
     <tr><td><code>server.host</code></td><td><code>127.0.0.1</code></td><td>Server bind address</td></tr>
     <tr><td><code>server.port</code></td><td><code>9000</code></td><td>Server port</td></tr>
-    <tr><td><code>models.*.provider</code></td><td>--</td><td><code>ollama</code> or <code>openai_compatible</code></td></tr>
+  </table>
+
+  <h3>Models</h3>
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>models.*.provider</code></td><td>required</td><td><code>ollama</code>, <code>openai_compatible</code>, or <code>anthropic</code></td></tr>
     <tr><td><code>models.*.base_url</code></td><td>--</td><td>Model API endpoint URL</td></tr>
     <tr><td><code>models.*.model</code></td><td>--</td><td>Model identifier string</td></tr>
     <tr><td><code>models.*.max_tokens</code></td><td><code>4096</code></td><td>Max response tokens</td></tr>
     <tr><td><code>models.*.temperature</code></td><td><code>0.1</code></td><td>Sampling temperature</td></tr>
     <tr><td><code>models.*.roles</code></td><td><code>["executor"]</code></td><td>Assigned roles (planner, executor, extractor, verifier)</td></tr>
+    <tr><td><code>models.*.api_key</code></td><td><code>""</code></td><td>Provider API key</td></tr>
+    <tr><td><code>models.*.tier</code></td><td><code>0</code></td><td>Explicit tier override (<code>0</code> = auto)</td></tr>
+    <tr><td><code>models.*.capabilities.*</code></td><td>auto-detected</td><td>Optional capability overrides (<code>vision</code>, <code>native_pdf</code>, <code>thinking</code>, <code>citations</code>, <code>audio_input</code>, <code>audio_output</code>)</td></tr>
+  </table>
+
+  <h3>Workspace</h3>
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Description</th></tr>
     <tr><td><code>workspace.default_path</code></td><td><code>~/projects</code></td><td>Default workspace directory</td></tr>
     <tr><td><code>workspace.scratch_dir</code></td><td><code>~/.loom/scratch</code></td><td>Temporary state storage</td></tr>
+  </table>
+
+  <h3>Execution</h3>
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Description</th></tr>
     <tr><td><code>execution.max_subtask_retries</code></td><td><code>3</code></td><td>Max retries per failed subtask</td></tr>
     <tr><td><code>execution.max_loop_iterations</code></td><td><code>50</code></td><td>Max tool-call loops per subtask</td></tr>
+    <tr><td><code>execution.max_parallel_subtasks</code></td><td><code>3</code></td><td>Max concurrent runnable subtasks</td></tr>
     <tr><td><code>execution.auto_approve_confidence_threshold</code></td><td><code>0.8</code></td><td>Auto-approve if confidence above this</td></tr>
+    <tr><td><code>execution.enable_streaming</code></td><td><code>false</code></td><td>Enable streaming behavior where supported</td></tr>
+    <tr><td><code>execution.delegate_task_timeout_seconds</code></td><td><code>3600</code></td><td>Timeout budget for delegated orchestration (<code>/run</code>, <code>delegate_task</code>)</td></tr>
+    <tr><td><code>execution.model_call_max_attempts</code></td><td><code>5</code></td><td>Model-call retry attempt cap</td></tr>
+    <tr><td><code>execution.model_call_retry_base_delay_seconds</code></td><td><code>0.5</code></td><td>Base backoff delay for model retries</td></tr>
+    <tr><td><code>execution.model_call_retry_max_delay_seconds</code></td><td><code>8.0</code></td><td>Max backoff delay for model retries</td></tr>
+    <tr><td><code>execution.model_call_retry_jitter_seconds</code></td><td><code>0.25</code></td><td>Retry jitter added to model-call backoff</td></tr>
+  </table>
+
+  <h3>Verification</h3>
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Description</th></tr>
     <tr><td><code>verification.tier1_enabled</code></td><td><code>true</code></td><td>Deterministic checks (syntax, file existence, tool success)</td></tr>
     <tr><td><code>verification.tier2_enabled</code></td><td><code>true</code></td><td>Independent LLM verification (different model, fresh context)</td></tr>
     <tr><td><code>verification.tier3_enabled</code></td><td><code>false</code></td><td>Multi-vote verification (N checks, majority agreement)</td></tr>
     <tr><td><code>verification.tier3_vote_count</code></td><td><code>3</code></td><td>Number of independent votes for tier 3</td></tr>
+    <tr><td><code>verification.policy_engine_enabled</code></td><td><code>true</code></td><td>Enable process policy behavior in verification</td></tr>
+    <tr><td><code>verification.regex_default_advisory</code></td><td><code>true</code></td><td>Treat regex rules as advisory unless explicitly hard</td></tr>
+    <tr><td><code>verification.strict_output_protocol</code></td><td><code>true</code></td><td>Enforce verifier output protocol handling</td></tr>
+    <tr><td><code>verification.shadow_compare_enabled</code></td><td><code>false</code></td><td>Emit shadow comparison telemetry</td></tr>
+    <tr><td><code>verification.phase_scope_default</code></td><td><code>current_phase</code></td><td>Default rule scope (<code>current_phase</code> or <code>global</code>)</td></tr>
+    <tr><td><code>verification.allow_partial_verified</code></td><td><code>true</code></td><td>Allow partial-verified outcomes when supported</td></tr>
+    <tr><td><code>verification.unconfirmed_supporting_threshold</code></td><td><code>0.30</code></td><td>Threshold for unconfirmed supporting evidence handling</td></tr>
+    <tr><td><code>verification.auto_confirm_prune_critical_path</code></td><td><code>true</code></td><td>Auto-run remediation attempts for critical-path failures</td></tr>
+    <tr><td><code>verification.confirm_or_prune_max_attempts</code></td><td><code>2</code></td><td>Max remediation attempts in confirm/prune flow</td></tr>
+    <tr><td><code>verification.confirm_or_prune_backoff_seconds</code></td><td><code>2.0</code></td><td>Backoff between remediation attempts</td></tr>
+    <tr><td><code>verification.confirm_or_prune_retry_on_transient</code></td><td><code>true</code></td><td>Retry remediation when transient errors are detected</td></tr>
+  </table>
+
+  <h3>Memory and Logging</h3>
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Description</th></tr>
     <tr><td><code>memory.database_path</code></td><td><code>~/.loom/loom.db</code></td><td>SQLite database location</td></tr>
     <tr><td><code>logging.level</code></td><td><code>INFO</code></td><td>Log verbosity (DEBUG, INFO, WARN, ERROR)</td></tr>
     <tr><td><code>logging.event_log_path</code></td><td><code>~/.loom/logs</code></td><td>Event log directory</td></tr>
+  </table>
+
+  <h3>Process</h3>
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Description</th></tr>
     <tr><td><code>process.default</code></td><td><code>""</code></td><td>Default process definition for all tasks</td></tr>
     <tr><td><code>process.search_paths</code></td><td><code>[]</code></td><td>Additional directories for process discovery</td></tr>
+    <tr><td><code>process.require_rule_scope_metadata</code></td><td><code>false</code></td><td>Enforce strict rule scope metadata validation</td></tr>
+    <tr><td><code>process.require_v2_contract</code></td><td><code>false</code></td><td>Require process contract <code>schema_version: 2</code></td></tr>
+    <tr><td><code>process.tui_run_scoped_workspace_enabled</code></td><td><code>true</code></td><td>Create per-run subfolders for TUI <code>/run</code></td></tr>
+    <tr><td><code>process.llm_run_folder_naming_enabled</code></td><td><code>true</code></td><td>Allow model-generated names for run folders</td></tr>
+  </table>
+
+  <h3>MCP (Legacy in <code>loom.toml</code>)</h3>
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>mcp.servers.*.command</code></td><td><code>""</code></td><td>Command used to launch MCP server process</td></tr>
+    <tr><td><code>mcp.servers.*.args</code></td><td><code>[]</code></td><td>Command arguments</td></tr>
+    <tr><td><code>mcp.servers.*.env</code></td><td><code>{}</code></td><td>Environment variables for MCP server process</td></tr>
+    <tr><td><code>mcp.servers.*.cwd</code></td><td><code>""</code></td><td>Working directory for MCP server process</td></tr>
+    <tr><td><code>mcp.servers.*.timeout_seconds</code></td><td><code>30</code></td><td>Timeout budget for MCP server calls</td></tr>
+    <tr><td><code>mcp.servers.*.enabled</code></td><td><code>true</code></td><td>Enable/disable MCP server</td></tr>
+  </table>
+
+  <h3>Environment Override</h3>
+  <table>
+    <tr><th>Env Var</th><th>Overrides</th><th>Description</th></tr>
+    <tr><td><code>LOOM_DELEGATE_TIMEOUT_SECONDS</code></td><td><code>execution.delegate_task_timeout_seconds</code></td><td>Overrides delegated orchestration timeout when set</td></tr>
   </table>
 
   <h3>Config Search Order</h3>
@@ -1494,6 +1652,11 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
         <li>Workspace path doesn't exist (create it first)</li>
         <li>Model server went down mid-task</li>
       </ul>
+      <p>If delegated process runs time out, raise the timeout budget:</p>
+      <pre><code><span class="key">[execution]</span>
+<span class="key">delegate_task_timeout_seconds</span> = <span class="val">7200</span></code></pre>
+      <p>Environment override (optional):</p>
+      <pre><code><span class="cmd">export</span> LOOM_DELEGATE_TIMEOUT_SECONDS=7200</code></pre>
     </div>
   </details>
 

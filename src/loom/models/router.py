@@ -134,22 +134,72 @@ class ResponseValidator:
         if not response.tool_calls:
             return ValidationResult(valid=True)
 
-        valid_names = {t["name"] for t in available_tools}
+        schema_by_name = {
+            t["name"]: t
+            for t in available_tools
+            if isinstance(t, dict) and isinstance(t.get("name"), str)
+        }
+        valid_names = set(schema_by_name.keys())
         issues = []
 
         for tc in response.tool_calls:
             if tc.name not in valid_names:
                 issues.append(f"Unknown tool: {tc.name}")
+                continue
+
             if not isinstance(tc.arguments, dict):
                 issues.append(f"Invalid arguments for {tc.name}: expected dict")
+                continue
+
+            required_fields = self._required_fields_for_tool(schema_by_name[tc.name])
+            missing = [
+                field
+                for field in required_fields
+                if self._argument_missing(tc.arguments.get(field))
+            ]
+            if missing:
+                issues.append(
+                    f"Missing required arguments for {tc.name}: "
+                    f"{', '.join(sorted(missing))}"
+                )
 
         if issues:
+            missing_required = any(
+                issue.startswith("Missing required arguments for")
+                for issue in issues
+            )
+            suggestion = "Use only the tools listed in AVAILABLE TOOLS."
+            if missing_required:
+                suggestion += (
+                    " Include all required tool arguments exactly as defined in "
+                    "the tool schema."
+                )
             return ValidationResult(
                 valid=False,
                 error="; ".join(issues),
-                suggestion="Use only the tools listed in AVAILABLE TOOLS.",
+                suggestion=suggestion,
             )
         return ValidationResult(valid=True)
+
+    @staticmethod
+    def _required_fields_for_tool(tool_schema: dict) -> set[str]:
+        """Extract top-level required field names from a tool schema."""
+        params = tool_schema.get("parameters")
+        if not isinstance(params, dict):
+            return set()
+        raw_required = params.get("required", [])
+        if not isinstance(raw_required, list):
+            return set()
+        return {field for field in raw_required if isinstance(field, str)}
+
+    @staticmethod
+    def _argument_missing(value: object) -> bool:
+        """Return True when a tool argument should be treated as missing."""
+        if value is None:
+            return True
+        if isinstance(value, str) and not value.strip():
+            return True
+        return False
 
     def validate_json_response(
         self,
@@ -157,26 +207,24 @@ class ResponseValidator:
         expected_keys: list[str] | None = None,
     ) -> ValidationResult:
         """Validate that the response text is valid JSON."""
-        text = response.text.strip()
-        # Strip markdown fences
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:])
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as e:
+        text = self._strip_markdown_fences(response.text.strip())
+        parsed, parse_error = self._extract_json_payload(text, expected_keys or [])
+        if parsed is None:
             return ValidationResult(
                 valid=False,
-                error=f"Invalid JSON: {e}",
+                error=f"Invalid JSON: {parse_error}",
                 suggestion="Respond with ONLY valid JSON, no markdown or explanation.",
                 parsed=None,
             )
 
         if expected_keys:
+            if not isinstance(parsed, dict):
+                return ValidationResult(
+                    valid=False,
+                    error="Expected a JSON object response.",
+                    suggestion=f"Response must include: {expected_keys}",
+                    parsed=parsed,
+                )
             missing = [k for k in expected_keys if k not in parsed]
             if missing:
                 return ValidationResult(
@@ -187,6 +235,57 @@ class ResponseValidator:
                 )
 
         return ValidationResult(valid=True, parsed=parsed)
+
+    @staticmethod
+    def _strip_markdown_fences(text: str) -> str:
+        """Strip outer markdown fences when present."""
+        if not text.startswith("```"):
+            return text
+        lines = text.split("\n")
+        text = "\n".join(lines[1:])
+        if text.endswith("```"):
+            text = text[:-3]
+        return text.strip()
+
+    @staticmethod
+    def _extract_json_payload(
+        text: str, expected_keys: list[str]
+    ) -> tuple[dict | list | None, str]:
+        """Extract JSON from plain or wrapped model output."""
+        decoder = json.JSONDecoder()
+        candidates: list[tuple[int, int, dict | list]] = []
+        parse_error = "No JSON object found"
+
+        try:
+            parsed = decoder.decode(text)
+            if isinstance(parsed, (dict, list)):
+                candidates.append((0, len(text), parsed))
+        except json.JSONDecodeError as e:
+            parse_error = str(e)
+
+        for i, ch in enumerate(text):
+            if ch not in "{[":
+                continue
+            try:
+                parsed, end = decoder.raw_decode(text[i:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, (dict, list)):
+                candidates.append((i, i + end, parsed))
+
+        if not candidates:
+            return None, parse_error
+
+        unique = {(start, end): payload for start, end, payload in candidates}
+        ordered = sorted(unique.items(), key=lambda item: (item[0][0], item[0][1]))
+        payloads = [payload for _, payload in ordered]
+
+        if expected_keys:
+            for payload in payloads:
+                if isinstance(payload, dict) and all(k in payload for k in expected_keys):
+                    return payload, ""
+
+        return payloads[0], ""
 
 
 @dataclass

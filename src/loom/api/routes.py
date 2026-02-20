@@ -48,6 +48,7 @@ def _get_engine(request: Request) -> Engine:
 async def create_new_task(request: Request, body: TaskCreateRequest):
     """Create and start a new task."""
     engine = _get_engine(request)
+    effective_process = body.process or engine.config.process.default or None
 
     # Validate workspace if provided
     if body.workspace:
@@ -57,18 +58,45 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
 
     # Resolve process definition if specified
     process_def = None
-    if body.process:
+    if effective_process:
         from loom.processes.schema import ProcessLoader, ProcessNotFoundError
 
         extra = [Path(p) for p in engine.config.process.search_paths]
         loader = ProcessLoader(
             workspace=Path(body.workspace) if body.workspace else None,
             extra_search_paths=extra,
+            require_rule_scope_metadata=bool(
+                getattr(engine.config.process, "require_rule_scope_metadata", False),
+            ),
+            require_v2_contract=bool(
+                getattr(engine.config.process, "require_v2_contract", False),
+            ),
         )
         try:
-            process_def = loader.load(body.process)
+            process_def = loader.load(effective_process)
         except ProcessNotFoundError as e:
             raise HTTPException(status_code=400, detail=str(e))
+
+    # Validate required tools early so clients get immediate feedback.
+    if process_def is not None:
+        tools_cfg = getattr(process_def, "tools", None)
+        required = list(getattr(tools_cfg, "required", []) or [])
+        excluded = set(getattr(tools_cfg, "excluded", []) or [])
+        if required:
+            from loom.tools import create_default_registry
+
+            available = set(
+                create_default_registry(engine.config).list_tools()
+            ) - excluded
+            missing = sorted(name for name in required if name not in available)
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Process '{getattr(process_def, 'name', body.process)}' "
+                        f"requires missing tool(s): {', '.join(missing)}"
+                    ),
+                )
 
     task = create_task(
         goal=body.goal,
@@ -77,7 +105,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         callback_url=body.callback_url or "",
         context=body.context,
     )
-    task.metadata["process"] = body.process or ""
+    task.metadata["process"] = effective_process or ""
 
     engine.state_manager.save(task)
 

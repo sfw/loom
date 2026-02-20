@@ -8,9 +8,11 @@ automatically when ``discover_tools()`` scans the package.
 from __future__ import annotations
 
 import importlib
+import logging
 import pkgutil
 
 import loom.tools as _pkg
+from loom.config import Config
 from loom.tools.registry import Tool as Tool
 from loom.tools.registry import ToolContext as ToolContext
 from loom.tools.registry import ToolRegistry
@@ -19,6 +21,7 @@ from loom.tools.registry import ToolSafetyError as ToolSafetyError
 
 # Modules that contain utilities, not tools — skip during discovery.
 _SKIP_MODULES = frozenset({"registry", "workspace"})
+logger = logging.getLogger(__name__)
 
 
 def discover_tools() -> list[type[Tool]]:
@@ -39,7 +42,7 @@ def discover_tools() -> list[type[Tool]]:
     return sorted(Tool._registered_classes, key=lambda cls: cls.__name__)
 
 
-def create_default_registry() -> ToolRegistry:
+def create_default_registry(config: Config | None = None) -> ToolRegistry:
     """Create a registry with all discovered built-in tools.
 
     This is the main entry-point used by ``loom.api.engine`` and tests.
@@ -49,5 +52,28 @@ def create_default_registry() -> ToolRegistry:
     """
     registry = ToolRegistry()
     for tool_cls in discover_tools():
+        if (
+            config is not None
+            and getattr(tool_cls, "name", "") == "delegate_task"
+        ):
+            timeout_seconds = int(
+                getattr(
+                    config.execution,
+                    "delegate_task_timeout_seconds",
+                    3600,
+                ) or 3600
+            )
+            timeout_seconds = max(1, timeout_seconds)
+            registry.register(tool_cls(timeout_seconds=timeout_seconds))
+            continue
         registry.register(tool_cls())
+
+    if config and config.mcp.servers:
+        try:
+            from loom.integrations.mcp_tools import register_mcp_tools
+
+            register_mcp_tools(registry, mcp_config=config.mcp)
+        except Exception as e:
+            logger.warning("Failed to register MCP tools: %s", e)
+
     return registry

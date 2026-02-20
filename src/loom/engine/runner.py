@@ -17,16 +17,31 @@ from enum import StrEnum
 from pathlib import Path
 
 from loom.config import Config
-from loom.engine.verification import VerificationGates, VerificationResult
+from loom.engine.semantic_compactor import SemanticCompactor
+from loom.engine.verification import Check, VerificationGates, VerificationResult
 from loom.events.bus import EventBus
-from loom.events.types import TOKEN_STREAMED, TOOL_CALL_COMPLETED, TOOL_CALL_STARTED
+from loom.events.types import (
+    ARTIFACT_CONFINEMENT_VIOLATION,
+    MODEL_INVOCATION,
+    TOKEN_STREAMED,
+    TOOL_CALL_COMPLETED,
+    TOOL_CALL_STARTED,
+)
 from loom.models.base import ModelResponse
+from loom.models.request_diagnostics import collect_request_diagnostics
+from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
+from loom.state.evidence import (
+    extract_evidence_records,
+    merge_evidence_records,
+    summarize_evidence_records,
+)
 from loom.state.memory import MemoryEntry, MemoryManager
 from loom.state.task_state import Subtask, Task, TaskStateManager
 from loom.tools.registry import ToolRegistry, ToolResult
 from loom.tools.workspace import ChangeLog
+from loom.utils.tokens import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +53,7 @@ class ToolCallRecord:
     tool: str
     args: dict
     result: ToolResult
+    call_id: str = ""
     timestamp: str = ""
 
     def __post_init__(self):
@@ -61,6 +77,7 @@ class SubtaskResult:
     duration_seconds: float = 0.0
     tokens_used: int = 0
     model_used: str = ""
+    evidence_records: list[dict] = field(default_factory=list)
 
 
 class SubtaskRunner:
@@ -78,7 +95,35 @@ class SubtaskRunner:
     """
 
     MAX_TOOL_ITERATIONS = 20
-    MAX_SUBTASK_WALL_CLOCK = 600  # 10 minutes per subtask
+    MAX_SUBTASK_WALL_CLOCK = 1200  # 20 minutes per subtask
+    MAX_MODEL_CONTEXT_TOKENS = 24_000
+    MAX_STATE_SUMMARY_CHARS = 320
+    MAX_VERIFICATION_SUMMARY_CHARS = 6000
+    DEFAULT_TOOL_RESULT_OUTPUT_CHARS = 3_000
+    HEAVY_TOOL_RESULT_OUTPUT_CHARS = 1_200
+    COMPACT_TOOL_RESULT_OUTPUT_CHARS = 320
+    COMPACT_TEXT_OUTPUT_CHARS = 600
+    MINIMAL_TEXT_OUTPUT_CHARS = 180
+    TOOL_CALL_ARGUMENT_CONTEXT_CHARS = 320
+    COMPACT_TOOL_CALL_ARGUMENT_CHARS = 140
+    _HEAVY_OUTPUT_TOOLS = frozenset({
+        "web_fetch",
+        "web_fetch_html",
+        "web_search",
+        "read_file",
+        "search_files",
+        "ripgrep_search",
+        "list_directory",
+        "glob_find",
+        "conversation_recall",
+    })
+    TOOL_CALL_CONTEXT_PLACEHOLDER = "Tool call context omitted."
+    LEGACY_TOOL_CALL_CONTEXT_PLACEHOLDER = "Tool call required to continue."
+    _TOOL_CALL_CONTEXT_PLACEHOLDERS = frozenset({
+        TOOL_CALL_CONTEXT_PLACEHOLDER.lower(),
+        LEGACY_TOOL_CALL_CONTEXT_PLACEHOLDER.lower(),
+    })
+    _TODO_REMINDER_PREFIX = "CURRENT TASK STATE:\n"
 
     def __init__(
         self,
@@ -100,6 +145,44 @@ class SubtaskRunner:
         self._config = config
         self._validator = ResponseValidator()
         self._event_bus = event_bus
+        self._compactor = SemanticCompactor(model_router, role="extractor", tier=1)
+
+    @staticmethod
+    def _read_roots_for_task(task: Task, workspace: Path | None) -> list[Path]:
+        """Resolve additional read-only roots for this task.
+
+        Only accepts roots that are ancestors of the task workspace so reads
+        can widen safely to parent trees without becoming arbitrary.
+        """
+        if workspace is None:
+            return []
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        raw_roots = metadata.get("read_roots", [])
+        if isinstance(raw_roots, str):
+            raw_roots = [raw_roots]
+        if not isinstance(raw_roots, list):
+            return []
+
+        resolved_workspace = workspace.resolve()
+        roots: list[Path] = []
+        seen: set[Path] = set()
+        for raw in raw_roots:
+            try:
+                candidate = Path(str(raw)).expanduser().resolve()
+            except Exception:
+                continue
+            # Disallow filesystem-root grants.
+            if candidate == Path(candidate.anchor):
+                continue
+            try:
+                resolved_workspace.relative_to(candidate)
+            except ValueError:
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            roots.append(candidate)
+        return roots
 
     async def run(
         self,
@@ -109,6 +192,8 @@ class SubtaskRunner:
         model_tier: int | None = None,
         retry_context: str = "",
         changelog: ChangeLog | None = None,
+        prior_successful_tool_calls: list[ToolCallRecord] | None = None,
+        prior_evidence_records: list[dict] | None = None,
     ) -> tuple[SubtaskResult, VerificationResult]:
         """Execute a subtask: prompt → tool loop → verify → extract memory.
 
@@ -117,15 +202,21 @@ class SubtaskRunner:
         """
         start_time = time.monotonic()
         workspace = Path(task.workspace) if task.workspace else None
+        read_roots = self._read_roots_for_task(task, workspace)
 
         # 1. Assemble prompt
         memory_entries = await self._memory.query_relevant(task.id, subtask.id)
+        evidence_summary = summarize_evidence_records(
+            prior_evidence_records or [],
+            max_entries=10,
+        )
         prompt = self._prompts.build_executor_prompt(
             task=task,
             subtask=subtask,
             state_manager=self._state,
             memory_entries=memory_entries,
             available_tools=self._tools.all_schemas(),
+            evidence_ledger_summary=evidence_summary,
         )
         if retry_context:
             prompt = prompt + "\n\n" + retry_context
@@ -137,24 +228,127 @@ class SubtaskRunner:
         # 3. Tool-calling loop
         messages: list[dict] = [{"role": "user", "content": prompt}]
         tool_calls_record: list[ToolCallRecord] = []
+        evidence_records_current: list[dict] = []
+        known_evidence_ids: set[str] = {
+            str(item.get("evidence_id", "")).strip()
+            for item in (prior_evidence_records or [])
+            if isinstance(item, dict)
+        }
+        known_evidence_ids.discard("")
         total_tokens = 0
         response = None
         streaming = self._config.execution.enable_streaming
+        completed_normally = False
+        interruption_reason: str | None = None
 
         for iteration in range(self.MAX_TOOL_ITERATIONS):
             # Wall-clock timeout check
             if time.monotonic() - start_time > self.MAX_SUBTASK_WALL_CLOCK:
+                interruption_reason = (
+                    "Execution exceeded subtask time budget "
+                    f"({self.MAX_SUBTASK_WALL_CLOCK}s) before completion."
+                )
                 break
-            if streaming:
-                response = await self._stream_completion(
-                    model, messages, self._tools.all_schemas(),
-                    task_id=task.id, subtask_id=subtask.id,
+            messages = await self._compact_messages_for_model(messages)
+            tool_schemas = self._tools.all_schemas()
+            operation = "stream" if streaming else "complete"
+            response = None
+            policy = ModelRetryPolicy.from_execution_config(self._config.execution)
+            invocation_attempt = 0
+            request_diag = None
+
+            async def _invoke_model():
+                nonlocal invocation_attempt, request_diag
+                invocation_attempt += 1
+                request_diag = collect_request_diagnostics(
+                    messages=messages,
+                    tools=tool_schemas,
+                    origin=f"runner.execute_subtask.{operation}",
                 )
+                self._emit_model_event(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    model_name=model.name,
+                    phase="start",
+                    details={
+                        **request_diag.to_event_payload(),
+                        "iteration": iteration + 1,
+                        "operation": operation,
+                        "invocation_attempt": invocation_attempt,
+                        "invocation_max_attempts": policy.max_attempts,
+                    },
+                )
+                if streaming:
+                    return await self._stream_completion(
+                        model,
+                        messages,
+                        tool_schemas,
+                        task_id=task.id,
+                        subtask_id=subtask.id,
+                    )
+                return await model.complete(messages, tools=tool_schemas)
+
+            def _on_invocation_failure(
+                attempt: int,
+                max_attempts: int,
+                error: BaseException,
+                remaining: int,
+            ) -> None:
+                self._emit_model_event(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    model_name=model.name,
+                    phase="done",
+                    details={
+                        "origin": request_diag.origin if request_diag else "",
+                        "iteration": iteration + 1,
+                        "operation": operation,
+                        "invocation_attempt": attempt,
+                        "invocation_max_attempts": max_attempts,
+                        "retry_queue_remaining": remaining,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    },
+                )
+
+            try:
+                response = await call_with_model_retry(
+                    _invoke_model,
+                    policy=policy,
+                    on_failure=_on_invocation_failure,
+                )
+            except Exception as e:
+                interruption_reason = (
+                    "Model invocation failed after "
+                    f"{invocation_attempt} attempt(s): {type(e).__name__}: {e}"
+                )
+                response = None
             else:
-                response = await model.complete(
-                    messages, tools=self._tools.all_schemas()
+                self._emit_model_event(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    model_name=model.name,
+                    phase="done",
+                    details={
+                        "origin": request_diag.origin if request_diag else "",
+                        "iteration": iteration + 1,
+                        "operation": operation,
+                        "invocation_attempt": invocation_attempt,
+                        "invocation_max_attempts": policy.max_attempts,
+                        "response_tool_calls": len(response.tool_calls or []),
+                        "response_tokens": response.usage.total_tokens,
+                        "response_chars": len(response.text or ""),
+                    },
                 )
-            total_tokens += response.usage.total_tokens
+                total_tokens += response.usage.total_tokens
+
+            if interruption_reason:
+                break
+            if response is None:
+                interruption_reason = (
+                    "Execution ended before receiving a model response."
+                )
+                break
 
             if response.has_tool_calls():
                 # Validate tool calls before execution
@@ -164,7 +358,7 @@ class SubtaskRunner:
                 if not validation.valid:
                     messages.append({
                         "role": "assistant",
-                        "content": response.text or None,
+                        "content": response.text or "",
                     })
                     messages.append({
                         "role": "system",
@@ -177,20 +371,13 @@ class SubtaskRunner:
                     continue
 
                 # Process validated tool calls
+                compact_tool_calls = await self._serialize_tool_calls_for_message(
+                    response.tool_calls or []
+                )
                 messages.append({
                     "role": "assistant",
-                    "content": response.text or None,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                        for tc in response.tool_calls
-                    ],
+                    "content": response.text or "",
+                    "tool_calls": compact_tool_calls,
                 })
 
                 for tc in response.tool_calls:
@@ -201,51 +388,145 @@ class SubtaskRunner:
                     tool_result = await self._tools.execute(
                         tc.name, tc.arguments,
                         workspace=workspace,
+                        read_roots=read_roots,
                         changelog=changelog,
                         subtask_id=subtask.id,
                     )
-                    tool_calls_record.append(ToolCallRecord(
-                        tool=tc.name, args=tc.arguments, result=tool_result,
-                    ))
+                    record = ToolCallRecord(
+                        tool=tc.name,
+                        args=tc.arguments,
+                        result=tool_result,
+                        call_id=str(getattr(tc, "id", "") or ""),
+                    )
+                    tool_calls_record.append(record)
+                    new_evidence = extract_evidence_records(
+                        task_id=task.id,
+                        subtask_id=subtask.id,
+                        tool_calls=[record],
+                        existing_ids=known_evidence_ids,
+                    )
+                    if new_evidence:
+                        evidence_records_current.extend(new_evidence)
+                        for item in new_evidence:
+                            evidence_id = str(item.get("evidence_id", "")).strip()
+                            if evidence_id:
+                                known_evidence_ids.add(evidence_id)
+                        data = tool_result.data if isinstance(tool_result.data, dict) else {}
+                        data = dict(data)
+                        data["evidence_ids"] = [
+                            str(item.get("evidence_id", "")).strip()
+                            for item in new_evidence
+                            if str(item.get("evidence_id", "")).strip()
+                        ]
+                        if not tool_result.data:
+                            tool_result.data = data
+                        else:
+                            tool_result.data = data
                     self._emit_tool_event(
                         TOOL_CALL_COMPLETED, task.id, subtask.id,
                         tc.name, tc.arguments,
                         result=tool_result,
+                        workspace=workspace,
                     )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": tool_result.to_json(),
+                        "content": await self._serialize_tool_result_for_model(
+                            tc.name, tool_result,
+                        ),
                     })
 
                 # Anti-amnesia reminder
                 messages.append({
-                    "role": "system",
+                    # Some OpenAI-compatible providers reject repeated in-thread
+                    # system messages during tool-call loops.
+                    "role": "user",
                     "content": self._build_todo_reminder(task, subtask),
                 })
             else:
                 # Text-only response — subtask complete
+                completed_normally = True
                 break
 
+        if interruption_reason is None and not completed_normally:
+            if response is not None and response.has_tool_calls():
+                interruption_reason = (
+                    "Execution reached tool-iteration budget "
+                    f"({self.MAX_TOOL_ITERATIONS} turns) while additional "
+                    "tool calls were still required."
+                )
+            elif response is None:
+                interruption_reason = (
+                    "Execution ended before receiving a model response."
+                )
+
         elapsed = time.monotonic() - start_time
-        summary = response.text[:200] if response and response.text else "No output"
+        model_output = response.text if response and response.text else ""
+        model_output_clean = self._strip_tool_call_placeholders(model_output)
+        if interruption_reason:
+            if model_output_clean:
+                model_output = (
+                    f"{interruption_reason} Last model response: {model_output_clean}"
+                )
+            else:
+                model_output = interruption_reason
+        else:
+            model_output = model_output_clean
+        summary = await self._summarize_model_output(
+            model_output,
+            max_chars=self.MAX_STATE_SUMMARY_CHARS,
+            label="subtask state summary",
+        )
+        verification_summary = await self._summarize_model_output(
+            model_output,
+            max_chars=self.MAX_VERIFICATION_SUMMARY_CHARS,
+            label="subtask verification summary",
+        )
 
         result = SubtaskResult(
-            status=SubtaskResultStatus.SUCCESS,
+            status=(
+                SubtaskResultStatus.FAILED
+                if interruption_reason
+                else SubtaskResultStatus.SUCCESS
+            ),
             summary=summary,
             tool_calls=tool_calls_record,
             duration_seconds=elapsed,
             tokens_used=total_tokens,
             model_used=model.name,
+            evidence_records=evidence_records_current,
         )
 
+        if interruption_reason:
+            verification = VerificationResult(
+                tier=1,
+                passed=False,
+                confidence=0.0,
+                checks=[Check(
+                    name="execution_completed",
+                    passed=False,
+                    detail=interruption_reason,
+                )],
+                feedback=interruption_reason,
+            )
+            self._spawn_memory_extraction(task.id, subtask.id, result)
+            return result, verification
+
         # 4. Verification
+        evidence_tool_calls = list(prior_successful_tool_calls or [])
+        combined_evidence_records = merge_evidence_records(
+            prior_evidence_records or [],
+            evidence_records_current,
+        )
         verification = await self._verification.verify(
             subtask=subtask,
-            result_summary=summary,
+            result_summary=verification_summary,
             tool_calls=tool_calls_record,
+            evidence_tool_calls=evidence_tool_calls,
+            evidence_records=combined_evidence_records,
             workspace=workspace,
             tier=subtask.verification_tier,
+            task_id=task.id,
         )
 
         if not verification.passed:
@@ -298,9 +579,36 @@ class SubtaskRunner:
             tool_calls_formatted=tool_calls_formatted,
             model_output=result.summary,
         )
+        request_messages = [{"role": "user", "content": prompt}]
 
         try:
-            response = await model.complete([{"role": "user", "content": prompt}])
+            request_diag = collect_request_diagnostics(
+                messages=request_messages,
+                origin="runner.extract_memory.complete",
+            )
+            self._emit_model_event(
+                task_id=task_id,
+                subtask_id=subtask_id,
+                model_name=model.name,
+                phase="start",
+                details=request_diag.to_event_payload(),
+            )
+            policy = ModelRetryPolicy.from_execution_config(self._config.execution)
+            response = await call_with_model_retry(
+                lambda: model.complete(request_messages),
+                policy=policy,
+            )
+            self._emit_model_event(
+                task_id=task_id,
+                subtask_id=subtask_id,
+                model_name=model.name,
+                phase="done",
+                details={
+                    "origin": request_diag.origin,
+                    "response_tokens": response.usage.total_tokens,
+                    "response_chars": len(response.text or ""),
+                },
+            )
             entries = self._parse_memory_entries(response, task_id, subtask_id)
             if entries:
                 await self._memory.store_many(entries)
@@ -349,7 +657,7 @@ class SubtaskRunner:
                 task_id=task_id,
                 subtask_id=subtask_id,
                 entry_type=entry_type,
-                summary=str(e.get("summary", ""))[:150],
+                summary=str(e.get("summary", "")),
                 detail=str(e.get("detail", "")),
                 tags=str(e.get("tags", "")),
             ))
@@ -413,6 +721,7 @@ class SubtaskRunner:
         tool_args: dict,
         *,
         result: ToolResult | None = None,
+        workspace: Path | None = None,
     ) -> None:
         """Emit a tool call event to the event bus."""
         if not self._event_bus:
@@ -436,6 +745,60 @@ class SubtaskRunner:
             event_type=event_type, task_id=task_id, data=data,
         ))
 
+        if (
+            result is not None
+            and not result.success
+            and self._is_artifact_confinement_violation(result.error)
+        ):
+            violation_data: dict[str, object] = {
+                "subtask_id": subtask_id,
+                "tool": tool_name,
+                "args": tool_args,
+                "error": result.error or "",
+            }
+            if workspace is not None:
+                violation_data["workspace"] = str(workspace)
+            attempted_path = str(tool_args.get("path", "")).strip()
+            if attempted_path:
+                violation_data["attempted_path"] = attempted_path
+            self._event_bus.emit(Event(
+                event_type=ARTIFACT_CONFINEMENT_VIOLATION,
+                task_id=task_id,
+                data=violation_data,
+            ))
+
+    @staticmethod
+    def _is_artifact_confinement_violation(error: str | None) -> bool:
+        text = str(error or "").lower()
+        return "safety violation" in text and "escapes workspace" in text
+
+    def _emit_model_event(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        model_name: str,
+        phase: str,
+        details: dict | None = None,
+    ) -> None:
+        """Emit model invocation lifecycle to the event bus."""
+        if not self._event_bus:
+            return
+        from loom.events.bus import Event
+
+        data: dict = {
+            "subtask_id": subtask_id,
+            "model": model_name,
+            "phase": phase,
+        }
+        if isinstance(details, dict) and details:
+            data.update(details)
+        self._event_bus.emit(Event(
+            event_type=MODEL_INVOCATION,
+            task_id=task_id,
+            data=data,
+        ))
+
     @staticmethod
     def _build_todo_reminder(task: Task, subtask: Subtask) -> str:
         return (
@@ -447,3 +810,514 @@ class SubtaskRunner:
             f"Do NOT move to the next subtask. Complete ONLY this one.\n"
             f"When finished, provide a summary of what you accomplished."
         )
+
+    @classmethod
+    def _tool_output_limit(cls, tool_name: str) -> int:
+        if tool_name in cls._HEAVY_OUTPUT_TOOLS:
+            return cls.HEAVY_TOOL_RESULT_OUTPUT_CHARS
+        return cls.DEFAULT_TOOL_RESULT_OUTPUT_CHARS
+
+    @staticmethod
+    def _hard_cap_text(text: str, max_chars: int) -> str:
+        """Deterministically bound text length when semantic compaction misses."""
+        value = str(text or "")
+        if max_chars <= 0:
+            return ""
+        if len(value) <= max_chars:
+            return value
+        if max_chars <= 40:
+            return value[:max_chars]
+
+        marker = "...[truncated]..."
+        remaining = max_chars - len(marker)
+        if remaining <= 0:
+            return value[:max_chars]
+
+        head = max(16, int(remaining * 0.65))
+        tail = max(8, remaining - head)
+        if head + tail > remaining:
+            tail = max(0, remaining - head)
+        compacted = f"{value[:head]}{marker}{value[-tail:] if tail else ''}"
+        return compacted[:max_chars]
+
+    async def _compact_text(self, text: str, *, max_chars: int, label: str) -> str:
+        compacted = await self._compactor.compact(
+            str(text or ""),
+            max_chars=max_chars,
+            label=label,
+        )
+        if len(compacted) > max_chars:
+            logger.warning(
+                "Compaction exceeded budget for %s: got %d chars (limit %d)",
+                label,
+                len(compacted),
+                max_chars,
+            )
+            return self._hard_cap_text(compacted, max_chars)
+        return compacted
+
+    async def _summarize_model_output(
+        self,
+        output: str,
+        *,
+        max_chars: int,
+        label: str,
+    ) -> str:
+        """Produce a bounded summary via semantic compaction."""
+        text = self._strip_tool_call_placeholders(output)
+        if not text:
+            return "No output"
+        if len(text) <= max_chars:
+            return text
+        return await self._compact_text(text, max_chars=max_chars, label=label)
+
+    @classmethod
+    def _strip_tool_call_placeholders(cls, output: str) -> str:
+        """Remove provider/compaction placeholder lines from model text."""
+        text = str(output or "")
+        if not text.strip():
+            return ""
+        kept: list[str] = []
+        for line in text.splitlines():
+            if line.strip().lower() in cls._TOOL_CALL_CONTEXT_PLACEHOLDERS:
+                continue
+            kept.append(line)
+        return "\n".join(kept).strip()
+
+    async def _summarize_tool_data(self, data: dict | None) -> dict | None:
+        if not isinstance(data, dict) or not data:
+            return None
+        if len(data) > 12:
+            packed = json.dumps(data, ensure_ascii=False, default=str)
+            summary_text = await self._compact_text(
+                packed,
+                max_chars=900,
+                label="tool data payload",
+            )
+            return {
+                "summary": summary_text,
+                "key_count": len(data),
+            }
+        summary: dict = {}
+        for key, value in data.items():
+            if isinstance(value, str):
+                summary[key] = await self._compact_text(
+                    value,
+                    max_chars=160,
+                    label=f"tool data {key}",
+                )
+            elif isinstance(value, (int, float, bool)) or value is None:
+                summary[key] = value
+            elif isinstance(value, dict):
+                packed = json.dumps(value, ensure_ascii=False, default=str)
+                summary[key] = await self._compact_text(
+                    packed,
+                    max_chars=220,
+                    label=f"tool data object {key}",
+                )
+            elif isinstance(value, list):
+                packed = json.dumps(value, ensure_ascii=False, default=str)
+                summary[key] = await self._compact_text(
+                    packed,
+                    max_chars=220,
+                    label=f"tool data list {key}",
+                )
+            else:
+                summary[key] = str(type(value).__name__)
+        return summary or None
+
+    async def _summarize_tool_call_arguments(
+        self,
+        args: object,
+        *,
+        max_chars: int,
+        label: str,
+    ) -> dict:
+        if isinstance(args, dict):
+            summary = await self._summarize_tool_data(args) or {}
+            packed = json.dumps(summary, ensure_ascii=False, default=str)
+            if len(packed) <= max_chars:
+                return summary
+            compacted = await self._compact_text(
+                packed,
+                max_chars=max_chars,
+                label=label,
+            )
+            return {
+                "summary": compacted,
+                "key_count": len(args),
+            }
+
+        packed = json.dumps(args, ensure_ascii=False, default=str)
+        compacted = await self._compact_text(
+            packed,
+            max_chars=max_chars,
+            label=label,
+        )
+        return {"summary": compacted}
+
+    async def _serialize_tool_calls_for_message(self, tool_calls: list) -> list[dict]:
+        serialized: list[dict] = []
+        for tc in tool_calls:
+            name = str(getattr(tc, "name", "") or "tool")
+            args = getattr(tc, "arguments", {})
+            compact_args = await self._summarize_tool_call_arguments(
+                args,
+                max_chars=self.TOOL_CALL_ARGUMENT_CONTEXT_CHARS,
+                label=f"{name} tool call args",
+            )
+            serialized.append({
+                "id": str(getattr(tc, "id", "") or ""),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(compact_args, ensure_ascii=False, default=str),
+                },
+            })
+        return serialized
+
+    async def _compact_assistant_tool_calls(
+        self,
+        tool_calls: object,
+        *,
+        max_chars: int,
+    ) -> list[dict] | None:
+        if not isinstance(tool_calls, list):
+            return None
+
+        compacted_calls: list[dict] = []
+        for item in tool_calls:
+            if not isinstance(item, dict):
+                continue
+            compact_item = dict(item)
+            function = compact_item.get("function")
+            if not isinstance(function, dict):
+                compacted_calls.append(compact_item)
+                continue
+
+            function_copy = dict(function)
+            name = str(function_copy.get("name", "") or "tool")
+            raw_args = function_copy.get("arguments", "{}")
+            parsed_args: object
+            if isinstance(raw_args, dict):
+                parsed_args = raw_args
+            elif isinstance(raw_args, str):
+                try:
+                    decoded = json.loads(raw_args)
+                except (json.JSONDecodeError, TypeError):
+                    parsed_args = {"raw": raw_args}
+                else:
+                    parsed_args = decoded
+            else:
+                parsed_args = {"raw": str(raw_args)}
+
+            compact_args = await self._summarize_tool_call_arguments(
+                parsed_args,
+                max_chars=max_chars,
+                label=f"{name} assistant tool-call args",
+            )
+            function_copy["arguments"] = json.dumps(
+                compact_args,
+                ensure_ascii=False,
+                default=str,
+            )
+            compact_item["function"] = function_copy
+            compacted_calls.append(compact_item)
+
+        return compacted_calls or None
+
+    async def _serialize_content_blocks_for_model(
+        self,
+        blocks: list | None,
+        *,
+        max_chars: int,
+    ) -> list[dict] | None:
+        if not blocks:
+            return None
+        from loom.content import serialize_block
+
+        serialized_blocks: list[dict] = []
+        for block in blocks:
+            try:
+                payload = serialize_block(block)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            compact = dict(payload)
+            for key in ("text", "text_fallback", "extracted_text", "thinking"):
+                value = compact.get(key)
+                if isinstance(value, str):
+                    compact[key] = await self._compact_text(
+                        value,
+                        max_chars=max_chars,
+                        label=f"content block {key}",
+                    )
+            serialized_blocks.append(compact)
+        return serialized_blocks or None
+
+    async def _serialize_tool_result_for_model(
+        self,
+        tool_name: str,
+        result: ToolResult,
+        *,
+        max_output_chars: int | None = None,
+    ) -> str:
+        limit = max_output_chars or self._tool_output_limit(tool_name)
+        output_text = await self._compact_text(
+            result.output,
+            max_chars=limit,
+            label=f"{tool_name} tool output",
+        )
+        payload: dict = {
+            "success": result.success,
+            "output": output_text,
+            "error": result.error,
+            "files_changed": list(result.files_changed),
+        }
+        if len(payload["files_changed"]) > 20:
+            files_text = "\n".join(payload["files_changed"])
+            payload["files_changed_summary"] = await self._compact_text(
+                files_text,
+                max_chars=380,
+                label=f"{tool_name} files changed",
+            )
+            payload["files_changed_count"] = len(payload["files_changed"])
+            payload.pop("files_changed", None)
+
+        data_summary = await self._summarize_tool_data(result.data)
+        if data_summary:
+            payload["data"] = data_summary
+        blocks = await self._serialize_content_blocks_for_model(
+            result.content_blocks,
+            max_chars=min(limit, 400),
+        )
+        if blocks:
+            payload["content_blocks"] = blocks
+        return json.dumps(payload)
+
+    async def _compact_tool_message_content(
+        self,
+        content: str,
+        *,
+        max_output_chars: int,
+    ) -> str:
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return await self._compact_text(
+                str(content),
+                max_chars=max_output_chars,
+                label="tool message content",
+            )
+
+        if not isinstance(parsed, dict):
+            return await self._compact_text(
+                str(content),
+                max_chars=max_output_chars,
+                label="tool message payload",
+            )
+
+        output = await self._compact_text(
+            str(parsed.get("output", "")),
+            max_chars=max_output_chars,
+            label="tool message output",
+        )
+        payload: dict = {
+            "success": bool(parsed.get("success", False)),
+            "output": output,
+            "error": parsed.get("error"),
+            "files_changed": list(parsed.get("files_changed", [])),
+        }
+        if len(payload["files_changed"]) > 20:
+            files_text = "\n".join(str(item) for item in payload["files_changed"])
+            payload["files_changed_summary"] = await self._compact_text(
+                files_text,
+                max_chars=320,
+                label="tool message files changed",
+            )
+            payload["files_changed_count"] = len(payload["files_changed"])
+            payload.pop("files_changed", None)
+
+        data_summary = await self._summarize_tool_data(parsed.get("data"))
+        if data_summary:
+            payload["data"] = data_summary
+
+        raw_blocks = parsed.get("content_blocks")
+        if isinstance(raw_blocks, list) and raw_blocks:
+            compact_blocks: list[dict] = []
+            for block in raw_blocks:
+                if not isinstance(block, dict):
+                    continue
+                compact = dict(block)
+                for key in ("text", "text_fallback", "extracted_text", "thinking"):
+                    value = compact.get(key)
+                    if isinstance(value, str):
+                        compact[key] = await self._compact_text(
+                            value,
+                            max_chars=min(max_output_chars, 400),
+                            label=f"tool block {key}",
+                        )
+                compact_blocks.append(compact)
+            if compact_blocks:
+                payload["content_blocks"] = compact_blocks
+        return json.dumps(payload)
+
+    @staticmethod
+    def _estimate_message_tokens(messages: list[dict]) -> int:
+        total = 0
+        for message in messages:
+            try:
+                total += estimate_tokens(json.dumps(message))
+            except (TypeError, ValueError):
+                total += estimate_tokens(str(message))
+        return total
+
+    async def _compact_messages_for_model(self, messages: list[dict]) -> list[dict]:
+        """Compact older messages to keep tool loops within context budget."""
+        if len(messages) < 3:
+            return messages
+
+        if self._estimate_message_tokens(messages) <= self.MAX_MODEL_CONTEXT_TOKENS:
+            return messages
+
+        compacted: list[dict] = [
+            dict(message) if isinstance(message, dict) else message
+            for message in messages
+        ]
+
+        # Always compact assistant tool-call argument payloads first.
+        # These can be extremely large (e.g., document_write content) and can
+        # exceed backend request byte caps even in short recent histories.
+        for msg in compacted:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "")).strip().lower()
+            if role != "assistant" or not msg.get("tool_calls"):
+                continue
+            compact_calls = await self._compact_assistant_tool_calls(
+                msg.get("tool_calls"),
+                max_chars=self.COMPACT_TOOL_CALL_ARGUMENT_CHARS,
+            )
+            if compact_calls is not None:
+                msg["tool_calls"] = compact_calls
+
+        async def _apply_pass(
+            *,
+            preserve_recent: int,
+            tool_chars: int,
+            text_chars: int,
+        ) -> None:
+            preserve_from = max(1, len(compacted) - preserve_recent)
+            for idx, msg in enumerate(compacted):
+                if idx == 0 or idx >= preserve_from or not isinstance(msg, dict):
+                    continue
+                role = str(msg.get("role", "")).strip().lower()
+                if role == "tool":
+                    msg["content"] = await self._compact_tool_message_content(
+                        msg.get("content", ""),
+                        max_output_chars=tool_chars,
+                    )
+                elif role == "assistant":
+                    if msg.get("tool_calls"):
+                        msg["content"] = self.TOOL_CALL_CONTEXT_PLACEHOLDER
+                        compact_calls = await self._compact_assistant_tool_calls(
+                            msg.get("tool_calls"),
+                            max_chars=max(80, min(text_chars, 220)),
+                        )
+                        if compact_calls is not None:
+                            msg["tool_calls"] = compact_calls
+                    else:
+                        content = msg.get("content")
+                        if isinstance(content, str) and len(content) > text_chars:
+                            msg["content"] = await self._compact_text(
+                                content,
+                                max_chars=text_chars,
+                                label="assistant context",
+                            )
+                elif role == "user":
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        if content.startswith(self._TODO_REMINDER_PREFIX):
+                            msg["content"] = (
+                                "Continue current subtask only. "
+                                "Do NOT move to the next subtask."
+                            )
+                        elif len(content) > text_chars:
+                            msg["content"] = await self._compact_text(
+                                content,
+                                max_chars=text_chars,
+                                label="user context",
+                            )
+                elif role == "system":
+                    content = msg.get("content")
+                    if isinstance(content, str) and len(content) > text_chars:
+                        msg["content"] = await self._compact_text(
+                            content,
+                            max_chars=text_chars,
+                            label="system context",
+                        )
+
+        await _apply_pass(
+            preserve_recent=8,
+            tool_chars=self.COMPACT_TOOL_RESULT_OUTPUT_CHARS,
+            text_chars=self.COMPACT_TEXT_OUTPUT_CHARS,
+        )
+        if self._estimate_message_tokens(compacted) <= self.MAX_MODEL_CONTEXT_TOKENS:
+            return compacted
+
+        await _apply_pass(
+            preserve_recent=4,
+            tool_chars=120,
+            text_chars=self.MINIMAL_TEXT_OUTPUT_CHARS,
+        )
+        if self._estimate_message_tokens(compacted) <= self.MAX_MODEL_CONTEXT_TOKENS:
+            return compacted
+
+        # Final semantic merge pass: replace old context with one compact brief.
+        preserve_from = max(1, len(compacted) - 3)
+        old_context = compacted[1:preserve_from]
+        recent = compacted[preserve_from:]
+        while recent and isinstance(recent[0], dict) and recent[0].get("role") == "tool":
+            recent = recent[1:]
+
+        if old_context:
+            merged_lines: list[str] = []
+            for msg in old_context:
+                if not isinstance(msg, dict):
+                    continue
+                role = str(msg.get("role", "")).strip().lower() or "unknown"
+                content = msg.get("content", "")
+                if role == "assistant" and msg.get("tool_calls"):
+                    tool_names = [
+                        str(tc.get("function", {}).get("name", "tool"))
+                        for tc in list(msg.get("tool_calls", []))
+                        if isinstance(tc, dict)
+                    ]
+                    merged_lines.append(
+                        f"[assistant/tool_call] {', '.join(tool_names) or 'tool call'}"
+                    )
+                    continue
+                if not isinstance(content, str):
+                    content = str(content)
+                merged_lines.append(f"[{role}] {content}")
+
+            merged_text = "\n".join(merged_lines).strip()
+            if merged_text:
+                merged_summary = await self._compact_text(
+                    merged_text,
+                    max_chars=700,
+                    label="prior conversation context",
+                )
+                compacted = [
+                    compacted[0],
+                    {"role": "user", "content": f"Prior compacted context:\n{merged_summary}"},
+                    *recent,
+                ]
+                if (
+                    self._estimate_message_tokens(compacted)
+                    <= self.MAX_MODEL_CONTEXT_TOKENS
+                ):
+                    return compacted
+
+        return compacted

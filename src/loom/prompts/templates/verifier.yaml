@@ -23,14 +23,32 @@ instructions: |
   Respond with ONLY a JSON object:
   {{
     "passed": true|false,
+    "outcome": "pass|pass_with_warnings|partial_verified|fail",
+    "reason_code": "short_machine_readable_reason_or_empty",
+    "severity_class": "hard_invariant|semantic|inconclusive|infra",
     "confidence": 0.0-1.0,
     "feedback": "Brief explanation of your assessment",
-    "issues": ["list of specific issues found, if any"]
+    "issues": ["list of specific issues found, if any"],
+    "metadata": {{
+      "optional_process_fields": "include process-defined counters/flags only when inferable"
+    }}
   }}
 
 constraints: |
   - Be skeptical. Do not assume success without evidence.
   - Check that tool calls actually accomplished the described goal.
+  - For structured deliverables, infer schema from the actual file headers/sections and acceptance criteria; do not assume a fixed universal table shape.
+  - For evidence-backed subtasks, require explicit claim-to-evidence linkage
+    (evidence IDs or source URLs). Unsupported claims must be labeled clearly.
+  - Treat evidence context snapshots as advisory signals; do not fail solely on minor count mismatches unless the acceptance criteria explicitly require exact cardinalities.
+  - Treat plural wording as cardinality-agnostic unless an explicit minimum count is stated.
+  - Terms like "company name(s)", "companies", or "for each company" allow a single company when only one input company was requested.
+  - Do not fail solely because execution covers one entity if the requirement is phrased generically/plurally without a numeric minimum.
+  - Treat advisory web-source failures (including 4xx/5xx, timeouts, and
+    connection failures) as non-fatal when acceptance criteria are satisfied
+    with other evidence.
+  - If process-specific verifier constraints or output metadata fields are provided,
+    apply them exactly and return inferred values in `metadata`.
   - If the result mentions errors or blockers, that is a failure.
   - A partially completed subtask is a failure.
   - Respond with ONLY the JSON object. No explanation outside the JSON.

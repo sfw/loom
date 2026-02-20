@@ -223,6 +223,59 @@ class TestResponseValidator:
         assert not result.valid
         assert "Unknown tool" in result.error
 
+    def test_missing_required_tool_argument(self):
+        validator = ResponseValidator()
+        response = ModelResponse(
+            text="",
+            tool_calls=[ToolCall(id="1", name="document_write", arguments={"title": "Report"})],
+        )
+        tools = [
+            {
+                "name": "document_write",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "title": {"type": "string"},
+                    },
+                },
+            },
+        ]
+        result = validator.validate_tool_calls(response, tools)
+        assert not result.valid
+        assert "Missing required arguments for document_write: path" in result.error
+        assert "required tool arguments" in result.suggestion
+
+    def test_blank_required_tool_argument(self):
+        validator = ResponseValidator()
+        response = ModelResponse(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="1",
+                    name="write_file",
+                    arguments={"path": "  ", "content": "x"},
+                )
+            ],
+        )
+        tools = [
+            {
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path", "content"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                },
+            },
+        ]
+        result = validator.validate_tool_calls(response, tools)
+        assert not result.valid
+        assert "Missing required arguments for write_file: path" in result.error
+
     def test_no_tool_calls_is_valid(self):
         validator = ResponseValidator()
         response = ModelResponse(text="Just text")
@@ -249,6 +302,24 @@ class TestResponseValidator:
         result = validator.validate_json_response(response)
         assert result.valid
         assert result.parsed == {"key": "value"}
+
+    def test_json_embedded_in_explanatory_text(self):
+        validator = ResponseValidator()
+        response = ModelResponse(
+            text='I checked the task.\n{"passed": true, "confidence": 0.9}\nDone.'
+        )
+        result = validator.validate_json_response(response, expected_keys=["passed"])
+        assert result.valid
+        assert result.parsed == {"passed": True, "confidence": 0.9}
+
+    def test_json_prefers_candidate_with_expected_keys(self):
+        validator = ResponseValidator()
+        response = ModelResponse(
+            text='Example schema: {"foo": 1}\nFinal: {"passed": false, "issues": []}'
+        )
+        result = validator.validate_json_response(response, expected_keys=["passed"])
+        assert result.valid
+        assert result.parsed == {"passed": False, "issues": []}
 
     def test_json_missing_keys(self):
         validator = ResponseValidator()

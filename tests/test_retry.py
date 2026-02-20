@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from loom.recovery.retry import AttemptRecord, RetryManager
+from loom.recovery.retry import AttemptRecord, RetryManager, RetryStrategy
 
 
 class TestRetryManager:
@@ -77,3 +77,132 @@ class TestRetryManager:
     def test_max_retries_property(self):
         mgr = RetryManager(max_retries=5)
         assert mgr.max_retries == 5
+
+    def test_classify_failure_verifier_parse(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="Verification inconclusive: could not parse verifier output.",
+            execution_error="",
+        )
+        assert strategy == RetryStrategy.VERIFIER_PARSE
+        assert markets == []
+
+    def test_classify_failure_verifier_exception_is_verifier_parse(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback=(
+                "Verification inconclusive: verifier raised an exception: timeout"
+            ),
+            execution_error="",
+        )
+        assert strategy == RetryStrategy.VERIFIER_PARSE
+        assert markets == []
+
+    def test_classify_failure_rate_limit(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="Execution encountered a critical tool failure (HTTP 429).",
+            execution_error="",
+        )
+        assert strategy == RetryStrategy.RATE_LIMIT
+        assert markets == []
+
+    def test_classify_failure_evidence_gap_extracts_targets(self):
+        strategy, targets = RetryManager.classify_failure(
+            verification_feedback=(
+                "Verification failed: No successful tool-call evidence found for target "
+                "'Arizona Water/Wastewater'. No successful tool-call evidence found for "
+                "target 'New Mexico Water/Wastewater'."
+            ),
+            execution_error="",
+        )
+        assert strategy == RetryStrategy.EVIDENCE_GAP
+        assert targets == ["Arizona Water/Wastewater", "New Mexico Water/Wastewater"]
+
+    def test_build_retry_context_includes_evidence_gap_plan(self):
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback=(
+                    "No successful tool-call evidence found for target "
+                    "'Arizona Water/Wastewater'."
+                ),
+                retry_strategy=RetryStrategy.EVIDENCE_GAP,
+                missing_targets=["Arizona Water/Wastewater"],
+            )
+        ]
+        context = mgr.build_retry_context(attempts)
+
+        assert "TARGETED RETRY PLAN" in context
+        assert "missing evidence coverage" in context
+        assert "Arizona Water/Wastewater" in context
+
+    def test_classify_failure_unconfirmed_data(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback=(
+                "Recommendations include unconfirmed claims; confirm-or-prune "
+                "remediation is required."
+            ),
+            execution_error="",
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    def test_classify_failure_prefers_structured_reason_code(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="Totally unrelated text",
+            execution_error="",
+            verification={"reason_code": "recommendation_unconfirmed"},
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    def test_classify_failure_prefers_structured_remediation_mode(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="No obvious markers",
+            execution_error="",
+            verification={"metadata": {"remediation_mode": "queue_follow_up"}},
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    def test_classify_failure_structured_fields_override_text_markers(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="HTTP 429 rate limit while running verifier",
+            execution_error="",
+            verification={"reason_code": "recommendation_unconfirmed"},
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    def test_classify_failure_uses_structured_severity_inconclusive(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="No obvious markers",
+            execution_error="",
+            verification={"severity_class": "inconclusive"},
+        )
+        assert strategy == RetryStrategy.VERIFIER_PARSE
+        assert markets == []
+
+    def test_classify_failure_uses_structured_severity_infra_rate_limit(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="HTTP 429 from upstream",
+            execution_error="",
+            verification={"severity_class": "infra"},
+        )
+        assert strategy == RetryStrategy.RATE_LIMIT
+        assert markets == []
+
+    def test_build_retry_context_includes_unconfirmed_plan(self):
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="recommendation_unconfirmed",
+                retry_strategy=RetryStrategy.UNCONFIRMED_DATA,
+            ),
+        ]
+        context = mgr.build_retry_context(attempts)
+
+        assert "TARGETED RETRY PLAN" in context
+        assert "Resolve verification findings" in context

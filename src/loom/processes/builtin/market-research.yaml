@@ -1,0 +1,348 @@
+name: market-research
+version: "1.0"
+schema_version: 2
+description: >
+  End-to-end market research workflow for company-focused analysis across
+  geographies, market conditions, trend trajectories, competitor intelligence,
+  public perception, and risk synthesis.
+author: "Loom Team"
+tags: [market-research, strategy, competition, trends, risk, geographies]
+
+persona: |
+  You are a senior market intelligence analyst. You produce evidence-backed
+  market research that is useful for strategic decision-making, not generic
+  summaries. You must map findings by company, geography, and service/product
+  line, explicitly separate facts from assumptions, and flag uncertainty.
+
+phase_mode: strict
+
+tool_guidance: |
+  Use CSV for structured comparison and markdown for narrative synthesis.
+  Prefer primary sources where possible (company filings, investor reports,
+  regulator data, official statistics, and first-party product pages).
+  For public perception analysis, triangulate across at least two source types
+  (e.g., review platforms, analyst commentary, media reporting).
+
+tools:
+  guidance: >
+    Use web_search/web_fetch for external evidence, spreadsheet for matrices,
+    and document_write for final synthesis artifacts.
+  required: [web_search, web_fetch, spreadsheet, calculator, read_file, write_file, document_write, search_files]
+  excluded: [delete_file, shell_execute, git_command]
+
+phases:
+  - id: scope-companies
+    description: >
+      Interpret requested company name(s), normalize legal/entity naming, and
+      define product/service lines to analyze for each company.
+    depends_on: []
+    model_tier: 2
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Every input company is represented with normalized name, core offerings,
+      and explicitly scoped service/product lines for comparison.
+    deliverables:
+      - "research-scope.md — normalized company list, objectives, and boundaries"
+      - "company-service-map.csv — company-by-service/product-line mapping"
+
+  - id: map-geographies
+    description: >
+      Identify operating geographies for each company and prioritize markets by
+      business relevance, maturity, and strategic importance.
+    depends_on: [scope-companies]
+    model_tier: 2
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Geography mapping includes countries/regions, evidence for market
+      presence, and priority classification rationale.
+    deliverables:
+      - "geography-footprint.csv — operating geographies by company and service line"
+      - "market-priority.md — prioritized market rationale and segmentation"
+
+  - id: environmental-scan
+    description: >
+      Perform environmental scans for priority markets, covering macroeconomic,
+      regulatory/political, social, technological, and infrastructure context.
+    depends_on: [map-geographies]
+    model_tier: 2
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      For each priority market, include a concise PESTLE-style readout with
+      evidence-backed implications for the scoped service/product lines.
+    deliverables:
+      - "environmental-scan.md — cross-market PESTLE analysis with implications"
+      - "market-condition-scorecard.csv — scored market conditions and constraints"
+
+  - id: analyze-market-trends
+    description: >
+      Analyze demand, pricing, customer behavior, channel, and technology
+      trends within each relevant market and service/product line.
+    depends_on: [environmental-scan]
+    model_tier: 3
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Trend coverage includes direction (up/down/flat), time horizon,
+      confidence level, and source-backed rationale for each key trend.
+    deliverables:
+      - "market-trends.md — trend narratives by geography and service line"
+      - "trend-dataset.csv — structured trend signals with recency and confidence"
+
+  - id: map-competition
+    description: >
+      Build competitor universe by market and service/product line, including
+      direct, indirect, and adjacent competitors.
+    depends_on: [analyze-market-trends]
+    model_tier: 2
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Competitor universe is segmented by geography and service line, with
+      competitor type and competitive threat rationale.
+    deliverables:
+      - "competitor-universe.csv — competitor map by geography and service line"
+
+  - id: deep-competitor-research
+    description: >
+      Conduct deep research on top competitors: offerings, pricing/GTM,
+      customer segments, partnerships, operating signals, and public perception.
+    depends_on: [map-competition]
+    model_tier: 3
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Top competitors have evidence-backed profiles, strengths/weaknesses,
+      strategic moves, and public perception indicators with source diversity.
+    deliverables:
+      - "competitor-profiles.md — deep competitor profiles and strategic positioning"
+      - "competitor-comparison-matrix.csv — competitor capabilities and positioning matrix"
+      - "public-perception-signals.csv — sentiment/reputation indicators with sources"
+      - "competitor-move-log.csv — major competitor moves with dates and implications"
+
+  - id: assess-market-risks
+    description: >
+      Synthesize market risks by company/geography/service line across social,
+      economic, political, regulatory, technological, and execution dimensions.
+    depends_on: [deep-competitor-research]
+    model_tier: 3
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Risk register includes probability, impact, leading indicators, and
+      mitigation options across multiple risk classes for each priority market.
+    deliverables:
+      - "market-risk-register.csv — multi-factor risk register with mitigations"
+      - "risk-heatmap.csv — risk scoring by market and risk category"
+      - "risk-narrative.md — key downside/upside risk narratives and triggers"
+
+  - id: synthesize-recommendations
+    description: >
+      Produce decision-grade synthesis: cross-market findings, competitive
+      implications, priority opportunities, risk-adjusted recommendations, and
+      a monitoring plan.
+    depends_on: [assess-market-risks]
+    model_tier: 3
+    verification_tier: 2
+    is_critical_path: true
+    is_synthesis: true
+    acceptance_criteria: >
+      Final synthesis clearly answers the market research objective, includes
+      market-by-market recommendations, and cites evidence for key calls.
+    deliverables:
+      - "market-research-report.md — final market research synthesis and recommendations"
+      - "strategic-watchlist.csv — monitoring metrics, thresholds, and owners"
+      - "source-index.csv — source registry with URLs, access dates, and scope tags"
+
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Run the market-research process and produce all declared deliverables."
+    timeout_seconds: 900
+    acceptance:
+      phases:
+        must_include: [scope-companies, map-geographies, environmental-scan, analyze-market-trends, map-competition, deep-competitor-research, assess-market-risks, synthesize-recommendations]
+      deliverables:
+        must_exist: [research-scope.md, company-service-map.csv, geography-footprint.csv, market-priority.md, environmental-scan.md, market-condition-scorecard.csv, market-trends.md, trend-dataset.csv, competitor-universe.csv, competitor-profiles.md, competitor-comparison-matrix.csv, public-perception-signals.csv, competitor-move-log.csv, market-risk-register.csv, risk-heatmap.csv, risk-narrative.md, market-research-report.md, strategic-watchlist.csv, source-index.csv]
+      verification:
+        forbidden_patterns: ["Expected deliverable '.*' not found", "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"]
+
+  - id: live-canary
+    mode: live
+    goal: "Run market research on live companies and produce a risk-aware competitive synthesis."
+    timeout_seconds: 1200
+    requires_network: true
+
+verification:
+  policy:
+    mode: llm_first
+    static_checks:
+      tool_success_policy: safety_integrity_only
+      file_integrity_policy: enforce_nonempty_changed_files
+      syntax_policy: enforce_parseable_artifacts
+      deliverable_existence_policy: enforce_declared_deliverables
+    semantic_checks:
+      - id: process-rules
+        check: "Apply process-defined verification rules and acceptance criteria."
+        severity: error
+        enforcement: hard
+        scope: phase
+    output_contract:
+      required_fields:
+        - passed
+        - outcome
+        - reason_code
+        - severity_class
+        - confidence
+        - feedback
+        - issues
+        - metadata
+      metadata_fields:
+        - remediation_required
+        - remediation_mode
+        - missing_targets
+    outcome_policy:
+      pass_states: [pass, pass_with_warnings, partial_verified]
+      fail_states: [fail]
+  remediation:
+    strategies:
+      - id: targeted-remediation
+        retry_strategy: unconfirmed_data
+        description: "Perform targeted follow-up based on verifier reason_code/metadata."
+    default_strategy: targeted-remediation
+    critical_path_behavior: block
+    retry_budget:
+      max_attempts: 2
+    transient_retry_policy:
+      retry_on_transient: true
+  rules:
+    - name: geography-and-service-coverage
+      description: "Findings must be segmented by geography and service/product line"
+      check: >
+        Validate that major findings are mapped to specific geographies and
+        scoped service/product lines, not generic aggregate summaries.
+      severity: error
+      type: llm
+      applies_to_phases: [map-geographies, environmental-scan, analyze-market-trends, map-competition, deep-competitor-research, assess-market-risks, synthesize-recommendations]
+
+    - name: competition-depth
+      description: "Competitor analysis must include strategic depth"
+      check: >
+        Ensure competitor analysis includes positioning, offering comparison,
+        GTM signals, and at least one concrete implication per major competitor.
+      severity: error
+      type: llm
+      applies_to_phases: [map-competition, deep-competitor-research, synthesize-recommendations]
+
+    - name: public-perception-evidence
+      description: "Public perception claims must be source-backed"
+      check: >
+        Validate that perception/reputation claims include sources and avoid
+        unsupported sentiment assertions.
+      severity: error
+      type: llm
+      applies_to_phases: [deep-competitor-research, synthesize-recommendations]
+
+    - name: multi-factor-risk-coverage
+      description: "Risk analysis must cover social/economic/political dimensions"
+      check: >
+        Confirm risk outputs include at least social, economic, political, and
+        regulatory factors, with explicit impact/probability framing.
+      severity: error
+      type: llm
+      applies_to_phases: [assess-market-risks, synthesize-recommendations]
+
+    - name: recency-markers-present
+      description: "Time-sensitive claims should include recency markers"
+      check: >
+        Major market trend and competitor move claims should include date
+        context or explicit recency statements.
+      severity: warning
+      type: llm
+      applies_to_phases: [analyze-market-trends, deep-competitor-research, synthesize-recommendations]
+
+    - name: no-placeholders
+      description: "No placeholder text in deliverables"
+      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
+      severity: error
+      type: regex
+      applies_to_phases: ["*"]
+
+evidence:
+  record_schema:
+    required_fields: [evidence_id, tool, source_url, created_at, quality]
+    facets: [target, entity, subject, region, category, segment, topic]
+  extraction:
+    include_result_facets: true
+    arg_mappings:
+      target: [target, entity, subject, company, market]
+      region: [region, geography, country]
+      category: [category, dimension, theme]
+  summarization:
+    max_entries: 12
+    include_facets: true
+
+prompt_contracts:
+  evidence_contract:
+    enabled: true
+    applies_to_phases: ["*"]
+  executor_constraints: |
+    Keep factual claims traceable to evidence IDs or source URLs.
+    If a claim cannot be verified, label it explicitly as unverified.
+  verifier_constraints: |
+    Evaluate acceptance criteria and process verification rules without assuming
+    a fixed output schema. Use metadata keys only when inferable.
+  remediation_instructions:
+    default: |
+      Perform targeted remediation only for failing checks. Preserve validated
+      work, add missing evidence links, and avoid broad reruns.
+
+memory:
+  extract_types:
+    - type: market_signal
+      description: "Material trend signal tied to geography and service line"
+    - type: competitor_signal
+      description: "Evidence-backed competitor move, positioning, or capability change"
+    - type: perception_signal
+      description: "Public perception indicator with source and relevance"
+    - type: risk_signal
+      description: "Market risk driver with trigger, impact, and mitigation context"
+    - type: strategic_recommendation
+      description: "Actionable recommendation with market context and rationale"
+  extraction_guidance: |
+    Prioritize signals that change strategic decisions. Include company,
+    geography, service line, source, and recency marker in each extracted item.
+
+workspace_analysis:
+  scan_for:
+    - "**/*.md — existing market notes, strategy docs, or prior intelligence"
+    - "**/*.csv — market datasets, trackers, and competitor matrices"
+    - "**/*.xlsx — prior structured market analysis exports"
+  guidance: |
+    Reuse credible local artifacts where current. If stale, retain structure but
+    refresh claims and annotate updated evidence.
+
+planner_examples:
+  - goal: "Research North American and European market outlook for two SaaS vendors"
+    subtasks:
+      - { id: scope-companies, description: "Normalize companies and map service lines", depends_on: [], model_tier: 2 }
+      - { id: map-geographies, description: "Map where each company operates and prioritize markets", depends_on: [scope-companies], model_tier: 2 }
+      - { id: environmental-scan, description: "Build market environment scan by priority geography", depends_on: [map-geographies], model_tier: 2 }
+      - { id: analyze-market-trends, description: "Analyze market and demand trends by service line", depends_on: [environmental-scan], model_tier: 3 }
+      - { id: map-competition, description: "Identify competitor landscape by market", depends_on: [analyze-market-trends], model_tier: 2 }
+      - { id: deep-competitor-research, description: "Deep-dive top competitors including perception signals", depends_on: [map-competition], model_tier: 3 }
+      - { id: assess-market-risks, description: "Build social/economic/political risk register", depends_on: [deep-competitor-research], model_tier: 3 }
+      - { id: synthesize-recommendations, description: "Deliver final market research and recommendations", depends_on: [assess-market-risks], model_tier: 3 }
+
+replanning:
+  triggers: |
+    - Input company names are ambiguous or map to multiple legal entities
+    - Priority market list is too broad to support decision-grade depth
+    - Critical competitor or risk evidence is contradictory across major sources
+  guidance: |
+    If entities are ambiguous, resolve and restate scope before proceeding.
+    If scope is too broad, narrow to highest-priority markets and explicitly
+    document exclusions. When key evidence conflicts, preserve both viewpoints
+    with confidence labels and escalation notes.

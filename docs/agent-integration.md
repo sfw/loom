@@ -3,7 +3,7 @@
 This guide shows how to connect external agents (Claude Code, custom scripts, cron jobs, other AI agents) to Loom as clients.
 
 **Two execution models:**
-- **Interactive** (`loom`) — conversation-first TUI with full session persistence. The agent and developer collaborate in real time with 21 tools, streaming, conversation recall, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition.
+- **Interactive** (`loom`) — conversation-first TUI with full session persistence. The agent and developer collaborate in real time with 21 tools, streaming, conversation recall, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition, and `/run <goal>` (or dynamic `/<process-name> <goal>`) forces process orchestration in-session. Use `/run close [run-id-prefix]` (or `Ctrl+W` on a run tab) to close/cancel a process run tab.
 - **Task mode** (REST API / MCP) — autonomous, fire-and-forget. Loom decomposes the goal into subtasks, executes, verifies, and reports back.
 
 This document covers both modes.
@@ -497,7 +497,7 @@ event_bus.subscribe_all(log_all)
 
 ## 4. Process Definitions
 
-Process definitions inject domain expertise into Loom without changing engine code. They're YAML files that specify personas, phase blueprints, verification rules, tool guidance, and memory extraction types.
+Process definitions inject domain expertise into Loom without changing engine code. Use process contract v2 (`schema_version: 2`) so verification, evidence, remediation, and prompt constraints are declared in YAML instead of runtime code.
 
 ### Built-in Processes
 
@@ -512,11 +512,12 @@ loom -w /tmp/project --process consulting-engagement
 
 | Process | Phases | Mode | Domain |
 |---------|--------|------|--------|
-| `investment-analysis` | 5 | strict | Financial due diligence and valuation |
-| `marketing-strategy` | 6 | guided | Go-to-market strategy and campaigns |
-| `research-report` | 4 | guided | Research synthesis and reporting |
-| `competitive-intel` | 3 | guided | Competitive landscape analysis |
-| `consulting-engagement` | 5 | guided | McKinsey-style issue tree consulting |
+| `investment-analysis` | 8 | strict | Financial due diligence, valuation, and investment memo synthesis |
+| `marketing-strategy` | 8 | strict | Go-to-market strategy, channel planning, and execution roadmap |
+| `research-report` | 6 | strict | Evidence-first research synthesis and quality-controlled reporting |
+| `competitive-intel` | 6 | strict | Competitive landscape analysis and response playbooks |
+| `consulting-engagement` | 7 | strict | Structured consulting workflow with issue-tree problem solving |
+| `market-research` | 8 | strict | Geography-aware market scans, trend analysis, and risk-aware competitor intelligence |
 
 ### Using with REST API
 
@@ -552,6 +553,7 @@ Create a YAML file in `~/.loom/processes/` or `<workspace>/.loom/processes/`:
 ```yaml
 name: my-custom-process
 version: "1.0"
+schema_version: 2
 description: "Custom domain process"
 persona: |
   You are a domain expert specializing in...
@@ -578,12 +580,30 @@ phases:
     acceptance_criteria: "Report is comprehensive and actionable"
 
 verification:
+  policy:
+    mode: llm_first
+    output_contract:
+      required_fields: [passed, outcome, reason_code, severity_class, confidence, feedback, issues, metadata]
+  remediation:
+    default_strategy: targeted-remediation
   rules:
     - name: no-placeholders
       description: "No placeholder text in output"
       check: "(?i)(TODO|PLACEHOLDER|TBD|INSERT HERE)"
       severity: error
       type: regex
+
+evidence:
+  record_schema:
+    required_fields: [evidence_id, tool, source_url, created_at, quality]
+    facets: [target, entity, subject, region, category]
+
+prompt_contracts:
+  evidence_contract:
+    enabled: true
+    applies_to_phases: ["*"]
+  verifier_constraints: |
+    Apply process rules and return metadata keys only when inferable.
 
 memory:
   extract_types:
@@ -594,6 +614,10 @@ tool_guidance: |
   Use the calculator tool for any quantitative analysis.
   Use the spreadsheet tool for data organization.
 ```
+
+Legacy v1 process YAML still loads in compatibility mode, but new packages
+should target `schema_version: 2`. Compatibility removal is targeted for
+June 30, 2026.
 
 ### Process Packages
 
@@ -628,8 +652,19 @@ loom install ./my-process -w /path/to/project
 # Skip auto-installing Python dependencies
 loom install acme/loom-analytics --skip-deps
 
+# Install dependencies in isolated per-process envs
+loom install acme/loom-analytics --isolated-deps
+
 # Uninstall
 loom uninstall google-analytics
+```
+
+Run packaged test cases (deterministic by default, or live with real providers):
+
+```bash
+loom process test investment-analysis
+loom process test ./my-local-process --case smoke
+loom process test ./my-local-process --live
 ```
 
 The installer expects a `process.yaml` at the repo root. Python dependencies
@@ -645,6 +680,24 @@ dependencies:
 # ... rest of process definition
 ```
 
+Process packages can also declare a `tests:` manifest in `process.yaml` with
+test IDs, deterministic/live mode, optional tool/network requirements, and
+acceptance checks for phases, deliverables, and verification output.
+
+Notes:
+- `tools.required` is enforced at runtime. Missing required tools fail process activation/task creation.
+- Bundled tool name collisions are rejected at load time for the colliding tool (warning + skip).
+- `--isolated-deps` installs dependencies into `<install-target>/.deps/<process-name>/`.
+
+### Process package troubleshooting
+
+- `Process '<name>' requires missing tool(s): ...`:
+  ensure those tools are available in the active registry, or remove them from `tools.required`.
+- `Bundled tool '<name>' ... conflicts with existing tool class ...; skipping bundled tool`:
+  rename the bundled tool to a globally unique name and reinstall.
+- `Failed to install isolated dependencies`:
+  verify dependency names/versions and Python packaging access in the isolated environment.
+
 ---
 
 ## 5. Learned Patterns (Adaptive Learning)
@@ -654,8 +707,11 @@ Loom learns behavioral patterns from your interactions and uses them to personal
 ### CLI
 
 ```bash
-# List all learned patterns
+# List learned behavioral patterns (default)
 loom learned
+
+# Include internal operational patterns
+loom learned --all
 
 # Filter by type
 loom learned --type behavioral_gap
@@ -670,7 +726,7 @@ loom reset-learning
 
 ### TUI
 
-Use the `/learned` slash command to open an interactive review screen. Each pattern shows its type, description, frequency count, and last-seen date, with a Delete button for removal.
+Use the `/learned` slash command to open an interactive review screen for behavioral patterns. Each pattern shows its type, description, frequency count, and last-seen date, with a Delete button for removal.
 
 ### Python API
 
@@ -768,6 +824,7 @@ max_subtask_retries = 3
 max_loop_iterations = 50
 max_parallel_subtasks = 3     # Independent subtasks run concurrently
 auto_approve_confidence_threshold = 0.8
+delegate_task_timeout_seconds = 3600  # /run delegation timeout budget
 
 [verification]
 tier1_enabled = true    # Deterministic checks (free, instant)
@@ -782,6 +839,42 @@ database_path = "~/.loom/loom.db"
 default_path = "~/projects"
 scratch_dir = "~/.loom/scratch"
 ```
+
+`delegate_task_timeout_seconds` controls `/run` (delegated orchestration) timeout.
+Environment variable `LOOM_DELEGATE_TIMEOUT_SECONDS` overrides it when set.
+
+MCP server configuration is managed separately in `~/.loom/mcp.toml`
+(workspace override: `./.loom/mcp.toml`):
+
+```toml
+[mcp.servers.notion]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-notion"]
+timeout_seconds = 30
+enabled = true
+
+[mcp.servers.notion.env]
+NOTION_TOKEN = "${NOTION_TOKEN}"
+```
+
+Merge precedence is:
+1. `--mcp-config <path>`
+2. `./.loom/mcp.toml`
+3. `~/.loom/mcp.toml`
+4. legacy `[mcp]` sections in `loom.toml`
+
+Use the MCP CLI manager:
+
+```bash
+loom mcp list
+loom mcp add notion --command npx --arg -y --arg @modelcontextprotocol/server-notion --env-ref NOTION_TOKEN=NOTION_TOKEN
+loom mcp test notion
+loom mcp migrate
+```
+
+Configured MCP servers are auto-discovered and exposed as namespaced tools:
+`mcp.<server>.<tool>`. Tool registrations refresh at runtime as connected MCP
+servers publish new tool lists.
 
 ---
 

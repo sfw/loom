@@ -110,6 +110,11 @@ class ExecutionConfig:
     max_parallel_subtasks: int = 3
     auto_approve_confidence_threshold: float = 0.8
     enable_streaming: bool = False
+    delegate_task_timeout_seconds: int = 3600
+    model_call_max_attempts: int = 5
+    model_call_retry_base_delay_seconds: float = 0.5
+    model_call_retry_max_delay_seconds: float = 8.0
+    model_call_retry_jitter_seconds: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,17 @@ class VerificationConfig:
     tier2_enabled: bool = True
     tier3_enabled: bool = False
     tier3_vote_count: int = 3
+    policy_engine_enabled: bool = True
+    regex_default_advisory: bool = True
+    strict_output_protocol: bool = True
+    shadow_compare_enabled: bool = False
+    phase_scope_default: str = "current_phase"  # "current_phase" | "global"
+    allow_partial_verified: bool = True
+    unconfirmed_supporting_threshold: float = 0.30
+    auto_confirm_prune_critical_path: bool = True
+    confirm_or_prune_max_attempts: int = 2
+    confirm_or_prune_backoff_seconds: float = 2.0
+    confirm_or_prune_retry_on_transient: bool = True
 
 
 @dataclass(frozen=True)
@@ -137,6 +153,29 @@ class ProcessConfig:
 
     default: str = ""  # Default process name (empty = no process)
     search_paths: list[str] = field(default_factory=list)
+    require_rule_scope_metadata: bool = False
+    require_v2_contract: bool = False
+    tui_run_scoped_workspace_enabled: bool = True
+    llm_run_folder_naming_enabled: bool = True
+
+
+@dataclass(frozen=True)
+class MCPServerConfig:
+    """Configuration for one external MCP server."""
+
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    cwd: str = ""
+    timeout_seconds: int = 30
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class MCPConfig:
+    """Configuration for MCP-backed tool discovery."""
+
+    servers: dict[str, MCPServerConfig] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -151,6 +190,7 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     process: ProcessConfig = field(default_factory=ProcessConfig)
+    mcp: MCPConfig = field(default_factory=MCPConfig)
 
     @property
     def database_path(self) -> Path:
@@ -241,6 +281,43 @@ def load_config(path: Path | None = None) -> Config:
     )
 
     exec_data = raw.get("execution", {})
+    delegate_timeout_raw = exec_data.get("delegate_task_timeout_seconds", 3600)
+    try:
+        delegate_task_timeout_seconds = int(delegate_timeout_raw)
+    except (TypeError, ValueError):
+        delegate_task_timeout_seconds = 3600
+    delegate_task_timeout_seconds = max(1, delegate_task_timeout_seconds)
+
+    max_attempts_raw = exec_data.get("model_call_max_attempts", 5)
+    try:
+        model_call_max_attempts = int(max_attempts_raw)
+    except (TypeError, ValueError):
+        model_call_max_attempts = 5
+    model_call_max_attempts = max(1, min(10, model_call_max_attempts))
+
+    base_delay_raw = exec_data.get("model_call_retry_base_delay_seconds", 0.5)
+    try:
+        model_call_retry_base_delay_seconds = float(base_delay_raw)
+    except (TypeError, ValueError):
+        model_call_retry_base_delay_seconds = 0.5
+    model_call_retry_base_delay_seconds = max(0.0, model_call_retry_base_delay_seconds)
+
+    max_delay_raw = exec_data.get("model_call_retry_max_delay_seconds", 8.0)
+    try:
+        model_call_retry_max_delay_seconds = float(max_delay_raw)
+    except (TypeError, ValueError):
+        model_call_retry_max_delay_seconds = 8.0
+    model_call_retry_max_delay_seconds = max(0.0, model_call_retry_max_delay_seconds)
+    if model_call_retry_max_delay_seconds < model_call_retry_base_delay_seconds:
+        model_call_retry_max_delay_seconds = model_call_retry_base_delay_seconds
+
+    jitter_raw = exec_data.get("model_call_retry_jitter_seconds", 0.25)
+    try:
+        model_call_retry_jitter_seconds = float(jitter_raw)
+    except (TypeError, ValueError):
+        model_call_retry_jitter_seconds = 0.25
+    model_call_retry_jitter_seconds = max(0.0, model_call_retry_jitter_seconds)
+
     execution = ExecutionConfig(
         max_subtask_retries=exec_data.get("max_subtask_retries", 3),
         max_loop_iterations=exec_data.get("max_loop_iterations", 50),
@@ -249,14 +326,57 @@ def load_config(path: Path | None = None) -> Config:
             "auto_approve_confidence_threshold", 0.8
         ),
         enable_streaming=exec_data.get("enable_streaming", False),
+        delegate_task_timeout_seconds=delegate_task_timeout_seconds,
+        model_call_max_attempts=model_call_max_attempts,
+        model_call_retry_base_delay_seconds=model_call_retry_base_delay_seconds,
+        model_call_retry_max_delay_seconds=model_call_retry_max_delay_seconds,
+        model_call_retry_jitter_seconds=model_call_retry_jitter_seconds,
     )
 
     verif_data = raw.get("verification", {})
+    threshold_raw = verif_data.get("unconfirmed_supporting_threshold", 0.30)
+    try:
+        threshold = float(threshold_raw)
+    except (TypeError, ValueError):
+        threshold = 0.30
+    threshold = max(0.0, min(1.0, threshold))
+    max_attempts_raw = verif_data.get("confirm_or_prune_max_attempts", 2)
+    try:
+        confirm_or_prune_max_attempts = int(max_attempts_raw)
+    except (TypeError, ValueError):
+        confirm_or_prune_max_attempts = 2
+    confirm_or_prune_max_attempts = max(1, confirm_or_prune_max_attempts)
+
+    backoff_raw = verif_data.get("confirm_or_prune_backoff_seconds", 2.0)
+    try:
+        confirm_or_prune_backoff_seconds = float(backoff_raw)
+    except (TypeError, ValueError):
+        confirm_or_prune_backoff_seconds = 2.0
+    confirm_or_prune_backoff_seconds = max(0.0, confirm_or_prune_backoff_seconds)
     verification = VerificationConfig(
         tier1_enabled=verif_data.get("tier1_enabled", True),
         tier2_enabled=verif_data.get("tier2_enabled", True),
         tier3_enabled=verif_data.get("tier3_enabled", False),
         tier3_vote_count=verif_data.get("tier3_vote_count", 3),
+        policy_engine_enabled=verif_data.get("policy_engine_enabled", True),
+        regex_default_advisory=verif_data.get("regex_default_advisory", True),
+        strict_output_protocol=verif_data.get("strict_output_protocol", True),
+        shadow_compare_enabled=verif_data.get("shadow_compare_enabled", False),
+        phase_scope_default=str(
+            verif_data.get("phase_scope_default", "current_phase"),
+        ),
+        allow_partial_verified=verif_data.get("allow_partial_verified", True),
+        unconfirmed_supporting_threshold=threshold,
+        auto_confirm_prune_critical_path=verif_data.get(
+            "auto_confirm_prune_critical_path",
+            True,
+        ),
+        confirm_or_prune_max_attempts=confirm_or_prune_max_attempts,
+        confirm_or_prune_backoff_seconds=confirm_or_prune_backoff_seconds,
+        confirm_or_prune_retry_on_transient=verif_data.get(
+            "confirm_or_prune_retry_on_transient",
+            True,
+        ),
     )
 
     mem_data = raw.get("memory", {})
@@ -274,7 +394,58 @@ def load_config(path: Path | None = None) -> Config:
     process = ProcessConfig(
         default=proc_data.get("default", ""),
         search_paths=proc_data.get("search_paths", []),
+        require_rule_scope_metadata=proc_data.get(
+            "require_rule_scope_metadata",
+            False,
+        ),
+        require_v2_contract=proc_data.get(
+            "require_v2_contract",
+            False,
+        ),
+        tui_run_scoped_workspace_enabled=proc_data.get(
+            "tui_run_scoped_workspace_enabled",
+            True,
+        ),
+        llm_run_folder_naming_enabled=proc_data.get(
+            "llm_run_folder_naming_enabled",
+            True,
+        ),
     )
+
+    mcp_servers: dict[str, MCPServerConfig] = {}
+    mcp_data = raw.get("mcp", {})
+    servers_data = mcp_data.get("servers", {}) if isinstance(mcp_data, dict) else {}
+    if isinstance(servers_data, dict):
+        for alias, server_data in servers_data.items():
+            if not isinstance(server_data, dict):
+                continue
+
+            raw_args = server_data.get("args", [])
+            args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
+
+            raw_env = server_data.get("env", {})
+            env: dict[str, str] = {}
+            if isinstance(raw_env, dict):
+                for key, value in raw_env.items():
+                    if isinstance(key, str):
+                        env[key] = str(value)
+
+            timeout_raw = server_data.get("timeout_seconds", 30)
+            try:
+                timeout_seconds = int(timeout_raw)
+            except (TypeError, ValueError):
+                timeout_seconds = 30
+            if timeout_seconds <= 0:
+                timeout_seconds = 30
+
+            mcp_servers[str(alias)] = MCPServerConfig(
+                command=str(server_data.get("command", "")),
+                args=args,
+                env=env,
+                cwd=str(server_data.get("cwd", "")),
+                timeout_seconds=timeout_seconds,
+                enabled=bool(server_data.get("enabled", True)),
+            )
 
     return Config(
         server=server,
@@ -285,4 +456,5 @@ def load_config(path: Path | None = None) -> Config:
         memory=memory,
         logging=logging_cfg,
         process=process,
+        mcp=MCPConfig(servers=mcp_servers),
     )

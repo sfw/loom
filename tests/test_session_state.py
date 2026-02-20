@@ -37,10 +37,10 @@ class TestSessionState:
         state.set_focus("Implement user registration")
         assert state.current_focus == "Implement user registration"
 
-    def test_set_focus_truncation(self):
+    def test_set_focus_preserves_content(self):
         state = SessionState()
         state.set_focus("x" * 200)
-        assert len(state.current_focus) == 100
+        assert state.current_focus == "x" * 200
 
     def test_pruning_files(self):
         state = SessionState()
@@ -98,6 +98,7 @@ class TestSessionState:
         )
         state.record_file("a.py", "created", 1)
         state.record_decision("use JWT", 2)
+        state.ui_state = {"process_tabs": {"runs": [{"run_id": "abc123"}]}}
 
         d = state.to_dict()
         restored = SessionState.from_dict(d)
@@ -108,6 +109,7 @@ class TestSessionState:
         assert len(restored.files_touched) == 1
         assert restored.files_touched[0].path == "a.py"
         assert len(restored.key_decisions) == 1
+        assert restored.ui_state["process_tabs"]["runs"][0]["run_id"] == "abc123"
 
     def test_from_json(self):
         state = SessionState(session_id="x", workspace="/tmp", model_name="m")

@@ -1,0 +1,46 @@
+{
+  "id": "synthesis-reason-diff-unconfirmed",
+  "description": "Both legacy and policy fail, but policy returns reason_code aligned to recommendation integrity.",
+  "source": {
+    "event_log": "20260218-181445-cowork-67986217.events.jsonl",
+    "sql_snapshot": "task:cowork-67986217"
+  },
+  "context": {
+    "process": "market-research",
+    "phase_id": "synthesize-recommendations",
+    "tool_calls": [
+      {"tool": "web_fetch", "status": "partial"},
+      {"tool": "write_file", "status": "ok", "path": "market-priority.md"}
+    ],
+    "raw_verifier_output": {
+      "passed": false,
+      "outcome": "fail",
+      "reason_code": "recommendation_unconfirmed"
+    }
+  },
+  "legacy": {
+    "tier": 2,
+    "passed": false,
+    "outcome": "fail",
+    "reason_code": "unconfirmed_critical_path",
+    "severity_class": "semantic"
+  },
+  "policy": {
+    "tier": 2,
+    "passed": false,
+    "outcome": "fail",
+    "reason_code": "recommendation_unconfirmed",
+    "severity_class": "semantic"
+  },
+  "verification_contract": {
+    "reason_code": "recommendation_unconfirmed",
+    "severity_class": "semantic",
+    "metadata": {
+      "remediation_mode": "confirm_or_prune"
+    }
+  },
+  "expected": {
+    "shadow_classification": "both_fail_reason_diff",
+    "retry_strategy": "unconfirmed_data"
+  }
+}

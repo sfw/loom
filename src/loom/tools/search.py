@@ -54,7 +54,11 @@ class SearchFilesTool(Tool):
 
         search_path = ctx.workspace
         if "path" in args and args["path"]:
-            search_path = self._resolve_path(args["path"], ctx.workspace)
+            search_path = self._resolve_read_path(
+                args["path"],
+                ctx.workspace,
+                ctx.read_roots,
+            )
 
         if not search_path.exists():
             return ToolResult.fail(f"Path not found: {args.get('path', '')}")
@@ -63,6 +67,7 @@ class SearchFilesTool(Tool):
         matches = []
         max_matches = 200
 
+        rel_base = search_path
         for root, dirs, files in os.walk(search_path):
             # Skip excluded directories
             dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
@@ -76,7 +81,7 @@ class SearchFilesTool(Tool):
                     with open(filepath, encoding="utf-8", errors="replace") as f:
                         for line_num, line in enumerate(f, 1):
                             if regex.search(line):
-                                rel = os.path.relpath(filepath, ctx.workspace)
+                                rel = os.path.relpath(filepath, rel_base)
                                 matches.append(f"{rel}:{line_num}: {line.rstrip()}")
                                 if len(matches) >= max_matches:
                                     break
@@ -129,7 +134,11 @@ class ListDirectoryTool(Tool):
 
         target = ctx.workspace
         if "path" in args and args["path"]:
-            target = self._resolve_path(args["path"], ctx.workspace)
+            target = self._resolve_read_path(
+                args["path"],
+                ctx.workspace,
+                ctx.read_roots,
+            )
 
         if not target.exists():
             return ToolResult.fail(f"Path not found: {args.get('path', '')}")

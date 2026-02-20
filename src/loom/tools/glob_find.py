@@ -59,11 +59,13 @@ class GlobFindTool(Tool):
 
         raw_path = args.get("path")
         if raw_path:
-            p = Path(raw_path)
-            if not p.is_absolute() and ctx.workspace:
-                search_path = (ctx.workspace / p).resolve()
-            else:
-                search_path = p.expanduser().resolve()
+            if ctx.workspace is None:
+                return ToolResult(success=False, output="No workspace or path specified.")
+            search_path = self._resolve_read_path(
+                str(raw_path),
+                ctx.workspace,
+                ctx.read_roots,
+            )
         else:
             search_path = ctx.workspace
         if not search_path:
@@ -73,14 +75,21 @@ class GlobFindTool(Tool):
         if not search_path.is_dir():
             return ToolResult(success=False, output=f"Not a directory: {search_path}")
 
-        # Workspace containment check
+        # Workspace/read-root containment check
         if ctx.workspace:
             try:
-                search_path.relative_to(ctx.workspace.resolve())
-            except ValueError:
+                self._verify_within_allowed_roots(
+                    search_path,
+                    ctx.workspace,
+                    ctx.read_roots,
+                )
+            except Exception:
                 return ToolResult(
                     success=False,
-                    output=f"Path '{search_path}' is outside workspace '{ctx.workspace}'.",
+                    output=(
+                        f"Path '{search_path}' is outside workspace/read roots. "
+                        f"Workspace: '{ctx.workspace}'."
+                    ),
                 )
 
         try:

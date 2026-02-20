@@ -161,6 +161,7 @@ class PromptAssembler:
         state_manager: TaskStateManager,
         memory_entries: list[MemoryEntry] | None = None,
         available_tools: list[dict] | None = None,
+        evidence_ledger_summary: str = "",
     ) -> str:
         """Assemble the full prompt for subtask execution.
 
@@ -192,6 +193,30 @@ class PromptAssembler:
                 or "Complete the described task."
             ),
         ).strip()
+        # PROCESS: enforce exact deliverable filenames for active phase/subtask.
+        if self._process:
+            deliverables = self._expected_deliverables_for_subtask(subtask.id)
+            if deliverables:
+                names = "\n".join(f"- {name}" for name in deliverables)
+                subtask_section += (
+                    "\n\nREQUIRED OUTPUT FILES (EXACT FILENAMES):\n"
+                    f"{names}\n"
+                    "You MUST create/update these exact filenames before "
+                    "finishing this subtask. Do not rename them."
+                )
+
+        if self._requires_evidence_contract(subtask):
+            subtask_section += (
+                "\n\nEVIDENCE CONTRACT:\n"
+                "- Every factual claim in deliverables must include supporting evidence.\n"
+                "- For CSV deliverables, include an `evidence_id` column and at least one "
+                "source/citation field (`source`, `source_url`, or `citation`).\n"
+                "- For narrative Markdown claims, append evidence references like "
+                "`[evidence: EV-XXXX]` or explicit source URLs.\n"
+                "- Reuse `evidence_ids` returned by tools whenever possible.\n"
+                "- If evidence is unavailable, label the claim/row as "
+                "`UNSUPPORTED_NO_EVIDENCE` instead of guessing."
+            )
 
         # 4. RETRIEVED CONTEXT (memory)
         if memory_entries:
@@ -202,6 +227,13 @@ class PromptAssembler:
             "memory",
             "RELEVANT CONTEXT FROM PRIOR WORK:\n{memory_entries_formatted}",
         ).format(memory_entries_formatted=memory_text).strip()
+        evidence_section = ""
+        evidence_summary = str(evidence_ledger_summary or "").strip()
+        if evidence_summary:
+            evidence_section = (
+                "EVIDENCE LEDGER SNAPSHOT (PERSISTED):\n"
+                + evidence_summary
+            )
 
         # 5. AVAILABLE TOOLS
         tools_section = ""
@@ -221,6 +253,50 @@ class PromptAssembler:
                 + self._process.tool_guidance.strip()
             )
             constraints = constraints + tool_guidance
+        if self._process:
+            executor_constraints = self._process.prompt_executor_constraints()
+            if executor_constraints:
+                constraints = (
+                    constraints
+                    + "\n\nPROCESS EXECUTION CONSTRAINTS:\n"
+                    + executor_constraints
+                )
+
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        raw_read_roots = metadata.get("read_roots", [])
+        if isinstance(raw_read_roots, str):
+            raw_read_roots = [raw_read_roots]
+        read_roots: list[str] = []
+        if isinstance(raw_read_roots, list):
+            for item in raw_read_roots:
+                text = str(item or "").strip()
+                if text:
+                    read_roots.append(text)
+        if read_roots:
+            workspace_name = ""
+            try:
+                workspace_name = Path(str(task.workspace or "")).name
+            except Exception:
+                workspace_name = ""
+            roots_text = "\n".join(f"- {root}" for root in read_roots[:6])
+            constraints += (
+                "\n\nREAD/WRITE SCOPE:\n"
+                f"- Write scope: ONLY files inside the task workspace root "
+                f"({task.workspace}).\n"
+                "- Write paths must be workspace-relative and should usually be just "
+                "filenames (for example, `brief-normalized.md`).\n"
+            )
+            if workspace_name:
+                constraints += (
+                    f"- Do NOT prefix write paths with `{workspace_name}/`.\n"
+                )
+            constraints += (
+                "- Read scope: you may inspect these additional reference roots using "
+                "read-only tools when needed:\n"
+                f"{roots_text}\n"
+                "- Use explicit `path` when exploring reference roots so reads are "
+                "unambiguous."
+            )
 
         sections = [
             role,
@@ -228,6 +304,7 @@ class PromptAssembler:
             task_state,
             subtask_section,
             memory_section,
+            evidence_section,
             tools_section,
             output_format,
             constraints,
@@ -236,6 +313,25 @@ class PromptAssembler:
 
         return self._trim_to_budget(prompt)
 
+    def _expected_deliverables_for_subtask(self, subtask_id: str) -> list[str]:
+        """Return expected deliverable filenames for the given subtask id."""
+        if not self._process:
+            return []
+        deliverables = self._process.get_deliverables()
+        if not deliverables:
+            return []
+        if subtask_id in deliverables:
+            return deliverables[subtask_id]
+        if len(deliverables) == 1:
+            return next(iter(deliverables.values()))
+        return []
+
+    def _requires_evidence_contract(self, subtask: Subtask) -> bool:
+        """Return True only when process contract explicitly enables it."""
+        if not self._process:
+            return False
+        return self._process.requires_evidence_contract(subtask.id)
+
     def build_replanner_prompt(
         self,
         goal: str,
@@ -243,6 +339,7 @@ class PromptAssembler:
         discoveries: list[str],
         errors: list[str],
         original_plan: Plan,
+        replan_reason: str = "",
     ) -> str:
         """Assemble prompt for re-planning."""
         template = self.get_template("replanner")
@@ -260,10 +357,15 @@ class PromptAssembler:
         original_plan_formatted = (
             "\n".join(plan_lines) if plan_lines else "No prior plan."
         )
+        process_replanning_triggers = "None provided."
+        if self._process and self._process.replanning_triggers.strip():
+            process_replanning_triggers = self._process.replanning_triggers.strip()
 
         instructions = template.get("instructions", "").format(
             goal=goal,
             current_state_yaml=current_state_yaml,
+            replan_reason=replan_reason or "subtask failures",
+            process_replanning_triggers=process_replanning_triggers,
             discoveries_formatted=(
                 "\n".join(f"- {d}" for d in discoveries) if discoveries
                 else "None."
@@ -334,6 +436,9 @@ class PromptAssembler:
         subtask: Subtask,
         result_summary: str,
         tool_calls_formatted: str,
+        *,
+        llm_rules: list | None = None,
+        phase_scope_default: str = "current_phase",
     ) -> str:
         """Assemble prompt for Tier 2 LLM verification."""
         template = self.get_template("verifier")
@@ -353,16 +458,46 @@ class PromptAssembler:
 
         # PROCESS: inject LLM verification rules
         if self._process and self._process.has_verification_rules():
-            llm_rules = self._process.llm_rules()
-            if llm_rules:
+            selected_rules = llm_rules
+            if selected_rules is None:
+                selected_rules = self._process.llm_rules_for_subtask(
+                    subtask.id,
+                    phase_scope_default=phase_scope_default,
+                )
+            if selected_rules:
                 rules_text = "\n".join(
-                    f"- [{r.severity.upper()}] {r.name}: {r.check}"
-                    for r in llm_rules
+                    (
+                        f"- [{r.severity.upper()} | "
+                        f"{(r.enforcement or 'advisory').upper()}] "
+                        f"{r.name}: {r.check}"
+                    )
+                    for r in selected_rules
                 )
                 instructions += (
                     "\n\nADDITIONAL DOMAIN-SPECIFIC CHECKS:\n"
                     + rules_text
                 )
+        if self._process:
+            verifier_constraints = self._process.prompt_verifier_constraints()
+            if verifier_constraints:
+                instructions += (
+                    "\n\nPROCESS VERIFIER CONSTRAINTS:\n"
+                    + verifier_constraints
+                )
+            output_contract = self._process.verifier_output_contract()
+            metadata_fields = output_contract.get("metadata_fields", [])
+            if isinstance(metadata_fields, list) and metadata_fields:
+                metadata_list = "\n".join(
+                    f"- {str(item).strip()}"
+                    for item in metadata_fields
+                    if str(item).strip()
+                )
+                if metadata_list:
+                    instructions += (
+                        "\n\nPROCESS OUTPUT METADATA FIELDS:\n"
+                        "Include these keys under `metadata` when inferable:\n"
+                        + metadata_list
+                    )
 
         sections = [role, instructions, constraints]
         return self.SECTION_SEPARATOR.join(s for s in sections if s)
@@ -401,8 +536,14 @@ class PromptAssembler:
                 ", ".join(phase.depends_on) if phase.depends_on
                 else "none"
             )
+            flags = []
+            if phase.is_critical_path:
+                flags.append("critical")
+            if phase.is_synthesis:
+                flags.append("synthesis")
+            flags_text = f", flags: {', '.join(flags)}" if flags else ""
             lines.append(f"- {phase.id} (depends: {deps}, "
-                         f"tier: {phase.model_tier})")
+                         f"tier: {phase.model_tier}{flags_text})")
             lines.append(f"  {phase.description.strip()}")
             if phase.acceptance_criteria:
                 lines.append(
@@ -476,21 +617,9 @@ class PromptAssembler:
     def _trim_to_budget(
         self, prompt: str, max_tokens: int = 8000,
     ) -> str:
-        """Trim prompt if it exceeds the token budget.
+        """Return prompt as-is.
 
-        Priority (highest to lowest): role, task_state, subtask,
-        constraints, output_format, tools, memory.
-        Currently does a simple truncation.
+        Model-facing compaction is handled semantically at runtime by the
+        engine (LLM-based compactor). Avoid hard truncation during assembly.
         """
-        estimated = self.estimate_tokens(prompt)
-        if estimated <= max_tokens:
-            return prompt
-
-        # Simple truncation to fit budget
-        max_chars = max_tokens * 4
-        if len(prompt) > max_chars:
-            return (
-                prompt[:max_chars]
-                + "\n\n[... prompt trimmed to fit context window ...]"
-            )
         return prompt

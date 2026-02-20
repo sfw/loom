@@ -27,6 +27,7 @@ Create `process.yaml`:
 ```yaml
 name: my-process
 version: "1.0"
+schema_version: 2
 description: >
   One-paragraph description of what this process does and when to use it.
 author: "Your Name"
@@ -74,6 +75,52 @@ Install it globally:
 loom install /path/to/my-process
 ```
 
+## Process contract v2 (recommended)
+
+Set `schema_version: 2` in `process.yaml` and declare behavior in data blocks
+instead of runtime code:
+
+- `verification.policy` -- LLM-first/static-first mode, static safety checks, semantic checks, verifier output contract.
+- `verification.remediation` -- strategy metadata, retry budget, critical-path behavior.
+- `evidence` -- record schema, extraction mappings, and summarization controls.
+- `prompt_contracts` -- process-specific executor/verifier/remediation instructions and evidence-contract activation.
+
+Minimal v2 structure:
+
+```yaml
+schema_version: 2
+
+verification:
+  policy:
+    mode: llm_first
+    output_contract:
+      required_fields: [passed, outcome, reason_code, severity_class, confidence, feedback, issues, metadata]
+  remediation:
+    default_strategy: targeted-remediation
+
+evidence:
+  record_schema:
+    required_fields: [evidence_id, tool, source_url, created_at, quality]
+    facets: [target, entity, subject, region, category]
+
+prompt_contracts:
+  evidence_contract:
+    enabled: true
+    applies_to_phases: ["*"]
+```
+
+### Migrating v1 to v2
+
+1. Add `schema_version: 2`.
+2. Keep existing `verification.rules` as-is.
+3. Add `verification.policy.output_contract.required_fields` including `passed`.
+4. Move remediation wording into `prompt_contracts.remediation_instructions`.
+5. Add `evidence.record_schema`/`evidence.extraction` and enable `prompt_contracts.evidence_contract`.
+
+Legacy v1 compatibility remains available during the transition window and is
+scheduled for removal on June 30, 2026. New or updated packages should migrate
+to `schema_version: 2` now.
+
 ## process.yaml reference
 
 ### Metadata
@@ -81,6 +128,7 @@ loom install /path/to/my-process
 ```yaml
 name: kebab-case-name          # Required. Lowercase alphanumeric + hyphens.
 version: "1.0"                 # Semver string.
+schema_version: 2              # Process contract version (v2 recommended).
 description: >                 # What the process does, when to use it.
   Multi-line description.
 author: "Name or Org"
@@ -126,7 +174,7 @@ tools:
 ```
 
 - `tool_guidance` — free-text instructions injected into the system prompt
-- `tools.required` — tools that must be available (Loom warns if missing)
+- `tools.required` — tools that must be available (Loom fails fast if missing)
 - `tools.excluded` — tools the model should not use in this process
 
 The required and excluded lists must not overlap.
@@ -176,6 +224,10 @@ phases:
 | `acceptance_criteria` | No | Concrete criteria for phase completion. |
 | `deliverables` | No | List of expected output files with descriptions. |
 
+Deliverables are enforced by exact filename at execution and verification time.
+If a phase declares `financial-summary.csv`, the model must create/update that
+exact path (not `tesla_financial_summary.csv` or other variants).
+
 **Dependency rules:**
 - Dependencies form a DAG (directed acyclic graph). Cycles are rejected at load time.
 - Independent phases (no shared dependencies) can run in parallel.
@@ -188,8 +240,17 @@ phases:
 
 ### Verification rules
 
+In contract v2, keep rule definitions in `verification.rules`, and add
+`verification.policy`/`verification.remediation` for runtime behavior.
+
 ```yaml
 verification:
+  policy:
+    mode: llm_first
+    output_contract:
+      required_fields: [passed, outcome, reason_code, severity_class, confidence, feedback, issues, metadata]
+  remediation:
+    default_strategy: targeted-remediation
   rules:
     - name: no-placeholders
       description: "No placeholder text in deliverables"
@@ -291,6 +352,48 @@ replanning:
 
 Declares when the engine should re-plan and how to adapt. Without replanning configuration, the engine follows the original plan rigidly.
 
+### Process test manifest
+
+Process packages can embed runnable test contracts directly in `process.yaml`:
+
+```yaml
+tests:
+  - id: smoke
+    mode: deterministic         # deterministic | live
+    goal: "Analyze Tesla for investment"
+    timeout_seconds: 900
+    requires_network: false
+    requires_tools:
+      - write_file
+    acceptance:
+      phases:
+        must_include:
+          - company-screening
+      deliverables:
+        must_exist:
+          - company-overview.md
+      verification:
+        forbidden_patterns:
+          - "deliverable_.* not found"
+```
+
+`mode: deterministic` runs with a scripted model backend for reproducible CI checks.  
+`mode: live` runs against configured real providers and external tools/sources.
+
+Run package tests:
+
+```bash
+loom process test <name-or-path>
+loom process test <name-or-path> --case smoke
+loom process test <name-or-path> --live
+```
+
+Validation rules:
+- `id` is required and must be unique per package.
+- `mode` must be `deterministic` or `live`.
+- `goal` is required.
+- `timeout_seconds` must be greater than zero.
+
 ## Bundled tools
 
 Packages can include custom Python tools in a `tools/` directory. These are auto-discovered and registered when the process loads.
@@ -372,6 +475,12 @@ class MyDomainTool(Tool):
 6. **File names** in `tools/` must not start with `_` (those are skipped)
 7. **One class per file** is conventional but not required — all `Tool` subclasses in the module are registered
 
+### Tool naming and collision policy
+
+- Bundled tool names must be globally unique across built-in tools and all loaded packages.
+- If a bundled tool name collides with an existing tool, Loom logs a warning and skips loading the colliding bundled tool.
+- Use clear prefixes for package tools (for example, `ga_`, `fin_`, `crm_`) to avoid conflicts.
+
 ### ToolContext
 
 The `ctx` object provides:
@@ -402,6 +511,9 @@ loom install /path/to/my-process
 
 # Into a specific workspace (instead of global ~/.loom/processes/)
 loom install /path/to/my-process -w /path/to/project
+
+# Install dependencies in an isolated per-process environment
+loom install /path/to/my-process --isolated-deps
 ```
 
 ### Installing from GitHub
@@ -450,6 +562,10 @@ Risk levels:
 - **HIGH** — Has both dependencies and bundled code
 
 Users must explicitly approve before installation proceeds.
+
+Dependency install modes:
+- Default: dependencies install into the current Python environment.
+- Isolated: `--isolated-deps` installs dependencies into `<install-target>/.deps/<process-name>/`.
 
 ## Design patterns
 
@@ -548,7 +664,7 @@ See [`packages/google-analytics/`](../packages/google-analytics/) for a full pac
 - 2 planner examples
 - Replanning triggers and guidance
 
-## Checklist
+## Process Package Compatibility Checklist
 
 Before publishing a package:
 
@@ -562,7 +678,23 @@ Before publishing a package:
 - [ ] 2-3 planner examples with realistic goals
 - [ ] `replanning` section describes when to adapt
 - [ ] Bundled tools (if any) handle errors gracefully and return `ToolResult.fail`
+- [ ] Bundled tool names are unique (no collisions with built-ins or other packages)
 - [ ] Dependencies are version-pinned
 - [ ] `loom install /path/to/package` succeeds
+- [ ] `loom install /path/to/package --isolated-deps` succeeds (if dependencies are declared)
 - [ ] `loom -w /tmp/test --process my-process` loads without errors
 - [ ] README.md explains usage, deliverables, and input data
+
+## Troubleshooting
+
+- `Process '<name>' requires missing tool(s): ...`:
+Install or enable the required tools, or remove them from `tools.required`.
+
+- `Bundled tool '<name>' ... conflicts with existing tool class ...; skipping bundled tool`:
+Rename the bundled tool to a globally unique name and reinstall the package.
+
+- `Failed to create isolated dependency environment`:
+Ensure the selected Python executable can create virtual environments (`python -m venv`).
+
+- `Failed to install isolated dependencies`:
+Check package names/versions and network/index access in the isolated environment.

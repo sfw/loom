@@ -25,6 +25,10 @@ from loom.models.base import (
     TokenUsage,
     ToolCall,
 )
+from loom.models.request_diagnostics import (
+    collect_request_diagnostics,
+    log_request_diagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +38,14 @@ class OllamaProvider(ModelProvider):
 
     def __init__(self, config: ModelConfig, provider_name: str = "", tier_override: int = 0):
         self._config = config
+        headers: dict[str, str] = {}
+        api_key = config.api_key.strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         self._client = httpx.AsyncClient(
             base_url=config.base_url,
             timeout=httpx.Timeout(300.0),
+            headers=headers,
         )
         self._model = config.model
         self._max_tokens = config.max_tokens
@@ -92,6 +101,18 @@ class OllamaProvider(ModelProvider):
             payload["tools"] = self._format_ollama_tools(tools)
         if response_format:
             payload["format"] = response_format.get("type", "json")
+        diagnostics = collect_request_diagnostics(
+            messages=payload.get("messages", []),
+            tools=payload.get("tools", []),
+            payload=payload,
+        )
+        log_request_diagnostics(
+            logger=logger,
+            provider_name=self._provider_name,
+            model_name=self._model,
+            operation="complete",
+            diagnostics=diagnostics,
+        )
 
         start = time.monotonic()
         try:
@@ -183,6 +204,18 @@ class OllamaProvider(ModelProvider):
         }
         if tools:
             payload["tools"] = self._format_ollama_tools(tools)
+        diagnostics = collect_request_diagnostics(
+            messages=payload.get("messages", []),
+            tools=payload.get("tools", []),
+            payload=payload,
+        )
+        log_request_diagnostics(
+            logger=logger,
+            provider_name=self._provider_name,
+            model_name=self._model,
+            operation="stream",
+            diagnostics=diagnostics,
+        )
 
         try:
             async with self._client.stream(

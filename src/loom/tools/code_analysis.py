@@ -30,13 +30,13 @@ class CodeStructure:
     def to_summary(self) -> str:
         lines = [f"File: {self.file_path} ({self.language})"]
         if self.imports:
-            lines.append(f"  Imports: {', '.join(self.imports[:20])}")
+            lines.append(f"  Imports: {', '.join(self.imports)}")
         if self.classes:
             lines.append(f"  Classes: {', '.join(self.classes)}")
         if self.functions:
-            lines.append(f"  Functions: {', '.join(self.functions[:30])}")
+            lines.append(f"  Functions: {', '.join(self.functions)}")
         if self.exports:
-            lines.append(f"  Exports: {', '.join(self.exports[:20])}")
+            lines.append(f"  Exports: {', '.join(self.exports)}")
         return "\n".join(lines)
 
 
@@ -116,7 +116,7 @@ def extract_go(source: str) -> CodeStructure:
     structure = CodeStructure(language="go")
 
     # Imports
-    for m in re.finditer(r'"([^"]+)"', source[:2000]):  # imports near top
+    for m in re.finditer(r'"([^"]+)"', source):
         structure.imports.append(m.group(1))
 
     # Structs (Go's "classes")

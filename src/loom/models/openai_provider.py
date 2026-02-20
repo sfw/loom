@@ -25,6 +25,10 @@ from loom.models.base import (
     TokenUsage,
     ToolCall,
 )
+from loom.models.request_diagnostics import (
+    collect_request_diagnostics,
+    log_request_diagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +36,18 @@ logger = logging.getLogger(__name__)
 class OpenAICompatibleProvider(ModelProvider):
     """Provider for OpenAI-compatible API endpoints."""
 
+    ASSISTANT_CONTENT_FALLBACK = "Tool call context omitted."
+
     def __init__(self, config: ModelConfig, provider_name: str = "", tier_override: int = 0):
         self._config = config
+        headers: dict[str, str] = {}
+        api_key = config.api_key.strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         self._client = httpx.AsyncClient(
             base_url=config.base_url,
             timeout=httpx.Timeout(300.0),
+            headers=headers,
         )
         self._model = config.model
         self._max_tokens = config.max_tokens
@@ -70,6 +81,45 @@ class OpenAICompatibleProvider(ModelProvider):
         except Exception:
             return "<response body unavailable>"
 
+    @staticmethod
+    def _needs_reasoning_content_retry(status_code: int, body_text: str) -> bool:
+        """Detect providers that require reasoning_content on tool-call turns."""
+        body = body_text.lower()
+        return (
+            status_code == 400
+            and "reasoning_content" in body
+            and "tool call message" in body
+        )
+
+    @staticmethod
+    def _inject_reasoning_content(messages: list[dict]) -> tuple[list[dict], bool]:
+        """Add reasoning_content to assistant tool-call messages when missing."""
+        patched: list[dict] = []
+        changed = False
+
+        for msg in messages:
+            if (
+                msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and "reasoning_content" not in msg
+            ):
+                updated = dict(msg)
+                content = updated.get("content")
+                if isinstance(content, str) and content.strip():
+                    updated["reasoning_content"] = content
+                else:
+                    # Some reasoning-enabled OpenAI-compatible providers reject
+                    # empty reasoning_content on assistant tool-call turns.
+                    updated["reasoning_content"] = (
+                        OpenAICompatibleProvider.ASSISTANT_CONTENT_FALLBACK
+                    )
+                patched.append(updated)
+                changed = True
+                continue
+            patched.append(msg)
+
+        return patched, changed
+
     async def complete(
         self,
         messages: list[dict],
@@ -89,6 +139,18 @@ class OpenAICompatibleProvider(ModelProvider):
             payload["tools"] = self._format_tools(tools)
         if response_format:
             payload["response_format"] = response_format
+        diagnostics = collect_request_diagnostics(
+            messages=payload.get("messages", []),
+            tools=payload.get("tools", []),
+            payload=payload,
+        )
+        log_request_diagnostics(
+            logger=logger,
+            provider_name=self._provider_name,
+            model_name=self._model,
+            operation="complete",
+            diagnostics=diagnostics,
+        )
 
         start = time.monotonic()
         try:
@@ -109,12 +171,49 @@ class OpenAICompatibleProvider(ModelProvider):
             ) from e
         except httpx.HTTPStatusError as e:
             body_text = await self._http_error_body(e.response)
-            raise ModelConnectionError(
-                f"Model server returned HTTP "
-                f"{e.response.status_code}: "
-                f"{body_text}",
-                original=e,
-            ) from e
+            if self._needs_reasoning_content_retry(e.response.status_code, body_text):
+                patched_messages, changed = self._inject_reasoning_content(converted)
+                if changed:
+                    retry_payload = dict(payload)
+                    retry_payload["messages"] = patched_messages
+                    try:
+                        response = await self._client.post(
+                            "/chat/completions", json=retry_payload,
+                        )
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as retry_err:
+                        retry_body = await self._http_error_body(retry_err.response)
+                        raise ModelConnectionError(
+                            f"Model server returned HTTP "
+                            f"{retry_err.response.status_code}: "
+                            f"{retry_body}",
+                            original=retry_err,
+                        ) from retry_err
+                    except httpx.ConnectError as retry_err:
+                        raise ModelConnectionError(
+                            f"Cannot connect to model server at "
+                            f"{self._client.base_url}: {retry_err}",
+                            original=retry_err,
+                        ) from retry_err
+                    except httpx.TimeoutException as retry_err:
+                        raise ModelConnectionError(
+                            f"Model request timed out ({self._model}): {retry_err}",
+                            original=retry_err,
+                        ) from retry_err
+                else:
+                    raise ModelConnectionError(
+                        f"Model server returned HTTP "
+                        f"{e.response.status_code}: "
+                        f"{body_text}",
+                        original=e,
+                    ) from e
+            else:
+                raise ModelConnectionError(
+                    f"Model server returned HTTP "
+                    f"{e.response.status_code}: "
+                    f"{body_text}",
+                    original=e,
+                ) from e
         latency = int((time.monotonic() - start) * 1000)
 
         data = response.json()
@@ -129,7 +228,7 @@ class OpenAICompatibleProvider(ModelProvider):
         tool_calls = None
         if message.get("tool_calls"):
             tool_calls = []
-            for tc in message["tool_calls"]:
+            for index, tc in enumerate(message["tool_calls"]):
                 func = tc.get("function", {})
                 args = func.get("arguments", {})
                 if isinstance(args, str):
@@ -138,8 +237,9 @@ class OpenAICompatibleProvider(ModelProvider):
                     except json.JSONDecodeError:
                         logger.warning("Malformed tool args from OpenAI: %s", str(args)[:200])
                         args = {}
+                tc_id = str(tc.get("id", "")).strip() or f"call_{index}"
                 tool_calls.append(ToolCall(
-                    id=tc.get("id", ""),
+                    id=tc_id,
                     name=func.get("name", ""),
                     arguments=args,
                 ))
@@ -178,102 +278,133 @@ class OpenAICompatibleProvider(ModelProvider):
         }
         if tools:
             payload["tools"] = self._format_tools(tools)
+        diagnostics = collect_request_diagnostics(
+            messages=payload.get("messages", []),
+            tools=payload.get("tools", []),
+            payload=payload,
+        )
+        log_request_diagnostics(
+            logger=logger,
+            provider_name=self._provider_name,
+            model_name=self._model,
+            operation="stream",
+            diagnostics=diagnostics,
+        )
+
+        request_payload = payload
+        tried_reasoning_retry = False
 
         try:
-            async with self._client.stream(
-                "POST", "/chat/completions", json=payload,
-            ) as response:
-                if response.is_error:
-                    body_text = await self._http_error_body(response)
-                    raise ModelConnectionError(
-                        f"Model server returned HTTP "
-                        f"{response.status_code}: "
-                        f"{body_text}",
-                    )
+            while True:
+                async with self._client.stream(
+                    "POST", "/chat/completions", json=request_payload,
+                ) as response:
+                    if response.is_error:
+                        body_text = await self._http_error_body(response)
+                        if (
+                            not tried_reasoning_retry
+                            and self._needs_reasoning_content_retry(
+                                response.status_code, body_text,
+                            )
+                        ):
+                            patched_messages, changed = self._inject_reasoning_content(
+                                request_payload.get("messages", []),
+                            )
+                            if changed:
+                                request_payload = dict(request_payload)
+                                request_payload["messages"] = patched_messages
+                                tried_reasoning_retry = True
+                                continue
+                        raise ModelConnectionError(
+                            f"Model server returned HTTP "
+                            f"{response.status_code}: "
+                            f"{body_text}",
+                        )
 
-                # Buffer tool call deltas until complete
-                tool_call_buffers: dict[int, dict] = {}
+                    # Buffer tool call deltas until complete
+                    tool_call_buffers: dict[int, dict] = {}
 
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[len("data:"):].strip()
-                    if data_str == "[DONE]":
-                        # Final chunk — assemble tool calls
-                        parsed_tools = None
-                        if tool_call_buffers:
-                            parsed_tools = []
-                            for idx in sorted(tool_call_buffers):
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[len("data:"):].strip()
+                        if data_str == "[DONE]":
+                            # Final chunk — assemble tool calls
+                            parsed_tools = None
+                            if tool_call_buffers:
+                                parsed_tools = []
+                                for idx in sorted(tool_call_buffers):
+                                    buf = tool_call_buffers[idx]
+                                    args_str = buf.get("arguments", "")
+                                    try:
+                                        args = (
+                                            json.loads(args_str)
+                                            if args_str
+                                            else {}
+                                        )
+                                    except json.JSONDecodeError:
+                                        args = {}
+                                    call_id = str(buf.get("id", "")).strip() or f"call_{idx}"
+                                    parsed_tools.append(ToolCall(
+                                        id=call_id,
+                                        name=buf.get("name", ""),
+                                        arguments=args,
+                                    ))
+                            yield StreamChunk(
+                                text="", done=True,
+                                tool_calls=parsed_tools,
+                            )
+                            return
+
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        choice = data.get("choices", [{}])[0]
+                        delta = choice.get("delta", {})
+                        text = delta.get("content") or ""
+
+                        # Accumulate tool call deltas
+                        if delta.get("tool_calls"):
+                            for tc_delta in delta["tool_calls"]:
+                                idx = tc_delta.get("index", 0)
+                                if idx not in tool_call_buffers:
+                                    tool_call_buffers[idx] = {
+                                        "id": "",
+                                        "name": "",
+                                        "arguments": "",
+                                    }
                                 buf = tool_call_buffers[idx]
-                                args_str = buf.get("arguments", "")
-                                try:
-                                    args = (
-                                        json.loads(args_str)
-                                        if args_str
-                                        else {}
-                                    )
-                                except json.JSONDecodeError:
-                                    args = {}
-                                parsed_tools.append(ToolCall(
-                                    id=buf.get("id", ""),
-                                    name=buf.get("name", ""),
-                                    arguments=args,
-                                ))
-                        yield StreamChunk(
-                            text="", done=True,
-                            tool_calls=parsed_tools,
-                        )
-                        return
+                                if tc_delta.get("id"):
+                                    buf["id"] = tc_delta["id"]
+                                func = tc_delta.get("function", {})
+                                if func.get("name"):
+                                    buf["name"] = func["name"]
+                                if func.get("arguments"):
+                                    buf["arguments"] += func["arguments"]
 
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                        # Check for usage in the chunk
+                        usage = None
+                        if data.get("usage"):
+                            u = data["usage"]
+                            usage = TokenUsage(
+                                input_tokens=u.get(
+                                    "prompt_tokens", 0,
+                                ),
+                                output_tokens=u.get(
+                                    "completion_tokens", 0,
+                                ),
+                                total_tokens=u.get(
+                                    "total_tokens", 0,
+                                ),
+                            )
 
-                    choice = data.get("choices", [{}])[0]
-                    delta = choice.get("delta", {})
-                    text = delta.get("content") or ""
-
-                    # Accumulate tool call deltas
-                    if delta.get("tool_calls"):
-                        for tc_delta in delta["tool_calls"]:
-                            idx = tc_delta.get("index", 0)
-                            if idx not in tool_call_buffers:
-                                tool_call_buffers[idx] = {
-                                    "id": "",
-                                    "name": "",
-                                    "arguments": "",
-                                }
-                            buf = tool_call_buffers[idx]
-                            if tc_delta.get("id"):
-                                buf["id"] = tc_delta["id"]
-                            func = tc_delta.get("function", {})
-                            if func.get("name"):
-                                buf["name"] = func["name"]
-                            if func.get("arguments"):
-                                buf["arguments"] += func["arguments"]
-
-                    # Check for usage in the chunk
-                    usage = None
-                    if data.get("usage"):
-                        u = data["usage"]
-                        usage = TokenUsage(
-                            input_tokens=u.get(
-                                "prompt_tokens", 0,
-                            ),
-                            output_tokens=u.get(
-                                "completion_tokens", 0,
-                            ),
-                            total_tokens=u.get(
-                                "total_tokens", 0,
-                            ),
-                        )
-
-                    if text:
-                        yield StreamChunk(
-                            text=text, done=False, usage=usage,
-                        )
+                        if text:
+                            yield StreamChunk(
+                                text=text, done=False, usage=usage,
+                            )
         except httpx.ConnectError as e:
             raise ModelConnectionError(
                 f"Cannot connect to model server at "
@@ -333,7 +464,7 @@ class OpenAICompatibleProvider(ModelProvider):
         injected as a follow-up user message with image_url/file content.
         """
         if not self._capabilities or not self._capabilities.vision:
-            return messages
+            return self._normalize_openai_messages(messages)
 
         result = []
         for msg in messages:
@@ -353,7 +484,93 @@ class OpenAICompatibleProvider(ModelProvider):
                     })
             else:
                 result.append(msg)
-        return result
+        return self._normalize_openai_messages(result)
+
+    @staticmethod
+    def _normalize_openai_messages(messages: list[dict]) -> list[dict]:
+        """Normalize message payloads for stricter OpenAI-compatible servers.
+
+        Some providers reject:
+        - assistant tool-call messages with null content
+        - assistant messages with empty/whitespace-only content
+        - missing tool-call IDs
+        - tool messages with missing tool_call_id
+        """
+        normalized: list[dict] = []
+        pending_tool_ids: list[str] = []
+
+        for msg_index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+
+            out = dict(message)
+            role = str(out.get("role", "")).strip()
+            if out.get("content") is None:
+                out["content"] = ""
+
+            if role == "assistant":
+                content = out.get("content")
+                if isinstance(content, str):
+                    if not content.strip():
+                        out["content"] = OpenAICompatibleProvider.ASSISTANT_CONTENT_FALLBACK
+                elif content is None:
+                    out["content"] = OpenAICompatibleProvider.ASSISTANT_CONTENT_FALLBACK
+                else:
+                    content_as_str = str(content)
+                    out["content"] = (
+                        content_as_str
+                        if content_as_str.strip()
+                        else OpenAICompatibleProvider.ASSISTANT_CONTENT_FALLBACK
+                    )
+
+                raw_tool_calls = out.get("tool_calls")
+                tool_calls: list[dict] = []
+                pending_tool_ids = []
+                if isinstance(raw_tool_calls, list):
+                    for tool_index, tool_call in enumerate(raw_tool_calls):
+                        if not isinstance(tool_call, dict):
+                            continue
+                        call = dict(tool_call)
+                        call_id = str(call.get("id", "")).strip()
+                        if not call_id:
+                            call_id = f"call_{msg_index}_{tool_index}"
+                        call["id"] = call_id
+                        call["type"] = "function"
+
+                        function = call.get("function")
+                        if not isinstance(function, dict):
+                            function = {}
+                        function_payload = dict(function)
+
+                        name = function_payload.get("name")
+                        function_payload["name"] = str(name or "")
+
+                        arguments = function_payload.get("arguments")
+                        if isinstance(arguments, dict):
+                            function_payload["arguments"] = json.dumps(arguments)
+                        elif arguments is None:
+                            function_payload["arguments"] = "{}"
+                        elif not isinstance(arguments, str):
+                            function_payload["arguments"] = str(arguments)
+
+                        call["function"] = function_payload
+                        tool_calls.append(call)
+                        pending_tool_ids.append(call_id)
+
+                out["tool_calls"] = tool_calls
+
+            elif role == "tool":
+                current_id = str(out.get("tool_call_id", "")).strip()
+                if not current_id and pending_tool_ids:
+                    out["tool_call_id"] = pending_tool_ids.pop(0)
+                elif current_id:
+                    out["tool_call_id"] = current_id
+                    if current_id in pending_tool_ids:
+                        pending_tool_ids.remove(current_id)
+
+            normalized.append(out)
+
+        return normalized
 
     def _build_tool_result_content(self, result_json: str) -> str:
         """Convert tool result with content blocks to OpenAI format.

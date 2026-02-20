@@ -1,0 +1,33 @@
+{
+  "id": "market-research-legacy-regex-false-fail",
+  "description": "Legacy regex hard-failed a TODO marker while policy mode allows pass_with_warnings.",
+  "source": {
+    "event_log": "20260218-143500-cowork-6ed45c14.events.jsonl",
+    "sql_snapshot": "task:cowork-6ed45c14"
+  },
+  "context": {
+    "process": "market-research",
+    "phase_id": "map-competition",
+    "tool_calls": [
+      {"tool": "web_search", "status": "ok"},
+      {"tool": "write_file", "status": "ok", "path": "company-service-map.csv"}
+    ]
+  },
+  "legacy": {
+    "tier": 1,
+    "passed": false,
+    "outcome": "fail",
+    "reason_code": "legacy_regex_failure",
+    "severity_class": "hard_invariant"
+  },
+  "policy": {
+    "tier": 2,
+    "passed": true,
+    "outcome": "pass_with_warnings",
+    "reason_code": "",
+    "severity_class": "semantic"
+  },
+  "expected": {
+    "shadow_classification": "old_fail_new_pass"
+  }
+}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -10,6 +11,95 @@ import click
 
 from loom import __version__
 from loom.config import Config, ConfigError, load_config
+from loom.mcp.config import (
+    MCPConfigManager,
+    MCPConfigManagerError,
+    MCPServerView,
+    apply_mcp_overrides,
+    ensure_valid_alias,
+    merge_server_edits,
+    parse_mcp_server_from_flags,
+    redact_server_env,
+)
+
+
+def _resolve_config_path(config_path: Path | None) -> Path | None:
+    """Resolve the effective loom.toml path used for config loading."""
+    if config_path is not None:
+        return config_path
+    candidates = [
+        Path.cwd() / "loom.toml",
+        Path.home() / ".loom" / "loom.toml",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_workspace(workspace: Path | None) -> Path:
+    return (workspace or Path.cwd()).resolve()
+
+
+def _apply_mcp_layers(
+    *,
+    base_config: Config,
+    workspace: Path | None,
+    explicit_mcp_path: Path | None,
+    legacy_config_path: Path | None,
+) -> Config:
+    """Apply merged MCP config layers to an already-loaded base config."""
+    return apply_mcp_overrides(
+        base_config,
+        workspace=workspace,
+        explicit_path=explicit_mcp_path,
+        legacy_config_path=legacy_config_path,
+    )
+
+
+def _effective_config(ctx: click.Context, workspace: Path | None = None) -> Config:
+    """Return config with MCP layering using the provided workspace."""
+    base = ctx.obj["base_config"]
+    explicit_mcp = ctx.obj.get("explicit_mcp_path")
+    legacy_cfg = ctx.obj.get("config_path")
+    active_workspace = workspace or ctx.obj.get("workspace")
+    return _apply_mcp_layers(
+        base_config=base,
+        workspace=active_workspace,
+        explicit_mcp_path=explicit_mcp,
+        legacy_config_path=legacy_cfg,
+    )
+
+
+def _mcp_manager(ctx: click.Context, workspace: Path | None = None) -> MCPConfigManager:
+    """Build shared MCP config manager from CLI context."""
+    active_workspace = workspace or ctx.obj.get("workspace")
+    return MCPConfigManager(
+        config=ctx.obj["base_config"],
+        workspace=active_workspace,
+        explicit_path=ctx.obj.get("explicit_mcp_path"),
+        legacy_config_path=ctx.obj.get("config_path"),
+    )
+
+
+def _serialize_mcp_view(
+    view: MCPServerView,
+    *,
+    redacted: bool = True,
+) -> dict:
+    env = redact_server_env(view.server) if redacted else dict(view.server.env)
+    payload = {
+        "alias": view.alias,
+        "source": view.source,
+        "source_path": str(view.source_path) if view.source_path else None,
+        "command": view.server.command,
+        "args": list(view.server.args),
+        "cwd": view.server.cwd,
+        "timeout_seconds": view.server.timeout_seconds,
+        "enabled": view.server.enabled,
+        "env": env,
+    }
+    return payload
 
 
 @click.group(invoke_without_command=True)
@@ -27,6 +117,13 @@ from loom.config import Config, ConfigError, load_config
     default=None,
     help="Workspace directory. Defaults to current directory.",
 )
+@click.option(
+    "--mcp-config",
+    "mcp_config_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Path to mcp.toml (highest precedence MCP config layer).",
+)
 @click.option("--model", "-m", default=None, help="Model name from config to use.")
 @click.option("--resume", "resume_session", default=None, help="Resume a previous session by ID.")
 @click.option(
@@ -38,6 +135,7 @@ def cli(
     ctx: click.Context,
     config_path: Path | None,
     workspace: Path | None,
+    mcp_config_path: Path | None,
     model: str | None,
     resume_session: str | None,
     process_name: str | None,
@@ -49,12 +147,32 @@ def cli(
     delegation.
     """
     ctx.ensure_object(dict)
+    resolved_config_path = _resolve_config_path(config_path)
     try:
-        ctx.obj["config"] = load_config(config_path)
+        base = load_config(resolved_config_path)
+        effective = _apply_mcp_layers(
+            base_config=base,
+            workspace=workspace,
+            explicit_mcp_path=mcp_config_path,
+            legacy_config_path=resolved_config_path,
+        )
+        ctx.obj["base_config"] = base
+        ctx.obj["config"] = effective
+        ctx.obj["config_path"] = resolved_config_path
+        ctx.obj["workspace"] = _resolve_workspace(workspace)
+        ctx.obj["explicit_mcp_path"] = (
+            mcp_config_path.expanduser().resolve() if mcp_config_path else None
+        )
     except ConfigError as e:
         if ctx.invoked_subcommand == "setup":
             # Let setup proceed even with broken/missing config
             ctx.obj["config"] = Config()
+            ctx.obj["base_config"] = ctx.obj["config"]
+            ctx.obj["config_path"] = resolved_config_path
+            ctx.obj["workspace"] = _resolve_workspace(workspace)
+            ctx.obj["explicit_mcp_path"] = (
+                mcp_config_path.expanduser().resolve() if mcp_config_path else None
+            )
         else:
             click.echo(f"Configuration error: {e}", err=True)
             sys.exit(1)
@@ -97,7 +215,7 @@ def _launch_tui(
     from loom.tui.app import LoomApp
 
     ws = (workspace or Path.cwd()).resolve()
-    tools = create_default_registry()
+    tools = create_default_registry(config)
 
     # Resolve model — None triggers the TUI setup wizard
     provider = None
@@ -119,6 +237,8 @@ def _launch_tui(
             )
             sys.exit(1)
 
+    effective_process = process_name or config.process.default or None
+
     app = LoomApp(
         model=provider,
         tools=tools,
@@ -127,7 +247,7 @@ def _launch_tui(
         db=db,
         store=store,
         resume_session=resume_session,
-        process_name=process_name,
+        process_name=effective_process,
     )
     app.run()
 
@@ -189,7 +309,7 @@ def cowork(
     All conversation history is persisted to SQLite. Use --resume to
     continue a previous session.
     """
-    config = ctx.obj["config"]
+    config = _effective_config(ctx, workspace)
     _launch_tui(config, workspace, model, resume_session, process_name)
 
 
@@ -201,7 +321,7 @@ def cowork(
 @click.pass_context
 def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     """Start the Loom API server."""
-    config = ctx.obj["config"]
+    config = _effective_config(ctx, None)
     actual_host = host if host is not None else config.server.host
     actual_port = port if port is not None else config.server.port
 
@@ -235,17 +355,18 @@ def run(
     server_url: str | None, process_name: str | None,
 ) -> None:
     """Submit a task and stream progress inline."""
-    config = ctx.obj["config"]
+    config = _effective_config(ctx, workspace)
     url = server_url or f"http://{config.server.host}:{config.server.port}"
     ws = str(workspace.resolve()) if workspace else None
+    effective_process = process_name or config.process.default or None
 
     click.echo(f"Submitting task to {url}: {goal}")
     if ws:
         click.echo(f"Workspace: {ws}")
-    if process_name:
-        click.echo(f"Process: {process_name}")
+    if effective_process:
+        click.echo(f"Process: {effective_process}")
 
-    asyncio.run(_run_task(url, goal, ws, process_name=process_name))
+    asyncio.run(_run_task(url, goal, ws, process_name=effective_process))
 
 
 def _validate_task_id(task_id: str) -> str:
@@ -302,7 +423,7 @@ async def _run_task(
 @click.pass_context
 def status(ctx: click.Context, task_id: str, server_url: str | None) -> None:
     """Check status of a task."""
-    config = ctx.obj["config"]
+    config = _effective_config(ctx, None)
     url = server_url or f"http://{config.server.host}:{config.server.port}"
 
     asyncio.run(_check_status(url, task_id))
@@ -337,7 +458,7 @@ async def _check_status(server_url: str, task_id: str) -> None:
 @click.pass_context
 def cancel(ctx: click.Context, task_id: str, server_url: str | None) -> None:
     """Cancel a running task."""
-    config = ctx.obj["config"]
+    config = _effective_config(ctx, None)
     url = server_url or f"http://{config.server.host}:{config.server.port}"
 
     asyncio.run(_cancel_task(url, task_id))
@@ -371,7 +492,7 @@ async def _cancel_task(server_url: str, task_id: str) -> None:
 @click.pass_context
 def models(ctx: click.Context) -> None:
     """List available models and their status."""
-    config = ctx.obj["config"]
+    config = _effective_config(ctx, None)
 
     if not config.models:
         click.echo("No models configured. Add model sections to loom.toml.")
@@ -388,7 +509,7 @@ def models(ctx: click.Context) -> None:
 @click.pass_context
 def mcp_serve(ctx: click.Context, server_url: str | None) -> None:
     """Start Loom as an MCP server (stdio transport)."""
-    config = ctx.obj["config"]
+    config = _effective_config(ctx, None)
     url = server_url or f"http://{config.server.host}:{config.server.port}"
 
     from loom.integrations.mcp_server import LoomMCPServer
@@ -396,6 +517,363 @@ def mcp_serve(ctx: click.Context, server_url: str | None) -> None:
     server = LoomMCPServer(engine_url=url)
     click.echo(f"Starting Loom MCP server (engine: {url})", err=True)
     asyncio.run(server.run_stdio())
+
+
+# -- MCP configuration management commands --------------------------------
+
+@cli.group()
+def mcp() -> None:
+    """Manage external MCP server configuration."""
+
+
+@mcp.command(name="list")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Include expanded command/env/source details.",
+)
+@click.pass_context
+def mcp_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
+    """List merged MCP server configuration."""
+    manager = _mcp_manager(ctx)
+    try:
+        merged = manager.load()
+        views = merged.as_views()
+    except MCPConfigManagerError as e:
+        click.echo(f"List failed: {e}", err=True)
+        sys.exit(1)
+    legacy_present = any(view.source == "legacy" for view in views)
+
+    if as_json:
+        payload = {
+            "servers": [
+                _serialize_mcp_view(view, redacted=True)
+                for view in views
+            ],
+            "legacy_sources_detected": legacy_present,
+        }
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    if not views:
+        click.echo("No MCP servers configured.")
+        return
+
+    click.echo("MCP servers:")
+    for view in views:
+        status = "enabled" if view.server.enabled else "disabled"
+        source_path = str(view.source_path) if view.source_path else "-"
+        click.echo(f"  {view.alias:16} {status:8} source={view.source}")
+        if verbose:
+            args = " ".join(view.server.args)
+            cmd = f"{view.server.command} {args}".strip()
+            click.echo(f"    path: {source_path}")
+            click.echo(f"    command: {cmd}")
+            click.echo(f"    cwd: {view.server.cwd or '-'}")
+            click.echo(f"    timeout_seconds: {view.server.timeout_seconds}")
+            env = redact_server_env(view.server)
+            if env:
+                click.echo("    env:")
+                for key, value in env.items():
+                    click.echo(f"      {key}={value}")
+            else:
+                click.echo("    env: (none)")
+
+    if legacy_present:
+        click.echo(
+            "\nLegacy MCP config detected in loom.toml. "
+            "Run `loom mcp migrate` to move it into mcp.toml."
+        )
+
+
+@mcp.command(name="show")
+@click.argument("alias")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def mcp_show(ctx: click.Context, alias: str, as_json: bool) -> None:
+    """Show one merged MCP server configuration."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        view = manager.get_view(clean_alias)
+    except MCPConfigManagerError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+    if view is None:
+        click.echo(f"MCP server not found: {clean_alias}", err=True)
+        sys.exit(1)
+
+    payload = _serialize_mcp_view(view, redacted=True)
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(f"Alias: {view.alias}")
+    click.echo(f"Source: {view.source}")
+    click.echo(f"Source path: {view.source_path or '-'}")
+    click.echo(f"Enabled: {view.server.enabled}")
+    click.echo(f"Command: {view.server.command}")
+    click.echo(f"Args: {' '.join(view.server.args) if view.server.args else '-'}")
+    click.echo(f"Cwd: {view.server.cwd or '-'}")
+    click.echo(f"Timeout: {view.server.timeout_seconds}s")
+    env = redact_server_env(view.server)
+    if env:
+        click.echo("Env:")
+        for key, value in env.items():
+            click.echo(f"  {key}={value}")
+    else:
+        click.echo("Env: (none)")
+    if view.source == "legacy":
+        click.echo(
+            "Note: this alias is from legacy loom.toml. "
+            "Run `loom mcp migrate` to move it into mcp.toml."
+        )
+
+
+@mcp.command(name="add")
+@click.argument("alias")
+@click.option("--command", "command", required=True, help="Server command binary.")
+@click.option("--arg", "args", multiple=True, help="Server command argument.")
+@click.option("--env", "env_pairs", multiple=True, help="Literal env KEY=VALUE.")
+@click.option(
+    "--env-ref",
+    "env_refs",
+    multiple=True,
+    help="Env indirection KEY=ENV_VAR (stored as ${ENV_VAR}).",
+)
+@click.option("--cwd", default="", help="Working directory for server process.")
+@click.option("--timeout", type=int, default=30, show_default=True)
+@click.option("--disabled", is_flag=True, default=False, help="Add server as disabled.")
+@click.pass_context
+def mcp_add(
+    ctx: click.Context,
+    alias: str,
+    command: str,
+    args: tuple[str, ...],
+    env_pairs: tuple[str, ...],
+    env_refs: tuple[str, ...],
+    cwd: str,
+    timeout: int,
+    disabled: bool,
+) -> None:
+    """Add a new MCP server config entry."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        server = parse_mcp_server_from_flags(
+            command=command,
+            args=args,
+            env_pairs=env_pairs,
+            env_refs=env_refs,
+            cwd=cwd,
+            timeout=timeout,
+            disabled=disabled,
+        )
+        target = manager.add_server(clean_alias, server)
+    except MCPConfigManagerError as e:
+        click.echo(f"Add failed: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Added MCP server '{clean_alias}' to {target}")
+
+
+@mcp.command(name="edit")
+@click.argument("alias")
+@click.option("--command", "command", default=None, help="Server command binary.")
+@click.option("--arg", "args", multiple=True, help="Server command argument.")
+@click.option("--env", "env_pairs", multiple=True, help="Literal env KEY=VALUE.")
+@click.option(
+    "--env-ref",
+    "env_refs",
+    multiple=True,
+    help="Env indirection KEY=ENV_VAR (stored as ${ENV_VAR}).",
+)
+@click.option("--cwd", default=None, help="Working directory for server process.")
+@click.option("--timeout", type=int, default=None, help="Tool timeout seconds.")
+@click.option("--disabled", is_flag=True, default=False, help="Disable server.")
+@click.pass_context
+def mcp_edit(
+    ctx: click.Context,
+    alias: str,
+    command: str | None,
+    args: tuple[str, ...],
+    env_pairs: tuple[str, ...],
+    env_refs: tuple[str, ...],
+    cwd: str | None,
+    timeout: int | None,
+    disabled: bool,
+) -> None:
+    """Edit an existing MCP server config entry."""
+    manager = _mcp_manager(ctx)
+    if (
+        command is None
+        and not args
+        and not env_pairs
+        and not env_refs
+        and cwd is None
+        and timeout is None
+        and not disabled
+    ):
+        click.echo("No edit flags provided.", err=True)
+        sys.exit(1)
+
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        updated_path, _updated = manager.edit_server(
+            clean_alias,
+            lambda current: merge_server_edits(
+                current=current,
+                command=command,
+                args=args,
+                env_pairs=env_pairs,
+                env_refs=env_refs,
+                cwd=cwd,
+                timeout=timeout,
+                disabled=disabled,
+            ),
+        )
+    except MCPConfigManagerError as e:
+        click.echo(f"Edit failed: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Updated MCP server '{clean_alias}' in {updated_path}")
+
+
+@mcp.command(name="remove")
+@click.argument("alias")
+@click.pass_context
+def mcp_remove(ctx: click.Context, alias: str) -> None:
+    """Remove an MCP server config entry."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        path = manager.remove_server(clean_alias)
+    except MCPConfigManagerError as e:
+        click.echo(f"Remove failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Removed MCP server '{clean_alias}' from {path}")
+
+
+@mcp.command(name="enable")
+@click.argument("alias")
+@click.pass_context
+def mcp_enable(ctx: click.Context, alias: str) -> None:
+    """Enable an MCP server."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        path, _updated = manager.edit_server(
+            clean_alias,
+            lambda current: current.__class__(
+                command=current.command,
+                args=list(current.args),
+                env=dict(current.env),
+                cwd=current.cwd,
+                timeout_seconds=current.timeout_seconds,
+                enabled=True,
+            ),
+        )
+    except MCPConfigManagerError as e:
+        click.echo(f"Enable failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Enabled MCP server '{clean_alias}' in {path}")
+
+
+@mcp.command(name="disable")
+@click.argument("alias")
+@click.pass_context
+def mcp_disable(ctx: click.Context, alias: str) -> None:
+    """Disable an MCP server."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        path, _updated = manager.edit_server(
+            clean_alias,
+            lambda current: current.__class__(
+                command=current.command,
+                args=list(current.args),
+                env=dict(current.env),
+                cwd=current.cwd,
+                timeout_seconds=current.timeout_seconds,
+                enabled=False,
+            ),
+        )
+    except MCPConfigManagerError as e:
+        click.echo(f"Disable failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Disabled MCP server '{clean_alias}' in {path}")
+
+
+@mcp.command(name="test")
+@click.argument("alias")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def mcp_test(ctx: click.Context, alias: str, as_json: bool) -> None:
+    """Probe MCP server connectivity and tools/list behavior."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+    except MCPConfigManagerError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+
+    try:
+        view, tools = manager.probe_server(clean_alias)
+        if view is None:
+            click.echo(f"MCP server not found: {clean_alias}", err=True)
+            sys.exit(1)
+    except Exception as e:
+        click.echo(f"MCP probe failed for '{clean_alias}': {e}", err=True)
+        sys.exit(1)
+
+    tool_names = [str(tool.get("name", "")) for tool in tools]
+    payload = {
+        "alias": view.alias,
+        "source": view.source,
+        "source_path": str(view.source_path) if view.source_path else None,
+        "tool_count": len(tool_names),
+        "tools": tool_names,
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(
+        f"MCP probe succeeded for '{view.alias}' "
+        f"({len(tool_names)} tool(s) discovered)."
+    )
+    if tool_names:
+        for tool_name in tool_names:
+            click.echo(f"  - {tool_name}")
+    else:
+        click.echo("  (no tools returned)")
+
+
+@mcp.command(name="migrate")
+@click.pass_context
+def mcp_migrate(ctx: click.Context) -> None:
+    """Move legacy `[mcp]` config from loom.toml into mcp.toml."""
+    manager = _mcp_manager(ctx)
+    try:
+        target, copied, removed = manager.migrate_legacy()
+    except MCPConfigManagerError as e:
+        click.echo(f"Migrate failed: {e}", err=True)
+        sys.exit(1)
+
+    if copied == 0:
+        click.echo("No legacy MCP config entries found to migrate.")
+        return
+
+    click.echo(f"Migrated {copied} MCP server(s) into {target}")
+    if removed:
+        click.echo("Removed legacy [mcp] sections from loom.toml.")
+    else:
+        click.echo(
+            "Legacy mcp sections were not removed automatically. "
+            "Review loom.toml if needed."
+        )
 
 
 # -- Process management commands -------------------------------------------
@@ -412,10 +890,19 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
     """List available process definitions."""
     from loom.processes.schema import ProcessLoader
 
-    config = ctx.obj["config"]
+    config = _effective_config(ctx, workspace)
     ws = (workspace or Path.cwd()).resolve()
     extra = [Path(p) for p in config.process.search_paths]
-    loader = ProcessLoader(workspace=ws, extra_search_paths=extra)
+    loader = ProcessLoader(
+        workspace=ws,
+        extra_search_paths=extra,
+        require_rule_scope_metadata=bool(
+            getattr(config.process, "require_rule_scope_metadata", False),
+        ),
+        require_v2_contract=bool(
+            getattr(config.process, "require_v2_contract", False),
+        ),
+    )
     available = loader.list_available()
 
     if not available:
@@ -440,6 +927,107 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
     )
 
 
+@cli.group()
+def process() -> None:
+    """Process subcommands."""
+
+
+@process.command(name="test")
+@click.argument("name_or_path")
+@click.option(
+    "--workspace", "-w",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Workspace for process execution and local process discovery.",
+)
+@click.option(
+    "--live",
+    is_flag=True,
+    default=False,
+    help="Include live test cases from process.yaml (requires configured models).",
+)
+@click.option(
+    "--case",
+    "case_id",
+    default=None,
+    help="Run a single process test case by ID.",
+)
+@click.pass_context
+def process_test(
+    ctx: click.Context,
+    name_or_path: str,
+    workspace: Path | None,
+    live: bool,
+    case_id: str | None,
+) -> None:
+    """Run declared (or default) process test cases.
+
+    NAME_OR_PATH can be either a process name from discovery or a direct
+    path to a process YAML/package directory.
+    """
+    from loom.processes.schema import ProcessLoader
+    from loom.processes.testing import run_process_tests
+
+    ws = (workspace or Path.cwd()).resolve()
+    config = _effective_config(ctx, ws)
+    extra = [Path(p) for p in config.process.search_paths]
+    loader = ProcessLoader(
+        workspace=ws,
+        extra_search_paths=extra,
+        require_rule_scope_metadata=bool(
+            getattr(config.process, "require_rule_scope_metadata", False),
+        ),
+        require_v2_contract=bool(
+            getattr(config.process, "require_v2_contract", False),
+        ),
+    )
+
+    try:
+        process_def = loader.load(name_or_path)
+    except Exception as e:
+        click.echo(f"Failed to load process {name_or_path!r}: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(
+        f"Running process tests for {process_def.name} v{process_def.version}"
+    )
+
+    try:
+        results = asyncio.run(run_process_tests(
+            process_def,
+            config=config,
+            workspace=ws,
+            include_live=live,
+            case_id=case_id,
+        ))
+    except ValueError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+
+    if not results:
+        click.echo("No matching process test cases selected.")
+        sys.exit(1)
+
+    failed = 0
+    for result in results:
+        status = "PASS" if result.passed else "FAIL"
+        click.echo(
+            f"[{status}] case={result.case_id} mode={result.mode} "
+            f"task_status={result.task_status or 'n/a'} "
+            f"duration={result.duration_seconds:.2f}s"
+        )
+        if result.message:
+            click.echo(f"  {result.message}")
+        for detail in result.details:
+            click.echo(f"  - {detail}")
+        if not result.passed:
+            failed += 1
+
+    click.echo(f"\n{len(results) - failed}/{len(results)} case(s) passed.")
+    if failed:
+        sys.exit(1)
+
+
 @cli.command(name="install")
 @click.argument("source")
 @click.option(
@@ -453,6 +1041,13 @@ def processes(ctx: click.Context, workspace: Path | None) -> None:
     help="Skip installing Python dependencies.",
 )
 @click.option(
+    "--isolated-deps", is_flag=True, default=False,
+    help=(
+        "Install package dependencies into <target>/.deps/<process-name>/ "
+        "instead of the current Python environment."
+    ),
+)
+@click.option(
     "--yes", "-y", is_flag=True, default=False,
     help="Skip interactive review and approve automatically.",
 )
@@ -462,6 +1057,7 @@ def install(
     source: str,
     install_workspace: Path | None,
     skip_deps: bool,
+    isolated_deps: bool,
     yes: bool,
 ) -> None:
     """Install a process package from a GitHub repo or local path.
@@ -488,6 +1084,7 @@ def install(
       loom install acme/loom-google-analytics
       loom install ./my-local-process
       loom install ./my-local-process -w /path/to/project
+      loom install ./my-local-process --isolated-deps
     """
     from loom.processes.installer import (
         InstallError,
@@ -501,6 +1098,15 @@ def install(
         target_dir = Path.home() / ".loom" / "processes"
 
     click.echo(f"Resolving source: {source}")
+    if isolated_deps and not skip_deps:
+        click.echo(
+            "Dependency mode: isolated "
+            "(per-process env under <target>/.deps/...)"
+        )
+    elif isolated_deps and skip_deps:
+        click.echo(
+            "Note: --isolated-deps has no effect when --skip-deps is set."
+        )
 
     def _review_and_prompt(review) -> bool:
         """Display review and ask user for confirmation."""
@@ -515,6 +1121,7 @@ def install(
             source,
             target_dir=target_dir,
             skip_deps=skip_deps,
+            isolated_deps=isolated_deps,
             review_callback=_review_and_prompt,
         )
         click.echo(f"Installed to: {dest}")
@@ -569,28 +1176,37 @@ def uninstall(
     "--limit", default=30, show_default=True,
     help="Max number of patterns to show.",
 )
+@click.option(
+    "--all", "include_all", is_flag=True, default=False,
+    help="Include internal operational patterns (task templates, retries, failures).",
+)
 @click.pass_context
 def learned(
     ctx: click.Context,
     pattern_type: str | None,
     delete_id: int | None,
     limit: int,
+    include_all: bool,
 ) -> None:
     """Review learned patterns.
 
-    Lists all patterns the learning system has extracted from your
-    interactions.  Use --delete ID to remove a specific pattern.
+    By default, shows learned behavioral patterns used to personalize
+    cowork interactions. Use --all to include internal operational
+    patterns from autonomous task execution.
+
+    Use --delete ID to remove a specific pattern.
 
     \b
     Examples:
-      loom learned                              # list all
+      loom learned                              # list behavioral patterns
+      loom learned --all                        # include internal patterns
       loom learned --type behavioral_gap        # filter by type
       loom learned --delete 5                   # delete pattern #5
     """
     from loom.learning.manager import LearningManager
     from loom.state.memory import Database
 
-    config = ctx.obj["config"]
+    config = _effective_config(ctx, None)
 
     async def _run():
         db = Database(str(Path(config.memory.database_path).expanduser()))
@@ -609,8 +1225,10 @@ def learned(
             patterns = await mgr.query_patterns(
                 pattern_type=pattern_type, limit=limit,
             )
-        else:
+        elif include_all:
             patterns = await mgr.query_all(limit=limit)
+        else:
+            patterns = await mgr.query_behavioral(limit=limit)
 
         if not patterns:
             click.echo("No learned patterns.")
@@ -637,7 +1255,7 @@ def reset_learning(ctx: click.Context) -> None:
     from loom.learning.manager import LearningManager
     from loom.state.memory import Database
 
-    config = ctx.obj["config"]
+    config = _effective_config(ctx, None)
 
     async def _reset():
         db = Database(str(Path(config.memory.database_path).expanduser()))

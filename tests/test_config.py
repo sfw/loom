@@ -19,11 +19,20 @@ class TestDefaultConfig:
         config = Config()
         assert config.models == {}
 
+    def test_default_mcp_servers_empty(self):
+        config = Config()
+        assert config.mcp.servers == {}
+
     def test_default_execution(self):
         config = Config()
         assert config.execution.max_subtask_retries == 3
         assert config.execution.max_loop_iterations == 50
         assert config.execution.auto_approve_confidence_threshold == 0.8
+        assert config.execution.delegate_task_timeout_seconds == 3600
+        assert config.execution.model_call_max_attempts == 5
+        assert config.execution.model_call_retry_base_delay_seconds == 0.5
+        assert config.execution.model_call_retry_max_delay_seconds == 8.0
+        assert config.execution.model_call_retry_jitter_seconds == 0.25
 
     def test_default_verification(self):
         config = Config()
@@ -31,6 +40,21 @@ class TestDefaultConfig:
         assert config.verification.tier2_enabled is True
         assert config.verification.tier3_enabled is False
         assert config.verification.tier3_vote_count == 3
+        assert config.verification.policy_engine_enabled is True
+        assert config.verification.regex_default_advisory is True
+        assert config.verification.phase_scope_default == "current_phase"
+        assert config.verification.allow_partial_verified is True
+        assert config.verification.unconfirmed_supporting_threshold == 0.30
+        assert config.verification.confirm_or_prune_max_attempts == 2
+        assert config.verification.confirm_or_prune_backoff_seconds == 2.0
+        assert config.verification.confirm_or_prune_retry_on_transient is True
+
+    def test_default_process_flags(self):
+        config = Config()
+        assert config.process.require_rule_scope_metadata is False
+        assert config.process.require_v2_contract is False
+        assert config.process.tui_run_scoped_workspace_enabled is True
+        assert config.process.llm_run_folder_naming_enabled is True
 
     def test_database_path_expands_user(self):
         config = Config()
@@ -120,3 +144,98 @@ enable_streaming = true
     def test_enable_streaming_default_false(self):
         config = Config()
         assert config.execution.enable_streaming is False
+
+    def test_execution_model_retry_policy_loaded(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[execution]
+delegate_task_timeout_seconds = 7200
+model_call_max_attempts = 9
+model_call_retry_base_delay_seconds = 0.75
+model_call_retry_max_delay_seconds = 12.0
+model_call_retry_jitter_seconds = 0.10
+""")
+        config = load_config(toml_file)
+        assert config.execution.delegate_task_timeout_seconds == 7200
+        assert config.execution.model_call_max_attempts == 9
+        assert config.execution.model_call_retry_base_delay_seconds == 0.75
+        assert config.execution.model_call_retry_max_delay_seconds == 12.0
+        assert config.execution.model_call_retry_jitter_seconds == 0.10
+
+    def test_execution_model_retry_policy_clamps_values(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[execution]
+delegate_task_timeout_seconds = 0
+model_call_max_attempts = 42
+model_call_retry_base_delay_seconds = -1.0
+model_call_retry_max_delay_seconds = -2.0
+model_call_retry_jitter_seconds = -0.5
+""")
+        config = load_config(toml_file)
+        assert config.execution.delegate_task_timeout_seconds == 1
+        assert config.execution.model_call_max_attempts == 10
+        assert config.execution.model_call_retry_base_delay_seconds == 0.0
+        assert config.execution.model_call_retry_max_delay_seconds == 0.0
+        assert config.execution.model_call_retry_jitter_seconds == 0.0
+
+    def test_verification_policy_flags_loaded(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[verification]
+policy_engine_enabled = false
+regex_default_advisory = false
+phase_scope_default = "global"
+allow_partial_verified = false
+unconfirmed_supporting_threshold = 0.55
+auto_confirm_prune_critical_path = false
+confirm_or_prune_max_attempts = 4
+confirm_or_prune_backoff_seconds = 1.25
+confirm_or_prune_retry_on_transient = false
+""")
+        config = load_config(toml_file)
+        assert config.verification.policy_engine_enabled is False
+        assert config.verification.regex_default_advisory is False
+        assert config.verification.phase_scope_default == "global"
+        assert config.verification.allow_partial_verified is False
+        assert config.verification.unconfirmed_supporting_threshold == 0.55
+        assert config.verification.auto_confirm_prune_critical_path is False
+        assert config.verification.confirm_or_prune_max_attempts == 4
+        assert config.verification.confirm_or_prune_backoff_seconds == 1.25
+        assert config.verification.confirm_or_prune_retry_on_transient is False
+
+    def test_process_flags_loaded(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[process]
+require_rule_scope_metadata = true
+require_v2_contract = true
+tui_run_scoped_workspace_enabled = false
+llm_run_folder_naming_enabled = false
+""")
+        config = load_config(toml_file)
+        assert config.process.require_rule_scope_metadata is True
+        assert config.process.require_v2_contract is True
+        assert config.process.tui_run_scoped_workspace_enabled is False
+        assert config.process.llm_run_folder_naming_enabled is False
+
+    def test_load_mcp_servers(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[mcp.servers.notion]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-notion"]
+timeout_seconds = 45
+enabled = true
+
+[mcp.servers.notion.env]
+NOTION_TOKEN = "secret-token"
+""")
+        config = load_config(toml_file)
+        assert "notion" in config.mcp.servers
+        server = config.mcp.servers["notion"]
+        assert server.command == "npx"
+        assert server.args == ["-y", "@modelcontextprotocol/server-notion"]
+        assert server.timeout_seconds == 45
+        assert server.enabled is True
+        assert server.env["NOTION_TOKEN"] == "secret-token"

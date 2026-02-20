@@ -1,150 +1,374 @@
 name: investment-analysis
-version: "1.0"
+version: "1.2"
+schema_version: 2
 description: >
-  Structured financial analysis for evaluating public equities or private
-  companies. Covers screening, fundamentals, valuation, risk assessment,
-  and investment memo generation. Buy-side research quality output.
+  Decision-grade investment workflow for public equities and private companies.
+  Covers thesis formation, financial and capital-structure analysis,
+  expectations-vs-variant framing, valuation method selection, scenario/return
+  modeling, risk and catalyst planning, and investment memo output.
 author: "Loom Team"
-tags: [finance, investing, valuation, equities, due-diligence]
+tags: [finance, investing, valuation, equities, due-diligence, memo, variant-view]
 
 persona: |
   You are a senior equity research analyst. Think in unit economics, moats,
-  and normalized earnings power. Cross-check management claims against
-  financials. Distinguish facts from estimates. Never present a valuation
-  without a sensitivity range.
+  balance-sheet resilience, and normalized earnings power. Cross-check
+  management claims against filings and reported numbers. Distinguish facts
+  from estimates. Never present a valuation without scenario ranges,
+  probability-weighted return math, and thesis-break conditions.
 
 phase_mode: strict
 
 tool_guidance: |
-  Use CSV for financial data and models. Markdown for narrative. Always
-  state fiscal year, currency, reported vs adjusted. Prefer TTM with date.
+  Use CSV for models and Markdown for narrative. Always state fiscal period,
+  currency, and reported vs adjusted metrics. For filing-derived metrics,
+  prefer SEC sources first (`https://data.sec.gov/submissions/CIK*.json` and
+  filing URLs from SEC metadata). If SEC is unavailable, document the fallback
+  source chain explicitly.
+
+tools:
+  guidance: >
+    Use web_search/web_fetch for filings and market context, spreadsheet for
+    valuation/return models, and document_write for memo assembly.
+  required: [web_search, web_fetch, spreadsheet, calculator, read_file, write_file, document_write, search_files]
+  excluded: [delete_file, shell_execute, git_command]
 
 phases:
   - id: company-screening
     description: >
-      Establish the thesis to test. Gather business model, revenue segments,
-      geographic mix, management tenure, share structure, and recent events.
+      Establish the thesis to test. Gather business model, segment/geography
+      mix, management quality, capital allocation profile, and recent catalysts.
     depends_on: []
     model_tier: 2
-    verification_tier: 1
+    verification_tier: 2
+    is_critical_path: true
     acceptance_criteria: >
-      Covers business description, revenue by segment and geography, key
-      management, share count, insider ownership, and one-sentence thesis.
+      Covers business description, segment/geography mix, management context,
+      share structure/ownership, and one-sentence testable thesis.
     deliverables:
       - "company-overview.md — business description and thesis"
       - "revenue-segments.csv — revenue by segment and geography"
+      - "governance-capital-allocation.md — management incentives and capital policy"
+
   - id: financial-analysis
     description: >
-      Analyze 3-5 years of historicals. Compute growth, margins, ROIC, FCF
-      conversion, and leverage. Identify trends and red flags.
+      Analyze historical financials and operating performance. Compute growth,
+      margins, returns, working-capital dynamics, cash conversion, leverage,
+      and normalization adjustments.
     depends_on: [company-screening]
     model_tier: 3
     verification_tier: 2
+    is_critical_path: true
     acceptance_criteria: >
-      Income statement, balance sheet, and cash flow for 3+ years. Key
-      ratios calculated and trended. Accounting adjustments noted.
+      Includes core financial statements with trend commentary, key ratios,
+      accounting adjustments, and data limitations. Flags red flags clearly.
     deliverables:
-      - "financial-summary.csv — 3-5 year historical financials"
+      - "financial-summary.csv — multi-year historical financials"
       - "ratio-analysis.md — key ratios, trends, and commentary"
-  - id: valuation-model
+      - "accounting-adjustments.md — normalization and accounting notes"
+      - "capital-structure.csv — debt schedule, maturity profile, and dilution context"
+
+  - id: expectations-and-variant-view
     description: >
-      Build DCF with explicit assumptions. Cross-check with comparable
-      multiples (EV/EBITDA, P/E, EV/Revenue). Provide bear/base/bull range.
+      Define what current pricing appears to imply and articulate the variant
+      thesis relative to consensus/market expectations.
     depends_on: [financial-analysis]
     model_tier: 3
     verification_tier: 2
+    is_critical_path: true
     acceptance_criteria: >
-      DCF with 5-year forecast plus terminal value. Terminal value under
-      65% of EV (or justified). WACC stated. 3+ public comparables used.
+      Market-implied expectations are explicit (growth, margin, multiple, or
+      other key drivers). Variant thesis explains why expectations are too high
+      or too low and includes at least 3 disconfirming signals to monitor.
     deliverables:
-      - "dcf-model.csv — DCF with assumptions and sensitivity table"
-      - "comparable-multiples.csv — peer trading multiples"
-      - "valuation-summary.md — methodology, range, and key drivers"
+      - "expectations-gap.md — implied expectations vs analyst/consensus context"
+      - "variant-thesis.md — differentiated thesis, evidence, and disconfirmers"
+
+  - id: valuation-approach
+    description: >
+      Select valuation methods appropriate for company stage and data quality
+      (e.g., DCF/comps for mature public, scenario/revenue multiple for
+      pre-revenue or private).
+    depends_on: [expectations-and-variant-view]
+    model_tier: 2
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Primary method is selected with fit rationale. Alternate method and
+      fallback triggers are documented. Method aligns with stage/profile.
+    deliverables:
+      - "valuation-approach.md — method selection and applicability rationale"
+
+  - id: valuation-model
+    description: >
+      Build valuation model(s) and scenario return math. Include bear/base/bull
+      ranges, probability weights, and key sensitivity drivers.
+    depends_on: [valuation-approach]
+    model_tier: 3
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Model includes assumptions, scenario ranges, and sensitivity table.
+      Scenario probabilities sum to 100%. Output includes expected value and
+      annualized return framing for the defined horizon.
+    deliverables:
+      - "valuation-model.csv — assumptions, scenarios, and sensitivity table"
+      - "comparable-multiples.csv — peer or transaction multiples reference"
+      - "return-distribution.csv — scenario probabilities and expected return math"
+      - "valuation-summary.md — valuation range, key drivers, and caveats"
+
   - id: risk-assessment
     description: >
-      Identify and rank material risks across business, competitive,
-      regulatory, financial, and macro categories with impact estimates.
+      Identify and rank risks across business, competitive, regulatory,
+      financial, governance, and macro categories with value-impact estimates.
     depends_on: [valuation-model]
     model_tier: 2
     verification_tier: 2
+    is_critical_path: true
     acceptance_criteria: >
-      8+ risks identified. Each has likelihood (low/med/high), valuation
-      impact in percentage terms, and a mitigant or monitoring signal.
+      At least 8 material risks with likelihood, valuation impact estimate,
+      and mitigant/monitoring signal. Includes explicit thesis-break conditions.
     deliverables:
       - "risk-matrix.md — categorized risks with likelihood and impact"
       - "risk-register.csv — structured risk data"
+      - "thesis-breakers.md — hard invalidation conditions for the thesis"
+
+  - id: catalyst-and-monitoring-plan
+    description: >
+      Build a dated catalyst calendar and an ongoing monitoring dashboard with
+      thresholds that would increase, reduce, or exit conviction.
+    depends_on: [risk-assessment]
+    model_tier: 2
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Catalyst calendar includes date windows, probability, and expected impact.
+      Monitoring dashboard includes KPI thresholds and explicit action rules.
+    deliverables:
+      - "catalyst-calendar.csv — catalyst timing, probability, and impact"
+      - "monitoring-dashboard.csv — KPIs, thresholds, and action triggers"
+      - "position-sizing-framework.md — sizing logic tied to conviction and downside"
+
   - id: investment-memo
     description: >
-      Synthesize into a concise memo with recommendation, target price
-      range, catalysts, and monitoring triggers.
-    depends_on: [risk-assessment]
+      Synthesize analysis into a recommendation memo with thesis, expectations
+      gap, valuation/return range, catalysts, risks, and monitoring plan.
+    depends_on: [catalyst-and-monitoring-plan]
     model_tier: 3
     verification_tier: 2
+    is_critical_path: true
+    is_synthesis: true
     acceptance_criteria: >
-      Under 2000 words. Includes executive summary, thesis, valuation range,
-      top 3 risks, catalysts with timing, and position sizing guidance.
+      Memo is under 2000 words and includes thesis, expectations-vs-variant,
+      recommendation, bear/base/bull valuation range, expected return summary,
+      top risks, catalysts with timing, thesis-breakers, and monitoring plan.
     deliverables:
       - "investment-memo.md — final recommendation with analysis"
 
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Run the investment-analysis process and produce all declared deliverables."
+    timeout_seconds: 900
+    acceptance:
+      phases:
+        must_include: [company-screening, financial-analysis, expectations-and-variant-view, valuation-approach, valuation-model, risk-assessment, catalyst-and-monitoring-plan, investment-memo]
+      deliverables:
+        must_exist: [company-overview.md, revenue-segments.csv, governance-capital-allocation.md, financial-summary.csv, ratio-analysis.md, accounting-adjustments.md, capital-structure.csv, expectations-gap.md, variant-thesis.md, valuation-approach.md, valuation-model.csv, comparable-multiples.csv, return-distribution.csv, valuation-summary.md, risk-matrix.md, risk-register.csv, thesis-breakers.md, catalyst-calendar.csv, monitoring-dashboard.csv, position-sizing-framework.md, investment-memo.md]
+      verification:
+        forbidden_patterns: ["Expected deliverable '.*' not found", "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"]
+
+  - id: live-canary
+    mode: live
+    goal: "Analyze a company for investment and produce a complete memo."
+    timeout_seconds: 1200
+    requires_network: true
+
 verification:
+  policy:
+    mode: llm_first
+    static_checks:
+      tool_success_policy: safety_integrity_only
+      file_integrity_policy: enforce_nonempty_changed_files
+      syntax_policy: enforce_parseable_artifacts
+      deliverable_existence_policy: enforce_declared_deliverables
+    semantic_checks:
+      - id: process-rules
+        check: "Apply process-defined verification rules and acceptance criteria."
+        severity: error
+        enforcement: hard
+        scope: phase
+    output_contract:
+      required_fields:
+        - passed
+        - outcome
+        - reason_code
+        - severity_class
+        - confidence
+        - feedback
+        - issues
+        - metadata
+      metadata_fields:
+        - remediation_required
+        - remediation_mode
+        - missing_targets
+    outcome_policy:
+      pass_states: [pass, pass_with_warnings, partial_verified]
+      fail_states: [fail]
+  remediation:
+    strategies:
+      - id: targeted-remediation
+        retry_strategy: unconfirmed_data
+        description: "Perform targeted follow-up based on verifier reason_code/metadata."
+    default_strategy: targeted-remediation
+    critical_path_behavior: block
+    retry_budget:
+      max_attempts: 2
+    transient_retry_policy:
+      retry_on_transient: true
   rules:
     - name: financial-linkage
-      description: "Financial statements must be internally consistent"
+      description: "Financial statements and commentary must be internally consistent"
       check: >
-        Verify net income ties to retained earnings change. Verify
-        depreciation in cash flow matches accumulated depreciation change.
+        Verify major statement relationships and that narrative commentary does
+        not contradict presented numbers.
       severity: error
       type: llm
-    - name: terminal-value-check
-      description: "Terminal value should not dominate the DCF"
+      applies_to_phases: [financial-analysis, valuation-model, investment-memo]
+
+    - name: method-fit
+      description: "Valuation method must fit company stage and data quality"
       check: >
-        If terminal value exceeds 65% of enterprise value, flag it and
-        check whether terminal growth rate exceeds long-run GDP growth.
+        Confirm valuation approach is appropriate for public/private and mature/
+        early-stage context, and that limitations are disclosed.
+      severity: error
+      type: llm
+      applies_to_phases: [valuation-approach, valuation-model]
+
+    - name: expectations-gap-present
+      description: "Memo must explicitly include expectations vs variant thesis"
+      check: >
+        Verify the output states what is implied by current pricing and how the
+        analyst view differs, including disconfirming signals.
+      severity: error
+      type: llm
+      applies_to_phases: [expectations-and-variant-view, investment-memo]
+
+    - name: probability-weighted-returns
+      description: "Scenario probabilities and expected return math are required"
+      check: >
+        Confirm scenario probabilities are defined and sum coherently, and that
+        expected return framing is mathematically consistent with scenario
+        outputs.
+      severity: error
+      type: llm
+      applies_to_phases: [valuation-model, investment-memo]
+
+    - name: capital-structure-risk
+      description: "Balance-sheet and dilution risks must be assessed"
+      check: >
+        Validate debt maturity, refinancing/dilution risk, and downside
+        implications are covered when material.
+      severity: error
+      type: llm
+      applies_to_phases: [financial-analysis, risk-assessment, investment-memo]
+
+    - name: terminal-value-check
+      description: "Terminal value dominance should be flagged in DCF cases"
+      check: >
+        When DCF is used, flag if terminal value dominates EV or terminal
+        assumptions appear unrealistic relative to long-run growth context.
       severity: warning
       type: llm
+      applies_to_phases: [valuation-model]
+
+    - name: memo-completeness
+      description: "Investment memo must include all required decision sections"
+      check: >
+        Verify memo includes thesis, expectations gap, valuation range, expected
+        return framing, catalysts, risks, thesis-breakers, and monitoring plan.
+      severity: error
+      type: llm
+      applies_to_phases: [investment-memo]
+
     - name: no-placeholders
       description: "No placeholder text in deliverables"
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
       severity: error
       type: regex
+      applies_to_phases: ["*"]
+
+evidence:
+  record_schema:
+    required_fields: [evidence_id, tool, source_url, created_at, quality]
+    facets: [target, entity, subject, region, category, segment, topic]
+  extraction:
+    include_result_facets: true
+    arg_mappings:
+      target: [target, entity, subject, company, market]
+      region: [region, geography, country]
+      category: [category, dimension, theme]
+  summarization:
+    max_entries: 12
+    include_facets: true
+
+prompt_contracts:
+  evidence_contract:
+    enabled: true
+    applies_to_phases: ["*"]
+  executor_constraints: |
+    Keep factual claims traceable to evidence IDs or source URLs.
+    If a claim cannot be verified, label it explicitly as unverified.
+  verifier_constraints: |
+    Evaluate acceptance criteria and process verification rules without assuming
+    a fixed output schema. Use metadata keys only when inferable.
+  remediation_instructions:
+    default: |
+      Perform targeted remediation only for failing checks. Preserve validated
+      work, add missing evidence links, and avoid broad reruns.
 
 memory:
   extract_types:
     - type: financial_metric
-      description: "Key financial data point with year and source"
+      description: "Key financial data point with period and source"
     - type: valuation_assumption
-      description: "Model assumption — discount rate, growth, margin target"
+      description: "Model assumption (discount rate, growth, margin, multiple)"
     - type: risk_factor
-      description: "Identified risk with likelihood and estimated value impact"
+      description: "Identified risk with likelihood and value impact"
+    - type: catalyst
+      description: "Event that could materially change valuation"
+    - type: thesis_breaker
+      description: "Condition that invalidates the investment thesis"
     - type: market_condition
-      description: "Macro or sector condition affecting the thesis"
+      description: "Macro or sector condition affecting thesis"
   extraction_guidance: |
-    Tag metrics with fiscal year. Tag assumptions with bear/base/bull case.
-    Tag risks with category. Prioritize facts that change the recommendation.
+    Tag metrics with fiscal period and currency. Tag assumptions by scenario
+    (bear/base/bull). Prioritize facts that change recommendation direction.
 
 workspace_analysis:
   scan_for:
-    - "*.csv — financial data, price history, or peer comparisons"
-    - "*.md — prior research notes or analyst reports"
+    - "**/*.csv — financial data, price history, or peer comparisons"
+    - "**/*.md — prior research notes, analyst writeups, or memos"
   guidance: |
-    Use existing financial data as starting point. Check for models with
-    assumptions worth reviewing or updating.
+    Use existing models as starting points, but validate assumptions and refresh
+    stale periods before making recommendations.
 
 planner_examples:
   - goal: "Analyze whether Cloudflare (NET) is compelling at current prices"
     subtasks:
-      - { id: company-screening, description: "Profile CDN/security/edge segments, revenue mix, retention rates", depends_on: [], model_tier: 2 }
-      - { id: financial-analysis, description: "FY2021-2025: growth durability, margin expansion, profitability path", depends_on: [company-screening], model_tier: 3 }
-      - { id: valuation-model, description: "5-year DCF, 25% op margin target, cross-check vs Datadog/Zscaler", depends_on: [financial-analysis], model_tier: 3 }
-      - { id: risk-assessment, description: "AWS/GCP bundling, concentration, SBC dilution, macro sensitivity", depends_on: [valuation-model], model_tier: 2 }
-      - { id: investment-memo, description: "Buy/hold/avoid with 12-month target and key catalysts", depends_on: [risk-assessment], model_tier: 3 }
+      - { id: company-screening, description: "Profile segment mix, retention dynamics, and thesis", depends_on: [], model_tier: 2 }
+      - { id: financial-analysis, description: "Review growth durability, margins, cash conversion, and balance-sheet resilience", depends_on: [company-screening], model_tier: 3 }
+      - { id: expectations-and-variant-view, description: "Map market expectations and define variant thesis", depends_on: [financial-analysis], model_tier: 3 }
+      - { id: valuation-approach, description: "Select valuation methods appropriate to profile", depends_on: [expectations-and-variant-view], model_tier: 2 }
+      - { id: valuation-model, description: "Build scenario valuation and expected return distribution", depends_on: [valuation-approach], model_tier: 3 }
+      - { id: risk-assessment, description: "Rank thesis risks and hard breakers", depends_on: [valuation-model], model_tier: 2 }
+      - { id: catalyst-and-monitoring-plan, description: "Define catalyst calendar and monitoring triggers", depends_on: [risk-assessment], model_tier: 2 }
+      - { id: investment-memo, description: "Write recommendation with sizing and monitoring guardrails", depends_on: [catalyst-and-monitoring-plan], model_tier: 3 }
 
 replanning:
   triggers: |
-    - Company is pre-revenue or has unusual accounting making DCF inappropriate
-    - Major corporate event (acquisition, restructuring) changes the thesis
-    - Thesis-breaking risk discovered in assessment phase
+    - Company stage/profile makes initial valuation approach inappropriate
+    - Major corporate event changes the thesis materially
+    - New evidence invalidates core variant assumptions
   guidance: |
-    For pre-revenue, substitute DCF with scenario-based valuation using
-    revenue milestones. If thesis breaks, fast-track to memo with avoid
-    recommendation rather than completing remaining phases.
+    If method fit changes, revisit valuation-approach before modeling. If the
+    variant thesis breaks, update recommendation immediately.

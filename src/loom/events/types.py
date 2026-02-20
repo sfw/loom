@@ -19,6 +19,7 @@ SUBTASK_BLOCKED = "subtask_blocked"
 # Tool events
 TOOL_CALL_STARTED = "tool_call_started"
 TOOL_CALL_COMPLETED = "tool_call_completed"
+ARTIFACT_CONFINEMENT_VIOLATION = "artifact_confinement_violation"
 
 # Model events
 MODEL_INVOCATION = "model_invocation"
@@ -27,6 +28,14 @@ MODEL_INVOCATION = "model_invocation"
 VERIFICATION_STARTED = "verification_started"
 VERIFICATION_PASSED = "verification_passed"
 VERIFICATION_FAILED = "verification_failed"
+VERIFICATION_RULE_APPLIED = "verification_rule_applied"
+VERIFICATION_RULE_SKIPPED = "verification_rule_skipped"
+VERIFICATION_OUTCOME = "verification_outcome"
+VERIFICATION_SHADOW_DIFF = "verification_shadow_diff"
+VERIFICATION_FALSE_NEGATIVE_CANDIDATE = "verification_false_negative_candidate"
+VERIFICATION_INCONCLUSIVE_RATE = "verification_inconclusive_rate"
+VERIFICATION_RULE_FAILURE_BY_TYPE = "rule_failure_by_type"
+VERIFICATION_DETERMINISTIC_BLOCK_RATE = "deterministic_block_rate"
 
 # Human interaction events
 APPROVAL_REQUESTED = "approval_requested"
@@ -35,6 +44,12 @@ STEER_INSTRUCTION = "steer_instruction"
 
 # Retry events
 SUBTASK_RETRYING = "subtask_retrying"
+REMEDIATION_QUEUED = "remediation_queued"
+REMEDIATION_STARTED = "remediation_started"
+REMEDIATION_ATTEMPT = "remediation_attempt"
+REMEDIATION_RESOLVED = "remediation_resolved"
+REMEDIATION_FAILED = "remediation_failed"
+REMEDIATION_EXPIRED = "remediation_expired"
 
 # Streaming events
 TOKEN_STREAMED = "token_streamed"

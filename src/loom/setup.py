@@ -309,6 +309,7 @@ def _generate_toml(models: list[dict]) -> str:
         "[execution]",
         "max_subtask_retries = 3",
         "max_loop_iterations = 50",
+        "delegate_task_timeout_seconds = 3600",
         "auto_approve_confidence_threshold = 0.8",
         "",
         "[verification]",

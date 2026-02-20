@@ -31,10 +31,15 @@ class TaskProgressPanel(Static):
     """Displays task_tracker progress in the sidebar."""
 
     tasks: reactive[list[dict]] = reactive(list, layout=True)
+    empty_message: reactive[str] = reactive("No tasks tracked")
+
+    def __init__(self, *, auto_follow: bool = False, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._auto_follow = bool(auto_follow)
 
     def render(self) -> str:
         if not self.tasks:
-            return "[dim]No tasks tracked[/dim]"
+            return f"[dim]{self.empty_message}[/dim]"
 
         lines: list[str] = []
         for t in self.tasks:
@@ -44,10 +49,26 @@ class TaskProgressPanel(Static):
                 icon = "[#9ece6a]\u2713[/]"
             elif status == "in_progress":
                 icon = "[#7dcfff]\u25c9[/]"
+            elif status == "failed":
+                icon = "[#f7768e]\u2717[/]"
+            elif status == "skipped":
+                icon = "[dim]-[/dim]"
             else:
                 icon = "[dim]\u25cb[/dim]"
             lines.append(f"{icon} {content}")
         return "\n".join(lines)
+
+    def watch_tasks(self, _tasks: list[dict]) -> None:
+        self._scroll_to_latest()
+
+    def watch_empty_message(self, _message: str) -> None:
+        self._scroll_to_latest()
+
+    def _scroll_to_latest(self) -> None:
+        """Keep the newest rows visible for streaming process-run updates."""
+        if not self._auto_follow or not self.is_attached:
+            return
+        self.call_after_refresh(self.scroll_end, animate=False)
 
 
 class Sidebar(Vertical):
@@ -81,6 +102,8 @@ class Sidebar(Vertical):
     Sidebar TaskProgressPanel {
         padding: 0 1;
         height: auto;
+        max-height: 14;
+        overflow-y: auto;
     }
     Sidebar FilteredTree {
         height: 1fr;
@@ -93,7 +116,7 @@ class Sidebar(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Label("Workspace", id="sidebar-label")
-        yield FilteredTree(str(self._workspace))
+        yield FilteredTree(str(self._workspace), id="workspace-tree")
         divider = "\u2500" * 10
         yield Label(divider, id="sidebar-divider")
         yield Label("Progress", id="progress-label")
@@ -107,3 +130,11 @@ class Sidebar(Vertical):
         """Update the task progress panel with new task data."""
         panel = self.query_one("#task-progress", TaskProgressPanel)
         panel.tasks = tasks
+
+    def refresh_workspace_tree(self) -> None:
+        """Reload workspace tree so newly-created files become visible."""
+        try:
+            tree = self.query_one("#workspace-tree", FilteredTree)
+        except Exception:
+            return
+        tree.reload()

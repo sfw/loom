@@ -1,0 +1,114 @@
+name: Process Canary
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  process-live-canary:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Prepare canary config
+        run: |
+          mkdir -p artifacts/process-live/results
+          if [ -n "${{ secrets.LOOM_PROCESS_LIVE_CONFIG_TOML }}" ]; then
+            printf '%s\n' "${{ secrets.LOOM_PROCESS_LIVE_CONFIG_TOML }}" > artifacts/process-live/loom-live.toml
+          fi
+
+      - name: Run live process canary suite
+        id: run_canary
+        continue-on-error: true
+        env:
+          LOOM_PROCESS_LIVE: "1"
+          LOOM_PROCESS_LIVE_CONFIG: artifacts/process-live/loom-live.toml
+          LOOM_PROCESS_LIVE_TIMEOUT: "1200"
+          LOOM_PROCESS_LIVE_ARTIFACT_DIR: artifacts/process-live/results
+          UV_CACHE_DIR: .uv-cache
+        run: |
+          set +e
+          set -o pipefail
+          uv run pytest -m process_live --tb=short -vv \
+            --junitxml=artifacts/process-live/junit.xml \
+            tests/test_process_live.py | tee artifacts/process-live/pytest.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
+          exit "${status}"
+
+      - name: Build canary summary
+        if: always()
+        env:
+          CANDIDATE_EXIT: ${{ steps.run_canary.outputs.exit_code }}
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          artifacts = Path("artifacts/process-live")
+          results_dir = artifacts / "results"
+          summary = artifacts / "summary.md"
+          junit_path = artifacts / "junit.xml"
+
+          lines = ["# Process Canary Summary", ""]
+
+          candidate_exit = "${CANDIDATE_EXIT}".strip() or "unknown"
+          lines.append(f"- Pytest exit code: `{candidate_exit}`")
+
+          if junit_path.exists():
+              root = ET.parse(junit_path).getroot()
+              suite = root if root.tag == "testsuite" else root.find("testsuite")
+              if suite is not None:
+                  tests = int(suite.attrib.get("tests", "0"))
+                  failures = int(suite.attrib.get("failures", "0"))
+                  errors = int(suite.attrib.get("errors", "0"))
+                  skipped = int(suite.attrib.get("skipped", "0"))
+                  lines.append(
+                      f"- JUnit totals: tests={tests}, failures={failures}, errors={errors}, skipped={skipped}"
+                  )
+          else:
+              lines.append("- JUnit report missing.")
+
+          lines.append("")
+          lines.append("## Per-process Results")
+          result_files = sorted(results_dir.glob("*.json")) if results_dir.exists() else []
+          if not result_files:
+              lines.append("- No per-process result files emitted.")
+          else:
+              for path in result_files:
+                  payload = json.loads(path.read_text())
+                  status = "PASS" if payload.get("passed") else "FAIL"
+                  lines.append(
+                      f"- `{payload.get('process')}`: {status} "
+                      f"(task_status={payload.get('task_status')}, "
+                      f"duration={payload.get('duration_seconds')})"
+                  )
+                  details = payload.get("details") or []
+                  for detail in details[:5]:
+                      lines.append(f"  - {detail}")
+          summary.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload canary artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: process-live-canary
+          path: artifacts/process-live

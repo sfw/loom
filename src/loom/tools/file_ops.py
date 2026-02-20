@@ -67,7 +67,11 @@ class ReadFileTool(Tool):
         if ctx.workspace is None:
             return ToolResult.fail("No workspace set")
 
-        path = self._resolve_path(args["path"], ctx.workspace)
+        path = self._resolve_read_path(
+            args["path"],
+            ctx.workspace,
+            ctx.read_roots,
+        )
         if not path.exists():
             return ToolResult.fail(f"File not found: {args['path']}")
         if not path.is_file():

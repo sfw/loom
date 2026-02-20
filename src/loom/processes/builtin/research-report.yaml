@@ -1,11 +1,12 @@
 name: research-report
-version: "1.0"
+version: "1.2"
+schema_version: 2
 description: >
-  General-purpose research workflow for investigating a question, gathering
-  evidence, synthesizing findings, and producing a structured report.
-  Suitable for market research, policy analysis, or technology assessments.
+  Evidence-first research workflow for investigating a question, gathering
+  sources, synthesizing findings, and producing a decision-grade report with
+  explicit assumptions, challenge testing, and QA checks.
 author: "Loom Team"
-tags: [research, analysis, writing, report, evidence-based]
+tags: [research, analysis, writing, report, evidence-based, quality-control]
 
 persona: |
   You are a methodical researcher who values evidence over opinion. Frame
@@ -13,81 +14,250 @@ persona: |
   sources, and flag confidence levels on all claims. Write in clear, direct
   prose and avoid jargon unless the audience requires it.
 
-phase_mode: guided
+phase_mode: strict
 
 tool_guidance: |
-  Use Markdown for narrative. Cite sources inline using [Author, Year] or
-  [Source Name] and collect full references at the end. Use tables for
-  comparisons. When evidence conflicts, present both sides.
+  Use Markdown for narrative and CSV for structured evidence. Cite sources
+  inline using [Author, Year] or [Source Name]. Separate facts from
+  assumptions. For numerical claims, include units, date context, and source.
+
+tools:
+  guidance: >
+    Prioritize web_search/web_fetch for external evidence and document_write for
+    structured report assembly.
+  required: [web_search, web_fetch, read_file, write_file, document_write, search_files]
+  excluded: [delete_file, shell_execute, git_command]
 
 phases:
   - id: frame-question
     description: >
-      Define the research question, sub-questions, scope boundaries, key
-      term definitions, and intended audience.
+      Define the research question, sub-questions, scope boundaries, key term
+      definitions, intended audience, and decision context.
     depends_on: []
     model_tier: 2
-    verification_tier: 1
+    verification_tier: 2
+    is_critical_path: true
     acceptance_criteria: >
-      Primary question stated. 3+ sub-questions identified. Scope explicit
-      (time, geography, industry). Key terms defined. Audience named.
+      Primary question stated. At least 3 sub-questions identified. Scope is
+      explicit (time, geography, industry). Key terms are defined. Audience and
+      decision context are explicit. Assumptions and unknowns are separate.
     deliverables:
-      - "research-brief.md — question framework, scope, and definitions"
+      - "research-brief.md — question framework, audience, and scope boundaries"
+      - "research-assumptions.md — explicit assumptions, constraints, and unknowns"
+
   - id: gather-evidence
     description: >
-      Collect evidence organized by sub-question. Rate each source on
-      credibility and relevance. Identify evidence gaps.
+      Collect and organize evidence by sub-question. Rate each source on
+      credibility, relevance, and recency. Identify evidence gaps.
     depends_on: [frame-question]
     model_tier: 2
-    verification_tier: 1
+    verification_tier: 2
+    is_critical_path: true
     acceptance_criteria: >
-      3+ sources per sub-question. Each rated for credibility (high/med/low).
-      Evidence organized by sub-question with attributions. Gaps noted.
+      At least 3 sources per sub-question. Each source has credibility
+      (high/medium/low), recency, and relevance rating. Evidence is grouped by
+      sub-question with attribution and material gaps are listed.
     deliverables:
-      - "evidence-log.csv — sources, credibility ratings, key findings"
+      - "evidence-log.csv — sources, credibility/relevance ratings, timestamps"
       - "evidence-notes.md — detailed notes by sub-question"
+      - "source-quality-scorecard.csv — source quality scoring and rationale"
+
   - id: synthesize-findings
     description: >
       Analyze evidence to answer each sub-question. Identify patterns,
-      contradictions, and confidence levels. Form cohesive primary answer.
+      contradictions, uncertainty, and what evidence would change conclusions.
     depends_on: [gather-evidence]
     model_tier: 3
     verification_tier: 2
+    is_critical_path: true
     acceptance_criteria: >
-      Each sub-question answered with confidence level. Contradictions
-      acknowledged and reconciled. Primary question clearly answered.
+      Each sub-question has an answer with confidence level and cited evidence.
+      Contradictions are reconciled (or documented unresolved) with rationale.
+      Primary question is answered with limitations stated.
     deliverables:
       - "synthesis.md — findings by sub-question with confidence levels"
-  - id: write-report
+      - "confidence-matrix.csv — claims, confidence scores, and evidence strength"
+      - "claim-evidence-map.csv — mapping of key claims to supporting sources"
+
+  - id: draft-report
     description: >
-      Produce final report with executive summary, methodology, findings,
-      conclusions, recommendations, and references.
+      Build the complete report draft with executive summary, methodology,
+      findings, conclusions, recommendations, and limitations.
     depends_on: [synthesize-findings]
     model_tier: 3
     verification_tier: 2
+    is_critical_path: true
     acceptance_criteria: >
-      Executive summary under 300 words. Methodology section present.
-      Findings by sub-question. Conclusions answer primary question.
-      Actionable recommendations. Full references section.
+      Draft includes all required sections and every major claim contains
+      inline citations.
     deliverables:
-      - "research-report.md — final report with all sections"
-      - "references.csv — structured reference list with URLs"
+      - "research-report-draft.md — complete first draft"
+
+  - id: red-team-review
+    description: >
+      Challenge the draft by stress-testing assumptions, counterarguments,
+      and alternative interpretations.
+    depends_on: [draft-report]
+    model_tier: 3
+    verification_tier: 2
+    is_critical_path: true
+    acceptance_criteria: >
+      Strongest counterarguments are documented and either resolved with
+      evidence or explicitly left open with impact on confidence.
+    deliverables:
+      - "red-team-review.md — strongest objections and resolution status"
+      - "open-questions.md — unresolved questions and required follow-up evidence"
+
+  - id: quality-assurance
+    description: >
+      Perform final QA on citation integrity, assumption traceability,
+      consistency, and publishing readiness.
+    depends_on: [red-team-review]
+    model_tier: 2
+    verification_tier: 2
+    is_critical_path: true
+    is_synthesis: true
+    acceptance_criteria: >
+      Final report is internally consistent, all factual claims are cited,
+      references are complete, limitations are explicit, and critical QA checks
+      are passed.
+    deliverables:
+      - "research-report.md — final quality-assured report"
+      - "references.csv — structured reference list with URLs and access dates"
+      - "qa-checklist.md — final QA pass/fail checklist"
+
+tests:
+  - id: smoke
+    mode: deterministic
+    goal: "Run the research-report process and produce all declared deliverables."
+    timeout_seconds: 900
+    acceptance:
+      phases:
+        must_include: [frame-question, gather-evidence, synthesize-findings, draft-report, red-team-review, quality-assurance]
+      deliverables:
+        must_exist: [research-brief.md, research-assumptions.md, evidence-log.csv, evidence-notes.md, source-quality-scorecard.csv, synthesis.md, confidence-matrix.csv, claim-evidence-map.csv, research-report-draft.md, red-team-review.md, open-questions.md, research-report.md, references.csv, qa-checklist.md]
+      verification:
+        forbidden_patterns: ["Expected deliverable '.*' not found", "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"]
+
+  - id: live-canary
+    mode: live
+    goal: "Research a current topic end-to-end and produce a sourced report."
+    timeout_seconds: 1200
+    requires_network: true
 
 verification:
+  policy:
+    mode: llm_first
+    static_checks:
+      tool_success_policy: safety_integrity_only
+      file_integrity_policy: enforce_nonempty_changed_files
+      syntax_policy: enforce_parseable_artifacts
+      deliverable_existence_policy: enforce_declared_deliverables
+    semantic_checks:
+      - id: process-rules
+        check: "Apply process-defined verification rules and acceptance criteria."
+        severity: error
+        enforcement: hard
+        scope: phase
+    output_contract:
+      required_fields:
+        - passed
+        - outcome
+        - reason_code
+        - severity_class
+        - confidence
+        - feedback
+        - issues
+        - metadata
+      metadata_fields:
+        - remediation_required
+        - remediation_mode
+        - missing_targets
+    outcome_policy:
+      pass_states: [pass, pass_with_warnings, partial_verified]
+      fail_states: [fail]
+  remediation:
+    strategies:
+      - id: targeted-remediation
+        retry_strategy: unconfirmed_data
+        description: "Perform targeted follow-up based on verifier reason_code/metadata."
+    default_strategy: targeted-remediation
+    critical_path_behavior: block
+    retry_budget:
+      max_attempts: 2
+    transient_retry_policy:
+      retry_on_transient: true
   rules:
     - name: citations-present
       description: "All factual claims must have inline citations"
       check: >
-        Scan for factual claims (statistics, dates, quotes). Each must
-        have an inline citation mapping to the references section. Flag
-        any unsupported claims.
+        Scan for factual claims (statistics, dates, quotes). Each must have an
+        inline citation mapping to references.
+      severity: error
+      type: llm
+      applies_to_phases: [synthesize-findings, draft-report, red-team-review, quality-assurance]
+
+    - name: assumptions-explicit
+      description: "Assumptions must be explicit and separated from facts"
+      check: >
+        Verify assumptions are labeled and not presented as factual conclusions.
       severity: warning
       type: llm
+      applies_to_phases: [frame-question, synthesize-findings, draft-report, quality-assurance]
+
+    - name: conclusion-traceability
+      description: "Conclusions must trace to evidence"
+      check: >
+        For each major conclusion, verify linked supporting evidence exists and
+        is represented in synthesis outputs.
+      severity: error
+      type: llm
+      applies_to_phases: [synthesize-findings, draft-report, quality-assurance]
+
+    - name: counterarguments-addressed
+      description: "Strong counterarguments must be handled"
+      check: >
+        Validate the report addresses the strongest competing explanations or
+        explicitly states unresolved uncertainty.
+      severity: error
+      type: llm
+      applies_to_phases: [red-team-review, quality-assurance]
+
     - name: no-placeholders
       description: "No placeholder text in deliverables"
       check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
       severity: error
       type: regex
+      applies_to_phases: ["*"]
+
+evidence:
+  record_schema:
+    required_fields: [evidence_id, tool, source_url, created_at, quality]
+    facets: [target, entity, subject, region, category, segment, topic]
+  extraction:
+    include_result_facets: true
+    arg_mappings:
+      target: [target, entity, subject, company, market]
+      region: [region, geography, country]
+      category: [category, dimension, theme]
+  summarization:
+    max_entries: 12
+    include_facets: true
+
+prompt_contracts:
+  evidence_contract:
+    enabled: true
+    applies_to_phases: ["*"]
+  executor_constraints: |
+    Keep factual claims traceable to evidence IDs or source URLs.
+    If a claim cannot be verified, label it explicitly as unverified.
+  verifier_constraints: |
+    Evaluate acceptance criteria and process verification rules without assuming
+    a fixed output schema. Use metadata keys only when inferable.
+  remediation_instructions:
+    default: |
+      Perform targeted remediation only for failing checks. Preserve validated
+      work, add missing evidence links, and avoid broad reruns.
 
 memory:
   extract_types:
@@ -97,46 +267,54 @@ memory:
       description: "Area where evidence is insufficient or conflicting"
     - type: synthesis_conclusion
       description: "Synthesized answer to a sub-question with confidence"
+    - type: decision_implication
+      description: "Action-relevant implication derived from findings"
   extraction_guidance: |
-    Prioritize findings that answer the question or change direction.
-    Always include source attribution. For gaps, note what evidence
-    would resolve them.
+    Prioritize findings that change decisions. Include source attribution and
+    confidence. For gaps, include what evidence would resolve uncertainty.
 
 workspace_analysis:
   scan_for:
-    - "*.md — existing research notes or prior reports"
-    - "*.csv — data files with relevant evidence"
-    - "*.txt — raw notes or interview transcripts"
+    - "**/*.md — existing research notes or prior reports"
+    - "**/*.csv — data files with relevant evidence"
+    - "**/*.txt — raw notes or interview transcripts"
   guidance: |
-    Reuse validated findings from prior research. Look for data files
-    that provide primary evidence.
+    Reuse validated findings where still current. Prioritize primary-source data
+    and timestamp stale artifacts.
 
 planner_examples:
   - goal: "Research solid-state battery outlook for electric vehicles"
     subtasks:
       - id: frame-question
-        description: "Scope: solid-state vs lithium-ion for EVs — energy density, cost, manufacturability, timeline"
+        description: "Scope key decisions, sub-questions, and assumptions"
         depends_on: []
         model_tier: 2
       - id: gather-evidence
-        description: "Collect from industry reports, patents, company announcements (Toyota, QuantumScape, Solid Power)"
+        description: "Collect primary and secondary evidence with source quality scoring"
         depends_on: [frame-question]
         model_tier: 2
       - id: synthesize-findings
-        description: "Compare approaches (sulfide, oxide, polymer), assess timelines, identify likely path to mass production"
+        description: "Build confidence-weighted conclusions and contradiction handling"
         depends_on: [gather-evidence]
         model_tier: 3
-      - id: write-report
-        description: "Report with tech comparison table, timeline estimates, key players, investment implications"
+      - id: draft-report
+        description: "Produce complete report draft"
         depends_on: [synthesize-findings]
         model_tier: 3
+      - id: red-team-review
+        description: "Stress-test arguments and note unresolved questions"
+        depends_on: [draft-report]
+        model_tier: 3
+      - id: quality-assurance
+        description: "Run final QA before publishing"
+        depends_on: [red-team-review]
+        model_tier: 2
 
 replanning:
   triggers: |
     - Research question is too broad to answer meaningfully
-    - Critical sub-question has no available evidence
-    - Early findings suggest the question should be reframed
+    - Critical sub-question has no reliable evidence
+    - New evidence invalidates core assumptions
   guidance: |
-    If too broad, narrow scope and restart evidence gathering. If evidence
-    is unavailable, note as limitation and adjust conclusions rather than
-    speculating.
+    If too broad, narrow scope and restate the governing question. If evidence
+    is unavailable, document the limitation and avoid speculation.

@@ -38,6 +38,8 @@ class SessionState:
     key_decisions: list[str] = field(default_factory=list)
     current_focus: str = ""
     errors_resolved: list[str] = field(default_factory=list)
+    # UI-only metadata (not injected into prompts), e.g. restored TUI tab state.
+    ui_state: dict = field(default_factory=dict)
 
     # Pruning limits
     MAX_FILES: int = 20
@@ -73,7 +75,7 @@ class SessionState:
 
     def set_focus(self, focus: str) -> None:
         """Update the current focus from the user's most recent message."""
-        self.current_focus = focus[:100] if focus else ""
+        self.current_focus = _normalize_inline(focus)
 
     def to_yaml(self) -> str:
         """Render as compact YAML for system prompt injection."""
@@ -119,6 +121,7 @@ class SessionState:
             "key_decisions": self.key_decisions,
             "current_focus": self.current_focus,
             "errors_resolved": self.errors_resolved,
+            "ui_state": self.ui_state,
         }
 
     @classmethod
@@ -133,6 +136,11 @@ class SessionState:
             current_focus=data.get("current_focus", ""),
             key_decisions=data.get("key_decisions", []),
             errors_resolved=data.get("errors_resolved", []),
+            ui_state=(
+                data.get("ui_state", {})
+                if isinstance(data.get("ui_state"), dict)
+                else {}
+            ),
         )
         for f in data.get("files_touched", []):
             if isinstance(f, dict) and "path" in f and "action" in f:
@@ -200,12 +208,20 @@ def extract_state_from_tool_events(
                         msg = git_args[i + 1]
                         break
                 if msg:
-                    state.record_decision(f"git commit: {msg[:80]}", turn_number)
+                    state.record_decision(
+                        f"git commit: {_normalize_inline(msg)}",
+                        turn_number,
+                    )
 
         elif name == "shell_execute":
             if result and not result.success:
-                cmd = args.get("command", "")[:60]
-                error_msg = (result.error or "")[:80]
+                cmd = _normalize_inline(str(args.get("command", "")))
+                error_msg = _normalize_inline(result.error or "")
                 state.record_error(
                     f"Command failed: {cmd} — {error_msg}", turn_number,
                 )
+
+
+def _normalize_inline(value: str) -> str:
+    """Collapse whitespace for inline session-state fields."""
+    return " ".join(str(value or "").split())

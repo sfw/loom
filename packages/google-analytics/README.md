@@ -2,6 +2,9 @@
 
 A [Loom](https://github.com/sfw/loom) process package for auditing and optimizing Google Analytics 4 implementations.
 
+This package uses process contract v2 (`schema_version: 2`) with explicit
+verification policy/remediation, evidence contracts, and prompt constraints.
+
 ## What it does
 
 This process guides Loom through a structured GA4 audit:
@@ -16,7 +19,7 @@ This process guides Loom through a structured GA4 audit:
 ## Installation
 
 ```bash
-loom install github.com/sfw/loom-process-google-analytics
+loom install https://github.com/sfw/loom-process-google-analytics
 ```
 
 Or install from a local directory:
@@ -31,11 +34,18 @@ loom install /path/to/loom-process-google-analytics
 loom cowork --process google-analytics
 ```
 
-Then describe your analytics goal:
+Then force process orchestration from the chat input:
 
-> "Audit our GA4 implementation for our B2B SaaS free trial funnel. We think we're losing visibility on the trial-to-paid conversion step."
+```text
+/run Audit our GA4 implementation for our B2B SaaS free trial funnel. We think we're losing visibility on the trial-to-paid conversion step.
+```
 
-Loom will decompose this into phased subtasks following the process definition, using the calculator for conversion rate math and spreadsheets for data tables.
+`/run` executes the active process in-session via `delegate_task` (no `loom serve` required).
+For non-interactive execution, use:
+
+```bash
+loom run "Audit our GA4 implementation for our B2B SaaS free trial funnel" --workspace /tmp/ga-audit --process google-analytics
+```
 
 ## Deliverables
 

@@ -298,6 +298,17 @@ your model details, and you're chatting in under a minute. All conversation
 history is saved to SQLite and survives restarts. Resume any session with
 `loom --resume <session-id>`.
 
+To run a process from the TUI without starting the API server:
+
+```text
+/process use investment-analysis
+/run Analyze Tesla for investment
+```
+
+`/run` uses in-process orchestration (`delegate_task`) and does not require
+`loom serve`. Timeout is configurable with
+`[execution].delegate_task_timeout_seconds` in `loom.toml`.
+
 ### Autonomous Task Mode
 
 With the server running:
@@ -361,6 +372,19 @@ Common causes:
 - Model returned empty response (model may be too small for the task)
 - Workspace path doesn't exist (create it first)
 - Model server went down mid-task
+
+If you see `delegate_task timed out`, increase the orchestration timeout:
+
+```toml
+[execution]
+delegate_task_timeout_seconds = 7200
+```
+
+Or set an environment override:
+
+```bash
+export LOOM_DELEGATE_TIMEOUT_SECONDS=7200
+```
 
 ### Learned patterns not appearing
 
