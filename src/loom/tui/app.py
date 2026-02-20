@@ -36,6 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -201,9 +202,12 @@ class ProcessRunList(VerticalScroll):
             return
         self._body.update(self._render_rows())
 
-    def _render_rows(self) -> str:
+    def _render_rows(self) -> Text:
         if not self._rows:
-            return f"[dim]{self._empty_message}[/dim]"
+            empty = Text.from_markup(f"[dim]{self._empty_message}[/dim]")
+            empty.no_wrap = False
+            empty.overflow = "fold"
+            return empty
 
         lines: list[str] = []
         for row in self._rows:
@@ -220,7 +224,10 @@ class ProcessRunList(VerticalScroll):
             else:
                 icon = "[dim]\u25cb[/dim]"
             lines.append(f"{icon} {content}")
-        return "\n".join(lines)
+        rendered = Text.from_markup("\n".join(lines))
+        rendered.no_wrap = False
+        rendered.overflow = "fold"
+        return rendered
 
     def _scroll_to_latest(self) -> None:
         if not self._auto_follow or not self.is_attached:

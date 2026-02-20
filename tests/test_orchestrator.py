@@ -1097,6 +1097,7 @@ class TestOrchestratorExecution:
         tools.execute.assert_called_once_with(
             "read_file", {"path": "/tmp/x"},
             workspace=None,
+            read_roots=[],
             changelog=None,
             subtask_id="s1",
         )
