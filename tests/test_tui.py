@@ -408,6 +408,26 @@ class TestProcessRunPane:
         assert pane._progress._auto_follow is True
         assert pane._outputs._auto_follow is True
 
+    def test_process_run_rows_render_with_fold_overflow(self):
+        from rich.text import Text
+
+        from loom.tui.app import ProcessRunList
+
+        panel = ProcessRunList(empty_message="No progress yet")
+        panel._rows = [{
+            "status": "completed",
+            "content": (
+                "Generate a high-volume longlist of slogan/tagline options across all "
+                "territories and devices before filtering."
+            ),
+        }]
+
+        rendered = panel._render_rows()
+        assert isinstance(rendered, Text)
+        assert rendered.no_wrap is False
+        assert rendered.overflow == "fold"
+        assert "longlist of slogan/tagline options" in rendered.plain
+
 
 class TestSidebarWidget:
     def test_refresh_workspace_tree_calls_reload(self):
