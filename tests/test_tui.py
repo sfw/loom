@@ -407,6 +407,7 @@ class TestProcessRunPane:
         )
         assert pane._progress._auto_follow is True
         assert pane._outputs._auto_follow is True
+        assert pane._outputs._follow_mode == "active"
 
     def test_process_run_rows_render_with_fold_overflow(self):
         from rich.text import Text
@@ -427,6 +428,66 @@ class TestProcessRunPane:
         assert rendered.no_wrap is False
         assert rendered.overflow == "fold"
         assert "longlist of slogan/tagline options" in rendered.plain
+
+    def test_process_run_active_follow_waits_for_started_rows(self):
+        from unittest.mock import PropertyMock, patch
+
+        from loom.tui.app import ProcessRunList
+
+        panel = ProcessRunList(
+            empty_message="No outputs yet",
+            auto_follow=True,
+            follow_mode="active",
+        )
+        panel._rows = [
+            {"status": "pending", "content": "slogan-longlist.csv"},
+            {"status": "pending", "content": "shortlist-scorecard.csv"},
+        ]
+        panel.call_after_refresh = MagicMock()
+
+        with patch.object(
+            ProcessRunList,
+            "is_attached",
+            new_callable=PropertyMock,
+            return_value=True,
+        ):
+            panel._scroll_to_latest()
+
+        panel.call_after_refresh.assert_not_called()
+
+    def test_process_run_active_follow_targets_current_output(self):
+        from unittest.mock import PropertyMock, patch
+
+        from loom.tui.app import ProcessRunList
+
+        panel = ProcessRunList(
+            empty_message="No outputs yet",
+            auto_follow=True,
+            follow_mode="active",
+        )
+        panel._rows = [
+            {"status": "pending", "content": "brief-normalized.md"},
+            {"status": "completed", "content": "brief-assumptions.md"},
+            {"status": "completed", "content": "tension-map.csv"},
+            {"status": "in_progress", "content": "insight-angles.md"},
+            {"status": "pending", "content": "signal-board.md"},
+        ]
+        panel.scroll_to = MagicMock()
+
+        def _run_immediately(callback, *_args, **_kwargs):
+            callback()
+
+        panel.call_after_refresh = MagicMock(side_effect=_run_immediately)
+
+        with patch.object(
+            ProcessRunList,
+            "is_attached",
+            new_callable=PropertyMock,
+            return_value=True,
+        ):
+            panel._scroll_to_latest()
+
+        panel.scroll_to.assert_called_once_with(y=1, animate=False, force=True)
 
 
 class TestSidebarWidget:
