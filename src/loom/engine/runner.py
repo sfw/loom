@@ -16,6 +16,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
+from loom.auth.runtime import AuthResolutionError, build_run_auth_context
 from loom.config import Config
 from loom.engine.semantic_compactor import SemanticCompactor
 from loom.engine.verification import Check, VerificationGates, VerificationResult
@@ -203,6 +204,31 @@ class SubtaskRunner:
         start_time = time.monotonic()
         workspace = Path(task.workspace) if task.workspace else None
         read_roots = self._read_roots_for_task(task, workspace)
+        auth_context = None
+        try:
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            auth_context = build_run_auth_context(
+                workspace=workspace,
+                metadata=metadata,
+            )
+        except AuthResolutionError as e:
+            failure_summary = f"Auth preflight failed: {e}"
+            result = SubtaskResult(
+                status=SubtaskResultStatus.FAILED,
+                summary=failure_summary,
+                duration_seconds=time.monotonic() - start_time,
+                model_used="",
+            )
+            verification = VerificationResult(
+                tier=1,
+                passed=False,
+                checks=[Check(name="auth_preflight", passed=False, detail=str(e))],
+                feedback=failure_summary,
+                outcome="fail",
+                reason_code="auth_preflight_failed",
+                metadata={"auth_error": str(e)},
+            )
+            return result, verification
 
         # 1. Assemble prompt
         memory_entries = await self._memory.query_relevant(task.id, subtask.id)
@@ -391,6 +417,7 @@ class SubtaskRunner:
                         read_roots=read_roots,
                         changelog=changelog,
                         subtask_id=subtask.id,
+                        auth_context=auth_context,
                     )
                     record = ToolCallRecord(
                         tool=tc.name,

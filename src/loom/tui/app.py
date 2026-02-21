@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shlex
 import textwrap
 import time
 import uuid
@@ -64,9 +65,11 @@ from loom.tools.registry import ToolRegistry
 from loom.tui.commands import LoomCommands
 from loom.tui.screens import (
     AskUserScreen,
+    AuthManagerScreen,
     ExitConfirmScreen,
     FileViewerScreen,
     LearnedScreen,
+    MCPManagerScreen,
     ProcessRunCloseScreen,
     SetupScreen,
     ToolApprovalScreen,
@@ -112,8 +115,20 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec(canonical="/model", description="show active model"),
     SlashCommandSpec(
         canonical="/mcp",
-        usage="[list|show <alias>|test <alias>|enable <alias>|disable <alias>|remove <alias>]",
+        usage=(
+            "[manage|list|show <alias>|test <alias>|add <alias> ...|"
+            "edit <alias> ...|enable <alias>|disable <alias>|remove <alias>]"
+        ),
         description="inspect/manage MCP server config",
+    ),
+    SlashCommandSpec(
+        canonical="/auth",
+        usage=(
+            "[manage|list|show <profile-id>|check|use <selector=profile>|"
+            "clear [selector]|select <selector=profile>|unset <selector>|"
+            "add <profile-id> ...|edit <profile-id> ...|remove <profile-id>]"
+        ),
+        description="inspect/manage run auth profile selection",
     ),
     SlashCommandSpec(canonical="/tools", description="list available tools"),
     SlashCommandSpec(canonical="/tokens", description="show session token usage"),
@@ -557,6 +572,9 @@ class LoomApp(App):
         store: ConversationStore | None = None,
         resume_session: str | None = None,
         process_name: str | None = None,
+        explicit_mcp_path: Path | None = None,
+        legacy_config_path: Path | None = None,
+        explicit_auth_path: Path | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -568,6 +586,9 @@ class LoomApp(App):
         self._store = store
         self._resume_session = resume_session
         self._process_name = process_name
+        self._explicit_mcp_path = explicit_mcp_path
+        self._legacy_config_path = legacy_config_path
+        self._explicit_auth_path = explicit_auth_path
         self._process_defn: ProcessDefinition | None = None
         self._session: CoworkSession | None = None
         self._chat_busy = False
@@ -593,6 +614,7 @@ class LoomApp(App):
         self._sidebar_cowork_tasks: list[dict] = []
         self._process_close_hint_shown = False
         self._auto_resume_workspace_on_init = True
+        self._run_auth_profile_overrides: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -731,7 +753,91 @@ class LoomApp(App):
         return MCPConfigManager(
             config=self._config,
             workspace=self._workspace,
+            explicit_path=self._explicit_mcp_path,
+            legacy_config_path=self._legacy_config_path,
         )
+
+    def _open_mcp_manager_screen(self) -> None:
+        """Open modal MCP manager and reload runtime when changed."""
+        manager = self._mcp_manager()
+
+        def _handle_result(result: dict[str, object] | None) -> None:
+            if not isinstance(result, dict):
+                return
+            if not result.get("changed"):
+                return
+            self.run_worker(
+                self._reload_mcp_runtime(),
+                group="mcp-manager-refresh",
+                exclusive=True,
+            )
+            try:
+                chat = self.query_one("#chat-log", ChatLog)
+                chat.add_info("MCP configuration updated.")
+            except Exception:
+                pass
+
+        self.push_screen(MCPManagerScreen(manager), callback=_handle_result)
+
+    def _open_auth_manager_screen(self) -> None:
+        """Open modal auth manager."""
+
+        def _handle_result(result: dict[str, object] | None) -> None:
+            if not isinstance(result, dict):
+                return
+            if not result.get("changed"):
+                return
+            try:
+                chat = self.query_one("#chat-log", ChatLog)
+                chat.add_info("Auth configuration updated.")
+            except Exception:
+                pass
+
+        self.push_screen(
+            AuthManagerScreen(
+                workspace=self._workspace,
+                explicit_auth_path=self._explicit_auth_path,
+            ),
+            callback=_handle_result,
+        )
+
+    def _auth_defaults_path(self) -> Path:
+        from loom.auth.config import default_workspace_auth_defaults_path
+
+        return default_workspace_auth_defaults_path(self._workspace)
+
+    @staticmethod
+    def _split_slash_args(raw: str) -> list[str]:
+        """Split slash-command argument string using shell-like quoting."""
+        try:
+            return shlex.split(raw)
+        except ValueError as e:
+            raise ValueError(f"Invalid quoted argument syntax: {e}") from e
+
+    @staticmethod
+    def _parse_kv_assignments(
+        values: list[str],
+        *,
+        option_name: str,
+        env_keys: bool = False,
+    ) -> dict[str, str]:
+        """Parse repeated KEY=VALUE assignments."""
+        result: dict[str, str] = {}
+        if env_keys:
+            from loom.mcp.config import ensure_valid_env_key
+
+        for value in values:
+            raw = str(value or "").strip()
+            if "=" not in raw:
+                raise ValueError(f"{option_name} expects KEY=VALUE entries.")
+            key, item = raw.split("=", 1)
+            clean_key = key.strip()
+            if env_keys:
+                clean_key = ensure_valid_env_key(clean_key)
+            if not clean_key:
+                raise ValueError(f"{option_name} key cannot be empty.")
+            result[clean_key] = item
+        return result
 
     async def _reload_mcp_runtime(self) -> None:
         """Reload merged MCP config and reconcile MCP tools in registry."""
@@ -2004,6 +2110,12 @@ class LoomApp(App):
             run,
             f"Run workspace: {run_workspace}",
         )
+        if self._run_auth_profile_overrides:
+            rendered = ", ".join(
+                f"{selector}={profile_id}"
+                for selector, profile_id in sorted(self._run_auth_profile_overrides.items())
+            )
+            self._append_process_run_activity(run, f"Run auth overrides: {rendered}")
         self._append_process_run_activity(run, "Queued process run.")
         if not self._process_close_hint_shown:
             chat.add_info(
@@ -2055,6 +2167,7 @@ class LoomApp(App):
                     "_approval_mode": "disabled",
                     "_process_override": run.process_defn,
                     "_read_roots": [str(self._workspace.resolve())],
+                    "_auth_profile_overrides": dict(self._run_auth_profile_overrides),
                     "_progress_callback": (
                         lambda data, rid=run_id: self._on_process_progress_event(
                             data, run_id=rid,
@@ -2493,7 +2606,9 @@ class LoomApp(App):
         title = "Slash commands:" if token == "/" else f"Matching {token}:"
         lines = [f"[bold #7dcfff]{title}[/]"]
         for cmd, desc in matches:
-            lines.append(f"  [#73daca]{cmd:<10}[/] {desc}")
+            safe_cmd = self._escape_markup(cmd)
+            safe_desc = self._escape_markup(desc)
+            lines.append(f"  [#73daca]{safe_cmd:<10}[/] {safe_desc}")
         return "\n".join(lines)
 
     @staticmethod
@@ -2826,24 +2941,25 @@ class LoomApp(App):
             chat.add_info(f"Model: {name}")
             return True
         if token == "/mcp":
-            from loom.mcp.config import MCPConfigManagerError, ensure_valid_alias
+            from loom.mcp.config import (
+                MCPConfigManagerError,
+                ensure_valid_alias,
+                merge_server_edits,
+                parse_mcp_server_from_flags,
+            )
 
             manager = self._mcp_manager()
             if not arg:
-                chat.add_info(
-                    "[bold #7dcfff]MCP Commands[/bold #7dcfff]\n"
-                    "  /mcp list\n"
-                    "  /mcp show <alias>\n"
-                    "  /mcp test <alias>\n"
-                    "  /mcp enable <alias>\n"
-                    "  /mcp disable <alias>\n"
-                    "  /mcp remove <alias>"
-                )
+                self._open_mcp_manager_screen()
                 return True
 
             subparts = arg.split(None, 1)
             subcmd = subparts[0].lower()
             rest = subparts[1].strip() if len(subparts) > 1 else ""
+
+            if subcmd == "manage":
+                self._open_mcp_manager_screen()
+                return True
 
             if subcmd == "list":
                 try:
@@ -2909,6 +3025,226 @@ class LoomApp(App):
                 chat.add_info("\n".join(lines))
                 return True
 
+            if subcmd == "add":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/mcp add",
+                            (
+                                "<alias> --command <cmd> [--arg <value>] "
+                                "[--env KEY=VALUE] [--env-ref KEY=ENV] "
+                                "[--cwd <path>] [--timeout <seconds>] [--disabled]"
+                            ),
+                        )
+                    )
+                    return True
+                try:
+                    tokens = self._split_slash_args(rest)
+                except ValueError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                if not tokens:
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/mcp add",
+                            "<alias> --command <cmd> [...]",
+                        )
+                    )
+                    return True
+                alias_token = tokens[0]
+                args_tokens = tokens[1:]
+                command = ""
+                cmd_args: list[str] = []
+                env_pairs: list[str] = []
+                env_refs: list[str] = []
+                cwd = ""
+                timeout = 30
+                disabled = False
+                index = 0
+                while index < len(args_tokens):
+                    item = args_tokens[index]
+                    if item == "--disabled":
+                        disabled = True
+                        index += 1
+                        continue
+                    if item in {
+                        "--command",
+                        "--arg",
+                        "--env",
+                        "--env-ref",
+                        "--cwd",
+                        "--timeout",
+                    }:
+                        if index + 1 >= len(args_tokens):
+                            chat.add_info(
+                                f"[bold #f7768e]Missing value for {item}.[/]"
+                            )
+                            return True
+                        value = args_tokens[index + 1]
+                        if item == "--command":
+                            command = value
+                        elif item == "--arg":
+                            cmd_args.append(value)
+                        elif item == "--env":
+                            env_pairs.append(value)
+                        elif item == "--env-ref":
+                            env_refs.append(value)
+                        elif item == "--cwd":
+                            cwd = value
+                        elif item == "--timeout":
+                            try:
+                                timeout = int(value)
+                            except ValueError:
+                                chat.add_info(
+                                    "[bold #f7768e]--timeout must be an integer.[/]"
+                                )
+                                return True
+                        index += 2
+                        continue
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown /mcp add option: {item}[/]"
+                    )
+                    return True
+                try:
+                    alias = ensure_valid_alias(alias_token)
+                    server = parse_mcp_server_from_flags(
+                        command=command,
+                        args=tuple(cmd_args),
+                        env_pairs=tuple(env_pairs),
+                        env_refs=tuple(env_refs),
+                        cwd=cwd,
+                        timeout=timeout,
+                        disabled=disabled,
+                    )
+                    await asyncio.to_thread(manager.add_server, alias, server)
+                    await self._reload_mcp_runtime()
+                    chat.add_info(f"MCP server '{alias}' added.")
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                return True
+
+            if subcmd == "edit":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/mcp edit",
+                            (
+                                "<alias> [--command <cmd>] [--arg <value>] "
+                                "[--env KEY=VALUE] [--env-ref KEY=ENV] "
+                                "[--cwd <path>] [--timeout <seconds>] "
+                                "[--enable|--disabled]"
+                            ),
+                        )
+                    )
+                    return True
+                try:
+                    tokens = self._split_slash_args(rest)
+                except ValueError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                if not tokens:
+                    chat.add_info(
+                        self._render_slash_command_usage("/mcp edit", "<alias> [...]")
+                    )
+                    return True
+                alias_token = tokens[0]
+                args_tokens = tokens[1:]
+                command: str | None = None
+                cmd_args: list[str] = []
+                env_pairs: list[str] = []
+                env_refs: list[str] = []
+                cwd: str | None = None
+                timeout: int | None = None
+                enabled_toggle: bool | None = None
+                index = 0
+                while index < len(args_tokens):
+                    item = args_tokens[index]
+                    if item == "--enable":
+                        enabled_toggle = True
+                        index += 1
+                        continue
+                    if item == "--disabled":
+                        enabled_toggle = False
+                        index += 1
+                        continue
+                    if item in {
+                        "--command",
+                        "--arg",
+                        "--env",
+                        "--env-ref",
+                        "--cwd",
+                        "--timeout",
+                    }:
+                        if index + 1 >= len(args_tokens):
+                            chat.add_info(
+                                f"[bold #f7768e]Missing value for {item}.[/]"
+                            )
+                            return True
+                        value = args_tokens[index + 1]
+                        if item == "--command":
+                            command = value
+                        elif item == "--arg":
+                            cmd_args.append(value)
+                        elif item == "--env":
+                            env_pairs.append(value)
+                        elif item == "--env-ref":
+                            env_refs.append(value)
+                        elif item == "--cwd":
+                            cwd = value
+                        elif item == "--timeout":
+                            try:
+                                timeout = int(value)
+                            except ValueError:
+                                chat.add_info(
+                                    "[bold #f7768e]--timeout must be an integer.[/]"
+                                )
+                                return True
+                        index += 2
+                        continue
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown /mcp edit option: {item}[/]"
+                    )
+                    return True
+
+                if (
+                    command is None
+                    and not cmd_args
+                    and not env_pairs
+                    and not env_refs
+                    and cwd is None
+                    and timeout is None
+                    and enabled_toggle is None
+                ):
+                    chat.add_info(
+                        "[bold #f7768e]/mcp edit requires at least one change flag.[/]"
+                    )
+                    return True
+
+                try:
+                    alias = ensure_valid_alias(alias_token)
+
+                    def _mutate(current):
+                        merged = merge_server_edits(
+                            current=current,
+                            command=command,
+                            args=tuple(cmd_args),
+                            env_pairs=tuple(env_pairs),
+                            env_refs=tuple(env_refs),
+                            cwd=cwd,
+                            timeout=timeout,
+                            disabled=(enabled_toggle is False),
+                        )
+                        if enabled_toggle is True:
+                            return replace(merged, enabled=True)
+                        return merged
+
+                    await asyncio.to_thread(manager.edit_server, alias, _mutate)
+                    await self._reload_mcp_runtime()
+                    chat.add_info(f"MCP server '{alias}' updated.")
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                return True
+
             if subcmd in {"enable", "disable"}:
                 if not rest:
                     chat.add_info(self._render_slash_command_usage(f"/mcp {subcmd}", "<alias>"))
@@ -2947,8 +3283,697 @@ class LoomApp(App):
                 self._render_slash_command_usage(
                     "/mcp",
                     (
-                        "[list|show <alias>|test <alias>|enable <alias>|"
-                        "disable <alias>|remove <alias>]"
+                        "[manage|list|show <alias>|test <alias>|add <alias> ...|"
+                        "edit <alias> ...|enable <alias>|disable <alias>|remove <alias>]"
+                    ),
+                )
+            )
+            return True
+        if token == "/auth":
+            from loom.auth.config import (
+                AuthConfigError,
+                AuthProfile,
+                load_merged_auth_config,
+                remove_auth_profile,
+                resolve_auth_write_path,
+                set_workspace_auth_default,
+                upsert_auth_profile,
+            )
+            from loom.auth.runtime import AuthResolutionError, parse_auth_profile_overrides
+
+            if not arg:
+                self._open_auth_manager_screen()
+                return True
+
+            subparts = arg.split(None, 1)
+            subcmd = subparts[0].lower()
+            rest = subparts[1].strip() if len(subparts) > 1 else ""
+
+            if subcmd == "manage":
+                self._open_auth_manager_screen()
+                return True
+
+            def _effective_defaults(merged_auth) -> dict[str, str]:
+                defaults = dict(merged_auth.config.defaults)
+                defaults.update(merged_auth.workspace_defaults)
+                return defaults
+
+            if subcmd == "list":
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
+                    return True
+
+                lines = [
+                    "[bold #7dcfff]Auth Profiles[/bold #7dcfff]",
+                    f"  user: {merged_auth.user_path}",
+                    f"  explicit: {merged_auth.explicit_path or '-'}",
+                    f"  workspace defaults: {merged_auth.workspace_defaults_path or '-'}",
+                ]
+                if not merged_auth.config.profiles:
+                    lines.append("  (none)")
+                else:
+                    for profile_id in sorted(merged_auth.config.profiles):
+                        profile = merged_auth.config.profiles[profile_id]
+                        label = f" label={profile.account_label}" if profile.account_label else ""
+                        lines.append(
+                            f"  {profile.profile_id}: provider={profile.provider} "
+                            f"mode={profile.mode}{label}"
+                        )
+
+                defaults = {
+                    selector: profile_id
+                    for selector, profile_id in _effective_defaults(merged_auth).items()
+                    if not selector.startswith("mcp.")
+                }
+                if defaults:
+                    lines.append("")
+                    lines.append("Defaults:")
+                    for selector, profile_id in sorted(defaults.items()):
+                        lines.append(f"  {selector} -> {profile_id}")
+
+                run_overrides = {
+                    selector: profile_id
+                    for selector, profile_id in self._run_auth_profile_overrides.items()
+                    if not selector.startswith("mcp.")
+                }
+                if run_overrides:
+                    lines.append("")
+                    lines.append("Run overrides:")
+                    for selector, profile_id in sorted(run_overrides.items()):
+                        lines.append(f"  {selector} -> {profile_id}")
+
+                chat.add_info("\n".join(lines))
+                return True
+
+            if subcmd == "show":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth show", "<profile-id>")
+                    )
+                    return True
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
+                    return True
+                profile = merged_auth.config.profiles.get(rest)
+                if profile is None:
+                    chat.add_info(f"[bold #f7768e]Auth profile not found: {rest}[/]")
+                    return True
+                env_keys = ", ".join(sorted(profile.env.keys())) or "-"
+                lines = [
+                    f"[bold #7dcfff]Profile[/bold #7dcfff] {profile.profile_id}",
+                    f"  provider: {profile.provider}",
+                    f"  mode: {profile.mode}",
+                    f"  label: {profile.account_label or '-'}",
+                    f"  secret_ref: {profile.secret_ref or '-'}",
+                    f"  token_ref: {profile.token_ref or '-'}",
+                    f"  env_keys: {env_keys}",
+                    f"  command: {profile.command or '-'}",
+                ]
+                if profile.scopes:
+                    lines.append(f"  scopes: {', '.join(profile.scopes)}")
+                chat.add_info("\n".join(lines))
+                return True
+
+            if subcmd == "check":
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
+                    return True
+
+                profiles = merged_auth.config.profiles
+                defaults = _effective_defaults(merged_auth)
+                errors: list[str] = []
+
+                for selector, profile_id in sorted(defaults.items()):
+                    if profile_id not in profiles:
+                        errors.append(
+                            f"default {selector!r} references unknown profile {profile_id!r}"
+                        )
+                        continue
+                    profile = profiles[profile_id]
+                    if selector.startswith("mcp."):
+                        continue
+                    if selector != profile.provider:
+                        errors.append(
+                            f"default {selector!r} must match provider {profile.provider!r}"
+                        )
+                for selector, profile_id in sorted(self._run_auth_profile_overrides.items()):
+                    profile = profiles.get(profile_id)
+                    if profile is None:
+                        errors.append(
+                            f"run override {selector!r} references unknown profile {profile_id!r}"
+                        )
+                        continue
+                    if selector.startswith("mcp."):
+                        errors.append(
+                            f"run override {selector!r} is no longer supported; "
+                            "MCP account selection is managed via MCP aliases."
+                        )
+                        continue
+                    if selector != profile.provider:
+                        errors.append(
+                            f"run override {selector!r} must match provider {profile.provider!r}"
+                        )
+
+                if errors:
+                    chat.add_info(
+                        "[bold #f7768e]Auth config validation failed:[/]\n"
+                        + "\n".join(f"  - {err}" for err in errors)
+                    )
+                    return True
+                chat.add_info("Auth config is valid.")
+                return True
+
+            if subcmd == "use":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth use", "<selector=profile>")
+                    )
+                    return True
+                try:
+                    parsed = parse_auth_profile_overrides((rest,))
+                except AuthResolutionError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                selector, profile_id = next(iter(parsed.items()))
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
+                    return True
+                profile = merged_auth.config.profiles.get(profile_id)
+                if profile is None:
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown auth profile: {profile_id}[/]"
+                    )
+                    return True
+                if selector.startswith("mcp."):
+                    chat.add_info(
+                        "[bold #f7768e]MCP selectors are no longer supported in /auth use. "
+                        "Select MCP accounts via MCP aliases in /mcp.[/]"
+                    )
+                    return True
+                if selector != profile.provider:
+                    chat.add_info(
+                        "[bold #f7768e]Selector must match profile provider.[/]"
+                    )
+                    return True
+                self._run_auth_profile_overrides[selector] = profile_id
+                chat.add_info(f"Run auth override set: {selector} -> {profile_id}")
+                return True
+
+            if subcmd == "clear":
+                if rest:
+                    removed = self._run_auth_profile_overrides.pop(rest, None)
+                    if removed is None:
+                        chat.add_info(f"No run auth override set for {rest}.")
+                        return True
+                    chat.add_info(f"Removed run auth override: {rest}")
+                    return True
+                self._run_auth_profile_overrides.clear()
+                chat.add_info("Cleared all run auth overrides.")
+                return True
+
+            if subcmd == "select":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth select", "<selector=profile>")
+                    )
+                    return True
+                try:
+                    parsed = parse_auth_profile_overrides((rest,))
+                except AuthResolutionError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                selector, profile_id = next(iter(parsed.items()))
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
+                    return True
+                profile = merged_auth.config.profiles.get(profile_id)
+                if profile is None:
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown auth profile: {profile_id}[/]"
+                    )
+                    return True
+                if selector.startswith("mcp."):
+                    chat.add_info(
+                        "[bold #f7768e]MCP selectors are no longer supported in /auth select. "
+                        "Select MCP accounts via MCP aliases in /mcp.[/]"
+                    )
+                    return True
+                if selector != profile.provider:
+                    chat.add_info(
+                        "[bold #f7768e]Selector must match profile provider.[/]"
+                    )
+                    return True
+
+                defaults_path = self._auth_defaults_path()
+                try:
+                    await asyncio.to_thread(
+                        set_workspace_auth_default,
+                        defaults_path,
+                        selector=selector,
+                        profile_id=profile_id,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                chat.add_info(
+                    f"Workspace auth default set: {selector} -> {profile_id}\n"
+                    f"[dim]{defaults_path}[/dim]"
+                )
+                return True
+
+            if subcmd == "unset":
+                clean_selector = rest.strip()
+                if not clean_selector:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth unset", "<selector>")
+                    )
+                    return True
+                defaults_path = self._auth_defaults_path()
+                try:
+                    await asyncio.to_thread(
+                        set_workspace_auth_default,
+                        defaults_path,
+                        selector=clean_selector,
+                        profile_id=None,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                chat.add_info(
+                    f"Workspace auth default removed: {clean_selector}\n"
+                    f"[dim]{defaults_path}[/dim]"
+                )
+                return True
+
+            if subcmd == "add":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/auth add",
+                            (
+                                "<profile-id> --provider <provider> --mode <mode> "
+                                "[--label <text>] [--secret-ref <ref>] "
+                                "[--token-ref <ref>] [--scope <scope>] "
+                                "[--env KEY=VALUE] [--command <cmd>] "
+                                "[--auth-check <token>] [--meta KEY=VALUE]"
+                            ),
+                        )
+                    )
+                    return True
+                try:
+                    tokens = self._split_slash_args(rest)
+                except ValueError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                if not tokens:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth add", "<profile-id> ...")
+                    )
+                    return True
+                profile_id = str(tokens[0]).strip()
+                args_tokens = tokens[1:]
+                provider = ""
+                mode = ""
+                label = ""
+                secret_ref = ""
+                token_ref = ""
+                scopes: list[str] = []
+                env_values: list[str] = []
+                command = ""
+                auth_check: list[str] = []
+                meta_values: list[str] = []
+                index = 0
+                while index < len(args_tokens):
+                    item = args_tokens[index]
+                    if item in {
+                        "--provider",
+                        "--mode",
+                        "--label",
+                        "--secret-ref",
+                        "--token-ref",
+                        "--scope",
+                        "--env",
+                        "--command",
+                        "--auth-check",
+                        "--meta",
+                    }:
+                        if index + 1 >= len(args_tokens):
+                            chat.add_info(
+                                f"[bold #f7768e]Missing value for {item}.[/]"
+                            )
+                            return True
+                        value = args_tokens[index + 1]
+                        if item == "--provider":
+                            provider = value
+                        elif item == "--mode":
+                            mode = value
+                        elif item == "--label":
+                            label = value
+                        elif item == "--secret-ref":
+                            secret_ref = value
+                        elif item == "--token-ref":
+                            token_ref = value
+                        elif item == "--scope":
+                            scopes.append(value)
+                        elif item == "--env":
+                            env_values.append(value)
+                        elif item == "--command":
+                            command = value
+                        elif item == "--auth-check":
+                            auth_check.append(value)
+                        elif item == "--meta":
+                            meta_values.append(value)
+                        index += 2
+                        continue
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown /auth add option: {item}[/]"
+                    )
+                    return True
+                if not profile_id:
+                    chat.add_info("[bold #f7768e]Profile id cannot be empty.[/]")
+                    return True
+                if not provider or not mode:
+                    chat.add_info(
+                        "[bold #f7768e]/auth add requires --provider and --mode.[/]"
+                    )
+                    return True
+                try:
+                    env = self._parse_kv_assignments(
+                        env_values,
+                        option_name="--env",
+                        env_keys=True,
+                    )
+                    metadata = self._parse_kv_assignments(
+                        meta_values,
+                        option_name="--meta",
+                    )
+                    profile = AuthProfile(
+                        profile_id=profile_id,
+                        provider=provider.strip(),
+                        mode=mode.strip(),
+                        account_label=label.strip(),
+                        secret_ref=secret_ref.strip(),
+                        token_ref=token_ref.strip(),
+                        scopes=[str(scope).strip() for scope in scopes if str(scope).strip()],
+                        env=env,
+                        command=command.strip(),
+                        auth_check=[
+                            str(item).strip()
+                            for item in auth_check
+                            if str(item).strip()
+                        ],
+                        metadata=metadata,
+                    )
+                    target = resolve_auth_write_path(
+                        explicit_path=self._explicit_auth_path,
+                    )
+                    await asyncio.to_thread(
+                        upsert_auth_profile,
+                        target,
+                        profile,
+                        must_exist=False,
+                    )
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                chat.add_info(
+                    f"Added auth profile '{profile_id}'.\n[dim]{target}[/dim]"
+                )
+                return True
+
+            if subcmd == "edit":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/auth edit",
+                            (
+                                "<profile-id> [--provider <provider>] [--mode <mode>] "
+                                "[--label <text>] [--secret-ref <ref>] [--token-ref <ref>] "
+                                "[--scope <scope>] [--clear-scopes] "
+                                "[--env KEY=VALUE] [--clear-env] "
+                                "[--command <cmd>] [--auth-check <token>] "
+                                "[--clear-auth-check] [--meta KEY=VALUE] [--clear-meta]"
+                            ),
+                        )
+                    )
+                    return True
+                try:
+                    tokens = self._split_slash_args(rest)
+                except ValueError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                if not tokens:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth edit", "<profile-id> ...")
+                    )
+                    return True
+                profile_id = str(tokens[0]).strip()
+                args_tokens = tokens[1:]
+                provider: str | None = None
+                mode: str | None = None
+                label: str | None = None
+                secret_ref: str | None = None
+                token_ref: str | None = None
+                scopes: list[str] = []
+                clear_scopes = False
+                env_values: list[str] = []
+                clear_env = False
+                command: str | None = None
+                auth_check_values: list[str] = []
+                clear_auth_check = False
+                meta_values: list[str] = []
+                clear_meta = False
+                index = 0
+                while index < len(args_tokens):
+                    item = args_tokens[index]
+                    if item in {
+                        "--clear-scopes",
+                        "--clear-env",
+                        "--clear-auth-check",
+                        "--clear-meta",
+                    }:
+                        if item == "--clear-scopes":
+                            clear_scopes = True
+                        elif item == "--clear-env":
+                            clear_env = True
+                        elif item == "--clear-auth-check":
+                            clear_auth_check = True
+                        elif item == "--clear-meta":
+                            clear_meta = True
+                        index += 1
+                        continue
+                    if item in {
+                        "--provider",
+                        "--mode",
+                        "--label",
+                        "--secret-ref",
+                        "--token-ref",
+                        "--scope",
+                        "--env",
+                        "--command",
+                        "--auth-check",
+                        "--meta",
+                    }:
+                        if index + 1 >= len(args_tokens):
+                            chat.add_info(
+                                f"[bold #f7768e]Missing value for {item}.[/]"
+                            )
+                            return True
+                        value = args_tokens[index + 1]
+                        if item == "--provider":
+                            provider = value
+                        elif item == "--mode":
+                            mode = value
+                        elif item == "--label":
+                            label = value
+                        elif item == "--secret-ref":
+                            secret_ref = value
+                        elif item == "--token-ref":
+                            token_ref = value
+                        elif item == "--scope":
+                            scopes.append(value)
+                        elif item == "--env":
+                            env_values.append(value)
+                        elif item == "--command":
+                            command = value
+                        elif item == "--auth-check":
+                            auth_check_values.append(value)
+                        elif item == "--meta":
+                            meta_values.append(value)
+                        index += 2
+                        continue
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown /auth edit option: {item}[/]"
+                    )
+                    return True
+                if not profile_id:
+                    chat.add_info("[bold #f7768e]Profile id cannot be empty.[/]")
+                    return True
+                if (
+                    provider is None
+                    and mode is None
+                    and label is None
+                    and secret_ref is None
+                    and token_ref is None
+                    and not scopes
+                    and not clear_scopes
+                    and not env_values
+                    and not clear_env
+                    and command is None
+                    and not auth_check_values
+                    and not clear_auth_check
+                    and not meta_values
+                    and not clear_meta
+                ):
+                    chat.add_info(
+                        "[bold #f7768e]/auth edit requires at least one change flag.[/]"
+                    )
+                    return True
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                    current = merged_auth.config.profiles.get(profile_id)
+                    if current is None:
+                        chat.add_info(
+                            f"[bold #f7768e]Auth profile not found: {profile_id}[/]"
+                        )
+                        return True
+                    env_updates = self._parse_kv_assignments(
+                        env_values,
+                        option_name="--env",
+                        env_keys=True,
+                    )
+                    meta_updates = self._parse_kv_assignments(
+                        meta_values,
+                        option_name="--meta",
+                    )
+                    next_scopes = [] if clear_scopes else list(current.scopes)
+                    if scopes:
+                        next_scopes = [
+                            str(scope).strip()
+                            for scope in scopes
+                            if str(scope).strip()
+                        ]
+                    next_env = {} if clear_env else dict(current.env)
+                    next_env.update(env_updates)
+                    next_auth_check = (
+                        []
+                        if clear_auth_check
+                        else list(current.auth_check)
+                    )
+                    if auth_check_values:
+                        next_auth_check = [
+                            str(item).strip()
+                            for item in auth_check_values
+                            if str(item).strip()
+                        ]
+                    next_metadata = {} if clear_meta else dict(current.metadata)
+                    next_metadata.update(meta_updates)
+                    updated = AuthProfile(
+                        profile_id=current.profile_id,
+                        provider=current.provider if provider is None else provider.strip(),
+                        mode=current.mode if mode is None else mode.strip(),
+                        account_label=(
+                            current.account_label
+                            if label is None else label.strip()
+                        ),
+                        secret_ref=(
+                            current.secret_ref
+                            if secret_ref is None else secret_ref.strip()
+                        ),
+                        token_ref=current.token_ref if token_ref is None else token_ref.strip(),
+                        scopes=next_scopes,
+                        env=next_env,
+                        command=current.command if command is None else command.strip(),
+                        auth_check=next_auth_check,
+                        metadata=next_metadata,
+                    )
+                    if not updated.provider or not updated.mode:
+                        chat.add_info(
+                            "[bold #f7768e]Provider and mode must be non-empty.[/]"
+                        )
+                        return True
+                    target = resolve_auth_write_path(
+                        explicit_path=self._explicit_auth_path,
+                    )
+                    await asyncio.to_thread(
+                        upsert_auth_profile,
+                        target,
+                        updated,
+                        must_exist=True,
+                    )
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                chat.add_info(
+                    f"Updated auth profile '{profile_id}'.\n[dim]{target}[/dim]"
+                )
+                return True
+
+            if subcmd == "remove":
+                profile_id = rest.strip()
+                if not profile_id:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth remove", "<profile-id>")
+                    )
+                    return True
+                target = resolve_auth_write_path(
+                    explicit_path=self._explicit_auth_path,
+                )
+                try:
+                    await asyncio.to_thread(
+                        remove_auth_profile,
+                        target,
+                        profile_id,
+                    )
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                chat.add_info(
+                    f"Removed auth profile '{profile_id}'.\n[dim]{target}[/dim]"
+                )
+                return True
+
+            chat.add_info(
+                self._render_slash_command_usage(
+                    "/auth",
+                    (
+                        "[manage|list|show <profile-id>|check|use <selector=profile>|"
+                        "clear [selector]|select <selector=profile>|unset <selector>|"
+                        "add <profile-id> ...|edit <profile-id> ...|remove <profile-id>]"
                     ),
                 )
             )
@@ -4068,6 +5093,25 @@ class LoomApp(App):
             return
         if command == "mcp_list":
             await self._handle_slash_command("/mcp list")
+            return
+        if command == "mcp_manage":
+            await self._handle_slash_command("/mcp manage")
+            return
+        if command == "mcp_add_prompt":
+            self._prefill_user_input(
+                "/mcp add <alias> --command <cmd> --arg <value> "
+            )
+            return
+        if command == "auth_list":
+            await self._handle_slash_command("/auth list")
+            return
+        if command == "auth_manage":
+            await self._handle_slash_command("/auth manage")
+            return
+        if command == "auth_add_prompt":
+            self._prefill_user_input(
+                "/auth add <profile-id> --provider <provider> --mode <mode> "
+            )
             return
         if command == "learned_patterns":
             await self._handle_slash_command("/learned")

@@ -50,6 +50,7 @@ Token-only stdio alternatives exist for some ecosystems, but they are incomplete
 5. Make connection/auth state clear in CLI and TUI.
 6. Align with MCP transport direction: Streamable HTTP as primary remote transport; legacy SSE compatibility mode only.
 7. Prefer protocol-level correctness via MCP SDK integration over ad-hoc HTTP implementations where feasible.
+8. Reuse the shared auth/token infrastructure from Track C (`loom auth`) instead of creating MCP-only token storage.
 
 ## Proposed MCP Connection Model
 
@@ -129,7 +130,7 @@ scopes = ["read:content", "write:content"]
 
 ### 2) Token Storage
 - Do not write access/refresh tokens to `mcp.toml`.
-- Store tokens in OS keychain via `keyring` (preferred).
+- Store tokens via shared auth/token backends defined in Track C (`loom auth` authority).
 - Keep only non-secret metadata in config/state (issuer, scopes, expiry metadata).
 - Optional explicit fallback `--allow-plaintext-token-store` (off by default) for headless hosts where keychain is unavailable.
 
@@ -145,6 +146,10 @@ Add:
 - `loom mcp auth refresh <alias>` (manual repair path)
 - Optional headless support:
   - `loom mcp auth login <alias> --device` for environments where browser callbacks are not possible.
+
+Command ownership policy:
+1. `loom mcp auth ...` is a compatibility/user-convenience surface.
+2. Implementation delegates to shared auth services (`loom auth`) and shared token store APIs.
 
 ## Runtime Connection Manager
 Introduce a single manager for discovery, auth, and tool sync:
@@ -235,7 +240,7 @@ Tests:
 
 ## Phase 3: OAuth Support
 - Add auth command group and PKCE login flow.
-- Add token store abstraction (keyring + explicit fallback).
+- Integrate MCP OAuth lifecycle with shared token store abstraction from Track C.
 - Auto-refresh handling and auth status plumbing.
 
 Tests:
