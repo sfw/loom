@@ -27,6 +27,7 @@ from loom.api.schemas import (
     TaskSteerRequest,
     ToolInfo,
 )
+from loom.auth.runtime import AuthResolutionError, build_run_auth_context
 from loom.engine.orchestrator import create_task
 from loom.events.bus import Event
 from loom.state.memory import MemoryEntry
@@ -98,14 +99,28 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
                     ),
                 )
 
+    metadata = body.metadata if isinstance(body.metadata, dict) else {}
+    metadata = dict(metadata)
+    metadata["process"] = effective_process or ""
+
+    # Validate auth profile selection early so auth errors fail fast.
+    workspace_path = Path(body.workspace) if body.workspace else None
+    try:
+        build_run_auth_context(
+            workspace=workspace_path,
+            metadata=metadata,
+        )
+    except AuthResolutionError as e:
+        raise HTTPException(status_code=400, detail=f"Auth preflight failed: {e}")
+
     task = create_task(
         goal=body.goal,
         workspace=body.workspace or "",
         approval_mode=body.approval_mode,
         callback_url=body.callback_url or "",
         context=body.context,
+        metadata=metadata,
     )
-    task.metadata["process"] = effective_process or ""
 
     engine.state_manager.save(task)
 
@@ -118,7 +133,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         approval_mode=task.approval_mode,
         context=task.context or None,
         callback_url=task.callback_url or None,
-        metadata=body.metadata or None,
+        metadata=metadata or None,
     )
 
     # Register webhook if callback_url provided

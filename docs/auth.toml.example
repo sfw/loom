@@ -1,0 +1,30 @@
+# Loom auth profile example
+# Canonical location: ~/.loom/auth.toml
+#
+# This file stores non-secret profile metadata and secret references only.
+# Do NOT put plaintext API keys or refresh tokens here.
+
+[auth.defaults]
+google_analytics = "ga_acme_prod"
+notion = "notion_marketing"
+
+[auth.profiles.ga_acme_prod]
+provider = "google_analytics"
+mode = "api_key"
+account_label = "ACME Prod"
+property_id = "123456789"
+secret_ref = "keychain://loom/google_analytics/ga_acme_prod/api_key"
+
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+account_label = "Marketing Workspace"
+scopes = ["read:content", "write:content"]
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+
+[auth.profiles.github_ops]
+provider = "github"
+mode = "cli_passthrough"
+account_label = "Ops GH CLI Session"
+command = "gh"
+auth_check = ["auth", "status"]

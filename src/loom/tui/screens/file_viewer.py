@@ -233,7 +233,8 @@ def _render_pdf(path: Path, _content: str | None) -> Widget:
         import pypdf
     except ImportError:
         return Static(
-            "[bold #f7768e]PDF preview unavailable[/]\nInstall `pypdf` to extract text.",
+            "[bold #f7768e]PDF preview unavailable[/]\n"
+            "Dependency missing in this environment. Run `uv sync` to install `pypdf`.",
         )
 
     try:

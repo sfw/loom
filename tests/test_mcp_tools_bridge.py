@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from loom.auth.runtime import build_run_auth_context
 from loom.config import Config, MCPConfig, MCPServerConfig
-from loom.integrations.mcp_tools import register_mcp_tools
+from loom.integrations.mcp_tools import _MCPStdioClient, register_mcp_tools
 from loom.mcp.config import apply_mcp_overrides
 from loom.tools import create_default_registry
 from loom.tools.registry import ToolRegistry
@@ -79,6 +80,120 @@ for line in sys.stdin:
             "id": req_id,
             "error": {{"code": -32601, "message": f"Unknown method: {{method}}"}},
         }}), flush=True)
+"""
+    )
+    return script_path
+
+
+def _write_env_echo_mcp_server(tmp_path: Path) -> Path:
+    script_path = tmp_path / "env_echo_mcp_server.py"
+    script_path.write_text(
+        """\
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"capabilities": {"tools": {"listChanged": True}}},
+        }), flush=True)
+        continue
+    if method == "notifications/initialized":
+        continue
+    if method == "tools/list":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"tools": [{
+                "name": "echo_env",
+                "description": "Echo env token",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                },
+            }]},
+        }), flush=True)
+        continue
+    if method == "tools/call":
+        params = msg.get("params", {})
+        arguments = params.get("arguments", {})
+        token = os.environ.get("MCP_TOKEN", "")
+        text = arguments.get("text", "")
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"content": [{"type": "text", "text": f"{token}:{text}"}]},
+        }), flush=True)
+        continue
+"""
+    )
+    return script_path
+
+
+def _write_auth_gated_mcp_server(tmp_path: Path) -> Path:
+    script_path = tmp_path / "auth_gated_mcp_server.py"
+    script_path.write_text(
+        """\
+import json
+import os
+import sys
+
+EXPECTED = "run-token"
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"capabilities": {"tools": {"listChanged": True}}},
+        }), flush=True)
+        continue
+    if method == "notifications/initialized":
+        continue
+    if method == "tools/list":
+        token = os.environ.get("MCP_TOKEN", "")
+        tools = []
+        if token == EXPECTED:
+            tools = [{
+                "name": "echo_env",
+                "description": "Echo env token",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                },
+            }]
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"tools": tools},
+        }), flush=True)
+        continue
+    if method == "tools/call":
+        params = msg.get("params", {})
+        arguments = params.get("arguments", {})
+        token = os.environ.get("MCP_TOKEN", "")
+        text = arguments.get("text", "")
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"content": [{"type": "text", "text": f"{token}:{text}"}]},
+        }), flush=True)
+        continue
 """
     )
     return script_path
@@ -298,6 +413,83 @@ def test_registers_namespaced_mcp_tools(tmp_path):
     assert registry.has("mcp.demo.echo")
 
 
+def test_mcp_client_terminate_closes_pipes_for_exited_process() -> None:
+    class _BrokenPipeStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+            raise BrokenPipeError("[Errno 32] Broken pipe")
+
+    class _TrackingStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _ExitedProcess:
+        def __init__(self) -> None:
+            self.stdin = _BrokenPipeStream()
+            self.stdout = _TrackingStream()
+            self.stderr = _TrackingStream()
+
+        def poll(self) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("terminate() should not be called for exited process")
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise AssertionError("wait() should not be called for exited process")
+
+    proc = _ExitedProcess()
+    _MCPStdioClient._terminate(proc)  # should not raise
+
+    assert proc.stdin.closed is True
+    assert proc.stdout.closed is True
+    assert proc.stderr.closed is True
+
+
+def test_mcp_client_send_request_reports_process_exit_context() -> None:
+    class _BrokenStdin:
+        def write(self, _payload: str) -> int:
+            raise BrokenPipeError("[Errno 32] Broken pipe")
+
+        def flush(self) -> None:
+            raise BrokenPipeError("[Errno 32] Broken pipe")
+
+    class _ErrStream:
+        def read(self) -> str:
+            return "oauth required"
+
+    class _ExitedProcess:
+        def __init__(self) -> None:
+            self.stdin = _BrokenStdin()
+            self.stderr = _ErrStream()
+
+        def poll(self) -> int:
+            return 1
+
+    client = _MCPStdioClient(
+        alias="demo",
+        server=MCPServerConfig(command=sys.executable, args=[]),
+    )
+    with pytest.raises(RuntimeError) as exc:
+        client._send_request(  # noqa: SLF001 - exercising write-path failure
+            _ExitedProcess(),
+            request_id=1,
+            method="tools/list",
+            params={},
+        )
+    text = str(exc.value)
+    assert "tools/list" in text
+    assert "Broken pipe" not in text
+    assert "exit code 1" in text
+    assert "oauth required" in text
+
+
 @pytest.mark.asyncio
 @pytest.mark.mcp
 async def test_mcp_tool_executes_through_registry(tmp_path):
@@ -328,6 +520,27 @@ async def test_mcp_tool_executes_through_registry(tmp_path):
     )
     assert result.success
     assert "echo:hello" in result.output
+
+
+@pytest.mark.asyncio
+@pytest.mark.mcp
+async def test_env_ref_values_expand_before_mcp_spawn(tmp_path, monkeypatch):
+    monkeypatch.setenv("REAL_MCP_TOKEN", "secret-123")
+    script = _write_env_echo_mcp_server(tmp_path)
+    cfg = _build_config_with_env(
+        script,
+        {"MCP_TOKEN": "${REAL_MCP_TOKEN}"},
+    )
+    registry = ToolRegistry()
+    register_mcp_tools(registry, mcp_config=cfg.mcp)
+
+    result = await registry.execute(
+        "mcp.demo.echo_env",
+        {"text": "hello"},
+        workspace=tmp_path,
+    )
+    assert result.success
+    assert "secret-123:hello" in result.output
 
 
 def test_mcp_name_collisions_are_skipped(tmp_path):
@@ -408,6 +621,46 @@ async def test_unknown_mcp_tool_triggers_runtime_refresh(tmp_path):
     )
     assert result.success
     assert "ping:now" in result.output
+
+
+@pytest.mark.asyncio
+@pytest.mark.mcp
+async def test_runtime_refresh_does_not_route_mcp_auth_via_auth_context(tmp_path):
+    script = _write_auth_gated_mcp_server(tmp_path)
+    cfg = _build_config_with_env(
+        script,
+        {},
+    )
+    registry = create_default_registry(cfg)
+    assert not registry.has("mcp.demo.echo_env")
+
+    auth_cfg = tmp_path / "auth.toml"
+    auth_cfg.write_text(
+        """
+[auth.mcp_alias_profiles]
+demo = "demo_profile"
+
+[auth.profiles.demo_profile]
+provider = "notion"
+mode = "env_passthrough"
+
+[auth.profiles.demo_profile.env]
+MCP_TOKEN = "run-token"
+"""
+    )
+    auth_context = build_run_auth_context(
+        workspace=tmp_path,
+        metadata={"auth_config_path": str(auth_cfg)},
+    )
+
+    result = await registry.execute(
+        "mcp.demo.echo_env",
+        {"text": "hello"},
+        workspace=tmp_path,
+        auth_context=auth_context,
+    )
+    assert not result.success
+    assert "Unknown tool: mcp.demo.echo_env" in result.error
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,8 @@ data/
 
 # Loom runtime
 .loom/
+.loom/auth.toml
+.loom/auth.defaults.toml
 loom.toml
 
 # OS

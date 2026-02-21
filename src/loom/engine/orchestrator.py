@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from loom.auth.runtime import AuthResolutionError, build_run_auth_context
 from loom.config import Config
 
 if TYPE_CHECKING:
@@ -1262,6 +1263,16 @@ class Orchestrator:
         code_analysis = ""
         workspace_analysis = ""
         read_roots = self._read_roots_for_task(task)
+        auth_context = None
+        try:
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            auth_context = build_run_auth_context(
+                workspace=Path(task.workspace) if task.workspace else None,
+                metadata=metadata,
+            )
+        except AuthResolutionError as e:
+            logger.warning("Auth context unavailable during planning for %s: %s", task.id, e)
+
         if task.workspace:
             workspace_path = Path(task.workspace)
             if workspace_path.exists():
@@ -1272,6 +1283,7 @@ class Orchestrator:
                         {},
                         workspace=workspace_path,
                         read_roots=read_roots,
+                        auth_context=auth_context,
                     )
 
                 async def _do_analysis():
@@ -1889,6 +1901,7 @@ def create_task(
     approval_mode: str = "auto",
     callback_url: str = "",
     context: dict | None = None,
+    metadata: dict | None = None,
 ) -> Task:
     """Factory for creating new tasks with a generated ID."""
     return Task(
@@ -1898,6 +1911,7 @@ def create_task(
         approval_mode=approval_mode,
         callback_url=callback_url,
         context=context or {},
+        metadata=metadata or {},
         created_at=datetime.now().isoformat(),
         updated_at=datetime.now().isoformat(),
     )

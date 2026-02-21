@@ -152,6 +152,15 @@ class DelegateTaskTool(Tool):
                 text = str(item or "").strip()
                 if text:
                     read_roots.append(text)
+        auth_profile_overrides_raw = args.get("_auth_profile_overrides", {})
+        auth_profile_overrides: dict[str, str] = {}
+        if isinstance(auth_profile_overrides_raw, dict):
+            for key, value in auth_profile_overrides_raw.items():
+                selector = str(key or "").strip()
+                profile_id = str(value or "").strip()
+                if selector and profile_id:
+                    auth_profile_overrides[selector] = profile_id
+        auth_config_path = str(args.get("_auth_config_path", "") or "").strip()
         workspace = str(ctx.workspace) if ctx.workspace else ""
 
         # Fresh orchestrator per call to isolate concurrent delegated runs.
@@ -178,6 +187,10 @@ class DelegateTaskTool(Tool):
         )
         if read_roots:
             task.metadata["read_roots"] = read_roots
+        if auth_profile_overrides:
+            task.metadata["auth_profile_overrides"] = auth_profile_overrides
+        if auth_config_path:
+            task.metadata["auth_config_path"] = auth_config_path
         event_bus = getattr(orchestrator, "_events", None)
         event_log_handle = None
         event_log_path = ""
