@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -1100,6 +1100,7 @@ class TestOrchestratorExecution:
             read_roots=[],
             changelog=None,
             subtask_id="s1",
+            auth_context=ANY,
         )
 
     @pytest.mark.asyncio

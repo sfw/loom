@@ -113,7 +113,8 @@ class TestCLI:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
-            def run(self):
+            def run(self, **kwargs):
+                captured["run_kwargs"] = kwargs
                 return None
 
         monkeypatch.setattr(main_mod, "_init_persistence", lambda _cfg: (None, None))
@@ -133,6 +134,7 @@ class TestCLI:
         )
 
         assert captured["process_name"] == "marketing-strategy"
+        assert captured["run_kwargs"] == {"mouse": True}
 
     def test_run_uses_default_process(self, tmp_path, monkeypatch):
         """`loom run` should send process.default when flag is omitted."""
@@ -140,8 +142,9 @@ class TestCLI:
 
         captured: dict[str, object] = {}
 
-        async def fake_run_task(_url, _goal, _ws, process_name=None):
+        async def fake_run_task(_url, _goal, _ws, process_name=None, metadata=None):
             captured["process_name"] = process_name
+            captured["metadata"] = metadata
 
         monkeypatch.setattr(main_mod, "_run_task", fake_run_task)
 
@@ -163,6 +166,58 @@ class TestCLI:
         )
         assert result.exit_code == 0
         assert captured["process_name"] == "marketing-strategy"
+        assert captured["metadata"] is None
+
+    def test_run_passes_auth_profile_metadata(self, tmp_path, monkeypatch):
+        """`loom run --auth-profile` should send metadata to API payload."""
+        import loom.__main__ as main_mod
+
+        captured: dict[str, object] = {}
+
+        async def fake_run_task(_url, _goal, _ws, process_name=None, metadata=None):
+            captured["process_name"] = process_name
+            captured["metadata"] = metadata
+
+        monkeypatch.setattr(main_mod, "_run_task", fake_run_task)
+
+        cfg_path = tmp_path / "loom.toml"
+        cfg_path.write_text(
+            "[server]\n"
+            "host = \"127.0.0.1\"\n"
+            "port = 9000\n"
+        )
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+"""
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg_path),
+                "--auth-config",
+                str(auth_cfg),
+                "run",
+                "demo goal",
+                "--auth-profile",
+                "notion=notion_marketing",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert captured["process_name"] is None
+        metadata = captured["metadata"]
+        assert isinstance(metadata, dict)
+        assert metadata["auth_profile_overrides"] == {
+            "notion": "notion_marketing"
+        }
+        assert metadata["auth_config_path"] == str(auth_cfg.resolve())
 
     def test_process_test_runs_selected_cases(self, tmp_path, monkeypatch):
         async def fake_run_process_tests(*args, **kwargs):
@@ -204,6 +259,330 @@ class TestCLI:
         assert result.exit_code == 0
         assert "[PASS] case=smoke mode=deterministic" in result.output
 
+
+class TestAuthCli:
+    def test_auth_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["auth", "--help"])
+        assert result.exit_code == 0
+        assert "list" in result.output
+        assert "show" in result.output
+        assert "check" in result.output
+        assert "route" not in result.output
+
+    def test_auth_list_show_check(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.defaults]
+notion = "notion_marketing"
+
+[auth.mcp_alias_profiles]
+notion_local = "notion_marketing"
+
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+account_label = "Marketing"
+scopes = ["read:content"]
+"""
+        )
+        runner = CliRunner()
+
+        list_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "list",
+                "--json",
+            ],
+        )
+        assert list_result.exit_code == 0
+        listed = json.loads(list_result.output)
+        assert listed["defaults"]["notion"] == "notion_marketing"
+        assert "mcp_alias_profiles" not in listed
+        assert listed["profiles"][0]["id"] == "notion_marketing"
+
+        show_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "show",
+                "notion_marketing",
+                "--json",
+            ],
+        )
+        assert show_result.exit_code == 0
+        shown = json.loads(show_result.output)
+        assert shown["provider"] == "notion"
+        assert shown["mode"] == "oauth2_pkce"
+
+        check_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "check",
+            ],
+        )
+        assert check_result.exit_code == 0
+        assert "Auth config is valid." in check_result.output
+
+    def test_auth_select_sets_and_unsets_workspace_default(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+"""
+        )
+        runner = CliRunner()
+
+        set_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "select",
+                "notion",
+                "notion_marketing",
+            ],
+        )
+        assert set_result.exit_code == 0
+        defaults_path = workspace / ".loom" / "auth.defaults.toml"
+        assert defaults_path.exists()
+        content = defaults_path.read_text()
+        assert 'notion = "notion_marketing"' in content
+
+        unset_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "select",
+                "notion",
+                "--unset",
+            ],
+        )
+        assert unset_result.exit_code == 0
+        assert 'notion = "notion_marketing"' not in defaults_path.read_text()
+
+    def test_auth_select_rejects_mcp_selector(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+"""
+        )
+        runner = CliRunner()
+
+        set_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "select",
+                "mcp.notion",
+                "notion_marketing",
+            ],
+        )
+        assert set_result.exit_code == 1
+        assert "MCP selectors are no longer supported" in set_result.output
+
+    def test_auth_route_subcommand_removed(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        runner = CliRunner()
+
+        route_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "auth",
+                "route",
+                "list",
+            ],
+        )
+        assert route_result.exit_code == 2
+        assert "No such command 'route'" in route_result.output
+
+    def test_auth_profile_add_edit_remove(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        auth_cfg = tmp_path / "auth.toml"
+        runner = CliRunner()
+
+        add_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "profile",
+                "add",
+                "notion_marketing",
+                "--provider",
+                "notion",
+                "--mode",
+                "oauth2_pkce",
+                "--label",
+                "Marketing",
+                "--token-ref",
+                "keychain://loom/notion/notion_marketing/tokens",
+                "--scope",
+                "read:content",
+                "--meta",
+                "workspace=marketing",
+            ],
+        )
+        assert add_result.exit_code == 0
+
+        show_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "show",
+                "notion_marketing",
+                "--json",
+            ],
+        )
+        assert show_result.exit_code == 0
+        shown = json.loads(show_result.output)
+        assert shown["provider"] == "notion"
+        assert shown["account_label"] == "Marketing"
+        assert shown["metadata"]["workspace"] == "marketing"
+
+        edit_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "profile",
+                "edit",
+                "notion_marketing",
+                "--mode",
+                "env_passthrough",
+                "--env",
+                "NOTION_TOKEN=${NOTION_TOKEN}",
+                "--clear-scopes",
+            ],
+        )
+        assert edit_result.exit_code == 0
+
+        show_after_edit = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "show",
+                "notion_marketing",
+                "--json",
+            ],
+        )
+        assert show_after_edit.exit_code == 0
+        edited = json.loads(show_after_edit.output)
+        assert edited["mode"] == "env_passthrough"
+        assert edited["scopes"] == []
+        assert edited["env"]["NOTION_TOKEN"] == "${NOTION_TOKEN}"
+
+        list_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "list",
+                "--json",
+            ],
+        )
+        assert list_result.exit_code == 0
+        listed = json.loads(list_result.output)
+        assert listed["profiles"][0]["id"] == "notion_marketing"
+
+        remove_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "profile",
+                "remove",
+                "notion_marketing",
+            ],
+        )
+        assert remove_result.exit_code == 0
+
+        list_after_remove = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "list",
+                "--json",
+            ],
+        )
+        assert list_after_remove.exit_code == 0
+        listed_after_remove = json.loads(list_after_remove.output)
+        assert listed_after_remove["profiles"] == []
 
 class TestMCPCli:
     def test_mcp_help(self):
@@ -352,7 +731,8 @@ class TestMCPCli:
             ],
         )
         assert list_empty.exit_code == 0
-        assert json.loads(list_empty.output)["servers"] == []
+        aliases = [item["alias"] for item in json.loads(list_empty.output)["servers"]]
+        assert "demo" not in aliases
 
     def test_mcp_migrate_moves_legacy_section(self, tmp_path):
         cfg = tmp_path / "loom.toml"

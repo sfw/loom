@@ -30,6 +30,7 @@ _SAFE_SEGMENT = re.compile(r"[^a-zA-Z0-9_-]+")
 _DEFAULT_TIMEOUT_SECONDS = 30
 _MIN_TIMEOUT_SECONDS = 5
 _MAX_TIMEOUT_SECONDS = 120
+_ENV_REF_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 
 def _sanitize_segment(raw: str, fallback: str) -> str:
@@ -40,6 +41,35 @@ def _sanitize_segment(raw: str, fallback: str) -> str:
 
 def _normalize_timeout_seconds(value: int) -> int:
     return max(_MIN_TIMEOUT_SECONDS, min(_MAX_TIMEOUT_SECONDS, int(value)))
+
+
+def _resolve_env_map(
+    raw_env: dict[str, str],
+    *,
+    base_env: dict[str, str],
+) -> dict[str, str]:
+    """Resolve env refs like `${TOKEN}` against a base environment."""
+    resolved: dict[str, str] = {}
+    missing_refs: list[str] = []
+    for key, value in raw_env.items():
+        text = str(value)
+        match = _ENV_REF_PATTERN.match(text.strip())
+        if match is None:
+            resolved[key] = text
+            continue
+        ref_name = match.group(1)
+        ref_value = base_env.get(ref_name)
+        if ref_value is None:
+            missing_refs.append(ref_name)
+            continue
+        resolved[key] = ref_value
+    if missing_refs:
+        missing = ", ".join(sorted(set(missing_refs)))
+        raise RuntimeError(
+            "Missing environment variable(s) for MCP env refs: "
+            f"{missing}"
+        )
+    return resolved
 
 
 def _error_to_text(error_payload: Any) -> str:
@@ -119,9 +149,15 @@ class _MCPStdioClient:
             timeout = _DEFAULT_TIMEOUT_SECONDS
         return _normalize_timeout_seconds(timeout)
 
-    def _spawn(self) -> subprocess.Popen:
+    def _spawn(
+        self,
+        *,
+        env_overrides: dict[str, str] | None = None,
+    ) -> subprocess.Popen:
         env = os.environ.copy()
-        env.update(self.server.env)
+        env.update(_resolve_env_map(self.server.env, base_env=env))
+        if env_overrides:
+            env.update(env_overrides)
         cwd = self.server.cwd.strip() or None
 
         return subprocess.Popen(
@@ -145,6 +181,11 @@ class _MCPStdioClient:
     ) -> None:
         if process.stdin is None:
             raise RuntimeError("MCP process stdin unavailable")
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"MCP server {self.alias!r} exited before accepting {method!r}: "
+                f"{self._exit_context(process)}"
+            )
         payload: dict[str, Any] = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -152,8 +193,15 @@ class _MCPStdioClient:
         }
         if params is not None:
             payload["params"] = params
-        process.stdin.write(json.dumps(payload, ensure_ascii=True) + "\n")
-        process.stdin.flush()
+        try:
+            process.stdin.write(json.dumps(payload, ensure_ascii=True) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            # Child exited between spawn and write/flush.
+            raise RuntimeError(
+                f"MCP server {self.alias!r} closed stdin during {method!r}: "
+                f"{self._exit_context(process)}"
+            ) from e
 
     def _send_notification(
         self,
@@ -170,8 +218,35 @@ class _MCPStdioClient:
         }
         if params is not None:
             payload["params"] = params
-        process.stdin.write(json.dumps(payload, ensure_ascii=True) + "\n")
-        process.stdin.flush()
+        try:
+            process.stdin.write(json.dumps(payload, ensure_ascii=True) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            # Best-effort notification; caller will fail on next request if needed.
+            logger.debug(
+                "MCP server %s did not accept notification %s (%s)",
+                self.alias,
+                method,
+                self._exit_context(process),
+            )
+
+    @staticmethod
+    def _exit_context(process: subprocess.Popen) -> str:
+        code = process.poll()
+        base = (
+            f"exit code {code}"
+            if code is not None
+            else "process still running"
+        )
+        stderr = ""
+        if code is not None and process.stderr is not None:
+            try:
+                stderr = process.stderr.read().strip()
+            except Exception:
+                stderr = ""
+        if stderr:
+            return f"{base}; stderr: {stderr}"
+        return base
 
     def _read_message(
         self,
@@ -275,8 +350,10 @@ class _MCPStdioClient:
         self,
         method: str,
         params: dict[str, Any] | None = None,
+        *,
+        env_overrides: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        process = self._spawn()
+        process = self._spawn(env_overrides=env_overrides)
         timeout_seconds = self._timeout_seconds()
         deadline = time.monotonic() + timeout_seconds
         try:
@@ -330,18 +407,47 @@ class _MCPStdioClient:
             self._terminate(process)
 
     @staticmethod
-    def _terminate(process: subprocess.Popen) -> None:
-        if process.poll() is not None:
+    def _close_pipe(stream: Any) -> None:
+        """Close one process pipe, swallowing teardown-time broken pipes."""
+        if stream is None:
             return
-        process.terminate()
         try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=1)
+            stream.close()
+        except (BrokenPipeError, OSError, ValueError):
+            # Broken pipes are expected when child exited before stdin flush.
+            pass
 
-    def list_tools(self) -> list[dict[str, Any]]:
-        response, _changed = self.request("tools/list", {})
+    @staticmethod
+    def _terminate(process: subprocess.Popen) -> None:
+        try:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    process.wait(timeout=1)
+        finally:
+            _MCPStdioClient._close_pipe(process.stdin)
+            _MCPStdioClient._close_pipe(process.stdout)
+            _MCPStdioClient._close_pipe(process.stderr)
+
+    def list_tools(
+        self,
+        *,
+        env_overrides: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        response, _changed = self.request(
+            "tools/list",
+            {},
+            env_overrides=env_overrides,
+        )
         tools_raw: Any
         if isinstance(response, dict) and "tools" in response:
             tools_raw = response.get("tools", [])
@@ -362,10 +468,13 @@ class _MCPStdioClient:
         self,
         name: str,
         arguments: dict[str, Any],
+        *,
+        env_overrides: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         return self.request(
             "tools/call",
             {"name": name, "arguments": arguments},
+            env_overrides=env_overrides,
         )
 
 
@@ -410,14 +519,29 @@ class MCPToolProxy(Tool):
         return self._timeout
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        env_overrides: dict[str, str] | None = None
+        auth_ctx = getattr(ctx, "auth_context", None)
+        if auth_ctx is not None:
+            try:
+                env_overrides = auth_ctx.env_for_mcp_alias(self._client.alias)
+            except Exception as e:
+                return ToolResult.fail(
+                    f"MCP auth context error for {self._client.alias!r}: {e}"
+                )
+
         try:
             result, list_changed = await asyncio.to_thread(
                 self._client.call_tool,
                 self._remote_name,
                 args,
+                env_overrides=env_overrides,
             )
             if list_changed and self._refresh_callback is not None:
-                await asyncio.to_thread(self._refresh_callback, force=True)
+                await asyncio.to_thread(
+                    self._refresh_callback,
+                    force=True,
+                    auth_context=auth_ctx,
+                )
         except TimeoutError:
             return ToolResult.fail(
                 f"MCP tool {self._local_name!r} timed out"
@@ -440,7 +564,11 @@ class MCPToolProxy(Tool):
                 self._refresh_callback is not None
                 and "unknown tool" in detail.lower()
             ):
-                await asyncio.to_thread(self._refresh_callback, force=True)
+                await asyncio.to_thread(
+                    self._refresh_callback,
+                    force=True,
+                    auth_context=auth_ctx,
+                )
             return ToolResult.fail(detail or "MCP tool returned isError=true")
 
         content = result.get("content")
@@ -489,7 +617,7 @@ class _MCPRegistrySynchronizer:
         self._clients[alias] = client
         return client
 
-    def _discover(self) -> dict[str, MCPToolProxy]:
+    def _discover(self, *, auth_context: Any = None) -> dict[str, MCPToolProxy]:
         discovered: dict[str, MCPToolProxy] = {}
 
         for alias_raw, server in self._mcp_config.servers.items():
@@ -505,8 +633,19 @@ class _MCPRegistrySynchronizer:
                 continue
 
             client = self._client_for(alias, server)
+            env_overrides: dict[str, str] | None = None
+            if auth_context is not None:
+                try:
+                    env_overrides = auth_context.env_for_mcp_alias(alias)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to resolve MCP auth env for %s: %s",
+                        alias,
+                        e,
+                    )
+                    continue
             try:
-                tools = client.list_tools()
+                tools = client.list_tools(env_overrides=env_overrides)
             except Exception as e:
                 logger.warning(
                     "Failed to discover MCP tools for %s: %s",
@@ -543,11 +682,11 @@ class _MCPRegistrySynchronizer:
 
         return discovered
 
-    def refresh(self, *, force: bool = False) -> list[str]:
+    def refresh(self, *, force: bool = False, auth_context: Any = None) -> list[str]:
         """Reconcile MCP tools in-place and return active MCP tool names."""
         del force  # currently always reconciles; reserved for future policies
         with self._lock:
-            discovered = self._discover()
+            discovered = self._discover(auth_context=auth_context)
             desired = set(discovered.keys())
             current = {
                 name for name in self._registry._tools.keys()  # noqa: SLF001

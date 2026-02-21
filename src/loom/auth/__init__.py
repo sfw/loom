@@ -1,0 +1,58 @@
+"""Auth profile config and runtime helpers."""
+
+from loom.auth.config import (
+    AuthConfig,
+    AuthConfigError,
+    AuthProfile,
+    MergedAuthConfig,
+    default_user_auth_path,
+    default_workspace_auth_defaults_path,
+    load_auth_file,
+    load_merged_auth_config,
+    load_workspace_auth_defaults,
+    merge_auth_config,
+    remove_auth_profile,
+    render_auth_toml,
+    render_workspace_auth_defaults,
+    resolve_auth_write_path,
+    set_auth_default,
+    set_workspace_auth_default,
+    upsert_auth_profile,
+    write_auth_file,
+    write_workspace_auth_defaults,
+)
+from loom.auth.runtime import (
+    AuthResolutionError,
+    RunAuthContext,
+    build_run_auth_context,
+    parse_auth_profile_overrides,
+)
+from loom.auth.secrets import SecretResolutionError, SecretResolver
+
+__all__ = [
+    "AuthConfig",
+    "AuthConfigError",
+    "AuthProfile",
+    "MergedAuthConfig",
+    "AuthResolutionError",
+    "SecretResolutionError",
+    "SecretResolver",
+    "RunAuthContext",
+    "build_run_auth_context",
+    "default_user_auth_path",
+    "default_workspace_auth_defaults_path",
+    "load_auth_file",
+    "load_merged_auth_config",
+    "load_workspace_auth_defaults",
+    "merge_auth_config",
+    "remove_auth_profile",
+    "render_auth_toml",
+    "render_workspace_auth_defaults",
+    "resolve_auth_write_path",
+    "set_auth_default",
+    "set_workspace_auth_default",
+    "upsert_auth_profile",
+    "write_auth_file",
+    "write_workspace_auth_defaults",
+    "parse_auth_profile_overrides",
+]

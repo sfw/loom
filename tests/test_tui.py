@@ -407,6 +407,7 @@ class TestProcessRunPane:
         )
         assert pane._progress._auto_follow is True
         assert pane._outputs._auto_follow is True
+        assert pane._outputs._follow_mode == "active"
 
     def test_process_run_rows_render_with_fold_overflow(self):
         from rich.text import Text
@@ -427,6 +428,66 @@ class TestProcessRunPane:
         assert rendered.no_wrap is False
         assert rendered.overflow == "fold"
         assert "longlist of slogan/tagline options" in rendered.plain
+
+    def test_process_run_active_follow_waits_for_started_rows(self):
+        from unittest.mock import PropertyMock, patch
+
+        from loom.tui.app import ProcessRunList
+
+        panel = ProcessRunList(
+            empty_message="No outputs yet",
+            auto_follow=True,
+            follow_mode="active",
+        )
+        panel._rows = [
+            {"status": "pending", "content": "slogan-longlist.csv"},
+            {"status": "pending", "content": "shortlist-scorecard.csv"},
+        ]
+        panel.call_after_refresh = MagicMock()
+
+        with patch.object(
+            ProcessRunList,
+            "is_attached",
+            new_callable=PropertyMock,
+            return_value=True,
+        ):
+            panel._scroll_to_latest()
+
+        panel.call_after_refresh.assert_not_called()
+
+    def test_process_run_active_follow_targets_current_output(self):
+        from unittest.mock import PropertyMock, patch
+
+        from loom.tui.app import ProcessRunList
+
+        panel = ProcessRunList(
+            empty_message="No outputs yet",
+            auto_follow=True,
+            follow_mode="active",
+        )
+        panel._rows = [
+            {"status": "pending", "content": "brief-normalized.md"},
+            {"status": "completed", "content": "brief-assumptions.md"},
+            {"status": "completed", "content": "tension-map.csv"},
+            {"status": "in_progress", "content": "insight-angles.md"},
+            {"status": "pending", "content": "signal-board.md"},
+        ]
+        panel.scroll_to = MagicMock()
+
+        def _run_immediately(callback, *_args, **_kwargs):
+            callback()
+
+        panel.call_after_refresh = MagicMock(side_effect=_run_immediately)
+
+        with patch.object(
+            ProcessRunList,
+            "is_attached",
+            new_callable=PropertyMock,
+            return_value=True,
+        ):
+            panel._scroll_to_latest()
+
+        panel.scroll_to.assert_called_once_with(y=1, animate=False, force=True)
 
 
 class TestSidebarWidget:
@@ -2496,6 +2557,7 @@ class TestProcessSlashCommands:
             error=None,
             data={"task_id": "cowork-1", "tasks": []},
         ))
+        app._run_auth_profile_overrides = {"notion": "notion_marketing"}
         app._update_process_run_visuals = MagicMock()
         app._refresh_sidebar_progress_summary = MagicMock()
         app._refresh_workspace_tree = MagicMock()
@@ -2521,6 +2583,9 @@ class TestProcessSlashCommands:
         assert payload["_process_override"] is process_defn
         assert payload["_approval_mode"] == "disabled"
         assert payload["_read_roots"] == [str(Path("/tmp").resolve())]
+        assert payload["_auth_profile_overrides"] == {
+            "notion": "notion_marketing"
+        }
         assert payload["context"]["workspace"] == "/tmp/process-run"
         assert payload["context"]["source_workspace_root"] == str(Path("/tmp").resolve())
         assert payload["context"]["requested_goal"] == "Analyze Tesla"
@@ -3464,7 +3529,7 @@ class TestProcessSlashCommands:
 
 class TestMCPSlashCommands:
     @pytest.mark.asyncio
-    async def test_mcp_without_args_shows_usage(self):
+    async def test_mcp_without_args_opens_manager(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -3472,14 +3537,14 @@ class TestMCPSlashCommands:
             tools=MagicMock(),
             workspace=Path("/tmp"),
         )
+        app._open_mcp_manager_screen = MagicMock()
         chat = MagicMock()
         app.query_one = MagicMock(return_value=chat)
 
         handled = await app._handle_slash_command("/mcp")
 
         assert handled is True
-        chat.add_info.assert_called_once()
-        assert "/mcp list" in chat.add_info.call_args.args[0]
+        app._open_mcp_manager_screen.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_mcp_list_uses_manager(self):
@@ -3663,6 +3728,320 @@ class TestMCPSlashCommands:
         assert "Tools discovered: 2" in message
         assert "echo" in message
         assert "ping" in message
+
+    @pytest.mark.asyncio
+    async def test_mcp_manage_routes_to_manager_screen(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._open_mcp_manager_screen = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/mcp manage")
+
+        assert handled is True
+        app._open_mcp_manager_screen.assert_called_once()
+
+    def test_mcp_manager_inherits_explicit_config_paths(self, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        captured: dict[str, object] = {}
+
+        class DummyManager:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("loom.mcp.config.MCPConfigManager", DummyManager)
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=MagicMock(),
+            explicit_mcp_path=Path("/tmp/override-mcp.toml"),
+            legacy_config_path=Path("/tmp/loom.toml"),
+        )
+
+        manager = app._mcp_manager()
+
+        assert isinstance(manager, DummyManager)
+        assert captured["explicit_path"] == Path("/tmp/override-mcp.toml")
+        assert captured["legacy_config_path"] == Path("/tmp/loom.toml")
+
+    @pytest.mark.asyncio
+    async def test_mcp_add_parses_flags_and_adds_server(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        manager = MagicMock()
+        manager.add_server.return_value = Path("/tmp/mcp.toml")
+        app._mcp_manager = MagicMock(return_value=manager)
+        app._reload_mcp_runtime = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command(
+            "/mcp add demo --command python --arg -m --arg demo.server "
+            "--env-ref TOKEN=REAL_TOKEN --timeout 45",
+        )
+
+        assert handled is True
+        manager.add_server.assert_called_once()
+        app._reload_mcp_runtime.assert_awaited_once()
+        chat.add_info.assert_called_once()
+        assert "added" in chat.add_info.call_args.args[0]
+
+
+class TestAuthSlashCommands:
+    @pytest.mark.asyncio
+    async def test_auth_without_args_opens_manager(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._refresh_process_command_index = MagicMock()
+        app._open_auth_manager_screen = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/auth")
+
+        assert handled is True
+        app._open_auth_manager_screen.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_auth_use_sets_run_override(self, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._refresh_process_command_index = MagicMock()
+
+        merged = SimpleNamespace(
+            config=SimpleNamespace(
+                profiles={
+                    "notion_marketing": SimpleNamespace(provider="notion"),
+                },
+                defaults={},
+                mcp_alias_profiles={},
+            ),
+            workspace_defaults={},
+            user_path=Path("/tmp/user-auth.toml"),
+            explicit_path=None,
+            workspace_defaults_path=Path("/tmp/.loom/auth.defaults.toml"),
+        )
+        monkeypatch.setattr(
+            "loom.auth.config.load_merged_auth_config",
+            lambda **_kwargs: merged,
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/auth use notion=notion_marketing")
+
+        assert handled is True
+        assert app._run_auth_profile_overrides == {
+            "notion": "notion_marketing"
+        }
+        chat.add_info.assert_called_once()
+        assert "notion -> notion_marketing" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_auth_add_and_remove_profile(self, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._refresh_process_command_index = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        monkeypatch.setattr(
+            "loom.auth.config.resolve_auth_write_path",
+            lambda explicit_path=None: Path("/tmp/auth.toml"),
+        )
+        monkeypatch.setattr(
+            "loom.auth.config.upsert_auth_profile",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "loom.auth.config.remove_auth_profile",
+            lambda *args, **kwargs: None,
+        )
+
+        handled_add = await app._handle_slash_command(
+            "/auth add notion_marketing --provider notion --mode oauth2_pkce "
+            "--token-ref keychain://loom/notion/notion_marketing/tokens",
+        )
+        assert handled_add is True
+        assert "Added auth profile" in chat.add_info.call_args.args[0]
+
+        handled_remove = await app._handle_slash_command(
+            "/auth remove notion_marketing",
+        )
+        assert handled_remove is True
+        assert "Removed auth profile" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_auth_manage_routes_to_manager_screen(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._open_auth_manager_screen = MagicMock()
+        app._refresh_process_command_index = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/auth manage")
+
+        assert handled is True
+        app._open_auth_manager_screen.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_auth_routes_subcommand_is_no_longer_supported(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._refresh_process_command_index = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/auth routes")
+
+        assert handled is True
+        chat.add_info.assert_called_once()
+        message = chat.add_info.call_args.args[0]
+        assert "Usage" in message
+        assert "/auth" in message
+        assert "routes" not in message
+
+    @pytest.mark.asyncio
+    async def test_auth_edit_uses_explicit_auth_path(self, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        explicit_path = Path("/tmp/override-auth.toml")
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            explicit_auth_path=explicit_path,
+        )
+        app._refresh_process_command_index = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        captured: dict[str, object] = {}
+        current = SimpleNamespace(
+            profile_id="notion_marketing",
+            provider="notion",
+            mode="oauth2_pkce",
+            account_label="",
+            secret_ref="",
+            token_ref="",
+            scopes=[],
+            env={},
+            command="",
+            auth_check=[],
+            metadata={},
+        )
+
+        def _fake_load_merged_auth_config(*, workspace, explicit_path=None):
+            captured["load_explicit_path"] = explicit_path
+            return SimpleNamespace(
+                config=SimpleNamespace(profiles={"notion_marketing": current}),
+            )
+
+        def _fake_resolve_auth_write_path(*, explicit_path=None):
+            captured["write_explicit_path"] = explicit_path
+            return Path("/tmp/auth.toml")
+
+        monkeypatch.setattr(
+            "loom.auth.config.load_merged_auth_config",
+            _fake_load_merged_auth_config,
+        )
+        monkeypatch.setattr(
+            "loom.auth.config.resolve_auth_write_path",
+            _fake_resolve_auth_write_path,
+        )
+        monkeypatch.setattr(
+            "loom.auth.config.upsert_auth_profile",
+            lambda *args, **kwargs: None,
+        )
+
+        handled = await app._handle_slash_command(
+            "/auth edit notion_marketing --label Marketing",
+        )
+
+        assert handled is True
+        assert captured["load_explicit_path"] == explicit_path
+        assert captured["write_explicit_path"] == explicit_path
+
+    @pytest.mark.asyncio
+    async def test_auth_use_rejects_mcp_selector(self, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._refresh_process_command_index = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        def _fake_load_merged_auth_config(**_kwargs):
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    profiles={
+                        "notion_marketing": SimpleNamespace(provider="notion"),
+                    },
+                    defaults={},
+                    mcp_alias_profiles={},
+                ),
+                workspace_defaults={},
+                user_path=Path("/tmp/user-auth.toml"),
+                explicit_path=None,
+                workspace_defaults_path=Path("/tmp/.loom/auth.defaults.toml"),
+            )
+
+        monkeypatch.setattr(
+            "loom.auth.config.load_merged_auth_config",
+            _fake_load_merged_auth_config,
+        )
+
+        handled = await app._handle_slash_command(
+            "/auth use mcp.notion=notion_marketing",
+        )
+
+        assert handled is True
+        chat.add_info.assert_called_once()
+        assert "MCP selectors are no longer supported" in chat.add_info.call_args.args[0]
 
 
 class TestCommandPaletteProcessActions:
@@ -4203,6 +4582,26 @@ class TestFileViewer:
 
         assert screen._error is None
         assert screen._viewer is not None
+
+    def test_render_pdf_missing_dependency_shows_sync_hint(self, tmp_path, monkeypatch):
+        import builtins
+
+        from loom.tui.screens import file_viewer
+
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        real_import = builtins.__import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "pypdf":
+                raise ImportError("No module named 'pypdf'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        widget = file_viewer._render_pdf(pdf, None)
+        rendered = str(widget.render())
+        assert "PDF preview unavailable" in rendered
+        assert "uv sync" in rendered
 
     def test_file_viewer_image_metadata_preview(self, tmp_path):
         from loom.tui.screens.file_viewer import FileViewerScreen

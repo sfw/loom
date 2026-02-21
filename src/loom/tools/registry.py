@@ -7,6 +7,7 @@ and schema generation for model consumption.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -95,6 +96,7 @@ class ToolContext:
     scratch_dir: Path | None = None
     changelog: Any | None = None  # ChangeLog instance for tracking file modifications
     subtask_id: str = ""
+    auth_context: Any | None = None
 
 
 class ToolSafetyError(Exception):
@@ -292,6 +294,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
         self._mcp_refresh_hook: Any = None
+        self._mcp_refresh_hook_supports_auth = False
         self._mcp_refresh_interval_seconds: float = 30.0
         self._mcp_last_refresh_at: float = 0.0
         self._mcp_refresh_running = False
@@ -304,10 +307,23 @@ class ToolRegistry:
     ) -> None:
         """Register a best-effort MCP refresh hook for dynamic tool sets."""
         self._mcp_refresh_hook = hook
+        supports_auth = False
+        try:
+            params = inspect.signature(hook).parameters
+            if "auth_context" in params:
+                supports_auth = True
+            else:
+                supports_auth = any(
+                    param.kind == inspect.Parameter.VAR_KEYWORD
+                    for param in params.values()
+                )
+        except (TypeError, ValueError):
+            supports_auth = False
+        self._mcp_refresh_hook_supports_auth = supports_auth
         self._mcp_refresh_interval_seconds = max(1.0, float(interval_seconds))
         self._mcp_last_refresh_at = 0.0
 
-    def _maybe_refresh_mcp(self, *, force: bool = False) -> None:
+    def _maybe_refresh_mcp(self, *, force: bool = False, auth_context: Any = None) -> None:
         if self._mcp_refresh_hook is None:
             return
         if self._mcp_refresh_running:
@@ -321,7 +337,10 @@ class ToolRegistry:
 
         self._mcp_refresh_running = True
         try:
-            self._mcp_refresh_hook(force=force)
+            if self._mcp_refresh_hook_supports_auth:
+                self._mcp_refresh_hook(force=force, auth_context=auth_context)
+            else:
+                self._mcp_refresh_hook(force=force)
             self._mcp_last_refresh_at = time.monotonic()
         except Exception as e:
             logging.getLogger(__name__).warning(
@@ -359,12 +378,13 @@ class ToolRegistry:
         scratch_dir: Path | None = None,
         changelog: Any = None,
         subtask_id: str = "",
+        auth_context: Any = None,
     ) -> ToolResult:
         """Execute a tool by name with timeout and context."""
-        self._maybe_refresh_mcp()
+        self._maybe_refresh_mcp(auth_context=auth_context)
         tool = self._tools.get(name)
         if tool is None and name.startswith("mcp."):
-            self._maybe_refresh_mcp(force=True)
+            self._maybe_refresh_mcp(force=True, auth_context=auth_context)
             tool = self._tools.get(name)
         if tool is None:
             return ToolResult.fail(f"Unknown tool: {name}")
@@ -383,6 +403,7 @@ class ToolRegistry:
             scratch_dir=scratch_dir,
             changelog=changelog,
             subtask_id=subtask_id,
+            auth_context=auth_context,
         )
 
         try:

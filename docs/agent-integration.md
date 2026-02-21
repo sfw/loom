@@ -202,11 +202,8 @@ Loom exposes itself as an [MCP (Model Context Protocol)](https://modelcontextpro
 ### Launching the MCP Server
 
 ```bash
-# stdio transport (for local agents like Claude Code)
+# stdio transport (current Loom mcp-serve mode)
 loom mcp-serve
-
-# SSE transport (for remote agents)
-loom mcp-serve --transport sse
 ```
 
 ### Configuring Claude Code to Use Loom
