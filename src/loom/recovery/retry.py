@@ -94,6 +94,7 @@ class RetryManager:
             return ""
 
         lines = ["PREVIOUS ATTEMPTS (all failed):"]
+        changed_files = self._changed_files_from_attempts(attempts)
         for a in attempts:
             lines.append(f"\nAttempt {a.attempt} (model tier {a.tier}):")
             if a.feedback:
@@ -110,6 +111,15 @@ class RetryManager:
                 categorized = categorize_error(a.error or "")
                 lines.append(f"  Error type: {a.error_category.value}")
                 lines.append(f"  Recovery hint: {categorized.recovery_hint}")
+
+        if changed_files:
+            lines.append("\nEDIT IN PLACE (avoid forked variants):")
+            for path in changed_files:
+                lines.append(f"- {path}")
+            lines.append(
+                "Do not create alternate versions like *-v2.*, *_v2.*, "
+                "*-copy.*, or similarly suffixed duplicates."
+            )
 
         strategy = attempts[-1].retry_strategy if attempts else RetryStrategy.GENERIC
         if strategy == RetryStrategy.RATE_LIMIT:
@@ -148,6 +158,33 @@ class RetryManager:
             "Take a different approach if needed."
         )
         return "\n".join(lines)
+
+    @staticmethod
+    def _changed_files_from_attempts(
+        attempts: list[AttemptRecord],
+        *,
+        max_items: int = 24,
+    ) -> list[str]:
+        files: list[str] = []
+        seen: set[str] = set()
+        for attempt in attempts:
+            raw_calls = getattr(attempt, "successful_tool_calls", [])
+            if not isinstance(raw_calls, list):
+                continue
+            for call in raw_calls:
+                result = getattr(call, "result", None)
+                changed = getattr(result, "files_changed", [])
+                if not isinstance(changed, list):
+                    continue
+                for item in changed:
+                    text = str(item or "").strip()
+                    if not text or text in seen:
+                        continue
+                    seen.add(text)
+                    files.append(text)
+                    if len(files) >= max_items:
+                        return files
+        return files
 
     @staticmethod
     def classify_failure(

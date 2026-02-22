@@ -63,10 +63,12 @@ class ChatLog(VerticalScroll):
         )
         self._scroll_to_end()
 
-    def add_model_text(self, text: str) -> None:
+    def add_model_text(self, text: str, *, markup: bool = False) -> None:
         """Append model response text."""
         self._flush_and_reset_stream()
-        self.mount(Static(text, classes="model-text", expand=True))
+        self.mount(
+            Static(text, classes="model-text", expand=True, markup=markup),
+        )
         self._scroll_to_end()
 
     def add_streaming_text(self, text: str) -> None:
@@ -144,10 +146,12 @@ class ChatLog(VerticalScroll):
         self.mount(Static(line, classes="turn-separator", expand=True))
         self._scroll_to_end()
 
-    def add_info(self, text: str) -> None:
+    def add_info(self, text: str, *, markup: bool = True) -> None:
         """Add an informational message (e.g. welcome text)."""
         self._flush_and_reset_stream()
-        self.mount(Static(text, classes="info-msg", expand=True))
+        self.mount(
+            Static(text, classes="info-msg", expand=True, markup=markup),
+        )
         self._scroll_to_end()
 
     def add_content_indicator(self, content_blocks: list) -> None:

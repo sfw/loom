@@ -20,9 +20,9 @@ PROVIDERS = [
 ]
 
 ROLE_PRESETS = {
-    "all": ["planner", "executor", "extractor", "verifier"],
+    "all": ["planner", "executor", "extractor", "verifier", "compactor"],
     "primary": ["planner", "executor"],
-    "utility": ["extractor", "verifier"],
+    "utility": ["extractor", "verifier", "compactor"],
 }
 
 CONFIG_DIR = Path.home() / ".loom"
@@ -264,9 +264,9 @@ def _prompt_roles() -> list[str]:
     click.echo()
     click.echo("Which roles should this model handle?")
     click.echo()
-    click.echo("  1. All roles (planner, executor, extractor, verifier)")
+    click.echo("  1. All roles (planner, executor, extractor, verifier, compactor)")
     click.echo("  2. Primary (planner, executor)")
-    click.echo("  3. Utility (extractor, verifier)")
+    click.echo("  3. Utility (extractor, verifier, compactor)")
     click.echo()
     choice = click.prompt(
         "Roles", type=click.IntRange(1, 3), default=1,
@@ -295,7 +295,7 @@ def _generate_toml(models: list[dict]) -> str:
         lines.append(f'model = "{m["model"]}"')
         if m.get("api_key"):
             lines.append(f'api_key = "{m["api_key"]}"')
-        lines.append(f"max_tokens = {m.get('max_tokens', 4096)}")
+        lines.append(f"max_tokens = {m.get('max_tokens', 8192)}")
         lines.append(f"temperature = {m.get('temperature', 0.1)}")
         roles_str = ", ".join(f'"{r}"' for r in m["roles"])
         lines.append(f"roles = [{roles_str}]")
@@ -317,6 +317,54 @@ def _generate_toml(models: list[dict]) -> str:
         "tier2_enabled = true",
         "tier3_enabled = false",
         "tier3_vote_count = 3",
+        "",
+        "[limits]",
+        "planning_response_max_tokens = 16384",
+        "adhoc_repair_source_max_chars = 0",
+        "evidence_context_text_max_chars = 8192",
+        "",
+        "[limits.runner]",
+        "max_tool_iterations = 20",
+        "max_subtask_wall_clock_seconds = 1200",
+        "max_model_context_tokens = 24000",
+        "max_state_summary_chars = 640",
+        "max_verification_summary_chars = 8000",
+        "default_tool_result_output_chars = 2800",
+        "heavy_tool_result_output_chars = 3600",
+        "compact_tool_result_output_chars = 900",
+        "compact_text_output_chars = 1400",
+        "minimal_text_output_chars = 260",
+        "tool_call_argument_context_chars = 700",
+        "compact_tool_call_argument_chars = 1600",
+        "",
+        "[limits.verifier]",
+        "max_tool_args_chars = 360",
+        "max_tool_status_chars = 320",
+        "max_tool_calls_tokens = 4000",
+        "max_verifier_prompt_tokens = 12000",
+        "max_result_summary_chars = 7000",
+        "compact_result_summary_chars = 2600",
+        "max_evidence_section_chars = 4200",
+        "max_evidence_section_compact_chars = 2200",
+        "max_artifact_section_chars = 4200",
+        "max_artifact_section_compact_chars = 2200",
+        "max_tool_output_excerpt_chars = 1100",
+        "max_artifact_file_excerpt_chars = 800",
+        "",
+        "[limits.compactor]",
+        "max_chunk_chars = 8000",
+        "max_chunks_per_round = 10",
+        "max_reduction_rounds = 2",
+        "min_compact_target_chars = 220",
+        "response_tokens_floor = 256",
+        "response_tokens_ratio = 0.55",
+        "response_tokens_buffer = 256",
+        "json_headroom_chars_floor = 128",
+        "json_headroom_chars_ratio = 0.30",
+        "json_headroom_chars_cap = 1024",
+        "chars_per_token_estimate = 2.8",
+        "token_headroom = 128",
+        "target_chars_ratio = 0.82",
         "",
         "[memory]",
         'database_path = "~/.loom/loom.db"',
@@ -371,7 +419,7 @@ def run_setup(*, reconfigure: bool = False) -> Path:
         "model": model,
         "api_key": api_key,
         "roles": roles,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "temperature": 0.1,
     }]
 

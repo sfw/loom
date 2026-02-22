@@ -40,6 +40,7 @@ class ModelResponse:
     usage: TokenUsage = field(default_factory=TokenUsage)
     model: str = ""
     latency_ms: int = 0
+    finish_reason: str = ""
 
     def has_tool_calls(self) -> bool:
         return bool(self.tool_calls)
@@ -114,6 +115,22 @@ class ModelProvider(ABC):
     def roles(self) -> list[str]:
         """Roles this provider can fulfill."""
         ...
+
+    @property
+    def configured_temperature(self) -> float | None:
+        """Return provider-configured default temperature when available."""
+        value = getattr(self, "_temperature", None)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    @property
+    def configured_max_tokens(self) -> int | None:
+        """Return provider-configured default max_tokens when available."""
+        value = getattr(self, "_max_tokens", None)
+        if isinstance(value, int) and value > 0:
+            return value
+        return None
 
 
 class ModelNotAvailableError(Exception):

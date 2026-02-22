@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import yaml
 
 from loom.tui.api_client import LoomAPIClient
 from loom.tui.screens.approval import ToolApprovalScreen
@@ -406,8 +407,32 @@ class TestProcessRunPane:
             goal="Generate campaign slogans",
         )
         assert pane._progress._auto_follow is True
+        assert pane._progress._follow_mode == "active"
         assert pane._outputs._auto_follow is True
         assert pane._outputs._follow_mode == "active"
+
+    def test_restart_button_shown_only_for_failed_run_with_task(self):
+        from loom.tui.app import ProcessRunPane
+
+        pane = ProcessRunPane(
+            run_id="abc123",
+            process_name="campaign-slogans",
+            goal="Generate campaign slogans",
+        )
+        pane.set_status_header(status="running", elapsed="0:01", task_id="cowork-1")
+        assert pane._actions.display is False
+        assert pane._restart_button.display is False
+        assert pane._restart_button.disabled is True
+
+        pane.set_status_header(status="failed", elapsed="0:42", task_id="")
+        assert pane._actions.display is False
+        assert pane._restart_button.display is False
+        assert pane._restart_button.disabled is True
+
+        pane.set_status_header(status="failed", elapsed="0:42", task_id="cowork-1")
+        assert pane._actions.display is True
+        assert pane._restart_button.display is True
+        assert pane._restart_button.disabled is False
 
     def test_process_run_rows_render_with_fold_overflow(self):
         from rich.text import Text
@@ -428,6 +453,34 @@ class TestProcessRunPane:
         assert rendered.no_wrap is False
         assert rendered.overflow == "fold"
         assert "longlist of slogan/tagline options" in rendered.plain
+
+    def test_process_run_rows_escape_markup_like_content(self):
+        from loom.tui.app import ProcessRunList
+
+        panel = ProcessRunList(empty_message="No progress yet")
+        panel._rows = [{
+            "status": "completed",
+            "content": "Verifier note ...[truncated]... follow-up",
+        }]
+
+        rendered = panel._render_rows()
+        assert "[truncated]" in rendered.plain
+
+    def test_process_run_result_coerces_rich_text_to_plain(self):
+        from rich.text import Text
+
+        from loom.tui.app import ProcessRunPane
+
+        pane = ProcessRunPane(
+            run_id="abc123",
+            process_name="campaign-slogans",
+            goal="Generate campaign slogans",
+        )
+        pane._log = MagicMock()
+
+        pane.add_result(Text.from_markup("[dim]ok[/dim]"), success=True)
+
+        assert pane._pending_results == [("ok", True)]
 
     def test_process_run_active_follow_waits_for_started_rows(self):
         from unittest.mock import PropertyMock, patch
@@ -917,6 +970,108 @@ class TestDelegateTaskUnbound:
 
         assert result.success is True
         assert observed_modes == ["disabled"]
+
+    @pytest.mark.asyncio
+    async def test_delegate_resume_reuses_plan_and_resets_incomplete_subtasks(self):
+        from loom.state.task_state import Plan, Subtask, SubtaskStatus, Task, TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        task = Task(
+            id="cowork-1234",
+            goal="Original goal",
+            workspace="/tmp",
+            status=TaskStatus.FAILED,
+            context={"existing": "ctx"},
+            plan=Plan(subtasks=[
+                Subtask(
+                    id="done",
+                    description="already done",
+                    status=SubtaskStatus.COMPLETED,
+                ),
+                Subtask(
+                    id="retry-me",
+                    description="retry this",
+                    status=SubtaskStatus.FAILED,
+                    summary="failed before",
+                    active_issue="timeout",
+                    retry_count=2,
+                ),
+                Subtask(
+                    id="blocked",
+                    description="blocked by failure",
+                    status=SubtaskStatus.SKIPPED,
+                    summary="Skipped: blocked",
+                ),
+            ]),
+        )
+
+        observed: dict = {}
+
+        async def _execute(resume_task, **kwargs):
+            observed["reuse_existing_plan"] = kwargs.get("reuse_existing_plan")
+            observed["statuses"] = [subtask.status for subtask in resume_task.plan.subtasks]
+            resume_task.status = TaskStatus.COMPLETED
+            return resume_task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator._state = MagicMock()
+            orchestrator._state.load = MagicMock(return_value=task)
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+        result = await tool.execute(
+            {
+                "goal": "Updated goal",
+                "context": {"new": "value"},
+                "_resume_task_id": "cowork-1234",
+            },
+            ctx,
+        )
+
+        assert result.success is True
+        assert observed["reuse_existing_plan"] is True
+        assert observed["statuses"] == [
+            SubtaskStatus.COMPLETED,
+            SubtaskStatus.PENDING,
+            SubtaskStatus.PENDING,
+        ]
+        assert task.goal == "Updated goal"
+        assert task.context["existing"] == "ctx"
+        assert task.context["new"] == "value"
+
+    @pytest.mark.asyncio
+    async def test_delegate_resume_rejects_completed_task(self):
+        from loom.state.task_state import Task, TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        task = Task(
+            id="cowork-done",
+            goal="Completed",
+            workspace="/tmp",
+            status=TaskStatus.COMPLETED,
+        )
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator._state = MagicMock()
+            orchestrator._state.load = MagicMock(return_value=task)
+            orchestrator.execute_task = AsyncMock()
+            return orchestrator
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+        result = await tool.execute(
+            {"goal": "Completed", "_resume_task_id": "cowork-done"},
+            ctx,
+        )
+
+        assert result.success is False
+        assert "already completed" in (result.error or "").lower()
 
     def test_delegate_timeout_default(self, monkeypatch):
         from loom.tools.delegate_task import DelegateTaskTool
@@ -1911,7 +2066,7 @@ class TestSlashCommandHints:
         assert app._slash_completion_candidates("/h") == ["/help"]
         assert app._slash_completion_candidates("/m") == ["/model", "/mcp"]
         assert app._slash_completion_candidates("/t") == ["/tools", "/tokens"]
-        assert app._slash_completion_candidates("/p") == ["/process"]
+        assert app._slash_completion_candidates("/p") == ["/process", "/processes"]
         assert app._slash_completion_candidates("/r") == ["/resume", "/run"]
 
     def test_slash_completion_candidates_include_dynamic_process_commands(self):
@@ -1970,7 +2125,7 @@ class TestProcessCatalogRendering:
 
 class TestProcessSlashCommands:
     @pytest.mark.asyncio
-    async def test_process_without_args_shows_usage(self):
+    async def test_process_without_args_shows_catalog(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -1979,17 +2134,15 @@ class TestProcessSlashCommands:
             workspace=Path("/tmp"),
         )
         app._process_defn = SimpleNamespace(name="marketing-strategy")
+        app._render_process_catalog = MagicMock(return_value="catalog")
         chat = MagicMock()
         app.query_one = MagicMock(return_value=chat)
 
         handled = await app._handle_slash_command("/process")
 
         assert handled is True
-        chat.add_info.assert_called_once()
-        message = chat.add_info.call_args.args[0]
-        assert "Process Controls" in message
-        assert "Active:[/] marketing-strategy" in message
-        assert "/process use <name-or-path>" in message
+        app._render_process_catalog.assert_called_once()
+        chat.add_info.assert_called_once_with("catalog")
 
     @pytest.mark.asyncio
     async def test_process_list_uses_catalog_renderer(self):
@@ -2005,6 +2158,25 @@ class TestProcessSlashCommands:
         app._render_process_catalog = MagicMock(return_value="catalog")
 
         handled = await app._handle_slash_command("/process list")
+
+        assert handled is True
+        app._render_process_catalog.assert_called_once()
+        chat.add_info.assert_called_once_with("catalog")
+
+    @pytest.mark.asyncio
+    async def test_processes_alias_uses_catalog_renderer(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app._render_process_catalog = MagicMock(return_value="catalog")
+
+        handled = await app._handle_slash_command("/processes")
 
         assert handled is True
         app._render_process_catalog.assert_called_once()
@@ -2173,7 +2345,7 @@ class TestProcessSlashCommands:
         assert "<goal>" in message
 
     @pytest.mark.asyncio
-    async def test_run_requires_active_process(self):
+    async def test_run_without_active_process_synthesizes_adhoc(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -2182,15 +2354,1694 @@ class TestProcessSlashCommands:
             workspace=Path("/tmp"),
         )
         app._process_defn = None
+        app._config = SimpleNamespace(process=SimpleNamespace(default=""))
+        adhoc_process = SimpleNamespace(name="adhoc-report", phases=[])
+        app._get_or_create_adhoc_process = AsyncMock(return_value=(
+            SimpleNamespace(
+                process_defn=adhoc_process,
+                recommended_tools=["web_search"],
+            ),
+            False,
+        ))
+        app._start_process_run = AsyncMock()
         chat = MagicMock()
         app.query_one = MagicMock(return_value=chat)
 
         handled = await app._handle_slash_command("/run analyze tesla")
 
         assert handled is True
-        chat.add_info.assert_called_once_with(
-            "No active process. Use /process use <name-or-path> first.",
+        app._get_or_create_adhoc_process.assert_awaited_once_with(
+            "analyze tesla",
+            fresh=False,
         )
+        app._start_process_run.assert_awaited_once()
+        assert app._start_process_run.await_args.args == ("analyze tesla",)
+        kwargs = app._start_process_run.await_args.kwargs
+        assert kwargs["process_defn"] is adhoc_process
+        assert kwargs["is_adhoc"] is True
+        assert kwargs["recommended_tools"] == ["web_search"]
+        assert isinstance(kwargs.get("adhoc_synthesis_notes"), list)
+        assert kwargs.get("adhoc_synthesis_notes")
+
+    @pytest.mark.asyncio
+    async def test_run_fresh_flag_bypasses_cache_lookup(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._process_defn = None
+        app._config = SimpleNamespace(process=SimpleNamespace(default=""))
+        adhoc_process = SimpleNamespace(name="adhoc-report", phases=[])
+        app._get_or_create_adhoc_process = AsyncMock(return_value=(
+            SimpleNamespace(
+                process_defn=adhoc_process,
+                recommended_tools=[],
+            ),
+            False,
+        ))
+        app._start_process_run = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/run --fresh analyze tesla")
+
+        assert handled is True
+        app._get_or_create_adhoc_process.assert_awaited_once_with(
+            "analyze tesla",
+            fresh=True,
+        )
+        app._start_process_run.assert_awaited_once()
+        assert app._start_process_run.await_args.args == ("analyze tesla",)
+        kwargs = app._start_process_run.await_args.kwargs
+        assert kwargs["process_defn"] is adhoc_process
+        assert kwargs["is_adhoc"] is True
+        assert kwargs["recommended_tools"] == []
+        assert isinstance(kwargs.get("adhoc_synthesis_notes"), list)
+        assert kwargs.get("adhoc_synthesis_notes")
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_adhoc_process_persists_cache_file(self, tmp_path, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        goal = "research wasted utility history"
+        key = app._adhoc_cache_key(goal)
+        spec = {
+            "intent": "research",
+            "name": "book-research-adhoc",
+            "description": "Ad hoc book research process",
+            "persona": "Investigative researcher",
+            "phase_mode": "guided",
+            "tool_guidance": "Gather and synthesize evidence.",
+            "required_tools": ["read_file", "write_file"],
+            "recommended_tools": ["spreadsheet"],
+            "phases": [
+                {
+                    "id": "scope",
+                    "description": "Define scope",
+                    "depends_on": [],
+                    "acceptance_criteria": "Scope documented.",
+                    "deliverables": ["scope.md"],
+                },
+                {
+                    "id": "research",
+                    "description": "Collect cases",
+                    "depends_on": ["scope"],
+                    "acceptance_criteria": "Cases validated.",
+                    "deliverables": ["cases.md"],
+                },
+            ],
+        }
+        generated_entry = app._build_adhoc_cache_entry(key=key, goal=goal, spec=spec)
+        app._synthesize_adhoc_process = AsyncMock(return_value=generated_entry)
+
+        resolved, from_cache = await app._get_or_create_adhoc_process(goal)
+
+        assert from_cache is False
+        assert resolved.process_defn.name == "book-research-adhoc"
+        cache_path = tmp_path / ".loom" / "cache" / "adhoc-processes" / f"{key}.yaml"
+        assert cache_path.exists()
+        payload = yaml.safe_load(cache_path.read_text(encoding="utf-8"))
+        assert payload["key"] == key
+        assert payload["goal"] == goal
+        assert payload["spec"]["name"] == "book-research-adhoc"
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_adhoc_process_uses_disk_cache(self, tmp_path, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file"]
+
+        goal = "draft incident retrospective"
+        key = app._adhoc_cache_key(goal)
+        spec = {
+            "intent": "writing",
+            "source": "model_generated",
+            "name": "retro-adhoc",
+            "description": "Incident retrospective process",
+            "persona": "Incident analyst",
+            "phase_mode": "guided",
+            "tool_guidance": "Collect timeline, analyze causes, summarize.",
+            "required_tools": ["read_file"],
+            "recommended_tools": [],
+            "phases": [
+                {
+                    "id": "timeline",
+                    "description": "Build timeline",
+                    "depends_on": [],
+                    "acceptance_criteria": "Timeline captured.",
+                    "deliverables": ["timeline.md"],
+                },
+                {
+                    "id": "identify-root-cause",
+                    "description": "Analyze root causes.",
+                    "depends_on": ["timeline"],
+                    "acceptance_criteria": "Root causes documented.",
+                    "deliverables": ["root-cause.md"],
+                },
+                {
+                    "id": "define-remediations",
+                    "description": "Define corrective actions.",
+                    "depends_on": ["identify-root-cause"],
+                    "acceptance_criteria": "Remediation plan defined.",
+                    "deliverables": ["remediations.md"],
+                },
+                {
+                    "id": "publish-retro",
+                    "description": "Publish final retrospective.",
+                    "depends_on": ["define-remediations"],
+                    "acceptance_criteria": "Final retrospective approved.",
+                    "deliverables": ["retro.md"],
+                },
+            ],
+        }
+        generated_entry = app._build_adhoc_cache_entry(key=key, goal=goal, spec=spec)
+        app._synthesize_adhoc_process = AsyncMock(return_value=generated_entry)
+
+        first, first_cached = await app._get_or_create_adhoc_process(goal)
+        assert first_cached is False
+        assert first.process_defn.name == "retro-adhoc"
+
+        app._adhoc_process_cache.clear()
+        app._synthesize_adhoc_process = AsyncMock(
+            side_effect=AssertionError("synthesis should not run when disk cache exists"),
+        )
+
+        second, second_cached = await app._get_or_create_adhoc_process(goal)
+
+        assert second_cached is True
+        assert second.process_defn.name == "retro-adhoc"
+        app._synthesize_adhoc_process.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_adhoc_process_fresh_bypasses_memory_and_disk_cache(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        goal = "research wasted utility history"
+        key = app._adhoc_cache_key(goal)
+
+        cached_spec = {
+            "intent": "research",
+            "source": "model_generated",
+            "name": "cached-process-adhoc",
+            "description": "cached",
+            "persona": "analyst",
+            "phase_mode": "strict",
+            "tool_guidance": "cached guidance",
+            "required_tools": ["read_file"],
+            "recommended_tools": [],
+            "phases": [
+                {
+                    "id": "cached-a",
+                    "description": "a",
+                    "depends_on": [],
+                    "acceptance_criteria": "a",
+                    "deliverables": ["a.md"],
+                },
+                {
+                    "id": "cached-b",
+                    "description": "b",
+                    "depends_on": ["cached-a"],
+                    "acceptance_criteria": "b",
+                    "deliverables": ["b.md"],
+                },
+                {
+                    "id": "cached-c",
+                    "description": "c",
+                    "depends_on": ["cached-b"],
+                    "acceptance_criteria": "c",
+                    "deliverables": ["c.md"],
+                },
+                {
+                    "id": "cached-d",
+                    "description": "d",
+                    "depends_on": ["cached-c"],
+                    "acceptance_criteria": "d",
+                    "deliverables": ["d.md"],
+                },
+            ],
+        }
+        cached_entry = app._build_adhoc_cache_entry(key=key, goal=goal, spec=cached_spec)
+        app._adhoc_process_cache[key] = cached_entry
+        disk_path = tmp_path / ".loom" / "cache" / "adhoc-processes" / f"{key}.yaml"
+        disk_path.parent.mkdir(parents=True, exist_ok=True)
+        disk_path.write_text(
+            yaml.safe_dump(
+                {
+                    "key": key,
+                    "goal": goal,
+                    "generated_at_monotonic": 1.0,
+                    "saved_at": "2026-02-21T00:00:00+00:00",
+                    "spec": cached_spec,
+                },
+                sort_keys=False,
+                allow_unicode=True,
+            ),
+            encoding="utf-8",
+        )
+
+        fresh_spec = {
+            "intent": "research",
+            "source": "model_generated",
+            "name": "fresh-process-adhoc",
+            "description": "fresh",
+            "persona": "analyst",
+            "phase_mode": "strict",
+            "tool_guidance": "fresh guidance",
+            "required_tools": ["read_file"],
+            "recommended_tools": [],
+            "phases": [
+                {
+                    "id": "fresh-a",
+                    "description": "a",
+                    "depends_on": [],
+                    "acceptance_criteria": "a",
+                    "deliverables": ["a.md"],
+                },
+                {
+                    "id": "fresh-b",
+                    "description": "b",
+                    "depends_on": ["fresh-a"],
+                    "acceptance_criteria": "b",
+                    "deliverables": ["b.md"],
+                },
+                {
+                    "id": "fresh-c",
+                    "description": "c",
+                    "depends_on": ["fresh-b"],
+                    "acceptance_criteria": "c",
+                    "deliverables": ["c.md"],
+                },
+                {
+                    "id": "fresh-d",
+                    "description": "d",
+                    "depends_on": ["fresh-c"],
+                    "acceptance_criteria": "d",
+                    "deliverables": ["d.md"],
+                },
+            ],
+        }
+        fresh_entry = app._build_adhoc_cache_entry(key=key, goal=goal, spec=fresh_spec)
+        app._synthesize_adhoc_process = AsyncMock(return_value=fresh_entry)
+
+        resolved, from_cache = await app._get_or_create_adhoc_process(goal, fresh=True)
+
+        assert from_cache is False
+        assert resolved.process_defn.name == "fresh-process-adhoc"
+        app._synthesize_adhoc_process.assert_awaited_once()
+
+    def test_adhoc_synthesis_activity_lines_include_diagnostics(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        entry = SimpleNamespace(
+            spec={
+                "source": "model_generated",
+                "intent": "research",
+                "phases": [{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": "d"}],
+                "required_tools": ["read_file"],
+                "recommended_tools": ["web_search"],
+                "_synthesis": {
+                    "initial_parse_ok": False,
+                    "repair_attempted": True,
+                    "repair_parse_ok": True,
+                    "initial_response_chars": 1450,
+                    "fallback_reason": "",
+                    "artifact_dir": "/tmp/adhoc-synthesis/run-1",
+                    "log_path": "/tmp/adhoc-synthesis.jsonl",
+                },
+            },
+        )
+
+        lines = app._adhoc_synthesis_activity_lines(
+            entry,  # type: ignore[arg-type]
+            from_cache=False,
+            fresh=True,
+        )
+
+        assert any("Ad hoc definition summary" in line for line in lines)
+        assert any("cache decision: miss (fresh=True)" in line for line in lines)
+        assert any("parse diagnostics: initial=failed, repair=ok" in line for line in lines)
+        assert any("Ad hoc synthesis artifacts:" in line for line in lines)
+        assert any("Ad hoc synthesis log:" in line for line in lines)
+
+    @pytest.mark.asyncio
+    async def test_synthesize_adhoc_process_persists_diagnostics_log(self, tmp_path, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+        app._model.complete = AsyncMock(return_value=SimpleNamespace(
+            text=json.dumps({
+                "intent": "research",
+                "name": "history-research",
+                "description": "custom research flow",
+                "persona": "historian",
+                "phase_mode": "strict",
+                "tool_guidance": "use primary sources",
+                "required_tools": ["read_file"],
+                "recommended_tools": [],
+                "phases": [
+                    {
+                        "id": "scope-hypothesis",
+                        "description": "define scope",
+                        "depends_on": [],
+                        "acceptance_criteria": "scope done",
+                        "deliverables": ["scope.md"],
+                    },
+                    {
+                        "id": "collect-cases",
+                        "description": "collect cases",
+                        "depends_on": ["scope-hypothesis"],
+                        "acceptance_criteria": "cases done",
+                        "deliverables": ["cases.md"],
+                    },
+                    {
+                        "id": "quantify-loss",
+                        "description": "quantify loss",
+                        "depends_on": ["collect-cases"],
+                        "acceptance_criteria": "quantified",
+                        "deliverables": ["quant.md"],
+                    },
+                    {
+                        "id": "select-twelve",
+                        "description": "finalize twelve",
+                        "depends_on": ["quantify-loss"],
+                        "acceptance_criteria": "selected",
+                        "deliverables": ["selected.md"],
+                    },
+                    {
+                        "id": "deliver-manuscript-notes",
+                        "description": "deliver notes",
+                        "depends_on": ["select-twelve"],
+                        "acceptance_criteria": "delivered",
+                        "deliverables": ["notes.md"],
+                    },
+                ],
+            }),
+        ))
+
+        entry = await app._synthesize_adhoc_process("research failures", key="a1b2c3d4")
+
+        synthesis = entry.spec.get("_synthesis", {})
+        assert isinstance(synthesis, dict)
+        assert synthesis.get("initial_parse_ok") is True
+        assert synthesis.get("resolved_source") == "model_generated"
+        artifact_dir = Path(str(synthesis.get("artifact_dir", "")))
+        assert artifact_dir.exists()
+        assert (artifact_dir / "01-initial-prompt.txt").exists()
+        assert (artifact_dir / "02-initial-response.txt").exists()
+        assert (artifact_dir / "10-normalized-spec.yaml").exists()
+        assert (artifact_dir / "11-diagnostics.json").exists()
+        log_path = Path(str(synthesis.get("log_path", "")))
+        assert log_path.exists()
+        log_lines = [
+            line.strip()
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert log_lines
+        latest = json.loads(log_lines[-1])
+        assert latest.get("event") == "adhoc_synthesis"
+        assert latest.get("cache_key") == "a1b2c3d4"
+
+    @pytest.mark.asyncio
+    async def test_synthesize_adhoc_process_respects_repair_source_limit(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.config import Config, LimitsConfig
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        class RepairCapModel:
+            name = "repair-cap-model"
+            configured_temperature = 1.0
+
+            def __init__(self) -> None:
+                self.calls = 0
+                self.prompts: list[str] = []
+
+            async def complete(
+                self,
+                messages,
+                tools=None,
+                temperature=None,
+                max_tokens=None,
+                response_format=None,
+            ):
+                del tools, temperature, max_tokens, response_format
+                self.calls += 1
+                prompt_text = str(messages[0].get("content", "") if messages else "")
+                self.prompts.append(prompt_text)
+                if self.calls == 1:
+                    return SimpleNamespace(text="not json " + ("x" * 2000))
+                return SimpleNamespace(text=json.dumps({
+                    "intent": "research",
+                    "name": "repair-cap-ok",
+                    "description": "custom process",
+                    "persona": "analyst",
+                    "phase_mode": "strict",
+                    "tool_guidance": "use tools",
+                    "required_tools": ["read_file"],
+                    "recommended_tools": [],
+                    "phases": [
+                        {
+                            "id": "scope",
+                            "description": "scope",
+                            "depends_on": [],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["scope.md"],
+                        },
+                        {
+                            "id": "collect",
+                            "description": "collect",
+                            "depends_on": ["scope"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["collect.md"],
+                        },
+                        {
+                            "id": "analyze",
+                            "description": "analyze",
+                            "depends_on": ["collect"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["analyze.md"],
+                        },
+                        {
+                            "id": "verify",
+                            "description": "verify",
+                            "depends_on": ["analyze"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["verify.md"],
+                        },
+                        {
+                            "id": "deliver",
+                            "description": "deliver",
+                            "depends_on": ["verify"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["deliver.md"],
+                        },
+                    ],
+                }))
+
+        model = RepairCapModel()
+        app = LoomApp(
+            model=model,  # type: ignore[arg-type]
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=Config(limits=LimitsConfig(adhoc_repair_source_max_chars=120)),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        entry = await app._synthesize_adhoc_process(
+            "research failure modes",
+            key="repaircap",
+        )
+
+        synthesis = entry.spec.get("_synthesis", {})
+        assert entry.process_defn.name == "repair-cap-ok-adhoc"
+        assert synthesis.get("repair_source_truncated") is True
+        assert synthesis.get("repair_source_chars") == 120
+        assert model.calls >= 2
+        assert len(model.prompts) >= 2
+        assert "<<<BEGIN_SOURCE>>>" in model.prompts[1]
+
+    @pytest.mark.asyncio
+    async def test_synthesize_adhoc_process_prefers_planner_role_model(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.config import Config, ModelConfig
+        from loom.tui.app import LoomApp
+
+        planner_model = MagicMock(name="planner-model")
+        planner_model.name = "planner-model"
+        planner_model.configured_temperature = 0.3
+        planner_model.complete = AsyncMock(return_value=SimpleNamespace(
+            text=json.dumps({
+                "intent": "research",
+                "name": "planner-selected",
+                "description": "planned",
+                "persona": "planner persona",
+                "phase_mode": "strict",
+                "tool_guidance": "use tools",
+                "required_tools": ["read_file"],
+                "recommended_tools": [],
+                "phases": [
+                    {
+                        "id": "scope",
+                        "description": "scope",
+                        "depends_on": [],
+                        "acceptance_criteria": "ok",
+                        "deliverables": ["scope.md"],
+                    },
+                    {
+                        "id": "collect",
+                        "description": "collect",
+                        "depends_on": ["scope"],
+                        "acceptance_criteria": "ok",
+                        "deliverables": ["collect.md"],
+                    },
+                    {
+                        "id": "analyze",
+                        "description": "analyze",
+                        "depends_on": ["collect"],
+                        "acceptance_criteria": "ok",
+                        "deliverables": ["analyze.md"],
+                    },
+                    {
+                        "id": "deliver",
+                        "description": "deliver",
+                        "depends_on": ["analyze"],
+                        "acceptance_criteria": "ok",
+                        "deliverables": ["deliver.md"],
+                    },
+                ],
+            }),
+        ))
+
+        active_model = MagicMock(name="active-executor-model")
+        active_model.complete = AsyncMock(side_effect=AssertionError(
+            "active cowork model should not be used for ad hoc synthesis",
+        ))
+
+        fake_router = MagicMock()
+
+        def _select(*, tier=1, role="executor"):
+            assert role == "planner"
+            assert tier == 2
+            return planner_model
+
+        fake_router.select = MagicMock(side_effect=_select)
+        fake_router.close = AsyncMock()
+        monkeypatch.setattr(
+            "loom.models.router.ModelRouter.from_config",
+            lambda cfg: fake_router,
+        )
+
+        app = LoomApp(
+            model=active_model,
+            tools=MagicMock(),
+            workspace=tmp_path,
+            config=Config(models={
+                "primary": ModelConfig(
+                    provider="ollama",
+                    base_url="http://localhost:11434",
+                    model="executor-model",
+                    roles=["executor"],
+                ),
+                "planner": ModelConfig(
+                    provider="ollama",
+                    base_url="http://localhost:11434",
+                    model="planner-model",
+                    roles=["planner"],
+                ),
+            }),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        entry = await app._synthesize_adhoc_process("research failures", key="planrole")
+
+        assert entry.process_defn.name == "planner-selected-adhoc"
+        assert planner_model.complete.await_count == 1
+        assert active_model.complete.await_count == 0
+        assert fake_router.select.call_count == 1
+        fake_router.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_synthesize_adhoc_process_uses_planner_token_limit(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.config import Config, LimitsConfig, ModelConfig
+        from loom.tui.app import LoomApp
+
+        planner_calls: list[int | None] = []
+        planner_model = MagicMock(name="planner-model")
+        planner_model.name = "planner-model"
+        planner_model.configured_temperature = 0.3
+        planner_model.configured_max_tokens = 8192
+
+        async def _planner_complete(messages, **kwargs):
+            del messages
+            planner_calls.append(kwargs.get("max_tokens"))
+            return SimpleNamespace(text=json.dumps({
+                "intent": "research",
+                "name": "planner-limit",
+                "description": "planned",
+                "persona": "planner persona",
+                "phase_mode": "strict",
+                "tool_guidance": "use tools",
+                "required_tools": ["read_file"],
+                "recommended_tools": [],
+                "phases": [
+                    {
+                        "id": "scope",
+                        "description": "scope",
+                        "depends_on": [],
+                        "acceptance_criteria": "ok",
+                        "deliverables": ["scope.md"],
+                    },
+                    {
+                        "id": "collect",
+                        "description": "collect",
+                        "depends_on": ["scope"],
+                        "acceptance_criteria": "ok",
+                        "deliverables": ["collect.md"],
+                    },
+                    {
+                        "id": "analyze",
+                        "description": "analyze",
+                        "depends_on": ["collect"],
+                        "acceptance_criteria": "ok",
+                        "deliverables": ["analyze.md"],
+                    },
+                ],
+            }))
+
+        planner_model.complete = AsyncMock(side_effect=_planner_complete)
+
+        active_model = MagicMock(name="active-executor-model")
+        active_model.complete = AsyncMock(side_effect=AssertionError(
+            "active cowork model should not be used for ad hoc synthesis",
+        ))
+
+        fake_router = MagicMock()
+        fake_router.select = MagicMock(return_value=planner_model)
+        fake_router.close = AsyncMock()
+        monkeypatch.setattr(
+            "loom.models.router.ModelRouter.from_config",
+            lambda cfg: fake_router,
+        )
+
+        app = LoomApp(
+            model=active_model,
+            tools=MagicMock(),
+            workspace=tmp_path,
+            config=Config(
+                models={
+                    "primary": ModelConfig(
+                        provider="ollama",
+                        base_url="http://localhost:11434",
+                        model="executor-model",
+                        roles=["executor"],
+                    ),
+                    "planner": ModelConfig(
+                        provider="ollama",
+                        base_url="http://localhost:11434",
+                        model="planner-model",
+                        roles=["planner"],
+                        max_tokens=8192,
+                    ),
+                },
+                limits=LimitsConfig(planning_response_max_tokens=16384),
+            ),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        entry = await app._synthesize_adhoc_process("research failures", key="planlimit")
+
+        assert entry.process_defn.name == "planner-limit-adhoc"
+        assert planner_calls
+        assert planner_calls[0] == 16384
+        assert active_model.complete.await_count == 0
+        fake_router.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_synthesize_adhoc_process_uses_model_configured_temperature(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.models.base import ModelConnectionError
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        class TempOneModel:
+            name = "temp-one-primary"
+            configured_temperature = 1.0
+
+            def __init__(self) -> None:
+                self.temps: list[float | None] = []
+
+            async def complete(
+                self,
+                messages,
+                tools=None,
+                temperature=None,
+                max_tokens=None,
+                response_format=None,
+            ):
+                del messages, tools, max_tokens, response_format
+                self.temps.append(temperature)
+                if temperature != 1.0:
+                    raise ModelConnectionError(
+                        "Model server returned HTTP 400: "
+                        '{"error":{"message":"invalid temperature: '
+                        'only 1 is allowed for this model"}}'
+                    )
+                return SimpleNamespace(
+                    text=json.dumps({
+                        "intent": "research",
+                        "name": "temp-recovered",
+                        "description": "custom process",
+                        "persona": "researcher",
+                        "phase_mode": "strict",
+                        "tool_guidance": "use tools",
+                        "required_tools": ["read_file"],
+                        "recommended_tools": [],
+                        "phases": [
+                            {
+                                "id": "scope",
+                                "description": "scope",
+                                "depends_on": [],
+                                "acceptance_criteria": "ok",
+                                "deliverables": ["scope.md"],
+                            },
+                            {
+                                "id": "collect",
+                                "description": "collect",
+                                "depends_on": ["scope"],
+                                "acceptance_criteria": "ok",
+                                "deliverables": ["collect.md"],
+                            },
+                            {
+                                "id": "analyze",
+                                "description": "analyze",
+                                "depends_on": ["collect"],
+                                "acceptance_criteria": "ok",
+                                "deliverables": ["analyze.md"],
+                            },
+                            {
+                                "id": "deliver",
+                                "description": "deliver",
+                                "depends_on": ["analyze"],
+                                "acceptance_criteria": "ok",
+                                "deliverables": ["deliver.md"],
+                            },
+                        ],
+                    }),
+                )
+
+        model = TempOneModel()
+        app = LoomApp(
+            model=model,  # type: ignore[arg-type]
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        entry = await app._synthesize_adhoc_process(
+            "research big failures",
+            key="temp1111",
+        )
+
+        assert entry.process_defn.name == "temp-recovered-adhoc"
+        assert model.temps and model.temps[0] == 1.0
+        synthesis = entry.spec.get("_synthesis", {})
+        assert synthesis.get("initial_temperature") == 1.0
+        assert synthesis.get("initial_parse_ok") is True
+        assert synthesis.get("resolved_source") == "model_generated"
+
+    @pytest.mark.asyncio
+    async def test_synthesize_adhoc_process_marks_temperature_config_mismatch(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.models.base import ModelConnectionError
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        class TempMismatchModel:
+            name = "temp-mismatch-primary"
+            configured_temperature = 0.1
+
+            async def complete(
+                self,
+                messages,
+                tools=None,
+                temperature=None,
+                max_tokens=None,
+                response_format=None,
+            ):
+                del messages, tools, temperature, max_tokens, response_format
+                raise ModelConnectionError(
+                    "Model server returned HTTP 400: "
+                    '{"error":{"message":"invalid temperature: '
+                    'only 1 is allowed for this model"}}'
+                )
+
+        app = LoomApp(
+            model=TempMismatchModel(),  # type: ignore[arg-type]
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        entry = await app._synthesize_adhoc_process(
+            "research big failures",
+            key="temp2222",
+        )
+
+        synthesis = entry.spec.get("_synthesis", {})
+        assert synthesis.get("resolved_source") == "fallback_template"
+        assert synthesis.get("fallback_reason") == "temperature_config_mismatch"
+        assert "invalid temperature" in str(synthesis.get("initial_error", "")).lower()
+
+    @pytest.mark.asyncio
+    async def test_synthesize_adhoc_process_marks_empty_model_response(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        class EmptyResponseModel:
+            name = "empty-response-primary"
+            configured_temperature = 1.0
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def complete(
+                self,
+                messages,
+                tools=None,
+                temperature=None,
+                max_tokens=None,
+                response_format=None,
+            ):
+                del messages, tools, temperature, max_tokens, response_format
+                self.calls += 1
+                return SimpleNamespace(text="")
+
+        model = EmptyResponseModel()
+        app = LoomApp(
+            model=model,  # type: ignore[arg-type]
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        entry = await app._synthesize_adhoc_process(
+            "research big failures",
+            key="temp3333",
+        )
+
+        synthesis = entry.spec.get("_synthesis", {})
+        assert synthesis.get("resolved_source") == "fallback_template"
+        assert synthesis.get("fallback_reason") == "empty_model_response"
+        assert synthesis.get("empty_response_retry_attempted") is True
+        assert model.calls >= 2
+
+    def test_normalize_adhoc_spec_preserves_phase_mode_and_minimum_phases(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        raw = {
+            "name": "book-research",
+            "description": "Research workflow",
+            "persona": "Research analyst",
+            "phase_mode": "guided",
+            "tool_guidance": "Use tools",
+            "required_tools": [],
+            "recommended_tools": [],
+            "phases": [
+                {
+                    "id": "only-step",
+                    "description": "Do everything",
+                    "depends_on": [],
+                    "acceptance_criteria": "Done",
+                    "deliverables": ["out.md"],
+                },
+            ],
+        }
+
+        normalized = app._normalize_adhoc_spec(
+            raw,
+            goal="research overinvestment cases",
+            key="abc12345deadbeef",
+            available_tools=[],
+        )
+
+        assert normalized["phase_mode"] == "guided"
+        assert len(normalized["phases"]) >= 3
+        ids = [phase["id"] for phase in normalized["phases"]]
+        assert "verify-quality" in ids
+        assert normalized["source"] == "fallback_template"
+
+    def test_extract_json_payload_handles_wrapped_text(self):
+        from loom.tui.app import LoomApp
+
+        raw = """
+        The process spec is below.
+        {
+          "intent": "research",
+          "name": "custom-adhoc",
+          "description": "custom",
+          "persona": "analyst",
+          "phase_mode": "strict",
+          "tool_guidance": "guidance",
+          "required_tools": [],
+          "recommended_tools": [],
+          "phases": []
+        }
+        """
+        parsed = LoomApp._extract_json_payload(
+            raw,
+            expected_keys=("intent", "name", "phases"),
+        )
+        assert isinstance(parsed, dict)
+        assert parsed.get("name") == "custom-adhoc"
+
+    def test_extract_json_payload_accepts_yaml_like_fallback(self):
+        from loom.tui.app import LoomApp
+
+        raw = (
+            "intent: research\n"
+            "name: yaml-adhoc\n"
+            "description: custom\n"
+            "persona: analyst\n"
+            "phase_mode: strict\n"
+            "tool_guidance: use tools\n"
+            "required_tools: []\n"
+            "recommended_tools: []\n"
+            "phases: []\n"
+        )
+        parsed = LoomApp._extract_json_payload(
+            raw,
+            expected_keys=("intent", "name", "phases"),
+        )
+        assert isinstance(parsed, dict)
+        assert parsed.get("name") == "yaml-adhoc"
+
+    def test_extract_json_payload_parses_fenced_block_with_preamble(self):
+        from loom.tui.app import LoomApp
+
+        raw = (
+            "I planned this process for you.\n"
+            "```json\n"
+            "{\n"
+            '  "intent": "research",\n'
+            '  "name": "fenced-adhoc",\n'
+            '  "description": "custom",\n'
+            '  "persona": "analyst",\n'
+            '  "phase_mode": "strict",\n'
+            '  "tool_guidance": "use tools",\n'
+            '  "required_tools": [],\n'
+            '  "recommended_tools": [],\n'
+            '  "phases": []\n'
+            "}\n"
+            "```\n"
+            "Done."
+        )
+        parsed = LoomApp._extract_json_payload(
+            raw,
+            expected_keys=("intent", "name", "phases"),
+        )
+        assert isinstance(parsed, dict)
+        assert parsed.get("name") == "fenced-adhoc"
+
+    def test_extract_json_payload_parses_yaml_after_markdown_heading(self):
+        from loom.tui.app import LoomApp
+
+        raw = (
+            "### Proposed process\n"
+            "- notes: draft\n\n"
+            "intent: research\n"
+            "name: markdown-yaml-adhoc\n"
+            "description: custom\n"
+            "persona: analyst\n"
+            "phase_mode: strict\n"
+            "tool_guidance: use tools\n"
+            "required_tools: []\n"
+            "recommended_tools: []\n"
+            "phases: []\n"
+        )
+        parsed = LoomApp._extract_json_payload(
+            raw,
+            expected_keys=("intent", "name", "phases"),
+        )
+        assert isinstance(parsed, dict)
+        assert parsed.get("name") == "markdown-yaml-adhoc"
+
+    def test_extract_json_payload_rejects_nested_partial_when_schema_expected(self):
+        from loom.tui.app import LoomApp
+
+        raw = (
+            '{"intent":"research","name":"x","phases":[{"id":"discovery","description":"d"}'
+        )
+        parsed = LoomApp._extract_json_payload(
+            raw,
+            expected_keys=("intent", "name", "phases"),
+        )
+        assert parsed is None
+
+    @pytest.mark.asyncio
+    async def test_synthesize_adhoc_process_uses_minimal_retry_when_initial_and_repair_non_parseable(  # noqa: E501
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        class ThreeStageModel:
+            name = "three-stage-primary"
+            configured_temperature = 1.0
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def complete(
+                self,
+                messages,
+                tools=None,
+                temperature=None,
+                max_tokens=None,
+                response_format=None,
+            ):
+                del messages, tools, temperature, max_tokens, response_format
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(text=(
+                        "Here is your process plan with reasoning and prose. "
+                        "Phase 1 scope, phase 2 evidence, phase 3 analyze."
+                    ))
+                if self.calls == 2:
+                    return SimpleNamespace(text=(
+                        "Still prose; not JSON. I recommend six phases and strict mode."
+                    ))
+                return SimpleNamespace(text=json.dumps({
+                    "intent": "research",
+                    "name": "minimal-retry-win",
+                    "description": "custom process",
+                    "persona": "research analyst",
+                    "phase_mode": "strict",
+                    "tool_guidance": "use tools",
+                    "required_tools": ["read_file"],
+                    "recommended_tools": [],
+                    "phases": [
+                        {
+                            "id": "scope",
+                            "description": "scope",
+                            "depends_on": [],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["scope.md"],
+                        },
+                        {
+                            "id": "source-plan",
+                            "description": "source planning",
+                            "depends_on": ["scope"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["plan.md"],
+                        },
+                        {
+                            "id": "collect-evidence",
+                            "description": "collect evidence",
+                            "depends_on": ["source-plan"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["evidence.md"],
+                        },
+                        {
+                            "id": "analyze-findings",
+                            "description": "analyze",
+                            "depends_on": ["collect-evidence"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["analysis.md"],
+                        },
+                        {
+                            "id": "deliver-report",
+                            "description": "deliver",
+                            "depends_on": ["analyze-findings"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["report.md"],
+                        },
+                    ],
+                }))
+
+        model = ThreeStageModel()
+        app = LoomApp(
+            model=model,  # type: ignore[arg-type]
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        entry = await app._synthesize_adhoc_process(
+            "research big failures",
+            key="temp4444",
+        )
+
+        synthesis = entry.spec.get("_synthesis", {})
+        assert entry.process_defn.name == "minimal-retry-win-adhoc"
+        assert synthesis.get("resolved_source") == "model_generated"
+        assert synthesis.get("minimal_retry_attempted") is True
+        assert synthesis.get("minimal_retry_parse_ok") is True
+        assert model.calls >= 3
+
+    @pytest.mark.asyncio
+    async def test_synthesize_adhoc_process_uses_minimal_retry_when_parsed_spec_incomplete(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        class IncompleteParsedModel:
+            name = "incomplete-primary"
+            configured_temperature = 1.0
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def complete(
+                self,
+                messages,
+                tools=None,
+                temperature=None,
+                max_tokens=None,
+                response_format=None,
+            ):
+                del messages, tools, temperature, max_tokens, response_format
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(text=json.dumps({
+                        "intent": "research",
+                        "name": "too-thin",
+                        "description": "incomplete process",
+                        "persona": "analyst",
+                        "phase_mode": "strict",
+                        "tool_guidance": "use tools",
+                        "required_tools": ["read_file"],
+                        "recommended_tools": [],
+                        "phases": [{
+                            "id": "scope",
+                            "description": "scope",
+                            "depends_on": [],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["scope.md"],
+                        }],
+                    }))
+                return SimpleNamespace(text=json.dumps({
+                    "intent": "research",
+                    "name": "recovered-thin",
+                    "description": "full process",
+                    "persona": "analyst",
+                    "phase_mode": "strict",
+                    "tool_guidance": "use tools",
+                    "required_tools": ["read_file"],
+                    "recommended_tools": [],
+                    "phases": [
+                        {
+                            "id": "scope",
+                            "description": "scope",
+                            "depends_on": [],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["scope.md"],
+                        },
+                        {
+                            "id": "source-plan",
+                            "description": "source plan",
+                            "depends_on": ["scope"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["plan.md"],
+                        },
+                        {
+                            "id": "collect-evidence",
+                            "description": "collect",
+                            "depends_on": ["source-plan"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["evidence.md"],
+                        },
+                        {
+                            "id": "analyze-findings",
+                            "description": "analyze",
+                            "depends_on": ["collect-evidence"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["analysis.md"],
+                        },
+                        {
+                            "id": "deliver-report",
+                            "description": "deliver",
+                            "depends_on": ["analyze-findings"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["report.md"],
+                        },
+                    ],
+                }))
+
+        model = IncompleteParsedModel()
+        app = LoomApp(
+            model=model,  # type: ignore[arg-type]
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        entry = await app._synthesize_adhoc_process(
+            "research big failures",
+            key="temp5555",
+        )
+
+        synthesis = entry.spec.get("_synthesis", {})
+        assert entry.process_defn.name == "recovered-thin-adhoc"
+        assert synthesis.get("parsed_raw_incomplete") is True
+        assert synthesis.get("minimal_retry_attempted") is True
+        assert synthesis.get("minimal_retry_parse_ok") is True
+        assert model.calls >= 2
+
+    @pytest.mark.asyncio
+    async def test_synthesize_adhoc_process_does_not_accept_truncated_nested_json(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        class TruncatedThenValidModel:
+            name = "truncated-valid-primary"
+            configured_temperature = 1.0
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def complete(
+                self,
+                messages,
+                tools=None,
+                temperature=None,
+                max_tokens=None,
+                response_format=None,
+            ):
+                del messages, tools, temperature, max_tokens, response_format
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(text=(
+                        '{"intent":"research","name":"x","description":"d","persona":"p",'
+                        '"phase_mode":"strict","tool_guidance":"g","required_tools":[],"recommended_tools":[],"phases":[{"id":"a","description":"b"'
+                    ))
+                if self.calls == 2:
+                    return SimpleNamespace(text="not json")
+                return SimpleNamespace(text=json.dumps({
+                    "intent": "research",
+                    "name": "final-valid",
+                    "description": "valid",
+                    "persona": "analyst",
+                    "phase_mode": "strict",
+                    "tool_guidance": "use tools",
+                    "required_tools": ["read_file"],
+                    "recommended_tools": [],
+                    "phases": [
+                        {
+                            "id": "scope",
+                            "description": "scope",
+                            "depends_on": [],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["scope.md"],
+                        },
+                        {
+                            "id": "source-plan",
+                            "description": "plan",
+                            "depends_on": ["scope"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["plan.md"],
+                        },
+                        {
+                            "id": "collect-evidence",
+                            "description": "collect",
+                            "depends_on": ["source-plan"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["evidence.md"],
+                        },
+                        {
+                            "id": "analyze-findings",
+                            "description": "analyze",
+                            "depends_on": ["collect-evidence"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["analysis.md"],
+                        },
+                        {
+                            "id": "verify-quality",
+                            "description": "verify",
+                            "depends_on": ["analyze-findings"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["verify.md"],
+                        },
+                        {
+                            "id": "deliver-report",
+                            "description": "deliver",
+                            "depends_on": ["verify-quality"],
+                            "acceptance_criteria": "ok",
+                            "deliverables": ["report.md"],
+                        },
+                    ],
+                }))
+
+        model = TruncatedThenValidModel()
+        app = LoomApp(
+            model=model,  # type: ignore[arg-type]
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        entry = await app._synthesize_adhoc_process(
+            "research big failures",
+            key="temp6666",
+        )
+
+        synthesis = entry.spec.get("_synthesis", {})
+        assert entry.process_defn.name == "final-valid-adhoc"
+        assert synthesis.get("resolved_source") == "model_generated"
+        assert synthesis.get("initial_parse_ok") is False
+        assert synthesis.get("minimal_retry_parse_ok") is True
+        assert model.calls >= 3
+
+    def test_normalize_adhoc_spec_build_requires_implementation_phase(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        raw = {
+            "name": "feature-work",
+            "description": "Build a feature",
+            "persona": "Software engineer",
+            "phase_mode": "strict",
+            "tool_guidance": "Use tools",
+            "required_tools": [],
+            "recommended_tools": [],
+            "phases": [
+                {
+                    "id": "scope",
+                    "description": "Define scope",
+                    "depends_on": [],
+                    "acceptance_criteria": "Scope documented",
+                    "deliverables": ["scope.md"],
+                },
+                {
+                    "id": "collect-notes",
+                    "description": "Collect notes",
+                    "depends_on": ["scope"],
+                    "acceptance_criteria": "Notes collected",
+                    "deliverables": ["notes.md"],
+                },
+                {
+                    "id": "analyze",
+                    "description": "Analyze notes",
+                    "depends_on": ["collect-notes"],
+                    "acceptance_criteria": "Analysis done",
+                    "deliverables": ["analysis.md"],
+                },
+                {
+                    "id": "deliver",
+                    "description": "Deliver summary",
+                    "depends_on": ["analyze"],
+                    "acceptance_criteria": "Delivered",
+                    "deliverables": ["final.md"],
+                },
+            ][:3],
+        }
+
+        normalized = app._normalize_adhoc_spec(
+            raw,
+            goal="build a new workflow engine",
+            key="feedbeef12345678",
+            available_tools=[],
+            intent="build",
+        )
+
+        assert normalized["phase_mode"] == "strict"
+        ids = [phase["id"] for phase in normalized["phases"]]
+        assert "implement-solution" in ids
+        assert "test-and-verify" in ids
+
+    def test_normalize_adhoc_spec_uses_model_intent_over_goal_text(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        raw = {
+            "intent": "writing",
+            "name": "book-flow",
+            "description": "Authoring workflow",
+            "persona": "Author",
+            "phase_mode": "strict",
+            "tool_guidance": "Write cleanly.",
+            "required_tools": [],
+            "recommended_tools": [],
+            "phases": [
+                {
+                    "id": "scope",
+                    "description": "Define scope",
+                    "depends_on": [],
+                    "acceptance_criteria": "Scope documented",
+                    "deliverables": ["scope.md"],
+                },
+            ],
+        }
+
+        normalized = app._normalize_adhoc_spec(
+            raw,
+            goal="build a distributed workflow engine",
+            key="aabbccddeeff0011",
+            available_tools=[],
+        )
+
+        ids = [phase["id"] for phase in normalized["phases"]]
+        assert normalized["intent"] == "writing"
+        assert "draft-content" in ids
+        assert "implement-solution" not in ids
+        assert normalized["source"] == "fallback_template"
+
+    def test_normalize_adhoc_spec_preserves_model_custom_phases_when_valid(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        raw = {
+            "intent": "research",
+            "name": "wasted-utility-custom",
+            "description": "Custom process",
+            "persona": "Historian",
+            "phase_mode": "strict",
+            "tool_guidance": "Use primary sources.",
+            "required_tools": [],
+            "recommended_tools": [],
+            "phases": [
+                {
+                    "id": "scope-hypothesis",
+                    "description": "Define hypothesis and inclusion rules.",
+                    "depends_on": [],
+                    "acceptance_criteria": "Rules are explicit.",
+                    "deliverables": ["rules.md"],
+                },
+                {
+                    "id": "assemble-candidates",
+                    "description": "Build candidate pool from diverse eras.",
+                    "depends_on": ["scope-hypothesis"],
+                    "acceptance_criteria": "Candidate pool complete.",
+                    "deliverables": ["candidates.md"],
+                },
+                {
+                    "id": "quantify-investment",
+                    "description": "Estimate inflation-adjusted investment and opportunity cost.",
+                    "depends_on": ["assemble-candidates"],
+                    "acceptance_criteria": "Quantification complete.",
+                    "deliverables": ["investment-model.md"],
+                },
+                {
+                    "id": "select-twelve",
+                    "description": "Finalize twelve cases with justification.",
+                    "depends_on": ["quantify-investment"],
+                    "acceptance_criteria": "Selection justified.",
+                    "deliverables": ["twelve-cases.md"],
+                },
+                {
+                    "id": "synthesize-manuscript-notes",
+                    "description": "Produce manuscript-ready notes.",
+                    "depends_on": ["select-twelve"],
+                    "acceptance_criteria": "Notes ready for book drafting.",
+                    "deliverables": ["manuscript-notes.md"],
+                },
+            ],
+        }
+
+        normalized = app._normalize_adhoc_spec(
+            raw,
+            goal="research overinvestment patterns for a history book",
+            key="1122334455667788",
+            available_tools=[],
+        )
+
+        ids = [phase["id"] for phase in normalized["phases"]]
+        assert normalized["source"] == "model_generated"
+        assert ids[0] == "scope-hypothesis"
+        assert "quantify-investment" in ids
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_adhoc_resynthesizes_fallback_template_cache(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.tui.app import LoomApp
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+
+        goal = "research wasted utility history"
+        key = app._adhoc_cache_key(goal)
+        fallback_spec = app._fallback_adhoc_spec(
+            goal,
+            available_tools=app._tools.list_tools.return_value,
+            intent="research",
+        )
+        cache_path = tmp_path / ".loom" / "cache" / "adhoc-processes" / f"{key}.yaml"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            yaml.safe_dump(
+                {
+                    "key": key,
+                    "goal": goal,
+                    "generated_at_monotonic": 1.0,
+                    "saved_at": "2026-02-21T00:00:00+00:00",
+                    "spec": fallback_spec,
+                },
+                sort_keys=False,
+                allow_unicode=True,
+            ),
+            encoding="utf-8",
+        )
+
+        custom_spec = {
+            "intent": "research",
+            "source": "model_generated",
+            "name": "custom-research-adhoc",
+            "description": "custom",
+            "persona": "analyst",
+            "phase_mode": "strict",
+            "tool_guidance": "custom",
+            "required_tools": ["read_file"],
+            "recommended_tools": [],
+            "phases": [
+                {
+                    "id": "custom-a",
+                    "description": "a",
+                    "depends_on": [],
+                    "acceptance_criteria": "a",
+                    "deliverables": ["a.md"],
+                },
+                {
+                    "id": "custom-b",
+                    "description": "b",
+                    "depends_on": ["custom-a"],
+                    "acceptance_criteria": "b",
+                    "deliverables": ["b.md"],
+                },
+                {
+                    "id": "custom-c",
+                    "description": "c",
+                    "depends_on": ["custom-b"],
+                    "acceptance_criteria": "c",
+                    "deliverables": ["c.md"],
+                },
+                {
+                    "id": "custom-d",
+                    "description": "d",
+                    "depends_on": ["custom-c"],
+                    "acceptance_criteria": "d",
+                    "deliverables": ["d.md"],
+                },
+            ],
+        }
+        generated_entry = app._build_adhoc_cache_entry(key=key, goal=goal, spec=custom_spec)
+        app._synthesize_adhoc_process = AsyncMock(return_value=generated_entry)
+
+        resolved, from_cache = await app._get_or_create_adhoc_process(goal)
+
+        assert from_cache is False
+        assert resolved.process_defn.name == "custom-research-adhoc"
+        app._synthesize_adhoc_process.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_run_starts_process_run_for_active_process(self):
@@ -2213,6 +4064,8 @@ class TestProcessSlashCommands:
         app._start_process_run.assert_awaited_once_with(
             "Analyze Tesla for investment",
             process_defn=app._process_defn,
+            is_adhoc=False,
+            recommended_tools=[],
         )
 
     @pytest.mark.asyncio
@@ -2231,6 +4084,152 @@ class TestProcessSlashCommands:
 
         assert handled is True
         app._close_process_run_from_target.assert_awaited_once_with("#abc123")
+
+    @pytest.mark.asyncio
+    async def test_run_resume_routes_to_resume_handler(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._resume_process_run_from_target = AsyncMock(return_value=True)
+        app.query_one = MagicMock(return_value=MagicMock())
+
+        handled = await app._handle_slash_command("/run resume current")
+
+        assert handled is True
+        app._resume_process_run_from_target.assert_awaited_once_with("current")
+
+    def test_process_run_restart_button_dispatches_restart_in_place(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._restart_process_run_in_place = AsyncMock(return_value=True)
+        app.run_worker = MagicMock()
+        event = SimpleNamespace(
+            button=SimpleNamespace(id="process-run-restart-abc123"),
+            stop=MagicMock(),
+            prevent_default=MagicMock(),
+        )
+
+        app.on_process_run_restart_pressed(event)
+
+        event.stop.assert_called_once()
+        event.prevent_default.assert_called_once()
+        app.run_worker.assert_called_once()
+        assert app.run_worker.call_args.kwargs["name"] == "process-run-restart-abc123"
+        assert app.run_worker.call_args.kwargs["group"] == "process-run-restart-abc123"
+        assert app.run_worker.call_args.kwargs["exclusive"] is False
+        worker_coro = app.run_worker.call_args.args[0]
+        assert asyncio.iscoroutine(worker_coro)
+        worker_coro.close()
+
+    @pytest.mark.asyncio
+    async def test_restart_process_run_in_place_reuses_same_run_id(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="market-research",
+            process_defn=None,
+            goal="Analyze EPCOR",
+            status="failed",
+            task_id="cowork-9",
+            run_workspace=Path("/tmp/process-run"),
+            pane_id="tab-run-abc123",
+            pane=MagicMock(),
+            tasks=[{"id": "old", "status": "failed", "content": "old"}],
+            task_labels={"old": "old"},
+            last_progress_message="old",
+            last_progress_at=12.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc123": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_process_run_outputs = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._persist_process_run_ui_state = AsyncMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        captured = {}
+
+        def fake_run_worker(coro, **kwargs):
+            captured["kwargs"] = kwargs
+            coro.close()
+            return MagicMock()
+
+        app.run_worker = fake_run_worker
+
+        restarted = await app._restart_process_run_in_place("abc123")
+
+        assert restarted is True
+        assert run.status == "queued"
+        assert run.tasks == []
+        assert run.task_labels == {}
+        assert run.worker is not None
+        assert captured["kwargs"]["name"] == "process-run-abc123"
+        assert captured["kwargs"]["group"] == "process-run-abc123"
+        run.pane.set_tasks.assert_called_once_with([])
+        app._persist_process_run_ui_state.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_process_run_starts_new_run_from_task_id(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="market-research",
+            process_defn=None,
+            goal="Analyze EPCOR",
+            status="failed",
+            task_id="cowork-9",
+            run_workspace=Path("/tmp/process-run"),
+            is_adhoc=True,
+            recommended_tools=["ripgrep_search"],
+        )
+        app._resolve_process_run_target = MagicMock(return_value=(run, None))
+        app._start_process_run = AsyncMock()
+        app.query_one = MagicMock(return_value=MagicMock())
+
+        resumed = await app._resume_process_run_from_target("abc123")
+
+        assert resumed is True
+        app._start_process_run.assert_awaited_once_with(
+            "Analyze EPCOR",
+            process_defn=None,
+            process_name_override="market-research",
+            command_prefix="/run resume abc123",
+            is_adhoc=True,
+            recommended_tools=["ripgrep_search"],
+            resume_task_id="cowork-9",
+            run_workspace_override=Path("/tmp/process-run"),
+        )
 
     @pytest.mark.asyncio
     async def test_dynamic_process_slash_command_runs_process_directly(self):
@@ -2500,6 +4499,72 @@ class TestProcessSlashCommands:
         assert model.complete.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_llm_process_run_folder_name_prefers_extractor_role_model(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.config import Config, ModelConfig
+        from loom.tui.app import LoomApp
+
+        extractor_model = MagicMock(name="extractor-model")
+        extractor_model.name = "extractor-model"
+        extractor_model.configured_temperature = 0.0
+        extractor_model.complete = AsyncMock(return_value=SimpleNamespace(
+            text="market-scan-encor",
+        ))
+
+        active_model = MagicMock(name="active-executor-model")
+        active_model.complete = AsyncMock(side_effect=AssertionError(
+            "active cowork model should not be used for folder naming",
+        ))
+
+        fake_router = MagicMock()
+
+        def _select(*, tier=1, role="executor"):
+            assert role == "extractor"
+            assert tier == 1
+            return extractor_model
+
+        fake_router.select = MagicMock(side_effect=_select)
+        fake_router.close = AsyncMock()
+        monkeypatch.setattr(
+            "loom.models.router.ModelRouter.from_config",
+            lambda cfg: fake_router,
+        )
+
+        app = LoomApp(
+            model=active_model,
+            tools=MagicMock(),
+            workspace=tmp_path,
+            config=Config(models={
+                "primary": ModelConfig(
+                    provider="ollama",
+                    base_url="http://localhost:11434",
+                    model="executor-model",
+                    roles=["executor"],
+                ),
+                "extractor": ModelConfig(
+                    provider="ollama",
+                    base_url="http://localhost:11434",
+                    model="extractor-model",
+                    roles=["extractor"],
+                ),
+            }),
+        )
+
+        slug = await app._llm_process_run_folder_name(
+            "market-research",
+            "Analyze Encor",
+        )
+
+        assert slug == "market-scan-encor"
+        assert extractor_model.complete.await_count == 1
+        assert active_model.complete.await_count == 0
+        assert fake_router.select.call_count == 1
+        fake_router.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_prepare_process_run_workspace_falls_back_when_llm_name_invalid(self, tmp_path):
         from loom.tui.app import LoomApp
 
@@ -2519,6 +4584,51 @@ class TestProcessSlashCommands:
         assert path.parent == tmp_path
         assert path.name == "market-research-analyze-encor"
         assert path.exists()
+
+    @pytest.mark.asyncio
+    async def test_llm_process_run_folder_name_rejects_prompt_echo(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        model = MagicMock(name="model")
+        model.complete = AsyncMock(return_value=SimpleNamespace(
+            text="the-user-wants-a-kebab-case-folder-name-for-a-pr",
+        ))
+        app = LoomApp(
+            model=model,
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+
+        slug = await app._llm_process_run_folder_name(
+            "research-process",
+            "I need you to research and summarize coastal flood risk in Miami.",
+        )
+
+        assert slug == ""
+
+    @pytest.mark.asyncio
+    async def test_llm_process_run_folder_name_extracts_slug_from_noisy_response(
+        self,
+        tmp_path,
+    ):
+        from loom.tui.app import LoomApp
+
+        model = MagicMock(name="model")
+        model.complete = AsyncMock(return_value=SimpleNamespace(
+            text="Slug: miami-flood-risk-summary (concise)",
+        ))
+        app = LoomApp(
+            model=model,
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+
+        slug = await app._llm_process_run_folder_name(
+            "research-process",
+            "Research and summarize coastal flood risk in Miami.",
+        )
+
+        assert slug == "miami-flood-risk-summary"
 
     @pytest.mark.asyncio
     async def test_execute_process_run_passes_workspace_and_process_override(self):
@@ -2586,6 +4696,7 @@ class TestProcessSlashCommands:
         assert payload["_auth_profile_overrides"] == {
             "notion": "notion_marketing"
         }
+        assert payload["_resume_task_id"] == ""
         assert payload["context"]["workspace"] == "/tmp/process-run"
         assert payload["context"]["source_workspace_root"] == str(Path("/tmp").resolve())
         assert payload["context"]["requested_goal"] == "Analyze Tesla"
@@ -3147,17 +5258,14 @@ class TestProcessSlashCommands:
 
         output_rows = pane.set_outputs.call_args.args[0]
         by_content = {row["content"]: row for row in output_rows}
-        assert "research-scope.md [dim](scope-companies)[/]" in by_content
-        assert by_content["research-scope.md [dim](scope-companies)[/]"]["status"] == (
+        assert "research-scope.md (scope-companies)" in by_content
+        assert by_content["research-scope.md (scope-companies)"]["status"] == (
             "completed"
         )
-        assert (
-            "geography-footprint.csv [dim](map-geographies)[/] [#f7768e](missing)[/]"
-            in by_content
+        assert "geography-footprint.csv (map-geographies) (missing)" in by_content
+        assert by_content["geography-footprint.csv (map-geographies) (missing)"]["status"] == (
+            "failed"
         )
-        assert by_content[
-            "geography-footprint.csv [dim](map-geographies)[/] [#f7768e](missing)[/]"
-        ]["status"] == "failed"
 
     def test_process_progress_outputs_use_run_workspace(self, tmp_path):
         from loom.tui.app import LoomApp
@@ -3241,17 +5349,171 @@ class TestProcessSlashCommands:
 
         output_rows = pane.set_outputs.call_args.args[0]
         by_content = {row["content"]: row for row in output_rows}
-        assert "market-trends.md [dim](analyze-market-trends)[/]" in by_content
-        assert by_content[
-            "market-trends.md [dim](analyze-market-trends)[/]"
-        ]["status"] == "completed"
-        assert (
-            "trend-dataset.csv [dim](analyze-market-trends)[/] [#f7768e](missing)[/]"
-            in by_content
+        assert "market-trends.md (analyze-market-trends)" in by_content
+        assert by_content["market-trends.md (analyze-market-trends)"]["status"] == "completed"
+        assert "trend-dataset.csv (analyze-market-trends) (missing)" in by_content
+        assert by_content["trend-dataset.csv (analyze-market-trends) (missing)"]["status"] == (
+            "failed"
         )
-        assert by_content[
-            "trend-dataset.csv [dim](analyze-market-trends)[/] [#f7768e](missing)[/]"
-        ]["status"] == "failed"
+
+    def test_adhoc_outputs_keep_declared_deliverables_after_plan_ready(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+
+        pane = MagicMock()
+        process_defn = SimpleNamespace(
+            phases=[
+                SimpleNamespace(id="inspect-pitch", description="Inspect pitch and constraints"),
+                SimpleNamespace(id="map-eras", description="Map historical eras"),
+            ],
+            get_deliverables=lambda: {
+                "inspect-pitch": ["pitch-analysis.md"],
+                "map-eras": ["era-coverage-matrix.csv"],
+            },
+        )
+        run = SimpleNamespace(
+            run_id="abc126",
+            process_name="wasted-utility-research-adhoc",
+            goal="Research historical over-investment cases",
+            run_workspace=tmp_path,
+            process_defn=process_defn,
+            pane_id="tab-run-abc126",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            task_labels={},
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+            is_adhoc=True,
+        )
+        app._process_runs = {"abc126": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#chat-log":
+                return chat
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._on_process_progress_event(
+            {
+                "event_type": "task_plan_ready",
+                "tasks": [
+                    {
+                        "id": "plan-step-1",
+                        "status": "in_progress",
+                        "content": "Read and analyze pitch.md",
+                    },
+                    {
+                        "id": "plan-step-2",
+                        "status": "pending",
+                        "content": "Establish historical coverage matrix",
+                    },
+                ],
+            },
+            run_id="abc126",
+        )
+
+        output_rows = pane.set_outputs.call_args.args[0]
+        by_content = {row["content"]: row for row in output_rows}
+        assert "pitch-analysis.md (inspect-pitch) (planned)" in by_content
+        assert "era-coverage-matrix.csv (map-eras) (planned)" in by_content
+        assert all("(expected output)" not in row["content"] for row in output_rows)
+
+    def test_adhoc_outputs_fallback_to_task_rows_without_deliverables(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        pane = MagicMock()
+        process_defn = SimpleNamespace(
+            phases=[],
+            get_deliverables=lambda: {},
+        )
+        run = SimpleNamespace(
+            run_id="abc127",
+            process_name="wasted-utility-research-adhoc",
+            goal="Research historical over-investment cases",
+            process_defn=process_defn,
+            pane_id="tab-run-abc127",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            task_labels={},
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+            is_adhoc=True,
+        )
+        app._process_runs = {"abc127": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#chat-log":
+                return chat
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._on_process_progress_event(
+            {
+                "event_type": "task_plan_ready",
+                "tasks": [
+                    {
+                        "id": "plan-step-1",
+                        "status": "in_progress",
+                        "content": "Read and analyze pitch.md",
+                    },
+                ],
+            },
+            run_id="abc127",
+        )
+
+        output_rows = pane.set_outputs.call_args.args[0]
+        assert output_rows == [
+            {
+                "id": "adhoc-output-1",
+                "status": "in_progress",
+                "content": "Read and analyze pitch.md (expected output)",
+            },
+        ]
 
     def test_process_progress_outputs_detect_existing_file_when_task_id_drifts(self, tmp_path):
         from loom.tui.app import LoomApp
@@ -3338,8 +5600,8 @@ class TestProcessSlashCommands:
 
         output_rows = pane.set_outputs.call_args.args[0]
         by_content = {row["content"]: row for row in output_rows}
-        assert "slogan-longlist.csv [dim](slogan-divergence)[/]" in by_content
-        assert by_content["slogan-longlist.csv [dim](slogan-divergence)[/]"]["status"] == (
+        assert "slogan-longlist.csv (slogan-divergence)" in by_content
+        assert by_content["slogan-longlist.csv (slogan-divergence)"]["status"] == (
             "completed"
         )
 
@@ -4484,6 +6746,7 @@ class TestSlashHelp:
         rendered = "\n".join(app._help_lines())
         assert "/resume <session-id-prefix>" in rendered
         assert "/run <goal|close" in rendered
+        assert "resume <run-id-prefix|current>" in rendered
         assert "run-id-prefix" in rendered
         assert "/quit (aliases: /exit, /q)" in rendered
         assert "/setup" in rendered

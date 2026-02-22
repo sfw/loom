@@ -356,7 +356,7 @@ def _init_persistence(config: Config):
     from loom.state.memory import Database
 
     try:
-        db_path = Path(config.memory.database_path).expanduser()
+        db_path = config.database_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
         db = Database(db_path)
 
@@ -1884,7 +1884,7 @@ def learned(
     config = _effective_config(ctx, None)
 
     async def _run():
-        db = Database(str(Path(config.memory.database_path).expanduser()))
+        db = Database(str(config.database_path))
         await db.initialize()
         mgr = LearningManager(db)
 
@@ -1933,7 +1933,7 @@ def reset_learning(ctx: click.Context) -> None:
     config = _effective_config(ctx, None)
 
     async def _reset():
-        db = Database(str(Path(config.memory.database_path).expanduser()))
+        db = Database(str(config.database_path))
         await db.initialize()
         manager = LearningManager(db)
         await manager.clear_all()

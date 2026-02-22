@@ -52,6 +52,7 @@ class OpenAICompatibleProvider(ModelProvider):
         self._model = config.model
         self._max_tokens = config.max_tokens
         self._temperature = config.temperature
+        self._reasoning_effort = str(getattr(config, "reasoning_effort", "") or "").strip()
         self._provider_name = provider_name or config.model
         self._roles = list(config.roles)
         self._tier = tier_override or self._infer_tier()
@@ -120,6 +121,80 @@ class OpenAICompatibleProvider(ModelProvider):
 
         return patched, changed
 
+    @classmethod
+    def _extract_text_fragments(cls, value: object) -> list[str]:
+        """Extract plain-text fragments from varied OpenAI-compatible payload shapes."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        if isinstance(value, (int, float, bool)):
+            return [str(value)]
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                parts.extend(cls._extract_text_fragments(item))
+            return parts
+        if isinstance(value, dict):
+            # Common content-part schema: {"type":"text","text":"..."}
+            part_type = str(value.get("type", "")).strip().lower()
+            if part_type in {"text", "output_text", "reasoning", "reasoning_text"}:
+                candidate = (
+                    value.get("text")
+                    if "text" in value
+                    else value.get("output_text")
+                )
+                if candidate is not None:
+                    return cls._extract_text_fragments(candidate)
+
+            parts: list[str] = []
+            for key in (
+                "content",
+                "text",
+                "output_text",
+                "reasoning_content",
+                "reasoning",
+                "value",
+                "summary",
+            ):
+                if key in value:
+                    parts.extend(cls._extract_text_fragments(value.get(key)))
+            return parts
+        return []
+
+    @classmethod
+    def _extract_response_text(
+        cls,
+        *,
+        data: dict,
+        choice: dict,
+        message: dict,
+    ) -> str:
+        """Extract assistant text across OpenAI and OpenAI-compatible response variants."""
+        fragments = cls._extract_text_fragments(message.get("content"))
+        if not fragments:
+            fragments = cls._extract_text_fragments(message.get("reasoning_content"))
+        if not fragments:
+            fragments = cls._extract_text_fragments(choice.get("text"))
+        if not fragments:
+            fragments = cls._extract_text_fragments(data.get("output_text"))
+        if not fragments:
+            fragments = cls._extract_text_fragments(data.get("content"))
+        if not fragments:
+            output = data.get("output")
+            if isinstance(output, list):
+                for item in output:
+                    if not isinstance(item, dict):
+                        continue
+                    fragments.extend(cls._extract_text_fragments(item.get("content")))
+                    if not fragments:
+                        fragments.extend(
+                            cls._extract_text_fragments(item.get("output_text")),
+                        )
+
+        cleaned = [str(part).strip() for part in fragments if str(part).strip()]
+        return "\n".join(cleaned).strip()
+
     async def complete(
         self,
         messages: list[dict],
@@ -135,6 +210,8 @@ class OpenAICompatibleProvider(ModelProvider):
             "max_tokens": max_tokens or self._max_tokens,
             "temperature": temperature if temperature is not None else self._temperature,
         }
+        if self._reasoning_effort:
+            payload["reasoning_effort"] = self._reasoning_effort
         if tools:
             payload["tools"] = self._format_tools(tools)
         if response_format:
@@ -224,6 +301,7 @@ class OpenAICompatibleProvider(ModelProvider):
             )
         choice = choices[0]
         message = choice.get("message", {})
+        finish_reason = str(choice.get("finish_reason", "") or "").strip()
 
         tool_calls = None
         if message.get("tool_calls"):
@@ -250,14 +328,29 @@ class OpenAICompatibleProvider(ModelProvider):
             output_tokens=usage_data.get("completion_tokens", 0),
             total_tokens=usage_data.get("total_tokens", 0),
         )
+        text = self._extract_response_text(
+            data=data if isinstance(data, dict) else {},
+            choice=choice if isinstance(choice, dict) else {},
+            message=message if isinstance(message, dict) else {},
+        )
+        if not text and not tool_calls:
+            logger.warning(
+                "OpenAI-compatible response had empty assistant text: "
+                "model=%s provider=%s message_keys=%s choice_keys=%s",
+                self._model,
+                self._provider_name,
+                sorted(message.keys()) if isinstance(message, dict) else [],
+                sorted(choice.keys()) if isinstance(choice, dict) else [],
+            )
 
         return ModelResponse(
-            text=message.get("content") or "",
+            text=text,
             tool_calls=tool_calls,
             raw=json.dumps(message),
             usage=usage,
             model=self._model,
             latency_ms=latency,
+            finish_reason=finish_reason,
         )
 
     async def stream(
@@ -276,6 +369,8 @@ class OpenAICompatibleProvider(ModelProvider):
             "temperature": temperature if temperature is not None else self._temperature,
             "stream": True,
         }
+        if self._reasoning_effort:
+            payload["reasoning_effort"] = self._reasoning_effort
         if tools:
             payload["tools"] = self._format_tools(tools)
         diagnostics = collect_request_diagnostics(

@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from loom.state.task_state import TaskStatus
+from loom.state.task_state import SubtaskStatus, TaskStatus
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
 if TYPE_CHECKING:
@@ -138,6 +138,7 @@ class DelegateTaskTool(Tool):
 
         context = args.get("context", {})
         wait = args.get("wait", True)
+        resume_task_id = str(args.get("_resume_task_id", "") or "").strip()
         progress_callback = args.get("_progress_callback")
         process_override = args.get("_process_override")
         approval_mode = str(
@@ -178,13 +179,29 @@ class DelegateTaskTool(Tool):
         except Exception as e:
             return ToolResult.fail(f"Failed to initialize orchestrator: {e}")
 
-        # Build task
-        task = _create_task(
-            goal,
-            workspace,
-            context,
-            approval_mode=approval_mode,
-        )
+        reuse_existing_plan = False
+        if resume_task_id:
+            task, resume_error = _load_task_for_resume(orchestrator, resume_task_id)
+            if task is None:
+                return ToolResult.fail(resume_error or "Failed to resume task.")
+            task, prepare_error = _prepare_task_for_resume(
+                task,
+                goal=goal,
+                workspace=workspace,
+                context=context,
+                approval_mode=approval_mode,
+            )
+            if task is None:
+                return ToolResult.fail(prepare_error or "Failed to resume task.")
+            reuse_existing_plan = True
+        else:
+            # Build task
+            task = _create_task(
+                goal,
+                workspace,
+                context,
+                approval_mode=approval_mode,
+            )
         if read_roots:
             task.metadata["read_roots"] = read_roots
         if auth_profile_overrides:
@@ -373,7 +390,12 @@ class DelegateTaskTool(Tool):
                     pass
 
         if not wait:
-            asyncio.create_task(orchestrator.execute_task(task))
+            if reuse_existing_plan:
+                asyncio.create_task(
+                    orchestrator.execute_task(task, reuse_existing_plan=True),
+                )
+            else:
+                asyncio.create_task(orchestrator.execute_task(task))
             return ToolResult.ok(
                 f"Task submitted (async): {task.id}\n"
                 f"Goal: {goal}\n"
@@ -388,7 +410,13 @@ class DelegateTaskTool(Tool):
         # Synchronous: execute and wait
         try:
             _emit_progress()
-            completed = await orchestrator.execute_task(task)
+            if reuse_existing_plan:
+                completed = await orchestrator.execute_task(
+                    task,
+                    reuse_existing_plan=True,
+                )
+            else:
+                completed = await orchestrator.execute_task(task)
             _flush_token_burst()
             status_raw = (
                 completed.status.value
@@ -472,6 +500,79 @@ def _create_task(
         approval_mode=approval_mode,
         created_at=datetime.now().isoformat(),
     )
+
+
+def _load_task_for_resume(
+    orchestrator: object,
+    task_id: str,
+) -> tuple[Task | None, str | None]:
+    """Load an existing task from orchestrator state storage."""
+    state = getattr(orchestrator, "_state", None)
+    if state is None or not hasattr(state, "load"):
+        return None, "Task resume is unavailable (orchestrator state manager missing)."
+
+    try:
+        loaded = state.load(task_id)
+    except FileNotFoundError:
+        return None, f"Cannot resume: task '{task_id}' was not found."
+    except Exception as e:
+        return None, f"Cannot resume task '{task_id}': {e}"
+    return loaded, None
+
+
+def _prepare_task_for_resume(
+    task: Task,
+    *,
+    goal: str,
+    workspace: str,
+    context: dict,
+    approval_mode: str,
+) -> tuple[Task | None, str | None]:
+    """Reset a persisted failed/interrupted task for another execution pass."""
+    if task.status == TaskStatus.COMPLETED:
+        return None, f"Cannot resume task '{task.id}': task is already completed."
+
+    if not task.plan or not task.plan.subtasks:
+        return None, (
+            f"Cannot resume task '{task.id}': no saved subtask plan available."
+        )
+
+    goal_text = str(goal or "").strip()
+    if goal_text:
+        task.goal = goal_text
+    if workspace:
+        task.workspace = workspace
+    if isinstance(context, dict) and context:
+        merged_context = dict(getattr(task, "context", {}) or {})
+        merged_context.update(context)
+        task.context = merged_context
+    task.approval_mode = approval_mode
+    task.completed_at = ""
+    task.status = TaskStatus.PENDING
+
+    needs_work = False
+    for subtask in task.plan.subtasks:
+        if subtask.status == SubtaskStatus.COMPLETED:
+            continue
+        needs_work = True
+        if subtask.status in {
+            SubtaskStatus.PENDING,
+            SubtaskStatus.RUNNING,
+            SubtaskStatus.FAILED,
+            SubtaskStatus.BLOCKED,
+            SubtaskStatus.SKIPPED,
+        }:
+            subtask.status = SubtaskStatus.PENDING
+        subtask.retry_count = 0
+        subtask.active_issue = ""
+        if subtask.status == SubtaskStatus.PENDING:
+            subtask.summary = ""
+
+    if not needs_work:
+        return None, f"Cannot resume task '{task.id}': no remaining work."
+
+    task.add_decision("Resumed execution from prior task state.")
+    return task, None
 
 
 def _resolve_delegate_event_log_file(

@@ -142,6 +142,7 @@ class OllamaProvider(ModelProvider):
 
         data = response.json()
         message = data.get("message", {})
+        finish_reason = str(data.get("done_reason", "") or "").strip()
 
         tool_calls = None
         if message.get("tool_calls"):
@@ -182,6 +183,7 @@ class OllamaProvider(ModelProvider):
             usage=usage,
             model=self._model,
             latency_ms=latency,
+            finish_reason=finish_reason,
         )
 
     async def stream(
