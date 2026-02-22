@@ -447,10 +447,23 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 @cli.command()
 @click.argument("goal")
 @click.option("--workspace", type=click.Path(exists=True, path_type=Path), default=None)
-@click.option("--server", "server_url", default=None, help="Server URL.")
+@click.option(
+    "--server",
+    "server_url",
+    default=None,
+    help="Server URL. Defaults to configured Loom API server.",
+)
 @click.option(
     "--process", "process_name", default=None,
     help="Process definition name or path.",
+)
+@click.option(
+    "--fresh",
+    "-f",
+    "fresh_adhoc",
+    is_flag=True,
+    default=False,
+    help="Bypass ad hoc process cache when no explicit/default process is set.",
 )
 @click.option(
     "--auth-profile",
@@ -462,30 +475,49 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 def run(
     ctx: click.Context, goal: str, workspace: Path | None,
     server_url: str | None, process_name: str | None,
+    fresh_adhoc: bool,
     auth_profile_pairs: tuple[str, ...],
 ) -> None:
-    """Submit a task and stream progress inline."""
+    """Submit a run goal and stream server-side process execution progress."""
     config = _effective_config(ctx, workspace)
-    url = server_url or f"http://{config.server.host}:{config.server.port}"
-    ws = str(workspace.resolve()) if workspace else None
+    ws_path = _resolve_workspace(workspace or ctx.obj.get("workspace"))
     effective_process = process_name or config.process.default or None
-    metadata: dict[str, object] = {}
+    url = server_url or f"http://{config.server.host}:{config.server.port}"
     try:
         overrides = parse_auth_profile_overrides(auth_profile_pairs)
     except AuthResolutionError as e:
         click.echo(f"Invalid --auth-profile value: {e}", err=True)
         sys.exit(1)
+    explicit_auth = ctx.obj.get("explicit_auth_path")
+
+    metadata: dict[str, object] = {}
     if overrides:
         metadata["auth_profile_overrides"] = overrides
-    explicit_auth = ctx.obj.get("explicit_auth_path")
     if explicit_auth is not None:
         metadata["auth_config_path"] = str(explicit_auth)
 
+    resolved_process_name: str | None = effective_process
+    run_workspace = ws_path
+    try:
+        resolved_process_name, run_workspace = asyncio.run(
+            _prepare_server_run_payload(
+                config=config,
+                workspace=ws_path,
+                goal=goal,
+                process_name=effective_process,
+                fresh_adhoc=fresh_adhoc,
+            )
+        )
+    except Exception as e:
+        click.echo(f"Failed to prepare run process: {e}", err=True)
+        sys.exit(1)
+
+    ws = str(run_workspace)
+
     click.echo(f"Submitting task to {url}: {goal}")
-    if ws:
-        click.echo(f"Workspace: {ws}")
-    if effective_process:
-        click.echo(f"Process: {effective_process}")
+    click.echo(f"Workspace: {ws}")
+    if resolved_process_name:
+        click.echo(f"Process: {resolved_process_name}")
     if overrides:
         rendered = ", ".join(
             f"{selector}={profile_id}" for selector, profile_id in sorted(overrides.items())
@@ -497,10 +529,108 @@ def run(
             url,
             goal,
             ws,
-            process_name=effective_process,
+            process_name=resolved_process_name,
             metadata=metadata if metadata else None,
         )
     )
+
+async def _prepare_server_run_payload(
+    *,
+    config: Config,
+    workspace: Path,
+    goal: str,
+    process_name: str | None,
+    fresh_adhoc: bool,
+) -> tuple[str, Path]:
+    """Resolve server payload inputs to mirror TUI `/run` process behavior."""
+    from loom.processes.schema import ProcessLoader
+    from loom.tools import create_default_registry
+    from loom.tui.app import LoomApp
+
+    root_workspace = workspace.resolve()
+    tools = create_default_registry(config)
+    helper = LoomApp(
+        model=None,
+        tools=tools,
+        workspace=root_workspace,
+        config=config,
+        db=None,
+        store=None,
+    )
+
+    if process_name:
+        extra = [Path(p) for p in config.process.search_paths]
+        loader = ProcessLoader(
+            workspace=root_workspace,
+            extra_search_paths=extra,
+            require_rule_scope_metadata=bool(
+                getattr(config.process, "require_rule_scope_metadata", False),
+            ),
+            require_v2_contract=bool(
+                getattr(config.process, "require_v2_contract", False),
+            ),
+        )
+        loaded = loader.load(process_name)
+        process_label = str(getattr(loaded, "name", "") or process_name)
+        run_workspace = await helper._prepare_process_run_workspace(process_label, goal)
+        return process_name, run_workspace
+
+    click.echo("Synthesizing ad hoc process for run goal...")
+    entry, from_cache = await helper._get_or_create_adhoc_process(
+        goal,
+        fresh=fresh_adhoc,
+    )
+    process_defn = entry.process_defn
+    process_label = str(getattr(process_defn, "name", "") or "process-run")
+    run_workspace = await helper._prepare_process_run_workspace(process_label, goal)
+    cache_status = "cache-hit" if from_cache else "cache-miss"
+    click.echo(
+        f"Ad hoc process: {process_label} ({cache_status}) "
+        f"with {len(process_defn.phases)} phases."
+    )
+    for line in helper._adhoc_synthesis_activity_lines(
+        entry,
+        from_cache=from_cache,
+        fresh=fresh_adhoc,
+    ):
+        click.echo(f"  - {line}")
+    if entry.recommended_tools:
+        click.echo(
+            "Recommended additional tools: "
+            + ", ".join(sorted(entry.recommended_tools)),
+        )
+
+    runtime_process_path = _persist_runtime_adhoc_process(
+        helper=helper,
+        entry=entry,
+    )
+    click.echo(f"Ad hoc runtime process file: {runtime_process_path}")
+    return str(runtime_process_path), run_workspace
+
+
+def _persist_runtime_adhoc_process(*, helper, entry) -> Path:
+    """Persist ad hoc definition as a process.yaml-like file for server loading."""
+    import yaml
+
+    process_defn = entry.process_defn
+    key = str(getattr(entry, "key", "") or helper._adhoc_cache_key(entry.goal))
+    safe_key = helper._sanitize_kebab_token(
+        key,
+        fallback="adhoc-runtime",
+        max_len=32,
+    )
+    runtime_dir = helper._adhoc_cache_dir() / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    process_path = runtime_dir / f"{safe_key}.process.yaml"
+
+    payload = helper._serialize_process_for_package(process_defn)
+    if not str(payload.get("name", "")).strip():
+        payload["name"] = f"adhoc-{safe_key}"
+    process_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return process_path
 
 
 def _validate_task_id(task_id: str) -> str:

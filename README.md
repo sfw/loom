@@ -44,7 +44,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Built for local model weaknesses.** Cloud models reproduce strings precisely. Local models don't -- they drift on whitespace, swap tabs for spaces, drop trailing newlines. Loom's edit tool handles this with fuzzy matching: when an exact string match fails, it normalizes whitespace and finds the closest candidate above a similarity threshold. It also rejects ambiguous matches (two similar regions) so it won't silently edit the wrong place. This is the difference between a tool that works with MiniMax and one that fails 30% of the time.
 
-**Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. Resume any previous session exactly where you left off with `--resume`. No compression pass, no lost details, no extra LLM calls.
+**Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every cowork turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. Resume any previous session exactly where you left off with `--resume`. This archival guarantee is for cowork history; `/run` and `loom run` may semantically compact model-facing payloads to stay within context budgets, while preserving source artifacts/logs.
 
 **The harness drives, not the model.** The model is a reasoning engine called repeatedly with scoped prompts. The orchestrator decides what happens next: which subtasks to run, when to verify, when to replan, when to escalate. This means a weaker model in a strong harness outperforms a stronger model in a weak one.
 
@@ -190,7 +190,7 @@ In the TUI, use `/learned` to open an interactive review screen for learned beha
 loom                    Launch the interactive TUI (default; setup wizard on first run)
 loom cowork             Alias for the interactive TUI
 loom setup              Run the configuration wizard (CLI fallback)
-loom run GOAL           Autonomous task execution with streaming progress
+loom run GOAL           Autonomous task execution (server-backed) with `/run`-equivalent process resolution
 loom serve              Start the API server
 loom status ID          Check task status
 loom cancel ID          Cancel a running task

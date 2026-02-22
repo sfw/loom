@@ -7361,7 +7361,7 @@ class LoomApp(App):
             ),
             self._sidebar_cowork_tasks[0],
         )
-        focus = self._one_line(primary.get("content", ""), 120)
+        focus = self._one_line(primary.get("content", ""), 180)
         status = "pending"
         if in_progress:
             status = "in_progress"
