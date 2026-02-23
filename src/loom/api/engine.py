@@ -87,7 +87,7 @@ async def create_engine(config: Config) -> Engine:
     logger = logging.getLogger("loom.engine")
 
     # Database
-    db_path = Path(config.memory.database_path).expanduser()
+    db_path = config.database_path
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         database = Database(str(db_path))

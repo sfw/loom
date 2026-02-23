@@ -254,8 +254,10 @@ def extract_evidence_records(
     existing_ids: set[str] | None = None,
     facet_hints: list[str] | None = None,
     facet_mappings: dict[str, list[str]] | None = None,
+    context_text_max_chars: int = 4000,
 ) -> list[dict[str, Any]]:
     """Extract normalized evidence records from successful tool calls."""
+    context_limit = max(120, int(context_text_max_chars or 0))
     seen_ids = set(existing_ids or set())
     records: list[dict[str, Any]] = []
 
@@ -339,7 +341,7 @@ def extract_evidence_records(
             "query": query_text,
             "facets": facets,
             "snippet": snippet_text,
-            "context_text": context_text[:1200],
+            "context_text": context_text[:context_limit],
             "quality": quality,
             "created_at": created_at,
         })

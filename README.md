@@ -44,7 +44,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Built for local model weaknesses.** Cloud models reproduce strings precisely. Local models don't -- they drift on whitespace, swap tabs for spaces, drop trailing newlines. Loom's edit tool handles this with fuzzy matching: when an exact string match fails, it normalizes whitespace and finds the closest candidate above a similarity threshold. It also rejects ambiguous matches (two similar regions) so it won't silently edit the wrong place. This is the difference between a tool that works with MiniMax and one that fails 30% of the time.
 
-**Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. Resume any previous session exactly where you left off with `--resume`. No compression pass, no lost details, no extra LLM calls.
+**Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every cowork turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. Resume any previous session exactly where you left off with `--resume`. This archival guarantee is for cowork history; `/run` and `loom run` may semantically compact model-facing payloads to stay within context budgets, while preserving source artifacts/logs.
 
 **The harness drives, not the model.** The model is a reasoning engine called repeatedly with scoped prompts. The orchestrator decides what happens next: which subtasks to run, when to verify, when to replan, when to escalate. This means a weaker model in a strong harness outperforms a stronger model in a weak one.
 
@@ -52,7 +52,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Full undo.** Every file write is preceded by a snapshot. You can revert any individual change, all changes from a subtask, or the entire task. The changelog tracks creates, modifies, deletes, and renames with before-state snapshots.
 
-**21 built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch (bounded streaming + truncation for large pages), web search (DuckDuckGo, no API key), code analysis (tree-sitter when installed, regex fallback), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, and ask_user for mid-execution questions. All tools auto-discovered via `__init_subclass__`.
+**Dozens of built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch (bounded streaming + truncation for large pages), web search (DuckDuckGo, no API key), code analysis (tree-sitter when installed, regex fallback), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, ask_user for mid-execution questions, and dedicated research helpers (academic search, citation and archive tooling, timeline/inflation utilities). All tools auto-discovered via `__init_subclass__`.
 
 **Inline diffs.** Every file edit produces a unified diff in the tool result. Diffs render with Rich markup syntax highlighting in the TUI -- green additions, red removals. You always see exactly what changed.
 
@@ -190,7 +190,7 @@ In the TUI, use `/learned` to open an interactive review screen for learned beha
 loom                    Launch the interactive TUI (default; setup wizard on first run)
 loom cowork             Alias for the interactive TUI
 loom setup              Run the configuration wizard (CLI fallback)
-loom run GOAL           Autonomous task execution with streaming progress
+loom run GOAL           Autonomous task execution (server-backed) with `/run`-equivalent process resolution
 loom serve              Start the API server
 loom status ID          Check task status
 loom cancel ID          Cancel a running task
@@ -208,9 +208,14 @@ loom reset-learning     Clear all learned patterns
 Common flags for `loom` / `loom cowork`:
 - `-w /path` -- workspace directory
 - `--mcp-config /path/to/mcp.toml` -- explicit MCP config layer
-- `-m model` -- model name from config
+- `-m model` -- explicit cowork model override from config (can bypass role routing)
 - `--resume <id>` -- resume a previous session
 - `--process <name>` -- load a process definition
+
+Role routing note:
+- Orchestrator and verifier paths route by role (`planner`, `executor`, `extractor`, `verifier`).
+- TUI helper calls (ad hoc process synthesis, run-folder naming) use role-selected helper models when configured.
+- Run-folder naming is guardrailed: Loom accepts only clean kebab-case slugs and falls back to deterministic naming when model output is low quality.
 
 ## Architecture
 

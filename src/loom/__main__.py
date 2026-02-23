@@ -5,11 +5,26 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import click
 
 from loom import __version__
+from loom.auth.config import (
+    AuthConfigError,
+    AuthProfile,
+    default_workspace_auth_defaults_path,
+    load_merged_auth_config,
+    remove_auth_profile,
+    resolve_auth_write_path,
+    set_workspace_auth_default,
+    upsert_auth_profile,
+)
+from loom.auth.runtime import (
+    AuthResolutionError,
+    parse_auth_profile_overrides,
+)
 from loom.config import Config, ConfigError, load_config
 from loom.mcp.config import (
     MCPConfigManager,
@@ -17,6 +32,7 @@ from loom.mcp.config import (
     MCPServerView,
     apply_mcp_overrides,
     ensure_valid_alias,
+    ensure_valid_env_key,
     merge_server_edits,
     parse_mcp_server_from_flags,
     redact_server_env,
@@ -82,6 +98,59 @@ def _mcp_manager(ctx: click.Context, workspace: Path | None = None) -> MCPConfig
     )
 
 
+def _merged_auth_config(
+    ctx: click.Context,
+    workspace: Path | None = None,
+):
+    """Load merged auth profile config for CLI commands."""
+    active_workspace = workspace or ctx.obj.get("workspace")
+    try:
+        return load_merged_auth_config(
+            workspace=active_workspace,
+            explicit_path=ctx.obj.get("explicit_auth_path"),
+        )
+    except AuthConfigError as e:
+        click.echo(f"Auth config error: {e}", err=True)
+        sys.exit(1)
+
+
+def _auth_write_path(ctx: click.Context) -> Path:
+    """Resolve writable auth.toml path for auth mutations."""
+    return resolve_auth_write_path(
+        explicit_path=ctx.obj.get("explicit_auth_path"),
+    )
+
+
+def _parse_kv_pairs(
+    pairs: tuple[str, ...],
+    *,
+    option_name: str,
+    validate_key: Callable[[str], str] | None = None,
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for pair in pairs:
+        raw = str(pair or "").strip()
+        if not raw:
+            continue
+        if "=" not in raw:
+            raise AuthConfigError(
+                f"Invalid {option_name} value {pair!r}; expected KEY=VALUE."
+            )
+        key, value = raw.split("=", 1)
+        clean_key = key.strip()
+        if validate_key is not None:
+            try:
+                clean_key = validate_key(clean_key)
+            except Exception as e:
+                raise AuthConfigError(str(e)) from e
+        if not clean_key:
+            raise AuthConfigError(
+                f"Invalid {option_name} value {pair!r}; key cannot be empty."
+            )
+        result[clean_key] = value
+    return result
+
+
 def _serialize_mcp_view(
     view: MCPServerView,
     *,
@@ -124,6 +193,13 @@ def _serialize_mcp_view(
     default=None,
     help="Path to mcp.toml (highest precedence MCP config layer).",
 )
+@click.option(
+    "--auth-config",
+    "auth_config_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Path to auth.toml (overlays ~/.loom/auth.toml).",
+)
 @click.option("--model", "-m", default=None, help="Model name from config to use.")
 @click.option("--resume", "resume_session", default=None, help="Resume a previous session by ID.")
 @click.option(
@@ -136,6 +212,7 @@ def cli(
     config_path: Path | None,
     workspace: Path | None,
     mcp_config_path: Path | None,
+    auth_config_path: Path | None,
     model: str | None,
     resume_session: str | None,
     process_name: str | None,
@@ -163,6 +240,9 @@ def cli(
         ctx.obj["explicit_mcp_path"] = (
             mcp_config_path.expanduser().resolve() if mcp_config_path else None
         )
+        ctx.obj["explicit_auth_path"] = (
+            auth_config_path.expanduser().resolve() if auth_config_path else None
+        )
     except ConfigError as e:
         if ctx.invoked_subcommand == "setup":
             # Let setup proceed even with broken/missing config
@@ -173,6 +253,9 @@ def cli(
             ctx.obj["explicit_mcp_path"] = (
                 mcp_config_path.expanduser().resolve() if mcp_config_path else None
             )
+            ctx.obj["explicit_auth_path"] = (
+                auth_config_path.expanduser().resolve() if auth_config_path else None
+            )
         else:
             click.echo(f"Configuration error: {e}", err=True)
             sys.exit(1)
@@ -182,6 +265,9 @@ def cli(
         _launch_tui(
             ctx.obj["config"], workspace, model,
             resume_session, process_name,
+            ctx.obj.get("explicit_mcp_path"),
+            ctx.obj.get("config_path"),
+            ctx.obj.get("explicit_auth_path"),
         )
 
 
@@ -209,6 +295,9 @@ def _launch_tui(
     model_name: str | None,
     resume_session: str | None,
     process_name: str | None,
+    explicit_mcp_path: Path | None = None,
+    legacy_config_path: Path | None = None,
+    explicit_auth_path: Path | None = None,
 ) -> None:
     """Launch the Loom TUI with full cowork backend."""
     from loom.tools import create_default_registry
@@ -248,6 +337,9 @@ def _launch_tui(
         store=store,
         resume_session=resume_session,
         process_name=effective_process,
+        explicit_mcp_path=explicit_mcp_path,
+        legacy_config_path=legacy_config_path,
+        explicit_auth_path=explicit_auth_path,
     )
     # Explicitly enable mouse support so click/scroll interactions stay
     # available even if Textual changes defaults across versions.
@@ -264,7 +356,7 @@ def _init_persistence(config: Config):
     from loom.state.memory import Database
 
     try:
-        db_path = Path(config.memory.database_path).expanduser()
+        db_path = config.database_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
         db = Database(db_path)
 
@@ -312,7 +404,16 @@ def cowork(
     continue a previous session.
     """
     config = _effective_config(ctx, workspace)
-    _launch_tui(config, workspace, model, resume_session, process_name)
+    _launch_tui(
+        config,
+        workspace,
+        model,
+        resume_session,
+        process_name,
+        ctx.obj.get("explicit_mcp_path"),
+        ctx.obj.get("config_path"),
+        ctx.obj.get("explicit_auth_path"),
+    )
 
 
 # -- Server and task commands ----------------------------------------------
@@ -346,29 +447,190 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 @cli.command()
 @click.argument("goal")
 @click.option("--workspace", type=click.Path(exists=True, path_type=Path), default=None)
-@click.option("--server", "server_url", default=None, help="Server URL.")
+@click.option(
+    "--server",
+    "server_url",
+    default=None,
+    help="Server URL. Defaults to configured Loom API server.",
+)
 @click.option(
     "--process", "process_name", default=None,
     help="Process definition name or path.",
+)
+@click.option(
+    "--fresh",
+    "-f",
+    "fresh_adhoc",
+    is_flag=True,
+    default=False,
+    help="Bypass ad hoc process cache when no explicit/default process is set.",
+)
+@click.option(
+    "--auth-profile",
+    "auth_profile_pairs",
+    multiple=True,
+    help="Auth selector mapping (selector=profile_id). Repeatable.",
 )
 @click.pass_context
 def run(
     ctx: click.Context, goal: str, workspace: Path | None,
     server_url: str | None, process_name: str | None,
+    fresh_adhoc: bool,
+    auth_profile_pairs: tuple[str, ...],
 ) -> None:
-    """Submit a task and stream progress inline."""
+    """Submit a run goal and stream server-side process execution progress."""
     config = _effective_config(ctx, workspace)
-    url = server_url or f"http://{config.server.host}:{config.server.port}"
-    ws = str(workspace.resolve()) if workspace else None
+    ws_path = _resolve_workspace(workspace or ctx.obj.get("workspace"))
     effective_process = process_name or config.process.default or None
+    url = server_url or f"http://{config.server.host}:{config.server.port}"
+    try:
+        overrides = parse_auth_profile_overrides(auth_profile_pairs)
+    except AuthResolutionError as e:
+        click.echo(f"Invalid --auth-profile value: {e}", err=True)
+        sys.exit(1)
+    explicit_auth = ctx.obj.get("explicit_auth_path")
+
+    metadata: dict[str, object] = {}
+    if overrides:
+        metadata["auth_profile_overrides"] = overrides
+    if explicit_auth is not None:
+        metadata["auth_config_path"] = str(explicit_auth)
+
+    resolved_process_name: str | None = effective_process
+    run_workspace = ws_path
+    try:
+        resolved_process_name, run_workspace = asyncio.run(
+            _prepare_server_run_payload(
+                config=config,
+                workspace=ws_path,
+                goal=goal,
+                process_name=effective_process,
+                fresh_adhoc=fresh_adhoc,
+            )
+        )
+    except Exception as e:
+        click.echo(f"Failed to prepare run process: {e}", err=True)
+        sys.exit(1)
+
+    ws = str(run_workspace)
 
     click.echo(f"Submitting task to {url}: {goal}")
-    if ws:
-        click.echo(f"Workspace: {ws}")
-    if effective_process:
-        click.echo(f"Process: {effective_process}")
+    click.echo(f"Workspace: {ws}")
+    if resolved_process_name:
+        click.echo(f"Process: {resolved_process_name}")
+    if overrides:
+        rendered = ", ".join(
+            f"{selector}={profile_id}" for selector, profile_id in sorted(overrides.items())
+        )
+        click.echo(f"Auth profiles: {rendered}")
 
-    asyncio.run(_run_task(url, goal, ws, process_name=effective_process))
+    asyncio.run(
+        _run_task(
+            url,
+            goal,
+            ws,
+            process_name=resolved_process_name,
+            metadata=metadata if metadata else None,
+        )
+    )
+
+async def _prepare_server_run_payload(
+    *,
+    config: Config,
+    workspace: Path,
+    goal: str,
+    process_name: str | None,
+    fresh_adhoc: bool,
+) -> tuple[str, Path]:
+    """Resolve server payload inputs to mirror TUI `/run` process behavior."""
+    from loom.processes.schema import ProcessLoader
+    from loom.tools import create_default_registry
+    from loom.tui.app import LoomApp
+
+    root_workspace = workspace.resolve()
+    tools = create_default_registry(config)
+    helper = LoomApp(
+        model=None,
+        tools=tools,
+        workspace=root_workspace,
+        config=config,
+        db=None,
+        store=None,
+    )
+
+    if process_name:
+        extra = [Path(p) for p in config.process.search_paths]
+        loader = ProcessLoader(
+            workspace=root_workspace,
+            extra_search_paths=extra,
+            require_rule_scope_metadata=bool(
+                getattr(config.process, "require_rule_scope_metadata", False),
+            ),
+            require_v2_contract=bool(
+                getattr(config.process, "require_v2_contract", False),
+            ),
+        )
+        loaded = loader.load(process_name)
+        process_label = str(getattr(loaded, "name", "") or process_name)
+        run_workspace = await helper._prepare_process_run_workspace(process_label, goal)
+        return process_name, run_workspace
+
+    click.echo("Synthesizing ad hoc process for run goal...")
+    entry, from_cache = await helper._get_or_create_adhoc_process(
+        goal,
+        fresh=fresh_adhoc,
+    )
+    process_defn = entry.process_defn
+    process_label = str(getattr(process_defn, "name", "") or "process-run")
+    run_workspace = await helper._prepare_process_run_workspace(process_label, goal)
+    cache_status = "cache-hit" if from_cache else "cache-miss"
+    click.echo(
+        f"Ad hoc process: {process_label} ({cache_status}) "
+        f"with {len(process_defn.phases)} phases."
+    )
+    for line in helper._adhoc_synthesis_activity_lines(
+        entry,
+        from_cache=from_cache,
+        fresh=fresh_adhoc,
+    ):
+        click.echo(f"  - {line}")
+    if entry.recommended_tools:
+        click.echo(
+            "Recommended additional tools: "
+            + ", ".join(sorted(entry.recommended_tools)),
+        )
+
+    runtime_process_path = _persist_runtime_adhoc_process(
+        helper=helper,
+        entry=entry,
+    )
+    click.echo(f"Ad hoc runtime process file: {runtime_process_path}")
+    return str(runtime_process_path), run_workspace
+
+
+def _persist_runtime_adhoc_process(*, helper, entry) -> Path:
+    """Persist ad hoc definition as a process.yaml-like file for server loading."""
+    import yaml
+
+    process_defn = entry.process_defn
+    key = str(getattr(entry, "key", "") or helper._adhoc_cache_key(entry.goal))
+    safe_key = helper._sanitize_kebab_token(
+        key,
+        fallback="adhoc-runtime",
+        max_len=32,
+    )
+    runtime_dir = helper._adhoc_cache_dir() / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    process_path = runtime_dir / f"{safe_key}.process.yaml"
+
+    payload = helper._serialize_process_for_package(process_defn)
+    if not str(payload.get("name", "")).strip():
+        payload["name"] = f"adhoc-{safe_key}"
+    process_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return process_path
 
 
 def _validate_task_id(task_id: str) -> str:
@@ -383,6 +645,7 @@ def _validate_task_id(task_id: str) -> str:
 async def _run_task(
     server_url: str, goal: str, workspace: str | None,
     process_name: str | None = None,
+    metadata: dict | None = None,
 ) -> None:
     """Submit task and stream progress."""
     import httpx
@@ -394,6 +657,8 @@ async def _run_task(
                 payload["workspace"] = workspace
             if process_name:
                 payload["process"] = process_name
+            if metadata:
+                payload["metadata"] = metadata
 
             response = await client.post("/tasks", json=payload)
             if response.status_code != 201:
@@ -519,6 +784,544 @@ def mcp_serve(ctx: click.Context, server_url: str | None) -> None:
     server = LoomMCPServer(engine_url=url)
     click.echo(f"Starting Loom MCP server (engine: {url})", err=True)
     asyncio.run(server.run_stdio())
+
+
+# -- Auth profile management commands -------------------------------------
+
+@cli.group()
+def auth() -> None:
+    """Manage auth profile configuration."""
+
+
+@auth.command(name="list")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Include all profile metadata fields.",
+)
+@click.pass_context
+def auth_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
+    """List merged auth profiles and defaults."""
+    merged = _merged_auth_config(ctx)
+    profiles = merged.config.profiles
+    effective_defaults = {
+        selector: profile_id
+        for selector, profile_id in {
+            **merged.config.defaults,
+            **merged.workspace_defaults,
+        }.items()
+        if not selector.startswith("mcp.")
+    }
+
+    payload = {
+        "sources": {
+            "user_path": str(merged.user_path),
+            "explicit_path": (
+                str(merged.explicit_path)
+                if merged.explicit_path is not None else None
+            ),
+            "workspace_defaults_path": (
+                str(merged.workspace_defaults_path)
+                if merged.workspace_defaults_path is not None else None
+            ),
+        },
+        "defaults": effective_defaults,
+        "profiles": [],
+    }
+    for profile_id in sorted(profiles):
+        profile = profiles[profile_id]
+        item = {
+            "id": profile.profile_id,
+            "provider": profile.provider,
+            "mode": profile.mode,
+            "account_label": profile.account_label,
+        }
+        if verbose:
+            item.update({
+                "secret_ref": profile.secret_ref,
+                "token_ref": profile.token_ref,
+                "scopes": list(profile.scopes),
+                "env_keys": sorted(profile.env.keys()),
+                "command": profile.command,
+                "auth_check": list(profile.auth_check),
+                "metadata": dict(profile.metadata),
+            })
+        payload["profiles"].append(item)
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo("Auth profiles:")
+    click.echo(f"  user:     {merged.user_path}")
+    click.echo(f"  explicit: {merged.explicit_path or '-'}")
+    click.echo(f"  workspace defaults: {merged.workspace_defaults_path or '-'}")
+    if not profiles:
+        click.echo("  (none)")
+    else:
+        for item in payload["profiles"]:
+            click.echo(
+                f"  {item['id']:24} provider={item['provider']} mode={item['mode']}"
+            )
+            if item.get("account_label"):
+                click.echo(f"    label: {item['account_label']}")
+            if verbose:
+                env_keys = ", ".join(item.get("env_keys", [])) or "-"
+                click.echo(f"    env_keys: {env_keys}")
+                if item.get("secret_ref"):
+                    click.echo(f"    secret_ref: {item['secret_ref']}")
+                if item.get("token_ref"):
+                    click.echo(f"    token_ref: {item['token_ref']}")
+                if item.get("command"):
+                    click.echo(f"    command: {item['command']}")
+
+    if effective_defaults:
+        click.echo("Defaults:")
+        for selector, profile_id in sorted(effective_defaults.items()):
+            click.echo(f"  {selector} -> {profile_id}")
+
+
+@auth.command(name="show")
+@click.argument("profile_id")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def auth_show(ctx: click.Context, profile_id: str, as_json: bool) -> None:
+    """Show one auth profile."""
+    merged = _merged_auth_config(ctx)
+    profile = merged.config.profiles.get(profile_id)
+    if profile is None:
+        click.echo(f"Auth profile not found: {profile_id}", err=True)
+        sys.exit(1)
+
+    payload = {
+        "id": profile.profile_id,
+        "provider": profile.provider,
+        "mode": profile.mode,
+        "account_label": profile.account_label,
+        "secret_ref": profile.secret_ref,
+        "token_ref": profile.token_ref,
+        "scopes": list(profile.scopes),
+        "env": dict(profile.env),
+        "command": profile.command,
+        "auth_check": list(profile.auth_check),
+        "metadata": dict(profile.metadata),
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(f"Profile: {payload['id']}")
+    click.echo(f"Provider: {payload['provider']}")
+    click.echo(f"Mode: {payload['mode']}")
+    click.echo(f"Label: {payload['account_label'] or '-'}")
+    click.echo(f"Secret ref: {payload['secret_ref'] or '-'}")
+    click.echo(f"Token ref: {payload['token_ref'] or '-'}")
+    click.echo(f"Scopes: {', '.join(payload['scopes']) or '-'}")
+    click.echo(f"Command: {payload['command'] or '-'}")
+    if payload["env"]:
+        click.echo("Env keys:")
+        for key in sorted(payload["env"]):
+            click.echo(f"  - {key}")
+
+
+@auth.command(name="check")
+@click.pass_context
+def auth_check(ctx: click.Context) -> None:
+    """Validate auth profile references and defaults."""
+    merged = _merged_auth_config(ctx)
+    profiles = merged.config.profiles
+    effective_defaults = {
+        selector: profile_id
+        for selector, profile_id in {
+            **merged.config.defaults,
+            **merged.workspace_defaults,
+        }.items()
+        if not selector.startswith("mcp.")
+    }
+
+    errors: list[str] = []
+    for selector, profile_id in sorted(effective_defaults.items()):
+        if profile_id not in profiles:
+            errors.append(
+                f"default selector {selector!r} references unknown profile {profile_id!r}"
+            )
+            continue
+        profile = profiles[profile_id]
+        if selector != profile.provider:
+            errors.append(
+                f"default selector {selector!r} must match profile provider {profile.provider!r}"
+            )
+
+    if errors:
+        click.echo("Auth config validation failed:", err=True)
+        for error in errors:
+            click.echo(f"  - {error}", err=True)
+        sys.exit(1)
+
+    click.echo("Auth config is valid.")
+    click.echo(f"Profiles: {len(profiles)}")
+    click.echo(f"Defaults: {len(effective_defaults)}")
+    defaults_path = (
+        merged.workspace_defaults_path
+        or default_workspace_auth_defaults_path(ctx.obj.get("workspace"))
+    )
+    click.echo(
+        f"Workspace defaults file: {defaults_path}"
+    )
+
+
+@auth.command(name="select")
+@click.argument("selector")
+@click.argument("profile_id", required=False)
+@click.option(
+    "--unset",
+    is_flag=True,
+    default=False,
+    help="Remove selector mapping from workspace defaults.",
+)
+@click.pass_context
+def auth_select(
+    ctx: click.Context,
+    selector: str,
+    profile_id: str | None,
+    unset: bool,
+) -> None:
+    """Set/clear workspace auth default selector mapping."""
+    merged = _merged_auth_config(ctx)
+    clean_selector = str(selector or "").strip()
+    if not clean_selector:
+        click.echo("Selector cannot be empty.", err=True)
+        sys.exit(1)
+    if clean_selector.startswith("mcp."):
+        click.echo(
+            "MCP selectors are no longer supported in `loom auth select`. "
+            "Use separate MCP aliases in `loom mcp` for multi-account MCP auth.",
+            err=True,
+        )
+        sys.exit(1)
+
+    workspace = ctx.obj.get("workspace")
+    defaults_path = default_workspace_auth_defaults_path(workspace)
+
+    if unset:
+        if profile_id:
+            click.echo(
+                "Do not pass profile_id when using --unset.",
+                err=True,
+            )
+            sys.exit(1)
+        try:
+            updated = set_workspace_auth_default(
+                defaults_path,
+                selector=clean_selector,
+                profile_id=None,
+            )
+        except AuthConfigError as e:
+            click.echo(f"Auth select failed: {e}", err=True)
+            sys.exit(1)
+        click.echo(f"Removed default mapping: {clean_selector}")
+        click.echo(f"Workspace defaults file: {defaults_path}")
+        click.echo(f"Remaining defaults: {len(updated)}")
+        return
+
+    clean_profile_id = str(profile_id or "").strip()
+    if not clean_profile_id:
+        click.echo("Missing profile_id. Usage: loom auth select <selector> <profile_id>", err=True)
+        sys.exit(1)
+    profile = merged.config.profiles.get(clean_profile_id)
+    if profile is None:
+        click.echo(f"Unknown auth profile: {clean_profile_id}", err=True)
+        sys.exit(1)
+    if clean_selector != profile.provider:
+        click.echo(
+            (
+                f"Selector {clean_selector!r} must match profile provider "
+                f"{profile.provider!r}."
+            ),
+            err=True,
+        )
+        sys.exit(1)
+
+    try:
+        set_workspace_auth_default(
+            defaults_path,
+            selector=clean_selector,
+            profile_id=clean_profile_id,
+        )
+    except AuthConfigError as e:
+        click.echo(f"Auth select failed: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Set workspace default: {clean_selector} -> {clean_profile_id}")
+    click.echo(f"Workspace defaults file: {defaults_path}")
+
+
+@auth.group(name="profile")
+def auth_profile() -> None:
+    """Manage auth profile definitions."""
+
+
+@auth_profile.command(name="list")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Include all profile metadata fields.",
+)
+@click.pass_context
+def auth_profile_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
+    """Alias for `loom auth list`."""
+    ctx.invoke(auth_list, as_json=as_json, verbose=verbose)
+
+
+@auth_profile.command(name="show")
+@click.argument("profile_id")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def auth_profile_show(ctx: click.Context, profile_id: str, as_json: bool) -> None:
+    """Alias for `loom auth show`."""
+    ctx.invoke(auth_show, profile_id=profile_id, as_json=as_json)
+
+
+@auth_profile.command(name="add")
+@click.argument("profile_id")
+@click.option("--provider", required=True, help="Provider id (e.g. notion).")
+@click.option(
+    "--mode",
+    required=True,
+    help="Credential mode (api_key, oauth2_pkce, env_passthrough, ...).",
+)
+@click.option("--label", "account_label", default="", help="Human-friendly account label.")
+@click.option("--secret-ref", default="", help="Secret ref (env://... or keychain://...).")
+@click.option("--token-ref", default="", help="OAuth token ref (env://... or keychain://...).")
+@click.option("--scope", "scopes", multiple=True, help="OAuth scope. Repeatable.")
+@click.option("--env", "env_pairs", multiple=True, help="Env mapping KEY=VALUE.")
+@click.option("--command", default="", help="CLI binary for cli_passthrough mode.")
+@click.option(
+    "--auth-check",
+    "auth_check",
+    multiple=True,
+    help="CLI auth check arg token. Repeatable.",
+)
+@click.option("--meta", "meta_pairs", multiple=True, help="Metadata KEY=VALUE.")
+@click.pass_context
+def auth_profile_add(
+    ctx: click.Context,
+    profile_id: str,
+    provider: str,
+    mode: str,
+    account_label: str,
+    secret_ref: str,
+    token_ref: str,
+    scopes: tuple[str, ...],
+    env_pairs: tuple[str, ...],
+    command: str,
+    auth_check: tuple[str, ...],
+    meta_pairs: tuple[str, ...],
+) -> None:
+    """Add a new auth profile entry."""
+    clean_profile_id = str(profile_id or "").strip()
+    if not clean_profile_id:
+        click.echo("Profile id cannot be empty.", err=True)
+        sys.exit(1)
+
+    try:
+        env = _parse_kv_pairs(
+            env_pairs,
+            option_name="--env",
+            validate_key=ensure_valid_env_key,
+        )
+        metadata = _parse_kv_pairs(meta_pairs, option_name="--meta")
+    except AuthConfigError as e:
+        click.echo(f"Add failed: {e}", err=True)
+        sys.exit(1)
+
+    profile = AuthProfile(
+        profile_id=clean_profile_id,
+        provider=str(provider or "").strip(),
+        mode=str(mode or "").strip(),
+        account_label=str(account_label or "").strip(),
+        secret_ref=str(secret_ref or "").strip(),
+        token_ref=str(token_ref or "").strip(),
+        scopes=[scope for scope in (str(s).strip() for s in scopes) if scope],
+        env=env,
+        command=str(command or "").strip(),
+        auth_check=[token for token in (str(a).strip() for a in auth_check) if token],
+        metadata=metadata,
+    )
+
+    if not profile.provider:
+        click.echo("--provider cannot be empty.", err=True)
+        sys.exit(1)
+    if not profile.mode:
+        click.echo("--mode cannot be empty.", err=True)
+        sys.exit(1)
+
+    target = _auth_write_path(ctx)
+    try:
+        updated = upsert_auth_profile(
+            target,
+            profile,
+            must_exist=False,
+        )
+    except AuthConfigError as e:
+        click.echo(f"Add failed: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Added auth profile '{clean_profile_id}' to {target}")
+    click.echo(f"Profiles in file: {len(updated.profiles)}")
+
+
+@auth_profile.command(name="edit")
+@click.argument("profile_id")
+@click.option("--provider", default=None, help="Provider id.")
+@click.option("--mode", default=None, help="Credential mode.")
+@click.option("--label", "account_label", default=None, help="Account label.")
+@click.option("--secret-ref", default=None, help="Secret ref.")
+@click.option("--token-ref", default=None, help="Token ref.")
+@click.option("--scope", "scopes", multiple=True, help="Replace scopes.")
+@click.option("--clear-scopes", is_flag=True, default=False, help="Clear scopes.")
+@click.option("--env", "env_pairs", multiple=True, help="Merge env KEY=VALUE.")
+@click.option("--clear-env", is_flag=True, default=False, help="Clear env mapping.")
+@click.option("--command", default=None, help="Command value.")
+@click.option(
+    "--auth-check",
+    "auth_check",
+    multiple=True,
+    help="Replace auth_check list values.",
+)
+@click.option(
+    "--clear-auth-check",
+    is_flag=True,
+    default=False,
+    help="Clear auth_check entries.",
+)
+@click.option("--meta", "meta_pairs", multiple=True, help="Merge metadata KEY=VALUE.")
+@click.option("--clear-meta", is_flag=True, default=False, help="Clear metadata.")
+@click.pass_context
+def auth_profile_edit(
+    ctx: click.Context,
+    profile_id: str,
+    provider: str | None,
+    mode: str | None,
+    account_label: str | None,
+    secret_ref: str | None,
+    token_ref: str | None,
+    scopes: tuple[str, ...],
+    clear_scopes: bool,
+    env_pairs: tuple[str, ...],
+    clear_env: bool,
+    command: str | None,
+    auth_check: tuple[str, ...],
+    clear_auth_check: bool,
+    meta_pairs: tuple[str, ...],
+    clear_meta: bool,
+) -> None:
+    """Edit an existing auth profile entry."""
+    clean_profile_id = str(profile_id or "").strip()
+    if not clean_profile_id:
+        click.echo("Profile id cannot be empty.", err=True)
+        sys.exit(1)
+
+    target = _auth_write_path(ctx)
+    try:
+        current_cfg = load_merged_auth_config(
+            workspace=ctx.obj.get("workspace"),
+            explicit_path=ctx.obj.get("explicit_auth_path"),
+        ).config
+    except AuthConfigError as e:
+        click.echo(f"Edit failed: {e}", err=True)
+        sys.exit(1)
+    current = current_cfg.profiles.get(clean_profile_id)
+    if current is None:
+        click.echo(f"Auth profile not found: {clean_profile_id}", err=True)
+        sys.exit(1)
+
+    try:
+        env_updates = _parse_kv_pairs(
+            env_pairs,
+            option_name="--env",
+            validate_key=ensure_valid_env_key,
+        )
+        meta_updates = _parse_kv_pairs(meta_pairs, option_name="--meta")
+    except AuthConfigError as e:
+        click.echo(f"Edit failed: {e}", err=True)
+        sys.exit(1)
+
+    next_scopes = list(current.scopes)
+    if clear_scopes:
+        next_scopes = []
+    elif scopes:
+        next_scopes = [scope for scope in (str(s).strip() for s in scopes) if scope]
+
+    next_env = {} if clear_env else dict(current.env)
+    next_env.update(env_updates)
+
+    next_auth_check = list(current.auth_check)
+    if clear_auth_check:
+        next_auth_check = []
+    elif auth_check:
+        next_auth_check = [token for token in (str(a).strip() for a in auth_check) if token]
+
+    next_metadata = {} if clear_meta else dict(current.metadata)
+    next_metadata.update(meta_updates)
+
+    updated_profile = AuthProfile(
+        profile_id=current.profile_id,
+        provider=current.provider if provider is None else str(provider).strip(),
+        mode=current.mode if mode is None else str(mode).strip(),
+        account_label=(
+            current.account_label
+            if account_label is None else str(account_label).strip()
+        ),
+        secret_ref=current.secret_ref if secret_ref is None else str(secret_ref).strip(),
+        token_ref=current.token_ref if token_ref is None else str(token_ref).strip(),
+        scopes=next_scopes,
+        env=next_env,
+        command=current.command if command is None else str(command).strip(),
+        auth_check=next_auth_check,
+        metadata=next_metadata,
+    )
+    if not updated_profile.provider:
+        click.echo("Provider cannot be empty after edit.", err=True)
+        sys.exit(1)
+    if not updated_profile.mode:
+        click.echo("Mode cannot be empty after edit.", err=True)
+        sys.exit(1)
+
+    try:
+        upsert_auth_profile(
+            target,
+            updated_profile,
+            must_exist=True,
+        )
+    except AuthConfigError as e:
+        click.echo(f"Edit failed: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Updated auth profile '{clean_profile_id}' in {target}")
+
+
+@auth_profile.command(name="remove")
+@click.argument("profile_id")
+@click.pass_context
+def auth_profile_remove(ctx: click.Context, profile_id: str) -> None:
+    """Remove an auth profile entry."""
+    clean_profile_id = str(profile_id or "").strip()
+    if not clean_profile_id:
+        click.echo("Profile id cannot be empty.", err=True)
+        sys.exit(1)
+    target = _auth_write_path(ctx)
+    try:
+        updated = remove_auth_profile(target, clean_profile_id)
+    except AuthConfigError as e:
+        click.echo(f"Remove failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Removed auth profile '{clean_profile_id}' from {target}")
+    click.echo(f"Profiles remaining: {len(updated.profiles)}")
 
 
 # -- MCP configuration management commands --------------------------------
@@ -1211,7 +2014,7 @@ def learned(
     config = _effective_config(ctx, None)
 
     async def _run():
-        db = Database(str(Path(config.memory.database_path).expanduser()))
+        db = Database(str(config.database_path))
         await db.initialize()
         mgr = LearningManager(db)
 
@@ -1260,7 +2063,7 @@ def reset_learning(ctx: click.Context) -> None:
     config = _effective_config(ctx, None)
 
     async def _reset():
-        db = Database(str(Path(config.memory.database_path).expanduser()))
+        db = Database(str(config.database_path))
         await db.initialize()
         manager = LearningManager(db)
         await manager.clear_all()

@@ -26,15 +26,18 @@ Layout:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
+import shlex
 import textwrap
 import time
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 from textual import events, on, work
@@ -42,6 +45,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
+    Button,
     DirectoryTree,
     Footer,
     Header,
@@ -64,9 +68,11 @@ from loom.tools.registry import ToolRegistry
 from loom.tui.commands import LoomCommands
 from loom.tui.screens import (
     AskUserScreen,
+    AuthManagerScreen,
     ExitConfirmScreen,
     FileViewerScreen,
     LearnedScreen,
+    MCPManagerScreen,
     ProcessRunCloseScreen,
     SetupScreen,
     ToolApprovalScreen,
@@ -88,6 +94,20 @@ if TYPE_CHECKING:
     from loom.state.memory import Database
 
 logger = logging.getLogger(__name__)
+
+
+def _plain_text(value: object | None) -> str:
+    """Coerce rich/plain values to a user-facing plain string."""
+    if value is None:
+        return ""
+    if isinstance(value, Text):
+        return value.plain
+    return str(value)
+
+
+def _escape_markup_text(value: object | None) -> str:
+    """Escape Rich markup control chars in dynamic text."""
+    return _plain_text(value).replace("[", "\\[")
 
 
 @dataclass(frozen=True)
@@ -112,8 +132,20 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec(canonical="/model", description="show active model"),
     SlashCommandSpec(
         canonical="/mcp",
-        usage="[list|show <alias>|test <alias>|enable <alias>|disable <alias>|remove <alias>]",
+        usage=(
+            "[manage|list|show <alias>|test <alias>|add <alias> ...|"
+            "edit <alias> ...|enable <alias>|disable <alias>|remove <alias>]"
+        ),
         description="inspect/manage MCP server config",
+    ),
+    SlashCommandSpec(
+        canonical="/auth",
+        usage=(
+            "[manage|list|show <profile-id>|check|use <selector=profile>|"
+            "clear [selector]|select <selector=profile>|unset <selector>|"
+            "add <profile-id> ...|edit <profile-id> ...|remove <profile-id>]"
+        ),
+        description="inspect/manage run auth profile selection",
     ),
     SlashCommandSpec(canonical="/tools", description="list available tools"),
     SlashCommandSpec(canonical="/tokens", description="show session token usage"),
@@ -132,12 +164,19 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec(
         canonical="/process",
         usage="[list|use <name>|off]",
-        description="inspect/switch active process",
+        description="legacy process controls (prefer /processes)",
+    ),
+    SlashCommandSpec(
+        canonical="/processes",
+        description="list available process definitions",
     ),
     SlashCommandSpec(
         canonical="/run",
-        usage="<goal|close [run-id-prefix]>",
-        description="run goal via active process orchestrator",
+        usage=(
+            "<goal|close [run-id-prefix]|resume <run-id-prefix|current>|"
+            "save <run-id-prefix|current> <name>>"
+        ),
+        description="run goal via process orchestrator (auto-ad-hoc when needed)",
     ),
 )
 _MAX_SLASH_HINT_LINES = 24
@@ -218,7 +257,7 @@ class ProcessRunList(VerticalScroll):
         lines: list[str] = []
         for row in self._rows:
             status = str(row.get("status", "pending")).strip()
-            content = str(row.get("content", "?")).strip() or "?"
+            content = _escape_markup_text(row.get("content", "?")).strip() or "?"
             if status == "completed":
                 icon = "[#9ece6a]\u2713[/]"
             elif status == "in_progress":
@@ -291,6 +330,14 @@ class ProcessRunPane(Vertical):
         color: $text-muted;
         margin: 0 0 1 0;
     }
+    ProcessRunPane .process-run-actions {
+        margin: 0 0 1 0;
+        height: auto;
+    }
+    ProcessRunPane .process-run-restart-btn {
+        width: auto;
+        min-width: 22;
+    }
     ProcessRunPane .process-run-section {
         color: $text-muted;
         text-style: bold;
@@ -333,11 +380,22 @@ class ProcessRunPane(Vertical):
         self._pending_results: list[tuple[str, bool]] = []
         self._header = Static(classes="process-run-header")
         self._meta = Static(classes="process-run-meta")
+        self._actions = Horizontal(classes="process-run-actions")
+        self._actions.display = False
+        self._restart_button = Button(
+            "Restart Failed Run",
+            id=f"process-run-restart-{run_id}",
+            classes="process-run-restart-btn",
+            variant="primary",
+        )
+        self._restart_button.display = False
+        self._restart_button.disabled = True
         self._progress_label = Static("Progress", classes="process-run-section")
         self._progress = ProcessRunList(
             id="process-run-progress",
             classes="process-run-list",
             auto_follow=True,
+            follow_mode="active",
             empty_message="No progress yet",
         )
         self._outputs_label = Static("Outputs", classes="process-run-section")
@@ -354,6 +412,8 @@ class ProcessRunPane(Vertical):
     def compose(self) -> ComposeResult:
         yield self._header
         yield self._meta
+        with self._actions:
+            yield self._restart_button
         yield self._progress_label
         yield self._progress
         yield self._outputs_label
@@ -382,6 +442,10 @@ class ProcessRunPane(Vertical):
             "Ctrl+P: Close process run tab[/dim]"
         )
         self._meta.update(meta)
+        can_restart = status == "failed" and bool(task_id.strip())
+        self._actions.display = can_restart
+        self._restart_button.display = can_restart
+        self._restart_button.disabled = not can_restart
 
     def set_tasks(self, tasks: list[dict]) -> None:
         """Replace task rows shown in the progress section."""
@@ -399,20 +463,25 @@ class ProcessRunPane(Vertical):
 
     def add_activity(self, text: str) -> None:
         """Append informational activity text."""
+        safe_text = _escape_markup_text(text)
         if not self.is_attached:
-            self._pending_activity.append(text)
+            self._pending_activity.append(safe_text)
             return
-        self._log.add_info(text)
+        self._log.add_info(safe_text)
 
     def add_result(self, text: str, *, success: bool) -> None:
         """Append final result text."""
+        safe_text = _escape_markup_text(text)
         if not self.is_attached:
-            self._pending_results.append((text, success))
+            self._pending_results.append((safe_text, success))
             return
         if success:
-            self._log.add_model_text(text)
+            self._log.add_model_text(safe_text)
             return
-        self._log.add_model_text(f"[bold #f7768e]Error:[/] {text}")
+        self._log.add_model_text(
+            f"[bold #f7768e]Error:[/] {safe_text}",
+            markup=True,
+        )
 
     def on_mount(self) -> None:
         """Flush updates queued before the pane was attached to the DOM."""
@@ -431,7 +500,10 @@ class ProcessRunPane(Vertical):
                 if success:
                     self._log.add_model_text(text)
                 else:
-                    self._log.add_model_text(f"[bold #f7768e]Error:[/] {text}")
+                    self._log.add_model_text(
+                        f"[bold #f7768e]Error:[/] {text}",
+                        markup=True,
+                    )
             self._pending_results.clear()
 
     @staticmethod
@@ -468,6 +540,20 @@ class ProcessRunState:
     result_log: list[dict] = field(default_factory=list)
     worker: object | None = None
     closed: bool = False
+    is_adhoc: bool = False
+    recommended_tools: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AdhocProcessCacheEntry:
+    """Cached ad hoc process synthesized for `/run` goals."""
+
+    key: str
+    goal: str
+    process_defn: ProcessDefinition
+    recommended_tools: list[str] = field(default_factory=list)
+    spec: dict[str, Any] = field(default_factory=dict)
+    generated_at: float = field(default_factory=time.monotonic)
 
 
 class LoomApp(App):
@@ -557,6 +643,9 @@ class LoomApp(App):
         store: ConversationStore | None = None,
         resume_session: str | None = None,
         process_name: str | None = None,
+        explicit_mcp_path: Path | None = None,
+        legacy_config_path: Path | None = None,
+        explicit_auth_path: Path | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -568,6 +657,9 @@ class LoomApp(App):
         self._store = store
         self._resume_session = resume_session
         self._process_name = process_name
+        self._explicit_mcp_path = explicit_mcp_path
+        self._legacy_config_path = legacy_config_path
+        self._explicit_auth_path = explicit_auth_path
         self._process_defn: ProcessDefinition | None = None
         self._session: CoworkSession | None = None
         self._chat_busy = False
@@ -590,9 +682,12 @@ class LoomApp(App):
         self._process_command_map: dict[str, str] = {}
         self._blocked_process_commands: list[str] = []
         self._cached_process_catalog: list[dict[str, str]] = []
+        self._adhoc_process_cache: dict[str, AdhocProcessCacheEntry] = {}
+        self._adhoc_package_doc_cache: str | None = None
         self._sidebar_cowork_tasks: list[dict] = []
         self._process_close_hint_shown = False
         self._auto_resume_workspace_on_init = True
+        self._run_auth_profile_overrides: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -731,7 +826,91 @@ class LoomApp(App):
         return MCPConfigManager(
             config=self._config,
             workspace=self._workspace,
+            explicit_path=self._explicit_mcp_path,
+            legacy_config_path=self._legacy_config_path,
         )
+
+    def _open_mcp_manager_screen(self) -> None:
+        """Open modal MCP manager and reload runtime when changed."""
+        manager = self._mcp_manager()
+
+        def _handle_result(result: dict[str, object] | None) -> None:
+            if not isinstance(result, dict):
+                return
+            if not result.get("changed"):
+                return
+            self.run_worker(
+                self._reload_mcp_runtime(),
+                group="mcp-manager-refresh",
+                exclusive=True,
+            )
+            try:
+                chat = self.query_one("#chat-log", ChatLog)
+                chat.add_info("MCP configuration updated.")
+            except Exception:
+                pass
+
+        self.push_screen(MCPManagerScreen(manager), callback=_handle_result)
+
+    def _open_auth_manager_screen(self) -> None:
+        """Open modal auth manager."""
+
+        def _handle_result(result: dict[str, object] | None) -> None:
+            if not isinstance(result, dict):
+                return
+            if not result.get("changed"):
+                return
+            try:
+                chat = self.query_one("#chat-log", ChatLog)
+                chat.add_info("Auth configuration updated.")
+            except Exception:
+                pass
+
+        self.push_screen(
+            AuthManagerScreen(
+                workspace=self._workspace,
+                explicit_auth_path=self._explicit_auth_path,
+            ),
+            callback=_handle_result,
+        )
+
+    def _auth_defaults_path(self) -> Path:
+        from loom.auth.config import default_workspace_auth_defaults_path
+
+        return default_workspace_auth_defaults_path(self._workspace)
+
+    @staticmethod
+    def _split_slash_args(raw: str) -> list[str]:
+        """Split slash-command argument string using shell-like quoting."""
+        try:
+            return shlex.split(raw)
+        except ValueError as e:
+            raise ValueError(f"Invalid quoted argument syntax: {e}") from e
+
+    @staticmethod
+    def _parse_kv_assignments(
+        values: list[str],
+        *,
+        option_name: str,
+        env_keys: bool = False,
+    ) -> dict[str, str]:
+        """Parse repeated KEY=VALUE assignments."""
+        result: dict[str, str] = {}
+        if env_keys:
+            from loom.mcp.config import ensure_valid_env_key
+
+        for value in values:
+            raw = str(value or "").strip()
+            if "=" not in raw:
+                raise ValueError(f"{option_name} expects KEY=VALUE entries.")
+            key, item = raw.split("=", 1)
+            clean_key = key.strip()
+            if env_keys:
+                clean_key = ensure_valid_env_key(clean_key)
+            if not clean_key:
+                raise ValueError(f"{option_name} key cannot be empty.")
+            result[clean_key] = item
+        return result
 
     async def _reload_mcp_runtime(self) -> None:
         """Reload merged MCP config and reconcile MCP tools in registry."""
@@ -785,6 +964,2008 @@ class LoomApp(App):
                 f"[bold #f7768e]Failed to load process "
                 f"'{self._process_name}': {e}[/]"
             )
+
+    @staticmethod
+    def _adhoc_cache_key(goal: str) -> str:
+        """Build a stable cache key for a run goal."""
+        normalized = " ".join(str(goal or "").strip().lower().split())
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+        return digest[:16]
+
+    @staticmethod
+    def _adhoc_cache_dir() -> Path:
+        """Return on-disk cache directory for ad hoc process specs."""
+        return Path.home() / ".loom" / "cache" / "adhoc-processes"
+
+    def _adhoc_synthesis_log_path(self) -> Path:
+        """Return diagnostics log path for ad hoc synthesis internals."""
+        configured = getattr(getattr(self._config, "logging", None), "event_log_path", "")
+        root = Path(str(configured).strip()).expanduser() if str(configured).strip() else (
+            Path.home() / ".loom" / "logs"
+        )
+        return root / "adhoc-synthesis.jsonl"
+
+    def _adhoc_synthesis_artifact_root(self) -> Path:
+        """Return directory root for per-run ad hoc synthesis artifacts."""
+        return self._adhoc_synthesis_log_path().parent / "adhoc-synthesis"
+
+    def _create_adhoc_synthesis_artifact_dir(self, *, key: str, goal: str) -> Path | None:
+        """Create a per-run artifact directory for ad hoc synthesis."""
+        try:
+            root = self._adhoc_synthesis_artifact_root()
+            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+            goal_slug = self._sanitize_kebab_token(
+                goal,
+                fallback="goal",
+                max_len=24,
+            )
+            run_id = uuid.uuid4().hex[:6]
+            run_dir = root / f"{stamp}-{key}-{goal_slug}-{run_id}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            return run_dir
+        except Exception as e:
+            logger.warning("Failed creating ad hoc synthesis artifact dir: %s", e)
+            return None
+
+    @staticmethod
+    def _write_adhoc_synthesis_artifact_text(
+        artifact_dir: Path | None,
+        filename: str,
+        content: str,
+    ) -> None:
+        """Write a text artifact into the synthesis run directory."""
+        if artifact_dir is None:
+            return
+        try:
+            path = artifact_dir / filename
+            path.write_text(str(content or ""), encoding="utf-8")
+        except Exception as e:
+            logger.warning("Failed writing ad hoc synthesis artifact %s: %s", filename, e)
+
+    @staticmethod
+    def _write_adhoc_synthesis_artifact_yaml(
+        artifact_dir: Path | None,
+        filename: str,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        """Write a YAML artifact into the synthesis run directory."""
+        if artifact_dir is None or not isinstance(payload, dict):
+            return
+        try:
+            import yaml
+
+            path = artifact_dir / filename
+            path.write_text(
+                yaml.safe_dump(
+                    payload,
+                    sort_keys=False,
+                    allow_unicode=True,
+                ),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning("Failed writing ad hoc synthesis YAML artifact %s: %s", filename, e)
+
+    def _append_adhoc_synthesis_log(self, payload: dict[str, Any]) -> Path | None:
+        """Append one ad hoc synthesis diagnostic entry to disk."""
+        if not isinstance(payload, dict) or not payload:
+            return None
+        path = self._adhoc_synthesis_log_path()
+        record = {
+            "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
+            **payload,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            return path
+        except Exception as e:
+            logger.warning("Failed writing ad hoc synthesis log %s: %s", path, e)
+            return None
+
+    def _adhoc_cache_path(self, key: str) -> Path:
+        """Return cache file path for an ad hoc cache key."""
+        safe_key = self._sanitize_kebab_token(
+            str(key or ""),
+            fallback="adhoc",
+            max_len=64,
+        ).replace("-", "")
+        if not safe_key:
+            safe_key = "adhoc"
+        return self._adhoc_cache_dir() / f"{safe_key}.yaml"
+
+    def _adhoc_legacy_cache_path(self, key: str) -> Path:
+        """Return legacy JSON cache file path for ad hoc cache key."""
+        safe_key = self._sanitize_kebab_token(
+            str(key or ""),
+            fallback="adhoc",
+            max_len=64,
+        ).replace("-", "")
+        if not safe_key:
+            safe_key = "adhoc"
+        return self._adhoc_cache_dir() / f"{safe_key}.json"
+
+    @classmethod
+    def _spec_from_process_defn(
+        cls,
+        process_defn: ProcessDefinition,
+        *,
+        recommended_tools: list[str],
+    ) -> dict[str, Any]:
+        """Serialize a ProcessDefinition into ad hoc spec-shaped payload."""
+        phases = [
+            {
+                "id": str(phase.id or "").strip(),
+                "description": str(phase.description or "").strip(),
+                "depends_on": [
+                    str(dep).strip()
+                    for dep in list(phase.depends_on)
+                    if str(dep).strip()
+                ],
+                "acceptance_criteria": str(phase.acceptance_criteria or "").strip(),
+                "deliverables": [
+                    str(item).strip()
+                    for item in list(phase.deliverables)
+                    if str(item).strip()
+                ],
+            }
+            for phase in list(process_defn.phases)
+        ]
+        return {
+            "intent": cls._infer_adhoc_intent_from_phases(phases),
+            "name": str(process_defn.name or "").strip(),
+            "description": str(process_defn.description or "").strip(),
+            "persona": str(process_defn.persona or "").strip(),
+            "phase_mode": str(process_defn.phase_mode or "guided").strip(),
+            "tool_guidance": str(process_defn.tool_guidance or "").strip(),
+            "required_tools": [
+                str(item).strip()
+                for item in list(getattr(process_defn.tools, "required", []) or [])
+                if str(item).strip()
+            ],
+            "recommended_tools": [
+                str(item).strip()
+                for item in recommended_tools
+                if str(item).strip()
+            ],
+            "phases": phases,
+        }
+
+    def _persist_adhoc_cache_entry(self, entry: AdhocProcessCacheEntry) -> Path:
+        """Persist synthesized ad hoc process definition to ~/.loom/cache."""
+        import yaml
+
+        cache_path = self._adhoc_cache_path(entry.key)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        spec_payload = entry.spec or self._spec_from_process_defn(
+            entry.process_defn,
+            recommended_tools=entry.recommended_tools,
+        )
+        payload: dict[str, Any] = {
+            "key": entry.key,
+            "goal": entry.goal,
+            "generated_at_monotonic": float(entry.generated_at),
+            "saved_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "spec": spec_payload,
+        }
+        cache_path.write_text(
+            yaml.safe_dump(
+                payload,
+                sort_keys=False,
+                allow_unicode=True,
+            ),
+            encoding="utf-8",
+        )
+        return cache_path
+
+    def _load_adhoc_cache_entry_from_disk(self, key: str) -> AdhocProcessCacheEntry | None:
+        """Load ad hoc process cache entry from ~/.loom/cache when present."""
+        import yaml
+
+        cache_path = self._adhoc_cache_path(key)
+        legacy_path = self._adhoc_legacy_cache_path(key)
+        read_path: Path | None = None
+        if cache_path.exists():
+            read_path = cache_path
+        elif legacy_path.exists():
+            read_path = legacy_path
+        else:
+            return None
+
+        try:
+            raw_text = read_path.read_text(encoding="utf-8")
+            if read_path.suffix.lower() == ".json":
+                payload = json.loads(raw_text)
+            else:
+                payload = yaml.safe_load(raw_text)
+        except Exception as e:
+            logger.warning("Failed to read ad hoc cache '%s': %s", read_path, e)
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        goal = str(payload.get("goal", "")).strip()
+        raw_spec = payload.get("spec")
+        if not goal or not isinstance(raw_spec, dict):
+            return None
+
+        raw_intent = self._normalize_adhoc_intent(
+            str(raw_spec.get("intent", "")),
+            default="",
+        )
+        if not raw_intent:
+            # Legacy cache entries (pre-intent) are treated as stale so /run
+            # re-synthesizes with LLM-selected intent.
+            return None
+
+        normalized = self._normalize_adhoc_spec(
+            raw_spec,
+            goal=goal,
+            key=key,
+            available_tools=self._available_tool_names(),
+            intent=raw_intent,
+        )
+        entry = self._build_adhoc_cache_entry(
+            key=key,
+            goal=goal,
+            spec=normalized,
+        )
+        generated_at = payload.get("generated_at_monotonic")
+        if isinstance(generated_at, (int, float)):
+            entry.generated_at = float(generated_at)
+        if read_path.suffix.lower() == ".json":
+            try:
+                self._persist_adhoc_cache_entry(entry)
+            except Exception:
+                pass
+        return entry
+
+    @staticmethod
+    def _sanitize_synthesis_trace(raw: dict[str, Any] | None) -> dict[str, Any]:
+        """Preserve only simple scalar fields from synthesis diagnostics."""
+        if not isinstance(raw, dict):
+            return {}
+        clean: dict[str, Any] = {}
+        for key, value in raw.items():
+            name = str(key or "").strip()
+            if not name:
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                clean[name] = value
+        return clean
+
+    @staticmethod
+    def _sanitize_kebab_token(value: str, *, fallback: str, max_len: int = 48) -> str:
+        """Normalize free-form text into a kebab-case token."""
+        lowered = str(value or "").strip().lower()
+        token = re.sub(r"[^a-z0-9-]+", "-", lowered)
+        token = re.sub(r"-{2,}", "-", token).strip("-")
+        if not token:
+            token = fallback
+        if len(token) > max_len:
+            token = token[:max_len].strip("-")
+        if not token:
+            token = fallback
+        return token
+
+    @staticmethod
+    def _sanitize_deliverable_name(value: str, *, fallback: str) -> str:
+        """Normalize deliverable path names for generated ad hoc processes."""
+        raw = str(value or "").strip()
+        if not raw:
+            return fallback
+        # Strip optional "filename — description" suffixes.
+        raw = raw.split("—")[0].split(" - ")[0].strip()
+        raw = raw.replace("\\", "/").lstrip("/")
+        parts = [p for p in raw.split("/") if p and p not in {".", ".."}]
+        if not parts:
+            return fallback
+        safe_parts: list[str] = []
+        for part in parts:
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "-", part).strip("-")
+            if safe:
+                safe_parts.append(safe)
+        if not safe_parts:
+            return fallback
+        candidate = "/".join(safe_parts)
+        if "." not in Path(candidate).name:
+            candidate += ".md"
+        return candidate
+
+    def _available_tool_names(self) -> list[str]:
+        """Return sorted available tool names from the active registry."""
+        try:
+            tools = self._tools.list_tools()
+        except Exception:
+            return []
+        names = sorted({
+            str(name or "").strip()
+            for name in tools
+            if str(name or "").strip()
+        })
+        return names
+
+    def _adhoc_package_contract_hint(self) -> str:
+        """Load full package authoring reference doc for ad hoc synthesis."""
+        cached = self._adhoc_package_doc_cache
+        if isinstance(cached, str) and cached:
+            return cached
+
+        candidates = [
+            Path(__file__).resolve().parents[3] / "docs" / "creating-packages.md",
+            self._workspace / "docs" / "creating-packages.md",
+            Path.cwd() / "docs" / "creating-packages.md",
+        ]
+        for path in candidates:
+            try:
+                if path.exists() and path.is_file():
+                    doc = path.read_text(encoding="utf-8")
+                    text = (
+                        f"Reference document path: {path}\n"
+                        "Use this full reference when designing the ad hoc process "
+                        "package contract.\n\n"
+                        f"{doc}"
+                    )
+                    self._adhoc_package_doc_cache = text
+                    return text
+            except Exception:
+                continue
+
+        fallback = (
+            "Reference document unavailable: docs/creating-packages.md.\n"
+            "Use Loom package conventions: kebab-case name, schema_version: 2, "
+            "phases with deliverables and acceptance criteria, strict|guided|suggestive "
+            "phase_mode, and tools.required drawn from available tools."
+        )
+        self._adhoc_package_doc_cache = fallback
+        return fallback
+
+    @staticmethod
+    def _extract_json_payload(
+        raw_text: str,
+        *,
+        expected_keys: tuple[str, ...] = (),
+    ) -> dict[str, Any] | None:
+        """Best-effort structured payload extraction from model output."""
+        text = str(raw_text or "").strip()
+        if not text:
+            return None
+        # Normalize typographic quotes that commonly break JSON parsing.
+        text = (
+            text.replace("“", '"')
+            .replace("”", '"')
+            .replace("’", "'")
+            .replace("‘", "'")
+        )
+
+        def _strip_wrapping_fence(value: str) -> str:
+            candidate = value.strip()
+            if not candidate.startswith("```"):
+                return candidate
+            lines = candidate.splitlines()
+            if lines:
+                lines = lines[1:]
+            while lines and not lines[-1].strip():
+                lines.pop()
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            return "\n".join(lines).strip()
+
+        def _parse_blob(blob: str) -> dict[str, Any] | None:
+            source = _strip_wrapping_fence(blob)
+            if not source:
+                return None
+
+            decoder = json.JSONDecoder()
+            candidates: list[dict[str, Any]] = []
+            try:
+                parsed = decoder.decode(source)
+                if isinstance(parsed, dict):
+                    candidates.append(parsed)
+            except Exception:
+                pass
+
+            for idx, ch in enumerate(source):
+                if ch != "{":
+                    continue
+                try:
+                    parsed, _end = decoder.raw_decode(source[idx:])
+                except Exception:
+                    continue
+                if isinstance(parsed, dict):
+                    candidates.append(parsed)
+
+            if expected_keys:
+                for payload in candidates:
+                    if all(key in payload for key in expected_keys):
+                        return payload
+            if candidates:
+                return candidates[0]
+
+            # Some models drift into YAML-like output despite JSON instructions.
+            try:
+                import yaml
+
+                parsed_yaml = yaml.safe_load(source)
+                if isinstance(parsed_yaml, dict):
+                    return parsed_yaml
+            except Exception:
+                pass
+            return None
+
+        payloads: list[dict[str, Any]] = []
+
+        direct = _parse_blob(text)
+        if direct is not None:
+            payloads.append(direct)
+
+        # Try fenced code blocks anywhere in the response, not just full-body fences.
+        for match in re.finditer(r"```(?:json|yaml|yml)?\s*([\s\S]*?)```", text, re.IGNORECASE):
+            block = str(match.group(1) or "").strip()
+            if not block:
+                continue
+            parsed = _parse_blob(block)
+            if parsed is not None:
+                payloads.append(parsed)
+
+        # Try to recover YAML objects from markdown/prose preambles.
+        if expected_keys:
+            lines = text.splitlines()
+            lowered_key_prefixes = tuple(
+                f"{str(key).strip().lower()}:"
+                for key in expected_keys
+                if str(key).strip()
+            )
+            for idx, line in enumerate(lines):
+                lower = str(line).strip().lower()
+                if not lowered_key_prefixes:
+                    break
+                if not any(lower.startswith(prefix) for prefix in lowered_key_prefixes):
+                    continue
+                snippet = "\n".join(lines[idx:]).strip()
+                if not snippet:
+                    continue
+                parsed = _parse_blob(snippet)
+                if parsed is not None:
+                    payloads.append(parsed)
+                    break
+
+        if expected_keys:
+            for payload in payloads:
+                if all(key in payload for key in expected_keys):
+                    return payload
+            # When an explicit schema is expected, avoid returning nested/partial
+            # dicts (e.g., truncated JSON where only one phase object parses).
+            return None
+
+        return payloads[0] if payloads else None
+
+    @staticmethod
+    def _synthesis_preview(text: str, *, max_chars: int = 480) -> str:
+        """Compact a model response preview for diagnostics logs."""
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(normalized) <= max_chars:
+            return normalized
+        return normalized[:max_chars].rstrip() + "..."
+
+    @staticmethod
+    def _raw_adhoc_spec_needs_minimal_retry(raw: dict[str, Any] | None) -> bool:
+        """Return True when parsed raw spec is too incomplete to trust directly."""
+        if not isinstance(raw, dict):
+            return True
+        phases_raw = raw.get("phases", [])
+        if not isinstance(phases_raw, list):
+            return True
+        phase_rows = [item for item in phases_raw if isinstance(item, dict)]
+        # Keep this permissive: simple goals can legitimately need ~3 phases.
+        if len(phase_rows) < 3:
+            return True
+        for phase in phase_rows:
+            if not str(phase.get("description", "")).strip():
+                return True
+            raw_deliverables = phase.get("deliverables", [])
+            if isinstance(raw_deliverables, str):
+                raw_deliverables = [raw_deliverables]
+            if not isinstance(raw_deliverables, list):
+                return True
+            if not any(str(item or "").strip() for item in raw_deliverables):
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_adhoc_intent(intent: str, *, default: str = "research") -> str:
+        """Normalize ad hoc intent labels to a supported enum-like value."""
+        text = str(intent or "").strip().lower()
+        if text in {"research", "writing", "build"}:
+            return text
+        fallback = str(default or "").strip().lower()
+        if not fallback:
+            return ""
+        if fallback in {"research", "writing", "build"}:
+            return fallback
+        return "research"
+
+    @classmethod
+    def _infer_adhoc_intent_from_phases(cls, phases: list[dict[str, Any]]) -> str:
+        """Infer intent from phase semantics when explicit intent is unavailable."""
+        if cls._phases_satisfy_intent(phases, "build"):
+            return "build"
+        if cls._phases_satisfy_intent(phases, "writing"):
+            return "writing"
+        if cls._phases_satisfy_intent(phases, "research"):
+            return "research"
+        return "research"
+
+    @classmethod
+    def _resolve_adhoc_intent(
+        cls,
+        raw: dict[str, Any] | None,
+        *,
+        intent_hint: str | None = None,
+    ) -> str:
+        """Resolve intent from model-provided fields, then phase semantics."""
+        normalized_hint = cls._normalize_adhoc_intent(
+            str(intent_hint or ""),
+            default="",
+        )
+        if normalized_hint:
+            return normalized_hint
+        if not isinstance(raw, dict):
+            return "research"
+        for key in ("intent", "goal_intent", "request_intent", "goal_type"):
+            value = cls._normalize_adhoc_intent(str(raw.get(key, "")), default="")
+            if value:
+                return value
+        raw_phases = raw.get("phases", [])
+        if isinstance(raw_phases, list):
+            phase_rows = [item for item in raw_phases if isinstance(item, dict)]
+            if phase_rows:
+                return cls._infer_adhoc_intent_from_phases(phase_rows)
+        return "research"
+
+    @staticmethod
+    def _adhoc_intent_progression(intent: str) -> str:
+        """Return phase progression guidance for the inferred intent."""
+        if intent == "build":
+            return (
+                "scope -> implementation plan/design -> implement/build -> "
+                "test/verify -> package/handoff -> final delivery"
+            )
+        if intent == "writing":
+            return (
+                "scope -> outline -> draft -> revise/edit -> "
+                "editorial verification -> final delivery"
+            )
+        return (
+            "scope -> source planning -> evidence collection -> "
+            "analysis/synthesis -> verification -> final delivery"
+        )
+
+    @staticmethod
+    def _adhoc_intent_phase_blueprint(intent: str, slug: str) -> list[dict[str, Any]]:
+        """Return deterministic phase blueprint for a goal intent."""
+        if intent == "build":
+            return [
+                {
+                    "id": "scope-and-constraints",
+                    "description": (
+                        "Clarify functional goals, constraints, and acceptance criteria."
+                    ),
+                    "depends_on": [],
+                    "acceptance_criteria": (
+                        "Requirements and success criteria are explicit and testable."
+                    ),
+                    "deliverables": [f"{slug}-requirements.md"],
+                },
+                {
+                    "id": "implementation-plan",
+                    "description": "Design implementation approach and execution plan.",
+                    "depends_on": ["scope-and-constraints"],
+                    "acceptance_criteria": (
+                        "Plan maps required changes, affected files, and sequencing."
+                    ),
+                    "deliverables": [f"{slug}-implementation-plan.md"],
+                },
+                {
+                    "id": "implement-solution",
+                    "description": "Execute implementation changes to satisfy requirements.",
+                    "depends_on": ["implementation-plan"],
+                    "acceptance_criteria": (
+                        "Requested solution is implemented and integrated without regressions."
+                    ),
+                    "deliverables": [f"{slug}-implementation-summary.md"],
+                },
+                {
+                    "id": "test-and-verify",
+                    "description": "Run validations and verify behavior against requirements.",
+                    "depends_on": ["implement-solution"],
+                    "acceptance_criteria": (
+                        "Verification evidence confirms behavior, edge cases, and quality."
+                    ),
+                    "deliverables": [f"{slug}-verification.md"],
+                },
+                {
+                    "id": "package-and-handoff",
+                    "description": "Prepare final artifacts, notes, and operational guidance.",
+                    "depends_on": ["test-and-verify"],
+                    "acceptance_criteria": (
+                        "Artifacts and notes are complete, actionable, and ready for handoff."
+                    ),
+                    "deliverables": [f"{slug}-handoff.md"],
+                },
+                {
+                    "id": "deliver-final",
+                    "description": "Deliver final outcome with summary of what changed and why.",
+                    "depends_on": ["package-and-handoff"],
+                    "acceptance_criteria": (
+                        "Final output is complete, validated, and aligned with the goal."
+                    ),
+                    "deliverables": [f"{slug}-final.md"],
+                },
+            ]
+        if intent == "writing":
+            return [
+                {
+                    "id": "scope-and-constraints",
+                    "description": (
+                        "Clarify audience, objective, constraints, tone, and output format."
+                    ),
+                    "depends_on": [],
+                    "acceptance_criteria": (
+                        "Writing brief defines objective, audience, and quality bar."
+                    ),
+                    "deliverables": [f"{slug}-brief.md"],
+                },
+                {
+                    "id": "outline-and-sources",
+                    "description": (
+                        "Create outline and gather source material or supporting points."
+                    ),
+                    "depends_on": ["scope-and-constraints"],
+                    "acceptance_criteria": (
+                        "Outline and supporting material are sufficient for a full draft."
+                    ),
+                    "deliverables": [f"{slug}-outline.md"],
+                },
+                {
+                    "id": "draft-content",
+                    "description": "Write the first complete draft.",
+                    "depends_on": ["outline-and-sources"],
+                    "acceptance_criteria": (
+                        "Draft covers required content and major claims end-to-end."
+                    ),
+                    "deliverables": [f"{slug}-draft.md"],
+                },
+                {
+                    "id": "revise-and-edit",
+                    "description": "Revise structure, clarity, and argument quality.",
+                    "depends_on": ["draft-content"],
+                    "acceptance_criteria": (
+                        "Revisions improve coherence, clarity, and reader usefulness."
+                    ),
+                    "deliverables": [f"{slug}-revised.md"],
+                },
+                {
+                    "id": "verify-quality",
+                    "description": "Perform editorial and factual quality checks.",
+                    "depends_on": ["revise-and-edit"],
+                    "acceptance_criteria": (
+                        "Claims, consistency, and style pass defined quality checks."
+                    ),
+                    "deliverables": [f"{slug}-verification.md"],
+                },
+                {
+                    "id": "deliver-final",
+                    "description": "Deliver final polished piece and rationale for key choices.",
+                    "depends_on": ["verify-quality"],
+                    "acceptance_criteria": (
+                        "Final output is publication-ready for the stated objective."
+                    ),
+                    "deliverables": [f"{slug}-final.md"],
+                },
+            ]
+        return [
+            {
+                "id": "scope-and-constraints",
+                "description": (
+                    "Clarify objective, constraints, assumptions, and success criteria."
+                ),
+                "depends_on": [],
+                "acceptance_criteria": (
+                    "Scope, constraints, and success criteria are explicit and actionable."
+                ),
+                "deliverables": [f"{slug}-brief.md"],
+            },
+            {
+                "id": "source-plan",
+                "description": (
+                    "Define research strategy, source classes, and evidence standards."
+                ),
+                "depends_on": ["scope-and-constraints"],
+                "acceptance_criteria": (
+                    "Research plan lists source priorities, collection method, and "
+                    "quality checks."
+                ),
+                "deliverables": [f"{slug}-source-plan.md"],
+            },
+            {
+                "id": "collect-evidence",
+                "description": "Gather and verify relevant evidence and source data.",
+                "depends_on": ["source-plan"],
+                "acceptance_criteria": (
+                    "Evidence log captures sufficient, credible, and attributable sources."
+                ),
+                "deliverables": [f"{slug}-evidence.md"],
+            },
+            {
+                "id": "analyze-findings",
+                "description": (
+                    "Analyze evidence, compare alternatives, and synthesize conclusions."
+                ),
+                "depends_on": ["collect-evidence"],
+                "acceptance_criteria": (
+                    "Analysis explains tradeoffs, uncertainty, and rationale for conclusions."
+                ),
+                "deliverables": [f"{slug}-analysis.md"],
+            },
+            {
+                "id": "verify-quality",
+                "description": "Validate completeness, consistency, and evidentiary support.",
+                "depends_on": ["analyze-findings"],
+                "acceptance_criteria": (
+                    "Claims are checked against evidence and key gaps/risks are documented."
+                ),
+                "deliverables": [f"{slug}-verification.md"],
+            },
+            {
+                "id": "deliver-report",
+                "description": "Produce final deliverable with recommendations and citations.",
+                "depends_on": ["verify-quality"],
+                "acceptance_criteria": (
+                    "Final output meets goal, includes references, and is ready to share."
+                ),
+                "deliverables": [f"{slug}-report.md"],
+            },
+        ]
+
+    @staticmethod
+    def _phases_satisfy_intent(phases: list[dict[str, Any]], intent: str) -> bool:
+        """Check whether phase set includes intent-critical steps."""
+        phase_texts = [
+            (
+                f"{str(phase.get('id', '')).strip()} "
+                f"{str(phase.get('description', '')).strip()}"
+            ).lower()
+            for phase in phases
+            if isinstance(phase, dict)
+        ]
+        if not phase_texts:
+            return False
+
+        def _has_any(markers: tuple[str, ...]) -> bool:
+            return any(any(marker in text for marker in markers) for text in phase_texts)
+
+        if intent == "build":
+            return _has_any(("implement", "build", "execute", "develop", "code")) and _has_any(
+                ("test", "verify", "validate", "qa"),
+            )
+        if intent == "writing":
+            return _has_any(("draft", "write", "compose")) and _has_any(
+                ("revise", "edit", "review", "verify"),
+            )
+        return _has_any(("collect", "evidence", "research", "source")) and _has_any(
+            ("analy", "synth", "compare", "evaluate"),
+        )
+
+    def _fallback_adhoc_spec(
+        self,
+        goal: str,
+        *,
+        available_tools: list[str],
+        intent: str | None = None,
+    ) -> dict[str, Any]:
+        """Return deterministic fallback spec when model synthesis fails."""
+        resolved_intent = self._normalize_adhoc_intent(
+            str(intent or ""),
+            default="research",
+        )
+        slug = self._sanitize_kebab_token(goal, fallback="adhoc-process", max_len=26)
+        available = set(available_tools)
+        preferred_by_intent: dict[str, list[str]] = {
+            "build": [
+                "search_files",
+                "read_file",
+                "write_file",
+                "shell_execute",
+                "ripgrep_search",
+                "document_write",
+            ],
+            "writing": [
+                "read_file",
+                "write_file",
+                "document_write",
+                "search_files",
+                "web_search",
+            ],
+            "research": [
+                "search_files",
+                "read_file",
+                "write_file",
+                "document_write",
+                "web_search",
+                "web_fetch",
+                "spreadsheet",
+            ],
+        }
+        preferred = preferred_by_intent.get(
+            resolved_intent,
+            preferred_by_intent["research"],
+        )
+        required_tools = [name for name in preferred if name in available][:5]
+        if not required_tools and available_tools:
+            required_tools = available_tools[: min(5, len(available_tools))]
+        recommended_by_intent: dict[str, list[str]] = {
+            "build": ["shell_execute", "ripgrep_search", "web_search"],
+            "writing": ["web_search", "document_write"],
+            "research": ["web_search", "web_fetch", "spreadsheet", "calculator"],
+        }
+        recommended = [
+            name
+            for name in recommended_by_intent.get(resolved_intent, [])
+            if name not in available
+        ]
+        return {
+            "source": "fallback_template",
+            "intent": resolved_intent,
+            "name": f"{slug}-adhoc",
+            "description": f"Ad hoc process synthesized for goal: {goal.strip()}",
+            "persona": (
+                "You are a pragmatic analyst. Build a concrete plan, produce useful "
+                "artifacts, and state evidence and assumptions."
+            ),
+            # Guided keeps the planner in control while still providing structure.
+            "phase_mode": "guided",
+            "tool_guidance": (
+                "Use available tools aggressively for evidence gathering, verification, "
+                "and artifact production. Prefer primary sources, maintain traceability, "
+                "and keep outputs concise and decision-oriented."
+            ),
+            "required_tools": required_tools,
+            "recommended_tools": recommended,
+            "phases": self._adhoc_intent_phase_blueprint(resolved_intent, slug),
+        }
+
+    def _normalize_adhoc_spec(
+        self,
+        raw: dict[str, Any] | None,
+        *,
+        goal: str,
+        key: str,
+        available_tools: list[str],
+        intent: str | None = None,
+    ) -> dict[str, Any]:
+        """Normalize model-produced ad hoc process spec into safe structure."""
+        resolved_intent = self._resolve_adhoc_intent(raw, intent_hint=intent)
+        fallback = self._fallback_adhoc_spec(
+            goal,
+            available_tools=available_tools,
+            intent=resolved_intent,
+        )
+        if not isinstance(raw, dict):
+            return fallback
+
+        raw_synthesis = self._sanitize_synthesis_trace(
+            raw.get("_synthesis") if isinstance(raw.get("_synthesis"), dict) else None
+        )
+        available_set = set(available_tools)
+        proposed_name = (
+            str(raw.get("name") or raw.get("name_hint") or "")
+            .strip()
+            .lower()
+        )
+        name = self._sanitize_kebab_token(
+            proposed_name,
+            fallback=f"adhoc-{key[:8]}",
+            max_len=40,
+        )
+        if not name.endswith("-adhoc"):
+            name = f"{name}-adhoc"
+
+        description = str(raw.get("description", "")).strip() or fallback["description"]
+        persona = str(raw.get("persona", "")).strip() or fallback["persona"]
+        tool_guidance = str(raw.get("tool_guidance", "")).strip() or fallback["tool_guidance"]
+        valid_phase_modes = {"strict", "guided", "suggestive"}
+        raw_phase_mode = str(raw.get("phase_mode", "")).strip().lower()
+        fallback_phase_mode = str(fallback.get("phase_mode", "guided")).strip().lower()
+        if fallback_phase_mode not in valid_phase_modes:
+            fallback_phase_mode = "guided"
+        phase_mode = raw_phase_mode if raw_phase_mode in valid_phase_modes else fallback_phase_mode
+
+        required_tools: list[str] = []
+        for item in raw.get("required_tools", []):
+            tool_name = str(item or "").strip()
+            if not tool_name or tool_name not in available_set:
+                continue
+            if tool_name not in required_tools:
+                required_tools.append(tool_name)
+        if not required_tools:
+            required_tools = list(fallback["required_tools"])
+
+        recommended_tools: list[str] = []
+        for item in raw.get("recommended_tools", []):
+            tool_name = str(item or "").strip()
+            if not tool_name or tool_name in available_set:
+                continue
+            if tool_name not in recommended_tools:
+                recommended_tools.append(tool_name)
+        for item in fallback["recommended_tools"]:
+            if item not in recommended_tools and item not in available_set:
+                recommended_tools.append(item)
+
+        seen_phase_ids: set[str] = set()
+        phases: list[dict[str, Any]] = []
+        raw_phases = raw.get("phases", [])
+        if not isinstance(raw_phases, list):
+            raw_phases = []
+        for idx, phase in enumerate(raw_phases, start=1):
+            if not isinstance(phase, dict):
+                continue
+            phase_id = self._sanitize_kebab_token(
+                str(phase.get("id", "")),
+                fallback=f"phase-{idx}",
+                max_len=36,
+            )
+            if phase_id in seen_phase_ids:
+                phase_id = f"{phase_id}-{idx}"
+            seen_phase_ids.add(phase_id)
+            desc = str(phase.get("description", "")).strip()
+            if not desc:
+                desc = f"Execute {phase_id.replace('-', ' ')}."
+
+            deliverables: list[str] = []
+            raw_deliverables = phase.get("deliverables", [])
+            if isinstance(raw_deliverables, str):
+                raw_deliverables = [raw_deliverables]
+            if isinstance(raw_deliverables, list):
+                for didx, item in enumerate(raw_deliverables, start=1):
+                    clean = self._sanitize_deliverable_name(
+                        str(item or ""),
+                        fallback=f"{phase_id}-{didx}.md",
+                    )
+                    if clean not in deliverables:
+                        deliverables.append(clean)
+            if not deliverables:
+                deliverables = [f"{phase_id}.md"]
+
+            depends_on: list[str] = []
+            raw_depends = phase.get("depends_on", [])
+            if isinstance(raw_depends, str):
+                raw_depends = [raw_depends]
+            if isinstance(raw_depends, list):
+                for dep in raw_depends:
+                    dep_id = self._sanitize_kebab_token(
+                        str(dep or ""),
+                        fallback="",
+                        max_len=36,
+                    )
+                    if not dep_id or dep_id == phase_id:
+                        continue
+                    if dep_id in seen_phase_ids and dep_id not in depends_on:
+                        depends_on.append(dep_id)
+
+            phases.append({
+                "id": phase_id,
+                "description": desc,
+                "depends_on": depends_on,
+                "deliverables": deliverables,
+                "acceptance_criteria": str(
+                    phase.get("acceptance_criteria", ""),
+                ).strip(),
+            })
+
+        used_template_phases = False
+        enforce_intent_shape = resolved_intent in {"build", "writing"}
+        if (
+            not phases
+            or len(phases) < 3
+            or (
+                enforce_intent_shape
+                and not self._phases_satisfy_intent(phases, resolved_intent)
+            )
+        ):
+            phases = list(fallback["phases"])
+            used_template_phases = True
+
+        if recommended_tools:
+            recommended = ", ".join(recommended_tools)
+            tool_guidance = (
+                f"{tool_guidance}\n\nRecommended additional tools for better outcomes: "
+                f"{recommended}"
+            )
+
+        source = "fallback_template" if used_template_phases else "model_generated"
+        raw_source = str(raw.get("source", "")).strip().lower()
+        if raw_source in {"fallback_template", "model_generated"}:
+            source = raw_source
+        elif not used_template_phases:
+            # Preserve template provenance when a cache entry omits source but
+            # still exactly matches the fallback phase blueprint.
+            if self._is_template_like_adhoc_spec(
+                {"intent": resolved_intent, "phases": phases},
+                goal=goal,
+            ):
+                source = "fallback_template"
+
+        return {
+            "source": source,
+            "intent": resolved_intent,
+            "name": name,
+            "description": description,
+            "persona": persona,
+            "phase_mode": phase_mode,
+            "tool_guidance": tool_guidance,
+            "required_tools": required_tools,
+            "recommended_tools": recommended_tools,
+            "phases": phases,
+            "_synthesis": raw_synthesis,
+        }
+
+    def _build_adhoc_cache_entry(
+        self,
+        *,
+        key: str,
+        goal: str,
+        spec: dict[str, Any],
+    ) -> AdhocProcessCacheEntry:
+        """Build a cached ad hoc process entry from normalized spec."""
+        from loom.processes.schema import PhaseTemplate, ProcessDefinition, ToolRequirements
+
+        phases = [
+            PhaseTemplate(
+                id=str(phase.get("id", "")).strip(),
+                description=str(phase.get("description", "")).strip(),
+                depends_on=[
+                    str(dep).strip()
+                    for dep in phase.get("depends_on", [])
+                    if str(dep).strip()
+                ],
+                acceptance_criteria=str(
+                    phase.get("acceptance_criteria", ""),
+                ).strip(),
+                deliverables=[
+                    str(item).strip()
+                    for item in phase.get("deliverables", [])
+                    if str(item).strip()
+                ],
+            )
+            for phase in spec.get("phases", [])
+            if isinstance(phase, dict)
+        ]
+        process_defn = ProcessDefinition(
+            name=str(spec.get("name", "")).strip() or f"adhoc-{key[:8]}",
+            version="adhoc-1",
+            description=str(spec.get("description", "")).strip(),
+            persona=str(spec.get("persona", "")).strip(),
+            tool_guidance=str(spec.get("tool_guidance", "")).strip(),
+            tools=ToolRequirements(
+                required=[
+                    str(item).strip()
+                    for item in spec.get("required_tools", [])
+                    if str(item).strip()
+                ],
+            ),
+            phase_mode=str(spec.get("phase_mode", "guided")).strip() or "guided",
+            phases=phases,
+            tags=["adhoc", "generated"],
+        )
+        try:
+            spec_snapshot = json.loads(json.dumps(spec, ensure_ascii=False))
+        except Exception:
+            spec_snapshot = self._spec_from_process_defn(
+                process_defn,
+                recommended_tools=[
+                    str(item).strip()
+                    for item in spec.get("recommended_tools", [])
+                    if str(item).strip()
+                ],
+            )
+        return AdhocProcessCacheEntry(
+            key=key,
+            goal=goal,
+            process_defn=process_defn,
+            recommended_tools=[
+                str(item).strip()
+                for item in spec.get("recommended_tools", [])
+                if str(item).strip()
+            ],
+            spec=spec_snapshot if isinstance(spec_snapshot, dict) else {},
+        )
+
+    def _is_template_like_adhoc_spec(self, spec: dict[str, Any], *, goal: str) -> bool:
+        """Return True when a spec appears to be the fallback template."""
+        if not isinstance(spec, dict):
+            return False
+        source = str(spec.get("source", "")).strip().lower()
+        if source == "fallback_template":
+            return True
+        if source == "model_generated":
+            return False
+
+        intent = self._normalize_adhoc_intent(str(spec.get("intent", "")), default="research")
+        slug = self._sanitize_kebab_token(goal, fallback="adhoc-process", max_len=26)
+        expected_ids = [
+            str(item.get("id", "")).strip()
+            for item in self._adhoc_intent_phase_blueprint(intent, slug)
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        ]
+        raw_phases = spec.get("phases", [])
+        if not isinstance(raw_phases, list) or not raw_phases:
+            return False
+        observed_ids = [
+            str(item.get("id", "")).strip()
+            for item in raw_phases
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        ]
+        return bool(expected_ids and observed_ids == expected_ids)
+
+    def _adhoc_synthesis_activity_lines(
+        self,
+        entry: AdhocProcessCacheEntry,
+        *,
+        from_cache: bool,
+        fresh: bool,
+    ) -> list[str]:
+        """Render concise diagnostics for Activity pane visibility."""
+        raw_spec = getattr(entry, "spec", None)
+        spec = raw_spec if isinstance(raw_spec, dict) else {}
+        source = str(spec.get("source", "")).strip() or "unknown"
+        intent = self._normalize_adhoc_intent(str(spec.get("intent", "")), default="research")
+        phases = spec.get("phases", [])
+        phase_count = len(phases) if isinstance(phases, list) else 0
+        required = spec.get("required_tools", [])
+        recommended = spec.get("recommended_tools", [])
+        required_count = len(required) if isinstance(required, list) else 0
+        recommended_count = len(recommended) if isinstance(recommended, list) else 0
+
+        lines = [
+            (
+                "Ad hoc definition summary: "
+                f"source={source}, intent={intent}, phases={phase_count}, "
+                f"required_tools={required_count}, recommended_tools={recommended_count}."
+            ),
+            f"Ad hoc cache decision: {'hit' if from_cache else 'miss'} (fresh={fresh}).",
+        ]
+        synthesis = self._sanitize_synthesis_trace(
+            spec.get("_synthesis") if isinstance(spec.get("_synthesis"), dict) else None
+        )
+        if synthesis:
+            initial_ok = bool(synthesis.get("initial_parse_ok"))
+            repair_attempted = bool(synthesis.get("repair_attempted"))
+            repair_ok = bool(synthesis.get("repair_parse_ok"))
+            minimal_attempted = bool(synthesis.get("minimal_retry_attempted"))
+            minimal_ok = bool(synthesis.get("minimal_retry_parse_ok"))
+            repair_state = "skipped"
+            if repair_attempted:
+                repair_state = "ok" if repair_ok else "failed"
+            minimal_state = "skipped"
+            if minimal_attempted:
+                minimal_state = "ok" if minimal_ok else "failed"
+            response_chars = int(synthesis.get("initial_response_chars") or 0)
+            if repair_attempted:
+                response_chars = int(synthesis.get("repair_response_chars") or response_chars)
+            if minimal_attempted:
+                response_chars = int(synthesis.get("minimal_retry_chars") or response_chars)
+            lines.append(
+                "Ad hoc parse diagnostics: "
+                f"initial={'ok' if initial_ok else 'failed'}, "
+                f"repair={repair_state}, minimal={minimal_state}, "
+                f"response_chars={response_chars}."
+            )
+            if bool(synthesis.get("empty_response_retry_attempted")):
+                retry_chars = int(synthesis.get("empty_response_retry_chars") or 0)
+                lines.append(
+                    f"Ad hoc empty-response retry: attempted, response_chars={retry_chars}.",
+                )
+            fallback_reason = str(synthesis.get("fallback_reason", "")).strip()
+            if fallback_reason:
+                lines.append(f"Ad hoc fallback reason: {fallback_reason}.")
+            initial_error = str(synthesis.get("initial_error", "")).strip()
+            if initial_error:
+                lines.append(f"Ad hoc initial error: {initial_error}.")
+            repair_error = str(synthesis.get("repair_error", "")).strip()
+            if repair_error:
+                lines.append(f"Ad hoc repair error: {repair_error}.")
+            minimal_error = str(synthesis.get("minimal_retry_error", "")).strip()
+            if minimal_error:
+                lines.append(f"Ad hoc minimal retry error: {minimal_error}.")
+            artifact_dir = str(synthesis.get("artifact_dir", "")).strip()
+            if artifact_dir:
+                lines.append(f"Ad hoc synthesis artifacts: {artifact_dir}")
+            log_path = str(synthesis.get("log_path", "")).strip()
+            if log_path:
+                lines.append(f"Ad hoc synthesis log: {log_path}")
+        return lines
+
+    @staticmethod
+    def _is_temperature_one_only_error(value: object) -> bool:
+        text = str(value or "").lower()
+        return "invalid temperature" in text and "only 1 is allowed" in text
+
+    @staticmethod
+    def _configured_model_temperature(model: ModelProvider | None) -> float | None:
+        """Return the selected model's configured temperature from loom.toml."""
+        if model is None:
+            return None
+        value = getattr(model, "configured_temperature", None)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _configured_model_max_tokens(model: ModelProvider | None) -> int | None:
+        """Return the selected model's configured max_tokens from loom.toml."""
+        if model is None:
+            return None
+        value = getattr(model, "configured_max_tokens", None)
+        if isinstance(value, int) and value > 0:
+            return value
+        return None
+
+    def _planning_response_max_tokens_limit(self) -> int | None:
+        """Return planner-only max_tokens override from limits config."""
+        value = getattr(
+            getattr(self._config, "limits", None),
+            "planning_response_max_tokens",
+            None,
+        )
+        if isinstance(value, int) and value > 0:
+            return value
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _has_configured_role_model(self, role: str) -> bool:
+        """Return True when config declares at least one model for the role.
+
+        If no model config is loaded (tests/ephemeral contexts), fall back to
+        whether an active session model exists.
+        """
+        models = getattr(getattr(self, "_config", None), "models", None)
+        if isinstance(models, dict) and models:
+            return any(
+                role in list(getattr(model_cfg, "roles", []) or [])
+                for model_cfg in models.values()
+            )
+        return self._model is not None
+
+    def _select_helper_model_for_role(
+        self,
+        *,
+        role: str,
+        tier: int,
+    ) -> tuple[ModelProvider | None, object | None]:
+        """Select a helper model for a role and return (model, router_or_none).
+
+        When full model config is available, selection is role-routed through
+        ModelRouter. Without configured models (common in unit tests), this
+        falls back to the active cowork model.
+        """
+        models = getattr(getattr(self, "_config", None), "models", None)
+        if isinstance(models, dict) and models:
+            from loom.models.router import ModelRouter
+
+            try:
+                router = ModelRouter.from_config(self._config)
+            except Exception as e:
+                logger.debug("Failed to build model router for role %s: %s", role, e)
+                return None, None
+            try:
+                model = router.select(tier=tier, role=role)
+            except Exception as e:
+                logger.debug("No helper model configured for role %s: %s", role, e)
+                return None, router
+            return model, router
+        return self._model, None
+
+    async def _invoke_helper_role_completion(
+        self,
+        *,
+        role: str,
+        tier: int,
+        prompt: str,
+        max_tokens: int | None,
+        temperature: float | None = None,
+    ) -> tuple[object, str, float | None, int | None]:
+        """Invoke a role-routed helper completion and close temporary routers."""
+        model, router = self._select_helper_model_for_role(role=role, tier=tier)
+        try:
+            if model is None:
+                raise RuntimeError(f"No model configured for role: {role}")
+            resolved_temperature = (
+                temperature
+                if temperature is not None
+                else self._configured_model_temperature(model)
+            )
+            planner_max_tokens = (
+                self._planning_response_max_tokens_limit()
+                if role == "planner"
+                else None
+            )
+            resolved_max_tokens = (
+                max_tokens
+                if isinstance(max_tokens, int) and max_tokens > 0
+                else planner_max_tokens
+                if isinstance(planner_max_tokens, int) and planner_max_tokens > 0
+                else self._configured_model_max_tokens(model)
+            )
+            response = await call_with_model_retry(
+                lambda: model.complete(
+                    [{"role": "user", "content": prompt}],
+                    temperature=resolved_temperature,
+                    max_tokens=resolved_max_tokens,
+                ),
+                policy=self._model_retry_policy(),
+            )
+            return (
+                response,
+                str(getattr(model, "name", "") or ""),
+                resolved_temperature,
+                resolved_max_tokens,
+            )
+        finally:
+            if router is not None:
+                close = getattr(router, "close", None)
+                if close is not None:
+                    try:
+                        await close()
+                    except Exception as e:
+                        logger.debug("Failed closing helper role router: %s", e)
+
+    def _should_resynthesize_cached_adhoc(self, entry: AdhocProcessCacheEntry) -> bool:
+        """Return True when cache should be refreshed from model synthesis."""
+        if not self._has_configured_role_model("planner"):
+            return False
+        spec = entry.spec if isinstance(entry.spec, dict) else {}
+        return self._is_template_like_adhoc_spec(spec, goal=entry.goal)
+
+    async def _synthesize_adhoc_process(self, goal: str, *, key: str) -> AdhocProcessCacheEntry:
+        """Generate an ad hoc process definition from a free-form run goal."""
+        available_tools = self._available_tool_names()
+        fallback_spec = self._fallback_adhoc_spec(
+            goal,
+            available_tools=available_tools,
+            intent="research",
+        )
+        diagnostics: dict[str, Any] = {
+            "cache_key": key,
+            "model_name": "",
+            "available_tool_count": len(available_tools),
+            "goal_chars": len(str(goal or "")),
+            "initial_max_tokens": None,
+            "repair_max_tokens": None,
+            "minimal_max_tokens": None,
+            "prompt_chars": 0,
+            "initial_response_chars": 0,
+            "initial_output_tokens": 0,
+            "initial_parse_ok": False,
+            "repair_attempted": False,
+            "repair_response_chars": 0,
+            "repair_output_tokens": 0,
+            "repair_parse_ok": False,
+            "empty_response_retry_attempted": False,
+            "empty_response_retry_chars": 0,
+            "minimal_retry_attempted": False,
+            "minimal_retry_chars": 0,
+            "minimal_output_tokens": 0,
+            "minimal_retry_parse_ok": False,
+            "parsed_raw_incomplete": False,
+            "minimal_retry_kept_prior_raw": False,
+            "fallback_reason": "",
+            "initial_error": "",
+            "repair_error": "",
+            "minimal_retry_error": "",
+            "initial_preview": "",
+            "repair_preview": "",
+            "minimal_preview": "",
+            "repair_source_chars": 0,
+            "repair_source_truncated": False,
+            "initial_temperature": None,
+            "repair_temperature": None,
+            "resolved_source": "fallback_template",
+            "resolved_intent": "research",
+            "phase_count": len(fallback_spec.get("phases", [])),
+            "required_tool_count": len(fallback_spec.get("required_tools", [])),
+            "recommended_tool_count": len(fallback_spec.get("recommended_tools", [])),
+            "log_path": str(self._adhoc_synthesis_log_path()),
+            "artifact_dir": "",
+        }
+        artifact_dir = self._create_adhoc_synthesis_artifact_dir(key=key, goal=goal)
+        if artifact_dir is not None:
+            diagnostics["artifact_dir"] = str(artifact_dir)
+            self._write_adhoc_synthesis_artifact_text(
+                artifact_dir,
+                "00-goal.txt",
+                str(goal or "").strip(),
+            )
+            self._write_adhoc_synthesis_artifact_text(
+                artifact_dir,
+                "00-available-tools.txt",
+                "\n".join(available_tools),
+            )
+        if not self._has_configured_role_model("planner"):
+            diagnostics["fallback_reason"] = "model_unavailable"
+            self._write_adhoc_synthesis_artifact_text(
+                artifact_dir,
+                "11-diagnostics.json",
+                json.dumps(
+                    self._sanitize_synthesis_trace(diagnostics),
+                    indent=2,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
+            self._write_adhoc_synthesis_artifact_text(
+                artifact_dir,
+                "12-rejection-reason.txt",
+                "fallback_reason=model_unavailable\nresolved_source=fallback_template\n",
+            )
+            fallback_spec["_synthesis"] = self._sanitize_synthesis_trace(diagnostics)
+            self._append_adhoc_synthesis_log({
+                "event": "adhoc_synthesis",
+                "goal": goal,
+                **self._sanitize_synthesis_trace(diagnostics),
+            })
+            logger.warning(
+                "Ad hoc synthesis[%s] used fallback: model unavailable",
+                key,
+            )
+            return self._build_adhoc_cache_entry(key=key, goal=goal, spec=fallback_spec)
+
+        tool_list = ", ".join(available_tools) if available_tools else "(none)"
+        prompt = (
+            "The user wants to do this:\n"
+            f"{goal}\n\n"
+            "Let's design an abstract Loom process for this request using "
+            "docs/creating-packages.md as the contract reference.\n"
+            "The process must be reusable, well-structured, and outcome-driven.\n\n"
+            "Return ONLY valid JSON with keys:\n"
+            "intent, name, description, persona, phase_mode, tool_guidance, required_tools, "
+            "recommended_tools, phases.\n"
+            "phases must be a list of objects with keys:\n"
+            "id, description, depends_on, acceptance_criteria, deliverables.\n\n"
+            "Hard requirements:\n"
+            "- Determine intent from the user goal and set `intent` to exactly one of: "
+            "research, writing, build.\n"
+            "- Use lowercase kebab-case for name and phase ids.\n"
+            "- phase_mode MUST be one of: strict, guided, suggestive.\n"
+            "- Prefer phase_mode=\"guided\" unless strict ordering is explicitly needed.\n"
+            "- Use as many phases as needed for the goal (typically 3-20), not a fixed count.\n"
+            "- Keep each phase small enough to finish within one subtask wall-clock budget.\n"
+            "- Use `depends_on` to model independence so parallelizable phases "
+            "can run concurrently.\n"
+            "- If intent=build, include an implementation/build phase and a test/verify phase.\n"
+            "- If intent=writing, include draft/write and revision/edit phases.\n"
+            "- If intent=research, include source/evidence collection and analysis/synthesis "
+            "phases.\n"
+            "- Every phase must include measurable acceptance_criteria.\n"
+            "- Every phase must include concrete deliverable filenames (.md/.csv/etc).\n"
+            "- If the goal mentions local files or directories, include a phase that "
+            "inspects them.\n"
+            "- required_tools must be selected ONLY from available tools.\n"
+            "- recommended_tools should list useful missing tools not currently available.\n"
+            "- Keep the process reusable and focused on outcomes, not implementation trivia.\n"
+            "- Do not wrap JSON in markdown fences.\n\n"
+            "Full package authoring reference:\n"
+            "<<<BEGIN_CREATING_PACKAGES_MD>>>\n"
+            + self._adhoc_package_contract_hint()
+            + "\n<<<END_CREATING_PACKAGES_MD>>>\n\n"
+            f"Available tools: {tool_list}\n"
+        )
+        diagnostics["prompt_chars"] = len(prompt)
+        self._write_adhoc_synthesis_artifact_text(
+            artifact_dir,
+            "01-initial-prompt.txt",
+            prompt,
+        )
+        configured_temperature: float | None = None
+
+        expected_json_keys = (
+            "intent",
+            "name",
+            "description",
+            "persona",
+            "phase_mode",
+            "tool_guidance",
+            "required_tools",
+            "recommended_tools",
+            "phases",
+        )
+        raw: dict[str, Any] | None = None
+        raw_text = ""
+        try:
+            response, model_name, configured_temperature, initial_max_tokens = (
+                await self._invoke_helper_role_completion(
+                    role="planner",
+                    tier=2,
+                    prompt=prompt,
+                    max_tokens=None,
+                )
+            )
+            diagnostics["model_name"] = model_name
+            diagnostics["initial_temperature"] = configured_temperature
+            diagnostics["repair_temperature"] = configured_temperature
+            diagnostics["initial_max_tokens"] = initial_max_tokens
+            raw_text = str(getattr(response, "text", "") or "")
+            diagnostics["initial_response_chars"] = len(raw_text)
+            diagnostics["initial_preview"] = self._synthesis_preview(raw_text)
+            self._write_adhoc_synthesis_artifact_text(
+                artifact_dir,
+                "02-initial-response.txt",
+                raw_text,
+            )
+            raw = self._extract_json_payload(
+                raw_text,
+                expected_keys=expected_json_keys,
+            )
+            diagnostics["initial_parse_ok"] = isinstance(raw, dict)
+        except Exception as e:
+            diagnostics["initial_error"] = str(e)
+            self._write_adhoc_synthesis_artifact_text(
+                artifact_dir,
+                "02-initial-error.txt",
+                str(e),
+            )
+            logger.warning("Ad hoc process synthesis failed: %s", e)
+
+        if raw is None and not raw_text.strip() and not str(
+            diagnostics.get("initial_error", ""),
+        ).strip():
+            diagnostics["repair_attempted"] = True
+            diagnostics["empty_response_retry_attempted"] = True
+            retry_prompt = (
+                "Your previous response was empty.\n"
+                "Return a non-empty strict JSON object only.\n"
+                "Required keys: intent, name, description, persona, phase_mode, "
+                "tool_guidance, required_tools, recommended_tools, phases.\n"
+                "Each phase object keys: id, description, depends_on, "
+                "acceptance_criteria, deliverables.\n\n"
+                "Use this same task request:\n"
+                f"{goal}\n\n"
+                "Do not include markdown fences."
+            )
+            self._write_adhoc_synthesis_artifact_text(
+                artifact_dir,
+                "03-empty-retry-prompt.txt",
+                retry_prompt,
+            )
+            try:
+                retry_response, retry_model_name, retry_temperature, retry_max_tokens = (
+                    await self._invoke_helper_role_completion(
+                        role="planner",
+                        tier=2,
+                        prompt=retry_prompt,
+                        max_tokens=None,
+                        temperature=configured_temperature,
+                    )
+                )
+                if not diagnostics["model_name"]:
+                    diagnostics["model_name"] = retry_model_name
+                if configured_temperature is None:
+                    configured_temperature = retry_temperature
+                    diagnostics["repair_temperature"] = retry_temperature
+                diagnostics["repair_max_tokens"] = retry_max_tokens
+                retry_text = str(getattr(retry_response, "text", "") or "")
+                diagnostics["empty_response_retry_chars"] = len(retry_text)
+                diagnostics["repair_response_chars"] = len(retry_text)
+                diagnostics["repair_preview"] = self._synthesis_preview(retry_text)
+                self._write_adhoc_synthesis_artifact_text(
+                    artifact_dir,
+                    "04-empty-retry-response.txt",
+                    retry_text,
+                )
+                if retry_text.strip():
+                    raw_text = retry_text
+                    raw = self._extract_json_payload(
+                        retry_text,
+                        expected_keys=expected_json_keys,
+                    )
+                    diagnostics["repair_parse_ok"] = isinstance(raw, dict)
+            except Exception as e:
+                diagnostics["repair_error"] = str(e)
+                self._write_adhoc_synthesis_artifact_text(
+                    artifact_dir,
+                    "04-empty-retry-error.txt",
+                    str(e),
+                )
+                logger.warning("Ad hoc process empty-response retry failed: %s", e)
+
+        if raw is None and raw_text.strip():
+            diagnostics["repair_attempted"] = True
+            repair_source_cap = int(
+                getattr(
+                    getattr(self._config, "limits", None),
+                    "adhoc_repair_source_max_chars",
+                    0,
+                )
+                or 0,
+            )
+            repair_source_text = raw_text
+            if repair_source_cap > 0 and len(repair_source_text) > repair_source_cap:
+                repair_source_text = repair_source_text[:repair_source_cap]
+            diagnostics["repair_source_chars"] = len(repair_source_text)
+            diagnostics["repair_source_truncated"] = len(repair_source_text) < len(raw_text)
+            repair_prompt = (
+                "You will receive model output that should describe a Loom process.\n"
+                "Convert it into STRICT JSON only.\n"
+                "Return exactly one JSON object with keys:\n"
+                "intent, name, description, persona, phase_mode, tool_guidance, "
+                "required_tools, recommended_tools, phases.\n"
+                "Each phase object must contain: id, description, depends_on, "
+                "acceptance_criteria, deliverables.\n"
+                "Do not include markdown fences.\n\n"
+                "SOURCE OUTPUT:\n"
+                "<<<BEGIN_SOURCE>>>\n"
+                f"{repair_source_text}\n"
+                "<<<END_SOURCE>>>"
+            )
+            self._write_adhoc_synthesis_artifact_text(
+                artifact_dir,
+                "05-repair-prompt.txt",
+                repair_prompt,
+            )
+            try:
+                repaired, repaired_model_name, repaired_temperature, repair_max_tokens = (
+                    await self._invoke_helper_role_completion(
+                        role="planner",
+                        tier=2,
+                        prompt=repair_prompt,
+                        max_tokens=None,
+                        temperature=configured_temperature,
+                    )
+                )
+                if not diagnostics["model_name"]:
+                    diagnostics["model_name"] = repaired_model_name
+                if configured_temperature is None:
+                    configured_temperature = repaired_temperature
+                    diagnostics["repair_temperature"] = repaired_temperature
+                diagnostics["repair_max_tokens"] = repair_max_tokens
+                repaired_text = str(getattr(repaired, "text", "") or "")
+                diagnostics["repair_response_chars"] = len(repaired_text)
+                diagnostics["repair_preview"] = self._synthesis_preview(repaired_text)
+                self._write_adhoc_synthesis_artifact_text(
+                    artifact_dir,
+                    "06-repair-response.txt",
+                    repaired_text,
+                )
+                raw = self._extract_json_payload(
+                    repaired_text,
+                    expected_keys=expected_json_keys,
+                )
+                diagnostics["repair_parse_ok"] = isinstance(raw, dict)
+            except Exception as e:
+                diagnostics["repair_error"] = str(e)
+                self._write_adhoc_synthesis_artifact_text(
+                    artifact_dir,
+                    "06-repair-error.txt",
+                    str(e),
+                )
+                logger.warning("Ad hoc process JSON repair failed: %s", e)
+
+        parsed_raw = raw if isinstance(raw, dict) else None
+        needs_minimal_retry = (
+            raw is None or self._raw_adhoc_spec_needs_minimal_retry(parsed_raw)
+        )
+        diagnostics["parsed_raw_incomplete"] = bool(
+            isinstance(parsed_raw, dict)
+            and self._raw_adhoc_spec_needs_minimal_retry(parsed_raw),
+        )
+        if needs_minimal_retry:
+            diagnostics["minimal_retry_attempted"] = True
+            minimal_prompt = (
+                "Return exactly one STRICT JSON object and nothing else.\n"
+                "Required top-level keys:\n"
+                "intent, name, description, persona, phase_mode, tool_guidance, "
+                "required_tools, recommended_tools, phases.\n"
+                "Constraints:\n"
+                "- intent: research | writing | build\n"
+                "- phase_mode: strict | guided | suggestive (prefer guided)\n"
+                "- phases length: 3-20\n"
+                "- each phase object keys: id, description, depends_on, "
+                "acceptance_criteria, deliverables\n"
+                "- required_tools must be from available tools only\n"
+                "- description, persona, tool_guidance must be concise (<= 180 chars each)\n"
+                "- phase descriptions must be concise (<= 120 chars)\n"
+                "- acceptance_criteria must be a short STRING (not array)\n"
+                "- deliverables must be filename strings like report.md\n"
+                "- do not include markdown/code fences/prose\n\n"
+                f"Goal:\n{goal}\n\n"
+                f"Available tools: {tool_list}\n"
+            )
+            self._write_adhoc_synthesis_artifact_text(
+                artifact_dir,
+                "07-minimal-retry-prompt.txt",
+                minimal_prompt,
+            )
+            try:
+                minimal, minimal_model_name, minimal_temperature, minimal_max_tokens = (
+                    await self._invoke_helper_role_completion(
+                        role="planner",
+                        tier=2,
+                        prompt=minimal_prompt,
+                        max_tokens=None,
+                        temperature=configured_temperature,
+                    )
+                )
+                if not diagnostics["model_name"]:
+                    diagnostics["model_name"] = minimal_model_name
+                if configured_temperature is None:
+                    configured_temperature = minimal_temperature
+                    diagnostics["repair_temperature"] = minimal_temperature
+                diagnostics["minimal_max_tokens"] = minimal_max_tokens
+                minimal_text = str(getattr(minimal, "text", "") or "")
+                diagnostics["minimal_retry_chars"] = len(minimal_text)
+                diagnostics["minimal_preview"] = self._synthesis_preview(minimal_text)
+                self._write_adhoc_synthesis_artifact_text(
+                    artifact_dir,
+                    "08-minimal-retry-response.txt",
+                    minimal_text,
+                )
+                minimal_parsed = self._extract_json_payload(
+                    minimal_text,
+                    expected_keys=expected_json_keys,
+                )
+                diagnostics["minimal_retry_parse_ok"] = isinstance(minimal_parsed, dict)
+                if isinstance(minimal_parsed, dict):
+                    raw = minimal_parsed
+                elif isinstance(parsed_raw, dict):
+                    # Preserve previously parsed content when minimal retry fails.
+                    diagnostics["minimal_retry_kept_prior_raw"] = True
+                    raw = parsed_raw
+            except Exception as e:
+                diagnostics["minimal_retry_error"] = str(e)
+                self._write_adhoc_synthesis_artifact_text(
+                    artifact_dir,
+                    "08-minimal-retry-error.txt",
+                    str(e),
+                )
+                if isinstance(parsed_raw, dict):
+                    diagnostics["minimal_retry_kept_prior_raw"] = True
+                    raw = parsed_raw
+                logger.warning("Ad hoc process minimal retry failed: %s", e)
+
+        if raw is None:
+            if self._is_temperature_one_only_error(diagnostics.get("initial_error", "")):
+                diagnostics["fallback_reason"] = "temperature_config_mismatch"
+            elif self._is_temperature_one_only_error(diagnostics.get("repair_error", "")):
+                diagnostics["fallback_reason"] = "temperature_config_mismatch"
+            elif not raw_text.strip():
+                diagnostics["fallback_reason"] = "empty_model_response"
+            elif str(diagnostics.get("initial_error", "")).strip():
+                diagnostics["fallback_reason"] = "model_completion_error"
+            elif (
+                diagnostics.get("repair_attempted")
+                and not diagnostics.get("repair_parse_ok")
+                and diagnostics.get("minimal_retry_attempted")
+                and not diagnostics.get("minimal_retry_parse_ok")
+            ):
+                diagnostics["fallback_reason"] = "schema_parse_failed"
+            else:
+                diagnostics["fallback_reason"] = "non_parseable_response"
+            preview = re.sub(r"\s+", " ", raw_text).strip()
+            if len(preview) > 280:
+                preview = preview[:280].rstrip() + "..."
+            logger.warning(
+                "Ad hoc process synthesis returned non-parseable payload; using fallback."
+                " preview=%r",
+                preview,
+            )
+
+        normalized = self._normalize_adhoc_spec(
+            raw,
+            goal=goal,
+            key=key,
+            available_tools=available_tools,
+        )
+        source = str(normalized.get("source", "")).strip() or "unknown"
+        diagnostics["resolved_source"] = source
+        diagnostics["resolved_intent"] = str(normalized.get("intent", "")).strip() or "research"
+        diagnostics["phase_count"] = len(normalized.get("phases", []) or [])
+        diagnostics["required_tool_count"] = len(normalized.get("required_tools", []) or [])
+        diagnostics["recommended_tool_count"] = len(normalized.get("recommended_tools", []) or [])
+        if (
+            source == "fallback_template"
+            and not str(diagnostics.get("fallback_reason", "")).strip()
+        ):
+            diagnostics["fallback_reason"] = "normalization_template_substitution"
+
+        self._write_adhoc_synthesis_artifact_yaml(
+            artifact_dir,
+            "09-parsed-raw.yaml",
+            raw if isinstance(raw, dict) else None,
+        )
+        self._write_adhoc_synthesis_artifact_yaml(
+            artifact_dir,
+            "10-normalized-spec.yaml",
+            normalized,
+        )
+        self._write_adhoc_synthesis_artifact_text(
+            artifact_dir,
+            "11-diagnostics.json",
+            json.dumps(
+                self._sanitize_synthesis_trace(diagnostics),
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        if str(diagnostics.get("fallback_reason", "")).strip():
+            self._write_adhoc_synthesis_artifact_text(
+                artifact_dir,
+                "12-rejection-reason.txt",
+                (
+                    "fallback_reason="
+                    f"{str(diagnostics.get('fallback_reason', '')).strip()}\n"
+                    "resolved_source="
+                    f"{str(diagnostics.get('resolved_source', '')).strip()}\n"
+                    "parsed_raw_incomplete="
+                    f"{bool(diagnostics.get('parsed_raw_incomplete'))}\n"
+                ),
+            )
+
+        normalized["_synthesis"] = self._sanitize_synthesis_trace(diagnostics)
+        self._append_adhoc_synthesis_log({
+            "event": "adhoc_synthesis",
+            "goal": goal,
+            **self._sanitize_synthesis_trace(diagnostics),
+        })
+        logger.warning(
+            "Ad hoc synthesis[%s]: source=%s intent=%s phases=%s parse(initial=%s repair=%s)",
+            key,
+            diagnostics["resolved_source"],
+            diagnostics["resolved_intent"],
+            diagnostics["phase_count"],
+            diagnostics["initial_parse_ok"],
+            diagnostics["repair_parse_ok"] if diagnostics["repair_attempted"] else "skipped",
+        )
+        return self._build_adhoc_cache_entry(key=key, goal=goal, spec=normalized)
+
+    async def _get_or_create_adhoc_process(
+        self,
+        goal: str,
+        *,
+        fresh: bool = False,
+    ) -> tuple[AdhocProcessCacheEntry, bool]:
+        """Fetch cached ad hoc process for goal, or synthesize and cache one."""
+        key = self._adhoc_cache_key(goal)
+        if fresh:
+            # Explicit --fresh requests should always bypass memory + disk cache.
+            self._adhoc_process_cache.pop(key, None)
+            generated = await self._synthesize_adhoc_process(goal, key=key)
+            self._adhoc_process_cache[key] = generated
+            try:
+                self._persist_adhoc_cache_entry(generated)
+            except Exception as e:
+                logger.warning("Failed to persist ad hoc process cache for %s: %s", key, e)
+            self._append_adhoc_synthesis_log({
+                "event": "adhoc_cache_decision",
+                "cache_key": key,
+                "goal": goal,
+                "decision": "fresh_synthesis",
+            })
+            return generated, False
+
+        cached = self._adhoc_process_cache.get(key)
+        if cached is not None and not self._should_resynthesize_cached_adhoc(cached):
+            self._append_adhoc_synthesis_log({
+                "event": "adhoc_cache_decision",
+                "cache_key": key,
+                "goal": goal,
+                "decision": "memory_hit",
+            })
+            return cached, True
+        if cached is not None:
+            self._adhoc_process_cache.pop(key, None)
+        disk_cached = self._load_adhoc_cache_entry_from_disk(key)
+        if disk_cached is not None and not self._should_resynthesize_cached_adhoc(disk_cached):
+            self._adhoc_process_cache[key] = disk_cached
+            self._append_adhoc_synthesis_log({
+                "event": "adhoc_cache_decision",
+                "cache_key": key,
+                "goal": goal,
+                "decision": "disk_hit",
+            })
+            return disk_cached, True
+        generated = await self._synthesize_adhoc_process(goal, key=key)
+        self._adhoc_process_cache[key] = generated
+        try:
+            self._persist_adhoc_cache_entry(generated)
+        except Exception as e:
+            logger.warning("Failed to persist ad hoc process cache for %s: %s", key, e)
+        self._append_adhoc_synthesis_log({
+            "event": "adhoc_cache_decision",
+            "cache_key": key,
+            "goal": goal,
+            "decision": "synthesized",
+        })
+        return generated, False
+
+    @staticmethod
+    def _serialize_process_for_package(process_defn: ProcessDefinition) -> dict[str, Any]:
+        """Convert a process definition into a process.yaml payload."""
+        payload: dict[str, Any] = {
+            "name": process_defn.name,
+            "schema_version": int(process_defn.schema_version or 1),
+            "version": "0.1.0",
+            "description": process_defn.description,
+            "persona": process_defn.persona,
+            "tool_guidance": process_defn.tool_guidance,
+            "phase_mode": process_defn.phase_mode or "guided",
+            "tools": {
+                "guidance": process_defn.tools.guidance,
+                "required": list(process_defn.tools.required),
+                "excluded": list(process_defn.tools.excluded),
+            },
+            "phases": [
+                {
+                    "id": phase.id,
+                    "description": phase.description,
+                    "depends_on": list(phase.depends_on),
+                    "acceptance_criteria": phase.acceptance_criteria,
+                    "deliverables": list(phase.deliverables),
+                }
+                for phase in process_defn.phases
+            ],
+            "tags": list(dict.fromkeys([*process_defn.tags, "adhoc", "generated"])),
+            "author": process_defn.author or "loom-adhoc",
+        }
+        return payload
+
+    def _save_adhoc_process_package(
+        self,
+        *,
+        process_defn: ProcessDefinition,
+        package_name: str,
+        recommended_tools: list[str],
+    ) -> Path:
+        """Persist an ad hoc process as a workspace-local package."""
+        import yaml
+
+        safe_name = self._sanitize_kebab_token(
+            package_name,
+            fallback="adhoc-process",
+            max_len=40,
+        )
+        package_dir = self._workspace / ".loom" / "processes" / safe_name
+        if package_dir.exists():
+            raise ValueError(f"Package already exists: {package_dir}")
+        package_dir.mkdir(parents=True, exist_ok=False)
+
+        spec = self._serialize_process_for_package(process_defn)
+        spec["name"] = safe_name
+        process_yaml = package_dir / "process.yaml"
+        process_yaml.write_text(
+            yaml.safe_dump(spec, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+
+        notes = [
+            f"# {safe_name}",
+            "",
+            "Generated from an ad hoc `/run` synthesis in Loom TUI.",
+        ]
+        if recommended_tools:
+            notes.append("")
+            notes.append("## Recommended Additional Tools")
+            for tool_name in recommended_tools:
+                notes.append(f"- {tool_name}")
+        (package_dir / "README.md").write_text(
+            "\n".join(notes).rstrip() + "\n",
+            encoding="utf-8",
+        )
+        return package_dir
 
     async def _reload_session_for_process_change(self, chat: ChatLog) -> None:
         """Rebuild session after changing active process."""
@@ -901,10 +3082,12 @@ class LoomApp(App):
             "[bold #7dcfff]Process Controls[/bold #7dcfff]",
             f"  [bold]Active:[/] {active}",
             "  [bold]Commands:[/]",
+            "    /processes",
             "    /process list",
             "    /process use <name-or-path>",
             "    /process off",
             "    /<process-name> <goal>",
+            "    /run <goal>",
         ])
 
     def _render_tools_catalog(self) -> str:
@@ -1023,8 +3206,7 @@ class LoomApp(App):
         active = self._process_defn.name if self._process_defn else ""
         lines = [
             "[bold #7dcfff]Available Processes[/bold #7dcfff]",
-            "[dim]Run directly with /<process-name> <goal> "
-            "or set active with /process use <name-or-path>[/dim]",
+            "[dim]Run directly with /<process-name> <goal> or /run <goal>[/dim]",
         ]
         for proc in available:
             name = str(proc.get("name", "")).strip()
@@ -1313,7 +3495,7 @@ class LoomApp(App):
         self, run: ProcessRunState, text: str, *, success: bool,
     ) -> None:
         """Record and render one process-run final result line."""
-        message = str(text or "").strip()
+        message = _plain_text(text).strip()
         if not message:
             message = "Process run completed." if success else "Process run failed."
         records = getattr(run, "result_log", None)
@@ -1655,8 +3837,8 @@ class LoomApp(App):
             if interrupted:
                 info += (
                     "\n"
-                    f"  [#f7768e]{interrupted} interrupted run(s) were marked failed "
-                    "because execution cannot resume after restart.[/]"
+                    f"  [#f7768e]{interrupted} interrupted run(s) were marked failed. "
+                    "Use /run resume <run-id-prefix> to continue.[/]"
                 )
             chat.add_info(info)
 
@@ -1739,6 +3921,70 @@ class LoomApp(App):
             slug = slug[:max_len].strip("-")
         return slug
 
+    @staticmethod
+    def _run_goal_for_folder_name(goal: str) -> str:
+        text = " ".join(str(goal or "").split()).strip()
+        if not text:
+            return ""
+        prefixes = (
+            r"^(?:please\s+)?i\s+need\s+you\s+to\s+",
+            r"^(?:please\s+)?can\s+you\s+",
+            r"^(?:please\s+)?could\s+you\s+",
+            r"^(?:please\s+)?help\s+me\s+(?:to\s+)?",
+            r"^the\s+user\s+wants(?:\s+me)?\s+to\s+",
+        )
+        for pattern in prefixes:
+            text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+        return text[:240]
+
+    @classmethod
+    def _extract_run_folder_slug(cls, response_text: str) -> str:
+        text = str(response_text or "").strip()
+        if not text:
+            return ""
+        first_line = text.splitlines()[0].strip().strip("`").strip("\"'")
+        match = re.search(r"[a-z0-9]+(?:-[a-z0-9]+)+", first_line.lower())
+        candidate = match.group(0) if match else first_line
+        return cls._slugify_process_run_folder(candidate, max_len=48)
+
+    @staticmethod
+    def _is_low_quality_run_folder_slug(slug: str) -> bool:
+        value = str(slug or "").strip().lower()
+        if not value:
+            return True
+        tokens = [part for part in value.split("-") if part]
+        if len(tokens) < 2:
+            return True
+        if tokens[:3] == ["the", "user", "wants"]:
+            return True
+        if tokens[:4] == ["i", "need", "you", "to"]:
+            return True
+
+        banned_tokens = {
+            "the",
+            "user",
+            "wants",
+            "i",
+            "need",
+            "you",
+            "to",
+            "folder",
+            "name",
+            "kebab",
+            "case",
+            "run",
+            "process",
+            "task",
+            "request",
+            "prompt",
+            "query",
+            "for",
+            "a",
+            "pr",
+        }
+        banned_hits = sum(1 for token in tokens if token in banned_tokens)
+        return banned_hits >= max(2, (len(tokens) + 1) // 2)
+
     def _fallback_process_run_folder_name(self, process_name: str, goal: str) -> str:
         merged = f"{process_name} {goal}".strip().lower()
         tokens = re.findall(r"[a-z0-9]+", merged)
@@ -1750,32 +3996,42 @@ class LoomApp(App):
         process_cfg = getattr(self._config, "process", None)
         if not bool(getattr(process_cfg, "llm_run_folder_naming_enabled", True)):
             return ""
-        if self._model is None:
+        if not self._has_configured_role_model("extractor"):
             return ""
+        goal_seed = self._run_goal_for_folder_name(goal)
         prompt = (
-            "Return one concise kebab-case folder name for this process run. "
-            "Use 2-6 words, only lowercase letters/numbers/hyphens, no slashes, "
-            "no punctuation, no explanation.\n"
-            f"Process: {process_name}\n"
-            f"Goal: {goal}\n"
-            "Folder name:"
+            "Return exactly one kebab-case folder name for this process run.\n"
+            "Requirements:\n"
+            "- Output ONLY the slug (single line, no quotes, no backticks, no explanation).\n"
+            "- 2-6 words, lowercase letters/numbers/hyphens only.\n"
+            "- Use concrete topic words from the goal.\n"
+            "- Do NOT echo prompt scaffolding or meta wording such as "
+            "\"the user wants\", \"i need you to\", \"folder\", \"name\", or \"for a pr\".\n"
+            f"Process label: {process_name}\n"
+            f"Goal: {goal_seed or goal}\n"
+            "Slug:"
         )
         try:
-            response = await call_with_model_retry(
-                lambda: self._model.complete(
-                    [{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    max_tokens=24,
-                ),
-                policy=self._model_retry_policy(),
+            response, _, _, _ = await self._invoke_helper_role_completion(
+                role="extractor",
+                tier=1,
+                prompt=prompt,
+                max_tokens=20,
+                temperature=0.2,
             )
         except Exception as e:
             logger.warning("LLM run-folder naming failed: %s", e)
             return ""
         text = str(getattr(response, "text", "") or "")
-        first_line = text.strip().splitlines()[0] if text.strip() else ""
-        first_line = first_line.strip().strip("`")
-        return self._slugify_process_run_folder(first_line)
+        slug = self._extract_run_folder_slug(text)
+        if self._is_low_quality_run_folder_slug(slug):
+            logger.debug(
+                "Discarding low-quality LLM run-folder name '%s' for goal '%s'",
+                slug,
+                goal_seed or goal,
+            )
+            return ""
+        return slug
 
     async def _prepare_process_run_workspace(
         self,
@@ -1922,19 +4178,110 @@ class LoomApp(App):
             return False
         return await self._close_process_run(run)
 
+    async def _resume_process_run_from_target(self, target: str) -> bool:
+        """Resolve and resume a failed/cancelled process run from /run resume."""
+        chat = self.query_one("#chat-log", ChatLog)
+        run, error = self._resolve_process_run_target(target)
+        if run is None:
+            if error:
+                if error == "Multiple runs open. Use /run close <run-id-prefix>.":
+                    error = "Multiple runs open. Use /run resume <run-id-prefix>."
+                chat.add_info(error)
+            return False
+
+        if run.status in {"queued", "running"}:
+            chat.add_info(
+                f"Run [dim]{run.run_id}[/dim] is already active and cannot be resumed."
+            )
+            return False
+        if not run.task_id:
+            chat.add_info(
+                f"Run [dim]{run.run_id}[/dim] has no task ID, so it cannot be resumed."
+            )
+            return False
+
+        await self._start_process_run(
+            run.goal,
+            process_defn=run.process_defn,
+            process_name_override=run.process_name,
+            command_prefix=f"/run resume {run.run_id}",
+            is_adhoc=bool(getattr(run, "is_adhoc", False)),
+            recommended_tools=list(getattr(run, "recommended_tools", [])),
+            resume_task_id=run.task_id,
+            run_workspace_override=run.run_workspace,
+        )
+        return True
+
+    async def _restart_process_run_in_place(self, run_id: str) -> bool:
+        """Restart one failed/cancelled run in the same tab."""
+        run = self._process_runs.get(run_id)
+        if run is None or run.closed:
+            return False
+
+        chat = self.query_one("#chat-log", ChatLog)
+        events_panel = self.query_one("#events-panel", EventPanel)
+        if run.status in {"queued", "running"}:
+            chat.add_info(
+                f"Run [dim]{run.run_id}[/dim] is already active and cannot be restarted."
+            )
+            return False
+        if not run.task_id:
+            chat.add_info(
+                f"Run [dim]{run.run_id}[/dim] has no task ID, so it cannot be restarted."
+            )
+            return False
+
+        run.status = "queued"
+        run.started_at = time.monotonic()
+        run.ended_at = None
+        run.tasks = []
+        run.task_labels = {}
+        run.last_progress_message = ""
+        run.last_progress_at = 0.0
+        self._update_process_run_visuals(run)
+        run.pane.set_tasks(run.tasks)
+        self._refresh_process_run_outputs(run)
+        self._append_process_run_activity(
+            run,
+            f"Restarting in place from task state {run.task_id}.",
+        )
+        run.worker = self.run_worker(
+            self._execute_process_run(run_id),
+            name=f"process-run-{run_id}",
+            group=f"process-run-{run_id}",
+            exclusive=False,
+        )
+        self._refresh_sidebar_progress_summary()
+        chat.add_info(
+            f"Restarted process run [dim]{run.run_id}[/dim] in place."
+        )
+        events_panel.add_event(
+            _now_str(),
+            "process_run",
+            f"{run.process_name} #{run.run_id} restarted",
+        )
+        await self._persist_process_run_ui_state()
+        return True
+
     async def _start_process_run(
         self,
         goal: str,
         *,
         process_defn: ProcessDefinition | None = None,
+        process_name_override: str | None = None,
         command_prefix: str = "/run",
+        is_adhoc: bool = False,
+        recommended_tools: list[str] | None = None,
+        adhoc_synthesis_notes: list[str] | None = None,
+        resume_task_id: str = "",
+        run_workspace_override: Path | None = None,
     ) -> None:
         """Create a run tab and launch process execution in a background worker."""
         chat = self.query_one("#chat-log", ChatLog)
         events_panel = self.query_one("#events-panel", EventPanel)
 
         selected_process = process_defn or self._process_defn
-        if selected_process is None:
+        if selected_process is None and not resume_task_id:
             chat.add_info(
                 "[bold #f7768e]No active process. Use /process use "
                 "<name-or-path> first.[/]"
@@ -1959,8 +4306,15 @@ class LoomApp(App):
             )
             return
 
-        process_name = selected_process.name
-        run_workspace = await self._prepare_process_run_workspace(process_name, goal)
+        process_name = str(process_name_override or "").strip()
+        if not process_name and selected_process is not None:
+            process_name = selected_process.name
+        if not process_name:
+            process_name = "resumed-process-run"
+        if run_workspace_override is not None:
+            run_workspace = Path(run_workspace_override).expanduser()
+        else:
+            run_workspace = await self._prepare_process_run_workspace(process_name, goal)
         run_id = self._new_process_run_id()
         pane_id = f"tab-run-{run_id}"
         pane = ProcessRunPane(
@@ -1977,7 +4331,10 @@ class LoomApp(App):
             pane_id=pane_id,
             pane=pane,
             status="queued",
+            task_id=str(resume_task_id or "").strip(),
             started_at=time.monotonic(),
+            is_adhoc=bool(is_adhoc),
+            recommended_tools=list(recommended_tools or []),
         )
         self._process_runs[run_id] = run
 
@@ -2004,6 +4361,26 @@ class LoomApp(App):
             run,
             f"Run workspace: {run_workspace}",
         )
+        if bool(getattr(run, "is_adhoc", False)):
+            self._append_process_run_activity(run, "Run mode: synthesized ad hoc process.")
+            for note in list(adhoc_synthesis_notes or []):
+                self._append_process_run_activity(run, note)
+            if run.recommended_tools:
+                self._append_process_run_activity(
+                    run,
+                    "Recommended extra tools: " + ", ".join(sorted(run.recommended_tools)),
+                )
+        if self._run_auth_profile_overrides:
+            rendered = ", ".join(
+                f"{selector}={profile_id}"
+                for selector, profile_id in sorted(self._run_auth_profile_overrides.items())
+            )
+            self._append_process_run_activity(run, f"Run auth overrides: {rendered}")
+        if run.task_id:
+            self._append_process_run_activity(
+                run,
+                f"Resuming task state: {run.task_id}",
+            )
         self._append_process_run_activity(run, "Queued process run.")
         if not self._process_close_hint_shown:
             chat.add_info(
@@ -2055,6 +4432,8 @@ class LoomApp(App):
                     "_approval_mode": "disabled",
                     "_process_override": run.process_defn,
                     "_read_roots": [str(self._workspace.resolve())],
+                    "_auth_profile_overrides": dict(self._run_auth_profile_overrides),
+                    "_resume_task_id": str(run.task_id or "").strip(),
                     "_progress_callback": (
                         lambda data, rid=run_id: self._on_process_progress_event(
                             data, run_id=rid,
@@ -2493,7 +4872,9 @@ class LoomApp(App):
         title = "Slash commands:" if token == "/" else f"Matching {token}:"
         lines = [f"[bold #7dcfff]{title}[/]"]
         for cmd, desc in matches:
-            lines.append(f"  [#73daca]{cmd:<10}[/] {desc}")
+            safe_cmd = self._escape_markup(cmd)
+            safe_desc = self._escape_markup(desc)
+            lines.append(f"  [#73daca]{safe_cmd:<10}[/] {safe_desc}")
         return "\n".join(lines)
 
     @staticmethod
@@ -2764,6 +5145,24 @@ class LoomApp(App):
         current = self.query_one("#user-input", Input).value
         self._set_slash_hint(self._render_slash_hint(current))
 
+    @on(Button.Pressed, ".process-run-restart-btn")
+    def on_process_run_restart_pressed(self, event: Button.Pressed) -> None:
+        """Restart a failed process run directly from its tab button."""
+        button_id = str(getattr(event.button, "id", "") or "").strip()
+        if not button_id.startswith("process-run-restart-"):
+            return
+        run_id = button_id.removeprefix("process-run-restart-").strip()
+        if not run_id:
+            return
+        event.stop()
+        event.prevent_default()
+        self.run_worker(
+            self._restart_process_run_in_place(run_id),
+            name=f"process-run-restart-{run_id}",
+            group=f"process-run-restart-{run_id}",
+            exclusive=False,
+        )
+
     def on_key(self, event: events.Key) -> None:
         """Handle user-input key captures (autocomplete + close-run shortcut)."""
         if event.key == "ctrl+w":
@@ -2826,24 +5225,25 @@ class LoomApp(App):
             chat.add_info(f"Model: {name}")
             return True
         if token == "/mcp":
-            from loom.mcp.config import MCPConfigManagerError, ensure_valid_alias
+            from loom.mcp.config import (
+                MCPConfigManagerError,
+                ensure_valid_alias,
+                merge_server_edits,
+                parse_mcp_server_from_flags,
+            )
 
             manager = self._mcp_manager()
             if not arg:
-                chat.add_info(
-                    "[bold #7dcfff]MCP Commands[/bold #7dcfff]\n"
-                    "  /mcp list\n"
-                    "  /mcp show <alias>\n"
-                    "  /mcp test <alias>\n"
-                    "  /mcp enable <alias>\n"
-                    "  /mcp disable <alias>\n"
-                    "  /mcp remove <alias>"
-                )
+                self._open_mcp_manager_screen()
                 return True
 
             subparts = arg.split(None, 1)
             subcmd = subparts[0].lower()
             rest = subparts[1].strip() if len(subparts) > 1 else ""
+
+            if subcmd == "manage":
+                self._open_mcp_manager_screen()
+                return True
 
             if subcmd == "list":
                 try:
@@ -2909,6 +5309,226 @@ class LoomApp(App):
                 chat.add_info("\n".join(lines))
                 return True
 
+            if subcmd == "add":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/mcp add",
+                            (
+                                "<alias> --command <cmd> [--arg <value>] "
+                                "[--env KEY=VALUE] [--env-ref KEY=ENV] "
+                                "[--cwd <path>] [--timeout <seconds>] [--disabled]"
+                            ),
+                        )
+                    )
+                    return True
+                try:
+                    tokens = self._split_slash_args(rest)
+                except ValueError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                if not tokens:
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/mcp add",
+                            "<alias> --command <cmd> [...]",
+                        )
+                    )
+                    return True
+                alias_token = tokens[0]
+                args_tokens = tokens[1:]
+                command = ""
+                cmd_args: list[str] = []
+                env_pairs: list[str] = []
+                env_refs: list[str] = []
+                cwd = ""
+                timeout = 30
+                disabled = False
+                index = 0
+                while index < len(args_tokens):
+                    item = args_tokens[index]
+                    if item == "--disabled":
+                        disabled = True
+                        index += 1
+                        continue
+                    if item in {
+                        "--command",
+                        "--arg",
+                        "--env",
+                        "--env-ref",
+                        "--cwd",
+                        "--timeout",
+                    }:
+                        if index + 1 >= len(args_tokens):
+                            chat.add_info(
+                                f"[bold #f7768e]Missing value for {item}.[/]"
+                            )
+                            return True
+                        value = args_tokens[index + 1]
+                        if item == "--command":
+                            command = value
+                        elif item == "--arg":
+                            cmd_args.append(value)
+                        elif item == "--env":
+                            env_pairs.append(value)
+                        elif item == "--env-ref":
+                            env_refs.append(value)
+                        elif item == "--cwd":
+                            cwd = value
+                        elif item == "--timeout":
+                            try:
+                                timeout = int(value)
+                            except ValueError:
+                                chat.add_info(
+                                    "[bold #f7768e]--timeout must be an integer.[/]"
+                                )
+                                return True
+                        index += 2
+                        continue
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown /mcp add option: {item}[/]"
+                    )
+                    return True
+                try:
+                    alias = ensure_valid_alias(alias_token)
+                    server = parse_mcp_server_from_flags(
+                        command=command,
+                        args=tuple(cmd_args),
+                        env_pairs=tuple(env_pairs),
+                        env_refs=tuple(env_refs),
+                        cwd=cwd,
+                        timeout=timeout,
+                        disabled=disabled,
+                    )
+                    await asyncio.to_thread(manager.add_server, alias, server)
+                    await self._reload_mcp_runtime()
+                    chat.add_info(f"MCP server '{alias}' added.")
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                return True
+
+            if subcmd == "edit":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/mcp edit",
+                            (
+                                "<alias> [--command <cmd>] [--arg <value>] "
+                                "[--env KEY=VALUE] [--env-ref KEY=ENV] "
+                                "[--cwd <path>] [--timeout <seconds>] "
+                                "[--enable|--disabled]"
+                            ),
+                        )
+                    )
+                    return True
+                try:
+                    tokens = self._split_slash_args(rest)
+                except ValueError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                if not tokens:
+                    chat.add_info(
+                        self._render_slash_command_usage("/mcp edit", "<alias> [...]")
+                    )
+                    return True
+                alias_token = tokens[0]
+                args_tokens = tokens[1:]
+                command: str | None = None
+                cmd_args: list[str] = []
+                env_pairs: list[str] = []
+                env_refs: list[str] = []
+                cwd: str | None = None
+                timeout: int | None = None
+                enabled_toggle: bool | None = None
+                index = 0
+                while index < len(args_tokens):
+                    item = args_tokens[index]
+                    if item == "--enable":
+                        enabled_toggle = True
+                        index += 1
+                        continue
+                    if item == "--disabled":
+                        enabled_toggle = False
+                        index += 1
+                        continue
+                    if item in {
+                        "--command",
+                        "--arg",
+                        "--env",
+                        "--env-ref",
+                        "--cwd",
+                        "--timeout",
+                    }:
+                        if index + 1 >= len(args_tokens):
+                            chat.add_info(
+                                f"[bold #f7768e]Missing value for {item}.[/]"
+                            )
+                            return True
+                        value = args_tokens[index + 1]
+                        if item == "--command":
+                            command = value
+                        elif item == "--arg":
+                            cmd_args.append(value)
+                        elif item == "--env":
+                            env_pairs.append(value)
+                        elif item == "--env-ref":
+                            env_refs.append(value)
+                        elif item == "--cwd":
+                            cwd = value
+                        elif item == "--timeout":
+                            try:
+                                timeout = int(value)
+                            except ValueError:
+                                chat.add_info(
+                                    "[bold #f7768e]--timeout must be an integer.[/]"
+                                )
+                                return True
+                        index += 2
+                        continue
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown /mcp edit option: {item}[/]"
+                    )
+                    return True
+
+                if (
+                    command is None
+                    and not cmd_args
+                    and not env_pairs
+                    and not env_refs
+                    and cwd is None
+                    and timeout is None
+                    and enabled_toggle is None
+                ):
+                    chat.add_info(
+                        "[bold #f7768e]/mcp edit requires at least one change flag.[/]"
+                    )
+                    return True
+
+                try:
+                    alias = ensure_valid_alias(alias_token)
+
+                    def _mutate(current):
+                        merged = merge_server_edits(
+                            current=current,
+                            command=command,
+                            args=tuple(cmd_args),
+                            env_pairs=tuple(env_pairs),
+                            env_refs=tuple(env_refs),
+                            cwd=cwd,
+                            timeout=timeout,
+                            disabled=(enabled_toggle is False),
+                        )
+                        if enabled_toggle is True:
+                            return replace(merged, enabled=True)
+                        return merged
+
+                    await asyncio.to_thread(manager.edit_server, alias, _mutate)
+                    await self._reload_mcp_runtime()
+                    chat.add_info(f"MCP server '{alias}' updated.")
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                return True
+
             if subcmd in {"enable", "disable"}:
                 if not rest:
                     chat.add_info(self._render_slash_command_usage(f"/mcp {subcmd}", "<alias>"))
@@ -2947,8 +5567,697 @@ class LoomApp(App):
                 self._render_slash_command_usage(
                     "/mcp",
                     (
-                        "[list|show <alias>|test <alias>|enable <alias>|"
-                        "disable <alias>|remove <alias>]"
+                        "[manage|list|show <alias>|test <alias>|add <alias> ...|"
+                        "edit <alias> ...|enable <alias>|disable <alias>|remove <alias>]"
+                    ),
+                )
+            )
+            return True
+        if token == "/auth":
+            from loom.auth.config import (
+                AuthConfigError,
+                AuthProfile,
+                load_merged_auth_config,
+                remove_auth_profile,
+                resolve_auth_write_path,
+                set_workspace_auth_default,
+                upsert_auth_profile,
+            )
+            from loom.auth.runtime import AuthResolutionError, parse_auth_profile_overrides
+
+            if not arg:
+                self._open_auth_manager_screen()
+                return True
+
+            subparts = arg.split(None, 1)
+            subcmd = subparts[0].lower()
+            rest = subparts[1].strip() if len(subparts) > 1 else ""
+
+            if subcmd == "manage":
+                self._open_auth_manager_screen()
+                return True
+
+            def _effective_defaults(merged_auth) -> dict[str, str]:
+                defaults = dict(merged_auth.config.defaults)
+                defaults.update(merged_auth.workspace_defaults)
+                return defaults
+
+            if subcmd == "list":
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
+                    return True
+
+                lines = [
+                    "[bold #7dcfff]Auth Profiles[/bold #7dcfff]",
+                    f"  user: {merged_auth.user_path}",
+                    f"  explicit: {merged_auth.explicit_path or '-'}",
+                    f"  workspace defaults: {merged_auth.workspace_defaults_path or '-'}",
+                ]
+                if not merged_auth.config.profiles:
+                    lines.append("  (none)")
+                else:
+                    for profile_id in sorted(merged_auth.config.profiles):
+                        profile = merged_auth.config.profiles[profile_id]
+                        label = f" label={profile.account_label}" if profile.account_label else ""
+                        lines.append(
+                            f"  {profile.profile_id}: provider={profile.provider} "
+                            f"mode={profile.mode}{label}"
+                        )
+
+                defaults = {
+                    selector: profile_id
+                    for selector, profile_id in _effective_defaults(merged_auth).items()
+                    if not selector.startswith("mcp.")
+                }
+                if defaults:
+                    lines.append("")
+                    lines.append("Defaults:")
+                    for selector, profile_id in sorted(defaults.items()):
+                        lines.append(f"  {selector} -> {profile_id}")
+
+                run_overrides = {
+                    selector: profile_id
+                    for selector, profile_id in self._run_auth_profile_overrides.items()
+                    if not selector.startswith("mcp.")
+                }
+                if run_overrides:
+                    lines.append("")
+                    lines.append("Run overrides:")
+                    for selector, profile_id in sorted(run_overrides.items()):
+                        lines.append(f"  {selector} -> {profile_id}")
+
+                chat.add_info("\n".join(lines))
+                return True
+
+            if subcmd == "show":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth show", "<profile-id>")
+                    )
+                    return True
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
+                    return True
+                profile = merged_auth.config.profiles.get(rest)
+                if profile is None:
+                    chat.add_info(f"[bold #f7768e]Auth profile not found: {rest}[/]")
+                    return True
+                env_keys = ", ".join(sorted(profile.env.keys())) or "-"
+                lines = [
+                    f"[bold #7dcfff]Profile[/bold #7dcfff] {profile.profile_id}",
+                    f"  provider: {profile.provider}",
+                    f"  mode: {profile.mode}",
+                    f"  label: {profile.account_label or '-'}",
+                    f"  secret_ref: {profile.secret_ref or '-'}",
+                    f"  token_ref: {profile.token_ref or '-'}",
+                    f"  env_keys: {env_keys}",
+                    f"  command: {profile.command or '-'}",
+                ]
+                if profile.scopes:
+                    lines.append(f"  scopes: {', '.join(profile.scopes)}")
+                chat.add_info("\n".join(lines))
+                return True
+
+            if subcmd == "check":
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
+                    return True
+
+                profiles = merged_auth.config.profiles
+                defaults = _effective_defaults(merged_auth)
+                errors: list[str] = []
+
+                for selector, profile_id in sorted(defaults.items()):
+                    if profile_id not in profiles:
+                        errors.append(
+                            f"default {selector!r} references unknown profile {profile_id!r}"
+                        )
+                        continue
+                    profile = profiles[profile_id]
+                    if selector.startswith("mcp."):
+                        continue
+                    if selector != profile.provider:
+                        errors.append(
+                            f"default {selector!r} must match provider {profile.provider!r}"
+                        )
+                for selector, profile_id in sorted(self._run_auth_profile_overrides.items()):
+                    profile = profiles.get(profile_id)
+                    if profile is None:
+                        errors.append(
+                            f"run override {selector!r} references unknown profile {profile_id!r}"
+                        )
+                        continue
+                    if selector.startswith("mcp."):
+                        errors.append(
+                            f"run override {selector!r} is no longer supported; "
+                            "MCP account selection is managed via MCP aliases."
+                        )
+                        continue
+                    if selector != profile.provider:
+                        errors.append(
+                            f"run override {selector!r} must match provider {profile.provider!r}"
+                        )
+
+                if errors:
+                    chat.add_info(
+                        "[bold #f7768e]Auth config validation failed:[/]\n"
+                        + "\n".join(f"  - {err}" for err in errors)
+                    )
+                    return True
+                chat.add_info("Auth config is valid.")
+                return True
+
+            if subcmd == "use":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth use", "<selector=profile>")
+                    )
+                    return True
+                try:
+                    parsed = parse_auth_profile_overrides((rest,))
+                except AuthResolutionError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                selector, profile_id = next(iter(parsed.items()))
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
+                    return True
+                profile = merged_auth.config.profiles.get(profile_id)
+                if profile is None:
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown auth profile: {profile_id}[/]"
+                    )
+                    return True
+                if selector.startswith("mcp."):
+                    chat.add_info(
+                        "[bold #f7768e]MCP selectors are no longer supported in /auth use. "
+                        "Select MCP accounts via MCP aliases in /mcp.[/]"
+                    )
+                    return True
+                if selector != profile.provider:
+                    chat.add_info(
+                        "[bold #f7768e]Selector must match profile provider.[/]"
+                    )
+                    return True
+                self._run_auth_profile_overrides[selector] = profile_id
+                chat.add_info(f"Run auth override set: {selector} -> {profile_id}")
+                return True
+
+            if subcmd == "clear":
+                if rest:
+                    removed = self._run_auth_profile_overrides.pop(rest, None)
+                    if removed is None:
+                        chat.add_info(f"No run auth override set for {rest}.")
+                        return True
+                    chat.add_info(f"Removed run auth override: {rest}")
+                    return True
+                self._run_auth_profile_overrides.clear()
+                chat.add_info("Cleared all run auth overrides.")
+                return True
+
+            if subcmd == "select":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth select", "<selector=profile>")
+                    )
+                    return True
+                try:
+                    parsed = parse_auth_profile_overrides((rest,))
+                except AuthResolutionError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                selector, profile_id = next(iter(parsed.items()))
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
+                    return True
+                profile = merged_auth.config.profiles.get(profile_id)
+                if profile is None:
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown auth profile: {profile_id}[/]"
+                    )
+                    return True
+                if selector.startswith("mcp."):
+                    chat.add_info(
+                        "[bold #f7768e]MCP selectors are no longer supported in /auth select. "
+                        "Select MCP accounts via MCP aliases in /mcp.[/]"
+                    )
+                    return True
+                if selector != profile.provider:
+                    chat.add_info(
+                        "[bold #f7768e]Selector must match profile provider.[/]"
+                    )
+                    return True
+
+                defaults_path = self._auth_defaults_path()
+                try:
+                    await asyncio.to_thread(
+                        set_workspace_auth_default,
+                        defaults_path,
+                        selector=selector,
+                        profile_id=profile_id,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                chat.add_info(
+                    f"Workspace auth default set: {selector} -> {profile_id}\n"
+                    f"[dim]{defaults_path}[/dim]"
+                )
+                return True
+
+            if subcmd == "unset":
+                clean_selector = rest.strip()
+                if not clean_selector:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth unset", "<selector>")
+                    )
+                    return True
+                defaults_path = self._auth_defaults_path()
+                try:
+                    await asyncio.to_thread(
+                        set_workspace_auth_default,
+                        defaults_path,
+                        selector=clean_selector,
+                        profile_id=None,
+                    )
+                except AuthConfigError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                chat.add_info(
+                    f"Workspace auth default removed: {clean_selector}\n"
+                    f"[dim]{defaults_path}[/dim]"
+                )
+                return True
+
+            if subcmd == "add":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/auth add",
+                            (
+                                "<profile-id> --provider <provider> --mode <mode> "
+                                "[--label <text>] [--secret-ref <ref>] "
+                                "[--token-ref <ref>] [--scope <scope>] "
+                                "[--env KEY=VALUE] [--command <cmd>] "
+                                "[--auth-check <token>] [--meta KEY=VALUE]"
+                            ),
+                        )
+                    )
+                    return True
+                try:
+                    tokens = self._split_slash_args(rest)
+                except ValueError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                if not tokens:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth add", "<profile-id> ...")
+                    )
+                    return True
+                profile_id = str(tokens[0]).strip()
+                args_tokens = tokens[1:]
+                provider = ""
+                mode = ""
+                label = ""
+                secret_ref = ""
+                token_ref = ""
+                scopes: list[str] = []
+                env_values: list[str] = []
+                command = ""
+                auth_check: list[str] = []
+                meta_values: list[str] = []
+                index = 0
+                while index < len(args_tokens):
+                    item = args_tokens[index]
+                    if item in {
+                        "--provider",
+                        "--mode",
+                        "--label",
+                        "--secret-ref",
+                        "--token-ref",
+                        "--scope",
+                        "--env",
+                        "--command",
+                        "--auth-check",
+                        "--meta",
+                    }:
+                        if index + 1 >= len(args_tokens):
+                            chat.add_info(
+                                f"[bold #f7768e]Missing value for {item}.[/]"
+                            )
+                            return True
+                        value = args_tokens[index + 1]
+                        if item == "--provider":
+                            provider = value
+                        elif item == "--mode":
+                            mode = value
+                        elif item == "--label":
+                            label = value
+                        elif item == "--secret-ref":
+                            secret_ref = value
+                        elif item == "--token-ref":
+                            token_ref = value
+                        elif item == "--scope":
+                            scopes.append(value)
+                        elif item == "--env":
+                            env_values.append(value)
+                        elif item == "--command":
+                            command = value
+                        elif item == "--auth-check":
+                            auth_check.append(value)
+                        elif item == "--meta":
+                            meta_values.append(value)
+                        index += 2
+                        continue
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown /auth add option: {item}[/]"
+                    )
+                    return True
+                if not profile_id:
+                    chat.add_info("[bold #f7768e]Profile id cannot be empty.[/]")
+                    return True
+                if not provider or not mode:
+                    chat.add_info(
+                        "[bold #f7768e]/auth add requires --provider and --mode.[/]"
+                    )
+                    return True
+                try:
+                    env = self._parse_kv_assignments(
+                        env_values,
+                        option_name="--env",
+                        env_keys=True,
+                    )
+                    metadata = self._parse_kv_assignments(
+                        meta_values,
+                        option_name="--meta",
+                    )
+                    profile = AuthProfile(
+                        profile_id=profile_id,
+                        provider=provider.strip(),
+                        mode=mode.strip(),
+                        account_label=label.strip(),
+                        secret_ref=secret_ref.strip(),
+                        token_ref=token_ref.strip(),
+                        scopes=[str(scope).strip() for scope in scopes if str(scope).strip()],
+                        env=env,
+                        command=command.strip(),
+                        auth_check=[
+                            str(item).strip()
+                            for item in auth_check
+                            if str(item).strip()
+                        ],
+                        metadata=metadata,
+                    )
+                    target = resolve_auth_write_path(
+                        explicit_path=self._explicit_auth_path,
+                    )
+                    await asyncio.to_thread(
+                        upsert_auth_profile,
+                        target,
+                        profile,
+                        must_exist=False,
+                    )
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                chat.add_info(
+                    f"Added auth profile '{profile_id}'.\n[dim]{target}[/dim]"
+                )
+                return True
+
+            if subcmd == "edit":
+                if not rest:
+                    chat.add_info(
+                        self._render_slash_command_usage(
+                            "/auth edit",
+                            (
+                                "<profile-id> [--provider <provider>] [--mode <mode>] "
+                                "[--label <text>] [--secret-ref <ref>] [--token-ref <ref>] "
+                                "[--scope <scope>] [--clear-scopes] "
+                                "[--env KEY=VALUE] [--clear-env] "
+                                "[--command <cmd>] [--auth-check <token>] "
+                                "[--clear-auth-check] [--meta KEY=VALUE] [--clear-meta]"
+                            ),
+                        )
+                    )
+                    return True
+                try:
+                    tokens = self._split_slash_args(rest)
+                except ValueError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                if not tokens:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth edit", "<profile-id> ...")
+                    )
+                    return True
+                profile_id = str(tokens[0]).strip()
+                args_tokens = tokens[1:]
+                provider: str | None = None
+                mode: str | None = None
+                label: str | None = None
+                secret_ref: str | None = None
+                token_ref: str | None = None
+                scopes: list[str] = []
+                clear_scopes = False
+                env_values: list[str] = []
+                clear_env = False
+                command: str | None = None
+                auth_check_values: list[str] = []
+                clear_auth_check = False
+                meta_values: list[str] = []
+                clear_meta = False
+                index = 0
+                while index < len(args_tokens):
+                    item = args_tokens[index]
+                    if item in {
+                        "--clear-scopes",
+                        "--clear-env",
+                        "--clear-auth-check",
+                        "--clear-meta",
+                    }:
+                        if item == "--clear-scopes":
+                            clear_scopes = True
+                        elif item == "--clear-env":
+                            clear_env = True
+                        elif item == "--clear-auth-check":
+                            clear_auth_check = True
+                        elif item == "--clear-meta":
+                            clear_meta = True
+                        index += 1
+                        continue
+                    if item in {
+                        "--provider",
+                        "--mode",
+                        "--label",
+                        "--secret-ref",
+                        "--token-ref",
+                        "--scope",
+                        "--env",
+                        "--command",
+                        "--auth-check",
+                        "--meta",
+                    }:
+                        if index + 1 >= len(args_tokens):
+                            chat.add_info(
+                                f"[bold #f7768e]Missing value for {item}.[/]"
+                            )
+                            return True
+                        value = args_tokens[index + 1]
+                        if item == "--provider":
+                            provider = value
+                        elif item == "--mode":
+                            mode = value
+                        elif item == "--label":
+                            label = value
+                        elif item == "--secret-ref":
+                            secret_ref = value
+                        elif item == "--token-ref":
+                            token_ref = value
+                        elif item == "--scope":
+                            scopes.append(value)
+                        elif item == "--env":
+                            env_values.append(value)
+                        elif item == "--command":
+                            command = value
+                        elif item == "--auth-check":
+                            auth_check_values.append(value)
+                        elif item == "--meta":
+                            meta_values.append(value)
+                        index += 2
+                        continue
+                    chat.add_info(
+                        f"[bold #f7768e]Unknown /auth edit option: {item}[/]"
+                    )
+                    return True
+                if not profile_id:
+                    chat.add_info("[bold #f7768e]Profile id cannot be empty.[/]")
+                    return True
+                if (
+                    provider is None
+                    and mode is None
+                    and label is None
+                    and secret_ref is None
+                    and token_ref is None
+                    and not scopes
+                    and not clear_scopes
+                    and not env_values
+                    and not clear_env
+                    and command is None
+                    and not auth_check_values
+                    and not clear_auth_check
+                    and not meta_values
+                    and not clear_meta
+                ):
+                    chat.add_info(
+                        "[bold #f7768e]/auth edit requires at least one change flag.[/]"
+                    )
+                    return True
+                try:
+                    merged_auth = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                    current = merged_auth.config.profiles.get(profile_id)
+                    if current is None:
+                        chat.add_info(
+                            f"[bold #f7768e]Auth profile not found: {profile_id}[/]"
+                        )
+                        return True
+                    env_updates = self._parse_kv_assignments(
+                        env_values,
+                        option_name="--env",
+                        env_keys=True,
+                    )
+                    meta_updates = self._parse_kv_assignments(
+                        meta_values,
+                        option_name="--meta",
+                    )
+                    next_scopes = [] if clear_scopes else list(current.scopes)
+                    if scopes:
+                        next_scopes = [
+                            str(scope).strip()
+                            for scope in scopes
+                            if str(scope).strip()
+                        ]
+                    next_env = {} if clear_env else dict(current.env)
+                    next_env.update(env_updates)
+                    next_auth_check = (
+                        []
+                        if clear_auth_check
+                        else list(current.auth_check)
+                    )
+                    if auth_check_values:
+                        next_auth_check = [
+                            str(item).strip()
+                            for item in auth_check_values
+                            if str(item).strip()
+                        ]
+                    next_metadata = {} if clear_meta else dict(current.metadata)
+                    next_metadata.update(meta_updates)
+                    updated = AuthProfile(
+                        profile_id=current.profile_id,
+                        provider=current.provider if provider is None else provider.strip(),
+                        mode=current.mode if mode is None else mode.strip(),
+                        account_label=(
+                            current.account_label
+                            if label is None else label.strip()
+                        ),
+                        secret_ref=(
+                            current.secret_ref
+                            if secret_ref is None else secret_ref.strip()
+                        ),
+                        token_ref=current.token_ref if token_ref is None else token_ref.strip(),
+                        scopes=next_scopes,
+                        env=next_env,
+                        command=current.command if command is None else command.strip(),
+                        auth_check=next_auth_check,
+                        metadata=next_metadata,
+                    )
+                    if not updated.provider or not updated.mode:
+                        chat.add_info(
+                            "[bold #f7768e]Provider and mode must be non-empty.[/]"
+                        )
+                        return True
+                    target = resolve_auth_write_path(
+                        explicit_path=self._explicit_auth_path,
+                    )
+                    await asyncio.to_thread(
+                        upsert_auth_profile,
+                        target,
+                        updated,
+                        must_exist=True,
+                    )
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                chat.add_info(
+                    f"Updated auth profile '{profile_id}'.\n[dim]{target}[/dim]"
+                )
+                return True
+
+            if subcmd == "remove":
+                profile_id = rest.strip()
+                if not profile_id:
+                    chat.add_info(
+                        self._render_slash_command_usage("/auth remove", "<profile-id>")
+                    )
+                    return True
+                target = resolve_auth_write_path(
+                    explicit_path=self._explicit_auth_path,
+                )
+                try:
+                    await asyncio.to_thread(
+                        remove_auth_profile,
+                        target,
+                        profile_id,
+                    )
+                except Exception as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                chat.add_info(
+                    f"Removed auth profile '{profile_id}'.\n[dim]{target}[/dim]"
+                )
+                return True
+
+            chat.add_info(
+                self._render_slash_command_usage(
+                    "/auth",
+                    (
+                        "[manage|list|show <profile-id>|check|use <selector=profile>|"
+                        "clear [selector]|select <selector=profile>|unset <selector>|"
+                        "add <profile-id> ...|edit <profile-id> ...|remove <profile-id>]"
                     ),
                 )
             )
@@ -2964,10 +6273,16 @@ class LoomApp(App):
         if token == "/tokens":
             chat.add_info(f"Session tokens: {self._total_tokens:,}")
             return True
-        if token == "/process":
+        if token in {"/process", "/processes"}:
             self._refresh_process_command_index()
+            if token == "/processes":
+                if arg:
+                    chat.add_info(self._render_slash_command_usage("/processes", ""))
+                    return True
+                chat.add_info(self._render_process_catalog())
+                return True
             if not arg:
-                chat.add_info(self._render_process_usage())
+                chat.add_info(self._render_process_catalog())
                 return True
 
             subparts = arg.split(None, 1)
@@ -3036,20 +6351,201 @@ class LoomApp(App):
 
         if token == "/run":
             if arg:
-                subcmd, _, subrest = arg.partition(" ")
-                if subcmd.lower() == "close":
-                    await self._close_process_run_from_target(subrest)
+                try:
+                    tokens = self._split_slash_args(arg)
+                except ValueError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
                     return True
-            goal = self._strip_wrapping_quotes(arg)
+                if tokens:
+                    subcmd = tokens[0].lower()
+                    if subcmd == "close":
+                        target = " ".join(tokens[1:]).strip()
+                        await self._close_process_run_from_target(target)
+                        return True
+                    if subcmd == "resume":
+                        if len(tokens) < 2:
+                            chat.add_info(
+                                self._render_slash_command_usage(
+                                    "/run resume",
+                                    "<run-id-prefix|current>",
+                                )
+                            )
+                            return True
+                        target = tokens[1]
+                        await self._resume_process_run_from_target(target)
+                        return True
+                    if subcmd == "save":
+                        if len(tokens) < 3:
+                            chat.add_info(
+                                self._render_slash_command_usage(
+                                    "/run save",
+                                    "<run-id-prefix|current> <name>",
+                                )
+                            )
+                            return True
+                        target = tokens[1]
+                        package_name = tokens[2]
+                        run, error = self._resolve_process_run_target(target)
+                        if run is None:
+                            chat.add_info(error or "Run not found.")
+                            return True
+                        if run.process_defn is None or not bool(
+                            getattr(run, "is_adhoc", False),
+                        ):
+                            chat.add_info(
+                                "[bold #f7768e]Only ad hoc /run processes can be saved.[/]"
+                            )
+                            return True
+                        try:
+                            saved_dir = await asyncio.to_thread(
+                                self._save_adhoc_process_package,
+                                process_defn=run.process_defn,
+                                package_name=package_name,
+                                recommended_tools=run.recommended_tools,
+                            )
+                        except Exception as e:
+                            chat.add_info(
+                                f"[bold #f7768e]Failed to save process package: {e}[/]"
+                            )
+                            return True
+                        self._refresh_process_command_index()
+                        safe_name = self._sanitize_kebab_token(
+                            package_name,
+                            fallback="adhoc-process",
+                            max_len=40,
+                        )
+                        chat.add_info(
+                            "Saved ad hoc process package:\n"
+                            f"  [bold]{safe_name}[/bold]\n"
+                            f"  [dim]{saved_dir}[/dim]\n"
+                            f"Run it with [bold]/{safe_name} <goal>[/bold]."
+                        )
+                        return True
+
+            run_process_name = ""
+            goal = ""
+            force_fresh = False
+            if arg:
+                try:
+                    tokens = self._split_slash_args(arg)
+                except ValueError as e:
+                    chat.add_info(f"[bold #f7768e]{e}[/]")
+                    return True
+                idx = 0
+                while idx < len(tokens):
+                    item = str(tokens[idx] or "").strip()
+                    if item in {"--fresh", "-f"}:
+                        force_fresh = True
+                        idx += 1
+                        continue
+                    if item in {"--process", "-p"}:
+                        if idx + 1 >= len(tokens):
+                            chat.add_info(
+                                self._render_slash_command_usage(
+                                    "/run",
+                                    "--process <name> <goal>",
+                                )
+                            )
+                            return True
+                        run_process_name = tokens[idx + 1].strip()
+                        idx += 2
+                        continue
+                    if item.startswith("-"):
+                        chat.add_info(
+                            self._render_slash_command_usage(
+                                "/run",
+                                "[--fresh] [--process <name>] <goal>",
+                            )
+                        )
+                        return True
+                    break
+                goal = " ".join(tokens[idx:]).strip()
+            else:
+                goal = ""
             if not goal:
                 chat.add_info(self._render_slash_command_usage("/run", "<goal>"))
                 return True
-            if self._process_defn is None:
+
+            process_defn = None
+            recommended_tools: list[str] = []
+            is_adhoc = False
+            adhoc_synthesis_notes: list[str] = []
+
+            if run_process_name:
+                loader = self._create_process_loader()
+                try:
+                    process_defn = loader.load(run_process_name)
+                except Exception as e:
+                    chat.add_info(
+                        f"[bold #f7768e]Failed to load process "
+                        f"'{run_process_name}': {e}[/]"
+                    )
+                    return True
+            elif self._process_defn is not None:
+                process_defn = self._process_defn
+            else:
+                default_process = str(
+                    getattr(getattr(self._config, "process", None), "default", "") or "",
+                ).strip()
+                if default_process:
+                    loader = self._create_process_loader()
+                    try:
+                        process_defn = loader.load(default_process)
+                    except Exception as e:
+                        chat.add_info(
+                            f"[bold #f7768e]Failed to load default process "
+                            f"'{default_process}': {e}[/]"
+                        )
+                        return True
+                else:
+                    chat.add_info("Synthesizing ad hoc process for /run goal...")
+                    entry, from_cache = await self._get_or_create_adhoc_process(
+                        goal,
+                        fresh=force_fresh,
+                    )
+                    process_defn = entry.process_defn
+                    recommended_tools = list(entry.recommended_tools)
+                    is_adhoc = True
+                    if from_cache:
+                        chat.add_info(
+                            f"Using cached ad hoc process [bold]{process_defn.name}[/bold]."
+                        )
+                    else:
+                        chat.add_info(
+                            f"Synthesized ad hoc process [bold]{process_defn.name}[/bold] "
+                            f"with {len(process_defn.phases)} phases."
+                        )
+                    if recommended_tools:
+                        chat.add_info(
+                            "Recommended additional tools: "
+                            + ", ".join(sorted(recommended_tools))
+                        )
+                    cache_key = str(
+                        getattr(entry, "key", "") or self._adhoc_cache_key(goal),
+                    )
+                    chat.add_info(
+                        "Ad hoc process cache: "
+                        f"[dim]{self._adhoc_cache_path(cache_key)}[/dim]"
+                    )
+                    adhoc_synthesis_notes = self._adhoc_synthesis_activity_lines(
+                        entry,
+                        from_cache=from_cache,
+                        fresh=force_fresh,
+                    )
+
+            if process_defn is None:
                 chat.add_info(
-                    "No active process. Use /process use <name-or-path> first.",
+                    "[bold #f7768e]Unable to resolve process for /run.[/]"
                 )
                 return True
-            await self._start_process_run(goal, process_defn=self._process_defn)
+            start_kwargs: dict[str, Any] = {
+                "process_defn": process_defn,
+                "is_adhoc": is_adhoc,
+                "recommended_tools": recommended_tools,
+            }
+            if adhoc_synthesis_notes:
+                start_kwargs["adhoc_synthesis_notes"] = adhoc_synthesis_notes
+            await self._start_process_run(goal, **start_kwargs)
             return True
 
         process_name = self._process_command_map.get(token)
@@ -3162,7 +6658,7 @@ class LoomApp(App):
         try:
             await self._run_interaction(user_message)
         except Exception as e:
-            chat.add_model_text(f"[bold #f7768e]Error:[/] {e}")
+            chat.add_model_text(f"[bold #f7768e]Error:[/] {e}", markup=True)
             self.notify(str(e), severity="error", timeout=5)
 
         self._chat_busy = False
@@ -3176,7 +6672,7 @@ class LoomApp(App):
             await self._run_interaction(message)
         except Exception as e:
             chat = self.query_one("#chat-log", ChatLog)
-            chat.add_model_text(f"[bold #f7768e]Error:[/] {e}")
+            chat.add_model_text(f"[bold #f7768e]Error:[/] {e}", markup=True)
             self.notify(str(e), severity="error", timeout=5)
 
     async def _run_interaction(self, message: str) -> None:
@@ -3383,7 +6879,7 @@ class LoomApp(App):
         """Normalize whitespace and cap a string for concise progress rows."""
         if text is None:
             return ""
-        compact = " ".join(str(text).split())
+        compact = " ".join(_plain_text(text).split())
         if max_len is None or max_len <= 0:
             return compact
         if len(compact) <= max_len:
@@ -3458,11 +6954,38 @@ class LoomApp(App):
         process = getattr(run, "process_defn", None)
         if process is None or not hasattr(process, "get_deliverables"):
             return []
+
         try:
             deliverables_by_phase = process.get_deliverables()
         except Exception:
-            return []
-        if not isinstance(deliverables_by_phase, dict) or not deliverables_by_phase:
+            deliverables_by_phase = {}
+
+        has_deliverables = (
+            isinstance(deliverables_by_phase, dict)
+            and bool(deliverables_by_phase)
+        )
+
+        if bool(getattr(run, "is_adhoc", False)) and not has_deliverables:
+            rows: list[dict] = []
+            for idx, task in enumerate(run.tasks, start=1):
+                if not isinstance(task, dict):
+                    continue
+                status = str(task.get("status", "pending")).strip()
+                if status not in {
+                    "pending", "in_progress", "completed", "failed", "skipped",
+                }:
+                    status = "pending"
+                label = self._one_line(task.get("content", ""), max_len=None)
+                if not label:
+                    label = str(task.get("id", "")).strip() or f"step-{idx}"
+                rows.append({
+                    "id": f"adhoc-output-{idx}",
+                    "status": status,
+                    "content": f"{label} (expected output)",
+                })
+            return rows
+
+        if not has_deliverables:
             return []
 
         subtask_status: dict[str, str] = {}
@@ -3519,23 +7042,23 @@ class LoomApp(App):
                     suffix = ""
                 elif phase_state == "in_progress":
                     status = "in_progress"
-                    suffix = " [dim](pending)[/]"
+                    suffix = " (pending)"
                 elif phase_state == "completed":
                     status = "failed"
-                    suffix = " [#f7768e](missing)[/]"
+                    suffix = " (missing)"
                 elif phase_state == "failed":
                     status = "failed"
-                    suffix = " [#f7768e](not produced)[/]"
+                    suffix = " (not produced)"
                 elif phase_state == "skipped":
                     status = "skipped"
-                    suffix = " [dim](skipped)[/]"
+                    suffix = " (skipped)"
                 else:
                     status = "pending"
-                    suffix = " [dim](planned)[/]"
+                    suffix = " (planned)"
                 rows.append({
                     "id": f"{phase_id}:{rel_path}",
                     "status": status,
-                    "content": f"{rel_path} [dim]({phase_id})[/]{suffix}",
+                    "content": f"{rel_path} ({phase_id}){suffix}",
                 })
         return rows
 
@@ -3573,7 +7096,7 @@ class LoomApp(App):
                         continue
                     if str(row.get("id", "")) != subtask_id:
                         continue
-                    content = str(row.get("content", "")).strip()
+                    content = _plain_text(row.get("content", "")).strip()
                     if content and content != subtask_id:
                         return content
                     break
@@ -3585,7 +7108,7 @@ class LoomApp(App):
                     continue
                 if str(row.get("id", "")) != subtask_id:
                     continue
-                content = str(row.get("content", "")).strip()
+                content = _plain_text(row.get("content", "")).strip()
                 if content and content != subtask_id:
                     return content
                 break
@@ -3751,7 +7274,7 @@ class LoomApp(App):
         message = error.strip() or "Process run failed."
         if "timed out" in message.lower():
             message = (
-                f"{message} Increase [execution].delegate_task_timeout_seconds "
+                f"{message} Increase \\[execution].delegate_task_timeout_seconds "
                 "(or LOOM_DELEGATE_TIMEOUT_SECONDS) for longer runs."
             )
         self._sidebar_cowork_tasks = [
@@ -3838,7 +7361,7 @@ class LoomApp(App):
             ),
             self._sidebar_cowork_tasks[0],
         )
-        focus = self._one_line(primary.get("content", ""), 120)
+        focus = self._one_line(primary.get("content", ""), 180)
         status = "pending"
         if in_progress:
             status = "in_progress"
@@ -4068,6 +7591,25 @@ class LoomApp(App):
             return
         if command == "mcp_list":
             await self._handle_slash_command("/mcp list")
+            return
+        if command == "mcp_manage":
+            await self._handle_slash_command("/mcp manage")
+            return
+        if command == "mcp_add_prompt":
+            self._prefill_user_input(
+                "/mcp add <alias> --command <cmd> --arg <value> "
+            )
+            return
+        if command == "auth_list":
+            await self._handle_slash_command("/auth list")
+            return
+        if command == "auth_manage":
+            await self._handle_slash_command("/auth manage")
+            return
+        if command == "auth_add_prompt":
+            self._prefill_user_input(
+                "/auth add <profile-id> --provider <provider> --mode <mode> "
+            )
             return
         if command == "learned_patterns":
             await self._handle_slash_command("/learned")

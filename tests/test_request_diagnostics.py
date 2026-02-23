@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from loom.models.request_diagnostics import collect_request_diagnostics, infer_call_origin
+from loom.models.base import ModelResponse, TokenUsage
+from loom.models.request_diagnostics import (
+    collect_request_diagnostics,
+    collect_response_diagnostics,
+    infer_call_origin,
+)
 
 
 def test_collect_request_diagnostics_counts_messages_and_tool_args() -> None:
@@ -78,3 +83,35 @@ def test_infer_call_origin_returns_identifier() -> None:
     origin = infer_call_origin()
     assert isinstance(origin, str)
     assert origin.strip() != ""
+
+
+def test_collect_response_diagnostics_includes_preview_and_usage() -> None:
+    response = ModelResponse(
+        text="This is a model output with concrete details and identifiers.",
+        usage=TokenUsage(input_tokens=10, output_tokens=20, total_tokens=30),
+        finish_reason="stop",
+    )
+    diag = collect_response_diagnostics(response, max_preview_chars=120)
+
+    assert diag.response_tokens == 30
+    assert diag.response_chars == len(response.text)
+    assert diag.response_tool_calls == 0
+    assert diag.response_preview == response.text
+    assert diag.response_preview_truncated is False
+    assert diag.response_finish_reason == "stop"
+
+
+def test_collect_response_diagnostics_truncates_preview() -> None:
+    response = ModelResponse(
+        text="x" * 400,
+        usage=TokenUsage(total_tokens=7),
+    )
+    diag = collect_response_diagnostics(response, max_preview_chars=80)
+    payload = diag.to_event_payload()
+
+    assert payload["response_tokens"] == 7
+    assert payload["response_chars"] == 400
+    assert payload["response_preview_truncated"] is True
+    assert payload["response_preview"].endswith("...[truncated]")
+    assert len(payload["response_preview"]) <= 80
+    assert payload["response_finish_reason"] == ""

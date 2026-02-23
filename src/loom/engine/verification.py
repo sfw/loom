@@ -10,6 +10,7 @@ The model that performed the work never checks its own output.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import csv
 import json
 import logging
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from loom.config import VerificationConfig
+from loom.config import CompactorLimitsConfig, VerificationConfig, VerifierLimitsConfig
 from loom.engine.semantic_compactor import SemanticCompactor
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
@@ -33,7 +34,10 @@ from loom.events.types import (
     VERIFICATION_RULE_SKIPPED,
     VERIFICATION_SHADOW_DIFF,
 )
-from loom.models.request_diagnostics import collect_request_diagnostics
+from loom.models.request_diagnostics import (
+    collect_request_diagnostics,
+    collect_response_diagnostics,
+)
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
@@ -44,6 +48,9 @@ if TYPE_CHECKING:
     from loom.processes.schema import ProcessDefinition
 
 logger = logging.getLogger(__name__)
+_COMPACTOR_EVENT_CONTEXT: contextvars.ContextVar[tuple[str, str] | None] = (
+    contextvars.ContextVar("verification_compactor_event_context", default=None)
+)
 
 _VALID_OUTCOMES = {
     "pass",
@@ -491,11 +498,193 @@ class LLMVerifier:
         validator: ResponseValidator,
         event_bus: EventBus | None = None,
         verification_config: VerificationConfig | None = None,
+        limits: VerifierLimitsConfig | None = None,
+        compactor_limits: CompactorLimitsConfig | None = None,
+        evidence_context_text_max_chars: int = 4000,
     ):
         self._router = model_router
         self._prompts = prompt_assembler
         self._validator = validator
-        self._compactor = SemanticCompactor(model_router, role="extractor", tier=1)
+        resolved_limits = limits or VerifierLimitsConfig()
+        self._max_tool_args_chars = int(
+            getattr(resolved_limits, "max_tool_args_chars", self._MAX_TOOL_ARGS_CHARS),
+        )
+        self._max_tool_status_chars = int(
+            getattr(
+                resolved_limits,
+                "max_tool_status_chars",
+                self._MAX_TOOL_STATUS_CHARS,
+            ),
+        )
+        self._max_tool_calls_tokens = int(
+            getattr(
+                resolved_limits,
+                "max_tool_calls_tokens",
+                self._MAX_TOOL_CALLS_TOKENS,
+            ),
+        )
+        self._max_verifier_prompt_tokens = int(
+            getattr(
+                resolved_limits,
+                "max_verifier_prompt_tokens",
+                self._MAX_VERIFIER_PROMPT_TOKENS,
+            ),
+        )
+        self._max_result_summary_chars = int(
+            getattr(
+                resolved_limits,
+                "max_result_summary_chars",
+                self._MAX_RESULT_SUMMARY_CHARS,
+            ),
+        )
+        self._compact_result_summary_chars = int(
+            getattr(
+                resolved_limits,
+                "compact_result_summary_chars",
+                self._COMPACT_RESULT_SUMMARY_CHARS,
+            ),
+        )
+        self._max_evidence_section_chars = int(
+            getattr(
+                resolved_limits,
+                "max_evidence_section_chars",
+                self._MAX_EVIDENCE_SECTION_CHARS,
+            ),
+        )
+        self._max_evidence_section_compact_chars = int(
+            getattr(
+                resolved_limits,
+                "max_evidence_section_compact_chars",
+                self._MAX_EVIDENCE_SECTION_COMPACT_CHARS,
+            ),
+        )
+        self._max_artifact_section_chars = int(
+            getattr(
+                resolved_limits,
+                "max_artifact_section_chars",
+                self._MAX_ARTIFACT_SECTION_CHARS,
+            ),
+        )
+        self._max_artifact_section_compact_chars = int(
+            getattr(
+                resolved_limits,
+                "max_artifact_section_compact_chars",
+                self._MAX_ARTIFACT_SECTION_COMPACT_CHARS,
+            ),
+        )
+        self._max_tool_output_excerpt_chars = int(
+            getattr(
+                resolved_limits,
+                "max_tool_output_excerpt_chars",
+                self._MAX_TOOL_OUTPUT_EXCERPT_CHARS,
+            ),
+        )
+        self._max_artifact_file_excerpt_chars = int(
+            getattr(
+                resolved_limits,
+                "max_artifact_file_excerpt_chars",
+                self._MAX_ARTIFACT_FILE_EXCERPT_CHARS,
+            ),
+        )
+        self._evidence_context_text_max_chars = max(
+            120,
+            int(evidence_context_text_max_chars or 0),
+        )
+        comp_limits = compactor_limits or CompactorLimitsConfig()
+        self._compactor = SemanticCompactor(
+            model_router,
+            model_event_hook=self._emit_compactor_model_event,
+            role="compactor",
+            tier=1,
+            allow_role_fallback=True,
+            max_chunk_chars=int(
+                getattr(comp_limits, "max_chunk_chars", SemanticCompactor._MAX_CHUNK_CHARS),
+            ),
+            max_chunks_per_round=int(
+                getattr(
+                    comp_limits,
+                    "max_chunks_per_round",
+                    SemanticCompactor._MAX_CHUNKS_PER_ROUND,
+                ),
+            ),
+            max_reduction_rounds=int(
+                getattr(
+                    comp_limits,
+                    "max_reduction_rounds",
+                    SemanticCompactor._MAX_REDUCTION_ROUNDS,
+                ),
+            ),
+            min_compact_target_chars=int(
+                getattr(
+                    comp_limits,
+                    "min_compact_target_chars",
+                    SemanticCompactor._MIN_COMPACT_TARGET_CHARS,
+                ),
+            ),
+            response_tokens_floor=int(
+                getattr(
+                    comp_limits,
+                    "response_tokens_floor",
+                    SemanticCompactor._RESPONSE_TOKENS_FLOOR,
+                ),
+            ),
+            response_tokens_ratio=float(
+                getattr(
+                    comp_limits,
+                    "response_tokens_ratio",
+                    SemanticCompactor._RESPONSE_TOKENS_RATIO,
+                ),
+            ),
+            response_tokens_buffer=int(
+                getattr(
+                    comp_limits,
+                    "response_tokens_buffer",
+                    SemanticCompactor._RESPONSE_TOKENS_BUFFER,
+                ),
+            ),
+            json_headroom_chars_floor=int(
+                getattr(
+                    comp_limits,
+                    "json_headroom_chars_floor",
+                    SemanticCompactor._JSON_HEADROOM_CHARS_FLOOR,
+                ),
+            ),
+            json_headroom_chars_ratio=float(
+                getattr(
+                    comp_limits,
+                    "json_headroom_chars_ratio",
+                    SemanticCompactor._JSON_HEADROOM_CHARS_RATIO,
+                ),
+            ),
+            json_headroom_chars_cap=int(
+                getattr(
+                    comp_limits,
+                    "json_headroom_chars_cap",
+                    SemanticCompactor._JSON_HEADROOM_CHARS_CAP,
+                ),
+            ),
+            chars_per_token_estimate=float(
+                getattr(
+                    comp_limits,
+                    "chars_per_token_estimate",
+                    SemanticCompactor._CHARS_PER_TOKEN_ESTIMATE,
+                ),
+            ),
+            token_headroom=int(
+                getattr(
+                    comp_limits,
+                    "token_headroom",
+                    SemanticCompactor._TOKEN_HEADROOM,
+                ),
+            ),
+            target_chars_ratio=float(
+                getattr(
+                    comp_limits,
+                    "target_chars_ratio",
+                    SemanticCompactor._TARGET_CHARS_RATIO,
+                ),
+            ),
+        )
         self._event_bus = event_bus
         self._config = verification_config or VerificationConfig()
 
@@ -567,7 +756,6 @@ class LLMVerifier:
                 len(compacted),
                 max_chars,
             )
-            return self._hard_cap_text(compacted, max_chars)
         return compacted
 
     async def _summarize_arg_value(
@@ -651,7 +839,7 @@ class LLMVerifier:
         for tc in tool_calls:
             args_text = await self._summarize_tool_args(
                 getattr(tc, "args", {}),
-                max_chars=self._MAX_TOOL_ARGS_CHARS,
+                max_chars=self._max_tool_args_chars,
             )
             result = getattr(tc, "result", None)
             if getattr(result, "success", False):
@@ -660,7 +848,7 @@ class LLMVerifier:
                 error_text = str(getattr(result, "error", "") or "unknown error")
                 compact_error = await self._compact_text(
                     error_text,
-                    max_chars=self._MAX_TOOL_STATUS_CHARS,
+                    max_chars=self._max_tool_status_chars,
                     label="tool status detail",
                 )
                 if self._is_advisory_tool_failure(
@@ -695,10 +883,10 @@ class LLMVerifier:
             lines.append(line)
 
         formatted = "\n".join(lines) if lines else "No tool calls."
-        if estimate_tokens(formatted) > self._MAX_TOOL_CALLS_TOKENS:
+        if estimate_tokens(formatted) > self._max_tool_calls_tokens:
             return await self._compact_text(
                 formatted,
-                max_chars=self._MAX_TOOL_CALLS_TOKENS * 4,
+                max_chars=self._max_tool_calls_tokens * 4,
                 label="verification tool-call history",
             )
         return formatted
@@ -751,7 +939,7 @@ class LLMVerifier:
                 return ""
             compacted = await self._compact_text(
                 output,
-                max_chars=self._MAX_TOOL_OUTPUT_EXCERPT_CHARS,
+                max_chars=self._max_tool_output_excerpt_chars,
                 label="verification tool output excerpt (document_write)",
             )
             return compacted.strip()
@@ -761,7 +949,7 @@ class LLMVerifier:
             return ""
         compacted = await self._compact_text(
             output,
-            max_chars=self._MAX_TOOL_OUTPUT_EXCERPT_CHARS,
+            max_chars=self._max_tool_output_excerpt_chars,
             label=f"verification tool output excerpt ({tool_name})",
         )
         return compacted.strip()
@@ -819,7 +1007,7 @@ class LLMVerifier:
                 continue
             excerpt = await self._compact_text(
                 content,
-                max_chars=self._MAX_ARTIFACT_FILE_EXCERPT_CHARS,
+                max_chars=self._max_artifact_file_excerpt_chars,
                 label=f"verification artifact excerpt ({path.name})",
             )
             lines.append(f"- {rel}:")
@@ -1016,8 +1204,8 @@ class LLMVerifier:
                     merged.append(dict(item))
             return merged
 
-    @staticmethod
     def _extract_evidence_from_tool_calls(
+        self,
         subtask_id: str,
         tool_calls: list | None,
     ) -> list[dict]:
@@ -1033,6 +1221,7 @@ class LLMVerifier:
                 subtask_id=subtask_id,
                 tool_calls=list(tool_calls),
                 existing_ids=set(),
+                context_text_max_chars=self._evidence_context_text_max_chars,
             )
         except Exception:
             return []
@@ -1208,6 +1397,27 @@ class LLMVerifier:
             lines.append(f"    attribution_columns: [{col_text}]")
 
         return lines
+
+    def _emit_compactor_model_event(self, payload: dict) -> None:
+        """Bridge semantic-compactor model events into verifier model_invocation events."""
+        context = _COMPACTOR_EVENT_CONTEXT.get()
+        if not context:
+            return
+        task_id, subtask_id = context
+        model_name = str(payload.get("model", "")).strip() or "unknown"
+        phase = str(payload.get("phase", "")).strip() or "done"
+        details = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"model", "phase"}
+        }
+        self._emit_model_event(
+            task_id=task_id,
+            subtask_id=subtask_id,
+            model_name=model_name,
+            phase=phase,
+            details=details,
+        )
 
     def _emit_model_event(
         self,
@@ -1660,6 +1870,10 @@ class LLMVerifier:
         self,
         model,
         raw_text: str,
+        *,
+        task_id: str = "",
+        subtask_id: str = "",
+        origin: str = "verification.repair_assessment.complete",
     ) -> VerificationResult | None:
         expected_keys = self._expected_verifier_response_keys()
         expected_display = ", ".join(f'"{key}"' for key in expected_keys)
@@ -1692,29 +1906,169 @@ class LLMVerifier:
             "RAW OUTPUT:\n"
             f"{raw_text}"
         )
+        request_messages = [{"role": "user", "content": repair_prompt}]
+        policy = ModelRetryPolicy()
+        invocation_attempt = 0
+        request_diag = collect_request_diagnostics(
+            messages=request_messages,
+            origin=origin,
+        )
+
+        async def _invoke_model():
+            nonlocal invocation_attempt
+            invocation_attempt += 1
+            self._emit_model_event(
+                task_id=task_id,
+                subtask_id=subtask_id,
+                model_name=getattr(model, "name", "unknown"),
+                phase="start",
+                details={
+                    "operation": "complete",
+                    "invocation_attempt": invocation_attempt,
+                    "invocation_max_attempts": policy.max_attempts,
+                    **request_diag.to_event_payload(),
+                },
+            )
+            return await model.complete(request_messages)
+
+        def _on_failure(
+            attempt: int,
+            max_attempts: int,
+            error: BaseException,
+            remaining: int,
+        ) -> None:
+            self._emit_model_event(
+                task_id=task_id,
+                subtask_id=subtask_id,
+                model_name=getattr(model, "name", "unknown"),
+                phase="done",
+                details={
+                    "operation": "complete",
+                    "origin": request_diag.origin,
+                    "invocation_attempt": attempt,
+                    "invocation_max_attempts": max_attempts,
+                    "retry_queue_remaining": remaining,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+            )
+
         try:
             response = await call_with_model_retry(
-                lambda: model.complete([{"role": "user", "content": repair_prompt}]),
-                policy=ModelRetryPolicy(),
+                _invoke_model,
+                policy=policy,
+                on_failure=_on_failure,
             )
         except Exception:
             return None
+        self._emit_model_event(
+            task_id=task_id,
+            subtask_id=subtask_id,
+            model_name=getattr(model, "name", "unknown"),
+            phase="done",
+            details={
+                "operation": "complete",
+                "origin": request_diag.origin,
+                "invocation_attempt": invocation_attempt,
+                "invocation_max_attempts": policy.max_attempts,
+                **collect_response_diagnostics(response).to_event_payload(),
+            },
+        )
         return self._parse_verifier_response(response)
 
     async def _repair_assessment_with_alternate_model(
         self,
         raw_text: str,
+        *,
+        task_id: str = "",
+        subtask_id: str = "",
+        origin: str = "verification.repair_assessment.alternate_model.complete",
     ) -> VerificationResult | None:
         try:
             alternate = self._router.select(tier=2, role="verifier")
         except Exception:
             return None
-        return await self._repair_assessment_with_model(alternate, raw_text)
+        return await self._repair_assessment_with_model(
+            alternate,
+            raw_text,
+            task_id=task_id,
+            subtask_id=subtask_id,
+            origin=origin,
+        )
 
-    async def _invoke_and_parse(self, model, prompt: str) -> VerificationResult:
+    async def _invoke_and_parse(
+        self,
+        model,
+        prompt: str,
+        *,
+        task_id: str = "",
+        subtask_id: str = "",
+        origin: str = "verification.invoke_and_parse.complete",
+    ) -> VerificationResult:
+        request_messages = [{"role": "user", "content": prompt}]
+        policy = ModelRetryPolicy()
+        invocation_attempt = 0
+        request_diag = collect_request_diagnostics(
+            messages=request_messages,
+            origin=origin,
+        )
+
+        async def _invoke_model():
+            nonlocal invocation_attempt
+            invocation_attempt += 1
+            self._emit_model_event(
+                task_id=task_id,
+                subtask_id=subtask_id,
+                model_name=getattr(model, "name", "unknown"),
+                phase="start",
+                details={
+                    "operation": "complete",
+                    "invocation_attempt": invocation_attempt,
+                    "invocation_max_attempts": policy.max_attempts,
+                    **request_diag.to_event_payload(),
+                },
+            )
+            return await model.complete(request_messages)
+
+        def _on_failure(
+            attempt: int,
+            max_attempts: int,
+            error: BaseException,
+            remaining: int,
+        ) -> None:
+            self._emit_model_event(
+                task_id=task_id,
+                subtask_id=subtask_id,
+                model_name=getattr(model, "name", "unknown"),
+                phase="done",
+                details={
+                    "operation": "complete",
+                    "origin": request_diag.origin,
+                    "invocation_attempt": attempt,
+                    "invocation_max_attempts": max_attempts,
+                    "retry_queue_remaining": remaining,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+            )
+
         response = await call_with_model_retry(
-            lambda: model.complete([{"role": "user", "content": prompt}]),
-            policy=ModelRetryPolicy(),
+            _invoke_model,
+            policy=policy,
+            on_failure=_on_failure,
+        )
+        self._emit_model_event(
+            task_id=task_id,
+            subtask_id=subtask_id,
+            model_name=getattr(model, "name", "unknown"),
+            phase="done",
+            details={
+                "operation": "complete",
+                "origin": request_diag.origin,
+                "invocation_attempt": invocation_attempt,
+                "invocation_max_attempts": policy.max_attempts,
+                **collect_response_diagnostics(response).to_event_payload(),
+            },
         )
         parsed = self._parse_verifier_response(response)
         if parsed is not None:
@@ -1723,7 +2077,13 @@ class LLMVerifier:
         if not bool(getattr(self._config, "strict_output_protocol", True)):
             return self._inconclusive_result()
 
-        repaired = await self._repair_assessment_with_model(model, response.text or "")
+        repaired = await self._repair_assessment_with_model(
+            model,
+            response.text or "",
+            task_id=task_id,
+            subtask_id=subtask_id,
+            origin="verification.repair_assessment.same_model.complete",
+        )
         if repaired is not None:
             repaired.metadata = dict(repaired.metadata)
             repaired.metadata["parser_stage"] = "repair_same_model"
@@ -1731,6 +2091,8 @@ class LLMVerifier:
 
         repaired_alt = await self._repair_assessment_with_alternate_model(
             response.text or "",
+            task_id=task_id,
+            subtask_id=subtask_id,
         )
         if repaired_alt is not None:
             repaired_alt.metadata = dict(repaired_alt.metadata)
@@ -1758,10 +2120,12 @@ class LLMVerifier:
         evidence_records: list[dict] | None = None,
         task_id: str = "",
     ) -> VerificationResult:
+        compactor_context_token = _COMPACTOR_EVENT_CONTEXT.set((task_id, subtask.id))
         try:
             model = self._router.select(tier=1, role="verifier")
         except Exception as e:
             logger.warning("Verifier model not available: %s", e)
+            _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
             return VerificationResult(
                 tier=0, passed=True, confidence=0.5,
                 feedback="Verification skipped: verifier model not configured",
@@ -1772,7 +2136,7 @@ class LLMVerifier:
 
         summary_for_prompt = await self._compact_text(
             result_summary,
-            max_chars=self._MAX_RESULT_SUMMARY_CHARS,
+            max_chars=self._max_result_summary_chars,
             label="verification result summary",
         )
         tool_calls_formatted = await self._format_tool_calls_for_prompt(tool_calls)
@@ -1788,12 +2152,12 @@ class LLMVerifier:
             effective_evidence,
             workspace=workspace,
             tool_calls=tool_calls,
-            max_chars=self._MAX_EVIDENCE_SECTION_CHARS,
+            max_chars=self._max_evidence_section_chars,
         )
         artifact_section = await self._build_artifact_content_section(
             workspace=workspace,
             tool_calls=tool_calls,
-            max_chars=self._MAX_ARTIFACT_SECTION_CHARS,
+            max_chars=self._max_artifact_section_chars,
         )
         phase_scope_default = self._phase_scope_default()
         selected_rules = self._select_phase_scoped_rules(
@@ -1811,10 +2175,10 @@ class LLMVerifier:
             prompt = prompt + "\n\n" + evidence_section
         if artifact_section:
             prompt = prompt + "\n\n" + artifact_section
-        if estimate_tokens(prompt) > self._MAX_VERIFIER_PROMPT_TOKENS:
+        if estimate_tokens(prompt) > self._max_verifier_prompt_tokens:
             summary_for_prompt = await self._compact_text(
                 summary_for_prompt,
-                max_chars=self._COMPACT_RESULT_SUMMARY_CHARS,
+                max_chars=self._compact_result_summary_chars,
                 label="verification compact summary",
             )
             tool_calls_formatted = await self._format_tool_calls_compact(tool_calls)
@@ -1831,7 +2195,7 @@ class LLMVerifier:
                     + "\n\n"
                     + self._hard_cap_text(
                         evidence_section,
-                        self._MAX_EVIDENCE_SECTION_COMPACT_CHARS,
+                        self._max_evidence_section_compact_chars,
                     )
                 )
             if artifact_section:
@@ -1840,7 +2204,7 @@ class LLMVerifier:
                     + "\n\n"
                     + self._hard_cap_text(
                         artifact_section,
-                        self._MAX_ARTIFACT_SECTION_COMPACT_CHARS,
+                        self._max_artifact_section_compact_chars,
                     )
                 )
 
@@ -1862,7 +2226,13 @@ class LLMVerifier:
             },
         )
         try:
-            first_result = await self._invoke_and_parse(model, prompt)
+            first_result = await self._invoke_and_parse(
+                model,
+                prompt,
+                task_id=task_id,
+                subtask_id=subtask.id,
+                origin="verification.tier2.invoke.complete",
+            )
             if not first_result.reason_code and not first_result.passed:
                 first_result.reason_code = "llm_semantic_failed"
             self._emit_model_event(
@@ -1880,6 +2250,7 @@ class LLMVerifier:
                     "reason_code": first_result.reason_code,
                 },
             )
+            _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
             return first_result
         except Exception as e:
             logger.warning("Verifier raised exception: %s", e)
@@ -1888,7 +2259,7 @@ class LLMVerifier:
                 subtask,
                 await self._compact_text(
                     summary_for_prompt,
-                    max_chars=self._COMPACT_RESULT_SUMMARY_CHARS,
+                    max_chars=self._compact_result_summary_chars,
                     label="verification retry summary",
                 ),
                 compact_tool_calls,
@@ -1901,7 +2272,7 @@ class LLMVerifier:
                     + "\n\n"
                     + self._hard_cap_text(
                         evidence_section,
-                        self._MAX_EVIDENCE_SECTION_COMPACT_CHARS,
+                        self._max_evidence_section_compact_chars,
                     )
                 )
             if artifact_section:
@@ -1910,7 +2281,7 @@ class LLMVerifier:
                     + "\n\n"
                     + self._hard_cap_text(
                         artifact_section,
-                        self._MAX_ARTIFACT_SECTION_COMPACT_CHARS,
+                        self._max_artifact_section_compact_chars,
                     )
                 )
             retry_messages = [{"role": "user", "content": compact_prompt}]
@@ -1931,7 +2302,13 @@ class LLMVerifier:
                 },
             )
             try:
-                retry_result = await self._invoke_and_parse(model, compact_prompt)
+                retry_result = await self._invoke_and_parse(
+                    model,
+                    compact_prompt,
+                    task_id=task_id,
+                    subtask_id=subtask.id,
+                    origin="verification.tier2.retry.invoke.complete",
+                )
                 if not retry_result.reason_code and not retry_result.passed:
                     retry_result.reason_code = "llm_semantic_failed"
                 self._emit_model_event(
@@ -1949,6 +2326,7 @@ class LLMVerifier:
                         "reason_code": retry_result.reason_code,
                     },
                 )
+                _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
                 return retry_result
             except Exception as retry_error:
                 logger.warning(
@@ -1967,6 +2345,7 @@ class LLMVerifier:
                         "error": str(retry_error),
                     },
                 )
+                _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
                 return VerificationResult(
                     tier=2,
                     passed=False,
@@ -2039,6 +2418,9 @@ class VerificationGates:
         model_router: ModelRouter,
         prompt_assembler: PromptAssembler,
         config: VerificationConfig,
+        limits: VerifierLimitsConfig | None = None,
+        compactor_limits: CompactorLimitsConfig | None = None,
+        evidence_context_text_max_chars: int = 4000,
         process: ProcessDefinition | None = None,
         event_bus: EventBus | None = None,
     ):
@@ -2056,6 +2438,9 @@ class VerificationGates:
             validator,
             event_bus=event_bus,
             verification_config=config,
+            limits=limits,
+            compactor_limits=compactor_limits,
+            evidence_context_text_max_chars=evidence_context_text_max_chars,
         )
         self._tier3 = VotingVerifier(self._tier2, config.tier3_vote_count)
 
@@ -2298,6 +2683,44 @@ class VerificationGates:
             metadata={"legacy_mode": True},
         )
 
+    @staticmethod
+    def _fallback_from_tier1_for_inconclusive_tier2(
+        *,
+        tier1_result: VerificationResult | None,
+        tier2_result: VerificationResult,
+    ) -> VerificationResult | None:
+        if tier1_result is None or not tier1_result.passed:
+            return None
+        reason = str(tier2_result.reason_code or "").strip().lower()
+        severity = str(tier2_result.severity_class or "").strip().lower()
+        if reason != "parse_inconclusive" and severity != "inconclusive":
+            return None
+        note = (
+            "Tier-2 verifier output was inconclusive; accepting Tier-1 checks "
+            "with warning."
+        )
+        merged_feedback = "\n".join(
+            part for part in [tier2_result.feedback or "", note] if part
+        )
+        metadata: dict[str, object] = {
+            "fallback": "tier1_due_to_tier2_parse_inconclusive",
+            "tier2_reason_code": reason or str(tier2_result.reason_code or ""),
+            "tier2_outcome": tier2_result.outcome,
+        }
+        if isinstance(tier2_result.metadata, dict) and tier2_result.metadata:
+            metadata["tier2"] = dict(tier2_result.metadata)
+        return VerificationResult(
+            tier=2,
+            passed=True,
+            confidence=max(0.5, float(tier1_result.confidence)),
+            checks=list(tier1_result.checks or []),
+            feedback=merged_feedback or None,
+            outcome="pass_with_warnings",
+            reason_code="infra_verifier_error",
+            severity_class="infra",
+            metadata=metadata,
+        )
+
     async def verify(
         self,
         subtask: Subtask,
@@ -2373,6 +2796,23 @@ class VerificationGates:
             task_id=task_id,
         )
         results.append(t2)
+        t1_result = next((item for item in results if item.tier == 1), None)
+        inconclusive_fallback = self._fallback_from_tier1_for_inconclusive_tier2(
+            tier1_result=t1_result,
+            tier2_result=t2,
+        )
+        if inconclusive_fallback is not None:
+            self._emit_instrumentation_events(
+                task_id=task_id,
+                subtask_id=subtask.id,
+                result=inconclusive_fallback,
+            )
+            self._emit_outcome_event(
+                task_id=task_id,
+                subtask_id=subtask.id,
+                result=inconclusive_fallback,
+            )
+            return inconclusive_fallback
         if not t2.passed:
             self._emit_instrumentation_events(
                 task_id=task_id,

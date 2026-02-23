@@ -6,7 +6,7 @@ port = 9000
 provider = "openai_compatible"
 base_url = "http://localhost:1234/v1"
 model = "minimax-m2.1"
-max_tokens = 4096
+max_tokens = 8192 
 temperature = 0.1
 roles = ["planner", "executor"]
 
@@ -14,9 +14,19 @@ roles = ["planner", "executor"]
 provider = "ollama"
 base_url = "http://localhost:11434"
 model = "qwen3:8b"
-max_tokens = 2048
+max_tokens = 4096 
 temperature = 0.0
 roles = ["extractor", "verifier"]
+
+[models.compactor]
+provider = "openai_compatible"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+model = "gemini-2.5-flash"
+api_key = "YOUR_GOOGLE_API_KEY"
+max_tokens = 4096
+temperature = 1.0
+reasoning_effort = "none"
+roles = ["compactor"]
 
 [workspace]
 default_path = "~/projects"
@@ -33,6 +43,54 @@ tier1_enabled = true
 tier2_enabled = true
 tier3_enabled = false
 tier3_vote_count = 3
+
+[limits]
+adhoc_repair_source_max_chars = 0 # 0 = no truncation in ad hoc JSON repair
+evidence_context_text_max_chars = 8192
+planning_response_max_tokens = 16384
+
+[limits.runner]
+max_tool_iterations = 20
+max_subtask_wall_clock_seconds = 1200
+max_model_context_tokens = 24000
+max_state_summary_chars = 640
+max_verification_summary_chars = 8000
+default_tool_result_output_chars = 2800
+heavy_tool_result_output_chars = 3600
+compact_tool_result_output_chars = 900
+compact_text_output_chars = 1400
+minimal_text_output_chars = 260
+tool_call_argument_context_chars = 700
+compact_tool_call_argument_chars = 1600
+
+[limits.verifier]
+max_tool_args_chars = 360
+max_tool_status_chars = 320
+max_tool_calls_tokens = 4000
+max_verifier_prompt_tokens = 12000
+max_result_summary_chars = 7000
+compact_result_summary_chars = 2600
+max_evidence_section_chars = 4200
+max_evidence_section_compact_chars = 2200
+max_artifact_section_chars = 4200
+max_artifact_section_compact_chars = 2200
+max_tool_output_excerpt_chars = 1100
+max_artifact_file_excerpt_chars = 800
+
+[limits.compactor]
+max_chunk_chars = 8000
+max_chunks_per_round = 10
+max_reduction_rounds = 2
+min_compact_target_chars = 220
+response_tokens_floor = 256
+response_tokens_ratio = 0.55
+response_tokens_buffer = 256
+json_headroom_chars_floor = 128
+json_headroom_chars_ratio = 0.30
+json_headroom_chars_cap = 1024
+chars_per_token_estimate = 2.8
+token_headroom = 128
+target_chars_ratio = 0.82
 
 [memory]
 database_path = "~/.loom/loom.db"

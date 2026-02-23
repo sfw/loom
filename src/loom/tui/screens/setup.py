@@ -214,7 +214,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
                 yield Label("Which roles should this model handle?")
                 yield Label("")
                 yield Label(
-                    "  [1] All roles (planner, executor, extractor, verifier)",
+                    "  [1] All roles (planner, executor, extractor, verifier, compactor)",
                     classes="setup-option",
                 )
                 yield Label(
@@ -222,7 +222,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
                     classes="setup-option",
                 )
                 yield Label(
-                    "  [3] Utility (extractor, verifier)",
+                    "  [3] Utility (extractor, verifier, compactor)",
                     classes="setup-option",
                 )
                 yield Label("Press 1, 2, or 3", classes="setup-hint")
@@ -676,7 +676,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             "model": self._model_name,
             "api_key": self._api_key,
             "roles": self._roles,
-            "max_tokens": 2048 if self._adding_utility else 4096,
+            "max_tokens": 2048 if self._adding_utility else 8192,
             "temperature": 0.0 if self._adding_utility else 0.1,
         }
 

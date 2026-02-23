@@ -304,8 +304,10 @@ class TestFullLifecycleHappyPath:
         )
         result = await orch.execute_task(task)
 
-        # Give async event handlers and fire-and-forget memory extraction time to flush
-        await asyncio.sleep(0.4)
+        # Flush async event handlers before asserting persisted lifecycle events.
+        await event_bus.drain(timeout=1.0)
+        # Memory extraction remains fire-and-forget; keep a short settling window.
+        await asyncio.sleep(0.2)
 
         # -- Assert: Task completed -------------------------------------------
         assert result.status == TaskStatus.COMPLETED
@@ -1017,7 +1019,7 @@ class TestEventPersistenceRoundtrip:
 
         task = create_task(goal="Think about things")
         result = await orch.execute_task(task)
-        await asyncio.sleep(0.3)
+        await event_bus.drain(timeout=1.0)
 
         assert result.status == TaskStatus.COMPLETED
 

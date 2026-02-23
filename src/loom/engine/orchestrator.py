@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from loom.auth.runtime import AuthResolutionError, build_run_auth_context
 from loom.config import Config
 
 if TYPE_CHECKING:
@@ -47,7 +48,10 @@ from loom.events.types import (
 )
 from loom.learning.manager import LearningManager
 from loom.models.base import ModelResponse
-from loom.models.request_diagnostics import collect_request_diagnostics
+from loom.models.request_diagnostics import (
+    collect_request_diagnostics,
+    collect_response_diagnostics,
+)
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
@@ -128,6 +132,15 @@ class Orchestrator:
             model_router=model_router,
             prompt_assembler=prompt_assembler,
             config=config.verification,
+            limits=getattr(getattr(config, "limits", None), "verifier", None),
+            compactor_limits=getattr(getattr(config, "limits", None), "compactor", None),
+            evidence_context_text_max_chars=int(
+                getattr(
+                    getattr(config, "limits", None),
+                    "evidence_context_text_max_chars",
+                    4000,
+                ),
+            ),
             process=process,
             event_bus=event_bus,
         )
@@ -175,21 +188,37 @@ class Orchestrator:
             event_bus=event_bus,
         )
 
-    async def execute_task(self, task: Task) -> Task:
+    async def execute_task(
+        self,
+        task: Task,
+        *,
+        reuse_existing_plan: bool = False,
+    ) -> Task:
         """Main entry point. Drives the full task lifecycle."""
         try:
-            # 1. Planning phase
-            task.status = TaskStatus.PLANNING
-            self._emit(TASK_PLANNING, task.id, {"goal": task.goal})
+            plan: Plan
+            if reuse_existing_plan and task.plan and task.plan.subtasks:
+                plan = task.plan
+                task.status = TaskStatus.EXECUTING
+                self._state.save(task)
+                self._emit(TASK_PLAN_READY, task.id, {
+                    "subtask_count": len(plan.subtasks),
+                    "subtask_ids": [s.id for s in plan.subtasks],
+                    "reused": True,
+                })
+            else:
+                # 1. Planning phase
+                task.status = TaskStatus.PLANNING
+                self._emit(TASK_PLANNING, task.id, {"goal": task.goal})
 
-            plan = await self._plan_task(task)
-            task.plan = plan
-            task.status = TaskStatus.EXECUTING
-            self._state.save(task)
-            self._emit(TASK_PLAN_READY, task.id, {
-                "subtask_count": len(plan.subtasks),
-                "subtask_ids": [s.id for s in plan.subtasks],
-            })
+                plan = await self._plan_task(task)
+                task.plan = plan
+                task.status = TaskStatus.EXECUTING
+                self._state.save(task)
+                self._emit(TASK_PLAN_READY, task.id, {
+                    "subtask_count": len(plan.subtasks),
+                    "subtask_ids": [s.id for s in plan.subtasks],
+                })
 
             # 2. Execution loop — parallel dispatch of independent subtasks
             self._emit(TASK_EXECUTING, task.id, {})
@@ -341,6 +370,11 @@ class Orchestrator:
 
         # Determine escalation tier
         attempts = attempts_by_subtask.get(subtask.id, [])
+        retry_strategy = (
+            attempts[-1].retry_strategy
+            if attempts
+            else RetryStrategy.GENERIC
+        )
         prior_successful_tool_calls: list[ToolCallRecord] = []
         prior_evidence_records = self._evidence_for_subtask(task.id, subtask.id)
         for attempt in attempts:
@@ -359,7 +393,15 @@ class Orchestrator:
             attempt=len(attempts),
             original_tier=subtask.model_tier,
         )
+        expected_deliverables = self._expected_deliverables_for_subtask(subtask)
         retry_context = self._retry.build_retry_context(attempts)
+        retry_context = self._augment_retry_context_for_outputs(
+            subtask=subtask,
+            attempts=attempts,
+            strategy=retry_strategy,
+            expected_deliverables=expected_deliverables,
+            base_context=retry_context,
+        )
         changelog = self._get_changelog(task)
 
         result, verification = await self._runner.run(
@@ -369,6 +411,10 @@ class Orchestrator:
             changelog=changelog,
             prior_successful_tool_calls=prior_successful_tool_calls,
             prior_evidence_records=prior_evidence_records,
+            expected_deliverables=expected_deliverables,
+            enforce_deliverable_paths=bool(attempts and expected_deliverables),
+            edit_existing_only=bool(attempts and expected_deliverables),
+            retry_strategy=retry_strategy.value,
         )
 
         return subtask, result, verification
@@ -725,6 +771,14 @@ class Orchestrator:
                     strategy=RetryStrategy.UNCONFIRMED_DATA,
                 )
             )
+            expected_deliverables = self._expected_deliverables_for_subtask(subtask)
+            remediation_context = self._augment_retry_context_for_outputs(
+                subtask=subtask,
+                attempts=attempts,
+                strategy=RetryStrategy.UNCONFIRMED_DATA,
+                expected_deliverables=expected_deliverables,
+                base_context=remediation_context,
+            )
             escalated_tier = self._retry.get_escalation_tier(
                 attempt=len(attempts),
                 original_tier=subtask.model_tier,
@@ -738,6 +792,10 @@ class Orchestrator:
                 changelog=changelog,
                 prior_successful_tool_calls=prior_successful_tool_calls,
                 prior_evidence_records=prior_evidence_records,
+                expected_deliverables=expected_deliverables,
+                enforce_deliverable_paths=bool(expected_deliverables),
+                edit_existing_only=bool(expected_deliverables),
+                retry_strategy=RetryStrategy.UNCONFIRMED_DATA.value,
             )
             self._persist_subtask_evidence(
                 task.id,
@@ -1074,6 +1132,96 @@ class Orchestrator:
             remediation_id=str(item.get("id", "")).strip() or None,
         )
 
+    def _expected_deliverables_for_subtask(self, subtask: Subtask) -> list[str]:
+        if self._process is None:
+            return []
+        deliverables = self._process.get_deliverables()
+        if not deliverables:
+            return []
+        if subtask.id in deliverables:
+            return [
+                str(item).strip()
+                for item in deliverables[subtask.id]
+                if str(item).strip()
+            ]
+        if len(deliverables) == 1:
+            return [
+                str(item).strip()
+                for item in next(iter(deliverables.values()))
+                if str(item).strip()
+            ]
+        return []
+
+    @staticmethod
+    def _files_from_attempts(attempts: list[AttemptRecord], *, max_items: int = 24) -> list[str]:
+        files: list[str] = []
+        seen: set[str] = set()
+        for attempt in attempts:
+            raw_calls = getattr(attempt, "successful_tool_calls", [])
+            if not isinstance(raw_calls, list):
+                continue
+            for call in raw_calls:
+                result = getattr(call, "result", None)
+                changed = getattr(result, "files_changed", [])
+                if not isinstance(changed, list):
+                    continue
+                for item in changed:
+                    text = str(item or "").strip()
+                    if not text or text in seen:
+                        continue
+                    seen.add(text)
+                    files.append(text)
+                    if len(files) >= max_items:
+                        return files
+        return files
+
+    def _augment_retry_context_for_outputs(
+        self,
+        *,
+        subtask: Subtask,
+        attempts: list[AttemptRecord],
+        strategy: RetryStrategy,
+        expected_deliverables: list[str],
+        base_context: str,
+    ) -> str:
+        del subtask  # Reserved for future per-subtask formatting.
+        lines: list[str] = []
+        existing_files = self._files_from_attempts(attempts)
+        if existing_files:
+            lines.append("EDIT-IN-PLACE FILES (do not fork or rename):")
+            for path in existing_files:
+                lines.append(f"- {path}")
+            lines.append(
+                "Do not create alternate copies such as *-v2.*, *_v2.*, *-copy.*, "
+                "or similarly suffixed variants."
+            )
+        if expected_deliverables:
+            lines.append("CANONICAL DELIVERABLE FILES FOR THIS SUBTASK:")
+            for name in expected_deliverables:
+                lines.append(f"- {name}")
+            lines.append(
+                "Write/update only these deliverable filenames for this phase. "
+                "If fixing verification issues, patch these files in place."
+            )
+        if (
+            strategy in {
+                RetryStrategy.RATE_LIMIT,
+                RetryStrategy.EVIDENCE_GAP,
+                RetryStrategy.UNCONFIRMED_DATA,
+            }
+            and expected_deliverables
+        ):
+            lines.append(
+                "Remediation scope: keep validated content and make only minimal edits "
+                "needed to satisfy failed checks."
+            )
+        if not lines:
+            return base_context
+        block = "\n".join(lines)
+        if base_context.strip():
+            return f"{base_context}\n\n{block}"
+        return block
+
     @staticmethod
     def _build_replan_reason(
         subtask: Subtask,
@@ -1262,6 +1410,16 @@ class Orchestrator:
         code_analysis = ""
         workspace_analysis = ""
         read_roots = self._read_roots_for_task(task)
+        auth_context = None
+        try:
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            auth_context = build_run_auth_context(
+                workspace=Path(task.workspace) if task.workspace else None,
+                metadata=metadata,
+            )
+        except AuthResolutionError as e:
+            logger.warning("Auth context unavailable during planning for %s: %s", task.id, e)
+
         if task.workspace:
             workspace_path = Path(task.workspace)
             if workspace_path.exists():
@@ -1272,6 +1430,7 @@ class Orchestrator:
                         {},
                         workspace=workspace_path,
                         read_roots=read_roots,
+                        auth_context=auth_context,
                     )
 
                 async def _do_analysis():
@@ -1325,7 +1484,10 @@ class Orchestrator:
                 "invocation_max_attempts": policy.max_attempts,
                 **request_diag.to_event_payload(),
             })
-            return await model.complete(request_messages)
+            return await model.complete(
+                request_messages,
+                max_tokens=self._planning_response_max_tokens(),
+            )
 
         def _on_failure(
             attempt: int,
@@ -1377,8 +1539,7 @@ class Orchestrator:
             "invocation_attempt": invocation_attempt,
             "invocation_max_attempts": policy.max_attempts,
             "origin": request_diag.origin if request_diag else "",
-            "response_tokens": response.usage.total_tokens,
-            "response_chars": len(response.text or ""),
+            **collect_response_diagnostics(response).to_event_payload(),
         })
 
         plan = self._parse_plan(response, goal=task.goal)
@@ -1608,7 +1769,10 @@ class Orchestrator:
                     "invocation_max_attempts": policy.max_attempts,
                     **request_diag.to_event_payload(),
                 })
-                return await model.complete(request_messages)
+                return await model.complete(
+                    request_messages,
+                    max_tokens=self._planning_response_max_tokens(),
+                )
 
             def _on_replanner_failure(
                 attempt: int,
@@ -1642,8 +1806,7 @@ class Orchestrator:
                 "invocation_attempt": invocation_attempt,
                 "invocation_max_attempts": policy.max_attempts,
                 "origin": request_diag.origin if request_diag else "",
-                "response_tokens": response.usage.total_tokens,
-                "response_chars": len(response.text or ""),
+                **collect_response_diagnostics(response).to_event_payload(),
             })
             new_plan = self._apply_process_phase_mode(
                 self._parse_plan(response, goal=task.goal),
@@ -1755,6 +1918,23 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _planning_response_max_tokens(self) -> int | None:
+        """Resolve token cap for planner responses.
+
+        A non-positive configured value disables the explicit cap and lets
+        providers choose their own default.
+        """
+        raw = getattr(
+            getattr(self._config, "limits", None),
+            "planning_response_max_tokens",
+            0,
+        )
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 0
+        return value if value > 0 else None
 
     def _evidence_for_subtask(self, task_id: str, subtask_id: str) -> list[dict]:
         """Load persisted evidence records scoped to one subtask."""
@@ -1889,6 +2069,7 @@ def create_task(
     approval_mode: str = "auto",
     callback_url: str = "",
     context: dict | None = None,
+    metadata: dict | None = None,
 ) -> Task:
     """Factory for creating new tasks with a generated ID."""
     return Task(
@@ -1898,6 +2079,7 @@ def create_task(
         approval_mode=approval_mode,
         callback_url=callback_url,
         context=context or {},
+        metadata=metadata or {},
         created_at=datetime.now().isoformat(),
         updated_at=datetime.now().isoformat(),
     )

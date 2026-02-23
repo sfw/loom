@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.reactive import reactive
@@ -44,7 +45,12 @@ class TaskProgressPanel(Static):
         lines: list[str] = []
         for t in self.tasks:
             status = t.get("status", "pending")
-            content = t.get("content", "?")
+            raw_content = t.get("content", "?")
+            if isinstance(raw_content, Text):
+                content = raw_content.plain
+            else:
+                content = str(raw_content)
+            content = content.replace("[", "\\[")
             if status == "completed":
                 icon = "[#9ece6a]\u2713[/]"
             elif status == "in_progress":

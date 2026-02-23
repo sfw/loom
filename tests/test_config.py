@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from loom.config import Config, load_config
+from loom.config import Config, MemoryConfig, WorkspaceConfig, load_config
 
 
 class TestDefaultConfig:
@@ -56,9 +56,35 @@ class TestDefaultConfig:
         assert config.process.tui_run_scoped_workspace_enabled is True
         assert config.process.llm_run_folder_naming_enabled is True
 
+    def test_default_limits(self):
+        config = Config()
+        assert config.limits.planning_response_max_tokens == 16384
+        assert config.limits.adhoc_repair_source_max_chars == 0
+        assert config.limits.evidence_context_text_max_chars == 4000
+        assert config.limits.runner.default_tool_result_output_chars == 4000
+        assert config.limits.verifier.max_verifier_prompt_tokens == 12000
+        assert config.limits.compactor.response_tokens_ratio == 0.75
+        assert config.limits.compactor.json_headroom_chars_floor == 48
+        assert config.limits.compactor.json_headroom_chars_ratio == 0.08
+        assert config.limits.compactor.json_headroom_chars_cap == 320
+        assert config.limits.compactor.chars_per_token_estimate == 3.6
+        assert config.limits.compactor.token_headroom == 24
+        assert config.limits.compactor.target_chars_ratio == 0.75
+
     def test_database_path_expands_user(self):
         config = Config()
         assert "~" not in str(config.database_path)
+
+    def test_temp_database_path_redirects_to_scratch(self):
+        config = Config(
+            memory=MemoryConfig(database_path=".tmp_loom.db"),
+            workspace=WorkspaceConfig(scratch_dir="~/.loom/scratch"),
+        )
+        assert config.database_path == Path.home() / ".loom" / "scratch" / ".tmp_loom.db"
+
+    def test_relative_database_path_keeps_non_temp_location(self):
+        config = Config(memory=MemoryConfig(database_path="data/loom.db"))
+        assert config.database_path == Path("data/loom.db")
 
     def test_scratch_path_expands_user(self):
         config = Config()
@@ -91,6 +117,7 @@ base_url = "http://localhost:11434"
 model = "llama3:8b"
 max_tokens = 2048
 temperature = 0.0
+reasoning_effort = "none"
 roles = ["executor", "planner"]
 
 [execution]
@@ -105,6 +132,7 @@ database_path = "/tmp/test.db"
         assert "test_model" in config.models
         assert config.models["test_model"].provider == "ollama"
         assert config.models["test_model"].model == "llama3:8b"
+        assert config.models["test_model"].reasoning_effort == "none"
         assert config.models["test_model"].roles == ["executor", "planner"]
         assert config.execution.max_subtask_retries == 5
         assert config.memory.database_path == "/tmp/test.db"
@@ -239,3 +267,48 @@ NOTION_TOKEN = "secret-token"
         assert server.timeout_seconds == 45
         assert server.enabled is True
         assert server.env["NOTION_TOKEN"] == "secret-token"
+
+    def test_load_limits_sections(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[limits]
+planning_response_max_tokens = 24000
+adhoc_repair_source_max_chars = 30000
+evidence_context_text_max_chars = 7200
+
+[limits.runner]
+max_model_context_tokens = 64000
+heavy_tool_result_output_chars = 3000
+
+[limits.verifier]
+max_verifier_prompt_tokens = 20000
+max_tool_output_excerpt_chars = 1800
+
+[limits.compactor]
+response_tokens_floor = 512
+response_tokens_ratio = 1.0
+response_tokens_buffer = 320
+json_headroom_chars_floor = 64
+json_headroom_chars_ratio = 0.12
+json_headroom_chars_cap = 512
+chars_per_token_estimate = 4.2
+token_headroom = 16
+target_chars_ratio = 0.6
+""")
+        config = load_config(toml_file)
+        assert config.limits.planning_response_max_tokens == 24000
+        assert config.limits.adhoc_repair_source_max_chars == 30000
+        assert config.limits.evidence_context_text_max_chars == 7200
+        assert config.limits.runner.max_model_context_tokens == 64000
+        assert config.limits.runner.heavy_tool_result_output_chars == 3000
+        assert config.limits.verifier.max_verifier_prompt_tokens == 20000
+        assert config.limits.verifier.max_tool_output_excerpt_chars == 1800
+        assert config.limits.compactor.response_tokens_floor == 512
+        assert config.limits.compactor.response_tokens_ratio == 1.0
+        assert config.limits.compactor.response_tokens_buffer == 320
+        assert config.limits.compactor.json_headroom_chars_floor == 64
+        assert config.limits.compactor.json_headroom_chars_ratio == 0.12
+        assert config.limits.compactor.json_headroom_chars_cap == 512
+        assert config.limits.compactor.chars_per_token_estimate == 4.2
+        assert config.limits.compactor.token_headroom == 16
+        assert config.limits.compactor.target_chars_ratio == 0.6

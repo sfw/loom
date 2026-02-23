@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
-from loom.config import Config, ExecutionConfig, VerificationConfig
+from loom.config import Config, ExecutionConfig, LimitsConfig, VerificationConfig
 from loom.engine.orchestrator import Orchestrator, SubtaskResult, ToolCallRecord, create_task
 from loom.engine.verification import VerificationResult
 from loom.events.bus import EventBus
@@ -27,6 +27,7 @@ from loom.processes.schema import PhaseTemplate, ProcessDefinition
 from loom.prompts.assembler import PromptAssembler
 from loom.recovery.retry import AttemptRecord, RetryStrategy
 from loom.state.task_state import (
+    Plan,
     Subtask,
     SubtaskStatus,
     Task,
@@ -202,6 +203,94 @@ class TestOrchestratorPlan:
         assert TASK_PLAN_READY in event_types
         assert TASK_EXECUTING in event_types
         assert TASK_COMPLETED in event_types
+
+    @pytest.mark.asyncio
+    async def test_plan_uses_planning_response_token_limit(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [
+                {"id": "step-1", "description": "Create file"},
+            ]
+        })
+        planner_max_tokens: list[int | None] = []
+
+        planner_model = AsyncMock()
+        planner_model.name = "mock-planner"
+        planner_model.complete = AsyncMock(side_effect=lambda _messages, **kwargs: (
+            planner_max_tokens.append(kwargs.get("max_tokens")),
+            ModelResponse(
+                text=plan_json,
+                usage=TokenUsage(input_tokens=100, output_tokens=50, total_tokens=150),
+            ),
+        )[1])
+
+        executor_model = AsyncMock()
+        executor_model.name = "mock-executor"
+        executor_model.complete = AsyncMock(return_value=ModelResponse(
+            text="done",
+            usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
+        ))
+
+        router = MagicMock(spec=ModelRouter)
+
+        def select_fn(tier=1, role="executor"):
+            del tier
+            return planner_model if role == "planner" else executor_model
+
+        router.select = MagicMock(side_effect=select_fn)
+
+        orch = Orchestrator(
+            model_router=router,
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=Config(limits=LimitsConfig(planning_response_max_tokens=16384)),
+        )
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert planner_max_tokens
+        assert planner_max_tokens[0] == 16384
+
+    @pytest.mark.asyncio
+    async def test_execute_task_reuses_existing_plan_when_requested(self, tmp_path):
+        bus = _make_event_bus()
+        events_received = []
+        bus.subscribe_all(lambda e: events_received.append(e))
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text="unused"),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=_make_config(),
+        )
+        orch._plan_task = AsyncMock(side_effect=AssertionError("planner should not run"))
+
+        task = _make_task()
+        task.status = TaskStatus.FAILED
+        task.plan = Plan(subtasks=[
+            Subtask(
+                id="done",
+                description="Already complete",
+                status=SubtaskStatus.COMPLETED,
+            ),
+        ])
+
+        result = await orch.execute_task(task, reuse_existing_plan=True)
+
+        assert result.status == TaskStatus.COMPLETED
+        orch._plan_task.assert_not_awaited()
+        event_types = [e.event_type for e in events_received]
+        assert TASK_PLAN_READY in event_types
+        assert TASK_PLANNING not in event_types
+        ready_event = next(e for e in events_received if e.event_type == TASK_PLAN_READY)
+        assert ready_event.data.get("reused") is True
 
     @pytest.mark.asyncio
     async def test_plan_fallback_on_invalid_json(self, tmp_path):
@@ -489,6 +578,66 @@ class TestOrchestratorExecution:
 
         _, kwargs = orch._runner.run.await_args
         assert kwargs["prior_successful_tool_calls"] == [successful_call]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_retry_enforces_canonical_deliverables(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "phase-a", "description": "Analyze"}]
+        })
+        process = ProcessDefinition(
+            name="test-process",
+            description="Test",
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task()
+        subtask = Subtask(id="phase-a", description="Analyze")
+        task.plan.subtasks = [subtask]
+
+        successful_call = ToolCallRecord(
+            tool="write_file",
+            args={"path": "analysis.md"},
+            result=ToolResult.ok("ok", files_changed=["analysis.md"]),
+        )
+        attempts = {
+            "phase-a": [
+                AttemptRecord(
+                    attempt=1,
+                    tier=1,
+                    feedback="Retry with fixes",
+                    retry_strategy=RetryStrategy.UNCONFIRMED_DATA,
+                    successful_tool_calls=[successful_call],
+                ),
+            ],
+        }
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="ok"),
+            VerificationResult(tier=1, passed=True),
+        ))
+
+        await orch._dispatch_subtask(task, subtask, attempts)
+
+        _, kwargs = orch._runner.run.await_args
+        assert kwargs["expected_deliverables"] == ["analysis.md"]
+        assert kwargs["enforce_deliverable_paths"] is True
+        assert kwargs["edit_existing_only"] is True
+        assert kwargs["retry_strategy"] == RetryStrategy.UNCONFIRMED_DATA.value
+        assert "CANONICAL DELIVERABLE FILES FOR THIS SUBTASK" in kwargs["retry_context"]
 
     @pytest.mark.asyncio
     async def test_single_subtask_exception_retries_instead_of_fatal_abort(self, tmp_path):
@@ -1100,6 +1249,7 @@ class TestOrchestratorExecution:
             read_roots=[],
             changelog=None,
             subtask_id="s1",
+            auth_context=ANY,
         )
 
     @pytest.mark.asyncio
@@ -1524,7 +1674,7 @@ class TestSubtaskRunnerContextBudget:
         assert len(summary) <= 60
 
     @pytest.mark.asyncio
-    async def test_compact_text_hard_caps_when_compactor_returns_oversize(self):
+    async def test_compact_text_keeps_oversize_compactor_output(self):
         runner = self._make_runner_for_compaction()
         runner._compactor = self._NoopCompactor()
 
@@ -1535,9 +1685,7 @@ class TestSubtaskRunnerContextBudget:
             label="oversize guard",
         )
 
-        assert len(compacted) <= 120
-        assert compacted.startswith("A")
-        assert compacted.endswith("A")
+        assert compacted == value
 
     @pytest.mark.asyncio
     async def test_compacts_recent_assistant_tool_call_arguments(self):
@@ -1622,3 +1770,78 @@ class TestSubtaskRunnerContextBudget:
             if event.event_type == ARTIFACT_CONFINEMENT_VIOLATION
         )
         assert violation.data["attempted_path"] == "../outside.md"
+
+    def test_tool_iteration_budget_uses_global_limit(self):
+        from loom.engine.runner import SubtaskRunner
+
+        research_subtask = Subtask(
+            id="collect-evidence",
+            description="Research and collect supporting evidence.",
+        )
+        verify_subtask = Subtask(
+            id="verify-findings",
+            description="Run verification checks on outputs.",
+        )
+        final_subtask = Subtask(
+            id="evaluate-select-twelve",
+            description=(
+                "Apply selection rubric to longlist to select exactly 12 final cases."
+            ),
+        )
+        research_budget = SubtaskRunner._tool_iteration_budget(
+            subtask=research_subtask,
+            retry_strategy="",
+            has_expected_deliverables=False,
+        )
+        verify_budget = SubtaskRunner._tool_iteration_budget(
+            subtask=verify_subtask,
+            retry_strategy="",
+            has_expected_deliverables=False,
+        )
+        remediation_budget = SubtaskRunner._tool_iteration_budget(
+            subtask=research_subtask,
+            retry_strategy="evidence_gap",
+            has_expected_deliverables=True,
+        )
+        final_budget = SubtaskRunner._tool_iteration_budget(
+            subtask=final_subtask,
+            retry_strategy="",
+            has_expected_deliverables=False,
+        )
+        custom_budget = SubtaskRunner._tool_iteration_budget(
+            subtask=final_subtask,
+            retry_strategy="rate_limit",
+            has_expected_deliverables=True,
+            base_budget=37,
+        )
+
+        assert research_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
+        assert verify_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
+        assert final_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
+        assert remediation_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
+        assert custom_budget == 37
+
+    def test_deliverable_policy_blocks_variant_and_noncanonical_retry_paths(self, tmp_path):
+        from loom.engine.runner import SubtaskRunner
+
+        variant_error = SubtaskRunner._validate_deliverable_write_policy(
+            tool_name="write_file",
+            tool_args={"path": "analysis-v2.md"},
+            workspace=tmp_path,
+            expected_deliverables=["analysis.md"],
+            enforce_deliverable_paths=False,
+            edit_existing_only=False,
+        )
+        assert variant_error is not None
+        assert "analysis.md" in variant_error
+
+        noncanonical_error = SubtaskRunner._validate_deliverable_write_policy(
+            tool_name="write_file",
+            tool_args={"path": "scratch-notes.md"},
+            workspace=tmp_path,
+            expected_deliverables=["analysis.md"],
+            enforce_deliverable_paths=True,
+            edit_existing_only=True,
+        )
+        assert noncanonical_error is not None
+        assert "Unexpected target(s)" in noncanonical_error

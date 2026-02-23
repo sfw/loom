@@ -8,14 +8,17 @@ results so the orchestrator never touches raw prompts or messages.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
+from loom.auth.runtime import AuthResolutionError, build_run_auth_context
 from loom.config import Config
 from loom.engine.semantic_compactor import SemanticCompactor
 from loom.engine.verification import Check, VerificationGates, VerificationResult
@@ -28,7 +31,10 @@ from loom.events.types import (
     TOOL_CALL_STARTED,
 )
 from loom.models.base import ModelResponse
-from loom.models.request_diagnostics import collect_request_diagnostics
+from loom.models.request_diagnostics import (
+    collect_request_diagnostics,
+    collect_response_diagnostics,
+)
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
@@ -44,6 +50,9 @@ from loom.tools.workspace import ChangeLog
 from loom.utils.tokens import estimate_tokens
 
 logger = logging.getLogger(__name__)
+_COMPACTOR_EVENT_CONTEXT: contextvars.ContextVar[tuple[str, str] | None] = (
+    contextvars.ContextVar("runner_compactor_event_context", default=None)
+)
 
 
 @dataclass
@@ -124,6 +133,29 @@ class SubtaskRunner:
         LEGACY_TOOL_CALL_CONTEXT_PLACEHOLDER.lower(),
     })
     _TODO_REMINDER_PREFIX = "CURRENT TASK STATE:\n"
+    _WRITE_MUTATING_TOOLS = frozenset({
+        "write_file",
+        "edit_file",
+        "document_write",
+        "move_file",
+        "delete_file",
+        "spreadsheet",
+    })
+    _SPREADSHEET_WRITE_OPERATIONS = frozenset({
+        "create",
+        "add_rows",
+        "add_column",
+        "update_cell",
+    })
+    _VARIANT_SUFFIX_MARKERS = (
+        "v",
+        "rev",
+        "copy",
+        "draft",
+        "final",
+        "updated",
+        "new",
+    )
 
     def __init__(
         self,
@@ -145,7 +177,194 @@ class SubtaskRunner:
         self._config = config
         self._validator = ResponseValidator()
         self._event_bus = event_bus
-        self._compactor = SemanticCompactor(model_router, role="extractor", tier=1)
+        runner_limits = getattr(getattr(config, "limits", None), "runner", None)
+        self._max_tool_iterations = int(
+            getattr(runner_limits, "max_tool_iterations", self.MAX_TOOL_ITERATIONS),
+        )
+        self._max_subtask_wall_clock_seconds = int(
+            getattr(
+                runner_limits,
+                "max_subtask_wall_clock_seconds",
+                self.MAX_SUBTASK_WALL_CLOCK,
+            ),
+        )
+        self._max_model_context_tokens = int(
+            getattr(
+                runner_limits,
+                "max_model_context_tokens",
+                self.MAX_MODEL_CONTEXT_TOKENS,
+            ),
+        )
+        self._max_state_summary_chars = int(
+            getattr(
+                runner_limits,
+                "max_state_summary_chars",
+                self.MAX_STATE_SUMMARY_CHARS,
+            ),
+        )
+        self._max_verification_summary_chars = int(
+            getattr(
+                runner_limits,
+                "max_verification_summary_chars",
+                self.MAX_VERIFICATION_SUMMARY_CHARS,
+            ),
+        )
+        self._default_tool_result_output_chars = int(
+            getattr(
+                runner_limits,
+                "default_tool_result_output_chars",
+                self.DEFAULT_TOOL_RESULT_OUTPUT_CHARS,
+            ),
+        )
+        self._heavy_tool_result_output_chars = int(
+            getattr(
+                runner_limits,
+                "heavy_tool_result_output_chars",
+                self.HEAVY_TOOL_RESULT_OUTPUT_CHARS,
+            ),
+        )
+        self._compact_tool_result_output_chars = int(
+            getattr(
+                runner_limits,
+                "compact_tool_result_output_chars",
+                self.COMPACT_TOOL_RESULT_OUTPUT_CHARS,
+            ),
+        )
+        self._compact_text_output_chars = int(
+            getattr(
+                runner_limits,
+                "compact_text_output_chars",
+                self.COMPACT_TEXT_OUTPUT_CHARS,
+            ),
+        )
+        self._minimal_text_output_chars = int(
+            getattr(
+                runner_limits,
+                "minimal_text_output_chars",
+                self.MINIMAL_TEXT_OUTPUT_CHARS,
+            ),
+        )
+        self._tool_call_argument_context_chars = int(
+            getattr(
+                runner_limits,
+                "tool_call_argument_context_chars",
+                self.TOOL_CALL_ARGUMENT_CONTEXT_CHARS,
+            ),
+        )
+        self._compact_tool_call_argument_chars = int(
+            getattr(
+                runner_limits,
+                "compact_tool_call_argument_chars",
+                self.COMPACT_TOOL_CALL_ARGUMENT_CHARS,
+            ),
+        )
+        self._evidence_context_text_max_chars = int(
+            getattr(
+                getattr(config, "limits", None),
+                "evidence_context_text_max_chars",
+                4000,
+            ),
+        )
+
+        compactor_limits = getattr(getattr(config, "limits", None), "compactor", None)
+        self._compactor = SemanticCompactor(
+            model_router,
+            model_event_hook=self._emit_compactor_model_event,
+            role="compactor",
+            tier=1,
+            allow_role_fallback=True,
+            max_chunk_chars=int(
+                getattr(
+                    compactor_limits,
+                    "max_chunk_chars",
+                    SemanticCompactor._MAX_CHUNK_CHARS,
+                ),
+            ),
+            max_chunks_per_round=int(
+                getattr(
+                    compactor_limits,
+                    "max_chunks_per_round",
+                    SemanticCompactor._MAX_CHUNKS_PER_ROUND,
+                ),
+            ),
+            max_reduction_rounds=int(
+                getattr(
+                    compactor_limits,
+                    "max_reduction_rounds",
+                    SemanticCompactor._MAX_REDUCTION_ROUNDS,
+                ),
+            ),
+            min_compact_target_chars=int(
+                getattr(
+                    compactor_limits,
+                    "min_compact_target_chars",
+                    SemanticCompactor._MIN_COMPACT_TARGET_CHARS,
+                ),
+            ),
+            response_tokens_floor=int(
+                getattr(
+                    compactor_limits,
+                    "response_tokens_floor",
+                    SemanticCompactor._RESPONSE_TOKENS_FLOOR,
+                ),
+            ),
+            response_tokens_ratio=float(
+                getattr(
+                    compactor_limits,
+                    "response_tokens_ratio",
+                    SemanticCompactor._RESPONSE_TOKENS_RATIO,
+                ),
+            ),
+            response_tokens_buffer=int(
+                getattr(
+                    compactor_limits,
+                    "response_tokens_buffer",
+                    SemanticCompactor._RESPONSE_TOKENS_BUFFER,
+                ),
+            ),
+            json_headroom_chars_floor=int(
+                getattr(
+                    compactor_limits,
+                    "json_headroom_chars_floor",
+                    SemanticCompactor._JSON_HEADROOM_CHARS_FLOOR,
+                ),
+            ),
+            json_headroom_chars_ratio=float(
+                getattr(
+                    compactor_limits,
+                    "json_headroom_chars_ratio",
+                    SemanticCompactor._JSON_HEADROOM_CHARS_RATIO,
+                ),
+            ),
+            json_headroom_chars_cap=int(
+                getattr(
+                    compactor_limits,
+                    "json_headroom_chars_cap",
+                    SemanticCompactor._JSON_HEADROOM_CHARS_CAP,
+                ),
+            ),
+            chars_per_token_estimate=float(
+                getattr(
+                    compactor_limits,
+                    "chars_per_token_estimate",
+                    SemanticCompactor._CHARS_PER_TOKEN_ESTIMATE,
+                ),
+            ),
+            token_headroom=int(
+                getattr(
+                    compactor_limits,
+                    "token_headroom",
+                    SemanticCompactor._TOKEN_HEADROOM,
+                ),
+            ),
+            target_chars_ratio=float(
+                getattr(
+                    compactor_limits,
+                    "target_chars_ratio",
+                    SemanticCompactor._TARGET_CHARS_RATIO,
+                ),
+            ),
+        )
 
     @staticmethod
     def _read_roots_for_task(task: Task, workspace: Path | None) -> list[Path]:
@@ -194,6 +413,10 @@ class SubtaskRunner:
         changelog: ChangeLog | None = None,
         prior_successful_tool_calls: list[ToolCallRecord] | None = None,
         prior_evidence_records: list[dict] | None = None,
+        expected_deliverables: list[str] | None = None,
+        enforce_deliverable_paths: bool = False,
+        edit_existing_only: bool = False,
+        retry_strategy: str = "",
     ) -> tuple[SubtaskResult, VerificationResult]:
         """Execute a subtask: prompt → tool loop → verify → extract memory.
 
@@ -201,8 +424,35 @@ class SubtaskRunner:
         Memory extraction is fire-and-forget — it does not block the return.
         """
         start_time = time.monotonic()
+        compactor_context_token = _COMPACTOR_EVENT_CONTEXT.set((task.id, subtask.id))
         workspace = Path(task.workspace) if task.workspace else None
         read_roots = self._read_roots_for_task(task, workspace)
+        auth_context = None
+        try:
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            auth_context = build_run_auth_context(
+                workspace=workspace,
+                metadata=metadata,
+            )
+        except AuthResolutionError as e:
+            failure_summary = f"Auth preflight failed: {e}"
+            result = SubtaskResult(
+                status=SubtaskResultStatus.FAILED,
+                summary=failure_summary,
+                duration_seconds=time.monotonic() - start_time,
+                model_used="",
+            )
+            verification = VerificationResult(
+                tier=1,
+                passed=False,
+                checks=[Check(name="auth_preflight", passed=False, detail=str(e))],
+                feedback=failure_summary,
+                outcome="fail",
+                reason_code="auth_preflight_failed",
+                metadata={"auth_error": str(e)},
+            )
+            _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
+            return result, verification
 
         # 1. Assemble prompt
         memory_entries = await self._memory.query_relevant(task.id, subtask.id)
@@ -240,13 +490,24 @@ class SubtaskRunner:
         streaming = self._config.execution.enable_streaming
         completed_normally = False
         interruption_reason: str | None = None
+        budget_exhaustion_note: str | None = None
+        canonical_deliverables = self._normalize_deliverable_paths(
+            expected_deliverables or [],
+            workspace=workspace,
+        )
+        iteration_budget = self._tool_iteration_budget(
+            subtask=subtask,
+            retry_strategy=retry_strategy,
+            has_expected_deliverables=bool(canonical_deliverables),
+            base_budget=self._max_tool_iterations,
+        )
 
-        for iteration in range(self.MAX_TOOL_ITERATIONS):
+        for iteration in range(iteration_budget):
             # Wall-clock timeout check
-            if time.monotonic() - start_time > self.MAX_SUBTASK_WALL_CLOCK:
+            if time.monotonic() - start_time > self._max_subtask_wall_clock_seconds:
                 interruption_reason = (
                     "Execution exceeded subtask time budget "
-                    f"({self.MAX_SUBTASK_WALL_CLOCK}s) before completion."
+                    f"({self._max_subtask_wall_clock_seconds}s) before completion."
                 )
                 break
             messages = await self._compact_messages_for_model(messages)
@@ -324,6 +585,7 @@ class SubtaskRunner:
                 )
                 response = None
             else:
+                response_diag = collect_response_diagnostics(response)
                 self._emit_model_event(
                     task_id=task.id,
                     subtask_id=subtask.id,
@@ -335,9 +597,7 @@ class SubtaskRunner:
                         "operation": operation,
                         "invocation_attempt": invocation_attempt,
                         "invocation_max_attempts": policy.max_attempts,
-                        "response_tool_calls": len(response.tool_calls or []),
-                        "response_tokens": response.usage.total_tokens,
-                        "response_chars": len(response.text or ""),
+                        **response_diag.to_event_payload(),
                     },
                 )
                 total_tokens += response.usage.total_tokens
@@ -385,13 +645,25 @@ class SubtaskRunner:
                         TOOL_CALL_STARTED, task.id, subtask.id,
                         tc.name, tc.arguments,
                     )
-                    tool_result = await self._tools.execute(
-                        tc.name, tc.arguments,
+                    policy_error = self._validate_deliverable_write_policy(
+                        tool_name=tc.name,
+                        tool_args=tc.arguments,
                         workspace=workspace,
-                        read_roots=read_roots,
-                        changelog=changelog,
-                        subtask_id=subtask.id,
+                        expected_deliverables=canonical_deliverables,
+                        enforce_deliverable_paths=enforce_deliverable_paths,
+                        edit_existing_only=edit_existing_only,
                     )
+                    if policy_error:
+                        tool_result = ToolResult.fail(policy_error)
+                    else:
+                        tool_result = await self._tools.execute(
+                            tc.name, tc.arguments,
+                            workspace=workspace,
+                            read_roots=read_roots,
+                            changelog=changelog,
+                            subtask_id=subtask.id,
+                            auth_context=auth_context,
+                        )
                     record = ToolCallRecord(
                         tool=tc.name,
                         args=tc.arguments,
@@ -404,6 +676,7 @@ class SubtaskRunner:
                         subtask_id=subtask.id,
                         tool_calls=[record],
                         existing_ids=known_evidence_ids,
+                        context_text_max_chars=self._evidence_context_text_max_chars,
                     )
                     if new_evidence:
                         evidence_records_current.extend(new_evidence)
@@ -447,15 +720,16 @@ class SubtaskRunner:
                 # Text-only response — subtask complete
                 completed_normally = True
                 break
-
-        if interruption_reason is None and not completed_normally:
+        else:
             if response is not None and response.has_tool_calls():
-                interruption_reason = (
+                budget_exhaustion_note = (
                     "Execution reached tool-iteration budget "
-                    f"({self.MAX_TOOL_ITERATIONS} turns) while additional "
+                    f"({iteration_budget} turns) while additional "
                     "tool calls were still required."
                 )
-            elif response is None:
+
+        if interruption_reason is None and not completed_normally:
+            if response is None:
                 interruption_reason = (
                     "Execution ended before receiving a model response."
                 )
@@ -472,14 +746,22 @@ class SubtaskRunner:
                 model_output = interruption_reason
         else:
             model_output = model_output_clean
+            if budget_exhaustion_note:
+                if model_output_clean:
+                    model_output = (
+                        f"{budget_exhaustion_note} Last model response: "
+                        f"{model_output_clean}"
+                    )
+                else:
+                    model_output = budget_exhaustion_note
         summary = await self._summarize_model_output(
             model_output,
-            max_chars=self.MAX_STATE_SUMMARY_CHARS,
+            max_chars=self._max_state_summary_chars,
             label="subtask state summary",
         )
         verification_summary = await self._summarize_model_output(
             model_output,
-            max_chars=self.MAX_VERIFICATION_SUMMARY_CHARS,
+            max_chars=self._max_verification_summary_chars,
             label="subtask verification summary",
         )
 
@@ -510,6 +792,7 @@ class SubtaskRunner:
                 feedback=interruption_reason,
             )
             self._spawn_memory_extraction(task.id, subtask.id, result)
+            _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
             return result, verification
 
         # 4. Verification
@@ -535,6 +818,7 @@ class SubtaskRunner:
         # 5. Memory extraction — fire-and-forget
         self._spawn_memory_extraction(task.id, subtask.id, result)
 
+        _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
         return result, verification
 
     def _spawn_memory_extraction(
@@ -605,8 +889,7 @@ class SubtaskRunner:
                 phase="done",
                 details={
                     "origin": request_diag.origin,
-                    "response_tokens": response.usage.total_tokens,
-                    "response_chars": len(response.text or ""),
+                    **collect_response_diagnostics(response).to_event_payload(),
                 },
             )
             entries = self._parse_memory_entries(response, task_id, subtask_id)
@@ -772,6 +1055,27 @@ class SubtaskRunner:
         text = str(error or "").lower()
         return "safety violation" in text and "escapes workspace" in text
 
+    def _emit_compactor_model_event(self, payload: dict) -> None:
+        """Bridge semantic-compactor model events into task model_invocation events."""
+        context = _COMPACTOR_EVENT_CONTEXT.get()
+        if not context:
+            return
+        task_id, subtask_id = context
+        model_name = str(payload.get("model", "")).strip() or "unknown"
+        phase = str(payload.get("phase", "")).strip() or "done"
+        details = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"model", "phase"}
+        }
+        self._emit_model_event(
+            task_id=task_id,
+            subtask_id=subtask_id,
+            model_name=model_name,
+            phase=phase,
+            details=details,
+        )
+
     def _emit_model_event(
         self,
         *,
@@ -812,10 +1116,198 @@ class SubtaskRunner:
         )
 
     @classmethod
-    def _tool_output_limit(cls, tool_name: str) -> int:
-        if tool_name in cls._HEAVY_OUTPUT_TOOLS:
-            return cls.HEAVY_TOOL_RESULT_OUTPUT_CHARS
-        return cls.DEFAULT_TOOL_RESULT_OUTPUT_CHARS
+    def _tool_iteration_budget(
+        cls,
+        *,
+        subtask: Subtask,
+        retry_strategy: str,
+        has_expected_deliverables: bool,
+        base_budget: int | None = None,
+    ) -> int:
+        del subtask, retry_strategy, has_expected_deliverables  # configured globally
+        budget = int(base_budget) if isinstance(base_budget, int) else cls.MAX_TOOL_ITERATIONS
+        return max(1, min(200, budget))
+
+    @staticmethod
+    def _normalize_path_for_policy(path_text: str, workspace: Path | None) -> str:
+        text = str(path_text or "").strip()
+        if not text:
+            return ""
+        path = Path(text).expanduser()
+        if path.is_absolute():
+            if workspace is None:
+                return path.as_posix().lstrip("./")
+            try:
+                return path.resolve().relative_to(workspace.resolve()).as_posix()
+            except Exception:
+                return path.as_posix().lstrip("./")
+        parts = [part for part in path.parts if part not in {"", "."}]
+        if workspace is not None and parts and parts[0] == workspace.name:
+            parts = parts[1:]
+        if not parts:
+            return ""
+        return Path(*parts).as_posix().lstrip("./")
+
+    @classmethod
+    def _normalize_deliverable_paths(
+        cls,
+        expected_deliverables: list[str],
+        *,
+        workspace: Path | None,
+    ) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in expected_deliverables:
+            value = cls._normalize_path_for_policy(str(item), workspace)
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
+    @classmethod
+    def _is_mutating_file_tool(cls, tool_name: str, tool_args: dict) -> bool:
+        name = str(tool_name or "").strip().lower()
+        if name not in cls._WRITE_MUTATING_TOOLS:
+            return False
+        if name != "spreadsheet":
+            return True
+        operation = str(tool_args.get("operation", "")).strip().lower()
+        return operation in cls._SPREADSHEET_WRITE_OPERATIONS
+
+    @classmethod
+    def _target_paths_for_policy(
+        cls,
+        *,
+        tool_name: str,
+        tool_args: dict,
+        workspace: Path | None,
+    ) -> list[str]:
+        if not cls._is_mutating_file_tool(tool_name, tool_args):
+            return []
+        keys = ("path", "destination", "source", "file", "file_path", "filepath")
+        result: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            raw = tool_args.get(key)
+            if raw is None:
+                continue
+            value = cls._normalize_path_for_policy(str(raw), workspace)
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
+
+    @classmethod
+    def _looks_like_deliverable_variant(
+        cls,
+        *,
+        candidate: str,
+        canonical: str,
+    ) -> bool:
+        cand = Path(candidate)
+        base = Path(canonical)
+        if cand == base:
+            return False
+        if cand.parent != base.parent or cand.suffix.lower() != base.suffix.lower():
+            return False
+        cand_stem = cand.stem.lower()
+        base_stem = base.stem.lower()
+        if not cand_stem.startswith(base_stem):
+            return False
+        remainder = cand_stem[len(base_stem):]
+        if not remainder or remainder[0] not in {"-", "_"}:
+            return False
+        tail = remainder[1:]
+        for marker in cls._VARIANT_SUFFIX_MARKERS:
+            if tail == marker:
+                return True
+            if tail.startswith(marker):
+                suffix = tail[len(marker):]
+                if not suffix:
+                    return True
+                if suffix.isdigit():
+                    return True
+                if suffix.startswith("-") and suffix[1:].isdigit():
+                    return True
+                if suffix.startswith("_") and suffix[1:].isdigit():
+                    return True
+        return bool(re.fullmatch(r"[a-z]{1,4}\d+", tail))
+
+    @classmethod
+    def _validate_deliverable_write_policy(
+        cls,
+        *,
+        tool_name: str,
+        tool_args: dict,
+        workspace: Path | None,
+        expected_deliverables: list[str],
+        enforce_deliverable_paths: bool,
+        edit_existing_only: bool,
+    ) -> str | None:
+        canonical = list(expected_deliverables)
+        if not canonical:
+            return None
+        paths = cls._target_paths_for_policy(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            workspace=workspace,
+        )
+        if not paths:
+            return None
+        canonical_set = set(canonical)
+        for path in paths:
+            if path in canonical_set:
+                continue
+            if any(
+                cls._looks_like_deliverable_variant(candidate=path, canonical=item)
+                for item in canonical
+            ):
+                allowed = ", ".join(canonical)
+                return (
+                    "Canonical deliverable policy violation: "
+                    f"'{path}' looks like a versioned copy of a required file. "
+                    f"Update canonical file(s) instead: {allowed}."
+                )
+        if enforce_deliverable_paths:
+            extras = [path for path in paths if path not in canonical_set]
+            if extras:
+                allowed = ", ".join(canonical)
+                return (
+                    "Canonical deliverable policy violation: "
+                    "retry/remediation writes must stay in canonical deliverables. "
+                    f"Unexpected target(s): {', '.join(extras)}. "
+                    f"Allowed: {allowed}."
+                )
+        if (
+            edit_existing_only
+            and str(tool_name or "").strip().lower() in {"move_file", "delete_file"}
+        ):
+            return (
+                "Remediation requires in-place edits to canonical deliverables. "
+                "Do not rename or delete files during retry."
+            )
+        return None
+
+    def _tool_output_limit(self, tool_name: str) -> int:
+        heavy_limit = int(
+            getattr(
+                self,
+                "_heavy_tool_result_output_chars",
+                self.HEAVY_TOOL_RESULT_OUTPUT_CHARS,
+            ),
+        )
+        default_limit = int(
+            getattr(
+                self,
+                "_default_tool_result_output_chars",
+                self.DEFAULT_TOOL_RESULT_OUTPUT_CHARS,
+            ),
+        )
+        if tool_name in self._HEAVY_OUTPUT_TOOLS:
+            return heavy_limit
+        return default_limit
 
     @staticmethod
     def _hard_cap_text(text: str, max_chars: int) -> str:
@@ -853,7 +1345,6 @@ class SubtaskRunner:
                 len(compacted),
                 max_chars,
             )
-            return self._hard_cap_text(compacted, max_chars)
         return compacted
 
     async def _summarize_model_output(
@@ -887,6 +1378,18 @@ class SubtaskRunner:
     async def _summarize_tool_data(self, data: dict | None) -> dict | None:
         if not isinstance(data, dict) or not data:
             return None
+        compact_tool_arg_chars = int(
+            getattr(
+                self,
+                "_compact_tool_call_argument_chars",
+                self.COMPACT_TOOL_CALL_ARGUMENT_CHARS,
+            ),
+        )
+        # Keep scalar fields slightly tighter than nested objects/lists.
+        compact_tool_data_text_chars = max(
+            80,
+            int(round(compact_tool_arg_chars * 0.75)),
+        )
         if len(data) > 12:
             packed = json.dumps(data, ensure_ascii=False, default=str)
             summary_text = await self._compact_text(
@@ -903,7 +1406,7 @@ class SubtaskRunner:
             if isinstance(value, str):
                 summary[key] = await self._compact_text(
                     value,
-                    max_chars=160,
+                    max_chars=compact_tool_data_text_chars,
                     label=f"tool data {key}",
                 )
             elif isinstance(value, (int, float, bool)) or value is None:
@@ -912,14 +1415,14 @@ class SubtaskRunner:
                 packed = json.dumps(value, ensure_ascii=False, default=str)
                 summary[key] = await self._compact_text(
                     packed,
-                    max_chars=220,
+                    max_chars=compact_tool_arg_chars,
                     label=f"tool data object {key}",
                 )
             elif isinstance(value, list):
                 packed = json.dumps(value, ensure_ascii=False, default=str)
                 summary[key] = await self._compact_text(
                     packed,
-                    max_chars=220,
+                    max_chars=compact_tool_arg_chars,
                     label=f"tool data list {key}",
                 )
             else:
@@ -957,13 +1460,20 @@ class SubtaskRunner:
         return {"summary": compacted}
 
     async def _serialize_tool_calls_for_message(self, tool_calls: list) -> list[dict]:
+        arg_limit = int(
+            getattr(
+                self,
+                "_tool_call_argument_context_chars",
+                self.TOOL_CALL_ARGUMENT_CONTEXT_CHARS,
+            ),
+        )
         serialized: list[dict] = []
         for tc in tool_calls:
             name = str(getattr(tc, "name", "") or "tool")
             args = getattr(tc, "arguments", {})
             compact_args = await self._summarize_tool_call_arguments(
                 args,
-                max_chars=self.TOOL_CALL_ARGUMENT_CONTEXT_CHARS,
+                max_chars=arg_limit,
                 label=f"{name} tool call args",
             )
             serialized.append({
@@ -1178,7 +1688,31 @@ class SubtaskRunner:
         if len(messages) < 3:
             return messages
 
-        if self._estimate_message_tokens(messages) <= self.MAX_MODEL_CONTEXT_TOKENS:
+        context_budget = int(
+            getattr(self, "_max_model_context_tokens", self.MAX_MODEL_CONTEXT_TOKENS),
+        )
+        compact_tool_call_args = int(
+            getattr(
+                self,
+                "_compact_tool_call_argument_chars",
+                self.COMPACT_TOOL_CALL_ARGUMENT_CHARS,
+            ),
+        )
+        compact_tool_output = int(
+            getattr(
+                self,
+                "_compact_tool_result_output_chars",
+                self.COMPACT_TOOL_RESULT_OUTPUT_CHARS,
+            ),
+        )
+        compact_text_chars = int(
+            getattr(self, "_compact_text_output_chars", self.COMPACT_TEXT_OUTPUT_CHARS),
+        )
+        minimal_text_chars = int(
+            getattr(self, "_minimal_text_output_chars", self.MINIMAL_TEXT_OUTPUT_CHARS),
+        )
+
+        if self._estimate_message_tokens(messages) <= context_budget:
             return messages
 
         compacted: list[dict] = [
@@ -1197,7 +1731,7 @@ class SubtaskRunner:
                 continue
             compact_calls = await self._compact_assistant_tool_calls(
                 msg.get("tool_calls"),
-                max_chars=self.COMPACT_TOOL_CALL_ARGUMENT_CHARS,
+                max_chars=compact_tool_call_args,
             )
             if compact_calls is not None:
                 msg["tool_calls"] = compact_calls
@@ -1223,7 +1757,7 @@ class SubtaskRunner:
                         msg["content"] = self.TOOL_CALL_CONTEXT_PLACEHOLDER
                         compact_calls = await self._compact_assistant_tool_calls(
                             msg.get("tool_calls"),
-                            max_chars=max(80, min(text_chars, 220)),
+                            max_chars=max(80, min(text_chars, compact_tool_call_args)),
                         )
                         if compact_calls is not None:
                             msg["tool_calls"] = compact_calls
@@ -1260,18 +1794,18 @@ class SubtaskRunner:
 
         await _apply_pass(
             preserve_recent=8,
-            tool_chars=self.COMPACT_TOOL_RESULT_OUTPUT_CHARS,
-            text_chars=self.COMPACT_TEXT_OUTPUT_CHARS,
+            tool_chars=compact_tool_output,
+            text_chars=compact_text_chars,
         )
-        if self._estimate_message_tokens(compacted) <= self.MAX_MODEL_CONTEXT_TOKENS:
+        if self._estimate_message_tokens(compacted) <= context_budget:
             return compacted
 
         await _apply_pass(
             preserve_recent=4,
             tool_chars=120,
-            text_chars=self.MINIMAL_TEXT_OUTPUT_CHARS,
+            text_chars=minimal_text_chars,
         )
-        if self._estimate_message_tokens(compacted) <= self.MAX_MODEL_CONTEXT_TOKENS:
+        if self._estimate_message_tokens(compacted) <= context_budget:
             return compacted
 
         # Final semantic merge pass: replace old context with one compact brief.
@@ -1316,7 +1850,7 @@ class SubtaskRunner:
                 ]
                 if (
                     self._estimate_message_tokens(compacted)
-                    <= self.MAX_MODEL_CONTEXT_TOKENS
+                    <= context_budget
                 ):
                     return compacted
 

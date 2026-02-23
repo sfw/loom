@@ -206,3 +206,24 @@ class TestRetryManager:
 
         assert "TARGETED RETRY PLAN" in context
         assert "Resolve verification findings" in context
+
+    def test_build_retry_context_includes_edit_in_place_file_guidance(self):
+        class _Call:
+            def __init__(self, files_changed):
+                self.result = type("Result", (), {"files_changed": files_changed})()
+
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="retry",
+                successful_tool_calls=[_Call(["analysis.md", "evidence.csv"])],
+            ),
+        ]
+        context = mgr.build_retry_context(attempts)
+
+        assert "EDIT IN PLACE" in context
+        assert "analysis.md" in context
+        assert "evidence.csv" in context
+        assert "-v2" in context

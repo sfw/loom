@@ -91,6 +91,69 @@ MCP server configuration can be supplied in:
 | `confirm_or_prune_backoff_seconds` | `float` | `2.0` | Backoff between remediation attempts. |
 | `confirm_or_prune_retry_on_transient` | `bool` | `true` | Retry remediation when transient failures are detected. |
 
+### `[limits]`
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `planning_response_max_tokens` | `int` | `16384` | Planner synthesis response budget. |
+| `adhoc_repair_source_max_chars` | `int` | `0` | Source truncation limit for ad hoc JSON repair (`0` means disabled). |
+| `evidence_context_text_max_chars` | `int` | `8192` | Evidence context cap fed into planning/verification prompts. |
+
+### `[limits.runner]`
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `max_tool_iterations` | `int` | `20` | Max tool/model loop iterations per subtask execution pass. |
+| `max_subtask_wall_clock_seconds` | `int` | `1200` | Per-subtask wall-clock timeout budget. |
+| `max_model_context_tokens` | `int` | `24000` | Runner model-context budget hint. |
+| `max_state_summary_chars` | `int` | `640` | Target size for compacted state summaries. |
+| `max_verification_summary_chars` | `int` | `8000` | Target size for verification summary payloads. |
+| `default_tool_result_output_chars` | `int` | `2800` | Default tool output compaction target. |
+| `heavy_tool_result_output_chars` | `int` | `3600` | Output target for heavy tools. |
+| `compact_tool_result_output_chars` | `int` | `900` | Output target for aggressively compacted tool excerpts. |
+| `compact_text_output_chars` | `int` | `1400` | Generic compacted text target. |
+| `minimal_text_output_chars` | `int` | `260` | Tiny fallback compacted text target. |
+| `tool_call_argument_context_chars` | `int` | `700` | Argument context extraction target. |
+| `compact_tool_call_argument_chars` | `int` | `1600` | Aggressive tool-argument compaction target. |
+
+### `[limits.verifier]`
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `max_tool_args_chars` | `int` | `360` | Max tool-argument excerpt size in verifier prompts. |
+| `max_tool_status_chars` | `int` | `320` | Max status excerpt size in verifier prompts. |
+| `max_tool_calls_tokens` | `int` | `4000` | Budget for serialized tool-call context in verification. |
+| `max_verifier_prompt_tokens` | `int` | `12000` | Verifier prompt assembly budget. |
+| `max_result_summary_chars` | `int` | `7000` | Max result summary size before extra compaction. |
+| `compact_result_summary_chars` | `int` | `2600` | Aggressive result-summary target. |
+| `max_evidence_section_chars` | `int` | `4200` | Evidence section limit for verification output. |
+| `max_evidence_section_compact_chars` | `int` | `2200` | Compacted evidence section target. |
+| `max_artifact_section_chars` | `int` | `4200` | Artifact section limit for verification output. |
+| `max_artifact_section_compact_chars` | `int` | `2200` | Compacted artifact section target. |
+| `max_tool_output_excerpt_chars` | `int` | `1100` | Tool output excerpt cap in verifier payloads. |
+| `max_artifact_file_excerpt_chars` | `int` | `800` | Artifact file excerpt cap in verifier payloads. |
+
+### `[limits.compactor]`
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `max_chunk_chars` | `int` | `8000` | Chunk size before hierarchical map/reduce compaction. |
+| `max_chunks_per_round` | `int` | `10` | Max chunks compacted per reduction round. |
+| `max_reduction_rounds` | `int` | `2` | Max full compaction reduction rounds per payload. |
+| `min_compact_target_chars` | `int` | `220` | Floor target when reducing per-attempt character budget. |
+| `response_tokens_floor` | `int` | `256` | Minimum `max_tokens` sent to compactor model calls. |
+| `response_tokens_ratio` | `float` | `0.55` | Token-budget ratio derived from hard character limits. |
+| `response_tokens_buffer` | `int` | `256` | Fixed token headroom added to compactor budget. |
+| `json_headroom_chars_floor` | `int` | `128` | Minimum extra characters reserved for JSON envelope overhead. |
+| `json_headroom_chars_ratio` | `float` | `0.30` | Ratio-based JSON envelope headroom. |
+| `json_headroom_chars_cap` | `int` | `1024` | Upper cap for JSON envelope headroom. |
+| `chars_per_token_estimate` | `float` | `2.8` | Character/token estimator used for budget calculations. |
+| `token_headroom` | `int` | `128` | Extra tokens added after char/token conversion. |
+| `target_chars_ratio` | `float` | `0.82` | Attempt target ratio under hard limit. |
+
+Compactor validation warnings:
+- If final retry still exceeds target chars, Loom keeps the compacted output and emits warning telemetry fields (`compactor_warning`, `compactor_warning_reason`, `compactor_warning_delta_chars`) instead of truncating.
+
 ### `[memory]`
 
 | Key | Type | Default | Description |
@@ -113,7 +176,7 @@ MCP server configuration can be supplied in:
 | `require_rule_scope_metadata` | `bool` | `false` | Enforce stricter rule scope metadata validation. |
 | `require_v2_contract` | `bool` | `false` | Require `schema_version: 2` process contracts. |
 | `tui_run_scoped_workspace_enabled` | `bool` | `true` | Create per-run subfolders for TUI `/run` executions. |
-| `llm_run_folder_naming_enabled` | `bool` | `true` | Allow model-generated run folder names in TUI. |
+| `llm_run_folder_naming_enabled` | `bool` | `true` | Allow model-generated run folder names in TUI. Low-quality/echoed names are rejected and fallback naming is used. |
 
 ### Legacy `[mcp]` in `loom.toml` (supported)
 
