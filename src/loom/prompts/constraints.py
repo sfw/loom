@@ -23,9 +23,10 @@ SAFETY_CONSTRAINTS = """\
 - Do NOT access the network unless the task explicitly requires it."""
 
 PLANNER_CONSTRAINTS = """\
-- Create 3-15 subtasks. Fewer is better if the task is simple.
+- Create 3-30 subtasks. Let task complexity determine the count.
 - The first subtask should always read/inspect the current state.
 - Do NOT create subtasks that depend on information you don't have.
+- Use depends_on to expose independent subtasks that can run in parallel.
 - Each subtask ID must be unique and descriptive."""
 
 VERIFIER_CONSTRAINTS = """\

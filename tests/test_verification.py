@@ -499,7 +499,7 @@ class TestLLMVerifier:
         assert result.feedback == "Verification inconclusive: could not parse verifier output."
 
     @pytest.mark.asyncio
-    async def test_verifier_compact_text_hard_caps_when_compactor_returns_oversize(self):
+    async def test_verifier_compact_text_keeps_oversize_compactor_output(self):
         router = MagicMock(spec=ModelRouter)
         prompts = MagicMock(spec=PromptAssembler)
 
@@ -513,9 +513,7 @@ class TestLLMVerifier:
             label="verifier oversize guard",
         )
 
-        assert len(compacted) <= 180
-        assert compacted.startswith("B")
-        assert compacted.endswith("B")
+        assert compacted == value
 
     @pytest.mark.asyncio
     async def test_fails_safe_on_no_verifier(self):
@@ -1024,6 +1022,35 @@ class TestVerificationGates:
         result = await gates.verify(_make_subtask(), "output", [tc], None, tier=2)
         assert not result.passed
         assert result.tier == 1  # Failed at tier 1, never reached tier 2
+
+    @pytest.mark.asyncio
+    async def test_tier2_parse_inconclusive_falls_back_to_tier1_warning(self):
+        config = VerificationConfig(tier1_enabled=True, tier2_enabled=True)
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
+        model.complete = AsyncMock(return_value=ModelResponse(
+            text="I cannot determine the result from the available information.",
+            usage=TokenUsage(input_tokens=20, output_tokens=15, total_tokens=35),
+        ))
+        router.select = MagicMock(return_value=model)
+        prompts = PromptAssembler()
+
+        gates = VerificationGates(router, prompts, config)
+        result = await gates.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "subtask summary",
+            [],
+            None,
+            tier=2,
+            task_id="task-parse-fallback",
+        )
+
+        assert result.passed
+        assert result.outcome == "pass_with_warnings"
+        assert result.reason_code == "infra_verifier_error"
+        assert result.severity_class == "infra"
+        assert result.metadata.get("fallback") == "tier1_due_to_tier2_parse_inconclusive"
 
     @pytest.mark.asyncio
     async def test_policy_engine_merges_tier1_warnings_with_tier2_pass(self):

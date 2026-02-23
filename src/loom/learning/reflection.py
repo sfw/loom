@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from loom.engine.semantic_compactor import SemanticCompactor
 from loom.learning.manager import LearnedPattern, LearningManager
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.models.router import ModelRouter
 
 logger = logging.getLogger(__name__)
 
@@ -282,11 +283,22 @@ class GapAnalysisEngine:
         self,
         learning: LearningManager,
         model=None,  # ModelProvider, optional for LLM-assisted extraction
+        model_router: ModelRouter | None = None,
+        model_role: str = "extractor",
+        model_tier: int = 1,
         model_retry_policy: ModelRetryPolicy | None = None,
     ):
         self._learning = learning
         self._model = model
-        self._compactor = SemanticCompactor(model=model)
+        self._model_router = model_router
+        self._model_role = str(model_role or "extractor").strip() or "extractor"
+        self._model_tier = int(model_tier or 1)
+        self._compactor = SemanticCompactor(
+            model=model,
+            model_router=model_router if model is None else None,
+            role=self._model_role,
+            tier=self._model_tier,
+        )
         self._model_retry_policy = model_retry_policy or ModelRetryPolicy()
 
         # State: the last completion point
@@ -295,7 +307,26 @@ class GapAnalysisEngine:
     @property
     def has_model(self) -> bool:
         """Whether LLM-assisted extraction is available."""
-        return self._model is not None
+        return self._resolved_model() is not None
+
+    def _resolved_model(self):
+        """Resolve the LLM used for reflection (explicit model or role-routed)."""
+        if self._model is not None:
+            return self._model
+        if self._model_router is None:
+            return None
+        try:
+            return self._model_router.select(
+                tier=self._model_tier,
+                role=self._model_role,
+            )
+        except Exception as e:
+            logger.debug(
+                "Reflection model unavailable for role %s: %s",
+                self._model_role,
+                e,
+            )
+            return None
 
     async def on_turn_complete(
         self,
@@ -358,7 +389,7 @@ class GapAnalysisEngine:
             return heuristic
 
         # For continuation (the default/ambiguous case), use LLM if available
-        if self._model is not None:
+        if self._resolved_model() is not None:
             return await self._classify_followup_llm(user_message, completed_summary)
 
         return heuristic
@@ -383,9 +414,12 @@ class GapAnalysisEngine:
             completed_summary=compact_summary,
             user_followup=compact_followup,
         )
+        model = self._resolved_model()
+        if model is None:
+            return FollowupType.CONTINUATION
         try:
             response = await call_with_model_retry(
-                lambda: self._model.complete(
+                lambda: model.complete(
                     [{"role": "user", "content": prompt}],
                 ),
                 policy=self._model_retry_policy,
@@ -411,7 +445,7 @@ class GapAnalysisEngine:
         If no LLM is available, falls back to a simple heuristic that
         captures the follow-up as-is.
         """
-        if self._model is not None:
+        if self._resolved_model() is not None:
             return await self._extract_gap_llm(
                 completed_summary, user_followup, followup_type,
             )
@@ -449,9 +483,12 @@ class GapAnalysisEngine:
             completed_summary=compact_summary,
             user_followup=compact_followup,
         )
+        model = self._resolved_model()
+        if model is None:
+            return None
         try:
             response = await call_with_model_retry(
-                lambda: self._model.complete(
+                lambda: model.complete(
                     [{"role": "user", "content": prompt}],
                 ),
                 policy=self._model_retry_policy,

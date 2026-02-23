@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from loom.learning.manager import LearnedPattern, LearningManager
@@ -315,6 +317,45 @@ class TestGapAnalysisNoLLM:
             assistant_response="You're welcome!",
         )
         assert engine._pending_completion is None
+
+
+class TestGapAnalysisRoleRouting:
+    @pytest.mark.asyncio
+    async def test_uses_router_selected_model_when_no_explicit_model(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        mgr = LearningManager(db)
+
+        extractor_model = MagicMock(name="extractor-model")
+        extractor_model.complete = AsyncMock(return_value=MagicMock(text="NEW_TASK"))
+
+        router = MagicMock()
+        router.select = MagicMock(return_value=extractor_model)
+
+        engine = GapAnalysisEngine(
+            learning=mgr,
+            model_router=router,
+            model_role="extractor",
+            model_tier=1,
+        )
+
+        # First turn establishes a completion point.
+        await engine.on_turn_complete(
+            user_message="Implement feature",
+            assistant_response=(
+                "I've implemented the feature. "
+                "Let me know if you need anything else."
+            ),
+        )
+        # Second turn uses router-selected model for ambiguous continuation classification.
+        result = await engine.on_turn_complete(
+            user_message="test and lint it",
+            assistant_response="Sure, doing that now.",
+        )
+
+        assert result.followup_type == FollowupType.NEW_TASK
+        assert router.select.call_count >= 1
+        extractor_model.complete.assert_awaited()
 
 
 # --- Completion summary ---

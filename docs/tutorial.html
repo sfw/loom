@@ -1583,7 +1583,7 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     <tr><td><code>process.require_rule_scope_metadata</code></td><td><code>false</code></td><td>Enforce strict rule scope metadata validation</td></tr>
     <tr><td><code>process.require_v2_contract</code></td><td><code>false</code></td><td>Require process contract <code>schema_version: 2</code></td></tr>
     <tr><td><code>process.tui_run_scoped_workspace_enabled</code></td><td><code>true</code></td><td>Create per-run subfolders for TUI <code>/run</code></td></tr>
-    <tr><td><code>process.llm_run_folder_naming_enabled</code></td><td><code>true</code></td><td>Allow model-generated names for run folders</td></tr>
+    <tr><td><code>process.llm_run_folder_naming_enabled</code></td><td><code>true</code></td><td>Allow model-generated names for run folders (guarded; low-quality names fall back to deterministic slugs)</td></tr>
   </table>
 
   <h3>MCP (Legacy in <code>loom.toml</code>)</h3>
@@ -1657,6 +1657,20 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
 <span class="key">delegate_task_timeout_seconds</span> = <span class="val">7200</span></code></pre>
       <p>Environment override (optional):</p>
       <pre><code><span class="cmd">export</span> LOOM_DELEGATE_TIMEOUT_SECONDS=7200</code></pre>
+    </div>
+  </details>
+
+  <details class="accordion">
+    <summary>Compactor warnings: <code>output_exceeds_target</code></summary>
+    <div class="inner">
+      <p>This warning means semantic compaction preserved content but could not reach the exact target size after retry. Loom now keeps that output and logs warning telemetry instead of truncating text.</p>
+      <p>In event logs, inspect these fields on compactor validation events:</p>
+      <ul style="padding-left: 20px; color: var(--text-dim);">
+        <li><code>compactor_warning</code></li>
+        <li><code>compactor_warning_reason</code></li>
+        <li><code>compactor_warning_delta_chars</code></li>
+      </ul>
+      <p>If warnings are frequent, increase the relevant runner/compactor limits in <code>loom.toml</code> to reduce pressure.</p>
     </div>
   </details>
 

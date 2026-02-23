@@ -52,9 +52,10 @@ instructions: |
   }}
 
 constraints: |
-  - Create 3-15 subtasks. Fewer is better if the task is simple.
+  - Create 3-30 subtasks. Let task complexity determine the count.
   - The first subtask should always read/inspect the current state before making changes.
   - Do NOT create subtasks that depend on information you don't have — inspect first, plan second.
+  - Use depends_on to expose independent subtasks so parallel work can be scheduled.
   - Each subtask ID must be unique and descriptive (e.g., "install-deps", "add-types", "run-tests").
   - Set model_tier: 1 for simple file ops, 2 for code generation, 3 for complex reasoning.
   - Set verification_tier: 1 for file checks, 2 for LLM review of complex output.

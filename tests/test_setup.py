@@ -66,7 +66,7 @@ class TestGenerateToml:
             "base_url": "https://api.anthropic.com",
             "model": "claude-sonnet-4-5-20250929",
             "api_key": "sk-ant-test123",
-            "roles": ["planner", "executor", "extractor", "verifier"],
+            "roles": ["planner", "executor", "extractor", "verifier", "compactor"],
             "max_tokens": 4096,
             "temperature": 0.1,
         }]
@@ -112,7 +112,7 @@ class TestGenerateToml:
             "base_url": "http://localhost:11434",
             "model": "llama3:8b",
             "api_key": "",
-            "roles": ["planner", "executor", "extractor", "verifier"],
+            "roles": ["planner", "executor", "extractor", "verifier", "compactor"],
             "max_tokens": 4096,
             "temperature": 0.1,
         }]
@@ -268,7 +268,7 @@ class TestRolePresets:
 
     def test_all_covers_every_role(self):
         assert set(ROLE_PRESETS["all"]) == {
-            "planner", "executor", "extractor", "verifier",
+            "planner", "executor", "extractor", "verifier", "compactor",
         }
 
     def test_primary_and_utility_cover_all(self):
@@ -390,7 +390,7 @@ class TestSetupScreen:
             "base_url": "http://localhost:11434",
             "model": "qwen3:14b",
             "api_key": "",
-            "roles": ["planner", "executor", "extractor", "verifier"],
+            "roles": ["planner", "executor", "extractor", "verifier", "compactor"],
             "max_tokens": 4096,
             "temperature": 0.1,
         }
@@ -438,7 +438,7 @@ class TestSetupScreen:
             "base_url": "http://localhost:11434",
             "model": "qwen3:14b",
             "api_key": "",
-            "roles": ["planner", "executor", "extractor", "verifier"],
+            "roles": ["planner", "executor", "extractor", "verifier", "compactor"],
             "max_tokens": 4096,
             "temperature": 0.1,
         }
@@ -458,7 +458,7 @@ class TestSetupScreen:
         screen._base_url = "http://localhost:11434"
         screen._model_name = "qwen3:14b"
         screen._api_key = ""
-        screen._roles = ["planner", "executor", "extractor", "verifier"]
+        screen._roles = ["planner", "executor", "extractor", "verifier", "compactor"]
 
         # Stub _prepare_confirm to track call
         called = []
@@ -719,7 +719,7 @@ class TestSetupScreenModelDrafts:
         screen._base_url = "http://localhost:11434"
         screen._model_name = "model-v1"
         screen._api_key = ""
-        screen._roles = ["planner", "executor", "extractor", "verifier"]
+        screen._roles = ["planner", "executor", "extractor", "verifier", "compactor"]
 
         screen._prepare_confirm = lambda: None
 
@@ -779,7 +779,7 @@ class TestSetupScreenModelDrafts:
         }
         screen._utility_model = {
             "name": "utility",
-            "roles": ["extractor", "verifier"],
+            "roles": ["extractor", "verifier", "compactor"],
             "model": "test2",
             "provider": "ollama",
             "base_url": "http://localhost:11434",

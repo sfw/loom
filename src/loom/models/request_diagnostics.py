@@ -16,6 +16,7 @@ from loom.utils.tokens import estimate_tokens
 
 _OVERSIZE_REQUEST_BYTES = 3_500_000
 _LARGE_REQUEST_BYTES = 1_000_000
+_DEFAULT_RESPONSE_PREVIEW_CHARS = 320
 
 
 def _safe_json_dumps(value: Any) -> str:
@@ -130,6 +131,83 @@ class RequestDiagnostics:
                 else "large" if self.is_large else "normal"
             ),
         }
+
+
+@dataclass(frozen=True)
+class ResponseDiagnostics:
+    """Compact response metrics for logging and event payloads."""
+
+    response_tokens: int
+    response_chars: int
+    response_tool_calls: int
+    response_preview: str
+    response_preview_truncated: bool
+    response_finish_reason: str
+
+    def to_event_payload(self) -> dict[str, Any]:
+        """Serialize response diagnostics for event-bus emission."""
+        return {
+            "response_tokens": self.response_tokens,
+            "response_chars": self.response_chars,
+            "response_tool_calls": self.response_tool_calls,
+            "response_preview": self.response_preview,
+            "response_preview_truncated": self.response_preview_truncated,
+            "response_finish_reason": self.response_finish_reason,
+        }
+
+
+def _truncate_preview(text: str, *, max_chars: int) -> tuple[str, bool]:
+    if max_chars <= 0:
+        return "", False
+
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= max_chars:
+        return cleaned, False
+
+    if max_chars <= 16:
+        return cleaned[:max_chars], True
+
+    marker = "...[truncated]"
+    keep = max_chars - len(marker)
+    if keep <= 0:
+        return cleaned[:max_chars], True
+    return f"{cleaned[:keep]}{marker}", True
+
+
+def collect_response_diagnostics(
+    response: Any,
+    *,
+    max_preview_chars: int = _DEFAULT_RESPONSE_PREVIEW_CHARS,
+) -> ResponseDiagnostics:
+    """Compute compact diagnostics from a model response object."""
+    text_value = str(getattr(response, "text", "") or "")
+    usage = getattr(response, "usage", None)
+    tool_calls = getattr(response, "tool_calls", None)
+
+    response_tokens_raw = getattr(usage, "total_tokens", 0)
+    try:
+        response_tokens = int(response_tokens_raw or 0)
+    except (TypeError, ValueError):
+        response_tokens = 0
+
+    response_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 0
+    finish_reason_raw = getattr(response, "finish_reason", "")
+    if finish_reason_raw is None:
+        finish_reason = ""
+    else:
+        finish_reason = str(finish_reason_raw).strip()
+    preview, preview_truncated = _truncate_preview(
+        text_value,
+        max_chars=max_preview_chars,
+    )
+    return ResponseDiagnostics(
+        response_tokens=response_tokens,
+        response_chars=len(text_value),
+        response_tool_calls=response_tool_calls,
+        response_preview=preview,
+        response_preview_truncated=preview_truncated,
+        response_finish_reason=finish_reason,
+    )
 
 
 def collect_request_diagnostics(

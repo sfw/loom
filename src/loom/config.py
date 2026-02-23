@@ -76,10 +76,11 @@ class ModelConfig:
     provider: str  # "ollama" | "openai_compatible" | "anthropic"
     base_url: str = ""
     model: str = ""
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     temperature: float = 0.1
     roles: list[str] = field(default_factory=lambda: ["executor"])
     api_key: str = ""
+    reasoning_effort: str = ""
     tier: int = 0  # 0 = auto-detect from model name
     capabilities: ModelCapabilities | None = None  # None = auto-detect
 
@@ -160,6 +161,73 @@ class ProcessConfig:
 
 
 @dataclass(frozen=True)
+class RunnerLimitsConfig:
+    """Execution-time sizing and compaction limits for subtask runner."""
+
+    max_tool_iterations: int = 20
+    max_subtask_wall_clock_seconds: int = 1200
+    max_model_context_tokens: int = 24_000
+    max_state_summary_chars: int = 480
+    max_verification_summary_chars: int = 8000
+    default_tool_result_output_chars: int = 4000
+    heavy_tool_result_output_chars: int = 2000
+    compact_tool_result_output_chars: int = 500
+    compact_text_output_chars: int = 900
+    minimal_text_output_chars: int = 260
+    tool_call_argument_context_chars: int = 500
+    compact_tool_call_argument_chars: int = 220
+
+
+@dataclass(frozen=True)
+class VerifierLimitsConfig:
+    """Sizing limits for LLM verification prompts and excerpts."""
+
+    max_tool_args_chars: int = 360
+    max_tool_status_chars: int = 320
+    max_tool_calls_tokens: int = 4000
+    max_verifier_prompt_tokens: int = 12_000
+    max_result_summary_chars: int = 7000
+    compact_result_summary_chars: int = 2600
+    max_evidence_section_chars: int = 4200
+    max_evidence_section_compact_chars: int = 2200
+    max_artifact_section_chars: int = 4200
+    max_artifact_section_compact_chars: int = 2200
+    max_tool_output_excerpt_chars: int = 1100
+    max_artifact_file_excerpt_chars: int = 800
+
+
+@dataclass(frozen=True)
+class CompactorLimitsConfig:
+    """Internal limits for semantic compactor chunking + response sizing."""
+
+    max_chunk_chars: int = 9000
+    max_chunks_per_round: int = 12
+    max_reduction_rounds: int = 4
+    min_compact_target_chars: int = 140
+    response_tokens_floor: int = 256
+    response_tokens_ratio: float = 0.75
+    response_tokens_buffer: int = 256
+    json_headroom_chars_floor: int = 48
+    json_headroom_chars_ratio: float = 0.08
+    json_headroom_chars_cap: int = 320
+    chars_per_token_estimate: float = 3.6
+    token_headroom: int = 24
+    target_chars_ratio: float = 0.75
+
+
+@dataclass(frozen=True)
+class LimitsConfig:
+    """Centralized sizing limits for prompts, compaction, and extraction."""
+
+    planning_response_max_tokens: int = 16_384
+    adhoc_repair_source_max_chars: int = 0  # 0 = no truncation
+    evidence_context_text_max_chars: int = 4000
+    runner: RunnerLimitsConfig = field(default_factory=RunnerLimitsConfig)
+    verifier: VerifierLimitsConfig = field(default_factory=VerifierLimitsConfig)
+    compactor: CompactorLimitsConfig = field(default_factory=CompactorLimitsConfig)
+
+
+@dataclass(frozen=True)
 class MCPServerConfig:
     """Configuration for one external MCP server."""
 
@@ -190,11 +258,26 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     process: ProcessConfig = field(default_factory=ProcessConfig)
+    limits: LimitsConfig = field(default_factory=LimitsConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
+
+    def _resolve_database_path(self) -> Path:
+        """Resolve the configured database path with scratch-temp redirect.
+
+        Relative temporary DB names (for example ``.tmp_loom.db``) should not
+        write next to the current working directory. Treat them as scratch
+        artifacts and place them under ``workspace.scratch_dir``.
+        """
+        path = Path(self.memory.database_path).expanduser()
+        if path.is_absolute():
+            return path
+        if path.name.startswith(".tmp_"):
+            return self.scratch_path / path.name
+        return path
 
     @property
     def database_path(self) -> Path:
-        return Path(self.memory.database_path).expanduser()
+        return self._resolve_database_path()
 
     @property
     def scratch_path(self) -> Path:
@@ -227,13 +310,56 @@ def _parse_model_config(name: str, data: dict) -> ModelConfig:
         provider=data["provider"],
         base_url=data.get("base_url", ""),
         model=data.get("model", ""),
-        max_tokens=data.get("max_tokens", 4096),
+        max_tokens=data.get("max_tokens", ModelConfig.max_tokens),
         temperature=data.get("temperature", 0.1),
         roles=roles,
         api_key=data.get("api_key", ""),
+        reasoning_effort=str(data.get("reasoning_effort", "") or "").strip(),
         tier=data.get("tier", 0),
         capabilities=capabilities,
     )
+
+
+def _int_from(
+    source: dict,
+    key: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Parse an int from dict with optional clamping."""
+    raw = source.get(key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = int(default)
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _float_from(
+    source: dict,
+    key: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    """Parse a float from dict with optional clamping."""
+    raw = source.get(key, default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = float(default)
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -412,6 +538,314 @@ def load_config(path: Path | None = None) -> Config:
         ),
     )
 
+    limits_data = raw.get("limits", {})
+    if not isinstance(limits_data, dict):
+        limits_data = {}
+    runner_limits_data = limits_data.get("runner", {})
+    if not isinstance(runner_limits_data, dict):
+        runner_limits_data = {}
+    verifier_limits_data = limits_data.get("verifier", {})
+    if not isinstance(verifier_limits_data, dict):
+        verifier_limits_data = {}
+    compactor_limits_data = limits_data.get("compactor", {})
+    if not isinstance(compactor_limits_data, dict):
+        compactor_limits_data = {}
+
+    runner_limits = RunnerLimitsConfig(
+        max_tool_iterations=_int_from(
+            runner_limits_data,
+            "max_tool_iterations",
+            RunnerLimitsConfig.max_tool_iterations,
+            minimum=4,
+            maximum=60,
+        ),
+        max_subtask_wall_clock_seconds=_int_from(
+            runner_limits_data,
+            "max_subtask_wall_clock_seconds",
+            RunnerLimitsConfig.max_subtask_wall_clock_seconds,
+            minimum=60,
+            maximum=86_400,
+        ),
+        max_model_context_tokens=_int_from(
+            runner_limits_data,
+            "max_model_context_tokens",
+            RunnerLimitsConfig.max_model_context_tokens,
+            minimum=2048,
+            maximum=500_000,
+        ),
+        max_state_summary_chars=_int_from(
+            runner_limits_data,
+            "max_state_summary_chars",
+            RunnerLimitsConfig.max_state_summary_chars,
+            minimum=120,
+            maximum=20_000,
+        ),
+        max_verification_summary_chars=_int_from(
+            runner_limits_data,
+            "max_verification_summary_chars",
+            RunnerLimitsConfig.max_verification_summary_chars,
+            minimum=400,
+            maximum=40_000,
+        ),
+        default_tool_result_output_chars=_int_from(
+            runner_limits_data,
+            "default_tool_result_output_chars",
+            RunnerLimitsConfig.default_tool_result_output_chars,
+            minimum=400,
+            maximum=40_000,
+        ),
+        heavy_tool_result_output_chars=_int_from(
+            runner_limits_data,
+            "heavy_tool_result_output_chars",
+            RunnerLimitsConfig.heavy_tool_result_output_chars,
+            minimum=200,
+            maximum=20_000,
+        ),
+        compact_tool_result_output_chars=_int_from(
+            runner_limits_data,
+            "compact_tool_result_output_chars",
+            RunnerLimitsConfig.compact_tool_result_output_chars,
+            minimum=80,
+            maximum=20_000,
+        ),
+        compact_text_output_chars=_int_from(
+            runner_limits_data,
+            "compact_text_output_chars",
+            RunnerLimitsConfig.compact_text_output_chars,
+            minimum=80,
+            maximum=20_000,
+        ),
+        minimal_text_output_chars=_int_from(
+            runner_limits_data,
+            "minimal_text_output_chars",
+            RunnerLimitsConfig.minimal_text_output_chars,
+            minimum=40,
+            maximum=10_000,
+        ),
+        tool_call_argument_context_chars=_int_from(
+            runner_limits_data,
+            "tool_call_argument_context_chars",
+            RunnerLimitsConfig.tool_call_argument_context_chars,
+            minimum=80,
+            maximum=20_000,
+        ),
+        compact_tool_call_argument_chars=_int_from(
+            runner_limits_data,
+            "compact_tool_call_argument_chars",
+            RunnerLimitsConfig.compact_tool_call_argument_chars,
+            minimum=40,
+            maximum=10_000,
+        ),
+    )
+
+    verifier_limits = VerifierLimitsConfig(
+        max_tool_args_chars=_int_from(
+            verifier_limits_data,
+            "max_tool_args_chars",
+            VerifierLimitsConfig.max_tool_args_chars,
+            minimum=80,
+            maximum=20_000,
+        ),
+        max_tool_status_chars=_int_from(
+            verifier_limits_data,
+            "max_tool_status_chars",
+            VerifierLimitsConfig.max_tool_status_chars,
+            minimum=80,
+            maximum=20_000,
+        ),
+        max_tool_calls_tokens=_int_from(
+            verifier_limits_data,
+            "max_tool_calls_tokens",
+            VerifierLimitsConfig.max_tool_calls_tokens,
+            minimum=400,
+            maximum=60_000,
+        ),
+        max_verifier_prompt_tokens=_int_from(
+            verifier_limits_data,
+            "max_verifier_prompt_tokens",
+            VerifierLimitsConfig.max_verifier_prompt_tokens,
+            minimum=800,
+            maximum=120_000,
+        ),
+        max_result_summary_chars=_int_from(
+            verifier_limits_data,
+            "max_result_summary_chars",
+            VerifierLimitsConfig.max_result_summary_chars,
+            minimum=200,
+            maximum=100_000,
+        ),
+        compact_result_summary_chars=_int_from(
+            verifier_limits_data,
+            "compact_result_summary_chars",
+            VerifierLimitsConfig.compact_result_summary_chars,
+            minimum=120,
+            maximum=100_000,
+        ),
+        max_evidence_section_chars=_int_from(
+            verifier_limits_data,
+            "max_evidence_section_chars",
+            VerifierLimitsConfig.max_evidence_section_chars,
+            minimum=200,
+            maximum=100_000,
+        ),
+        max_evidence_section_compact_chars=_int_from(
+            verifier_limits_data,
+            "max_evidence_section_compact_chars",
+            VerifierLimitsConfig.max_evidence_section_compact_chars,
+            minimum=120,
+            maximum=100_000,
+        ),
+        max_artifact_section_chars=_int_from(
+            verifier_limits_data,
+            "max_artifact_section_chars",
+            VerifierLimitsConfig.max_artifact_section_chars,
+            minimum=200,
+            maximum=100_000,
+        ),
+        max_artifact_section_compact_chars=_int_from(
+            verifier_limits_data,
+            "max_artifact_section_compact_chars",
+            VerifierLimitsConfig.max_artifact_section_compact_chars,
+            minimum=120,
+            maximum=100_000,
+        ),
+        max_tool_output_excerpt_chars=_int_from(
+            verifier_limits_data,
+            "max_tool_output_excerpt_chars",
+            VerifierLimitsConfig.max_tool_output_excerpt_chars,
+            minimum=120,
+            maximum=40_000,
+        ),
+        max_artifact_file_excerpt_chars=_int_from(
+            verifier_limits_data,
+            "max_artifact_file_excerpt_chars",
+            VerifierLimitsConfig.max_artifact_file_excerpt_chars,
+            minimum=120,
+            maximum=40_000,
+        ),
+    )
+
+    compactor_limits = CompactorLimitsConfig(
+        max_chunk_chars=_int_from(
+            compactor_limits_data,
+            "max_chunk_chars",
+            CompactorLimitsConfig.max_chunk_chars,
+            minimum=300,
+            maximum=200_000,
+        ),
+        max_chunks_per_round=_int_from(
+            compactor_limits_data,
+            "max_chunks_per_round",
+            CompactorLimitsConfig.max_chunks_per_round,
+            minimum=1,
+            maximum=100,
+        ),
+        max_reduction_rounds=_int_from(
+            compactor_limits_data,
+            "max_reduction_rounds",
+            CompactorLimitsConfig.max_reduction_rounds,
+            minimum=1,
+            maximum=20,
+        ),
+        min_compact_target_chars=_int_from(
+            compactor_limits_data,
+            "min_compact_target_chars",
+            CompactorLimitsConfig.min_compact_target_chars,
+            minimum=20,
+            maximum=20_000,
+        ),
+        response_tokens_floor=_int_from(
+            compactor_limits_data,
+            "response_tokens_floor",
+            CompactorLimitsConfig.response_tokens_floor,
+            minimum=0,
+            maximum=100_000,
+        ),
+        response_tokens_ratio=_float_from(
+            compactor_limits_data,
+            "response_tokens_ratio",
+            CompactorLimitsConfig.response_tokens_ratio,
+            minimum=0.0,
+            maximum=8.0,
+        ),
+        response_tokens_buffer=_int_from(
+            compactor_limits_data,
+            "response_tokens_buffer",
+            CompactorLimitsConfig.response_tokens_buffer,
+            minimum=0,
+            maximum=100_000,
+        ),
+        json_headroom_chars_floor=_int_from(
+            compactor_limits_data,
+            "json_headroom_chars_floor",
+            CompactorLimitsConfig.json_headroom_chars_floor,
+            minimum=0,
+            maximum=20_000,
+        ),
+        json_headroom_chars_ratio=_float_from(
+            compactor_limits_data,
+            "json_headroom_chars_ratio",
+            CompactorLimitsConfig.json_headroom_chars_ratio,
+            minimum=0.0,
+            maximum=2.0,
+        ),
+        json_headroom_chars_cap=_int_from(
+            compactor_limits_data,
+            "json_headroom_chars_cap",
+            CompactorLimitsConfig.json_headroom_chars_cap,
+            minimum=0,
+            maximum=100_000,
+        ),
+        chars_per_token_estimate=_float_from(
+            compactor_limits_data,
+            "chars_per_token_estimate",
+            CompactorLimitsConfig.chars_per_token_estimate,
+            minimum=0.1,
+            maximum=16.0,
+        ),
+        token_headroom=_int_from(
+            compactor_limits_data,
+            "token_headroom",
+            CompactorLimitsConfig.token_headroom,
+            minimum=0,
+            maximum=20_000,
+        ),
+        target_chars_ratio=_float_from(
+            compactor_limits_data,
+            "target_chars_ratio",
+            CompactorLimitsConfig.target_chars_ratio,
+            minimum=0.01,
+            maximum=1.0,
+        ),
+    )
+
+    limits = LimitsConfig(
+        planning_response_max_tokens=_int_from(
+            limits_data,
+            "planning_response_max_tokens",
+            LimitsConfig.planning_response_max_tokens,
+            minimum=0,
+            maximum=500_000,
+        ),
+        adhoc_repair_source_max_chars=_int_from(
+            limits_data,
+            "adhoc_repair_source_max_chars",
+            LimitsConfig.adhoc_repair_source_max_chars,
+            minimum=0,
+            maximum=500_000,
+        ),
+        evidence_context_text_max_chars=_int_from(
+            limits_data,
+            "evidence_context_text_max_chars",
+            LimitsConfig.evidence_context_text_max_chars,
+            minimum=200,
+            maximum=100_000,
+        ),
+        runner=runner_limits,
+        verifier=verifier_limits,
+        compactor=compactor_limits,
+    )
+
     mcp_servers: dict[str, MCPServerConfig] = {}
     mcp_data = raw.get("mcp", {})
     servers_data = mcp_data.get("servers", {}) if isinstance(mcp_data, dict) else {}
@@ -456,5 +890,6 @@ def load_config(path: Path | None = None) -> Config:
         memory=memory,
         logging=logging_cfg,
         process=process,
+        limits=limits,
         mcp=MCPConfig(servers=mcp_servers),
     )

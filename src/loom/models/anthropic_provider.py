@@ -318,6 +318,7 @@ class AnthropicProvider(ModelProvider):
         usage_data = data.get("usage", {})
         in_tok = usage_data.get("input_tokens", 0)
         out_tok = usage_data.get("output_tokens", 0)
+        finish_reason = str(data.get("stop_reason", "") or "").strip()
         usage = TokenUsage(
             input_tokens=in_tok,
             output_tokens=out_tok,
@@ -330,6 +331,7 @@ class AnthropicProvider(ModelProvider):
             thinking=thinking_blocks if thinking_blocks else None,
             usage=usage,
             raw=data,
+            finish_reason=finish_reason,
         )
 
     # ------------------------------------------------------------------

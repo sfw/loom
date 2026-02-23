@@ -134,7 +134,7 @@ class TestModelConnectionError:
 
 
 class TestOpenAIProviderErrors:
-    def _make_provider(self, *, api_key: str = ""):
+    def _make_provider(self, *, api_key: str = "", reasoning_effort: str = ""):
         from loom.config import ModelConfig
         from loom.models.openai_provider import OpenAICompatibleProvider
 
@@ -143,6 +143,7 @@ class TestOpenAIProviderErrors:
             base_url="http://localhost:9999",
             model="test-model",
             api_key=api_key,
+            reasoning_effort=reasoning_effort,
         )
         return OpenAICompatibleProvider(config)
 
@@ -327,6 +328,69 @@ class TestOpenAIProviderErrors:
 
         assert response.tool_calls is not None
         assert response.tool_calls[0].id == "call_0"
+
+    @pytest.mark.asyncio
+    async def test_complete_uses_reasoning_content_when_content_is_empty(self):
+        provider = self._make_provider()
+        provider._client = AsyncMock()
+
+        ok = MagicMock()
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "reasoning_content": (
+                        '{"intent":"research","name":"book-research","phases":[]}'
+                    ),
+                },
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        provider._client.post = AsyncMock(return_value=ok)
+
+        response = await provider.complete([{"role": "user", "content": "hi"}])
+        assert response.text.startswith('{"intent":"research"')
+
+    @pytest.mark.asyncio
+    async def test_complete_extracts_text_from_content_parts(self):
+        provider = self._make_provider()
+        provider._client = AsyncMock()
+
+        ok = MagicMock()
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "{\"intent\":\"research\"}"},
+                    ],
+                },
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        provider._client.post = AsyncMock(return_value=ok)
+
+        response = await provider.complete([{"role": "user", "content": "hi"}])
+        assert response.text == "{\"intent\":\"research\"}"
+
+    @pytest.mark.asyncio
+    async def test_complete_includes_reasoning_effort_when_configured(self):
+        provider = self._make_provider(reasoning_effort="none")
+        provider._client = AsyncMock()
+
+        ok = MagicMock()
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        provider._client.post = AsyncMock(return_value=ok)
+
+        response = await provider.complete([{"role": "user", "content": "hi"}])
+        assert response.text == "ok"
+        payload = provider._client.post.await_args.kwargs["json"]
+        assert payload["reasoning_effort"] == "none"
 
     @pytest.mark.asyncio
     async def test_complete_retry_injects_non_empty_reasoning_content_when_content_empty(self):

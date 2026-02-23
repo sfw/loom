@@ -142,10 +142,31 @@ class TestCLI:
 
         captured: dict[str, object] = {}
 
-        async def fake_run_task(_url, _goal, _ws, process_name=None, metadata=None):
+        async def fake_prepare_run_payload(
+            *,
+            config,
+            workspace,
+            goal,
+            process_name,
+            fresh_adhoc,
+        ):
+            assert config is not None
+            assert goal == "demo goal"
+            assert process_name == "marketing-strategy"
+            assert fresh_adhoc is False
+            return process_name, workspace
+
+        async def fake_run_task(
+            _url,
+            _goal,
+            _ws,
+            process_name=None,
+            metadata=None,
+        ):
             captured["process_name"] = process_name
             captured["metadata"] = metadata
 
+        monkeypatch.setattr(main_mod, "_prepare_server_run_payload", fake_prepare_run_payload)
         monkeypatch.setattr(main_mod, "_run_task", fake_run_task)
 
         cfg_path = tmp_path / "loom.toml"
@@ -174,10 +195,31 @@ class TestCLI:
 
         captured: dict[str, object] = {}
 
-        async def fake_run_task(_url, _goal, _ws, process_name=None, metadata=None):
+        async def fake_prepare_run_payload(
+            *,
+            config,
+            workspace,
+            goal,
+            process_name,
+            fresh_adhoc,
+        ):
+            assert config is not None
+            assert process_name is None
+            assert goal == "demo goal"
+            assert fresh_adhoc is False
+            return "/tmp/adhoc-runtime.process.yaml", workspace
+
+        async def fake_run_task(
+            _url,
+            _goal,
+            _ws,
+            process_name=None,
+            metadata=None,
+        ):
             captured["process_name"] = process_name
             captured["metadata"] = metadata
 
+        monkeypatch.setattr(main_mod, "_prepare_server_run_payload", fake_prepare_run_payload)
         monkeypatch.setattr(main_mod, "_run_task", fake_run_task)
 
         cfg_path = tmp_path / "loom.toml"
@@ -211,7 +253,7 @@ mode = "oauth2_pkce"
             catch_exceptions=False,
         )
         assert result.exit_code == 0
-        assert captured["process_name"] is None
+        assert captured["process_name"] == "/tmp/adhoc-runtime.process.yaml"
         metadata = captured["metadata"]
         assert isinstance(metadata, dict)
         assert metadata["auth_profile_overrides"] == {
