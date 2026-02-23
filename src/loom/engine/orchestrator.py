@@ -36,6 +36,7 @@ from loom.events.types import (
     REMEDIATION_STARTED,
     SUBTASK_COMPLETED,
     SUBTASK_FAILED,
+    SUBTASK_OUTCOME_STALE,
     SUBTASK_RETRYING,
     SUBTASK_STARTED,
     TASK_CANCELLED,
@@ -44,6 +45,7 @@ from loom.events.types import (
     TASK_FAILED,
     TASK_PLAN_READY,
     TASK_PLANNING,
+    TASK_REPLAN_REJECTED,
     TASK_REPLANNING,
 )
 from loom.learning.manager import LearningManager
@@ -226,6 +228,7 @@ class Orchestrator:
             max_iterations = self._config.execution.max_loop_iterations
             max_parallel = self._config.execution.max_parallel_subtasks
             attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
+            pending_replan: dict[str, str | None] | None = None
 
             while self._scheduler.has_pending(task.plan) and iteration < max_iterations:
                 if task.status == TaskStatus.CANCELLED:
@@ -239,6 +242,7 @@ class Orchestrator:
                 # Cap to max_parallel_subtasks
                 batch = runnable[:max_parallel]
                 iteration += 1
+                batch_plan_version = task.plan.version
 
                 # Dispatch batch
                 if len(batch) == 1:
@@ -275,17 +279,42 @@ class Orchestrator:
                         else:
                             outcomes.append(item)
 
-                # Process outcomes (retry / replan / approve)
+                # Process outcomes (retry / replan / approve).
+                # Replanning is deferred until the whole batch is processed.
                 for subtask, result, verification in outcomes:
+                    if batch_plan_version != task.plan.version:
+                        self._record_stale_outcome(
+                            task=task,
+                            subtask=subtask,
+                            outcome_plan_version=batch_plan_version,
+                        )
+                        continue
                     if result.status == "failed":
-                        await self._handle_failure(
+                        replan_request = await self._handle_failure(
                             task, subtask, result, verification,
                             attempts_by_subtask,
                         )
+                        if replan_request is not None and pending_replan is None:
+                            pending_replan = replan_request
                     else:
                         await self._handle_success(
                             task, subtask, result, verification,
                         )
+
+                if pending_replan is not None and task.status == TaskStatus.EXECUTING:
+                    await self._replan_task(
+                        task,
+                        reason=str(pending_replan.get("reason", "subtask_failures")),
+                        failed_subtask_id=str(
+                            pending_replan.get("failed_subtask_id", ""),
+                        ),
+                        verification_feedback=pending_replan.get(
+                            "verification_feedback",
+                        ),
+                    )
+                    pending_replan = None
+                elif task.status != TaskStatus.EXECUTING:
+                    pending_replan = None
 
                 # Opportunistically execute queued remediation work between
                 # scheduling batches so non-blocking follow-ups can converge.
@@ -430,7 +459,7 @@ class Orchestrator:
         result: SubtaskResult,
         verification: VerificationResult,
         attempts_by_subtask: dict[str, list[AttemptRecord]],
-    ) -> None:
+    ) -> dict[str, str | None] | None:
         """Process a failed subtask: record attempt, retry or replan."""
         self._persist_subtask_evidence(task.id, subtask.id, result.evidence_records)
         attempt_list = attempts_by_subtask.setdefault(subtask.id, [])
@@ -476,7 +505,7 @@ class Orchestrator:
             )
             if verification_retry.passed:
                 await self._handle_success(task, subtask, result, verification_retry)
-                return
+                return None
             verification = verification_retry
             attempt_record.feedback = verification_retry.feedback or attempt_record.feedback
             if verification_retry.feedback:
@@ -508,7 +537,7 @@ class Orchestrator:
             )
             result.status = SubtaskResultStatus.SUCCESS
             await self._handle_success(task, subtask, result, verification)
-            return
+            return None
 
         async with self._state_lock:
             subtask.status = SubtaskStatus.FAILED
@@ -560,7 +589,7 @@ class Orchestrator:
                         attempts=attempt_list,
                     )
                     if remediation_recovered:
-                        return
+                        return None
                     await self._queue_remediation_work_item(
                         task=task,
                         subtask=subtask,
@@ -571,15 +600,16 @@ class Orchestrator:
                 await self._abort_on_critical_path_failure(
                     task, subtask, verification,
                 )
-                return
+                return None
 
-            # Non-critical failures trigger re-planning.
-            await self._replan_task(
-                task,
-                reason=self._build_replan_reason(subtask, verification),
-                failed_subtask_id=subtask.id,
-                verification_feedback=verification.feedback,
-            )
+            # Non-critical failures request re-planning at batch boundary.
+            return {
+                "reason": self._build_replan_reason(subtask, verification),
+                "failed_subtask_id": subtask.id,
+                "verification_feedback": verification.feedback,
+            }
+
+        return None
 
     async def _abort_on_critical_path_failure(
         self,
@@ -1811,6 +1841,23 @@ class Orchestrator:
             new_plan = self._apply_process_phase_mode(
                 self._parse_plan(response, goal=task.goal),
             )
+            validation_error = self._validate_replan_contract(
+                current_plan=task.plan,
+                replanned_plan=new_plan,
+            )
+            if validation_error:
+                self._emit(TASK_REPLAN_REJECTED, task.id, {
+                    "failed_subtask_id": failed_subtask_id,
+                    "reason": reason,
+                    "validation_error": validation_error,
+                    "old_subtask_ids": [s.id for s in task.plan.subtasks],
+                    "new_subtask_ids": [s.id for s in new_plan.subtasks],
+                })
+                task.add_decision(
+                    f"Rejected replanned plan: {validation_error}",
+                )
+                self._state.save(task)
+                return False
 
             # Preserve completed subtask state
             completed_ids = {
@@ -1831,6 +1878,7 @@ class Orchestrator:
                 "subtask_count": len(new_plan.subtasks),
                 "version": new_plan.version,
                 "replanned": True,
+                "subtask_ids": [s.id for s in new_plan.subtasks],
             })
             return True
 
@@ -1838,6 +1886,50 @@ class Orchestrator:
             task.add_error("replanner", str(e))
             self._state.save(task)
             return False
+
+    @staticmethod
+    def _validate_replan_contract(
+        *,
+        current_plan: Plan,
+        replanned_plan: Plan,
+    ) -> str | None:
+        """Ensure replanning preserves prior subtask IDs exactly.
+
+        Replanning may add new subtasks, but it must not drop or rename
+        existing IDs. This keeps reconciliation deterministic and avoids
+        any remapping logic.
+        """
+        current_ids = [s.id for s in current_plan.subtasks]
+        new_ids = [s.id for s in replanned_plan.subtasks]
+        new_id_set = set(new_ids)
+
+        if len(new_ids) != len(new_id_set):
+            duplicates: list[str] = []
+            seen: set[str] = set()
+            for subtask_id in new_ids:
+                if subtask_id in seen and subtask_id not in duplicates:
+                    duplicates.append(subtask_id)
+                seen.add(subtask_id)
+            duplicates.sort()
+            return "duplicate subtask IDs in replanned plan: " + ", ".join(duplicates)
+
+        missing_ids = sorted(
+            subtask_id
+            for subtask_id in current_ids
+            if subtask_id not in new_id_set
+        )
+        if missing_ids:
+            return "replanned plan dropped existing subtask IDs: " + ", ".join(missing_ids)
+
+        unresolved_deps: list[str] = []
+        for subtask in replanned_plan.subtasks:
+            bad = sorted(dep for dep in subtask.depends_on if dep not in new_id_set)
+            if bad:
+                unresolved_deps.append(f"{subtask.id} -> {', '.join(bad)}")
+        if unresolved_deps:
+            return "replanned plan contains unresolved dependencies: " + "; ".join(unresolved_deps)
+
+        return None
 
     def _parse_plan(self, response: ModelResponse, goal: str = "") -> Plan:
         """Parse a plan from the model's JSON response."""
@@ -1935,6 +2027,20 @@ class Orchestrator:
         except (TypeError, ValueError):
             value = 0
         return value if value > 0 else None
+
+    def _record_stale_outcome(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        outcome_plan_version: int,
+    ) -> None:
+        """Emit telemetry for outcomes produced by an outdated plan version."""
+        self._emit(SUBTASK_OUTCOME_STALE, task.id, {
+            "subtask_id": subtask.id,
+            "outcome_plan_version": int(outcome_plan_version),
+            "current_plan_version": int(task.plan.version),
+        })
 
     def _evidence_for_subtask(self, task_id: str, subtask_id: str) -> list[dict]:
         """Load persisted evidence records scoped to one subtask."""
