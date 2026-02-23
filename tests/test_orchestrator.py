@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock
 
@@ -1373,6 +1374,7 @@ class TestOrchestratorExecution:
             "read_file", {"path": "/tmp/x"},
             workspace=None,
             read_roots=[],
+            scratch_dir=ANY,
             changelog=None,
             subtask_id="s1",
             auth_context=ANY,
@@ -1694,17 +1696,134 @@ class TestSubtaskRunnerContextBudget:
                 compacted = candidate
             return compacted or value
 
+    class _RecordingCompactor:
+        def __init__(self):
+            self.calls: list[tuple[str, int, int]] = []
+
+        async def compact(self, text: str, *, max_chars: int, label: str = "") -> str:
+            value = str(text or "")
+            self.calls.append((str(label), int(max_chars), len(value)))
+            if len(value) <= max_chars:
+                return value
+            words = value.split()
+            if not words:
+                return value
+            compacted = ""
+            for word in words:
+                candidate = f"{compacted} {word}".strip()
+                if compacted and len(candidate) > max_chars:
+                    break
+                compacted = candidate
+            return compacted or value
+
     @staticmethod
     def _make_runner_for_compaction():
         from loom.engine.runner import SubtaskRunner
 
         runner = SubtaskRunner.__new__(SubtaskRunner)
         runner._compactor = TestSubtaskRunnerContextBudget._FakeCompactor()
+        runner._runner_compaction_policy_mode = "legacy"
+        runner._max_model_context_tokens = SubtaskRunner.MAX_MODEL_CONTEXT_TOKENS
+        return runner
+
+    @staticmethod
+    def _make_runner_for_tiered_compaction(*, context_budget: int = 2500):
+        from loom.engine.runner import SubtaskRunner
+
+        runner = SubtaskRunner.__new__(SubtaskRunner)
+        runner._compactor = TestSubtaskRunnerContextBudget._RecordingCompactor()
+        runner._runner_compaction_policy_mode = "tiered"
+        runner._max_model_context_tokens = context_budget
+        runner._compaction_pressure_ratio_soft = 0.70
+        runner._compaction_pressure_ratio_hard = 0.92
+        runner._preserve_recent_critical_messages = 4
+        runner._compact_tool_call_argument_chars = 160
+        runner._compact_tool_result_output_chars = 180
+        runner._compact_text_output_chars = 220
+        runner._minimal_text_output_chars = 120
+        runner._compaction_timeout_guard_seconds = 25
+        runner._compaction_no_gain_min_delta_chars = 4
+        runner._compaction_no_gain_attempt_limit = 2
+        runner._compaction_churn_warning_calls = 100
+        runner._extractor_tool_args_max_chars = 180
+        runner._extractor_tool_trace_max_chars = 1800
+        runner._extractor_prompt_max_chars = 2600
+        runner._enable_model_overflow_fallback = True
+        runner._overflow_fallback_tool_message_min_chars = 500
+        runner._overflow_fallback_tool_output_excerpt_chars = 220
         return runner
 
     class _NoopCompactor:
         async def compact(self, text: str, *, max_chars: int, label: str = "") -> str:
             return str(text or "")
+
+    def test_detects_model_overflow_error_markers(self):
+        from loom.engine.runner import SubtaskRunner
+
+        assert SubtaskRunner._is_model_request_overflow_error(
+            "Invalid request: total message size 123 exceeds limit 99",
+        )
+        assert SubtaskRunner._is_model_request_overflow_error(
+            "Invalid request: Your request exceeded model token limit: 262144",
+        )
+        assert not SubtaskRunner._is_model_request_overflow_error(
+            "Model server returned HTTP 522: upstream timeout",
+        )
+
+    def test_overflow_fallback_rewrites_older_tool_messages_and_preserves_latest(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=1200)
+        tool_payload = json.dumps({
+            "success": True,
+            "output": "A" * 12_000,
+            "error": None,
+            "files_changed": [],
+            "data": {
+                "content_kind": "pdf",
+                "artifact_ref": "af_123",
+                "size_bytes": 2_000_000,
+                "url": "https://example.com/report.pdf",
+            },
+        })
+        latest_payload = json.dumps({
+            "success": True,
+            "output": "latest short output",
+            "error": None,
+            "files_changed": [],
+            "data": {"content_kind": "pdf", "artifact_ref": "af_latest"},
+        })
+        messages = [
+            {"role": "user", "content": "Goal: analyze report."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {"name": "web_fetch", "arguments": "{\"url\":\"https://example.com/a.pdf\"}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_old", "content": tool_payload},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_latest",
+                    "type": "function",
+                    "function": {"name": "web_fetch", "arguments": "{\"url\":\"https://example.com/b.pdf\"}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_latest", "content": latest_payload},
+        ]
+
+        rewritten, report = runner._apply_model_overflow_fallback(messages)
+
+        assert report["overflow_fallback_applied"] is True
+        assert report["overflow_fallback_rewritten_messages"] == 1
+        assert report["overflow_fallback_chars_reduced"] > 0
+        rewritten_old = json.loads(rewritten[2]["content"])
+        assert "overflow fallback applied" in rewritten_old["output"]
+        # Latest tool result is preserved verbatim.
+        assert rewritten[4]["content"] == latest_payload
 
     @pytest.mark.asyncio
     async def test_serialize_tool_result_for_model_compacts_output_and_data(self):
@@ -1865,6 +1984,307 @@ class TestSubtaskRunnerContextBudget:
         )
         assert len(args_text) <= 500
         assert "A" * 200 not in args_text
+
+    @pytest.mark.asyncio
+    async def test_no_compaction_when_under_budget(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=12_000)
+        messages = [
+            {"role": "user", "content": "Goal: summarize file structure."},
+            {"role": "assistant", "content": "I will inspect the workspace."},
+            {"role": "user", "content": "Focus on src and tests only."},
+        ]
+
+        compacted = await runner._compact_messages_for_model(messages, remaining_seconds=240)
+
+        assert compacted == messages
+        assert runner._compactor.calls == []
+        assert runner._last_compaction_diagnostics["compaction_skipped_reason"] == "no_pressure"
+
+    @pytest.mark.asyncio
+    async def test_compaction_policy_mode_off_disables_runner_compaction(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=1200)
+        runner._runner_compaction_policy_mode = "off"
+
+        result = ToolResult.ok("X" * 5000)
+        payload = await runner._serialize_tool_result_for_model(
+            "web_fetch",
+            result,
+            max_output_chars=120,
+        )
+        parsed = json.loads(payload)
+
+        messages = [
+            {"role": "user", "content": "Goal: draft deliverable."},
+            {"role": "assistant", "content": "Y " * 1500},
+        ]
+        compacted = await runner._compact_messages_for_model(messages, remaining_seconds=120)
+
+        assert parsed["output"] == result.output
+        assert compacted == messages
+        assert runner._compactor.calls == []
+        assert runner._last_compaction_diagnostics["compaction_policy_mode"] == "off"
+        assert runner._last_compaction_diagnostics["compaction_skipped_reason"] == "policy_disabled"
+
+    @pytest.mark.asyncio
+    async def test_compaction_order_tool_trace_before_critical_context(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=1200)
+        huge_args_older = json.dumps({"path": "report-old.md", "content": "A" * 14000})
+        huge_args_latest = json.dumps({"path": "report.md", "content": "D" * 9000})
+        messages = [
+            {"role": "user", "content": "Goal: build report."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_older",
+                    "type": "function",
+                    "function": {"name": "document_write", "arguments": huge_args_older},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_older",
+                "content": json.dumps({
+                    "success": True,
+                    "output": "B" * 10000,
+                    "error": None,
+                    "files_changed": ["report-old.md"],
+                }),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_latest",
+                    "type": "function",
+                    "function": {"name": "document_write", "arguments": huge_args_latest},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_latest",
+                "content": json.dumps({
+                    "success": True,
+                    "output": "short ok",
+                    "error": None,
+                    "files_changed": ["report.md"],
+                }),
+            },
+            {"role": "user", "content": "Historical context " + ("C " * 1400)},
+            {
+                "role": "assistant",
+                "content": "LATEST CRITICAL: keep acceptance criteria unchanged.",
+            },
+            {"role": "user", "content": "LATEST USER STEER: preserve bullet ordering exactly."},
+        ]
+
+        compacted = await runner._compact_messages_for_model(messages, remaining_seconds=240)
+        labels = [label for label, _max, _size in runner._compactor.calls]
+        arg_idx = next(i for i, label in enumerate(labels) if "assistant tool-call args" in label)
+        context_indices = [
+            idx for idx, label in enumerate(labels)
+            if label.endswith("context")
+        ]
+        if context_indices:
+            assert arg_idx < min(context_indices)
+        assert any(
+            msg.get("content") == "LATEST USER STEER: preserve bullet ordering exactly."
+            for msg in compacted
+            if isinstance(msg, dict)
+        )
+
+    @pytest.mark.asyncio
+    async def test_preserve_latest_critical_turns_under_pressure(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=1500)
+        messages = [{"role": "user", "content": "Goal: analyze telemetry."}]
+        for idx in range(10):
+            messages.append({"role": "user", "content": f"Old context {idx}: " + ("x " * 600)})
+            messages.append({
+                "role": "assistant",
+                "content": f"Old assistant note {idx}: " + ("y " * 400),
+            })
+        latest_assistant = "LATEST CRITICAL ASSISTANT: keep file names exact."
+        latest_user = "LATEST CRITICAL USER: do not drop failed-subtask IDs."
+        messages.extend([
+            {"role": "assistant", "content": latest_assistant},
+            {"role": "user", "content": latest_user},
+        ])
+
+        compacted = await runner._compact_messages_for_model(messages, remaining_seconds=240)
+        contents = [
+            msg.get("content", "")
+            for msg in compacted
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str)
+        ]
+        assert latest_assistant in contents
+        assert latest_user in contents
+
+    @pytest.mark.asyncio
+    async def test_critical_tier_old_context_merge_without_latest_instruction_loss(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=600)
+        huge_args = json.dumps({"path": "output.md", "content": "Z" * 18000})
+        messages = [{"role": "user", "content": "Goal: execute and verify all subtasks."}]
+        for idx in range(6):
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": f"call_{idx}",
+                    "type": "function",
+                    "function": {"name": "document_write", "arguments": huge_args},
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": f"call_{idx}",
+                "content": json.dumps({
+                    "success": True,
+                    "output": "Q" * 8000,
+                    "error": None,
+                    "files_changed": ["output.md"],
+                }),
+            })
+            messages.append({"role": "user", "content": f"Older narrative {idx}: " + ("r " * 500)})
+
+        latest_instruction = "LATEST INSTRUCTION: preserve the rubric schema exactly."
+        messages.extend([
+            {"role": "assistant", "content": latest_instruction},
+            {"role": "user", "content": "LATEST USER: keep unresolved evidence IDs in output."},
+        ])
+
+        compacted = await runner._compact_messages_for_model(messages, remaining_seconds=240)
+        contents = [
+            msg.get("content", "")
+            for msg in compacted
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str)
+        ]
+        assert any(content.startswith("Prior compacted context:\n") for content in contents)
+        assert latest_instruction in contents
+        assert runner._last_compaction_diagnostics["compaction_pressure_tier"] == "critical"
+
+    @pytest.mark.asyncio
+    async def test_memory_extractor_compacts_large_tool_args(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=2000)
+        runner._config = Config()
+        runner._subtask_deadline_monotonic = time.monotonic() + 120.0
+        runner._memory = AsyncMock()
+        runner._memory.store_many = AsyncMock()
+        runner._event_bus = None
+        runner._validator = MagicMock()
+        runner._validator.validate_json_response = MagicMock(
+            return_value=MagicMock(valid=False, parsed=None),
+        )
+
+        class _ExtractorModel:
+            name = "mock-extractor"
+            roles = ["extractor"]
+
+            def __init__(self):
+                self.messages = []
+
+            async def complete(self, messages, **kwargs):
+                del kwargs
+                self.messages.append(messages)
+                return ModelResponse(
+                    text="[]",
+                    usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
+                )
+
+        extractor_model = _ExtractorModel()
+        runner._router = MagicMock()
+        runner._router.select = MagicMock(return_value=extractor_model)
+        runner._prompts = MagicMock()
+        runner._prompts.build_extractor_prompt = MagicMock(
+            side_effect=lambda subtask_id, tool_calls_formatted, model_output: (
+                f"SUBTASK {subtask_id}\nTOOLS\n{tool_calls_formatted}\nOUTPUT\n{model_output}"
+            ),
+        )
+
+        result = SubtaskResult(
+            summary="Execution completed with output artifacts.",
+            tool_calls=[
+                ToolCallRecord(
+                    tool="document_write",
+                    args={"path": "report.md", "content": "A" * 200_000},
+                    result=ToolResult.ok("ok"),
+                ),
+            ],
+        )
+
+        await runner._extract_memory("task-1", "subtask-1", result)
+
+        assert extractor_model.messages
+        prompt = extractor_model.messages[0][0]["content"]
+        assert "document_write(" in prompt
+        assert "A" * 500 not in prompt
+        runner._memory.store_many.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_near_skips_nonessential_compaction(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=800)
+        huge_args_old = json.dumps({"path": "report-old.md", "content": "A" * 12000})
+        huge_args_latest = json.dumps({"path": "report.md", "content": "D" * 8000})
+        messages = [
+            {"role": "user", "content": "Goal: finish report."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {"name": "document_write", "arguments": huge_args_old},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_old",
+                "content": json.dumps({
+                    "success": True,
+                    "output": "B" * 9000,
+                    "error": None,
+                    "files_changed": ["report-old.md"],
+                }),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_latest",
+                    "type": "function",
+                    "function": {"name": "document_write", "arguments": huge_args_latest},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_latest",
+                "content": json.dumps({
+                    "success": True,
+                    "output": "done",
+                    "error": None,
+                    "files_changed": ["report.md"],
+                }),
+            },
+            {"role": "user", "content": "Old narrative " + ("x " * 800)},
+            {"role": "assistant", "content": "LATEST CRITICAL: keep final file name unchanged."},
+        ]
+
+        await runner._compact_messages_for_model(messages, remaining_seconds=5)
+        labels = [label for label, _max, _size in runner._compactor.calls]
+        assert any("assistant tool-call args" in label for label in labels)
+        assert all("tool message output" not in label for label in labels)
+        assert runner._last_compaction_diagnostics["compaction_skipped_reason"] == "timeout_guard"
+
+    @pytest.mark.asyncio
+    async def test_no_hard_truncation_marker_inserted_by_runner_compaction_path(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=700)
+        messages = [{"role": "user", "content": "Goal: reduce context safely."}]
+        for idx in range(8):
+            messages.append({"role": "user", "content": f"Context {idx}: " + ("data " * 1000)})
+        messages.append({"role": "assistant", "content": "LATEST CRITICAL: keep all file paths."})
+
+        compacted = await runner._compact_messages_for_model(messages, remaining_seconds=180)
+        serialized = json.dumps(compacted, ensure_ascii=False, default=str)
+        assert "...[truncated]..." not in serialized
 
     def test_emit_tool_event_emits_artifact_confinement_violation(self):
         from loom.engine.runner import SubtaskRunner

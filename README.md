@@ -116,6 +116,13 @@ max_subtask_retries = 3
 max_loop_iterations = 50
 max_parallel_subtasks = 3
 delegate_task_timeout_seconds = 3600
+
+[limits.runner]
+enable_filetype_ingest_router = true
+enable_model_overflow_fallback = true
+ingest_artifact_retention_max_age_days = 14
+ingest_artifact_retention_max_files_per_scope = 96
+ingest_artifact_retention_max_bytes_per_scope = 268435456
 ```
 
 Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor). A common split is stronger model for planning + verification and cheaper model for extraction + execution.
@@ -137,6 +144,12 @@ Configured MCP servers are auto-discovered at startup and registered as namespac
 `delegate_task` (used by `/run`) defaults to a 3600s timeout. Configure this in
 `loom.toml` under `[execution].delegate_task_timeout_seconds`; env override
 `LOOM_DELEGATE_TIMEOUT_SECONDS` still applies when set.
+
+For large fetched binaries/documents (PDFs, Office files, archives), tune
+`[limits.runner]` retention keys to control cleanup pressure:
+`ingest_artifact_retention_max_age_days`,
+`ingest_artifact_retention_max_files_per_scope`, and
+`ingest_artifact_retention_max_bytes_per_scope`.
 
 ## Process Definitions
 

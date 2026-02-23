@@ -120,6 +120,12 @@ Recommended two-model split:
 | `minimal_text_output_chars` | `int` | `260` | Tiny fallback compacted text target. |
 | `tool_call_argument_context_chars` | `int` | `700` | Argument context extraction target. |
 | `compact_tool_call_argument_chars` | `int` | `1600` | Aggressive tool-argument compaction target. |
+| `runner_compaction_policy_mode` | `string` | `"tiered"` | Runner compaction policy (`legacy`, `tiered`, `off`). |
+| `enable_filetype_ingest_router` | `bool` | `true` | Routes fetched binary/doc payloads into artifact-backed summaries. |
+| `enable_model_overflow_fallback` | `bool` | `true` | Enables one-shot overflow fallback rewrite when model request size is exceeded. |
+| `ingest_artifact_retention_max_age_days` | `int` | `14` | Max artifact age (days) before retention cleanup removes old fetched artifacts. |
+| `ingest_artifact_retention_max_files_per_scope` | `int` | `96` | Max retained fetched artifact files per scope/subtask directory. |
+| `ingest_artifact_retention_max_bytes_per_scope` | `int` | `268435456` | Max retained bytes per fetched artifact scope directory (256 MiB). |
 
 ### `[limits.verifier]`
 
@@ -214,4 +220,7 @@ definitions inside `loom.toml`:
 - `verification.unconfirmed_supporting_threshold` is clamped to `0..1`.
 - `verification.confirm_or_prune_max_attempts` is clamped to at least `1`.
 - `verification.confirm_or_prune_backoff_seconds` is clamped to `>= 0`.
+- `limits.runner.ingest_artifact_retention_max_age_days` is clamped to `0..3650`.
+- `limits.runner.ingest_artifact_retention_max_files_per_scope` is clamped to `1..200000`.
+- `limits.runner.ingest_artifact_retention_max_bytes_per_scope` is clamped to `1024..20000000000`.
 - MCP `timeout_seconds` falls back to `30` when invalid/non-positive.

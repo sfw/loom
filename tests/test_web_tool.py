@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
+from loom.tools.registry import ToolContext, ToolResult
 from loom.tools.web import (
     DEFAULT_WEB_USER_AGENT,
     WebFetchHtmlTool,
     WebFetchTool,
     _build_request_headers,
+    _execute_web_fetch,
     _looks_like_html,
     _should_retry_status,
     _strip_html,
@@ -184,3 +190,165 @@ class TestWebToolSchemas:
         props = tool.parameters.get("properties", {})
         assert "url" in props
         assert tool.name == "web_fetch_html"
+
+
+class TestWebToolHiddenRuntimeArgs:
+    @pytest.mark.asyncio
+    async def test_web_fetch_forwards_retention_overrides(self, monkeypatch):
+        captured: dict[str, object] = {}
+
+        async def _fake_execute_web_fetch(
+            url: str,
+            *,
+            extract_text: bool,
+            max_download_bytes: int,
+            enable_filetype_ingest_router: bool,
+            artifact_retention_max_age_days: int,
+            artifact_retention_max_files_per_scope: int,
+            artifact_retention_max_bytes_per_scope: int,
+            ctx,
+        ):
+            captured["url"] = url
+            captured["extract_text"] = extract_text
+            captured["max_download_bytes"] = max_download_bytes
+            captured["enable_filetype_ingest_router"] = enable_filetype_ingest_router
+            captured["artifact_retention_max_age_days"] = artifact_retention_max_age_days
+            captured["artifact_retention_max_files_per_scope"] = (
+                artifact_retention_max_files_per_scope
+            )
+            captured["artifact_retention_max_bytes_per_scope"] = (
+                artifact_retention_max_bytes_per_scope
+            )
+            captured["ctx"] = ctx
+            return ToolResult.ok("ok")
+
+        monkeypatch.setattr("loom.tools.web._execute_web_fetch", _fake_execute_web_fetch)
+        tool = WebFetchTool()
+        ctx = ToolContext(workspace=None)
+        result = await tool.execute(
+            {
+                "url": "https://example.com/report.pdf",
+                "_enable_filetype_ingest_router": False,
+                "_artifact_retention_max_age_days": 31,
+                "_artifact_retention_max_files_per_scope": 120,
+                "_artifact_retention_max_bytes_per_scope": 42_000_000,
+            },
+            ctx,
+        )
+        assert result.success
+        assert captured["url"] == "https://example.com/report.pdf"
+        assert captured["extract_text"] is True
+        assert captured["enable_filetype_ingest_router"] is False
+        assert captured["artifact_retention_max_age_days"] == 31
+        assert captured["artifact_retention_max_files_per_scope"] == 120
+        assert captured["artifact_retention_max_bytes_per_scope"] == 42_000_000
+
+
+class _FakeResponse:
+    def __init__(self, url: str, headers: dict[str, str], status_code: int = 200):
+        self.url = url
+        self.headers = headers
+        self.status_code = status_code
+        self.encoding = "utf-8"
+        self.is_redirect = False
+
+    async def aclose(self):
+        return None
+
+    def raise_for_status(self):
+        return None
+
+
+class _FakeAsyncClient:
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        del exc_type, exc, tb
+        return False
+
+
+class TestWebFetchBinaryRouting:
+    @pytest.mark.asyncio
+    async def test_pdf_fetch_returns_artifact_summary(self, monkeypatch, tmp_path: Path):
+        fake_response = _FakeResponse(
+            "https://example.com/report.pdf",
+            headers={
+                "content-type": "application/pdf",
+                "content-length": "128",
+            },
+        )
+
+        async def _fake_get_with_retries(client, url, headers=None, stream=False):
+            del client, url, headers, stream
+            return fake_response
+
+        async def _fake_read_response_limited(response, max_bytes):
+            del response, max_bytes
+            # Minimal PDF-like bytes; extraction may fail, but routing still persists artifact.
+            return (b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n", False)
+
+        monkeypatch.setattr("loom.tools.web.httpx.AsyncClient", _FakeAsyncClient)
+        monkeypatch.setattr("loom.tools.web._get_with_retries", _fake_get_with_retries)
+        monkeypatch.setattr("loom.tools.web._read_response_limited", _fake_read_response_limited)
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        ctx = ToolContext(
+            workspace=workspace,
+            read_roots=[],
+            scratch_dir=tmp_path / "scratch",
+            changelog=None,
+            subtask_id="subtask-1",
+            auth_context=None,
+        )
+        result = await _execute_web_fetch(
+            "https://example.com/report.pdf",
+            extract_text=True,
+            max_download_bytes=1024,
+            enable_filetype_ingest_router=True,
+            ctx=ctx,
+        )
+
+        assert result.success is True
+        assert isinstance(result.data, dict)
+        assert result.data.get("content_kind") == "pdf"
+        assert result.data.get("artifact_ref")
+        artifact_path = Path(str(result.data.get("artifact_path", "")))
+        assert artifact_path.exists()
+        assert "Fetched PDF artifact" in result.output
+
+    @pytest.mark.asyncio
+    async def test_pdf_fetch_uses_legacy_decode_when_router_disabled(self, monkeypatch):
+        fake_response = _FakeResponse(
+            "https://example.com/report.pdf",
+            headers={"content-type": "application/pdf"},
+        )
+
+        async def _fake_get_with_retries(client, url, headers=None, stream=False):
+            del client, url, headers, stream
+            return fake_response
+
+        async def _fake_read_response_limited(response, max_bytes):
+            del response, max_bytes
+            return (b"%PDF-1.4\nraw-bytes", False)
+
+        monkeypatch.setattr("loom.tools.web.httpx.AsyncClient", _FakeAsyncClient)
+        monkeypatch.setattr("loom.tools.web._get_with_retries", _fake_get_with_retries)
+        monkeypatch.setattr("loom.tools.web._read_response_limited", _fake_read_response_limited)
+
+        result = await _execute_web_fetch(
+            "https://example.com/report.pdf",
+            extract_text=True,
+            max_download_bytes=1024,
+            enable_filetype_ingest_router=False,
+            ctx=None,
+        )
+
+        assert result.success is True
+        assert isinstance(result.data, dict)
+        assert result.data.get("content_kind") == "text"
+        assert "%PDF-1.4" in result.output

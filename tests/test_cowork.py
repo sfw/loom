@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -14,6 +15,7 @@ from loom.cowork.session import (
 )
 from loom.models.base import ModelProvider, ModelResponse, TokenUsage, ToolCall
 from loom.tools import create_default_registry
+from loom.tools.registry import ToolResult
 
 # --- Fixtures ---
 
@@ -124,6 +126,51 @@ class TestCoworkSession:
         assert len(turns) == 1
         assert "hello function" in turns[0].text
         assert turns[0].tokens_used == 35
+
+    async def test_web_fetch_call_injects_ingest_flag_and_scratch_dir(
+        self,
+        workspace,
+        tools,
+        tmp_path: Path,
+    ):
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="tc1",
+                    name="web_fetch",
+                    arguments={"url": "https://example.com/report.pdf"},
+                )],
+                usage=TokenUsage(total_tokens=10),
+            ),
+            ModelResponse(
+                text="Done.",
+                usage=TokenUsage(total_tokens=5),
+            ),
+        ])
+        tools.execute = AsyncMock(return_value=ToolResult.ok("fetched"))
+        scratch_dir = tmp_path / "scratch"
+
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            scratch_dir=scratch_dir,
+            enable_filetype_ingest_router=False,
+        )
+        async for _event in session.send("Fetch the report"):
+            pass
+
+        tools.execute.assert_called_once()
+        args = tools.execute.call_args.args
+        kwargs = tools.execute.call_args.kwargs
+        assert args[0] == "web_fetch"
+        assert args[1]["_enable_filetype_ingest_router"] is False
+        assert args[1]["_artifact_retention_max_age_days"] == 14
+        assert args[1]["_artifact_retention_max_files_per_scope"] == 96
+        assert args[1]["_artifact_retention_max_bytes_per_scope"] == 268_435_456
+        assert kwargs["workspace"] == workspace
+        assert kwargs["scratch_dir"] == scratch_dir
 
     async def test_conversation_history_maintained(self, workspace, tools):
         """Conversation history grows with each exchange."""

@@ -686,6 +686,7 @@ class LoomApp(App):
         self._adhoc_package_doc_cache: str | None = None
         self._sidebar_cowork_tasks: list[dict] = []
         self._process_close_hint_shown = False
+        self._close_process_tab_inflight = False
         self._auto_resume_workspace_on_init = True
         self._run_auth_profile_overrides: dict[str, str] = {}
 
@@ -3308,6 +3309,48 @@ class LoomApp(App):
             return ModelRetryPolicy()
         return ModelRetryPolicy.from_execution_config(self._config.execution)
 
+    def _cowork_scratch_dir(self) -> Path | None:
+        if self._config is None:
+            return None
+        try:
+            return self._config.scratch_path
+        except Exception:
+            return None
+
+    def _cowork_enable_filetype_ingest_router(self) -> bool:
+        runner_limits = getattr(getattr(self._config, "limits", None), "runner", None)
+        if runner_limits is None:
+            return True
+        return bool(getattr(runner_limits, "enable_filetype_ingest_router", True))
+
+    def _cowork_ingest_artifact_retention_max_age_days(self) -> int:
+        runner_limits = getattr(getattr(self._config, "limits", None), "runner", None)
+        if runner_limits is None:
+            return 14
+        return max(0, int(getattr(runner_limits, "ingest_artifact_retention_max_age_days", 14)))
+
+    def _cowork_ingest_artifact_retention_max_files_per_scope(self) -> int:
+        runner_limits = getattr(getattr(self._config, "limits", None), "runner", None)
+        if runner_limits is None:
+            return 96
+        return max(
+            1,
+            int(getattr(runner_limits, "ingest_artifact_retention_max_files_per_scope", 96)),
+        )
+
+    def _cowork_ingest_artifact_retention_max_bytes_per_scope(self) -> int:
+        runner_limits = getattr(getattr(self._config, "limits", None), "runner", None)
+        if runner_limits is None:
+            return 268_435_456
+        return max(
+            1024,
+            int(getattr(
+                runner_limits,
+                "ingest_artifact_retention_max_bytes_per_scope",
+                268_435_456,
+            )),
+        )
+
     async def _initialize_session(self) -> None:
         """Initialize tools, session, and welcome message.
 
@@ -3345,10 +3388,15 @@ class LoomApp(App):
                 model=self._model,
                 tools=self._tools,
                 workspace=self._workspace,
+                scratch_dir=self._cowork_scratch_dir(),
                 system_prompt=system_prompt,
                 approver=approver,
                 store=self._store,
                 model_retry_policy=self._model_retry_policy(),
+                enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
+                ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
+                ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
+                ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
             )
             try:
                 await self._session.resume(resume_target)
@@ -3384,11 +3432,16 @@ class LoomApp(App):
                 model=self._model,
                 tools=self._tools,
                 workspace=self._workspace,
+                scratch_dir=self._cowork_scratch_dir(),
                 system_prompt=system_prompt,
                 approver=approver,
                 store=self._store,
                 session_id=session_id,
                 model_retry_policy=self._model_retry_policy(),
+                enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
+                ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
+                ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
+                ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
             )
         else:
             # Ephemeral session (no database)
@@ -3396,9 +3449,14 @@ class LoomApp(App):
                 model=self._model,
                 tools=self._tools,
                 workspace=self._workspace,
+                scratch_dir=self._cowork_scratch_dir(),
                 system_prompt=system_prompt,
                 approver=approver,
                 model_retry_policy=self._model_retry_policy(),
+                enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
+                ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
+                ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
+                ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
             )
 
         # Bind session-dependent tools
@@ -4104,20 +4162,29 @@ class LoomApp(App):
     async def _confirm_close_process_run(self, run: ProcessRunState) -> bool:
         """Prompt before closing a process run tab."""
         waiter: asyncio.Future[bool] = asyncio.Future()
+        screen = None
 
         def handle_result(confirmed: bool) -> None:
             if not waiter.done():
                 waiter.set_result(bool(confirmed))
 
         running = run.status in {"queued", "running"}
-        self.push_screen(
-            ProcessRunCloseScreen(
-                run_label=f"{run.process_name} #{run.run_id}",
-                running=running,
-            ),
-            callback=handle_result,
+        screen = ProcessRunCloseScreen(
+            run_label=f"{run.process_name} #{run.run_id}",
+            running=running,
         )
-        return await waiter
+        self.push_screen(screen, callback=handle_result)
+        try:
+            return await waiter
+        except asyncio.CancelledError:
+            # If the close-flow worker is cancelled, dismiss the modal so the
+            # UI doesn't end up blocked behind an orphaned confirmation screen.
+            try:
+                if screen is not None:
+                    screen.dismiss(False)
+            except Exception:
+                pass
+            raise
 
     async def _close_process_run(self, run: ProcessRunState) -> bool:
         """Close a process run tab; active runs are marked failed/cancelled."""
@@ -4189,53 +4256,74 @@ class LoomApp(App):
                 chat.add_info(error)
             return False
 
-        if run.status in {"queued", "running"}:
-            chat.add_info(
-                f"Run [dim]{run.run_id}[/dim] is already active and cannot be resumed."
-            )
-            return False
-        if not run.task_id:
-            chat.add_info(
-                f"Run [dim]{run.run_id}[/dim] has no task ID, so it cannot be resumed."
-            )
-            return False
+        chat.add_user_message(f"/run resume {target}")
+        return await self._restart_process_run_in_place(run.run_id, mode="resume")
 
-        await self._start_process_run(
-            run.goal,
-            process_defn=run.process_defn,
-            process_name_override=run.process_name,
-            command_prefix=f"/run resume {run.run_id}",
-            is_adhoc=bool(getattr(run, "is_adhoc", False)),
-            recommended_tools=list(getattr(run, "recommended_tools", [])),
-            resume_task_id=run.task_id,
-            run_workspace_override=run.run_workspace,
-        )
-        return True
+    @staticmethod
+    def _resume_seed_task_rows(run: ProcessRunState) -> tuple[list[dict], dict[str, str]]:
+        """Clone prior task rows for resume; keep completed rows and reset the rest."""
+        rows: list[dict] = []
+        row_ids: set[str] = set()
+        for item in getattr(run, "tasks", []):
+            if not isinstance(item, dict):
+                continue
+            cloned = dict(item)
+            status = str(cloned.get("status", "pending")).strip()
+            if status != "completed":
+                status = "pending"
+            cloned["status"] = status
+            subtask_id = str(cloned.get("id", "")).strip()
+            if subtask_id:
+                row_ids.add(subtask_id)
+            rows.append(cloned)
 
-    async def _restart_process_run_in_place(self, run_id: str) -> bool:
+        labels: dict[str, str] = {}
+        raw_labels = getattr(run, "task_labels", {})
+        if isinstance(raw_labels, dict):
+            for key, value in raw_labels.items():
+                subtask_id = str(key).strip()
+                if not subtask_id:
+                    continue
+                if row_ids and subtask_id not in row_ids:
+                    continue
+                labels[subtask_id] = str(value)
+        return rows, labels
+
+    async def _restart_process_run_in_place(
+        self,
+        run_id: str,
+        *,
+        mode: str = "restart",
+    ) -> bool:
         """Restart one failed/cancelled run in the same tab."""
         run = self._process_runs.get(run_id)
         if run is None or run.closed:
             return False
 
+        normalized_mode = str(mode or "").strip().lower()
+        is_resume = normalized_mode == "resume"
+        verb_denied = "resumed" if is_resume else "restarted"
+        verb_ongoing = "Resuming" if is_resume else "Restarting"
+        verb_done = "Resumed" if is_resume else "Restarted"
+        event_action = "resumed" if is_resume else "restarted"
+
         chat = self.query_one("#chat-log", ChatLog)
         events_panel = self.query_one("#events-panel", EventPanel)
         if run.status in {"queued", "running"}:
             chat.add_info(
-                f"Run [dim]{run.run_id}[/dim] is already active and cannot be restarted."
+                f"Run [dim]{run.run_id}[/dim] is already active and cannot be {verb_denied}."
             )
             return False
         if not run.task_id:
             chat.add_info(
-                f"Run [dim]{run.run_id}[/dim] has no task ID, so it cannot be restarted."
+                f"Run [dim]{run.run_id}[/dim] has no task ID, so it cannot be {verb_denied}."
             )
             return False
 
         run.status = "queued"
         run.started_at = time.monotonic()
         run.ended_at = None
-        run.tasks = []
-        run.task_labels = {}
+        run.tasks, run.task_labels = self._resume_seed_task_rows(run)
         run.last_progress_message = ""
         run.last_progress_at = 0.0
         self._update_process_run_visuals(run)
@@ -4243,7 +4331,7 @@ class LoomApp(App):
         self._refresh_process_run_outputs(run)
         self._append_process_run_activity(
             run,
-            f"Restarting in place from task state {run.task_id}.",
+            f"{verb_ongoing} in place from task state {run.task_id}.",
         )
         run.worker = self.run_worker(
             self._execute_process_run(run_id),
@@ -4253,12 +4341,12 @@ class LoomApp(App):
         )
         self._refresh_sidebar_progress_summary()
         chat.add_info(
-            f"Restarted process run [dim]{run.run_id}[/dim] in place."
+            f"{verb_done} process run [dim]{run.run_id}[/dim] in place."
         )
         events_panel.add_event(
             _now_str(),
             "process_run",
-            f"{run.process_name} #{run.run_id} restarted",
+            f"{run.process_name} #{run.run_id} {event_action}",
         )
         await self._persist_process_run_ui_state()
         return True
@@ -4349,6 +4437,7 @@ class LoomApp(App):
         )
         tabs.active = pane_id
         self._update_process_run_visuals(run)
+        run.pane.set_tasks(run.tasks)
         self._refresh_process_run_outputs(run)
         self._refresh_sidebar_progress_summary()
 
@@ -4979,11 +5068,16 @@ class LoomApp(App):
             model=self._model,
             tools=self._tools,
             workspace=self._workspace,
+            scratch_dir=self._cowork_scratch_dir(),
             system_prompt=system_prompt,
             approver=approver,
             store=self._store,
             session_id=session_id,
             model_retry_policy=self._model_retry_policy(),
+            enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
+            ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
+            ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
+            ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
         )
         self._total_tokens = 0
         self._bind_session_tools()
@@ -5011,10 +5105,15 @@ class LoomApp(App):
             model=self._model,
             tools=self._tools,
             workspace=self._workspace,
+            scratch_dir=self._cowork_scratch_dir(),
             system_prompt=system_prompt,
             approver=approver,
             store=self._store,
             model_retry_policy=self._model_retry_policy(),
+            enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
+            ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
+            ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
+            ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
         )
         await new_session.resume(session_id)
 
@@ -7512,11 +7611,25 @@ class LoomApp(App):
 
     def action_close_process_tab(self) -> None:
         """Close current process run tab with confirmation."""
-        self.run_worker(
-            self._close_process_run_from_target("current"),
-            group="close-process-tab",
-            exclusive=True,
-        )
+        if self._close_process_tab_inflight:
+            return
+        self._close_process_tab_inflight = True
+
+        async def _close_current_tab() -> None:
+            try:
+                await self._close_process_run_from_target("current")
+            finally:
+                self._close_process_tab_inflight = False
+
+        try:
+            self.run_worker(
+                _close_current_tab(),
+                group="close-process-tab",
+                exclusive=False,
+            )
+        except Exception:
+            self._close_process_tab_inflight = False
+            raise
 
     def action_tab_chat(self) -> None:
         tabs = self.query_one("#tabs", TabbedContent)

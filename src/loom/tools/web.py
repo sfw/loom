@@ -15,6 +15,14 @@ import socket
 
 import httpx
 
+from loom.ingest.artifacts import (
+    DEFAULT_RETENTION_MAX_AGE_DAYS,
+    DEFAULT_RETENTION_MAX_BYTES_PER_SCOPE,
+    DEFAULT_RETENTION_MAX_FILES_PER_SCOPE,
+    persist_fetch_artifact,
+)
+from loom.ingest.handlers import summarize_artifact
+from loom.ingest.router import ContentKind, detect_content_kind, normalize_media_type
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
 # Safety: block private/internal networks
@@ -27,6 +35,7 @@ _BLOCKED_HOSTS = re.compile(
 MAX_RESPONSE_SIZE = 512 * 1024  # 512KB
 MAX_DOWNLOAD_BYTES = MAX_RESPONSE_SIZE * 4  # 2MB bounded download
 MAX_HTML_SOURCE_DOWNLOAD_BYTES = MAX_RESPONSE_SIZE  # 512KB raw HTML source cap
+MAX_BINARY_SUMMARY_CHARS = 3_600
 FETCH_TIMEOUT = 30.0
 MAX_FETCH_ATTEMPTS = 3
 FETCH_RETRY_BASE_DELAY = 0.4
@@ -103,6 +112,22 @@ def _build_request_headers() -> dict[str, str]:
 def _should_retry_status(status_code: int) -> bool:
     """Return True if an HTTP status is likely transient."""
     return status_code in RETRYABLE_HTTP_STATUS
+
+
+def _hidden_int_arg(
+    args: dict,
+    key: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = args.get(key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(minimum, min(maximum, value))
 
 
 async def _get_with_retries(
@@ -195,6 +220,11 @@ async def _execute_web_fetch(
     *,
     extract_text: bool,
     max_download_bytes: int,
+    enable_filetype_ingest_router: bool = True,
+    artifact_retention_max_age_days: int = DEFAULT_RETENTION_MAX_AGE_DAYS,
+    artifact_retention_max_files_per_scope: int = DEFAULT_RETENTION_MAX_FILES_PER_SCOPE,
+    artifact_retention_max_bytes_per_scope: int = DEFAULT_RETENTION_MAX_BYTES_PER_SCOPE,
+    ctx: ToolContext | None = None,
 ) -> ToolResult:
     if not url:
         return ToolResult.fail("No URL provided")
@@ -249,36 +279,122 @@ async def _execute_web_fetch(
             content_bytes, stream_truncated = await _read_response_limited(
                 response, max_download_bytes,
             )
+            resolved_url = str(response.url)
+            status_code = response.status_code
             await response.aclose()
-            content = _decode_response_bytes(response, content_bytes)
-
-            # Strip HTML for text-oriented fetches.
-            # Some servers mislabel HTML as text/plain, so detect by content too.
-            if extract_text and _looks_like_html(content, content_type):
-                content = _strip_html(content)
-
-            truncation_notes = []
+            media_type = normalize_media_type(content_type)
+            truncation_notes: list[str] = []
             if stream_truncated or (
                 declared_size is not None and declared_size > max_download_bytes
             ):
                 truncation_notes.append(
                     f"download truncated to first {max_download_bytes} bytes"
                 )
-            if truncation_notes:
-                content += "\n\n... (" + "; ".join(truncation_notes) + ")"
 
-            return ToolResult.ok(
-                content,
-                data={
-                    "url": str(response.url),
-                    "status_code": response.status_code,
-                    "content_type": content_type,
-                    "size_bytes": len(content),
-                    "declared_size_bytes": declared_size,
-                    "truncated": bool(truncation_notes),
-                    "extract_text": extract_text,
-                },
+            if not enable_filetype_ingest_router:
+                content = _decode_response_bytes(response, content_bytes)
+                if extract_text and _looks_like_html(content, media_type):
+                    content = _strip_html(content)
+                if truncation_notes:
+                    content += "\n\n... (" + "; ".join(truncation_notes) + ")"
+                return ToolResult.ok(
+                    content,
+                    data={
+                        "url": resolved_url,
+                        "status_code": status_code,
+                        "content_type": media_type or content_type,
+                        "content_kind": ContentKind.TEXT,
+                        "size_bytes": len(content),
+                        "declared_size_bytes": declared_size,
+                        "truncated": bool(truncation_notes),
+                        "extract_text": extract_text,
+                    },
+                )
+
+            content_kind = detect_content_kind(
+                content_type=media_type,
+                content_bytes=content_bytes,
+                url=resolved_url,
             )
+
+            if content_kind in {ContentKind.TEXT, ContentKind.HTML}:
+                content = _decode_response_bytes(response, content_bytes)
+
+                # Strip HTML for text-oriented fetches.
+                # Some servers mislabel HTML as text/plain, so detect by content too.
+                if extract_text and (
+                    content_kind == ContentKind.HTML
+                    or _looks_like_html(content, media_type)
+                ):
+                    content = _strip_html(content)
+
+                if truncation_notes:
+                    content += "\n\n... (" + "; ".join(truncation_notes) + ")"
+
+                return ToolResult.ok(
+                    content,
+                    data={
+                        "url": resolved_url,
+                        "status_code": status_code,
+                        "content_type": media_type or content_type,
+                        "content_kind": content_kind,
+                        "size_bytes": len(content),
+                        "declared_size_bytes": declared_size,
+                        "truncated": bool(truncation_notes),
+                        "extract_text": extract_text,
+                    },
+                )
+
+            # Binary/document path: persist bytes and return artifact-backed summary.
+            workspace = None
+            scratch_dir = None
+            subtask_id = ""
+            if ctx is not None:
+                workspace = ctx.workspace
+                scratch_dir = ctx.scratch_dir
+                subtask_id = ctx.subtask_id
+            record = persist_fetch_artifact(
+                content_bytes=content_bytes,
+                source_url=resolved_url,
+                media_type=media_type or content_type,
+                content_kind=content_kind,
+                workspace=workspace,
+                scratch_dir=scratch_dir,
+                subtask_id=subtask_id,
+                retention_max_age_days=artifact_retention_max_age_days,
+                retention_max_files_per_scope=artifact_retention_max_files_per_scope,
+                retention_max_bytes_per_scope=artifact_retention_max_bytes_per_scope,
+            )
+            summary = summarize_artifact(
+                path=record.path,
+                content_kind=content_kind,
+                media_type=media_type or content_type,
+                max_chars=MAX_BINARY_SUMMARY_CHARS,
+            )
+            output = summary.summary_text
+            if truncation_notes:
+                output += "\n\n... (" + "; ".join(truncation_notes) + ")"
+
+            data: dict = {
+                "url": resolved_url,
+                "status_code": status_code,
+                "content_type": media_type or content_type,
+                "content_kind": content_kind,
+                "size_bytes": record.size_bytes,
+                "declared_size_bytes": declared_size,
+                "truncated": bool(truncation_notes),
+                "extract_text": extract_text,
+                "artifact_ref": record.artifact_ref,
+                "artifact_path": str(record.path),
+                "handler": summary.handler,
+                "extracted_chars": len(summary.extracted_text),
+                "extraction_truncated": bool(summary.extraction_truncated),
+            }
+            if record.workspace_relpath:
+                data["artifact_workspace_relpath"] = record.workspace_relpath
+            if summary.metadata:
+                data["handler_metadata"] = summary.metadata
+            return ToolResult.ok(output, data=data)
     except httpx.HTTPStatusError as e:
         target = str(e.request.url) if e.request else url
         return ToolResult.fail(f"HTTP {e.response.status_code}: {target}")
@@ -325,10 +441,37 @@ class WebFetchTool(Tool):
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         url = args.get("url", "")
+        enable_router = bool(args.get("_enable_filetype_ingest_router", True))
+        retention_max_age_days = _hidden_int_arg(
+            args,
+            "_artifact_retention_max_age_days",
+            DEFAULT_RETENTION_MAX_AGE_DAYS,
+            minimum=0,
+            maximum=3650,
+        )
+        retention_max_files_per_scope = _hidden_int_arg(
+            args,
+            "_artifact_retention_max_files_per_scope",
+            DEFAULT_RETENTION_MAX_FILES_PER_SCOPE,
+            minimum=1,
+            maximum=200_000,
+        )
+        retention_max_bytes_per_scope = _hidden_int_arg(
+            args,
+            "_artifact_retention_max_bytes_per_scope",
+            DEFAULT_RETENTION_MAX_BYTES_PER_SCOPE,
+            minimum=1024,
+            maximum=20_000_000_000,
+        )
         return await _execute_web_fetch(
             url,
             extract_text=True,
             max_download_bytes=MAX_DOWNLOAD_BYTES,
+            enable_filetype_ingest_router=enable_router,
+            artifact_retention_max_age_days=retention_max_age_days,
+            artifact_retention_max_files_per_scope=retention_max_files_per_scope,
+            artifact_retention_max_bytes_per_scope=retention_max_bytes_per_scope,
+            ctx=ctx,
         )
 
 
@@ -364,10 +507,37 @@ class WebFetchHtmlTool(Tool):
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         url = args.get("url", "")
+        enable_router = bool(args.get("_enable_filetype_ingest_router", True))
+        retention_max_age_days = _hidden_int_arg(
+            args,
+            "_artifact_retention_max_age_days",
+            DEFAULT_RETENTION_MAX_AGE_DAYS,
+            minimum=0,
+            maximum=3650,
+        )
+        retention_max_files_per_scope = _hidden_int_arg(
+            args,
+            "_artifact_retention_max_files_per_scope",
+            DEFAULT_RETENTION_MAX_FILES_PER_SCOPE,
+            minimum=1,
+            maximum=200_000,
+        )
+        retention_max_bytes_per_scope = _hidden_int_arg(
+            args,
+            "_artifact_retention_max_bytes_per_scope",
+            DEFAULT_RETENTION_MAX_BYTES_PER_SCOPE,
+            minimum=1024,
+            maximum=20_000_000_000,
+        )
         return await _execute_web_fetch(
             url,
             extract_text=False,
             max_download_bytes=MAX_HTML_SOURCE_DOWNLOAD_BYTES,
+            enable_filetype_ingest_router=enable_router,
+            artifact_retention_max_age_days=retention_max_age_days,
+            artifact_retention_max_files_per_scope=retention_max_files_per_scope,
+            artifact_retention_max_bytes_per_scope=retention_max_bytes_per_scope,
+            ctx=ctx,
         )
 
 
