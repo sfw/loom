@@ -101,7 +101,7 @@ base_url = "http://localhost:11434"
 model = "kimi-k2.5"
 max_tokens = 4096
 temperature = 0.1
-roles = ["planner", "executor"]
+roles = ["planner", "verifier"]
 
 [models.utility]
 provider = "ollama"
@@ -109,7 +109,7 @@ base_url = "http://localhost:11434"
 model = "minimax-m2.1"
 max_tokens = 2048
 temperature = 0.0
-roles = ["extractor", "verifier"]
+roles = ["extractor", "executor"]
 
 [execution]
 max_subtask_retries = 3
@@ -118,7 +118,7 @@ max_parallel_subtasks = 3
 delegate_task_timeout_seconds = 3600
 ```
 
-Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor) so you can use a big model for planning and a small one for verification.
+Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor). A common split is stronger model for planning + verification and cheaper model for extraction + execution.
 Manage external MCP servers in `~/.loom/mcp.toml` (or workspace `./.loom/mcp.toml`):
 
 ```toml

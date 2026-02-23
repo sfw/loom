@@ -8,7 +8,7 @@ base_url = "http://localhost:1234/v1"
 model = "minimax-m2.1"
 max_tokens = 8192 
 temperature = 0.1
-roles = ["planner", "executor"]
+roles = ["planner", "verifier"]
 
 [models.utility]
 provider = "ollama"
@@ -16,7 +16,7 @@ base_url = "http://localhost:11434"
 model = "qwen3:8b"
 max_tokens = 4096 
 temperature = 0.0
-roles = ["extractor", "verifier"]
+roles = ["extractor", "executor"]
 
 [models.compactor]
 provider = "openai_compatible"

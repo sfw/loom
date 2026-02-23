@@ -1,18 +1,33 @@
-# Dead Code Cleanup Plan (2026-02-22)
+# Dead Code Cleanup Plan (2026-02-22, revalidated 2026-02-23)
+
+## Applicability Status (2026-02-23)
+Status: still applicable.
+
+Revalidation summary:
+- All phase-1 symbol candidates are still present and still definition-only across `src/` and `tests/`.
+- All phase-2 module candidates are still present and still test-only.
+- No cleanup in this plan appears to have landed yet.
 
 ## Scope
-This plan targets dead or orphaned Python code in `src/loom/` using reference scans plus full-suite coverage as evidence.
+This plan targets dead or orphaned Python code in `src/loom/` using reference scans plus test evidence.
 
 ## Evidence Snapshot
-- `uv run ruff check src tests --select F401,F841` -> no unused imports/locals (dead code is mostly orphaned symbols/modules, not lint-level issues).
+
+### 2026-02-22 baseline (original plan)
+- `uv run ruff check src tests --select F401,F841` -> no unused imports/locals.
 - `uv run pytest --cov=loom --cov-report=term-missing:skip-covered -q` -> `1682 passed, 50 skipped`, overall `69%` coverage.
 - Symbol reference scan (`rg` + AST pass) identified symbols with exactly one source reference (their own definition).
-- Confirmation query:
-  - `rg -n "...candidate symbols..." src -S` returned only definitions for the targets listed below.
 
-## Findings
+### 2026-02-23 revalidation (current)
+- `rg -n "\bErrorResponse\b|\bContentBlockResponse\b|\b_resolve_env_value\b|\basync_terminal_approval_prompt\b|\bvalidate_legacy_toml\b|\bis_retryable_model_error\b|\bcoerce_int\b|\bsupported_year_range\b|\bEngineError\b" src tests` -> only definition lines.
+- `rg -n "from\\s+loom\\.cowork\\.display|import\\s+loom\\.cowork\\.display|\bdisplay_tool_start\b|\bdisplay_tool_complete\b|\b_extract_diff\b" src tests` -> only `src/loom/cowork/display.py` plus `_extract_diff` usage in `tests/test_tools.py`.
+- `rg -n "from\\s+loom\\.prompts\\.constraints|import\\s+loom\\.prompts\\.constraints|\bget_constraints_for_role\b|\bCOMMON_CONSTRAINTS\b" src tests` -> only `src/loom/prompts/constraints.py` plus `tests/test_prompts.py`.
+- `rg -n "from\\s+loom\\.tui\\.api_client|import\\s+loom\\.tui\\.api_client|\bLoomAPIClient\b" src tests` -> only `src/loom/tui/api_client.py` plus `tests/test_tui.py`.
+- `rg -n "\bLoomError\b|\bEngineError\b|\bModelError\b|\bToolError\b|\bStateError\b" src tests` -> only `src/loom/exceptions.py` definitions.
 
-### High-confidence dead symbols (no runtime or test references)
+## Current Findings
+
+### Phase 1 candidates (still dead as of 2026-02-23)
 1. `src/loom/api/schemas.py:91` `ErrorResponse`
 2. `src/loom/api/schemas.py:124` `ContentBlockResponse`
 3. `src/loom/auth/runtime.py:64` `_resolve_env_value`
@@ -21,24 +36,27 @@ This plan targets dead or orphaned Python code in `src/loom/` using reference sc
 6. `src/loom/models/retry.py:51` `is_retryable_model_error`
 7. `src/loom/research/text.py:40` `coerce_int`
 8. `src/loom/tools/inflation_calculator.py:217` `supported_year_range`
-9. `src/loom/exceptions.py:14` `EngineError` (+ file-level hierarchy appears unused)
+9. `src/loom/exceptions.py:14` `EngineError` (and sibling hierarchy in `src/loom/exceptions.py` appears unused)
 
-### High-confidence dead production modules (test-only usage)
+### Phase 2 candidates (still test-only as of 2026-02-23)
 1. `src/loom/cowork/display.py`
 - Display entrypoints (`display_tool_start`, `display_tool_complete`, etc.) have no runtime references.
-- Only `_extract_diff` is referenced in tests (`tests/test_tools.py:1110`).
-
+- Only `_extract_diff` is referenced in tests (`tests/test_tools.py:1110` onward).
 2. `src/loom/prompts/constraints.py`
-- Constraint constants/helpers are referenced only in tests (`tests/test_prompts.py:11` onward).
+- Constraint constants/helpers are referenced in tests (`tests/test_prompts.py`) but not runtime code.
 - Runtime prompt assembly currently uses template files in `src/loom/prompts/templates/`.
-
 3. `src/loom/tui/api_client.py`
-- `LoomAPIClient` is referenced only in tests (`tests/test_tui.py:14` onward).
+- `LoomAPIClient` is referenced in tests (`tests/test_tui.py`) but not runtime code.
 - Current TUI path uses in-process orchestration (`src/loom/tui/app.py`), not this HTTP client.
+
+## Execution Status
+- Phase 1: not started.
+- Phase 2: not started.
+- Phase 3: not started.
 
 ## Cleanup Sequence
 
-### Phase 1: Remove isolated orphan symbols (low-risk)
+### Phase 1: Remove isolated orphan symbols (low risk)
 1. Delete dead symbols from:
 - `src/loom/api/schemas.py`
 - `src/loom/auth/runtime.py`
@@ -55,11 +73,9 @@ This plan targets dead or orphaned Python code in `src/loom/` using reference sc
 1. `src/loom/cowork/display.py`
 - Preferred: remove module and drop `_extract_diff` tests from `tests/test_tools.py`.
 - Alternative: if terminal cowork mode is planned, wire module into CLI flow explicitly and keep it.
-
 2. `src/loom/prompts/constraints.py`
 - Preferred: remove module and tests that only validate this orphaned layer.
 - Alternative: integrate it into prompt assembly and de-duplicate template constraints.
-
 3. `src/loom/tui/api_client.py`
 - Preferred: remove module and legacy tests.
 - Alternative: reintroduce server-mode TUI path and make this client active runtime code.

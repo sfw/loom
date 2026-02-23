@@ -49,6 +49,11 @@ MCP server configuration can be supplied in:
 | `capabilities.audio_input` | `bool` | auto-detected | Override audio input support hint. |
 | `capabilities.audio_output` | `bool` | auto-detected | Override audio output support hint. |
 
+Recommended two-model split:
+- `primary` roles: `["planner", "verifier"]`
+- `utility` roles: `["extractor", "executor"]`
+- Ensure at least one configured model has the `executor` role.
+
 ### `[workspace]`
 
 | Key | Type | Default | Description |
