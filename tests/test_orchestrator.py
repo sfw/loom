@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import time
 from pathlib import Path
@@ -1657,6 +1658,125 @@ class TestOrchestratorFinalize:
         result = await orch.execute_task(task)
         assert result.status == TaskStatus.COMPLETED
         assert result.completed_at != ""
+
+    @pytest.mark.asyncio
+    async def test_wrap_up_exports_evidence_ledger_csv_to_workspace(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "Only step"}]
+        })
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path / "state"),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(
+                status="success",
+                summary="captured evidence",
+                evidence_records=[{
+                    "evidence_id": "EV-1",
+                    "tool": "web_fetch",
+                    "source_url": "https://example.com/report",
+                    "quality": 0.9,
+                    "facets": {"market": "water"},
+                }],
+            ),
+            VerificationResult(tier=1, passed=True),
+        ))
+
+        task = _make_task(workspace=str(workspace))
+        result = await orch.execute_task(task)
+        assert result.status == TaskStatus.COMPLETED
+
+        ledger_csv = workspace / "evidence-ledger.csv"
+        assert ledger_csv.exists()
+        with ledger_csv.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        assert len(rows) == 1
+        assert rows[0]["evidence_id"] == "EV-1"
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["subtask_id"] == "s1"
+        assert rows[0]["facets"] == '{"market": "water"}'
+
+    @pytest.mark.asyncio
+    async def test_wrap_up_skips_evidence_csv_when_no_ledger(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "Only step"}]
+        })
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path / "state"),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+
+        task = _make_task(workspace=str(workspace))
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert not (workspace / "evidence-ledger.csv").exists()
+
+    @pytest.mark.asyncio
+    async def test_wrap_up_exports_evidence_csv_for_failed_task(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{
+                "id": "s1",
+                "description": "Only step",
+                "is_critical_path": True,
+            }]
+        })
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path / "state"),
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=0)),
+        )
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(
+                status="failed",
+                summary="verification failed",
+                evidence_records=[{
+                    "evidence_id": "EV-FAIL-1",
+                    "tool": "web_search",
+                    "query": "utility market",
+                }],
+            ),
+            VerificationResult(
+                tier=2,
+                passed=False,
+                feedback="Verification failed",
+            ),
+        ))
+
+        task = _make_task(workspace=str(workspace))
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.FAILED
+        ledger_csv = workspace / "evidence-ledger.csv"
+        assert ledger_csv.exists()
+        with ledger_csv.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        assert len(rows) == 1
+        assert rows[0]["evidence_id"] == "EV-FAIL-1"
 
     @pytest.mark.asyncio
     async def test_cancel_task(self, tmp_path):

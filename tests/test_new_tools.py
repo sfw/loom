@@ -450,6 +450,22 @@ class TestSpreadsheetRead:
         assert result.success
         assert "Empty" in result.output
 
+    async def test_read_from_allowed_read_root_with_absolute_path(self, sheet, workspace):
+        read_root = workspace.parent / f"{workspace.name}-read-root"
+        read_root.mkdir()
+        csv_path = read_root / "external.csv"
+        csv_path.write_text("Name,Score\nAlice,95\n")
+
+        read_ctx = ToolContext(workspace=workspace, read_roots=[read_root])
+        result = await sheet.execute(
+            {"operation": "read", "path": str(csv_path)},
+            read_ctx,
+        )
+
+        assert result.success
+        assert "Alice" in result.output
+        assert "Score" in result.output
+
 
 class TestSpreadsheetAddRows:
     """Test adding rows to existing CSV."""
@@ -718,6 +734,22 @@ class TestSpreadsheetSummary:
         assert result.success
         assert "Empty" in result.output
 
+    async def test_summary_from_allowed_read_root_with_absolute_path(self, sheet, workspace):
+        read_root = workspace.parent / f"{workspace.name}-read-root"
+        read_root.mkdir()
+        csv_path = read_root / "external.csv"
+        csv_path.write_text("Name,Score\nAlice,95\nBob,87\n")
+
+        read_ctx = ToolContext(workspace=workspace, read_roots=[read_root])
+        result = await sheet.execute(
+            {"operation": "summary", "path": str(csv_path)},
+            read_ctx,
+        )
+
+        assert result.success
+        assert "Columns (2)" in result.output
+        assert "Rows: 2" in result.output
+
 
 class TestSpreadsheetErrors:
     """Test spreadsheet error handling."""
@@ -745,6 +777,24 @@ class TestSpreadsheetErrors:
         )
         assert not result.success
         assert "Unknown operation" in result.error
+
+    async def test_write_remains_confined_even_with_read_roots(self, sheet, workspace):
+        read_root = workspace.parent / f"{workspace.name}-read-root"
+        read_root.mkdir()
+
+        write_ctx = ToolContext(workspace=workspace, read_roots=[read_root])
+        outside_path = read_root / "outside.csv"
+        result = await sheet.execute(
+            {
+                "operation": "create",
+                "path": str(outside_path),
+                "headers": ["A"],
+            },
+            write_ctx,
+        )
+
+        assert not result.success
+        assert "escapes workspace" in (result.error or "")
 
 
 class TestSpreadsheetMetadata:
