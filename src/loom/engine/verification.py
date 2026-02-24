@@ -26,7 +26,6 @@ from loom.engine.semantic_compactor import SemanticCompactor
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
     MODEL_INVOCATION,
-    VERIFICATION_CONTRADICTION_DETECTED,
     VERIFICATION_DETERMINISTIC_BLOCK_RATE,
     VERIFICATION_FALSE_NEGATIVE_CANDIDATE,
     VERIFICATION_INCONCLUSIVE_RATE,
@@ -53,6 +52,7 @@ logger = logging.getLogger(__name__)
 _COMPACTOR_EVENT_CONTEXT: contextvars.ContextVar[tuple[str, str] | None] = (
     contextvars.ContextVar("verification_compactor_event_context", default=None)
 )
+_VERIFICATION_CONTRADICTION_EVENT_TYPE = "verification_contradiction_detected"
 
 _VALID_OUTCOMES = {
     "pass",
@@ -3290,7 +3290,7 @@ class VerificationGates:
                 metadata.get("contradiction_detected_no_downgrade", False),
             )
             self._event_bus.emit(Event(
-                event_type=VERIFICATION_CONTRADICTION_DETECTED,
+                event_type=_VERIFICATION_CONTRADICTION_EVENT_TYPE,
                 task_id=task_id,
                 data={
                     "subtask_id": subtask_id,
