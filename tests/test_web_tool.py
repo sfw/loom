@@ -317,6 +317,12 @@ class TestWebFetchBinaryRouting:
         assert isinstance(result.data, dict)
         assert result.data.get("content_kind") == "pdf"
         assert result.data.get("artifact_ref")
+        assert isinstance(result.data.get("artifact_retention"), dict)
+        assert set(result.data.get("artifact_retention", {})) == {
+            "scopes_scanned",
+            "files_deleted",
+            "bytes_deleted",
+        }
         artifact_path = Path(str(result.data.get("artifact_path", "")))
         assert artifact_path.exists()
         assert "Fetched PDF artifact" in result.output

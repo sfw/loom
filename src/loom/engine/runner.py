@@ -19,6 +19,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from loom.auth.runtime import AuthResolutionError, build_run_auth_context
 from loom.config import Config
@@ -27,7 +28,13 @@ from loom.engine.verification import Check, VerificationGates, VerificationResul
 from loom.events.bus import EventBus
 from loom.events.types import (
     ARTIFACT_CONFINEMENT_VIOLATION,
+    ARTIFACT_INGEST_CLASSIFIED,
+    ARTIFACT_INGEST_COMPLETED,
+    ARTIFACT_READ_COMPLETED,
+    ARTIFACT_RETENTION_PRUNED,
+    COMPACTION_POLICY_DECISION,
     MODEL_INVOCATION,
+    OVERFLOW_FALLBACK_APPLIED,
     TOKEN_STREAMED,
     TOOL_CALL_COMPLETED,
     TOOL_CALL_STARTED,
@@ -89,6 +96,7 @@ class SubtaskResult:
     tokens_used: int = 0
     model_used: str = ""
     evidence_records: list[dict] = field(default_factory=list)
+    telemetry_counters: dict[str, int] = field(default_factory=dict)
 
 
 class CompactionClass(StrEnum):
@@ -152,6 +160,8 @@ class SubtaskRunner:
     EXTRACTOR_PROMPT_MAX_CHARS = 9000
     COMPACTION_CHURN_WARNING_CALLS = 10
     ENABLE_FILETYPE_INGEST_ROUTER = True
+    ENABLE_ARTIFACT_TELEMETRY_EVENTS = True
+    ARTIFACT_TELEMETRY_MAX_METADATA_CHARS = 1200
     ENABLE_MODEL_OVERFLOW_FALLBACK = True
     OVERFLOW_FALLBACK_TOOL_MESSAGE_MIN_CHARS = 4_000
     OVERFLOW_FALLBACK_TOOL_OUTPUT_EXCERPT_CHARS = 1_200
@@ -435,6 +445,23 @@ class SubtaskRunner:
                 self.ENABLE_FILETYPE_INGEST_ROUTER,
             ),
         )
+        self._enable_artifact_telemetry_events = bool(
+            getattr(
+                runner_limits,
+                "enable_artifact_telemetry_events",
+                self.ENABLE_ARTIFACT_TELEMETRY_EVENTS,
+            ),
+        )
+        self._artifact_telemetry_max_metadata_chars = max(
+            120,
+            int(
+                getattr(
+                    runner_limits,
+                    "artifact_telemetry_max_metadata_chars",
+                    self.ARTIFACT_TELEMETRY_MAX_METADATA_CHARS,
+                ),
+            ),
+        )
         self._enable_model_overflow_fallback = bool(
             getattr(
                 runner_limits,
@@ -588,6 +615,7 @@ class SubtaskRunner:
             "compactor_calls": 0,
             "skip_reasons": {},
         }
+        self._active_subtask_telemetry_counters: dict[str, int] | None = None
 
     def _reset_compaction_runtime_stats(self) -> None:
         self._compaction_runtime_stats = {
@@ -678,6 +706,479 @@ class SubtaskRunner:
         )
 
     @staticmethod
+    def _new_subtask_telemetry_counters() -> dict[str, int]:
+        return {
+            "artifact_ingests": 0,
+            "artifact_reads": 0,
+            "artifact_retention_deletes": 0,
+            "compaction_policy_decisions": 0,
+            "overflow_fallback_count": 0,
+            "compactor_warning_count": 0,
+        }
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _normalize_reason_code(reason: str) -> str:
+        text = str(reason or "").strip().lower()
+        if not text:
+            return "unspecified"
+        normalized = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+        return normalized or "unspecified"
+
+    def _telemetry_events_enabled(self) -> bool:
+        return bool(getattr(self, "_enable_artifact_telemetry_events", False))
+
+    def _increment_subtask_counter(self, key: str, amount: int = 1) -> None:
+        counters = getattr(self, "_active_subtask_telemetry_counters", None)
+        if not isinstance(counters, dict):
+            return
+        step = max(0, self._safe_int(amount))
+        if step <= 0:
+            return
+        counters[key] = self._safe_int(counters.get(key, 0)) + step
+
+    @classmethod
+    def _sanitize_url_for_telemetry(cls, raw_url: Any) -> str:
+        text = str(raw_url or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = urlsplit(text)
+            host = parsed.hostname or ""
+            if parsed.port:
+                host = f"{host}:{parsed.port}"
+            netloc = host or parsed.netloc
+            return urlunsplit((parsed.scheme, netloc, parsed.path or "", "", ""))
+        except Exception:
+            return text.split("?", 1)[0].split("#", 1)[0]
+
+    @staticmethod
+    def _stable_json_length(value: Any) -> int:
+        try:
+            serialized = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except (TypeError, ValueError):
+            serialized = json.dumps(str(value), ensure_ascii=False)
+        return len(serialized)
+
+    @staticmethod
+    def _stable_json_digest(value: Any) -> str:
+        try:
+            serialized = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except (TypeError, ValueError):
+            serialized = json.dumps(str(value), ensure_ascii=False)
+        return hashlib.sha1(
+            serialized.encode("utf-8", errors="ignore"),
+        ).hexdigest()[:16]
+
+    @classmethod
+    def _normalize_handler_metadata_value(cls, raw: Any) -> Any:
+        if raw is None:
+            return None
+        if isinstance(raw, (str, int, float, bool)):
+            return raw
+        if isinstance(raw, dict):
+            normalized: dict[str, Any] = {}
+            for key in sorted(raw.keys(), key=lambda item: str(item)):
+                normalized[str(key)] = cls._normalize_handler_metadata_value(raw.get(key))
+            return normalized
+        if isinstance(raw, (list, tuple)):
+            return [cls._normalize_handler_metadata_value(item) for item in raw]
+        return str(raw)
+
+    def _summarize_oversize_handler_metadata(
+        self,
+        *,
+        normalized: Any,
+        original_chars: int,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "_loom_meta": "metadata_omitted",
+            "original_type": type(normalized).__name__,
+            "original_chars": max(0, int(original_chars)),
+            "sha1": self._stable_json_digest(normalized),
+        }
+        if isinstance(normalized, dict):
+            keys = [str(key) for key in sorted(normalized.keys())]
+            summary["key_count"] = len(keys)
+            if keys:
+                summary["keys"] = keys[:6]
+                if len(keys) > 6:
+                    summary["keys_omitted"] = len(keys) - 6
+        elif isinstance(normalized, list):
+            summary["item_count"] = len(normalized)
+        elif isinstance(normalized, str):
+            summary["string_chars"] = len(normalized)
+
+        if self._stable_json_length(summary) <= max_chars:
+            return summary
+
+        for optional_key in (
+            "keys",
+            "keys_omitted",
+            "item_count",
+            "string_chars",
+            "key_count",
+        ):
+            summary.pop(optional_key, None)
+            if self._stable_json_length(summary) <= max_chars:
+                return summary
+
+        minimal = {
+            "_loom_meta": "metadata_omitted",
+            "original_type": type(normalized).__name__,
+            "sha1": summary["sha1"],
+        }
+        return minimal
+
+    def _sanitize_handler_metadata(self, raw: Any) -> Any:
+        normalized = self._normalize_handler_metadata_value(raw)
+        if normalized is None:
+            return None
+        max_chars = int(
+            getattr(
+                self,
+                "_artifact_telemetry_max_metadata_chars",
+                self.ARTIFACT_TELEMETRY_MAX_METADATA_CHARS,
+            ),
+        )
+        max_chars = max(120, max_chars)
+        original_chars = self._stable_json_length(normalized)
+        if original_chars <= max_chars:
+            return normalized
+        return self._summarize_oversize_handler_metadata(
+            normalized=normalized,
+            original_chars=original_chars,
+            max_chars=max_chars,
+        )
+
+    def _emit_telemetry_event(
+        self,
+        *,
+        event_type: str,
+        task_id: str,
+        data: dict[str, Any],
+        counter_key: str = "",
+        counter_amount: int = 1,
+    ) -> None:
+        if not self._event_bus:
+            return
+        from loom.events.bus import Event
+
+        self._event_bus.emit(Event(event_type=event_type, task_id=task_id, data=data))
+        if counter_key:
+            self._increment_subtask_counter(counter_key, counter_amount)
+
+    def _artifact_event_common_payload(
+        self,
+        *,
+        subtask_id: str,
+        tool_name: str,
+        tool_args: dict,
+        result: ToolResult,
+    ) -> dict[str, Any]:
+        data = result.data if isinstance(result.data, dict) else {}
+        url = data.get("url", "") or data.get("source_url", "") or tool_args.get("url", "")
+        content_kind = str(data.get("content_kind", "")).strip() or "unknown"
+        content_type = str(
+            data.get("content_type", "") or data.get("media_type", ""),
+        ).strip()
+        return {
+            "subtask_id": subtask_id,
+            "tool": tool_name,
+            "url": self._sanitize_url_for_telemetry(url),
+            "content_kind": content_kind,
+            "content_type": content_type,
+            "status": "ok" if result.success else "error",
+        }
+
+    def _emit_artifact_ingest_telemetry(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        tool_name: str,
+        tool_args: dict,
+        result: ToolResult,
+    ) -> None:
+        if not self._telemetry_events_enabled() or not self._event_bus:
+            return
+        if tool_name not in {"web_fetch", "web_fetch_html"}:
+            return
+        data = result.data if isinstance(result.data, dict) else {}
+        artifact_ref = str(data.get("artifact_ref", "")).strip()
+        artifact_relpath = str(data.get("artifact_workspace_relpath", "")).strip()
+        artifact_path = str(data.get("artifact_path", "")).strip()
+        if not (artifact_ref or artifact_relpath or artifact_path):
+            return
+
+        payload = self._artifact_event_common_payload(
+            subtask_id=subtask_id,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            result=result,
+        )
+        if artifact_ref:
+            payload["artifact_ref"] = artifact_ref
+        if artifact_relpath:
+            payload["artifact_workspace_relpath"] = artifact_relpath
+        elif artifact_path:
+            payload["artifact_path"] = artifact_path
+        if "size_bytes" in data:
+            payload["size_bytes"] = self._safe_int(data.get("size_bytes"))
+        if "declared_size_bytes" in data:
+            payload["declared_size_bytes"] = self._safe_int(data.get("declared_size_bytes"))
+        handler = str(data.get("handler", "")).strip()
+        if handler:
+            payload["handler"] = handler
+        if "extracted_chars" in data:
+            payload["extracted_chars"] = self._safe_int(data.get("extracted_chars"))
+        if "extraction_truncated" in data:
+            payload["extraction_truncated"] = bool(data.get("extraction_truncated"))
+        metadata = self._sanitize_handler_metadata(data.get("handler_metadata"))
+        if metadata is not None:
+            payload["handler_metadata"] = metadata
+
+        self._emit_telemetry_event(
+            event_type=ARTIFACT_INGEST_CLASSIFIED,
+            task_id=task_id,
+            data=dict(payload),
+        )
+        self._emit_telemetry_event(
+            event_type=ARTIFACT_INGEST_COMPLETED,
+            task_id=task_id,
+            data=dict(payload),
+            counter_key="artifact_ingests",
+        )
+
+        retention = data.get("artifact_retention")
+        if isinstance(retention, dict):
+            files_deleted = max(0, self._safe_int(retention.get("files_deleted")))
+            if files_deleted > 0:
+                retention_payload = dict(payload)
+                retention_payload["scopes_scanned"] = max(
+                    0,
+                    self._safe_int(retention.get("scopes_scanned")),
+                )
+                retention_payload["files_deleted"] = files_deleted
+                retention_payload["bytes_deleted"] = max(
+                    0,
+                    self._safe_int(retention.get("bytes_deleted")),
+                )
+                self._emit_telemetry_event(
+                    event_type=ARTIFACT_RETENTION_PRUNED,
+                    task_id=task_id,
+                    data=retention_payload,
+                    counter_key="artifact_retention_deletes",
+                    counter_amount=files_deleted,
+                )
+
+    def _emit_artifact_read_telemetry(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        tool_name: str,
+        tool_args: dict,
+        result: ToolResult,
+    ) -> None:
+        if not self._telemetry_events_enabled() or not self._event_bus:
+            return
+        if tool_name != "read_artifact":
+            return
+
+        data = result.data if isinstance(result.data, dict) else {}
+        payload = self._artifact_event_common_payload(
+            subtask_id=subtask_id,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            result=result,
+        )
+        artifact_ref = str(
+            data.get("artifact_ref", "") or tool_args.get("artifact_ref", ""),
+        ).strip()
+        if artifact_ref:
+            payload["artifact_ref"] = artifact_ref
+        artifact_relpath = str(data.get("artifact_workspace_relpath", "")).strip()
+        artifact_path = str(data.get("artifact_path", "")).strip()
+        if artifact_relpath:
+            payload["artifact_workspace_relpath"] = artifact_relpath
+        elif artifact_path:
+            payload["artifact_path"] = artifact_path
+        if "size_bytes" in data:
+            payload["size_bytes"] = self._safe_int(data.get("size_bytes"))
+        if "declared_size_bytes" in data:
+            payload["declared_size_bytes"] = self._safe_int(data.get("declared_size_bytes"))
+        handler = str(data.get("handler", "")).strip()
+        if handler:
+            payload["handler"] = handler
+        if "extracted_chars" in data:
+            payload["extracted_chars"] = self._safe_int(data.get("extracted_chars"))
+        if "extraction_truncated" in data:
+            payload["extraction_truncated"] = bool(data.get("extraction_truncated"))
+        metadata = self._sanitize_handler_metadata(data.get("handler_metadata"))
+        if metadata is not None:
+            payload["handler_metadata"] = metadata
+        if not result.success and result.error:
+            payload["error"] = str(result.error)
+
+        self._emit_telemetry_event(
+            event_type=ARTIFACT_READ_COMPLETED,
+            task_id=task_id,
+            data=payload,
+            counter_key="artifact_reads",
+        )
+
+    def _compaction_decision_from_diagnostics(
+        self,
+        diagnostics: dict[str, Any],
+    ) -> tuple[str, str]:
+        skip_reason = self._normalize_reason_code(
+            str(diagnostics.get("compaction_skipped_reason", "")).strip(),
+        )
+        stage = str(diagnostics.get("compaction_stage", "")).strip().lower()
+        if skip_reason and skip_reason not in {"none", "unspecified"}:
+            return "skip", skip_reason
+        if stage in {"stage_1_tool_args", "stage_2_tool_outputs"}:
+            reason = (
+                "tool_args_compacted"
+                if stage == "stage_1_tool_args"
+                else "tool_output_compacted"
+            )
+            return "compact_tool", reason
+        if stage in {"stage_2_general", "stage_3_historical", "stage_3_minimal", "stage_4_merge"}:
+            reason = "history_merged" if stage == "stage_4_merge" else "history_compacted"
+            return "compact_history", reason
+        return "skip", "no_change"
+
+    def _emit_compaction_policy_decision_from_diagnostics(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+    ) -> None:
+        if not self._telemetry_events_enabled() or not self._event_bus:
+            return
+        diagnostics = dict(getattr(self, "_last_compaction_diagnostics", {}))
+        mode = str(
+            diagnostics.get(
+                "compaction_policy_mode",
+                self._runner_compaction_mode(),
+            ),
+        ).strip().lower()
+        pressure_ratio = self._safe_float(diagnostics.get("compaction_pressure_ratio", 0.0))
+        if pressure_ratio <= 0.0:
+            before = self._safe_float(diagnostics.get("compaction_est_tokens_before", 0.0))
+            budget = float(
+                max(
+                    1,
+                    int(
+                        getattr(
+                            self,
+                            "_max_model_context_tokens",
+                            self.MAX_MODEL_CONTEXT_TOKENS,
+                        ),
+                    ),
+                ),
+            )
+            pressure_ratio = before / budget if before > 0 else 0.0
+        decision, reason = self._compaction_decision_from_diagnostics(diagnostics)
+        self._emit_telemetry_event(
+            event_type=COMPACTION_POLICY_DECISION,
+            task_id=task_id,
+            data={
+                "subtask_id": subtask_id,
+                "pressure_ratio": round(pressure_ratio, 4),
+                "policy_mode": mode or self.RUNNER_COMPACTION_POLICY_MODE,
+                "decision": decision,
+                "reason": reason,
+            },
+            counter_key="compaction_policy_decisions",
+        )
+
+    def _emit_overflow_fallback_telemetry(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        report: dict[str, Any],
+    ) -> None:
+        if not self._telemetry_events_enabled() or not self._event_bus:
+            return
+        if not bool(report.get("overflow_fallback_applied", False)):
+            return
+        diagnostics = dict(getattr(self, "_last_compaction_diagnostics", {}))
+        mode = str(
+            diagnostics.get(
+                "compaction_policy_mode",
+                self._runner_compaction_mode(),
+            ),
+        ).strip().lower() or self.RUNNER_COMPACTION_POLICY_MODE
+        pressure_ratio = self._safe_float(diagnostics.get("compaction_pressure_ratio", 0.0))
+        payload = {
+            "subtask_id": subtask_id,
+            "pressure_ratio": round(pressure_ratio, 4),
+            "policy_mode": mode,
+            "decision": "fallback_rewrite",
+            "reason": "overflow_context_limit",
+            "rewritten_messages": max(
+                0,
+                self._safe_int(report.get("overflow_fallback_rewritten_messages", 0)),
+            ),
+            "chars_reduced": max(
+                0,
+                self._safe_int(report.get("overflow_fallback_chars_reduced", 0)),
+            ),
+            "preserved_recent_messages": max(
+                0,
+                self._safe_int(report.get("overflow_fallback_preserved_recent_messages", 0)),
+            ),
+        }
+        self._emit_telemetry_event(
+            event_type=COMPACTION_POLICY_DECISION,
+            task_id=task_id,
+            data={
+                "subtask_id": payload["subtask_id"],
+                "pressure_ratio": payload["pressure_ratio"],
+                "policy_mode": payload["policy_mode"],
+                "decision": payload["decision"],
+                "reason": payload["reason"],
+            },
+            counter_key="compaction_policy_decisions",
+        )
+        self._emit_telemetry_event(
+            event_type=OVERFLOW_FALLBACK_APPLIED,
+            task_id=task_id,
+            data=payload,
+            counter_key="overflow_fallback_count",
+        )
+
+    @staticmethod
     def _read_roots_for_task(task: Task, workspace: Path | None) -> list[Path]:
         """Resolve additional read-only roots for this task.
 
@@ -751,6 +1252,8 @@ class SubtaskRunner:
             "compaction_candidate_count": 0,
             "compaction_skipped_reason": "not_started",
         }
+        telemetry_counters = self._new_subtask_telemetry_counters()
+        self._active_subtask_telemetry_counters = telemetry_counters
         compactor_context_token = _COMPACTOR_EVENT_CONTEXT.set((task.id, subtask.id))
         workspace = Path(task.workspace) if task.workspace else None
         read_roots = self._read_roots_for_task(task, workspace)
@@ -768,6 +1271,7 @@ class SubtaskRunner:
                 summary=failure_summary,
                 duration_seconds=time.monotonic() - start_time,
                 model_used="",
+                telemetry_counters=dict(telemetry_counters),
             )
             verification = VerificationResult(
                 tier=1,
@@ -779,6 +1283,7 @@ class SubtaskRunner:
                 metadata={"auth_error": str(e)},
             )
             self._subtask_deadline_monotonic = None
+            self._active_subtask_telemetry_counters = None
             _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
             return result, verification
 
@@ -842,6 +1347,10 @@ class SubtaskRunner:
             messages = await self._compact_messages_for_model(
                 messages,
                 remaining_seconds=remaining_seconds,
+            )
+            self._emit_compaction_policy_decision_from_diagnostics(
+                task_id=task.id,
+                subtask_id=subtask.id,
             )
             tool_schemas = self._tools.all_schemas()
             operation = "stream" if streaming else "complete"
@@ -914,6 +1423,12 @@ class SubtaskRunner:
                     messages, overflow_fallback_report = self._apply_model_overflow_fallback(
                         messages,
                     )
+                    if overflow_fallback_report:
+                        self._emit_overflow_fallback_telemetry(
+                            task_id=task.id,
+                            subtask_id=subtask.id,
+                            report=overflow_fallback_report,
+                        )
                 self._emit_model_event(
                     task_id=task.id,
                     subtask_id=subtask.id,
@@ -1079,6 +1594,20 @@ class SubtaskRunner:
                         result=tool_result,
                         workspace=workspace,
                     )
+                    self._emit_artifact_ingest_telemetry(
+                        task_id=task.id,
+                        subtask_id=subtask.id,
+                        tool_name=tc.name,
+                        tool_args=tc.arguments,
+                        result=tool_result,
+                    )
+                    self._emit_artifact_read_telemetry(
+                        task_id=task.id,
+                        subtask_id=subtask.id,
+                        tool_name=tc.name,
+                        tool_args=tc.arguments,
+                        result=tool_result,
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -1155,6 +1684,7 @@ class SubtaskRunner:
             tokens_used=total_tokens,
             model_used=model.name,
             evidence_records=evidence_records_current,
+            telemetry_counters=dict(telemetry_counters),
         )
 
         if interruption_reason:
@@ -1171,6 +1701,7 @@ class SubtaskRunner:
             )
             self._spawn_memory_extraction(task.id, subtask.id, result)
             self._subtask_deadline_monotonic = None
+            self._active_subtask_telemetry_counters = None
             _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
             return result, verification
 
@@ -1198,6 +1729,7 @@ class SubtaskRunner:
         self._spawn_memory_extraction(task.id, subtask.id, result)
 
         self._subtask_deadline_monotonic = None
+        self._active_subtask_telemetry_counters = None
         _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
         return result, verification
 
@@ -1547,6 +2079,8 @@ class SubtaskRunner:
         context = _COMPACTOR_EVENT_CONTEXT.get()
         if not context:
             return
+        if bool(payload.get("compactor_warning")):
+            self._increment_subtask_counter("compactor_warning_count")
         task_id, subtask_id = context
         model_name = str(payload.get("model", "")).strip() or "unknown"
         phase = str(payload.get("phase", "")).strip() or "done"
@@ -2400,6 +2934,7 @@ class SubtaskRunner:
                 "overflow_fallback_applied": False,
                 "overflow_fallback_rewritten_messages": 0,
                 "overflow_fallback_chars_reduced": 0,
+                "overflow_fallback_preserved_recent_messages": 0,
                 "overflow_fallback_skipped_reason": "empty_history",
             }
 
@@ -2418,6 +2953,7 @@ class SubtaskRunner:
         rewritten_count = 0
         chars_reduced = 0
         candidate_count = 0
+        preserved_recent_messages = 1 if latest_tool_idx >= 0 else 0
 
         for idx, message in enumerate(messages):
             if not isinstance(message, dict):
@@ -2451,6 +2987,7 @@ class SubtaskRunner:
                 "overflow_fallback_rewritten_messages": 0,
                 "overflow_fallback_chars_reduced": 0,
                 "overflow_fallback_candidate_messages": candidate_count,
+                "overflow_fallback_preserved_recent_messages": preserved_recent_messages,
                 "overflow_fallback_skipped_reason": "no_eligible_tool_payloads",
             }
 
@@ -2459,6 +2996,7 @@ class SubtaskRunner:
             "overflow_fallback_rewritten_messages": rewritten_count,
             "overflow_fallback_chars_reduced": chars_reduced,
             "overflow_fallback_candidate_messages": candidate_count,
+            "overflow_fallback_preserved_recent_messages": preserved_recent_messages,
             "overflow_fallback_skipped_reason": "",
         }
 

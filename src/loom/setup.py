@@ -337,6 +337,8 @@ def _generate_toml(models: list[dict]) -> str:
         "tool_call_argument_context_chars = 700",
         "compact_tool_call_argument_chars = 1600",
         "enable_filetype_ingest_router = true",
+        "enable_artifact_telemetry_events = true",
+        "artifact_telemetry_max_metadata_chars = 1200",
         "enable_model_overflow_fallback = true",
         "ingest_artifact_retention_max_age_days = 14",
         "ingest_artifact_retention_max_files_per_scope = 96",

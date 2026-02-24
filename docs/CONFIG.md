@@ -122,6 +122,8 @@ Recommended two-model split:
 | `compact_tool_call_argument_chars` | `int` | `1600` | Aggressive tool-argument compaction target. |
 | `runner_compaction_policy_mode` | `string` | `"tiered"` | Runner compaction policy (`legacy`, `tiered`, `off`). |
 | `enable_filetype_ingest_router` | `bool` | `true` | Routes fetched binary/doc payloads into artifact-backed summaries. |
+| `enable_artifact_telemetry_events` | `bool` | `true` | Emits artifact ingest/read/retention and compaction/overflow transparency events to run logs (set `false` to disable). |
+| `artifact_telemetry_max_metadata_chars` | `int` | `1200` | Max serialized chars allowed for `handler_metadata` telemetry payload fields (oversize metadata is compacted into deterministic summary metadata, not string-sliced). |
 | `enable_model_overflow_fallback` | `bool` | `true` | Enables one-shot overflow fallback rewrite when model request size is exceeded. |
 | `ingest_artifact_retention_max_age_days` | `int` | `14` | Max artifact age (days) before retention cleanup removes old fetched artifacts. |
 | `ingest_artifact_retention_max_files_per_scope` | `int` | `96` | Max retained fetched artifact files per scope/subtask directory. |
@@ -164,6 +166,56 @@ Recommended two-model split:
 
 Compactor validation warnings:
 - If final retry still exceeds target chars, Loom keeps the compacted output and emits warning telemetry fields (`compactor_warning`, `compactor_warning_reason`, `compactor_warning_delta_chars`) instead of truncating.
+
+### Run Telemetry Event Contracts
+
+When `limits.runner.enable_artifact_telemetry_events = true`, Loom emits these additional run-log events (`.events.jsonl`) from orchestration boundaries:
+
+- `artifact_ingest_classified`
+- `artifact_ingest_completed`
+- `artifact_retention_pruned` (only when `files_deleted > 0`)
+- `artifact_read_completed`
+- `compaction_policy_decision`
+- `overflow_fallback_applied` (only when fallback rewrite executes)
+- `telemetry_run_summary` (once per task finalization)
+
+Artifact event required fields:
+- `subtask_id`, `tool`, `url` (sanitized), `content_kind`, `content_type`, `status` (`ok|error`)
+
+Artifact event optional fields (when available):
+- `artifact_ref`
+- `artifact_workspace_relpath` (preferred) or `artifact_path` (fallback)
+- `size_bytes`
+- `declared_size_bytes`
+- `handler`
+- `extracted_chars`
+- `extraction_truncated`
+- `handler_metadata` (bounded by `artifact_telemetry_max_metadata_chars`)
+
+Retention event fields:
+- `scopes_scanned`, `files_deleted`, `bytes_deleted`
+
+Compaction decision event fields:
+- `subtask_id`, `pressure_ratio`, `policy_mode`
+- `decision` (`skip|compact_tool|compact_history|fallback_rewrite`)
+- `reason` (deterministic short code)
+
+Overflow fallback fields:
+- `rewritten_messages`, `chars_reduced`, `preserved_recent_messages`
+
+Run summary fields:
+- `artifact_ingests`
+- `artifact_reads`
+- `artifact_retention_deletes`
+- `compaction_policy_decisions`
+- `overflow_fallback_count`
+- `compactor_warning_count`
+
+Safety notes:
+- Telemetry events do not include raw extracted document text or binary payload snippets.
+- URL telemetry removes query strings and fragments.
+- Prefer `artifact_workspace_relpath` over absolute paths.
+- Oversize `handler_metadata` is reduced to deterministic summary fields (`_loom_meta`, type, size, hash) instead of hard string truncation.
 
 ### `[memory]`
 
@@ -220,6 +272,7 @@ definitions inside `loom.toml`:
 - `verification.unconfirmed_supporting_threshold` is clamped to `0..1`.
 - `verification.confirm_or_prune_max_attempts` is clamped to at least `1`.
 - `verification.confirm_or_prune_backoff_seconds` is clamped to `>= 0`.
+- `limits.runner.artifact_telemetry_max_metadata_chars` is clamped to `120..20000`.
 - `limits.runner.ingest_artifact_retention_max_age_days` is clamped to `0..3650`.
 - `limits.runner.ingest_artifact_retention_max_files_per_scope` is clamped to `1..200000`.
 - `limits.runner.ingest_artifact_retention_max_bytes_per_scope` is clamped to `1024..20000000000`.

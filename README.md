@@ -119,6 +119,8 @@ delegate_task_timeout_seconds = 3600
 
 [limits.runner]
 enable_filetype_ingest_router = true
+enable_artifact_telemetry_events = true
+artifact_telemetry_max_metadata_chars = 1200
 enable_model_overflow_fallback = true
 ingest_artifact_retention_max_age_days = 14
 ingest_artifact_retention_max_files_per_scope = 96
@@ -145,6 +147,9 @@ Configured MCP servers are auto-discovered at startup and registered as namespac
 `loom.toml` under `[execution].delegate_task_timeout_seconds`; env override
 `LOOM_DELEGATE_TIMEOUT_SECONDS` still applies when set.
 
+For artifact and overflow transparency telemetry in `.events.jsonl`, enable
+`[limits.runner].enable_artifact_telemetry_events` (default `true`; set to `false` to disable).
+Use `artifact_telemetry_max_metadata_chars` to bound handler metadata payload size.
 For large fetched binaries/documents (PDFs, Office files, archives), tune
 `[limits.runner]` retention keys to control cleanup pressure:
 `ingest_artifact_retention_max_age_days`,

@@ -178,6 +178,8 @@ class RunnerLimitsConfig:
     compact_tool_call_argument_chars: int = 220
     runner_compaction_policy_mode: str = "tiered"  # "legacy" | "tiered" | "off"
     enable_filetype_ingest_router: bool = True
+    enable_artifact_telemetry_events: bool = True
+    artifact_telemetry_max_metadata_chars: int = 1200
     enable_model_overflow_fallback: bool = True
     ingest_artifact_retention_max_age_days: int = 14
     ingest_artifact_retention_max_files_per_scope: int = 96
@@ -701,6 +703,18 @@ def load_config(path: Path | None = None) -> Config:
             runner_limits_data,
             "enable_filetype_ingest_router",
             RunnerLimitsConfig.enable_filetype_ingest_router,
+        ),
+        enable_artifact_telemetry_events=_bool_from(
+            runner_limits_data,
+            "enable_artifact_telemetry_events",
+            RunnerLimitsConfig.enable_artifact_telemetry_events,
+        ),
+        artifact_telemetry_max_metadata_chars=_int_from(
+            runner_limits_data,
+            "artifact_telemetry_max_metadata_chars",
+            RunnerLimitsConfig.artifact_telemetry_max_metadata_chars,
+            minimum=120,
+            maximum=20_000,
         ),
         enable_model_overflow_fallback=_bool_from(
             runner_limits_data,

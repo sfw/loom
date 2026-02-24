@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -27,6 +27,7 @@ class ArtifactRecord:
     size_bytes: int
     created_at: str
     workspace_relpath: str = ""
+    cleanup_stats: dict[str, int] = field(default_factory=dict)
 
 
 _MEDIA_TYPE_EXTENSION = {
@@ -394,27 +395,22 @@ def persist_fetch_artifact(
         except Exception:
             relpath = ""
 
-    record = ArtifactRecord(
-        artifact_ref=artifact_ref,
-        path=artifact_path.resolve(),
-        source_url=str(source_url or ""),
-        media_type=str(media_type or ""),
-        content_kind=str(content_kind or ""),
-        size_bytes=len(content_bytes),
-        created_at=now,
-        workspace_relpath=relpath,
-    )
+    resolved_path = artifact_path.resolve()
+    source_url_text = str(source_url or "")
+    media_type_text = str(media_type or "")
+    content_kind_text = str(content_kind or "")
+    size_bytes = len(content_bytes)
 
     manifest_path = scope_dir / "manifest.jsonl"
     manifest_entry = {
-        "artifact_ref": record.artifact_ref,
-        "path": str(record.path),
-        "workspace_relpath": record.workspace_relpath,
-        "source_url": record.source_url,
-        "media_type": record.media_type,
-        "content_kind": record.content_kind,
-        "size_bytes": record.size_bytes,
-        "created_at": record.created_at,
+        "artifact_ref": artifact_ref,
+        "path": str(resolved_path),
+        "workspace_relpath": relpath,
+        "source_url": source_url_text,
+        "media_type": media_type_text,
+        "content_kind": content_kind_text,
+        "size_bytes": size_bytes,
+        "created_at": now,
     }
     with manifest_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(manifest_entry, ensure_ascii=False))
@@ -422,7 +418,7 @@ def persist_fetch_artifact(
 
     # Run scope cleanup every write and periodically sweep all scopes.
     scan_all_scopes = artifact_ref[-1] in {"0", "1"}
-    cleanup_fetch_artifacts(
+    cleanup_stats = cleanup_fetch_artifacts(
         workspace=workspace,
         scratch_dir=scratch_dir,
         subtask_id=subtask_id,
@@ -432,4 +428,18 @@ def persist_fetch_artifact(
         scan_all_scopes=scan_all_scopes,
     )
 
-    return record
+    return ArtifactRecord(
+        artifact_ref=artifact_ref,
+        path=resolved_path,
+        source_url=source_url_text,
+        media_type=media_type_text,
+        content_kind=content_kind_text,
+        size_bytes=size_bytes,
+        created_at=now,
+        workspace_relpath=relpath,
+        cleanup_stats={
+            "scopes_scanned": int(cleanup_stats.get("scopes_scanned", 0)),
+            "files_deleted": int(cleanup_stats.get("files_deleted", 0)),
+            "bytes_deleted": int(cleanup_stats.get("bytes_deleted", 0)),
+        },
+    )

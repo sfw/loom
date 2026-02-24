@@ -319,7 +319,13 @@ class DelegateTaskTool(Tool):
             callable(progress_callback) or event_log_handle is not None
         ):
             from loom.events.types import (
+                ARTIFACT_INGEST_CLASSIFIED,
+                ARTIFACT_INGEST_COMPLETED,
+                ARTIFACT_READ_COMPLETED,
+                ARTIFACT_RETENTION_PRUNED,
+                COMPACTION_POLICY_DECISION,
                 MODEL_INVOCATION,
+                OVERFLOW_FALLBACK_APPLIED,
                 SUBTASK_COMPLETED,
                 SUBTASK_FAILED,
                 SUBTASK_RETRYING,
@@ -330,6 +336,7 @@ class DelegateTaskTool(Tool):
                 TASK_PLAN_READY,
                 TASK_PLANNING,
                 TASK_REPLANNING,
+                TELEMETRY_RUN_SUMMARY,
                 TOKEN_STREAMED,
                 TOOL_CALL_COMPLETED,
                 TOOL_CALL_STARTED,
@@ -345,11 +352,18 @@ class DelegateTaskTool(Tool):
                 TOKEN_STREAMED,
                 TOOL_CALL_STARTED,
                 TOOL_CALL_COMPLETED,
+                ARTIFACT_INGEST_CLASSIFIED,
+                ARTIFACT_INGEST_COMPLETED,
+                ARTIFACT_RETENTION_PRUNED,
+                ARTIFACT_READ_COMPLETED,
+                COMPACTION_POLICY_DECISION,
+                OVERFLOW_FALLBACK_APPLIED,
                 SUBTASK_COMPLETED,
                 SUBTASK_FAILED,
                 TASK_REPLANNING,
                 TASK_COMPLETED,
                 TASK_FAILED,
+                TELEMETRY_RUN_SUMMARY,
             )
 
             def _on_event(event) -> None:

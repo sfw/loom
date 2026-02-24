@@ -95,6 +95,7 @@ class ReadArtifactTool(Tool):
             "artifact_path": str(record.path),
             "content_kind": content_kind,
             "content_type": media_type,
+            "url": record.source_url,
             "source_url": record.source_url,
             "size_bytes": record.size_bytes,
             "created_at": record.created_at,

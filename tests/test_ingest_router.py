@@ -56,6 +56,8 @@ class TestArtifactStore:
         assert record.path.exists()
         assert record.artifact_ref.startswith("af_")
         assert record.workspace_relpath.startswith(".loom_artifacts/")
+        assert isinstance(record.cleanup_stats, dict)
+        assert set(record.cleanup_stats) == {"scopes_scanned", "files_deleted", "bytes_deleted"}
         manifest = record.path.parent / "manifest.jsonl"
         assert manifest.exists()
 

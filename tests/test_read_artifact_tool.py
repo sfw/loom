@@ -45,6 +45,9 @@ class TestReadArtifactTool:
         assert isinstance(result.data, dict)
         assert result.data.get("artifact_ref") == record.artifact_ref
         assert result.data.get("artifact_path") == str(record.path)
+        assert result.data.get("url") == "https://example.com/report.pdf"
+        assert result.data.get("source_url") == "https://example.com/report.pdf"
+        assert isinstance(result.data.get("extracted_chars"), int)
         assert "artifact" in result.output.lower()
 
     @pytest.mark.asyncio

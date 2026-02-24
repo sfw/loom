@@ -47,6 +47,7 @@ from loom.events.types import (
     TASK_PLANNING,
     TASK_REPLAN_REJECTED,
     TASK_REPLANNING,
+    TELEMETRY_RUN_SUMMARY,
 )
 from loom.learning.manager import LearningManager
 from loom.models.base import ModelResponse
@@ -153,6 +154,7 @@ class Orchestrator:
         )
         self._state_lock = asyncio.Lock()
         self._changelog_cache: dict[str, ChangeLog] = {}
+        self._telemetry_rollup: dict[str, int] = self._new_telemetry_rollup()
 
         # Inject process into prompt assembler
         if process is not None:
@@ -198,6 +200,7 @@ class Orchestrator:
     ) -> Task:
         """Main entry point. Drives the full task lifecycle."""
         try:
+            self._telemetry_rollup = self._new_telemetry_rollup()
             plan: Plan
             if reuse_existing_plan and task.plan and task.plan.subtasks:
                 plan = task.plan
@@ -282,6 +285,7 @@ class Orchestrator:
                 # Process outcomes (retry / replan / approve).
                 # Replanning is deferred until the whole batch is processed.
                 for subtask, result, verification in outcomes:
+                    self._accumulate_subtask_telemetry(result)
                     if batch_plan_version != task.plan.version:
                         self._record_stale_outcome(
                             task=task,
@@ -2146,6 +2150,7 @@ class Orchestrator:
                 "blocking_remediation_failures": blocking_remediation_failures,
             })
 
+        self._emit_telemetry_run_summary(task)
         self._state.save(task)
         return task
 
@@ -2162,6 +2167,57 @@ class Orchestrator:
         self._events.emit(Event(
             event_type=event_type, task_id=task_id, data=data
         ))
+
+    @staticmethod
+    def _new_telemetry_rollup() -> dict[str, int]:
+        return {
+            "artifact_ingests": 0,
+            "artifact_reads": 0,
+            "artifact_retention_deletes": 0,
+            "compaction_policy_decisions": 0,
+            "overflow_fallback_count": 0,
+            "compactor_warning_count": 0,
+        }
+
+    def _accumulate_subtask_telemetry(self, result: SubtaskResult) -> None:
+        counters = getattr(result, "telemetry_counters", None)
+        if not isinstance(counters, dict):
+            return
+        rollup = getattr(self, "_telemetry_rollup", None)
+        if not isinstance(rollup, dict):
+            self._telemetry_rollup = self._new_telemetry_rollup()
+            rollup = self._telemetry_rollup
+        for key in (
+            "artifact_ingests",
+            "artifact_reads",
+            "artifact_retention_deletes",
+            "compaction_policy_decisions",
+            "overflow_fallback_count",
+            "compactor_warning_count",
+        ):
+            try:
+                increment = int(counters.get(key, 0))
+            except (TypeError, ValueError):
+                increment = 0
+            if increment <= 0:
+                continue
+            rollup[key] = int(rollup.get(key, 0)) + increment
+
+    def _emit_telemetry_run_summary(self, task: Task) -> None:
+        runner_limits = getattr(getattr(self._config, "limits", None), "runner", None)
+        if not bool(getattr(runner_limits, "enable_artifact_telemetry_events", False)):
+            return
+        rollup = getattr(self, "_telemetry_rollup", None)
+        if not isinstance(rollup, dict):
+            rollup = self._new_telemetry_rollup()
+        self._emit(TELEMETRY_RUN_SUMMARY, task.id, {
+            "artifact_ingests": int(rollup.get("artifact_ingests", 0)),
+            "artifact_reads": int(rollup.get("artifact_reads", 0)),
+            "artifact_retention_deletes": int(rollup.get("artifact_retention_deletes", 0)),
+            "compaction_policy_decisions": int(rollup.get("compaction_policy_decisions", 0)),
+            "overflow_fallback_count": int(rollup.get("overflow_fallback_count", 0)),
+            "compactor_warning_count": int(rollup.get("compactor_warning_count", 0)),
+        })
 
     def cancel_task(self, task: Task) -> None:
         """Mark a task for cancellation."""

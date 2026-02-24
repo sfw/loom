@@ -9,18 +9,31 @@ from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
-from loom.config import Config, ExecutionConfig, LimitsConfig, VerificationConfig
+from loom.config import (
+    Config,
+    ExecutionConfig,
+    LimitsConfig,
+    RunnerLimitsConfig,
+    VerificationConfig,
+)
 from loom.engine.orchestrator import Orchestrator, SubtaskResult, ToolCallRecord, create_task
 from loom.engine.verification import VerificationResult
 from loom.events.bus import EventBus
 from loom.events.types import (
     ARTIFACT_CONFINEMENT_VIOLATION,
+    ARTIFACT_INGEST_CLASSIFIED,
+    ARTIFACT_INGEST_COMPLETED,
+    ARTIFACT_READ_COMPLETED,
+    ARTIFACT_RETENTION_PRUNED,
+    COMPACTION_POLICY_DECISION,
+    OVERFLOW_FALLBACK_APPLIED,
     TASK_COMPLETED,
     TASK_EXECUTING,
     TASK_FAILED,
     TASK_PLAN_READY,
     TASK_PLANNING,
     TASK_REPLAN_REJECTED,
+    TELEMETRY_RUN_SUMMARY,
     TOOL_CALL_COMPLETED,
 )
 from loom.models.base import ModelConnectionError, ModelResponse, TokenUsage, ToolCall
@@ -256,6 +269,63 @@ class TestOrchestratorPlan:
         assert result.status == TaskStatus.COMPLETED
         assert planner_max_tokens
         assert planner_max_tokens[0] == 16384
+
+    @pytest.mark.asyncio
+    async def test_emits_telemetry_run_summary_when_enabled(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "Emit telemetry"}]
+        })
+        bus = _make_event_bus()
+        events_received = []
+        bus.subscribe_all(lambda e: events_received.append(e))
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=Config(
+                limits=LimitsConfig(
+                    runner=RunnerLimitsConfig(
+                        enable_artifact_telemetry_events=True,
+                    ),
+                ),
+            ),
+        )
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(
+                status="success",
+                summary="ok",
+                telemetry_counters={
+                    "artifact_ingests": 2,
+                    "artifact_reads": 1,
+                    "artifact_retention_deletes": 3,
+                    "compaction_policy_decisions": 4,
+                    "overflow_fallback_count": 1,
+                    "compactor_warning_count": 2,
+                },
+            ),
+            VerificationResult(tier=1, passed=True),
+        ))
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        summary_event = next(
+            event for event in events_received
+            if event.event_type == TELEMETRY_RUN_SUMMARY
+        )
+        assert summary_event.data == {
+            "artifact_ingests": 2,
+            "artifact_reads": 1,
+            "artifact_retention_deletes": 3,
+            "compaction_policy_decisions": 4,
+            "overflow_fallback_count": 1,
+            "compactor_warning_count": 2,
+        }
 
     @pytest.mark.asyncio
     async def test_execute_task_reuses_existing_plan_when_requested(self, tmp_path):
@@ -1753,6 +1823,27 @@ class TestSubtaskRunnerContextBudget:
         runner._overflow_fallback_tool_output_excerpt_chars = 220
         return runner
 
+    @staticmethod
+    def _make_runner_for_telemetry():
+        from loom.engine.runner import SubtaskRunner
+
+        runner = SubtaskRunner.__new__(SubtaskRunner)
+        runner._event_bus = EventBus()
+        runner._enable_artifact_telemetry_events = True
+        runner._artifact_telemetry_max_metadata_chars = 120
+        runner._runner_compaction_policy_mode = "tiered"
+        runner._max_model_context_tokens = 2400
+        runner._last_compaction_diagnostics = {
+            "compaction_policy_mode": "tiered",
+            "compaction_pressure_ratio": 0.91,
+            "compaction_stage": "stage_2_tool_outputs",
+            "compaction_skipped_reason": "",
+        }
+        runner._active_subtask_telemetry_counters = (
+            SubtaskRunner._new_subtask_telemetry_counters()
+        )
+        return runner
+
     class _NoopCompactor:
         async def compact(self, text: str, *, max_chars: int, label: str = "") -> str:
             return str(text or "")
@@ -2316,6 +2407,246 @@ class TestSubtaskRunnerContextBudget:
             if event.event_type == ARTIFACT_CONFINEMENT_VIOLATION
         )
         assert violation.data["attempted_path"] == "../outside.md"
+
+    def test_tool_call_completed_payload_contract_unchanged(self):
+        runner = self._make_runner_for_telemetry()
+        events = []
+        runner._event_bus.subscribe_all(lambda event: events.append(event))
+
+        runner._emit_tool_event(
+            TOOL_CALL_COMPLETED,
+            "task-1",
+            "subtask-1",
+            "web_fetch",
+            {"url": "https://example.com/report.pdf"},
+            result=ToolResult.ok("ok"),
+        )
+
+        tool_event = next(event for event in events if event.event_type == TOOL_CALL_COMPLETED)
+        assert tool_event.data == {
+            "subtask_id": "subtask-1",
+            "tool": "web_fetch",
+            "args": {"url": "https://example.com/report.pdf"},
+            "success": True,
+            "error": "",
+        }
+
+    def test_artifact_ingest_telemetry_required_fields_and_redaction(self):
+        runner = self._make_runner_for_telemetry()
+        events = []
+        runner._event_bus.subscribe_all(lambda event: events.append(event))
+
+        result = ToolResult.ok(
+            "Fetched PDF artifact",
+            data={
+                "url": "https://example.com/report.pdf?token=secret#fragment",
+                "content_kind": "pdf",
+                "content_type": "application/pdf",
+                "artifact_ref": "af_1234abcd",
+                "artifact_workspace_relpath": ".loom_artifacts/fetched/s1/af_1234abcd.pdf",
+                "size_bytes": 4096,
+                "declared_size_bytes": 5000,
+                "handler": "pdf_handler",
+                "extracted_chars": 1800,
+                "extraction_truncated": True,
+                "handler_metadata": {"details": "x" * 800},
+            },
+        )
+
+        runner._emit_artifact_ingest_telemetry(
+            task_id="task-1",
+            subtask_id="subtask-1",
+            tool_name="web_fetch",
+            tool_args={"url": "https://example.com/report.pdf?token=secret#fragment"},
+            result=result,
+        )
+
+        classified = next(
+            event for event in events
+            if event.event_type == ARTIFACT_INGEST_CLASSIFIED
+        )
+        completed = next(
+            event for event in events
+            if event.event_type == ARTIFACT_INGEST_COMPLETED
+        )
+        for event in (classified, completed):
+            payload = event.data
+            assert payload["subtask_id"] == "subtask-1"
+            assert payload["tool"] == "web_fetch"
+            assert payload["status"] == "ok"
+            assert payload["url"] == "https://example.com/report.pdf"
+            assert "token=secret" not in payload["url"]
+            assert payload["content_kind"] == "pdf"
+            assert payload["content_type"] == "application/pdf"
+            assert payload["artifact_ref"] == "af_1234abcd"
+            assert payload["artifact_workspace_relpath"].startswith(".loom_artifacts/")
+            assert payload["size_bytes"] == 4096
+            assert payload["declared_size_bytes"] == 5000
+            assert payload["handler"] == "pdf_handler"
+            assert payload["extracted_chars"] == 1800
+            assert payload["extraction_truncated"] is True
+            metadata_payload = payload.get("handler_metadata")
+            assert isinstance(metadata_payload, dict)
+            assert metadata_payload.get("_loom_meta") == "metadata_omitted"
+            assert metadata_payload.get("original_type") == "dict"
+            assert isinstance(metadata_payload.get("sha1"), str)
+            assert metadata_payload["sha1"]
+            assert "truncated" not in json.dumps(metadata_payload, ensure_ascii=False)
+        assert runner._active_subtask_telemetry_counters["artifact_ingests"] == 1
+
+    def test_artifact_retention_event_emitted_only_when_deletions_occur(self):
+        runner = self._make_runner_for_telemetry()
+        events = []
+        runner._event_bus.subscribe_all(lambda event: events.append(event))
+
+        no_delete = ToolResult.ok(
+            "ok",
+            data={
+                "url": "https://example.com/report.pdf",
+                "content_kind": "pdf",
+                "content_type": "application/pdf",
+                "artifact_ref": "af_no_delete",
+                "artifact_workspace_relpath": ".loom_artifacts/fetched/s1/af_no_delete.pdf",
+                "artifact_retention": {
+                    "scopes_scanned": 1,
+                    "files_deleted": 0,
+                    "bytes_deleted": 0,
+                },
+            },
+        )
+        runner._emit_artifact_ingest_telemetry(
+            task_id="task-1",
+            subtask_id="subtask-1",
+            tool_name="web_fetch",
+            tool_args={"url": "https://example.com/report.pdf"},
+            result=no_delete,
+        )
+        assert ARTIFACT_RETENTION_PRUNED not in [event.event_type for event in events]
+
+        with_delete = ToolResult.ok(
+            "ok",
+            data={
+                "url": "https://example.com/report.pdf",
+                "content_kind": "pdf",
+                "content_type": "application/pdf",
+                "artifact_ref": "af_deleted",
+                "artifact_workspace_relpath": ".loom_artifacts/fetched/s1/af_deleted.pdf",
+                "artifact_retention": {
+                    "scopes_scanned": 2,
+                    "files_deleted": 3,
+                    "bytes_deleted": 9000,
+                },
+            },
+        )
+        runner._emit_artifact_ingest_telemetry(
+            task_id="task-1",
+            subtask_id="subtask-1",
+            tool_name="web_fetch",
+            tool_args={"url": "https://example.com/report.pdf"},
+            result=with_delete,
+        )
+        retention = next(
+            event for event in events
+            if event.event_type == ARTIFACT_RETENTION_PRUNED
+        )
+        assert retention.data["files_deleted"] == 3
+        assert retention.data["bytes_deleted"] == 9000
+        assert runner._active_subtask_telemetry_counters["artifact_retention_deletes"] == 3
+
+    def test_artifact_read_completed_emits_success_and_failure(self):
+        runner = self._make_runner_for_telemetry()
+        events = []
+        runner._event_bus.subscribe_all(lambda event: events.append(event))
+
+        success_result = ToolResult.ok(
+            "ok",
+            data={
+                "source_url": "https://example.com/report.pdf?sig=hidden",
+                "content_kind": "pdf",
+                "content_type": "application/pdf",
+                "artifact_ref": "af_read_ok",
+                "artifact_workspace_relpath": ".loom_artifacts/fetched/s1/af_read_ok.pdf",
+                "handler": "pdf_handler",
+                "extracted_chars": 1200,
+                "extraction_truncated": False,
+            },
+        )
+        runner._emit_artifact_read_telemetry(
+            task_id="task-1",
+            subtask_id="subtask-1",
+            tool_name="read_artifact",
+            tool_args={"artifact_ref": "af_read_ok"},
+            result=success_result,
+        )
+
+        failed_result = ToolResult.fail("Artifact not found")
+        runner._emit_artifact_read_telemetry(
+            task_id="task-1",
+            subtask_id="subtask-1",
+            tool_name="read_artifact",
+            tool_args={"artifact_ref": "af_missing"},
+            result=failed_result,
+        )
+
+        read_events = [
+            event for event in events
+            if event.event_type == ARTIFACT_READ_COMPLETED
+        ]
+        assert len(read_events) == 2
+        assert read_events[0].data["status"] == "ok"
+        assert read_events[0].data["url"] == "https://example.com/report.pdf"
+        assert read_events[1].data["status"] == "error"
+        assert read_events[1].data["artifact_ref"] == "af_missing"
+        assert runner._active_subtask_telemetry_counters["artifact_reads"] == 2
+
+    def test_compaction_and_overflow_telemetry_events(self):
+        runner = self._make_runner_for_telemetry()
+        events = []
+        runner._event_bus.subscribe_all(lambda event: events.append(event))
+
+        runner._emit_compaction_policy_decision_from_diagnostics(
+            task_id="task-1",
+            subtask_id="subtask-1",
+        )
+        decision_event = next(
+            event for event in events
+            if event.event_type == COMPACTION_POLICY_DECISION
+        )
+        assert decision_event.data["decision"] == "compact_tool"
+        assert decision_event.data["reason"] == "tool_output_compacted"
+
+        runner._emit_overflow_fallback_telemetry(
+            task_id="task-1",
+            subtask_id="subtask-1",
+            report={
+                "overflow_fallback_applied": True,
+                "overflow_fallback_rewritten_messages": 2,
+                "overflow_fallback_chars_reduced": 6400,
+                "overflow_fallback_preserved_recent_messages": 1,
+            },
+        )
+        overflow_events = [
+            event for event in events
+            if event.event_type == OVERFLOW_FALLBACK_APPLIED
+        ]
+        assert len(overflow_events) == 1
+        overflow_payload = overflow_events[0].data
+        assert overflow_payload["decision"] == "fallback_rewrite"
+        assert overflow_payload["rewritten_messages"] == 2
+        assert overflow_payload["chars_reduced"] == 6400
+        assert overflow_payload["preserved_recent_messages"] == 1
+
+        runner._emit_overflow_fallback_telemetry(
+            task_id="task-1",
+            subtask_id="subtask-1",
+            report={"overflow_fallback_applied": False},
+        )
+        overflow_events = [
+            event for event in events
+            if event.event_type == OVERFLOW_FALLBACK_APPLIED
+        ]
+        assert len(overflow_events) == 1
+        assert runner._active_subtask_telemetry_counters["overflow_fallback_count"] == 1
 
     def test_tool_iteration_budget_uses_global_limit(self):
         from loom.engine.runner import SubtaskRunner

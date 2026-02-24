@@ -22,6 +22,13 @@ SUBTASK_BLOCKED = "subtask_blocked"
 TOOL_CALL_STARTED = "tool_call_started"
 TOOL_CALL_COMPLETED = "tool_call_completed"
 ARTIFACT_CONFINEMENT_VIOLATION = "artifact_confinement_violation"
+ARTIFACT_INGEST_CLASSIFIED = "artifact_ingest_classified"
+ARTIFACT_INGEST_COMPLETED = "artifact_ingest_completed"
+ARTIFACT_RETENTION_PRUNED = "artifact_retention_pruned"
+ARTIFACT_READ_COMPLETED = "artifact_read_completed"
+COMPACTION_POLICY_DECISION = "compaction_policy_decision"
+OVERFLOW_FALLBACK_APPLIED = "overflow_fallback_applied"
+TELEMETRY_RUN_SUMMARY = "telemetry_run_summary"
 
 # Model events
 MODEL_INVOCATION = "model_invocation"

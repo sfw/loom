@@ -392,6 +392,13 @@ async def _execute_web_fetch(
             }
             if record.workspace_relpath:
                 data["artifact_workspace_relpath"] = record.workspace_relpath
+            cleanup_stats = dict(getattr(record, "cleanup_stats", {}) or {})
+            if cleanup_stats:
+                data["artifact_retention"] = {
+                    "scopes_scanned": int(cleanup_stats.get("scopes_scanned", 0)),
+                    "files_deleted": int(cleanup_stats.get("files_deleted", 0)),
+                    "bytes_deleted": int(cleanup_stats.get("bytes_deleted", 0)),
+                }
             if summary.metadata:
                 data["handler_metadata"] = summary.metadata
             return ToolResult.ok(output, data=data)
