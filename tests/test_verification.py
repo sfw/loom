@@ -956,6 +956,47 @@ class TestLLMVerifier:
         assert result.reason_code == "policy_remediation_required"
         assert result.metadata.get("remediation_mode") == "targeted_remediation"
 
+    @pytest.mark.asyncio
+    async def test_verifier_normalizes_uncertainty_metadata_fields(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.roles = ["verifier", "extractor"]
+        model.complete = AsyncMock(return_value=ModelResponse(
+            text=json.dumps({
+                "passed": False,
+                "outcome": "fail",
+                "reason_code": "policy_remediation_required",
+                "severity_class": "semantic",
+                "confidence": 0.45,
+                "feedback": "Supporting claims still need evidence links.",
+                "issues": ["missing evidence linkage"],
+                "metadata": {
+                    "remediation_required": "true",
+                    "remediation_mode": "Queue_Follow_Up",
+                    "missing_targets": "T1, T2",
+                    "unverified_claim_count": "3",
+                    "verified_claim_count": "7",
+                    "supporting_ratio": "55%",
+                },
+            }),
+            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+        ))
+        router.select = MagicMock(return_value=model)
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.process = None
+        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
+        verifier = LLMVerifier(router, prompts, ResponseValidator())
+        verifier._compactor = self._FakeCompactor()
+
+        result = await verifier.verify(_make_subtask(), "output", [], None)
+        assert not result.passed
+        assert result.metadata.get("remediation_required") is True
+        assert result.metadata.get("remediation_mode") == "queue_follow_up"
+        assert result.metadata.get("missing_targets") == ["T1", "T2"]
+        assert result.metadata.get("unverified_claim_count") == 3
+        assert result.metadata.get("verified_claim_count") == 7
+        assert result.metadata.get("supporting_ratio") == pytest.approx(0.55)
+
 
 # --- VotingVerifier ---
 
@@ -1051,6 +1092,326 @@ class TestVerificationGates:
         assert result.reason_code == "infra_verifier_error"
         assert result.severity_class == "infra"
         assert result.metadata.get("fallback") == "tier1_due_to_tier2_parse_inconclusive"
+
+    @pytest.mark.asyncio
+    async def test_placeholder_claim_contradiction_returns_inconclusive_retry_path(self, tmp_path):
+        process = _make_process(deliverables={"phase-a": ["report.md"]})
+        (tmp_path / "report.md").write_text("Final output with no unresolved placeholders.")
+        config = VerificationConfig(
+            tier1_enabled=True,
+            tier2_enabled=True,
+            contradiction_guard_enabled=True,
+        )
+        router = MagicMock(spec=ModelRouter)
+        prompts = PromptAssembler(process=process)
+        event_bus = EventBus()
+        events = []
+        event_bus.subscribe_all(lambda event: events.append(event))
+
+        gates = VerificationGates(
+            router,
+            prompts,
+            config,
+            process=process,
+            event_bus=event_bus,
+        )
+        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="incomplete_deliverable_placeholder",
+            severity_class="semantic",
+            feedback="Deliverable contains [MISSING] placeholder markers.",
+            metadata={"issues": ["[MISSING] placeholder present"]},
+        ))
+
+        tool_call = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "report.md"},
+            result=ToolResult.ok("ok", files_changed=["report.md"]),
+        )
+        result = await gates.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "subtask summary",
+            [tool_call],
+            tmp_path,
+            tier=2,
+            task_id="task-contradiction",
+        )
+
+        assert not result.passed
+        assert result.reason_code == "parse_inconclusive"
+        assert result.severity_class == "inconclusive"
+        assert result.metadata.get("contradiction_detected") is True
+        scan = result.metadata.get("deterministic_placeholder_scan", {})
+        assert scan.get("scanned_file_count") == 1
+        assert scan.get("matched_file_count") == 0
+        assert scan.get("coverage_sufficient") is True
+        assert scan.get("scan_mode") in {"targeted_only", "targeted_plus_fallback"}
+        event_types = [event.event_type for event in events]
+        assert "verification_contradiction_detected" in event_types
+        contradiction_event = next(
+            event for event in events
+            if event.event_type == "verification_contradiction_detected"
+        )
+        assert contradiction_event.data.get("coverage_sufficient") is True
+        assert contradiction_event.data.get("contradiction_downgrade_count") == 1
+        assert contradiction_event.data.get("contradiction_detected_no_downgrade_count") == 0
+
+    @pytest.mark.asyncio
+    async def test_marker_in_changed_file_blocks_downgrade(self, tmp_path):
+        process = _make_process(deliverables={"phase-a": ["report.md"]})
+        (tmp_path / "report.md").write_text("Final deliverable.")
+        (tmp_path / "scratch-notes.md").write_text("TODO: unresolved bullet.")
+        config = VerificationConfig(
+            tier1_enabled=True,
+            tier2_enabled=True,
+            contradiction_guard_enabled=True,
+        )
+        router = MagicMock(spec=ModelRouter)
+        prompts = PromptAssembler(process=process)
+        gates = VerificationGates(router, prompts, config, process=process)
+        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="incomplete_deliverable_placeholder",
+            severity_class="semantic",
+            feedback="Deliverable still contains TODO markers.",
+            metadata={"issues": ["TODO placeholder found"]},
+        ))
+
+        tool_calls = [
+            MockToolCallRecord(
+                tool="write_file",
+                args={"path": "report.md"},
+                result=ToolResult.ok("ok", files_changed=["report.md"]),
+            ),
+            MockToolCallRecord(
+                tool="write_file",
+                args={"path": "scratch-notes.md"},
+                result=ToolResult.ok("ok", files_changed=["scratch-notes.md"]),
+            ),
+        ]
+        result = await gates.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "summary",
+            tool_calls,
+            tmp_path,
+            tier=2,
+            task_id="task-nondeliverable-marker",
+        )
+
+        assert not result.passed
+        assert result.reason_code == "incomplete_deliverable_placeholder"
+        assert result.metadata.get("contradiction_detected") is False
+        scan = result.metadata.get("deterministic_placeholder_scan", {})
+        assert "scratch-notes.md" in scan.get("matched_files", [])
+        assert scan.get("matched_file_count") == 1
+
+    @pytest.mark.asyncio
+    async def test_placeholder_marker_in_prior_attempt_candidate_blocks_downgrade(self, tmp_path):
+        process = _make_process(deliverables={"phase-a": ["report.md"]})
+        (tmp_path / "report.md").write_text("Final deliverable.")
+        (tmp_path / "prior-draft.md").write_text("PLACEHOLDER remains in prior attempt.")
+        config = VerificationConfig(
+            tier1_enabled=True,
+            tier2_enabled=True,
+            contradiction_guard_enabled=True,
+        )
+        router = MagicMock(spec=ModelRouter)
+        prompts = PromptAssembler(process=process)
+        gates = VerificationGates(router, prompts, config, process=process)
+        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="incomplete_deliverable_placeholder",
+            severity_class="semantic",
+            feedback="Placeholder marker reported by verifier.",
+            metadata={"issues": ["placeholder marker present"]},
+        ))
+
+        tool_calls = [
+            MockToolCallRecord(
+                tool="write_file",
+                args={"path": "report.md"},
+                result=ToolResult.ok("ok", files_changed=["report.md"]),
+            ),
+        ]
+        prior_tool_calls = [
+            MockToolCallRecord(
+                tool="write_file",
+                args={"path": "prior-draft.md"},
+                result=ToolResult.ok("ok", files_changed=["prior-draft.md"]),
+            ),
+        ]
+        result = await gates.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "summary",
+            tool_calls,
+            tmp_path,
+            evidence_tool_calls=prior_tool_calls,
+            tier=2,
+            task_id="task-prior-marker",
+        )
+
+        assert not result.passed
+        assert result.reason_code == "incomplete_deliverable_placeholder"
+        scan = result.metadata.get("deterministic_placeholder_scan", {})
+        assert "prior-draft.md" in scan.get("matched_files", [])
+        assert scan.get("matched_file_count") == 1
+
+    @pytest.mark.asyncio
+    async def test_clean_scan_with_insufficient_coverage_preserves_fail(self, tmp_path):
+        process = _make_process(deliverables={"phase-a": ["report.md", "appendix.md"]})
+        (tmp_path / "report.md").write_text("Final report")
+        (tmp_path / "appendix.md").write_text("Appendix notes")
+        config = VerificationConfig(
+            tier1_enabled=True,
+            tier2_enabled=True,
+            contradiction_guard_enabled=True,
+            contradiction_guard_strict_coverage=True,
+            contradiction_scan_min_files_for_sufficiency=3,
+        )
+        router = MagicMock(spec=ModelRouter)
+        prompts = PromptAssembler(process=process)
+        gates = VerificationGates(router, prompts, config, process=process)
+        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="incomplete_deliverable_placeholder",
+            severity_class="semantic",
+            feedback="Verifier reported placeholder marker.",
+            metadata={"issues": ["placeholder marker present"]},
+        ))
+
+        result = await gates.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "summary",
+            [],
+            tmp_path,
+            tier=2,
+            task_id="task-insufficient-coverage",
+        )
+
+        assert not result.passed
+        assert result.reason_code == "incomplete_deliverable_placeholder"
+        assert result.metadata.get("contradiction_detected") is False
+        assert result.metadata.get("contradiction_detected_no_downgrade") is True
+        scan = result.metadata.get("deterministic_placeholder_scan", {})
+        assert scan.get("coverage_sufficient") is False
+        assert "minimum_file_coverage_not_met" in scan.get("coverage_insufficient_reason", "")
+
+    @pytest.mark.asyncio
+    async def test_cap_exhaustion_marks_insufficient_coverage_and_no_downgrade(self, tmp_path):
+        process = _make_process(deliverables={"phase-a": ["a.md", "b.md"]})
+        (tmp_path / "a.md").write_text("File A clean")
+        (tmp_path / "b.md").write_text("File B clean")
+        config = VerificationConfig(
+            tier1_enabled=True,
+            tier2_enabled=True,
+            contradiction_guard_enabled=True,
+            contradiction_guard_strict_coverage=True,
+            contradiction_scan_max_files=1,
+            contradiction_scan_min_files_for_sufficiency=2,
+        )
+        router = MagicMock(spec=ModelRouter)
+        prompts = PromptAssembler(process=process)
+        event_bus = EventBus()
+        events = []
+        event_bus.subscribe_all(lambda event: events.append(event))
+        gates = VerificationGates(
+            router,
+            prompts,
+            config,
+            process=process,
+            event_bus=event_bus,
+        )
+        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="incomplete_deliverable_placeholder",
+            severity_class="semantic",
+            feedback="Verifier reported placeholder marker.",
+            metadata={"issues": ["placeholder marker present"]},
+        ))
+
+        result = await gates.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "summary",
+            [],
+            tmp_path,
+            tier=2,
+            task_id="task-cap-exhaustion",
+        )
+
+        assert not result.passed
+        assert result.reason_code == "incomplete_deliverable_placeholder"
+        scan = result.metadata.get("deterministic_placeholder_scan", {})
+        assert scan.get("cap_exhausted") is True
+        assert scan.get("cap_exhaustion_reason") == "max_files_reached"
+        assert scan.get("coverage_sufficient") is False
+        assert result.metadata.get("contradiction_detected_no_downgrade") is True
+        contradiction_event = next(
+            event for event in events
+            if event.event_type == "verification_contradiction_detected"
+        )
+        assert contradiction_event.data.get("contradiction_detected_no_downgrade_count") == 1
+        assert contradiction_event.data.get("cap_exhaustion_count") == 1
+
+    @pytest.mark.asyncio
+    async def test_large_binary_and_symlink_candidates_are_skipped(self, tmp_path):
+        process = _make_process(
+            deliverables={"phase-a": ["report.md", "large.md", "binary.md", "linked.md"]},
+        )
+        (tmp_path / "report.md").write_text("Clean final report")
+        (tmp_path / "large.md").write_text("A" * 400)
+        (tmp_path / "binary.md").write_bytes(b"\x00\x01\x02binary")
+        try:
+            (tmp_path / "linked.md").symlink_to(tmp_path / "report.md")
+        except OSError:
+            pytest.skip("Symlink not supported in this environment")
+        config = VerificationConfig(
+            tier1_enabled=True,
+            tier2_enabled=True,
+            contradiction_guard_enabled=True,
+            contradiction_guard_strict_coverage=True,
+            contradiction_scan_max_file_bytes=128,
+            contradiction_scan_min_files_for_sufficiency=2,
+        )
+        router = MagicMock(spec=ModelRouter)
+        prompts = PromptAssembler(process=process)
+        gates = VerificationGates(router, prompts, config, process=process)
+        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="incomplete_deliverable_placeholder",
+            severity_class="semantic",
+            feedback="Verifier reported placeholder marker.",
+            metadata={"issues": ["placeholder marker present"]},
+        ))
+
+        result = await gates.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "summary",
+            [],
+            tmp_path,
+            tier=2,
+            task_id="task-skip-behavior",
+        )
+
+        assert not result.passed
+        assert result.reason_code == "incomplete_deliverable_placeholder"
+        scan = result.metadata.get("deterministic_placeholder_scan", {})
+        assert scan.get("scanned_file_count") == 1
+        assert scan.get("skipped_large_file_count", 0) >= 1
+        assert scan.get("skipped_binary_file_count", 0) >= 1
+        assert scan.get("skipped_symlink_count", 0) >= 1
+        assert scan.get("coverage_sufficient") is False
 
     @pytest.mark.asyncio
     async def test_policy_engine_merges_tier1_warnings_with_tier2_pass(self):
