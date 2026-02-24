@@ -533,7 +533,7 @@ loom install user/loom-process-my-domain
 | `~/.loom/processes/` | User-global (default install target) |
 | `./loom-processes/` | Workspace-local |
 | `./.loom/processes/` | Workspace-local (alternative) |
-| `src/loom/processes/builtin/` | Built-in (cannot be overwritten) |
+| `src/loom/processes/builtin/` | Built-in (lowest precedence; user/workspace can override by name) |
 
 Later entries in the search order override earlier ones. A workspace-local process with the same name as a global one takes precedence.
 

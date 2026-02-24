@@ -610,7 +610,7 @@
 <span class="key">provider</span> = <span class="str">"ollama"</span>
 <span class="key">base_url</span> = <span class="str">"http://localhost:11434"</span>
 <span class="key">model</span>    = <span class="str">"qwen3:14b"</span>
-<span class="key">max_tokens</span>   = <span class="val">4096</span>
+<span class="key">max_tokens</span>   = <span class="val">8192</span>
 <span class="key">temperature</span>  = <span class="val">0.1</span>
 <span class="key">roles</span> = <span class="str">["planner", "executor"]</span>
 
@@ -621,7 +621,7 @@
 <span class="key">model</span>    = <span class="str">"qwen3:8b"</span>
 <span class="key">max_tokens</span>   = <span class="val">2048</span>
 <span class="key">temperature</span>  = <span class="val">0.0</span>
-<span class="key">roles</span> = <span class="str">["extractor", "verifier"]</span>
+<span class="key">roles</span> = <span class="str">["extractor", "verifier", "compactor"]</span>
 
 <span class="cmt"># Workspace</span>
 <span class="key">[workspace]</span>
@@ -1298,10 +1298,13 @@
   <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks</span><span class="endpoint-desc">List all tasks (filter with ?status=)</span></div>
   <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks/{id}</span><span class="endpoint-desc">Full task state, plan, and progress</span></div>
   <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks/{id}/stream</span><span class="endpoint-desc">SSE event stream</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks/{id}/tokens</span><span class="endpoint-desc">SSE token stream</span></div>
   <div class="endpoint"><span class="method method-patch">PATCH</span><span class="endpoint-path">/tasks/{id}</span><span class="endpoint-desc">Inject instructions (steer)</span></div>
   <div class="endpoint"><span class="method method-delete">DELETE</span><span class="endpoint-path">/tasks/{id}</span><span class="endpoint-desc">Cancel a running task</span></div>
   <div class="endpoint"><span class="method method-post">POST</span><span class="endpoint-path">/tasks/{id}/approve</span><span class="endpoint-desc">Approve/reject a gated step</span></div>
   <div class="endpoint"><span class="method method-post">POST</span><span class="endpoint-path">/tasks/{id}/feedback</span><span class="endpoint-desc">Provide mid-task feedback</span></div>
+  <div class="endpoint"><span class="method method-post">POST</span><span class="endpoint-path">/tasks/{id}/message</span><span class="endpoint-desc">Inject conversational message</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks/{id}/conversation</span><span class="endpoint-desc">Read injected conversation messages</span></div>
 
   <h3>Subtasks</h3>
   <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tasks/{id}/subtasks</span><span class="endpoint-desc">List all subtasks with status</span></div>
@@ -1512,7 +1515,7 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
 <section id="config-ref">
   <h2>Configuration Reference</h2>
 
-  <p>This section summarizes all runtime config keys. For a full, copyable reference with defaults and normalization rules, see <a href="CONFIG.md"><code>docs/CONFIG.md</code></a>.</p>
+  <p>This section highlights common runtime config keys. For the full key-by-key reference (including normalization rules), see <a href="CONFIG.md"><code>docs/CONFIG.md</code></a>.</p>
 
   <h3>Server</h3>
   <table>
@@ -1527,10 +1530,11 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     <tr><td><code>models.*.provider</code></td><td>required</td><td><code>ollama</code>, <code>openai_compatible</code>, or <code>anthropic</code></td></tr>
     <tr><td><code>models.*.base_url</code></td><td>--</td><td>Model API endpoint URL</td></tr>
     <tr><td><code>models.*.model</code></td><td>--</td><td>Model identifier string</td></tr>
-    <tr><td><code>models.*.max_tokens</code></td><td><code>4096</code></td><td>Max response tokens</td></tr>
+    <tr><td><code>models.*.max_tokens</code></td><td><code>8192</code></td><td>Max response tokens</td></tr>
     <tr><td><code>models.*.temperature</code></td><td><code>0.1</code></td><td>Sampling temperature</td></tr>
-    <tr><td><code>models.*.roles</code></td><td><code>["executor"]</code></td><td>Assigned roles (planner, executor, extractor, verifier)</td></tr>
+    <tr><td><code>models.*.roles</code></td><td><code>["executor"]</code></td><td>Assigned roles (planner, executor, extractor, verifier, compactor)</td></tr>
     <tr><td><code>models.*.api_key</code></td><td><code>""</code></td><td>Provider API key</td></tr>
+    <tr><td><code>models.*.reasoning_effort</code></td><td><code>""</code></td><td>Optional provider-specific reasoning hint</td></tr>
     <tr><td><code>models.*.tier</code></td><td><code>0</code></td><td>Explicit tier override (<code>0</code> = auto)</td></tr>
     <tr><td><code>models.*.capabilities.*</code></td><td>auto-detected</td><td>Optional capability overrides (<code>vision</code>, <code>native_pdf</code>, <code>thinking</code>, <code>citations</code>, <code>audio_input</code>, <code>audio_output</code>)</td></tr>
   </table>

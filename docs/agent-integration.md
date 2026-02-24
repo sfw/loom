@@ -3,7 +3,7 @@
 This guide shows how to connect external agents (Claude Code, custom scripts, cron jobs, other AI agents) to Loom as clients.
 
 **Two execution models:**
-- **Interactive** (`loom`) — conversation-first TUI with full session persistence. The agent and developer collaborate in real time with 21 tools, streaming, conversation recall, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition, and `/run <goal>` (or dynamic `/<process-name> <goal>`) forces process orchestration in-session. Use `/run close [run-id-prefix]` (or `Ctrl+W` on a run tab) to close/cancel a process run tab.
+- **Interactive** (`loom`) — conversation-first TUI with full session persistence. The agent and developer collaborate in real time with Loom’s built-in toolset (30 tools as of this release), streaming, conversation recall, and per-tool-call approval. No server needed. Optional `--process` flag loads a domain-specific process definition, and `/run <goal>` (or dynamic `/<process-name> <goal>`) forces process orchestration in-session. Use `/run close [run-id-prefix]` (or `Ctrl+W` on a run tab) to close/cancel a process run tab.
 - **Task mode** (REST API / MCP) — autonomous, fire-and-forget. Loom decomposes the goal into subtasks, executes, verifies, and reports back.
 
 This document covers both modes.
@@ -74,6 +74,7 @@ print(f"Task submitted: {task_id}")
 | `context` | No | Dict with constraints, focus areas, preferences |
 | `approval_mode` | No | `"auto"` (default), `"manual"`, or `"confidence_threshold"` |
 | `callback_url` | No | URL to POST results to on completion/failure |
+| `metadata` | No | Optional dict for run metadata (for example auth profile overrides) |
 
 ### Wait for Results
 
@@ -98,14 +99,23 @@ else:
 **Option B: SSE Stream (preferred)**
 
 ```python
-with httpx.stream("GET", f"http://localhost:9000/tasks/{task_id}/stream") as stream:
-    for line in stream.iter_lines():
-        if not line.strip() or not line.startswith("data: "):
-            continue
-        event = json.loads(line.removeprefix("data: "))
-        print(f"[{event['event_type']}] {event.get('data', {})}")
+import json
 
-        if event["event_type"] in ("task_completed", "task_failed"):
+with httpx.stream("GET", f"http://localhost:9000/tasks/{task_id}/stream") as stream:
+    event_type = ""
+    for line in stream.iter_lines():
+        if not line.strip():
+            continue
+        if line.startswith("event: "):
+            event_type = line.removeprefix("event: ").strip()
+            continue
+        if not line.startswith("data: "):
+            continue
+
+        payload = json.loads(line.removeprefix("data: "))
+        print(f"[{event_type}] {payload}")
+
+        if event_type in ("task_completed", "task_failed", "task_cancelled"):
             break
 ```
 
@@ -116,14 +126,13 @@ Set `callback_url` when creating the task. Loom will POST the result:
 ```json
 {
   "task_id": "a1b2c3d4",
-  "status": "completed",
-  "goal": "Refactor auth module",
-  "subtasks_completed": 5,
-  "subtasks_failed": 0,
-  "workspace_changes": {
-    "files_created": 2,
-    "files_modified": 7,
-    "files_deleted": 0
+  "event_type": "task_completed",
+  "timestamp": "2026-02-24T14:35:18.912345+00:00",
+  "data": {
+    "status": "completed",
+    "goal": "Refactor auth module",
+    "subtasks_completed": 5,
+    "subtasks_failed": 0
   }
 }
 ```
@@ -138,10 +147,10 @@ tasks = client.get("/tasks").json()
 task = client.get(f"/tasks/{task_id}").json()
 
 # Cancel a running task
-client.post(f"/tasks/{task_id}/cancel")
+client.delete(f"/tasks/{task_id}")
 
 # Steer a running task (inject new instructions mid-flight)
-client.post(f"/tasks/{task_id}/steer", json={
+client.patch(f"/tasks/{task_id}", json={
     "instruction": "Focus on the login flow first, skip registration for now"
 })
 
@@ -153,9 +162,22 @@ client.post(f"/tasks/{task_id}/approve", json={
 
 # Provide feedback on a completed/failed task
 client.post(f"/tasks/{task_id}/feedback", json={
-    "rating": 4,
-    "comment": "Good but missed the edge case in password reset"
+    "feedback": "Good progress; prioritize the password reset edge case next.",
+    "subtask_id": "s3"
 })
+
+# Send a conversational message to a running task
+client.post(f"/tasks/{task_id}/message", json={
+    "message": "Keep backward compatibility for old auth tokens.",
+    "role": "user"
+})
+
+# Retrieve conversation messages injected during task execution
+messages = client.get(f"/tasks/{task_id}/conversation").json()
+
+# Stream raw token events (SSE)
+with httpx.stream("GET", f"http://localhost:9000/tasks/{task_id}/tokens") as stream:
+    ...
 
 # System health
 health = client.get("/health").json()
@@ -250,7 +272,7 @@ For agents written in Python, you can use Loom's engines directly without the HT
 
 ### Cowork Session (Interactive)
 
-Use CoworkSession for conversation-first interactive work with all 21 tools:
+Use CoworkSession for conversation-first interactive work with the full built-in toolset:
 
 ```python
 import asyncio
@@ -265,7 +287,7 @@ async def cowork():
     config = load_config()
     router = ModelRouter.from_config(config)
     model = router.select(role="executor")
-    tools = create_default_registry()
+    tools = create_default_registry(config)
     workspace = Path("/projects/myapp")
 
     session = CoworkSession(
@@ -368,7 +390,7 @@ class MyCustomProvider(ModelProvider):
     @property
     def roles(self) -> list[str]:
         # Which roles can this model fulfill?
-        # Options: "executor", "planner", "verifier", "extractor"
+        # Options: "executor", "planner", "verifier", "extractor", "compactor"
         return ["executor", "planner"]
 ```
 
@@ -807,7 +829,7 @@ port = 9000
 provider = "ollama"
 base_url = "http://localhost:11434"
 model = "qwen3:8b"
-roles = ["executor", "extractor"]
+roles = ["executor", "extractor", "compactor"]
 
 [models.planner]
 provider = "ollama"

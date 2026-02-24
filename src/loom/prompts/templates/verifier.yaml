@@ -30,6 +30,12 @@ instructions: |
     "feedback": "Brief explanation of your assessment",
     "issues": ["list of specific issues found, if any"],
     "metadata": {{
+      "remediation_required": true|false,
+      "remediation_mode": "confirm_or_prune|queue_follow_up|targeted_remediation|remediate_and_retry|empty",
+      "missing_targets": ["optional list of unresolved targets"],
+      "unverified_claim_count": 0,
+      "verified_claim_count": 0,
+      "supporting_ratio": 0.0,
       "optional_process_fields": "include process-defined counters/flags only when inferable"
     }}
   }}

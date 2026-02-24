@@ -171,7 +171,7 @@ tests:
       deliverables:
         must_exist: [market-sizing.md, market-data.csv, assumption-register.md, competitive-landscape.md, competitor-matrix.csv, customer-segments.md, segment-profiles.csv, positioning.md, messaging-matrix.csv, channel-strategy.md, channel-economics.csv, kpi-tree.md, attribution-plan.md, experiment-backlog.csv, funnel-model.csv, enablement-plan.md, operating-rhythm.md, campaign-plan.md, budget-allocation.csv, creative-briefs.md, launch-risk-register.csv]
       verification:
-        forbidden_patterns: ["Expected deliverable '.*' not found", "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"]
+        forbidden_patterns: ["Expected deliverable '.*' not found", "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]|\\[MISSING\\]"]
 
   - id: live-canary
     mode: live
@@ -207,6 +207,9 @@ verification:
         - remediation_required
         - remediation_mode
         - missing_targets
+        - unverified_claim_count
+        - verified_claim_count
+        - supporting_ratio
     outcome_policy:
       pass_states: [pass, pass_with_warnings, partial_verified]
       fail_states: [fail]
@@ -268,7 +271,7 @@ verification:
 
     - name: no-placeholders
       description: "No placeholder text in deliverables"
-      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
+      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]|\\[MISSING\\]"
       severity: error
       type: regex
       applies_to_phases: ["*"]
