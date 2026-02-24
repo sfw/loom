@@ -14,6 +14,7 @@ import contextvars
 import csv
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,7 @@ logger = logging.getLogger(__name__)
 _COMPACTOR_EVENT_CONTEXT: contextvars.ContextVar[tuple[str, str] | None] = (
     contextvars.ContextVar("verification_compactor_event_context", default=None)
 )
+_VERIFICATION_CONTRADICTION_EVENT_TYPE = "verification_contradiction_detected"
 
 _VALID_OUTCOMES = {
     "pass",
@@ -1528,6 +1530,78 @@ class LLMVerifier:
         return None
 
     @staticmethod
+    def _to_string_list(value: object) -> list[str]:
+        if isinstance(value, list):
+            items = [str(item or "").strip() for item in value]
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            items = re.split(r"[,\n;]+", text)
+        else:
+            return []
+        normalized: list[str] = []
+        for item in items:
+            text = str(item or "").strip()
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized
+
+    @classmethod
+    def _normalize_verifier_metadata(cls, metadata: dict[str, object]) -> dict[str, object]:
+        normalized: dict[str, object] = {
+            str(key).strip(): value
+            for key, value in metadata.items()
+            if str(key).strip()
+        }
+        lookup: dict[str, str] = {
+            key.lower(): key for key in normalized
+        }
+
+        def value_for(field_name: str) -> object | None:
+            key = lookup.get(field_name)
+            if key is None:
+                return None
+            return normalized.get(key)
+
+        remediation_required_raw = value_for("remediation_required")
+        if remediation_required_raw is not None:
+            remediation_required = cls._to_bool(remediation_required_raw)
+            if remediation_required is None:
+                remediation_required = bool(remediation_required_raw)
+            normalized["remediation_required"] = remediation_required
+
+        remediation_mode_raw = value_for("remediation_mode")
+        if remediation_mode_raw is not None:
+            normalized["remediation_mode"] = str(
+                remediation_mode_raw or "",
+            ).strip().lower()
+
+        missing_targets_raw = value_for("missing_targets")
+        if missing_targets_raw is not None:
+            normalized["missing_targets"] = cls._to_string_list(missing_targets_raw)
+
+        unverified_claim_count_raw = value_for("unverified_claim_count")
+        if unverified_claim_count_raw is not None:
+            unverified_claim_count = cls._to_int(unverified_claim_count_raw)
+            if unverified_claim_count is not None:
+                normalized["unverified_claim_count"] = max(0, unverified_claim_count)
+
+        verified_claim_count_raw = value_for("verified_claim_count")
+        if verified_claim_count_raw is not None:
+            verified_claim_count = cls._to_int(verified_claim_count_raw)
+            if verified_claim_count is not None:
+                normalized["verified_claim_count"] = max(0, verified_claim_count)
+
+        supporting_ratio_raw = value_for("supporting_ratio")
+        if supporting_ratio_raw is not None:
+            supporting_ratio = cls._to_confidence(supporting_ratio_raw)
+            if supporting_ratio is not None:
+                normalized["supporting_ratio"] = supporting_ratio
+
+        return normalized
+
+    @staticmethod
     def _normalize_outcome(value: object, *, passed: bool) -> str:
         normalized = str(value or "").strip().lower()
         if normalized in _VALID_OUTCOMES:
@@ -1824,6 +1898,7 @@ class LLMVerifier:
         metadata = assessment.get("metadata", {})
         if not isinstance(metadata, dict):
             metadata = {}
+        metadata = LLMVerifier._normalize_verifier_metadata(metadata)
         return VerificationResult(
             tier=2,
             passed=passed,
@@ -1837,7 +1912,7 @@ class LLMVerifier:
             outcome=outcome,
             reason_code=reason_code,
             severity_class=severity_class,
-            metadata={"issues": issues, **metadata},
+            metadata={**metadata, "issues": issues},
         )
 
     def _inconclusive_result(self) -> VerificationResult:
@@ -2413,6 +2488,58 @@ class VotingVerifier:
 class VerificationGates:
     """Orchestrates the three-tier verification pipeline."""
 
+    _PLACEHOLDER_CLAIM_REASON_CODES = frozenset({
+        "incomplete_deliverable_placeholder",
+        "incomplete_deliverable_content",
+    })
+    _PLACEHOLDER_MARKER_PATTERN = re.compile(
+        r"\[(?:TBD|TODO|INSERT|PLACEHOLDER|MISSING)\]|\bTODO\b|\bPLACEHOLDER\b",
+        flags=re.IGNORECASE,
+    )
+    _DEFAULT_CONTRADICTION_SCAN_ALLOWED_SUFFIXES = (
+        ".md",
+        ".txt",
+        ".rst",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".xml",
+        ".html",
+        ".htm",
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".sql",
+        ".sh",
+    )
+    _CONTRADICTION_SCAN_EXCLUDED_DIRS = frozenset({
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "node_modules",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "__pycache__",
+        ".tox",
+        ".idea",
+        ".vscode",
+        ".next",
+        "dist",
+        "build",
+        "target",
+    })
+
     def __init__(
         self,
         model_router: ModelRouter,
@@ -2426,6 +2553,7 @@ class VerificationGates:
     ):
         self._config = config
         self._event_bus = event_bus
+        self._process = process
         validator = ResponseValidator()
         self._tier1 = DeterministicVerifier(
             process=process,
@@ -2443,6 +2571,661 @@ class VerificationGates:
             evidence_context_text_max_chars=evidence_context_text_max_chars,
         )
         self._tier3 = VotingVerifier(self._tier2, config.tier3_vote_count)
+
+    def _expected_deliverables_for_subtask(self, subtask: Subtask) -> list[str]:
+        process = self._process
+        if process is None:
+            return []
+        deliverables = process.get_deliverables()
+        if not deliverables:
+            return []
+        if subtask.id in deliverables:
+            return [
+                str(item).strip()
+                for item in deliverables[subtask.id]
+                if str(item).strip()
+            ]
+        if len(deliverables) == 1:
+            return [
+                str(item).strip()
+                for item in next(iter(deliverables.values()))
+                if str(item).strip()
+            ]
+        return []
+
+    @staticmethod
+    def _files_changed(tool_calls: list) -> list[str]:
+        files: list[str] = []
+        seen: set[str] = set()
+        for call in tool_calls:
+            result = getattr(call, "result", None)
+            changed = getattr(result, "files_changed", [])
+            if not isinstance(changed, list):
+                continue
+            for item in changed:
+                text = str(item or "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                files.append(text)
+        return files
+
+    @staticmethod
+    def _to_nonempty_int(
+        value: object,
+        default: int,
+        *,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        parsed = max(minimum, parsed)
+        parsed = min(maximum, parsed)
+        return parsed
+
+    @staticmethod
+    def _to_bool(raw: object, default: bool) -> bool:
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off", ""}:
+                return False
+        return bool(default)
+
+    @classmethod
+    def _normalized_scan_suffixes(cls, raw: object) -> tuple[str, ...]:
+        if isinstance(raw, str):
+            parts = re.split(r"[,\n;]+", raw)
+        elif isinstance(raw, (list, tuple, set)):
+            parts = list(raw)
+        else:
+            parts = []
+        normalized: list[str] = []
+        for part in parts:
+            text = str(part or "").strip().lower()
+            if not text:
+                continue
+            text = text.lstrip("*")
+            if not text.startswith("."):
+                text = f".{text}"
+            if text and text not in normalized:
+                normalized.append(text)
+        if not normalized:
+            return cls._DEFAULT_CONTRADICTION_SCAN_ALLOWED_SUFFIXES
+        return tuple(normalized)
+
+    @classmethod
+    def _normalize_candidate_path(
+        cls,
+        *,
+        workspace: Path | None,
+        raw_path: object,
+    ) -> str | None:
+        if workspace is None:
+            return None
+        text = str(raw_path or "").strip()
+        if not text:
+            return None
+
+        workspace_root = Path(os.path.normpath(str(workspace)))
+        path = Path(text)
+        rel_text = ""
+        if path.is_absolute():
+            normalized_abs = Path(os.path.normpath(str(path)))
+            try:
+                rel_text = normalized_abs.relative_to(workspace_root).as_posix()
+            except ValueError:
+                return None
+        else:
+            normalized_rel = Path(os.path.normpath(text))
+            if normalized_rel.is_absolute():
+                return None
+            if any(part == ".." for part in normalized_rel.parts):
+                return None
+            rel_text = normalized_rel.as_posix()
+
+        rel_text = rel_text.strip()
+        if rel_text in {"", "."}:
+            return None
+        return rel_text
+
+    @classmethod
+    def _normalize_candidate_bucket(
+        cls,
+        *,
+        workspace: Path | None,
+        raw_paths: list[str],
+    ) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in raw_paths:
+            rel_path = cls._normalize_candidate_path(workspace=workspace, raw_path=item)
+            if not rel_path or rel_path in seen:
+                continue
+            seen.add(rel_path)
+            normalized.append(rel_path)
+        return normalized
+
+    @staticmethod
+    def _evidence_artifact_paths(evidence_records: list[dict] | None) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        for record in evidence_records or []:
+            if not isinstance(record, dict):
+                continue
+            candidates: list[object] = [
+                record.get("artifact_workspace_relpath"),
+                record.get("artifact_path"),
+                record.get("path"),
+                record.get("file_path"),
+            ]
+            facets = record.get("facets")
+            if isinstance(facets, dict):
+                candidates.extend([
+                    facets.get("artifact_workspace_relpath"),
+                    facets.get("artifact_path"),
+                    facets.get("path"),
+                    facets.get("file_path"),
+                ])
+            for item in candidates:
+                text = str(item or "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                paths.append(text)
+        return paths
+
+    @classmethod
+    def _build_placeholder_scan_candidates(
+        cls,
+        *,
+        subtask: Subtask,
+        workspace: Path | None,
+        tool_calls: list,
+        evidence_tool_calls: list | None,
+        evidence_records: list[dict] | None,
+        expected_deliverables: list[str],
+    ) -> dict[str, object]:
+        canonical_paths = cls._normalize_candidate_bucket(
+            workspace=workspace,
+            raw_paths=expected_deliverables,
+        )
+        current_paths = cls._normalize_candidate_bucket(
+            workspace=workspace,
+            raw_paths=cls._files_changed(tool_calls),
+        )
+        prior_paths = cls._normalize_candidate_bucket(
+            workspace=workspace,
+            raw_paths=cls._files_changed(evidence_tool_calls or []),
+        )
+        evidence_paths = cls._normalize_candidate_bucket(
+            workspace=workspace,
+            raw_paths=cls._evidence_artifact_paths(evidence_records),
+        )
+        buckets: list[tuple[str, list[str]]] = [
+            ("canonical", canonical_paths),
+            ("current_attempt", current_paths),
+            ("prior_attempt", prior_paths),
+            ("evidence_artifact", evidence_paths),
+        ]
+        ordered_candidates: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for source, paths in buckets:
+            for rel_path in paths:
+                if rel_path in seen:
+                    continue
+                seen.add(rel_path)
+                ordered_candidates.append((rel_path, source))
+        return {
+            "ordered_candidates": ordered_candidates,
+            "canonical_candidates": set(canonical_paths),
+            "changed_candidates": set(current_paths) | set(prior_paths),
+            "candidate_source_counts": {
+                "canonical": len(canonical_paths),
+                "current_attempt": len(current_paths),
+                "prior_attempt": len(prior_paths),
+                "evidence_artifact": len(evidence_paths),
+                "fallback": 0,
+            },
+            "single_canonical_candidate": len(canonical_paths) == 1,
+        }
+
+    @classmethod
+    def _path_has_symlink_component(
+        cls,
+        *,
+        workspace: Path,
+        path: Path,
+    ) -> bool:
+        workspace_root = workspace.resolve(strict=False)
+        current = path
+        try:
+            current.relative_to(workspace_root)
+        except ValueError:
+            return True
+        while True:
+            try:
+                current.relative_to(workspace_root)
+            except ValueError:
+                return True
+            if current == workspace_root:
+                return False
+            try:
+                if current.is_symlink():
+                    return True
+            except OSError:
+                return True
+            parent = current.parent
+            if parent == current:
+                return True
+            current = parent
+
+    @classmethod
+    def _is_placeholder_claim_failure(cls, result: VerificationResult) -> bool:
+        if result.passed:
+            return False
+        reason_code = str(result.reason_code or "").strip().lower()
+        if reason_code in cls._PLACEHOLDER_CLAIM_REASON_CODES:
+            return True
+        issue_text = ""
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        raw_issues = metadata.get("issues", [])
+        if isinstance(raw_issues, list):
+            issue_text = " ".join(str(item or "") for item in raw_issues)
+        haystack = " ".join([
+            reason_code,
+            str(result.feedback or ""),
+            issue_text,
+        ])
+        return bool(cls._PLACEHOLDER_MARKER_PATTERN.search(haystack))
+
+    def _scan_placeholder_markers(
+        self,
+        *,
+        workspace: Path | None,
+        candidate_data: dict[str, object],
+    ) -> dict[str, object]:
+        if workspace is None:
+            return {
+                "scan_mode": "targeted_only",
+                "scanned_files": [],
+                "scanned_file_count": 0,
+                "scanned_total_bytes": 0,
+                "matched_files": [],
+                "matched_file_count": 0,
+                "coverage_sufficient": False,
+                "coverage_insufficient_reason": "workspace_unavailable",
+                "candidate_source_counts": {
+                    "canonical": 0,
+                    "current_attempt": 0,
+                    "prior_attempt": 0,
+                    "evidence_artifact": 0,
+                    "fallback": 0,
+                },
+                "cap_exhausted": False,
+                "cap_exhaustion_reason": "",
+                "skipped_large_file_count": 0,
+                "skipped_binary_file_count": 0,
+                "skipped_symlink_count": 0,
+                "skipped_suffix_count": 0,
+            }
+        ordered_candidates = candidate_data.get("ordered_candidates", [])
+        if not isinstance(ordered_candidates, list):
+            ordered_candidates = []
+        canonical_candidates = candidate_data.get("canonical_candidates", set())
+        if not isinstance(canonical_candidates, set):
+            canonical_candidates = set()
+        changed_candidates = candidate_data.get("changed_candidates", set())
+        if not isinstance(changed_candidates, set):
+            changed_candidates = set()
+        candidate_source_counts = candidate_data.get("candidate_source_counts", {})
+        if not isinstance(candidate_source_counts, dict):
+            candidate_source_counts = {}
+
+        max_files = self._to_nonempty_int(
+            getattr(self._config, "contradiction_scan_max_files", 80),
+            80,
+            minimum=1,
+            maximum=1000,
+        )
+        max_total_bytes = self._to_nonempty_int(
+            getattr(self._config, "contradiction_scan_max_total_bytes", 2_500_000),
+            2_500_000,
+            minimum=1_024,
+            maximum=50_000_000,
+        )
+        max_file_bytes = self._to_nonempty_int(
+            getattr(self._config, "contradiction_scan_max_file_bytes", 300_000),
+            300_000,
+            minimum=1,
+            maximum=10_000_000,
+        )
+        max_file_bytes = min(max_file_bytes, max_total_bytes)
+        min_files_for_sufficiency = self._to_nonempty_int(
+            getattr(
+                self._config,
+                "contradiction_scan_min_files_for_sufficiency",
+                2,
+            ),
+            2,
+            minimum=1,
+            maximum=100,
+        )
+        strict_coverage = self._to_bool(
+            getattr(self._config, "contradiction_guard_strict_coverage", True),
+            True,
+        )
+        allowed_suffixes = set(
+            self._normalized_scan_suffixes(
+                getattr(self._config, "contradiction_scan_allowed_suffixes", ()),
+            ),
+        )
+
+        workspace_root = workspace.resolve(strict=False)
+        scanned_files: list[str] = []
+        matched_files: list[str] = []
+        scanned_total_bytes = 0
+        scanned_canonical_count = 0
+        scanned_changed_count = 0
+        scanned_seen: set[str] = set()
+        cap_exhausted = False
+        cap_exhaustion_reason = ""
+        skipped_large_file_count = 0
+        skipped_binary_file_count = 0
+        skipped_symlink_count = 0
+        skipped_suffix_count = 0
+
+        def mark_cap(reason: str) -> None:
+            nonlocal cap_exhausted, cap_exhaustion_reason
+            if not cap_exhausted:
+                cap_exhausted = True
+                cap_exhaustion_reason = reason
+
+        def scan_candidate(rel_path: str, source: str) -> bool:
+            nonlocal scanned_total_bytes
+            nonlocal scanned_canonical_count
+            nonlocal scanned_changed_count
+            nonlocal skipped_large_file_count
+            nonlocal skipped_binary_file_count
+            nonlocal skipped_symlink_count
+            nonlocal skipped_suffix_count
+
+            if rel_path in scanned_seen:
+                return False
+            if len(scanned_files) >= max_files:
+                mark_cap("max_files_reached")
+                return False
+            if scanned_total_bytes >= max_total_bytes:
+                mark_cap("max_total_bytes_reached")
+                return False
+
+            fpath = workspace_root / rel_path
+            try:
+                resolved = fpath.resolve(strict=False)
+            except OSError:
+                return False
+            try:
+                resolved.relative_to(workspace_root)
+            except ValueError:
+                skipped_symlink_count += 1
+                return False
+            if self._path_has_symlink_component(workspace=workspace_root, path=fpath):
+                skipped_symlink_count += 1
+                return False
+            try:
+                if not fpath.exists() or not fpath.is_file():
+                    return False
+                suffix = fpath.suffix.lower()
+                if suffix not in allowed_suffixes:
+                    skipped_suffix_count += 1
+                    return False
+                fsize = int(fpath.stat().st_size)
+            except OSError:
+                return False
+            if fsize > max_file_bytes:
+                skipped_large_file_count += 1
+                return False
+            if scanned_total_bytes + fsize > max_total_bytes:
+                mark_cap("max_total_bytes_reached")
+                return False
+            try:
+                payload = fpath.read_bytes()
+            except OSError:
+                return False
+            if b"\x00" in payload[:2048]:
+                skipped_binary_file_count += 1
+                return False
+
+            scanned_seen.add(rel_path)
+            scanned_files.append(rel_path)
+            scanned_total_bytes += fsize
+            if rel_path in canonical_candidates:
+                scanned_canonical_count += 1
+            if rel_path in changed_candidates:
+                scanned_changed_count += 1
+
+            content = payload.decode("utf-8", errors="replace")
+            if self._PLACEHOLDER_MARKER_PATTERN.search(content):
+                matched_files.append(rel_path)
+                return True
+            if source == "fallback":
+                candidate_source_counts["fallback"] = (
+                    int(candidate_source_counts.get("fallback", 0) or 0) + 1
+                )
+            return False
+
+        for item in ordered_candidates:
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+            rel_path = str(item[0] or "").strip()
+            source = str(item[1] or "").strip().lower() or "canonical"
+            if not rel_path:
+                continue
+            if scan_candidate(rel_path, source):
+                break
+            if cap_exhausted:
+                break
+
+        scan_mode = "targeted_only"
+        if not matched_files and not cap_exhausted:
+            scan_mode = "targeted_plus_fallback"
+            fallback_visit_cap = max(200, max_files * 40)
+            visited_entries = 0
+            stop_fallback = False
+            for root, dirs, files in os.walk(workspace_root, topdown=True, followlinks=False):
+                filtered_dirs: list[str] = []
+                for name in sorted(dirs):
+                    if (
+                        not name
+                        or name.startswith(".")
+                        or name in self._CONTRADICTION_SCAN_EXCLUDED_DIRS
+                    ):
+                        continue
+                    candidate_dir = Path(root) / name
+                    try:
+                        if candidate_dir.is_symlink():
+                            continue
+                    except OSError:
+                        continue
+                    filtered_dirs.append(name)
+                dirs[:] = filtered_dirs
+                for filename in sorted(files):
+                    visited_entries += 1
+                    if visited_entries > fallback_visit_cap:
+                        mark_cap("fallback_entry_cap_reached")
+                        stop_fallback = True
+                        break
+                    candidate_file = Path(root) / filename
+                    try:
+                        if candidate_file.is_symlink():
+                            skipped_symlink_count += 1
+                            continue
+                    except OSError:
+                        continue
+                    try:
+                        rel_path = candidate_file.relative_to(workspace_root).as_posix()
+                    except ValueError:
+                        continue
+                    if rel_path in scanned_seen:
+                        continue
+                    if scan_candidate(rel_path, "fallback"):
+                        stop_fallback = True
+                        break
+                    if cap_exhausted:
+                        stop_fallback = True
+                        break
+                if stop_fallback:
+                    break
+
+        scanned_file_count = len(scanned_files)
+        matched_file_count = len(matched_files)
+        coverage_sufficient = False
+        coverage_insufficient_reason = ""
+        if strict_coverage:
+            reasons: list[str] = []
+            priority_scanned = scanned_canonical_count + scanned_changed_count
+            if scanned_file_count <= 0:
+                reasons.append("no_files_scanned")
+            if priority_scanned <= 0:
+                reasons.append("no_canonical_or_changed_candidate_scanned")
+            allow_single_canonical = bool(candidate_data.get("single_canonical_candidate", False))
+            if not (allow_single_canonical and scanned_canonical_count == 1):
+                if scanned_file_count < min_files_for_sufficiency:
+                    reasons.append("minimum_file_coverage_not_met")
+            if cap_exhausted and priority_scanned <= 0:
+                reasons.append("cap_exhausted_before_priority_scan")
+            coverage_sufficient = not reasons
+            if reasons:
+                coverage_insufficient_reason = ";".join(dict.fromkeys(reasons))
+        else:
+            coverage_sufficient = scanned_file_count > 0
+            if not coverage_sufficient:
+                coverage_insufficient_reason = "no_files_scanned"
+
+        return {
+            "scan_mode": scan_mode,
+            "scanned_files": scanned_files,
+            "scanned_file_count": scanned_file_count,
+            "scanned_total_bytes": scanned_total_bytes,
+            "matched_files": matched_files,
+            "matched_file_count": matched_file_count,
+            "coverage_sufficient": coverage_sufficient,
+            "coverage_insufficient_reason": coverage_insufficient_reason,
+            "candidate_source_counts": candidate_source_counts,
+            "cap_exhausted": cap_exhausted,
+            "cap_exhaustion_reason": cap_exhaustion_reason,
+            "skipped_large_file_count": skipped_large_file_count,
+            "skipped_binary_file_count": skipped_binary_file_count,
+            "skipped_symlink_count": skipped_symlink_count,
+            "skipped_suffix_count": skipped_suffix_count,
+        }
+
+    def _apply_placeholder_contradiction_guard(
+        self,
+        *,
+        subtask: Subtask,
+        result: VerificationResult,
+        workspace: Path | None,
+        tool_calls: list,
+        evidence_tool_calls: list | None = None,
+        evidence_records: list[dict] | None = None,
+    ) -> VerificationResult:
+        if not bool(getattr(self._config, "contradiction_guard_enabled", True)):
+            return result
+        if result.passed:
+            return result
+        if str(result.severity_class or "").strip().lower() == "hard_invariant":
+            return result
+        if not self._is_placeholder_claim_failure(result):
+            return result
+
+        expected_deliverables = self._expected_deliverables_for_subtask(subtask)
+        candidate_data = self._build_placeholder_scan_candidates(
+            subtask=subtask,
+            workspace=workspace,
+            tool_calls=tool_calls,
+            evidence_tool_calls=evidence_tool_calls,
+            evidence_records=evidence_records,
+            expected_deliverables=expected_deliverables,
+        )
+        scan = self._scan_placeholder_markers(
+            workspace=workspace,
+            candidate_data=candidate_data,
+        )
+        matched_file_count = int(scan.get("matched_file_count", 0) or 0)
+        coverage_sufficient = bool(scan.get("coverage_sufficient", False))
+        coverage_reason = str(scan.get("coverage_insufficient_reason", "") or "")
+
+        metadata = dict(result.metadata) if isinstance(result.metadata, dict) else {}
+        metadata["contradicted_reason_code"] = str(result.reason_code or "")
+        metadata["deterministic_placeholder_scan"] = scan
+        metadata["coverage_sufficient"] = coverage_sufficient
+        metadata["contradiction_downgraded"] = False
+        metadata["contradiction_detected_no_downgrade"] = False
+
+        if matched_file_count > 0:
+            metadata["contradiction_detected"] = False
+            metadata["contradiction_marker_found"] = True
+            return VerificationResult(
+                tier=result.tier,
+                passed=result.passed,
+                confidence=float(result.confidence or 0.0),
+                checks=list(result.checks or []),
+                feedback=result.feedback,
+                outcome=result.outcome,
+                reason_code=result.reason_code,
+                severity_class=result.severity_class,
+                metadata=metadata,
+            )
+
+        if not coverage_sufficient:
+            metadata["contradiction_detected"] = False
+            metadata["contradiction_detected_no_downgrade"] = True
+            metadata["coverage_insufficient_reason"] = coverage_reason
+            return VerificationResult(
+                tier=result.tier,
+                passed=result.passed,
+                confidence=float(result.confidence or 0.0),
+                checks=list(result.checks or []),
+                feedback=result.feedback,
+                outcome=result.outcome,
+                reason_code=result.reason_code,
+                severity_class=result.severity_class,
+                metadata=metadata,
+            )
+
+        metadata["contradiction_detected"] = True
+        metadata["contradiction_downgraded"] = True
+        metadata["contradiction_kind"] = (
+            "placeholder_claim_without_deterministic_match"
+        )
+        feedback_parts = [
+            str(result.feedback or "").strip(),
+            (
+                "Verifier placeholder/TODO claim contradicted by deterministic "
+                "artifact scan; marking verification inconclusive for verifier-only retry."
+            ),
+        ]
+        feedback = "\n".join(part for part in feedback_parts if part)
+        return VerificationResult(
+            tier=result.tier,
+            passed=False,
+            confidence=min(0.5, float(result.confidence or 0.5)),
+            checks=list(result.checks or []),
+            feedback=feedback,
+            outcome="fail",
+            reason_code="parse_inconclusive",
+            severity_class="inconclusive",
+            metadata=metadata,
+        )
 
     def _emit_outcome_event(
         self,
@@ -2494,6 +3277,56 @@ class VerificationGates:
     ) -> None:
         if not self._event_bus or not task_id:
             return
+
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        scan = metadata.get("deterministic_placeholder_scan", {})
+        if isinstance(scan, dict):
+            scan_dict = scan if isinstance(scan, dict) else {}
+            candidate_source_counts = scan_dict.get("candidate_source_counts", {})
+            if not isinstance(candidate_source_counts, dict):
+                candidate_source_counts = {}
+            contradiction_downgraded = bool(metadata.get("contradiction_downgraded", False))
+            contradiction_detected_no_downgrade = bool(
+                metadata.get("contradiction_detected_no_downgrade", False),
+            )
+            self._event_bus.emit(Event(
+                event_type=_VERIFICATION_CONTRADICTION_EVENT_TYPE,
+                task_id=task_id,
+                data={
+                    "subtask_id": subtask_id,
+                    "tier": result.tier,
+                    "reason_code": result.reason_code,
+                    "contradicted_reason_code": str(
+                        metadata.get("contradicted_reason_code", ""),
+                    ),
+                    "scanned_file_count": int(
+                        scan_dict.get("scanned_file_count", 0) or 0,
+                    ),
+                    "scanned_total_bytes": int(
+                        scan_dict.get("scanned_total_bytes", 0) or 0,
+                    ),
+                    "matched_file_count": int(
+                        scan_dict.get("matched_file_count", 0) or 0,
+                    ),
+                    "scan_mode": str(
+                        scan_dict.get("scan_mode", "targeted_only") or "targeted_only",
+                    ),
+                    "coverage_sufficient": bool(
+                        scan_dict.get("coverage_sufficient", False),
+                    ),
+                    "candidate_source_counts": candidate_source_counts,
+                    "coverage_insufficient_reason": str(
+                        scan_dict.get("coverage_insufficient_reason", "") or "",
+                    ),
+                    "contradiction_downgrade_count": 1 if contradiction_downgraded else 0,
+                    "contradiction_detected_no_downgrade_count": (
+                        1 if contradiction_detected_no_downgrade else 0
+                    ),
+                    "cap_exhaustion_count": (
+                        1 if bool(scan_dict.get("cap_exhausted", False)) else 0
+                    ),
+                },
+            ))
 
         if result.reason_code == "parse_inconclusive":
             self._event_bus.emit(Event(
@@ -2691,6 +3524,11 @@ class VerificationGates:
     ) -> VerificationResult | None:
         if tier1_result is None or not tier1_result.passed:
             return None
+        if (
+            isinstance(tier2_result.metadata, dict)
+            and bool(tier2_result.metadata.get("contradiction_detected", False))
+        ):
+            return None
         reason = str(tier2_result.reason_code or "").strip().lower()
         severity = str(tier2_result.severity_class or "").strip().lower()
         if reason != "parse_inconclusive" and severity != "inconclusive":
@@ -2794,6 +3632,14 @@ class VerificationGates:
             evidence_tool_calls=evidence_tool_calls,
             evidence_records=evidence_records,
             task_id=task_id,
+        )
+        t2 = self._apply_placeholder_contradiction_guard(
+            subtask=subtask,
+            result=t2,
+            workspace=workspace,
+            tool_calls=tool_calls,
+            evidence_tool_calls=evidence_tool_calls,
+            evidence_records=evidence_records,
         )
         results.append(t2)
         t1_result = next((item for item in results if item.tier == 1), None)

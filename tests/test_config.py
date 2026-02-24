@@ -48,6 +48,13 @@ class TestDefaultConfig:
         assert config.verification.confirm_or_prune_max_attempts == 2
         assert config.verification.confirm_or_prune_backoff_seconds == 2.0
         assert config.verification.confirm_or_prune_retry_on_transient is True
+        assert config.verification.contradiction_guard_enabled is True
+        assert config.verification.contradiction_guard_strict_coverage is True
+        assert config.verification.contradiction_scan_max_files == 80
+        assert config.verification.contradiction_scan_max_total_bytes == 2_500_000
+        assert config.verification.contradiction_scan_max_file_bytes == 300_000
+        assert config.verification.contradiction_scan_min_files_for_sufficiency == 2
+        assert ".md" in config.verification.contradiction_scan_allowed_suffixes
 
     def test_default_process_flags(self):
         config = Config()
@@ -229,6 +236,13 @@ auto_confirm_prune_critical_path = false
 confirm_or_prune_max_attempts = 4
 confirm_or_prune_backoff_seconds = 1.25
 confirm_or_prune_retry_on_transient = false
+contradiction_guard_enabled = false
+contradiction_guard_strict_coverage = false
+contradiction_scan_max_files = 120
+contradiction_scan_max_total_bytes = 3600000
+contradiction_scan_max_file_bytes = 240000
+contradiction_scan_allowed_suffixes = [".md", "txt", ".csv"]
+contradiction_scan_min_files_for_sufficiency = 4
 """)
         config = load_config(toml_file)
         assert config.verification.policy_engine_enabled is False
@@ -240,6 +254,40 @@ confirm_or_prune_retry_on_transient = false
         assert config.verification.confirm_or_prune_max_attempts == 4
         assert config.verification.confirm_or_prune_backoff_seconds == 1.25
         assert config.verification.confirm_or_prune_retry_on_transient is False
+        assert config.verification.contradiction_guard_enabled is False
+        assert config.verification.contradiction_guard_strict_coverage is False
+        assert config.verification.contradiction_scan_max_files == 120
+        assert config.verification.contradiction_scan_max_total_bytes == 3_600_000
+        assert config.verification.contradiction_scan_max_file_bytes == 240_000
+        assert config.verification.contradiction_scan_allowed_suffixes == [
+            ".md",
+            ".txt",
+            ".csv",
+        ]
+        assert config.verification.contradiction_scan_min_files_for_sufficiency == 4
+
+    def test_verification_contradiction_scan_values_are_clamped_and_safe(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[verification]
+contradiction_guard_strict_coverage = "maybe"
+contradiction_scan_max_files = -3
+contradiction_scan_max_total_bytes = "bad"
+contradiction_scan_max_file_bytes = 999999999
+contradiction_scan_allowed_suffixes = [123, "", ".MD", "txt"]
+contradiction_scan_min_files_for_sufficiency = 999
+""")
+        config = load_config(toml_file)
+        assert config.verification.contradiction_guard_strict_coverage is True
+        assert config.verification.contradiction_scan_max_files == 1
+        assert config.verification.contradiction_scan_max_total_bytes == 2_500_000
+        assert config.verification.contradiction_scan_max_file_bytes == 2_500_000
+        assert config.verification.contradiction_scan_allowed_suffixes == [
+            ".123",
+            ".md",
+            ".txt",
+        ]
+        assert config.verification.contradiction_scan_min_files_for_sufficiency == 100
 
     def test_process_flags_loaded(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

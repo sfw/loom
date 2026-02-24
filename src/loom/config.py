@@ -6,6 +6,7 @@ Configuration is loaded once at startup and passed via dependency injection.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -135,6 +136,39 @@ class VerificationConfig:
     confirm_or_prune_max_attempts: int = 2
     confirm_or_prune_backoff_seconds: float = 2.0
     confirm_or_prune_retry_on_transient: bool = True
+    contradiction_guard_enabled: bool = True
+    contradiction_guard_strict_coverage: bool = True
+    contradiction_scan_max_files: int = 80
+    contradiction_scan_max_total_bytes: int = 2_500_000
+    contradiction_scan_max_file_bytes: int = 300_000
+    contradiction_scan_allowed_suffixes: list[str] = field(default_factory=lambda: [
+        ".md",
+        ".txt",
+        ".rst",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".xml",
+        ".html",
+        ".htm",
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".sql",
+        ".sh",
+    ])
+    contradiction_scan_min_files_for_sufficiency: int = 2
+    remediation_queue_max_attempts: int = 3
+    remediation_queue_backoff_seconds: float = 2.0
+    remediation_queue_max_backoff_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -397,6 +431,29 @@ def _bool_from(source: dict, key: str, default: bool) -> bool:
     return bool(default)
 
 
+def _suffix_list_from(source: dict, key: str, default: list[str]) -> list[str]:
+    """Parse suffix list from config, supporting list or delimited string."""
+    raw = source.get(key, default)
+    if isinstance(raw, str):
+        values = re.split(r"[,\n;]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = list(default)
+
+    normalized: list[str] = []
+    for item in values:
+        text = str(item or "").strip().lower()
+        if not text:
+            continue
+        text = text.lstrip("*")
+        if not text.startswith("."):
+            text = f".{text}"
+        if text not in normalized:
+            normalized.append(text)
+    return normalized or list(default)
+
+
 def load_config(path: Path | None = None) -> Config:
     """Load configuration from a TOML file.
 
@@ -495,6 +552,8 @@ def load_config(path: Path | None = None) -> Config:
     )
 
     verif_data = raw.get("verification", {})
+    if not isinstance(verif_data, dict):
+        verif_data = {}
     threshold_raw = verif_data.get("unconfirmed_supporting_threshold", 0.30)
     try:
         threshold = float(threshold_raw)
@@ -514,6 +573,71 @@ def load_config(path: Path | None = None) -> Config:
     except (TypeError, ValueError):
         confirm_or_prune_backoff_seconds = 2.0
     confirm_or_prune_backoff_seconds = max(0.0, confirm_or_prune_backoff_seconds)
+
+    queue_max_attempts_raw = verif_data.get("remediation_queue_max_attempts", 3)
+    try:
+        remediation_queue_max_attempts = int(queue_max_attempts_raw)
+    except (TypeError, ValueError):
+        remediation_queue_max_attempts = 3
+    remediation_queue_max_attempts = max(1, remediation_queue_max_attempts)
+
+    queue_backoff_raw = verif_data.get("remediation_queue_backoff_seconds", 2.0)
+    try:
+        remediation_queue_backoff_seconds = float(queue_backoff_raw)
+    except (TypeError, ValueError):
+        remediation_queue_backoff_seconds = 2.0
+    remediation_queue_backoff_seconds = max(0.0, remediation_queue_backoff_seconds)
+
+    queue_max_backoff_raw = verif_data.get(
+        "remediation_queue_max_backoff_seconds",
+        30.0,
+    )
+    try:
+        remediation_queue_max_backoff_seconds = float(queue_max_backoff_raw)
+    except (TypeError, ValueError):
+        remediation_queue_max_backoff_seconds = 30.0
+    remediation_queue_max_backoff_seconds = max(
+        remediation_queue_backoff_seconds,
+        remediation_queue_max_backoff_seconds,
+    )
+    contradiction_scan_max_files = _int_from(
+        verif_data,
+        "contradiction_scan_max_files",
+        VerificationConfig.contradiction_scan_max_files,
+        minimum=1,
+        maximum=1000,
+    )
+    contradiction_scan_max_total_bytes = _int_from(
+        verif_data,
+        "contradiction_scan_max_total_bytes",
+        VerificationConfig.contradiction_scan_max_total_bytes,
+        minimum=1_024,
+        maximum=50_000_000,
+    )
+    contradiction_scan_max_file_bytes = _int_from(
+        verif_data,
+        "contradiction_scan_max_file_bytes",
+        VerificationConfig.contradiction_scan_max_file_bytes,
+        minimum=1,
+        maximum=10_000_000,
+    )
+    contradiction_scan_max_file_bytes = min(
+        contradiction_scan_max_file_bytes,
+        contradiction_scan_max_total_bytes,
+    )
+    contradiction_scan_min_files_for_sufficiency = _int_from(
+        verif_data,
+        "contradiction_scan_min_files_for_sufficiency",
+        VerificationConfig.contradiction_scan_min_files_for_sufficiency,
+        minimum=1,
+        maximum=100,
+    )
+    contradiction_scan_allowed_suffixes = _suffix_list_from(
+        verif_data,
+        "contradiction_scan_allowed_suffixes",
+        VerificationConfig().contradiction_scan_allowed_suffixes,
+    )
+
     verification = VerificationConfig(
         tier1_enabled=verif_data.get("tier1_enabled", True),
         tier2_enabled=verif_data.get("tier2_enabled", True),
@@ -538,6 +662,26 @@ def load_config(path: Path | None = None) -> Config:
             "confirm_or_prune_retry_on_transient",
             True,
         ),
+        contradiction_guard_enabled=_bool_from(
+            verif_data,
+            "contradiction_guard_enabled",
+            True,
+        ),
+        contradiction_guard_strict_coverage=_bool_from(
+            verif_data,
+            "contradiction_guard_strict_coverage",
+            True,
+        ),
+        contradiction_scan_max_files=contradiction_scan_max_files,
+        contradiction_scan_max_total_bytes=contradiction_scan_max_total_bytes,
+        contradiction_scan_max_file_bytes=contradiction_scan_max_file_bytes,
+        contradiction_scan_allowed_suffixes=contradiction_scan_allowed_suffixes,
+        contradiction_scan_min_files_for_sufficiency=(
+            contradiction_scan_min_files_for_sufficiency
+        ),
+        remediation_queue_max_attempts=remediation_queue_max_attempts,
+        remediation_queue_backoff_seconds=remediation_queue_backoff_seconds,
+        remediation_queue_max_backoff_seconds=remediation_queue_max_backoff_seconds,
     )
 
     mem_data = raw.get("memory", {})
