@@ -11,6 +11,8 @@ Subtask execution is delegated to SubtaskRunner.  Independent subtasks
 from __future__ import annotations
 
 import asyncio
+import csv
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -342,6 +344,7 @@ class Orchestrator:
                 finalizing=True,
             )
             result_task = self._finalize_task(task)
+            self._export_evidence_ledger_csv(result_task)
 
             # 4. Learn from execution (best-effort)
             await self._learn_from_task(result_task)
@@ -360,6 +363,7 @@ class Orchestrator:
                 "error": str(e),
                 "error_type": type(e).__name__,
             })
+            self._export_evidence_ledger_csv(task)
             await self._learn_from_task(task)
             return task
 
@@ -2042,6 +2046,22 @@ class Orchestrator:
     _ALL_DOC_EXTENSIONS: frozenset[str] = frozenset(
         ext for exts in _DOC_EXTENSIONS.values() for ext in exts
     )
+    _EVIDENCE_LEDGER_CSV_NAME = "evidence-ledger.csv"
+    _EVIDENCE_LEDGER_CSV_BASE_FIELDS: tuple[str, ...] = (
+        "evidence_id",
+        "task_id",
+        "subtask_id",
+        "tool",
+        "evidence_kind",
+        "tool_call_id",
+        "source_url",
+        "query",
+        "quality",
+        "created_at",
+        "snippet",
+        "context_text",
+        "facets",
+    )
 
     async def _analyze_workspace(self, workspace_path: Path) -> str:
         """Run code analysis *and* document scan for better planning context.
@@ -2511,6 +2531,77 @@ class Orchestrator:
         changelog = ChangeLog(task_id=task.id, workspace=workspace, data_dir=data_dir)
         self._changelog_cache[task.id] = changelog
         return changelog
+
+    @staticmethod
+    def _stringify_evidence_csv_value(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (str, int, float, bool)):
+            return str(value)
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(value)
+
+    @classmethod
+    def _evidence_csv_fieldnames(cls, rows: list[dict[str, str]]) -> list[str]:
+        base = list(cls._EVIDENCE_LEDGER_CSV_BASE_FIELDS)
+        extras: set[str] = set()
+        for row in rows:
+            for key in row:
+                if key and key not in base:
+                    extras.add(key)
+        return base + sorted(extras)
+
+    def _evidence_csv_rows(self, records: list[dict]) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            row: dict[str, str] = {}
+            for raw_key, value in record.items():
+                key = str(raw_key or "").strip()
+                if not key:
+                    continue
+                row[key] = self._stringify_evidence_csv_value(value)
+            if row:
+                rows.append(row)
+        return rows
+
+    def _export_evidence_ledger_csv(self, task: Task) -> None:
+        """Best-effort evidence ledger export to the task workspace."""
+        workspace_text = str(task.workspace or "").strip()
+        if not workspace_text:
+            return
+        workspace = Path(workspace_text).expanduser()
+        if not workspace.exists() or not workspace.is_dir():
+            return
+        try:
+            records = self._state.load_evidence_records(task.id)
+        except Exception as e:
+            logger.warning("Failed loading evidence ledger for CSV export %s: %s", task.id, e)
+            return
+        rows = self._evidence_csv_rows(records)
+        if not rows:
+            return
+        output_path = workspace / self._EVIDENCE_LEDGER_CSV_NAME
+        fieldnames = self._evidence_csv_fieldnames(rows)
+        try:
+            with output_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=fieldnames,
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+        except Exception as e:
+            logger.warning(
+                "Failed exporting evidence ledger CSV for %s to %s: %s",
+                task.id,
+                output_path,
+                e,
+            )
 
     def _finalize_task(self, task: Task) -> Task:
         """Finalize task: set status, emit events."""
