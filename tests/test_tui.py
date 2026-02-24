@@ -2423,6 +2423,109 @@ class TestProcessSlashCommands:
         assert kwargs.get("adhoc_synthesis_notes")
 
     @pytest.mark.asyncio
+    async def test_run_file_goal_loads_content_for_adhoc(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        (tmp_path / "problem.md").write_text(
+            "# Problem\nImplement a deterministic CSV export.",
+            encoding="utf-8",
+        )
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        app._process_defn = None
+        app._config = SimpleNamespace(process=SimpleNamespace(default=""))
+        adhoc_process = SimpleNamespace(name="adhoc-report", phases=[])
+        app._get_or_create_adhoc_process = AsyncMock(return_value=(
+            SimpleNamespace(
+                process_defn=adhoc_process,
+                recommended_tools=[],
+            ),
+            False,
+        ))
+        app._start_process_run = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/run problem.md")
+
+        assert handled is True
+        called_goal = app._get_or_create_adhoc_process.await_args.args[0]
+        assert "problem.md" in called_goal
+        assert "Implement a deterministic CSV export." in called_goal
+        app._start_process_run.assert_awaited_once()
+        assert app._start_process_run.await_args.args == ("problem.md",)
+        kwargs = app._start_process_run.await_args.kwargs
+        assert kwargs["process_defn"] is adhoc_process
+        assert kwargs["is_adhoc"] is True
+        assert kwargs["recommended_tools"] == []
+        assert kwargs["goal_context_overrides"]["run_goal_file_input"]["path"] == "problem.md"
+        assert kwargs["goal_context_overrides"]["run_goal_file_input"]["truncated"] is False
+        assert "Implement a deterministic CSV export." in (
+            kwargs["goal_context_overrides"]["run_goal_file_input"]["content"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_at_file_prefix_supports_inline_goal_override(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        (tmp_path / "problem.md").write_text(
+            "Primary acceptance criteria for release packaging.",
+            encoding="utf-8",
+        )
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        app._process_defn = SimpleNamespace(name="investment-analysis")
+        app._start_process_run = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command(
+            "/run @problem.md focus only on risk items",
+        )
+
+        assert handled is True
+        app._start_process_run.assert_awaited_once_with(
+            "focus only on risk items",
+            process_defn=app._process_defn,
+            is_adhoc=False,
+            recommended_tools=[],
+            goal_context_overrides={
+                "run_goal_file_input": {
+                    "path": "problem.md",
+                    "content": "Primary acceptance criteria for release packaging.",
+                    "truncated": False,
+                    "max_chars": 32000,
+                },
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_at_file_prefix_requires_existing_workspace_file(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        app._start_process_run = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/run @missing-problem.md")
+
+        assert handled is True
+        app._start_process_run.assert_not_awaited()
+        chat.add_info.assert_called()
+        assert "Run goal file not found" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
     async def test_get_or_create_adhoc_process_persists_cache_file(self, tmp_path, monkeypatch):
         from loom.tui.app import LoomApp
 
