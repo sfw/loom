@@ -49,7 +49,10 @@ class SpreadsheetTool(Tool):
                 },
                 "path": {
                     "type": "string",
-                    "description": "Path to the CSV file (relative to workspace).",
+                    "description": (
+                        "Path to the CSV file. Write operations require a workspace-relative "
+                        "path. Read operations can also target files under allowed read roots."
+                    ),
                 },
                 "headers": {
                     "type": "array",
@@ -104,7 +107,14 @@ class SpreadsheetTool(Tool):
             return ToolResult.fail("No path provided")
 
         try:
-            filepath = self._resolve_path(raw_path, ctx.workspace)
+            if operation in {"read", "summary"}:
+                filepath = self._resolve_read_path(
+                    raw_path,
+                    ctx.workspace,
+                    ctx.read_roots,
+                )
+            else:
+                filepath = self._resolve_path(raw_path, ctx.workspace)
         except Exception as e:
             return ToolResult.fail(str(e))
 
