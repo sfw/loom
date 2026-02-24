@@ -149,6 +149,7 @@ class CoworkSession:
         model: ModelProvider,
         tools: ToolRegistry,
         workspace: Path | None = None,
+        scratch_dir: Path | None = None,
         system_prompt: str = "",
         max_context_messages: int = 200,
         approver: ToolApprover | None = None,
@@ -158,10 +159,15 @@ class CoworkSession:
         max_context_tokens: int = 180_000,
         reflection: GapAnalysisEngine | None = None,
         model_retry_policy: ModelRetryPolicy | None = None,
+        enable_filetype_ingest_router: bool = True,
+        ingest_artifact_retention_max_age_days: int = 14,
+        ingest_artifact_retention_max_files_per_scope: int = 96,
+        ingest_artifact_retention_max_bytes_per_scope: int = 268_435_456,
     ):
         self._model = model
         self._tools = tools
         self._workspace = workspace
+        self._scratch_dir = scratch_dir
         self._max_context = max_context_messages
         self._max_context_tokens = max_context_tokens
         self._approver = approver
@@ -185,6 +191,19 @@ class CoworkSession:
         self._static_system_prompt = system_prompt
         self._compactor = SemanticCompactor(model=model)
         self._model_retry_policy = model_retry_policy or ModelRetryPolicy()
+        self._enable_filetype_ingest_router = bool(enable_filetype_ingest_router)
+        self._ingest_artifact_retention_max_age_days = max(
+            0,
+            int(ingest_artifact_retention_max_age_days),
+        )
+        self._ingest_artifact_retention_max_files_per_scope = max(
+            1,
+            int(ingest_artifact_retention_max_files_per_scope),
+        )
+        self._ingest_artifact_retention_max_bytes_per_scope = max(
+            1024,
+            int(ingest_artifact_retention_max_bytes_per_scope),
+        )
 
         # Learned behaviors section (injected into system prompt)
         self._behaviors_section = ""
@@ -303,8 +322,12 @@ class CoworkSession:
                             continue
 
                     start = time.monotonic()
+                    execute_args = self._prepare_tool_execute_arguments(tc.name, tc.arguments)
                     result = await self._tools.execute(
-                        tc.name, tc.arguments, workspace=self._workspace,
+                        tc.name,
+                        execute_args,
+                        workspace=self._workspace,
+                        scratch_dir=self._scratch_dir,
                     )
                     event.result = result
                     event.elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -432,8 +455,12 @@ class CoworkSession:
                             continue
 
                     start = time.monotonic()
+                    execute_args = self._prepare_tool_execute_arguments(tc.name, tc.arguments)
                     result = await self._tools.execute(
-                        tc.name, tc.arguments, workspace=self._workspace,
+                        tc.name,
+                        execute_args,
+                        workspace=self._workspace,
+                        scratch_dir=self._scratch_dir,
                     )
                     event.result = result
                     event.elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -546,6 +573,24 @@ class CoworkSession:
             selected.pop(0)
 
         return system + selected
+
+    def _prepare_tool_execute_arguments(self, tool_name: str, arguments: dict) -> dict:
+        """Inject runtime-only knobs used by selected tools."""
+        execute_args = dict(arguments or {})
+        if tool_name in {"web_fetch", "web_fetch_html"}:
+            execute_args["_enable_filetype_ingest_router"] = bool(
+                self._enable_filetype_ingest_router,
+            )
+            execute_args["_artifact_retention_max_age_days"] = int(
+                self._ingest_artifact_retention_max_age_days,
+            )
+            execute_args["_artifact_retention_max_files_per_scope"] = int(
+                self._ingest_artifact_retention_max_files_per_scope,
+            )
+            execute_args["_artifact_retention_max_bytes_per_scope"] = int(
+                self._ingest_artifact_retention_max_bytes_per_scope,
+            )
+        return execute_args
 
     def _maybe_trim(self) -> None:
         """Trim in-memory message cache if very large.

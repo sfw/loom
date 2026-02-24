@@ -176,6 +176,25 @@ class RunnerLimitsConfig:
     minimal_text_output_chars: int = 260
     tool_call_argument_context_chars: int = 500
     compact_tool_call_argument_chars: int = 220
+    runner_compaction_policy_mode: str = "tiered"  # "legacy" | "tiered" | "off"
+    enable_filetype_ingest_router: bool = True
+    enable_artifact_telemetry_events: bool = True
+    artifact_telemetry_max_metadata_chars: int = 1200
+    enable_model_overflow_fallback: bool = True
+    ingest_artifact_retention_max_age_days: int = 14
+    ingest_artifact_retention_max_files_per_scope: int = 96
+    ingest_artifact_retention_max_bytes_per_scope: int = 268_435_456
+    preserve_recent_critical_messages: int = 6
+    compaction_pressure_ratio_soft: float = 0.86
+    compaction_pressure_ratio_hard: float = 1.02
+    compaction_no_gain_min_delta_chars: int = 24
+    compaction_no_gain_attempt_limit: int = 2
+    compaction_timeout_guard_seconds: int = 30
+    extractor_timeout_guard_seconds: int = 20
+    extractor_tool_args_max_chars: int = 260
+    extractor_tool_trace_max_chars: int = 3600
+    extractor_prompt_max_chars: int = 9000
+    compaction_churn_warning_calls: int = 10
 
 
 @dataclass(frozen=True)
@@ -360,6 +379,22 @@ def _float_from(
     if maximum is not None:
         value = min(maximum, value)
     return value
+
+
+def _bool_from(source: dict, key: str, default: bool) -> bool:
+    """Parse a bool from dict with permissive string/int support."""
+    raw = source.get(key, default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(default)
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -551,6 +586,33 @@ def load_config(path: Path | None = None) -> Config:
     if not isinstance(compactor_limits_data, dict):
         compactor_limits_data = {}
 
+    runner_compaction_policy_mode = str(
+        runner_limits_data.get(
+            "runner_compaction_policy_mode",
+            RunnerLimitsConfig.runner_compaction_policy_mode,
+        ),
+    ).strip().lower()
+    if runner_compaction_policy_mode not in {"legacy", "tiered", "off"}:
+        runner_compaction_policy_mode = RunnerLimitsConfig.runner_compaction_policy_mode
+    compaction_pressure_ratio_soft = _float_from(
+        runner_limits_data,
+        "compaction_pressure_ratio_soft",
+        RunnerLimitsConfig.compaction_pressure_ratio_soft,
+        minimum=0.4,
+        maximum=2.5,
+    )
+    compaction_pressure_ratio_hard = _float_from(
+        runner_limits_data,
+        "compaction_pressure_ratio_hard",
+        RunnerLimitsConfig.compaction_pressure_ratio_hard,
+        minimum=0.41,
+        maximum=3.0,
+    )
+    compaction_pressure_ratio_hard = max(
+        compaction_pressure_ratio_soft + 0.01,
+        compaction_pressure_ratio_hard,
+    )
+
     runner_limits = RunnerLimitsConfig(
         max_tool_iterations=_int_from(
             runner_limits_data,
@@ -635,6 +697,115 @@ def load_config(path: Path | None = None) -> Config:
             RunnerLimitsConfig.compact_tool_call_argument_chars,
             minimum=40,
             maximum=10_000,
+        ),
+        runner_compaction_policy_mode=runner_compaction_policy_mode,
+        enable_filetype_ingest_router=_bool_from(
+            runner_limits_data,
+            "enable_filetype_ingest_router",
+            RunnerLimitsConfig.enable_filetype_ingest_router,
+        ),
+        enable_artifact_telemetry_events=_bool_from(
+            runner_limits_data,
+            "enable_artifact_telemetry_events",
+            RunnerLimitsConfig.enable_artifact_telemetry_events,
+        ),
+        artifact_telemetry_max_metadata_chars=_int_from(
+            runner_limits_data,
+            "artifact_telemetry_max_metadata_chars",
+            RunnerLimitsConfig.artifact_telemetry_max_metadata_chars,
+            minimum=120,
+            maximum=20_000,
+        ),
+        enable_model_overflow_fallback=_bool_from(
+            runner_limits_data,
+            "enable_model_overflow_fallback",
+            RunnerLimitsConfig.enable_model_overflow_fallback,
+        ),
+        ingest_artifact_retention_max_age_days=_int_from(
+            runner_limits_data,
+            "ingest_artifact_retention_max_age_days",
+            RunnerLimitsConfig.ingest_artifact_retention_max_age_days,
+            minimum=0,
+            maximum=3650,
+        ),
+        ingest_artifact_retention_max_files_per_scope=_int_from(
+            runner_limits_data,
+            "ingest_artifact_retention_max_files_per_scope",
+            RunnerLimitsConfig.ingest_artifact_retention_max_files_per_scope,
+            minimum=1,
+            maximum=200_000,
+        ),
+        ingest_artifact_retention_max_bytes_per_scope=_int_from(
+            runner_limits_data,
+            "ingest_artifact_retention_max_bytes_per_scope",
+            RunnerLimitsConfig.ingest_artifact_retention_max_bytes_per_scope,
+            minimum=1024,
+            maximum=20_000_000_000,
+        ),
+        preserve_recent_critical_messages=_int_from(
+            runner_limits_data,
+            "preserve_recent_critical_messages",
+            RunnerLimitsConfig.preserve_recent_critical_messages,
+            minimum=2,
+            maximum=30,
+        ),
+        compaction_pressure_ratio_soft=compaction_pressure_ratio_soft,
+        compaction_pressure_ratio_hard=compaction_pressure_ratio_hard,
+        compaction_no_gain_min_delta_chars=_int_from(
+            runner_limits_data,
+            "compaction_no_gain_min_delta_chars",
+            RunnerLimitsConfig.compaction_no_gain_min_delta_chars,
+            minimum=1,
+            maximum=5000,
+        ),
+        compaction_no_gain_attempt_limit=_int_from(
+            runner_limits_data,
+            "compaction_no_gain_attempt_limit",
+            RunnerLimitsConfig.compaction_no_gain_attempt_limit,
+            minimum=1,
+            maximum=25,
+        ),
+        compaction_timeout_guard_seconds=_int_from(
+            runner_limits_data,
+            "compaction_timeout_guard_seconds",
+            RunnerLimitsConfig.compaction_timeout_guard_seconds,
+            minimum=0,
+            maximum=3600,
+        ),
+        extractor_timeout_guard_seconds=_int_from(
+            runner_limits_data,
+            "extractor_timeout_guard_seconds",
+            RunnerLimitsConfig.extractor_timeout_guard_seconds,
+            minimum=0,
+            maximum=3600,
+        ),
+        extractor_tool_args_max_chars=_int_from(
+            runner_limits_data,
+            "extractor_tool_args_max_chars",
+            RunnerLimitsConfig.extractor_tool_args_max_chars,
+            minimum=80,
+            maximum=20_000,
+        ),
+        extractor_tool_trace_max_chars=_int_from(
+            runner_limits_data,
+            "extractor_tool_trace_max_chars",
+            RunnerLimitsConfig.extractor_tool_trace_max_chars,
+            minimum=200,
+            maximum=80_000,
+        ),
+        extractor_prompt_max_chars=_int_from(
+            runner_limits_data,
+            "extractor_prompt_max_chars",
+            RunnerLimitsConfig.extractor_prompt_max_chars,
+            minimum=400,
+            maximum=120_000,
+        ),
+        compaction_churn_warning_calls=_int_from(
+            runner_limits_data,
+            "compaction_churn_warning_calls",
+            RunnerLimitsConfig.compaction_churn_warning_calls,
+            minimum=1,
+            maximum=500,
         ),
     )
 

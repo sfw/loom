@@ -197,6 +197,9 @@ class TestRunSetup:
         assert 'provider = "ollama"' in content
         assert 'model = "qwen3:14b"' in content
         assert "delegate_task_timeout_seconds = 3600" in content
+        assert "ingest_artifact_retention_max_age_days = 14" in content
+        assert "ingest_artifact_retention_max_files_per_scope = 96" in content
+        assert "ingest_artifact_retention_max_bytes_per_scope = 268435456" in content
         assert (cfg_dir / "scratch").is_dir()
         assert (cfg_dir / "logs").is_dir()
         assert (cfg_dir / "processes").is_dir()

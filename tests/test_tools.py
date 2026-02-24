@@ -93,6 +93,7 @@ class TestRegistry:
         assert "analyze_code" in tools
         assert "web_fetch" in tools
         assert "web_fetch_html" in tools
+        assert "read_artifact" in tools
 
     def test_register_duplicate_raises(self):
         reg = ToolRegistry()
@@ -117,6 +118,7 @@ class TestRegistry:
             "DeleteFileTool", "MoveFileTool", "ShellExecuteTool",
             "GitCommandTool", "SearchFilesTool", "ListDirectoryTool",
             "AnalyzeCodeTool", "WebFetchTool", "WebFetchHtmlTool",
+            "ReadArtifactTool",
         }
         assert expected.issubset(names), f"Missing: {expected - names}"
 

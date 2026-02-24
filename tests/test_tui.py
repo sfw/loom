@@ -4185,16 +4185,18 @@ class TestProcessSlashCommands:
 
         assert restarted is True
         assert run.status == "queued"
-        assert run.tasks == []
-        assert run.task_labels == {}
+        assert run.tasks == [{"id": "old", "status": "pending", "content": "old"}]
+        assert run.task_labels == {"old": "old"}
         assert run.worker is not None
         assert captured["kwargs"]["name"] == "process-run-abc123"
         assert captured["kwargs"]["group"] == "process-run-abc123"
-        run.pane.set_tasks.assert_called_once_with([])
+        run.pane.set_tasks.assert_called_once_with(
+            [{"id": "old", "status": "pending", "content": "old"}]
+        )
         app._persist_process_run_ui_state.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_resume_process_run_starts_new_run_from_task_id(self):
+    async def test_resume_process_run_continues_in_place(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -4212,23 +4214,28 @@ class TestProcessSlashCommands:
             run_workspace=Path("/tmp/process-run"),
             is_adhoc=True,
             recommended_tools=["ripgrep_search"],
+            tasks=[
+                {"id": "phase-1", "status": "failed", "content": "Scope companies"},
+                {"id": "phase-2", "status": "completed", "content": "Analyze comps"},
+            ],
+            task_labels={
+                "phase-1": "Scope companies",
+                "phase-2": "Analyze comps",
+                "stale": "Ignore",
+            },
         )
         app._resolve_process_run_target = MagicMock(return_value=(run, None))
-        app._start_process_run = AsyncMock()
-        app.query_one = MagicMock(return_value=MagicMock())
+        app._restart_process_run_in_place = AsyncMock(return_value=True)
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
 
         resumed = await app._resume_process_run_from_target("abc123")
 
         assert resumed is True
-        app._start_process_run.assert_awaited_once_with(
-            "Analyze EPCOR",
-            process_defn=None,
-            process_name_override="market-research",
-            command_prefix="/run resume abc123",
-            is_adhoc=True,
-            recommended_tools=["ripgrep_search"],
-            resume_task_id="cowork-9",
-            run_workspace_override=Path("/tmp/process-run"),
+        chat.add_user_message.assert_called_once_with("/run resume abc123")
+        app._restart_process_run_in_place.assert_awaited_once_with(
+            "abc123",
+            mode="resume",
         )
 
     @pytest.mark.asyncio
@@ -6732,6 +6739,60 @@ class TestCommandPaletteProcessActions:
             await pilot.pause()
 
         assert called["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_action_close_process_tab_starts_nonexclusive_worker(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._close_process_run_from_target = AsyncMock(return_value=True)
+        captured: dict = {}
+
+        def _capture_worker(coro, **kwargs):
+            captured["coro"] = coro
+            captured["kwargs"] = kwargs
+            return MagicMock()
+
+        app.run_worker = MagicMock(side_effect=_capture_worker)
+
+        app.action_close_process_tab()
+
+        assert app.run_worker.call_count == 1
+        assert captured["kwargs"]["group"] == "close-process-tab"
+        assert captured["kwargs"]["exclusive"] is False
+        assert app._close_process_tab_inflight is True
+
+        await captured["coro"]
+        app._close_process_run_from_target.assert_awaited_once_with("current")
+        assert app._close_process_tab_inflight is False
+
+    def test_action_close_process_tab_ignores_reentry(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._close_process_run_from_target = AsyncMock(return_value=True)
+        first_coro: dict = {}
+
+        def _capture_worker(coro, **_kwargs):
+            first_coro["coro"] = coro
+            return MagicMock()
+
+        app.run_worker = MagicMock(side_effect=_capture_worker)
+
+        app.action_close_process_tab()
+        app.action_close_process_tab()
+
+        assert app.run_worker.call_count == 1
+        # Close pending coroutine to avoid unawaited coroutine warnings.
+        first_coro["coro"].close()
 
 
 class TestSlashHelp:

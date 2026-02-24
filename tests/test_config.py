@@ -62,6 +62,15 @@ class TestDefaultConfig:
         assert config.limits.adhoc_repair_source_max_chars == 0
         assert config.limits.evidence_context_text_max_chars == 4000
         assert config.limits.runner.default_tool_result_output_chars == 4000
+        assert config.limits.runner.runner_compaction_policy_mode == "tiered"
+        assert config.limits.runner.enable_filetype_ingest_router is True
+        assert config.limits.runner.enable_artifact_telemetry_events is True
+        assert config.limits.runner.artifact_telemetry_max_metadata_chars == 1200
+        assert config.limits.runner.enable_model_overflow_fallback is True
+        assert config.limits.runner.ingest_artifact_retention_max_age_days == 14
+        assert config.limits.runner.ingest_artifact_retention_max_files_per_scope == 96
+        assert config.limits.runner.ingest_artifact_retention_max_bytes_per_scope == 268_435_456
+        assert config.limits.runner.compaction_pressure_ratio_soft == 0.86
         assert config.limits.verifier.max_verifier_prompt_tokens == 12000
         assert config.limits.compactor.response_tokens_ratio == 0.75
         assert config.limits.compactor.json_headroom_chars_floor == 48
@@ -279,6 +288,25 @@ evidence_context_text_max_chars = 7200
 [limits.runner]
 max_model_context_tokens = 64000
 heavy_tool_result_output_chars = 3000
+runner_compaction_policy_mode = "tiered"
+enable_filetype_ingest_router = false
+enable_artifact_telemetry_events = true
+artifact_telemetry_max_metadata_chars = 1800
+enable_model_overflow_fallback = false
+ingest_artifact_retention_max_age_days = 30
+ingest_artifact_retention_max_files_per_scope = 240
+ingest_artifact_retention_max_bytes_per_scope = 104857600
+preserve_recent_critical_messages = 8
+compaction_pressure_ratio_soft = 0.9
+compaction_pressure_ratio_hard = 1.1
+compaction_no_gain_min_delta_chars = 32
+compaction_no_gain_attempt_limit = 4
+compaction_timeout_guard_seconds = 42
+extractor_timeout_guard_seconds = 27
+extractor_tool_args_max_chars = 420
+extractor_tool_trace_max_chars = 5100
+extractor_prompt_max_chars = 12000
+compaction_churn_warning_calls = 14
 
 [limits.verifier]
 max_verifier_prompt_tokens = 20000
@@ -301,6 +329,25 @@ target_chars_ratio = 0.6
         assert config.limits.evidence_context_text_max_chars == 7200
         assert config.limits.runner.max_model_context_tokens == 64000
         assert config.limits.runner.heavy_tool_result_output_chars == 3000
+        assert config.limits.runner.runner_compaction_policy_mode == "tiered"
+        assert config.limits.runner.enable_filetype_ingest_router is False
+        assert config.limits.runner.enable_artifact_telemetry_events is True
+        assert config.limits.runner.artifact_telemetry_max_metadata_chars == 1800
+        assert config.limits.runner.enable_model_overflow_fallback is False
+        assert config.limits.runner.ingest_artifact_retention_max_age_days == 30
+        assert config.limits.runner.ingest_artifact_retention_max_files_per_scope == 240
+        assert config.limits.runner.ingest_artifact_retention_max_bytes_per_scope == 104_857_600
+        assert config.limits.runner.preserve_recent_critical_messages == 8
+        assert config.limits.runner.compaction_pressure_ratio_soft == 0.9
+        assert config.limits.runner.compaction_pressure_ratio_hard == 1.1
+        assert config.limits.runner.compaction_no_gain_min_delta_chars == 32
+        assert config.limits.runner.compaction_no_gain_attempt_limit == 4
+        assert config.limits.runner.compaction_timeout_guard_seconds == 42
+        assert config.limits.runner.extractor_timeout_guard_seconds == 27
+        assert config.limits.runner.extractor_tool_args_max_chars == 420
+        assert config.limits.runner.extractor_tool_trace_max_chars == 5100
+        assert config.limits.runner.extractor_prompt_max_chars == 12000
+        assert config.limits.runner.compaction_churn_warning_calls == 14
         assert config.limits.verifier.max_verifier_prompt_tokens == 20000
         assert config.limits.verifier.max_tool_output_excerpt_chars == 1800
         assert config.limits.compactor.response_tokens_floor == 512
@@ -312,3 +359,30 @@ target_chars_ratio = 0.6
         assert config.limits.compactor.chars_per_token_estimate == 4.2
         assert config.limits.compactor.token_headroom == 16
         assert config.limits.compactor.target_chars_ratio == 0.6
+
+    def test_load_runner_compaction_policy_mode_off(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[limits.runner]
+runner_compaction_policy_mode = "off"
+""")
+        config = load_config(toml_file)
+        assert config.limits.runner.runner_compaction_policy_mode == "off"
+
+    def test_invalid_runner_compaction_policy_mode_falls_back(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[limits.runner]
+runner_compaction_policy_mode = "invalid-mode"
+""")
+        config = load_config(toml_file)
+        assert config.limits.runner.runner_compaction_policy_mode == "tiered"
+
+    def test_can_disable_artifact_telemetry_events(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[limits.runner]
+enable_artifact_telemetry_events = false
+""")
+        config = load_config(toml_file)
+        assert config.limits.runner.enable_artifact_telemetry_events is False

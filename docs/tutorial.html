@@ -634,6 +634,16 @@
 <span class="key">max_loop_iterations</span> = <span class="val">50</span>
 <span class="key">delegate_task_timeout_seconds</span> = <span class="val">3600</span>
 
+<span class="cmt"># Runner ingest + overflow fallback controls</span>
+<span class="key">[limits.runner]</span>
+<span class="key">enable_filetype_ingest_router</span> = <span class="val">true</span>
+<span class="key">enable_artifact_telemetry_events</span> = <span class="val">true</span>
+<span class="key">artifact_telemetry_max_metadata_chars</span> = <span class="val">1200</span>
+<span class="key">enable_model_overflow_fallback</span> = <span class="val">true</span>
+<span class="key">ingest_artifact_retention_max_age_days</span> = <span class="val">14</span>
+<span class="key">ingest_artifact_retention_max_files_per_scope</span> = <span class="val">96</span>
+<span class="key">ingest_artifact_retention_max_bytes_per_scope</span> = <span class="val">268435456</span>
+
 <span class="cmt"># Verification gates</span>
 <span class="key">[verification]</span>
 <span class="key">tier1_enabled</span> = <span class="val">true</span>   <span class="cmt"># Deterministic checks (free, instant)</span>
