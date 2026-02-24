@@ -180,7 +180,7 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     ),
 )
 _MAX_SLASH_HINT_LINES = 24
-_WORKSPACE_REFRESH_TOOLS = {"document_write", "document_create"}
+_WORKSPACE_REFRESH_TOOLS = {"document_write", "document_create", "humanize_writing"}
 _PROCESS_STATUS_ICON = {
     "queued": "\u25cb",
     "running": "\u25c9",
