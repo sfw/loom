@@ -1739,3 +1739,54 @@ tools:
         defn = self._load_yaml_str(tmp_path, yaml_content)
         assert defn.tools.required == []
         assert defn.tools.excluded == ["shell_execute"]
+
+
+class TestRemediationCriticalPathBehavior:
+    def test_process_definition_normalizes_critical_path_behavior(self):
+        defn = ProcessDefinition(name="x")
+        assert defn.remediation_critical_path_behavior() == "block"
+        defn.verification_remediation.critical_path_behavior = "queue_follow_up"
+        assert defn.remediation_critical_path_behavior() == "queue_follow_up"
+
+    def test_loader_rejects_invalid_critical_path_behavior(self, tmp_path):
+        yaml_content = """\
+name: invalid-critical-path
+schema_version: 2
+version: '1.0'
+description: test
+persona: test
+verification:
+  policy:
+    mode: llm_first
+    output_contract:
+      required_fields: [passed, metadata]
+      metadata_fields: []
+  remediation:
+    critical_path_behavior: invalid-mode
+"""
+        path = tmp_path / "invalid.yaml"
+        path.write_text(yaml_content)
+        loader = ProcessLoader()
+        with pytest.raises(ProcessValidationError) as exc_info:
+            loader.load(str(path))
+        assert any(
+            "critical_path_behavior must be one of" in err
+            for err in exc_info.value.errors
+        )
+
+    def test_marketing_strategy_includes_missing_placeholder_and_metadata_fields(self):
+        loader = ProcessLoader()
+        defn = loader.load("marketing-strategy")
+        no_placeholders = next(
+            (rule for rule in defn.verification_rules if rule.name == "no-placeholders"),
+            None,
+        )
+        assert no_placeholders is not None
+        assert "\\[MISSING\\]" in str(no_placeholders.check)
+        metadata_fields = defn.verifier_metadata_fields()
+        assert "remediation_required" in metadata_fields
+        assert "remediation_mode" in metadata_fields
+        assert "missing_targets" in metadata_fields
+        assert "unverified_claim_count" in metadata_fields
+        assert "verified_claim_count" in metadata_fields
+        assert "supporting_ratio" in metadata_fields

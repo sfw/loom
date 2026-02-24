@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from loom.recovery.retry import AttemptRecord, RetryManager, RetryStrategy
 
 
@@ -154,6 +156,34 @@ class TestRetryManager:
             verification={"reason_code": "recommendation_unconfirmed"},
         )
         assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    @pytest.mark.parametrize("reason_code", [
+        "incomplete_deliverable_placeholder",
+        "incomplete_deliverable_content",
+        "unsupported_claims_and_incomplete_evidence",
+        "insufficient_evidence",
+        "recommendation_unconfirmed",
+    ])
+    def test_classify_failure_routes_semantic_reason_codes_to_unconfirmed_data(
+        self,
+        reason_code: str,
+    ):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="verification failed",
+            execution_error="",
+            verification={"reason_code": reason_code},
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    def test_classify_failure_keeps_hard_invariant_on_strict_path(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="hard invariant failed",
+            execution_error="",
+            verification={"reason_code": "hard_invariant_failed"},
+        )
+        assert strategy == RetryStrategy.GENERIC
         assert markets == []
 
     def test_classify_failure_prefers_structured_remediation_mode(self):

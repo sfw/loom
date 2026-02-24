@@ -34,6 +34,7 @@ from loom.events.types import (
     REMEDIATION_QUEUED,
     REMEDIATION_RESOLVED,
     REMEDIATION_STARTED,
+    REMEDIATION_TERMINAL,
     SUBTASK_COMPLETED,
     SUBTASK_FAILED,
     SUBTASK_OUTCOME_STALE,
@@ -48,6 +49,7 @@ from loom.events.types import (
     TASK_REPLAN_REJECTED,
     TASK_REPLANNING,
     TELEMETRY_RUN_SUMMARY,
+    UNCONFIRMED_DATA_QUEUED,
 )
 from loom.learning.manager import LearningManager
 from loom.models.base import ModelResponse
@@ -78,6 +80,11 @@ from loom.tools.workspace import ChangeLog
 logger = logging.getLogger(__name__)
 
 _REMEDIATION_TERMINAL_STATES = frozenset({"resolved", "failed", "expired"})
+_VALID_CRITICAL_PATH_BEHAVIORS = frozenset({
+    "block",
+    "confirm_or_prune_then_queue",
+    "queue_follow_up",
+})
 
 # Re-export dataclasses that existing code imports from here
 __all__ = [
@@ -518,7 +525,16 @@ class Orchestrator:
                     if part
                 )
 
-        if strategy == RetryStrategy.UNCONFIRMED_DATA and not subtask.is_critical_path:
+        critical_path_behavior = self._critical_path_behavior()
+        hard_invariant_failure = self._is_hard_invariant_failure(verification)
+        if (
+            strategy == RetryStrategy.UNCONFIRMED_DATA
+            and not hard_invariant_failure
+            and (
+                not subtask.is_critical_path
+                or critical_path_behavior == "queue_follow_up"
+            )
+        ):
             await self._queue_remediation_work_item(
                 task=task,
                 subtask=subtask,
@@ -526,20 +542,21 @@ class Orchestrator:
                 strategy=strategy,
                 blocking=False,
             )
-            verification.passed = True
-            if verification.outcome == "fail":
-                verification.outcome = (
-                    "partial_verified"
-                    if self._config.verification.allow_partial_verified
-                    else "pass_with_warnings"
+            if subtask.is_critical_path:
+                note = (
+                    "Remediation queued for follow-up "
+                    "(critical path policy: queue_follow_up)."
                 )
-            if not verification.reason_code:
-                verification.reason_code = "unconfirmed_noncritical"
-            note = "Remediation queued for follow-up (non-critical path)."
-            verification.feedback = (
-                f"{verification.feedback}\n{note}" if verification.feedback else note
+                default_reason = "unconfirmed_critical_queue_follow_up"
+            else:
+                note = "Remediation queued for follow-up (non-critical path)."
+                default_reason = "unconfirmed_noncritical"
+            self._apply_unconfirmed_follow_up_success(
+                result=result,
+                verification=verification,
+                note=note,
+                default_reason_code=default_reason,
             )
-            result.status = SubtaskResultStatus.SUCCESS
             await self._handle_success(task, subtask, result, verification)
             return None
 
@@ -586,21 +603,57 @@ class Orchestrator:
             # All retries exhausted.
             # Critical-path failures abort the remaining plan.
             if subtask.is_critical_path:
-                if strategy == RetryStrategy.UNCONFIRMED_DATA:
-                    remediation_recovered, _ = await self._run_confirm_or_prune_remediation(
-                        task=task,
-                        subtask=subtask,
-                        attempts=attempt_list,
-                    )
-                    if remediation_recovered:
+                if (
+                    strategy == RetryStrategy.UNCONFIRMED_DATA
+                    and not hard_invariant_failure
+                ):
+                    if critical_path_behavior == "confirm_or_prune_then_queue":
+                        remediation_recovered, _ = (
+                            await self._run_confirm_or_prune_remediation(
+                                task=task,
+                                subtask=subtask,
+                                attempts=attempt_list,
+                            )
+                        )
+                        if remediation_recovered:
+                            return None
+                        await self._queue_remediation_work_item(
+                            task=task,
+                            subtask=subtask,
+                            verification=verification,
+                            strategy=strategy,
+                            blocking=True,
+                        )
+                        self._apply_unconfirmed_follow_up_success(
+                            result=result,
+                            verification=verification,
+                            note=(
+                                "Critical-path remediation queued as blocking "
+                                "follow-up (policy: confirm_or_prune_then_queue)."
+                            ),
+                            default_reason_code="unconfirmed_critical_path",
+                        )
+                        await self._handle_success(task, subtask, result, verification)
                         return None
-                    await self._queue_remediation_work_item(
-                        task=task,
-                        subtask=subtask,
-                        verification=verification,
-                        strategy=strategy,
-                        blocking=True,
-                    )
+                    if critical_path_behavior == "queue_follow_up":
+                        await self._queue_remediation_work_item(
+                            task=task,
+                            subtask=subtask,
+                            verification=verification,
+                            strategy=strategy,
+                            blocking=False,
+                        )
+                        self._apply_unconfirmed_follow_up_success(
+                            result=result,
+                            verification=verification,
+                            note=(
+                                "Critical-path remediation queued as follow-up "
+                                "(policy: queue_follow_up)."
+                            ),
+                            default_reason_code="unconfirmed_critical_path",
+                        )
+                        await self._handle_success(task, subtask, result, verification)
+                        return None
                 await self._abort_on_critical_path_failure(
                     task, subtask, verification,
                 )
@@ -646,6 +699,233 @@ class Orchestrator:
             )
             self._state.save(task)
 
+    def _critical_path_behavior(self) -> str:
+        process = self._process
+        if process is None:
+            return "block"
+        getter = getattr(process, "remediation_critical_path_behavior", None)
+        if callable(getter):
+            value = str(getter() or "").strip().lower()
+        else:
+            remediation = getattr(process, "verification_remediation", None)
+            value = str(
+                getattr(remediation, "critical_path_behavior", "") or "",
+            ).strip().lower()
+        if value in _VALID_CRITICAL_PATH_BEHAVIORS:
+            return value
+        return "block"
+
+    @staticmethod
+    def _is_hard_invariant_failure(verification: VerificationResult | None) -> bool:
+        if verification is None:
+            return False
+        reason_code = str(verification.reason_code or "").strip().lower()
+        severity = str(verification.severity_class or "").strip().lower()
+        return (
+            reason_code == "hard_invariant_failed"
+            or severity == "hard_invariant"
+        )
+
+    @staticmethod
+    def _normalize_missing_targets(raw: object) -> list[str]:
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return []
+            if "," in text:
+                candidates = [item.strip() for item in text.split(",")]
+            else:
+                candidates = [text]
+            return [item for item in candidates if item]
+        if isinstance(raw, list):
+            deduped: list[str] = []
+            for item in raw:
+                text = str(item or "").strip()
+                if text and text not in deduped:
+                    deduped.append(text)
+            return deduped
+        return []
+
+    @staticmethod
+    def _to_int_or_none(value: object) -> int | None:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value)
+            return None
+        if isinstance(value, str):
+            text = value.strip().replace(",", "")
+            if not text:
+                return None
+            try:
+                return int(float(text))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _to_ratio_or_none(value: object) -> float | None:
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                numeric = float(text.rstrip("%"))
+            except ValueError:
+                return None
+            if text.endswith("%"):
+                numeric /= 100.0
+        else:
+            return None
+        if numeric > 1.0 and numeric <= 100.0:
+            numeric /= 100.0
+        return max(0.0, min(1.0, numeric))
+
+    @staticmethod
+    def _to_float_or_none(value: object) -> float | None:
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _extract_unconfirmed_metadata(
+        cls,
+        verification: VerificationResult,
+    ) -> dict[str, object]:
+        metadata = verification.metadata if isinstance(verification.metadata, dict) else {}
+        extracted: dict[str, object] = {}
+
+        remediation_required = metadata.get("remediation_required", False)
+        if isinstance(remediation_required, bool):
+            extracted["remediation_required"] = remediation_required
+        else:
+            text = str(remediation_required or "").strip().lower()
+            extracted["remediation_required"] = text in {"1", "true", "yes", "on"}
+
+        remediation_mode = str(metadata.get("remediation_mode", "") or "").strip().lower()
+        if remediation_mode:
+            extracted["remediation_mode"] = remediation_mode
+
+        missing_targets = cls._normalize_missing_targets(metadata.get("missing_targets"))
+        if missing_targets:
+            extracted["missing_targets"] = missing_targets
+
+        unverified_claim_count = cls._to_int_or_none(
+            metadata.get("unverified_claim_count"),
+        )
+        if unverified_claim_count is not None:
+            extracted["unverified_claim_count"] = max(0, unverified_claim_count)
+
+        verified_claim_count = cls._to_int_or_none(
+            metadata.get("verified_claim_count"),
+        )
+        if verified_claim_count is not None:
+            extracted["verified_claim_count"] = max(0, verified_claim_count)
+
+        supporting_ratio = cls._to_ratio_or_none(metadata.get("supporting_ratio"))
+        if supporting_ratio is not None:
+            extracted["supporting_ratio"] = supporting_ratio
+
+        return extracted
+
+    def _remediation_queue_limits(self) -> tuple[int, float, float]:
+        max_attempts = int(
+            getattr(self._config.verification, "remediation_queue_max_attempts", 3) or 3,
+        )
+        process = self._process
+        if process is not None:
+            retry_budget = getattr(
+                getattr(process, "verification_remediation", None),
+                "retry_budget",
+                {},
+            )
+            if isinstance(retry_budget, dict):
+                raw_max_attempts = self._to_int_or_none(retry_budget.get("max_attempts"))
+                if raw_max_attempts is not None and raw_max_attempts > 0:
+                    max_attempts = raw_max_attempts
+        if max_attempts <= 0:
+            max_attempts = int(
+                getattr(self._config.verification, "confirm_or_prune_max_attempts", 2) or 2,
+            )
+        max_attempts = max(1, max_attempts)
+
+        base_backoff = float(
+            getattr(self._config.verification, "remediation_queue_backoff_seconds", 2.0) or 0.0,
+        )
+        if base_backoff < 0:
+            base_backoff = 0.0
+
+        max_backoff = float(
+            getattr(
+                self._config.verification,
+                "remediation_queue_max_backoff_seconds",
+                30.0,
+            ) or 0.0,
+        )
+        if max_backoff <= 0:
+            max_backoff = max(base_backoff, 0.0)
+        if max_backoff < base_backoff:
+            max_backoff = base_backoff
+        return max_attempts, base_backoff, max_backoff
+
+    @staticmethod
+    def _bounded_remediation_backoff_seconds(
+        *,
+        base_backoff_seconds: float,
+        max_backoff_seconds: float,
+        attempt_count: int,
+    ) -> float:
+        base = max(0.0, float(base_backoff_seconds or 0.0))
+        if base <= 0:
+            return 0.0
+        ceiling = max(base, float(max_backoff_seconds or 0.0))
+        exponent = max(0, int(attempt_count) - 1)
+        computed = base * (2**exponent)
+        return min(ceiling, computed)
+
+    def _apply_unconfirmed_follow_up_success(
+        self,
+        *,
+        result: SubtaskResult,
+        verification: VerificationResult,
+        note: str,
+        default_reason_code: str,
+    ) -> None:
+        verification.passed = True
+        if verification.outcome == "fail":
+            verification.outcome = (
+                "partial_verified"
+                if self._config.verification.allow_partial_verified
+                else "pass_with_warnings"
+            )
+        elif verification.outcome == "pass":
+            verification.outcome = "pass_with_warnings"
+        if not verification.reason_code:
+            verification.reason_code = default_reason_code
+        if verification.severity_class == "hard_invariant":
+            verification.severity_class = "semantic"
+        verification.feedback = (
+            f"{verification.feedback}\n{note}" if verification.feedback else note
+        )
+        result.status = SubtaskResultStatus.SUCCESS
+
     async def _queue_remediation_work_item(
         self,
         *,
@@ -659,6 +939,13 @@ class Orchestrator:
         reason_code = str(verification.reason_code or "").strip().lower()
         strategy_value = strategy.value
         now = datetime.now()
+        max_attempts, base_backoff_seconds, max_backoff_seconds = (
+            self._remediation_queue_limits()
+        )
+        uncertainty = self._extract_unconfirmed_metadata(verification)
+        missing_targets = self._normalize_missing_targets(
+            uncertainty.get("missing_targets"),
+        )
 
         for item in queue:
             if not isinstance(item, dict):
@@ -675,9 +962,68 @@ class Orchestrator:
 
             if blocking and not bool(item.get("blocking", False)):
                 item["blocking"] = True
+            existing_targets = self._normalize_missing_targets(
+                item.get("missing_targets"),
+            )
+            merged_targets = existing_targets + [
+                target for target in missing_targets
+                if target not in existing_targets
+            ]
+            if merged_targets:
+                item["missing_targets"] = merged_targets
+            for key, value in uncertainty.items():
+                if key == "missing_targets":
+                    continue
+                item[key] = value
+            item["feedback"] = verification.feedback or str(item.get("feedback", ""))
+            item["verification_outcome"] = verification.outcome
+            existing_max_attempts = self._to_int_or_none(item.get("max_attempts"))
+            if existing_max_attempts is None:
+                existing_max_attempts = max_attempts
+            existing_base_backoff = self._to_float_or_none(
+                item.get("base_backoff_seconds"),
+            )
+            if existing_base_backoff is None:
+                try:
+                    existing_base_backoff = float(
+                        item.get("base_backoff_seconds", base_backoff_seconds) or 0.0,
+                    )
+                except (TypeError, ValueError):
+                    existing_base_backoff = base_backoff_seconds
+            existing_max_backoff = self._to_float_or_none(
+                item.get("max_backoff_seconds"),
+            )
+            if existing_max_backoff is None:
+                try:
+                    existing_max_backoff = float(
+                        item.get("max_backoff_seconds", max_backoff_seconds) or 0.0,
+                    )
+                except (TypeError, ValueError):
+                    existing_max_backoff = max_backoff_seconds
+            item["max_attempts"] = max(
+                existing_max_attempts,
+                max_attempts,
+            )
+            item["base_backoff_seconds"] = max(
+                max(0.0, float(existing_base_backoff or 0.0)),
+                base_backoff_seconds,
+            )
+            item["max_backoff_seconds"] = max(
+                max(0.0, float(existing_max_backoff or 0.0)),
+                max_backoff_seconds,
+            )
             item["updated_at"] = now.isoformat()
             async with self._state_lock:
                 self._state.save(task)
+            self._emit(UNCONFIRMED_DATA_QUEUED, task.id, {
+                "remediation_id": str(item.get("id", "")).strip(),
+                "subtask_id": subtask.id,
+                "strategy": strategy_value,
+                "reason_code": reason_code,
+                "blocking": bool(item.get("blocking", False)),
+                "critical_path": bool(subtask.is_critical_path),
+                "deduped": True,
+            })
             return
 
         item = {
@@ -692,11 +1038,22 @@ class Orchestrator:
             "state": "queued",
             "attempt_count": 0,
             "last_error": "",
+            "terminal_reason": "",
+            "critical_path": bool(subtask.is_critical_path),
+            "max_attempts": max_attempts,
+            "base_backoff_seconds": base_backoff_seconds,
+            "max_backoff_seconds": max_backoff_seconds,
+            "missing_targets": missing_targets,
             "created_at": now.isoformat(),
             "updated_at": now.isoformat(),
             "next_attempt_at": now.isoformat(),
             "ttl_at": (now + timedelta(hours=6)).isoformat(),
         }
+        item.update({
+            key: value
+            for key, value in uncertainty.items()
+            if key != "missing_targets"
+        })
         queue.append(item)
         async with self._state_lock:
             task.add_decision(
@@ -710,6 +1067,16 @@ class Orchestrator:
             "strategy": strategy_value,
             "reason_code": reason_code,
             "blocking": bool(blocking),
+        })
+        self._emit(UNCONFIRMED_DATA_QUEUED, task.id, {
+            "remediation_id": item["id"],
+            "subtask_id": subtask.id,
+            "strategy": strategy_value,
+            "reason_code": reason_code,
+            "blocking": bool(blocking),
+            "critical_path": bool(subtask.is_critical_path),
+            "deduped": False,
+            "missing_targets": list(missing_targets),
         })
 
     def _build_remediation_retry_context(self, *, strategy: RetryStrategy) -> str:
@@ -1014,25 +1381,8 @@ class Orchestrator:
         if not isinstance(queue, list) or not queue:
             return
 
-        max_attempts = max(
-            1,
-            int(
-                getattr(
-                    self._config.verification,
-                    "confirm_or_prune_max_attempts",
-                    2,
-                ) or 2
-            ),
-        )
-        backoff_seconds = max(
-            0.0,
-            float(
-                getattr(
-                    self._config.verification,
-                    "confirm_or_prune_backoff_seconds",
-                    2.0,
-                ) or 0.0
-            ),
+        default_max_attempts, default_base_backoff, default_max_backoff = (
+            self._remediation_queue_limits()
         )
         changed = False
         now = datetime.now()
@@ -1055,11 +1405,19 @@ class Orchestrator:
                     str(item.get("last_error", "")).strip()
                     or "remediation ttl exceeded"
                 )
+                item["terminal_reason"] = "ttl_expired"
                 changed = True
                 self._emit(REMEDIATION_EXPIRED, task.id, {
                     "remediation_id": remediation_id,
                     "subtask_id": subtask_id,
                     "strategy": str(item.get("strategy", "")),
+                })
+                self._emit(REMEDIATION_TERMINAL, task.id, {
+                    "remediation_id": remediation_id,
+                    "subtask_id": subtask_id,
+                    "strategy": str(item.get("strategy", "")),
+                    "state": "expired",
+                    "reason": "ttl_expired",
                 })
                 continue
 
@@ -1085,11 +1443,19 @@ class Orchestrator:
                 item["state"] = "resolved"
                 item["updated_at"] = datetime.now().isoformat()
                 item["last_error"] = ""
+                item["terminal_reason"] = "resolved"
                 changed = True
                 self._emit(REMEDIATION_RESOLVED, task.id, {
                     "remediation_id": remediation_id,
                     "subtask_id": subtask_id,
                     "strategy": str(item.get("strategy", "")),
+                })
+                self._emit(REMEDIATION_TERMINAL, task.id, {
+                    "remediation_id": remediation_id,
+                    "subtask_id": subtask_id,
+                    "strategy": str(item.get("strategy", "")),
+                    "state": "resolved",
+                    "reason": "resolved",
                 })
                 continue
 
@@ -1097,9 +1463,34 @@ class Orchestrator:
             item["attempt_count"] = attempt_count
             item["last_error"] = str(error or "").strip()
             item["updated_at"] = datetime.now().isoformat()
+            parsed_max_attempts = self._to_int_or_none(item.get("max_attempts"))
+            if parsed_max_attempts is None:
+                parsed_max_attempts = default_max_attempts
+            max_attempts = max(1, parsed_max_attempts)
+
+            parsed_base_backoff = self._to_float_or_none(
+                item.get("base_backoff_seconds"),
+            )
+            if parsed_base_backoff is None:
+                parsed_base_backoff = default_base_backoff
+            base_backoff_seconds = max(0.0, parsed_base_backoff)
+
+            parsed_max_backoff = self._to_float_or_none(
+                item.get("max_backoff_seconds"),
+            )
+            if parsed_max_backoff is None:
+                parsed_max_backoff = default_max_backoff
+            max_backoff_seconds = max(
+                base_backoff_seconds,
+                parsed_max_backoff,
+            )
             exhausted = attempt_count >= max_attempts
             if exhausted or (finalizing and bool(item.get("blocking", False))):
                 item["state"] = "failed"
+                item["terminal_reason"] = (
+                    "max_attempts_exhausted"
+                    if exhausted else "blocking_unresolved_at_finalization"
+                )
                 self._emit(REMEDIATION_FAILED, task.id, {
                     "remediation_id": remediation_id,
                     "subtask_id": subtask_id,
@@ -1107,10 +1498,23 @@ class Orchestrator:
                     "attempt_count": attempt_count,
                     "error": item["last_error"],
                 })
+                self._emit(REMEDIATION_TERMINAL, task.id, {
+                    "remediation_id": remediation_id,
+                    "subtask_id": subtask_id,
+                    "strategy": str(item.get("strategy", "")),
+                    "state": "failed",
+                    "reason": str(item.get("terminal_reason", "")),
+                    "attempt_count": attempt_count,
+                })
             else:
                 item["state"] = "queued"
+                delay_seconds = self._bounded_remediation_backoff_seconds(
+                    base_backoff_seconds=base_backoff_seconds,
+                    max_backoff_seconds=max_backoff_seconds,
+                    attempt_count=attempt_count,
+                )
                 item["next_attempt_at"] = (
-                    datetime.now() + timedelta(seconds=backoff_seconds)
+                    datetime.now() + timedelta(seconds=delay_seconds)
                 ).isoformat()
             changed = True
 
@@ -1129,6 +1533,7 @@ class Orchestrator:
                     str(item.get("last_error", "")).strip()
                     or "blocking remediation unresolved at task finalization"
                 )
+                item["terminal_reason"] = "blocking_unresolved_at_finalization"
                 changed = True
                 self._emit(REMEDIATION_FAILED, task.id, {
                     "remediation_id": str(item.get("id", "")).strip(),
@@ -1136,6 +1541,14 @@ class Orchestrator:
                     "strategy": str(item.get("strategy", "")),
                     "attempt_count": int(item.get("attempt_count", 0) or 0),
                     "error": item["last_error"],
+                })
+                self._emit(REMEDIATION_TERMINAL, task.id, {
+                    "remediation_id": str(item.get("id", "")).strip(),
+                    "subtask_id": str(item.get("subtask_id", "")).strip(),
+                    "strategy": str(item.get("strategy", "")),
+                    "state": "failed",
+                    "reason": "blocking_unresolved_at_finalization",
+                    "attempt_count": int(item.get("attempt_count", 0) or 0),
                 })
 
         if changed:
@@ -2112,8 +2525,16 @@ class Orchestrator:
                     continue
                 state = str(item.get("state", "queued")).strip().lower()
                 if state != "resolved":
+                    subtask_id = str(item.get("subtask_id", "")).strip()
+                    terminal_reason = str(item.get("terminal_reason", "")).strip()
+                    last_error = str(item.get("last_error", "")).strip()
+                    label = subtask_id or str(item.get("id", "")).strip() or "unknown"
+                    if terminal_reason:
+                        label = f"{label} ({terminal_reason})"
+                    elif last_error:
+                        label = f"{label} ({last_error})"
                     blocking_remediation_failures.append(
-                        str(item.get("subtask_id", "")).strip(),
+                        label,
                     )
 
         all_done = (

@@ -335,6 +335,14 @@ class ProcessDefinition:
                 return default.strip()
         return ""
 
+    def remediation_critical_path_behavior(self) -> str:
+        raw = str(
+            self.verification_remediation.critical_path_behavior or "",
+        ).strip().lower()
+        if raw in {"block", "confirm_or_prune_then_queue", "queue_follow_up"}:
+            return raw
+        return "block"
+
     def regex_rules(self) -> list[VerificationRule]:
         """Return only regex-type verification rules."""
         return [r for r in self.verification_rules if r.type == "regex"]
@@ -688,7 +696,7 @@ class ProcessLoader:
             default_strategy=str(remediation_raw.get("default_strategy", "") or "").strip(),
             critical_path_behavior=str(
                 remediation_raw.get("critical_path_behavior", "") or "",
-            ).strip(),
+            ).strip().lower(),
             retry_budget=retry_budget,
             transient_retry_policy=transient_retry_policy,
         )
@@ -957,6 +965,19 @@ class ProcessLoader:
             if evidence_facets and not isinstance(evidence_facets, list):
                 errors.append(
                     "evidence.record_schema.facets must be a list when provided",
+                )
+
+            critical_path_behavior = str(
+                defn.verification_remediation.critical_path_behavior or "",
+            ).strip().lower()
+            if critical_path_behavior and critical_path_behavior not in {
+                "block",
+                "confirm_or_prune_then_queue",
+                "queue_follow_up",
+            }:
+                errors.append(
+                    "verification.remediation.critical_path_behavior must be one of "
+                    "{'block', 'confirm_or_prune_then_queue', 'queue_follow_up'}",
                 )
 
         # Phase validation

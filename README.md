@@ -52,7 +52,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Full undo.** Every file write is preceded by a snapshot. You can revert any individual change, all changes from a subtask, or the entire task. The changelog tracks creates, modifies, deletes, and renames with before-state snapshots.
 
-**Dozens of built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch (bounded streaming + truncation for large pages), web search (DuckDuckGo, no API key), code analysis (tree-sitter when installed, regex fallback), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, ask_user for mid-execution questions, and dedicated research helpers (academic search, citation and archive tooling, timeline/inflation utilities). All tools auto-discovered via `__init_subclass__`.
+**Dozens of built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch (bounded streaming + truncation for large pages), web search (DuckDuckGo, no API key), code analysis (tree-sitter when installed, regex fallback), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, ask_user for mid-execution questions, and dedicated research helpers (academic/archives/citations/fact-checking/timeline/inflation plus keyless economic data, historical currency normalization, primary-source OCR, correspondence analysis, and social network mapping). All tools auto-discovered via `__init_subclass__`.
 
 **Inline diffs.** Every file edit produces a unified diff in the tool result. Diffs render with Rich markup syntax highlighting in the TUI -- green additions, red removals. You always see exactly what changed.
 
@@ -99,7 +99,7 @@ You can also create the config manually. Loom reads `loom.toml` from the current
 provider = "ollama"                    # or "openai_compatible" or "anthropic"
 base_url = "http://localhost:11434"
 model = "kimi-k2.5"
-max_tokens = 4096
+max_tokens = 8192
 temperature = 0.1
 roles = ["planner", "verifier"]
 
@@ -109,7 +109,7 @@ base_url = "http://localhost:11434"
 model = "minimax-m2.1"
 max_tokens = 2048
 temperature = 0.0
-roles = ["extractor", "executor"]
+roles = ["extractor", "executor", "compactor"]
 
 [execution]
 max_subtask_retries = 3
@@ -127,7 +127,7 @@ ingest_artifact_retention_max_files_per_scope = 96
 ingest_artifact_retention_max_bytes_per_scope = 268435456
 ```
 
-Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (planner, executor, verifier, extractor). A common split is stronger model for planning + verification and cheaper model for extraction + execution.
+Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (`planner`, `executor`, `extractor`, `verifier`, `compactor`). A common split is stronger model for planning + verification and cheaper model for extraction + execution + compaction.
 Manage external MCP servers in `~/.loom/mcp.toml` (or workspace `./.loom/mcp.toml`):
 
 ```toml
@@ -198,7 +198,7 @@ In the TUI, use `/learned` to open an interactive review screen for learned beha
 
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal|close [run-id-prefix]>`), dynamic direct process commands (`/<process-name> <goal>`), learned pattern review (`/learned`), MCP config controls (`/mcp list`, `/mcp show`, `/mcp test`, `/mcp enable`, `/mcp disable`, `/mcp remove`), and click-to-open workspace file previews (Markdown, code/text with syntax highlighting including TypeScript/CSS, JSON, CSV/TSV, HTML, diff/patch, Office docs, PDF text, and image metadata). `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `loom serve`.
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal|close [run-id-prefix]>`), dynamic direct process commands (`/<process-name> <goal>`), learned pattern review (`/learned`), MCP config controls (`/mcp list`, `/mcp show`, `/mcp test`, `/mcp enable`, `/mcp disable`, `/mcp remove`), auth profile controls (`/auth list`, `/auth show`, `/auth use`, `/auth add`, `/auth edit`, `/auth remove`, `/auth manage`), and click-to-open workspace file previews (Markdown, code/text with syntax highlighting including TypeScript/CSS, JSON, CSV/TSV, HTML, diff/patch, Office docs, PDF text, and image metadata). `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `loom serve`.
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
@@ -213,6 +213,7 @@ loom serve              Start the API server
 loom status ID          Check task status
 loom cancel ID          Cancel a running task
 loom models             List configured models
+loom auth ...           Manage auth profiles/default selectors
 loom processes          List available process definitions
 loom install SOURCE     Install a process package
 loom uninstall NAME     Remove a process package
@@ -231,13 +232,13 @@ Common flags for `loom` / `loom cowork`:
 - `--process <name>` -- load a process definition
 
 Role routing note:
-- Orchestrator and verifier paths route by role (`planner`, `executor`, `extractor`, `verifier`).
+- Orchestrator and verifier paths route by role (`planner`, `executor`, `extractor`, `verifier`, `compactor`).
 - TUI helper calls (ad hoc process synthesis, run-folder naming) use role-selected helper models when configured.
 - Run-folder naming is guardrailed: Loom accepts only clean kebab-case slugs and falls back to deterministic naming when model output is low quality.
 
 ## Architecture
 
-35,135 lines of Python in `src/`. 1,648 tests collected. No frameworks (no LangChain, no CrewAI).
+53,964 lines of Python in `src/`. 1,824 tests collected. No frameworks (no LangChain, no CrewAI).
 
 ```
 src/loom/
@@ -255,7 +256,7 @@ src/loom/
   prompts/               7-section prompt assembler with budget trimming
   recovery/              Approval gates, confidence scoring, retry escalation
   state/                 Task state, SQLite memory archive, conversation store
-  tools/                 21 tools with auto-discovery, safety, changelog + tree-sitter backend
+  tools/                 30 built-in tools with auto-discovery, safety, changelog + tree-sitter backend
   tui/                   Textual TUI: chat, sidebar, diff viewer, modals, events
 ```
 
@@ -263,7 +264,7 @@ src/loom/
 
 ```bash
 uv sync --extra dev     # or: pip install -e ".[dev]"
-pytest                  # 1,648 tests collected
+pytest                  # 1,824 tests collected
 ruff check src/ tests/  # lint
 ```
 

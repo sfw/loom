@@ -203,8 +203,20 @@ class RetryManager:
         missing_targets = RetryManager._extract_missing_targets_from_verification(
             verification,
         )
+        unconfirmed_reason_codes = {
+            "policy_remediation_required",
+            "unconfirmed_claims",
+            "pending_remediation",
+            "incomplete_deliverable_placeholder",
+            "incomplete_deliverable_content",
+            "unsupported_claims_and_incomplete_evidence",
+            "insufficient_evidence",
+            "recommendation_unconfirmed",
+        }
 
         # Prefer structured verification contract when available.
+        if reason_code == "hard_invariant_failed":
+            return RetryStrategy.GENERIC, []
         if reason_code in {"parse_inconclusive", "infra_verifier_error"}:
             return RetryStrategy.VERIFIER_PARSE, []
         if reason_code in {
@@ -213,22 +225,17 @@ class RetryManager:
             "insufficient_evidence_targets",
         }:
             return RetryStrategy.EVIDENCE_GAP, missing_targets
-        if reason_code in {
-            "policy_remediation_required",
-            "unconfirmed_claims",
-            "insufficient_evidence",
-            "pending_remediation",
-        }:
-            return RetryStrategy.UNCONFIRMED_DATA, []
+        if reason_code in unconfirmed_reason_codes:
+            return RetryStrategy.UNCONFIRMED_DATA, missing_targets
         if "unconfirmed" in reason_code or "remediation" in reason_code:
-            return RetryStrategy.UNCONFIRMED_DATA, []
+            return RetryStrategy.UNCONFIRMED_DATA, missing_targets
         if remediation_mode in {
             "confirm_or_prune",
             "queue_follow_up",
             "targeted_remediation",
             "remediate_and_retry",
         }:
-            return RetryStrategy.UNCONFIRMED_DATA, []
+            return RetryStrategy.UNCONFIRMED_DATA, missing_targets
         if severity_class == "inconclusive":
             return RetryStrategy.VERIFIER_PARSE, []
         if severity_class == "infra":

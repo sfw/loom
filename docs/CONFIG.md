@@ -1,18 +1,18 @@
 # Loom Configuration Reference
 
-This document lists all supported `loom.toml` and MCP config keys, their defaults,
-and what each option controls.
+This document lists supported `loom.toml` keys, legacy `[mcp]` keys, defaults,
+and normalization behavior for the current runtime.
 
 ## Config Resolution Order
 
-Loom loads configuration in this order:
+Loom loads core config in this order:
 
 1. `--config /explicit/path/loom.toml` (CLI flag, when provided)
 2. `./loom.toml` (current working directory)
 3. `~/.loom/loom.toml` (user config)
 4. Built-in defaults
 
-MCP server configuration can be supplied in:
+MCP server config layers are resolved in this order:
 
 1. `--mcp-config <path>`
 2. `./.loom/mcp.toml`
@@ -30,17 +30,18 @@ MCP server configuration can be supplied in:
 
 ### `[models.<name>]`
 
-`<name>` is any model alias you choose (for example `primary`, `utility`, `planner`).
+`<name>` is any model alias (for example `primary`, `utility`, `planner`).
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `provider` | `string` | required | One of `ollama`, `openai_compatible`, `anthropic`. |
 | `base_url` | `string` | `""` | Provider API endpoint base URL. |
 | `model` | `string` | `""` | Model identifier to call. |
-| `max_tokens` | `int` | `4096` | Max completion tokens for that model profile. |
+| `max_tokens` | `int` | `8192` | Max completion tokens for that model profile. |
 | `temperature` | `float` | `0.1` | Sampling temperature. |
-| `roles` | `list[string]` | `["executor"]` | Assigned roles: `planner`, `executor`, `extractor`, `verifier`. |
+| `roles` | `list[string]` | `["executor"]` | Assigned roles: `planner`, `executor`, `extractor`, `verifier`, `compactor`. |
 | `api_key` | `string` | `""` | API key (if provider requires auth). |
+| `reasoning_effort` | `string` | `""` | Optional provider-specific reasoning control hint. |
 | `tier` | `int` | `0` | Optional explicit quality/cost tier (`0` = auto-detect). |
 | `capabilities.vision` | `bool` | auto-detected | Override model vision support. |
 | `capabilities.native_pdf` | `bool` | auto-detected | Override native PDF support. |
@@ -51,7 +52,7 @@ MCP server configuration can be supplied in:
 
 Recommended two-model split:
 - `primary` roles: `["planner", "verifier"]`
-- `utility` roles: `["extractor", "executor"]`
+- `utility` roles: `["executor", "extractor", "compactor"]`
 - Ensure at least one configured model has the `executor` role.
 
 ### `[workspace]`
@@ -95,6 +96,22 @@ Recommended two-model split:
 | `confirm_or_prune_max_attempts` | `int` | `2` | Max remediation attempts in confirm/prune path. |
 | `confirm_or_prune_backoff_seconds` | `float` | `2.0` | Backoff between remediation attempts. |
 | `confirm_or_prune_retry_on_transient` | `bool` | `true` | Retry remediation when transient failures are detected. |
+| `contradiction_guard_enabled` | `bool` | `true` | Enables contradiction scanning against workspace artifacts. |
+| `contradiction_guard_strict_coverage` | `bool` | `true` | Requires enough evidence coverage before contradiction pass. |
+| `contradiction_scan_max_files` | `int` | `80` | Max files scanned during contradiction checks. |
+| `contradiction_scan_max_total_bytes` | `int` | `2500000` | Total byte cap across scanned files. |
+| `contradiction_scan_max_file_bytes` | `int` | `300000` | Per-file byte cap during contradiction scanning. |
+| `contradiction_scan_allowed_suffixes` | `list[string]` | text/code suffix allowlist | File suffix allowlist for contradiction scanning. |
+| `contradiction_scan_min_files_for_sufficiency` | `int` | `2` | Minimum scanned files required for sufficiency. |
+| `remediation_queue_max_attempts` | `int` | `3` | Max queued remediation attempts after confirm/prune. |
+| `remediation_queue_backoff_seconds` | `float` | `2.0` | Base backoff for queued remediation retries. |
+| `remediation_queue_max_backoff_seconds` | `float` | `30.0` | Max backoff cap for queued remediation retries. |
+
+Default `contradiction_scan_allowed_suffixes`:
+
+`.md`, `.txt`, `.rst`, `.csv`, `.tsv`, `.json`, `.yaml`, `.yml`,
+`.toml`, `.ini`, `.cfg`, `.conf`, `.xml`, `.html`, `.htm`, `.py`,
+`.js`, `.ts`, `.tsx`, `.jsx`, `.sql`, `.sh`
 
 ### `[limits]`
 
@@ -102,7 +119,7 @@ Recommended two-model split:
 | --- | --- | --- | --- |
 | `planning_response_max_tokens` | `int` | `16384` | Planner synthesis response budget. |
 | `adhoc_repair_source_max_chars` | `int` | `0` | Source truncation limit for ad hoc JSON repair (`0` means disabled). |
-| `evidence_context_text_max_chars` | `int` | `8192` | Evidence context cap fed into planning/verification prompts. |
+| `evidence_context_text_max_chars` | `int` | `4000` | Evidence context cap fed into planning/verification prompts. |
 
 ### `[limits.runner]`
 
@@ -111,23 +128,34 @@ Recommended two-model split:
 | `max_tool_iterations` | `int` | `20` | Max tool/model loop iterations per subtask execution pass. |
 | `max_subtask_wall_clock_seconds` | `int` | `1200` | Per-subtask wall-clock timeout budget. |
 | `max_model_context_tokens` | `int` | `24000` | Runner model-context budget hint. |
-| `max_state_summary_chars` | `int` | `640` | Target size for compacted state summaries. |
+| `max_state_summary_chars` | `int` | `480` | Target size for compacted state summaries. |
 | `max_verification_summary_chars` | `int` | `8000` | Target size for verification summary payloads. |
-| `default_tool_result_output_chars` | `int` | `2800` | Default tool output compaction target. |
-| `heavy_tool_result_output_chars` | `int` | `3600` | Output target for heavy tools. |
-| `compact_tool_result_output_chars` | `int` | `900` | Output target for aggressively compacted tool excerpts. |
-| `compact_text_output_chars` | `int` | `1400` | Generic compacted text target. |
+| `default_tool_result_output_chars` | `int` | `4000` | Default tool output compaction target. |
+| `heavy_tool_result_output_chars` | `int` | `2000` | Output target for heavy tools. |
+| `compact_tool_result_output_chars` | `int` | `500` | Output target for aggressively compacted tool excerpts. |
+| `compact_text_output_chars` | `int` | `900` | Generic compacted text target. |
 | `minimal_text_output_chars` | `int` | `260` | Tiny fallback compacted text target. |
-| `tool_call_argument_context_chars` | `int` | `700` | Argument context extraction target. |
-| `compact_tool_call_argument_chars` | `int` | `1600` | Aggressive tool-argument compaction target. |
+| `tool_call_argument_context_chars` | `int` | `500` | Argument context extraction target. |
+| `compact_tool_call_argument_chars` | `int` | `220` | Aggressive tool-argument compaction target. |
 | `runner_compaction_policy_mode` | `string` | `"tiered"` | Runner compaction policy (`legacy`, `tiered`, `off`). |
 | `enable_filetype_ingest_router` | `bool` | `true` | Routes fetched binary/doc payloads into artifact-backed summaries. |
 | `enable_artifact_telemetry_events` | `bool` | `true` | Emits artifact ingest/read/retention and compaction/overflow transparency events to run logs (set `false` to disable). |
-| `artifact_telemetry_max_metadata_chars` | `int` | `1200` | Max serialized chars allowed for `handler_metadata` telemetry payload fields (oversize metadata is compacted into deterministic summary metadata, not string-sliced). |
+| `artifact_telemetry_max_metadata_chars` | `int` | `1200` | Max serialized chars allowed for `handler_metadata` telemetry payload fields. |
 | `enable_model_overflow_fallback` | `bool` | `true` | Enables one-shot overflow fallback rewrite when model request size is exceeded. |
 | `ingest_artifact_retention_max_age_days` | `int` | `14` | Max artifact age (days) before retention cleanup removes old fetched artifacts. |
 | `ingest_artifact_retention_max_files_per_scope` | `int` | `96` | Max retained fetched artifact files per scope/subtask directory. |
 | `ingest_artifact_retention_max_bytes_per_scope` | `int` | `268435456` | Max retained bytes per fetched artifact scope directory (256 MiB). |
+| `preserve_recent_critical_messages` | `int` | `6` | Count of most-recent critical messages protected from compaction pruning. |
+| `compaction_pressure_ratio_soft` | `float` | `0.86` | Soft pressure ratio threshold for compaction policy. |
+| `compaction_pressure_ratio_hard` | `float` | `1.02` | Hard pressure ratio threshold for compaction policy. |
+| `compaction_no_gain_min_delta_chars` | `int` | `24` | Minimum char delta to treat compaction as meaningful gain. |
+| `compaction_no_gain_attempt_limit` | `int` | `2` | Max consecutive no-gain compaction attempts before skipping. |
+| `compaction_timeout_guard_seconds` | `int` | `30` | Timeout guard for compaction operations. |
+| `extractor_timeout_guard_seconds` | `int` | `20` | Timeout guard for asynchronous memory extraction. |
+| `extractor_tool_args_max_chars` | `int` | `260` | Tool argument excerpt cap for extraction prompts. |
+| `extractor_tool_trace_max_chars` | `int` | `3600` | Tool trace excerpt cap for extraction prompts. |
+| `extractor_prompt_max_chars` | `int` | `9000` | Max prompt size budget for extraction calls. |
+| `compaction_churn_warning_calls` | `int` | `10` | Threshold for compaction churn warning telemetry. |
 
 ### `[limits.verifier]`
 
@@ -150,26 +178,27 @@ Recommended two-model split:
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `max_chunk_chars` | `int` | `8000` | Chunk size before hierarchical map/reduce compaction. |
-| `max_chunks_per_round` | `int` | `10` | Max chunks compacted per reduction round. |
-| `max_reduction_rounds` | `int` | `2` | Max full compaction reduction rounds per payload. |
-| `min_compact_target_chars` | `int` | `220` | Floor target when reducing per-attempt character budget. |
+| `max_chunk_chars` | `int` | `9000` | Chunk size before hierarchical map/reduce compaction. |
+| `max_chunks_per_round` | `int` | `12` | Max chunks compacted per reduction round. |
+| `max_reduction_rounds` | `int` | `4` | Max full compaction reduction rounds per payload. |
+| `min_compact_target_chars` | `int` | `140` | Floor target when reducing per-attempt character budget. |
 | `response_tokens_floor` | `int` | `256` | Minimum `max_tokens` sent to compactor model calls. |
-| `response_tokens_ratio` | `float` | `0.55` | Token-budget ratio derived from hard character limits. |
+| `response_tokens_ratio` | `float` | `0.75` | Token-budget ratio derived from hard character limits. |
 | `response_tokens_buffer` | `int` | `256` | Fixed token headroom added to compactor budget. |
-| `json_headroom_chars_floor` | `int` | `128` | Minimum extra characters reserved for JSON envelope overhead. |
-| `json_headroom_chars_ratio` | `float` | `0.30` | Ratio-based JSON envelope headroom. |
-| `json_headroom_chars_cap` | `int` | `1024` | Upper cap for JSON envelope headroom. |
-| `chars_per_token_estimate` | `float` | `2.8` | Character/token estimator used for budget calculations. |
-| `token_headroom` | `int` | `128` | Extra tokens added after char/token conversion. |
-| `target_chars_ratio` | `float` | `0.82` | Attempt target ratio under hard limit. |
+| `json_headroom_chars_floor` | `int` | `48` | Minimum extra characters reserved for JSON envelope overhead. |
+| `json_headroom_chars_ratio` | `float` | `0.08` | Ratio-based JSON envelope headroom. |
+| `json_headroom_chars_cap` | `int` | `320` | Upper cap for JSON envelope headroom. |
+| `chars_per_token_estimate` | `float` | `3.6` | Character/token estimator used for budget calculations. |
+| `token_headroom` | `int` | `24` | Extra tokens added after char/token conversion. |
+| `target_chars_ratio` | `float` | `0.75` | Attempt target ratio under hard limit. |
 
 Compactor validation warnings:
-- If final retry still exceeds target chars, Loom keeps the compacted output and emits warning telemetry fields (`compactor_warning`, `compactor_warning_reason`, `compactor_warning_delta_chars`) instead of truncating.
+- If final retry still exceeds target chars, Loom keeps the compacted output and emits warning telemetry fields (`compactor_warning`, `compactor_warning_reason`, `compactor_warning_delta_chars`, `compactor_warning_target_chars`, `compactor_warning_received_chars`) instead of truncating.
 
 ### Run Telemetry Event Contracts
 
-When `limits.runner.enable_artifact_telemetry_events = true`, Loom emits these additional run-log events (`.events.jsonl`) from orchestration boundaries:
+When `limits.runner.enable_artifact_telemetry_events = true`, Loom emits these
+run-log events (`.events.jsonl`) from orchestration boundaries:
 
 - `artifact_ingest_classified`
 - `artifact_ingest_completed`
@@ -215,7 +244,7 @@ Safety notes:
 - Telemetry events do not include raw extracted document text or binary payload snippets.
 - URL telemetry removes query strings and fragments.
 - Prefer `artifact_workspace_relpath` over absolute paths.
-- Oversize `handler_metadata` is reduced to deterministic summary fields (`_loom_meta`, type, size, hash) instead of hard string truncation.
+- Oversize `handler_metadata` is reduced to deterministic summary metadata instead of raw payload slicing.
 
 ### `[memory]`
 
@@ -243,7 +272,7 @@ Safety notes:
 
 ### Legacy `[mcp]` in `loom.toml` (supported)
 
-The preferred MCP config lives in `mcp.toml`, but Loom still accepts MCP server
+Preferred MCP config lives in `mcp.toml`, but Loom still accepts server
 definitions inside `loom.toml`:
 
 `[mcp.servers.<alias>]`
@@ -272,8 +301,68 @@ definitions inside `loom.toml`:
 - `verification.unconfirmed_supporting_threshold` is clamped to `0..1`.
 - `verification.confirm_or_prune_max_attempts` is clamped to at least `1`.
 - `verification.confirm_or_prune_backoff_seconds` is clamped to `>= 0`.
+- `verification.remediation_queue_max_attempts` is clamped to at least `1`.
+- `verification.remediation_queue_backoff_seconds` is clamped to `>= 0`.
+- `verification.remediation_queue_max_backoff_seconds` is clamped to `>= remediation_queue_backoff_seconds`.
+- `verification.contradiction_scan_max_files` is clamped to `1..1000`.
+- `verification.contradiction_scan_max_total_bytes` is clamped to `1024..50000000`.
+- `verification.contradiction_scan_max_file_bytes` is clamped to `1..10000000` and cannot exceed `contradiction_scan_max_total_bytes`.
+- `verification.contradiction_scan_min_files_for_sufficiency` is clamped to `1..100`.
+- `verification.contradiction_scan_allowed_suffixes` is normalized to unique lowercase suffixes prefixed with `.`.
+- `limits.planning_response_max_tokens` is clamped to `0..500000`.
+- `limits.adhoc_repair_source_max_chars` is clamped to `0..500000`.
+- `limits.evidence_context_text_max_chars` is clamped to `200..100000`.
+- `limits.runner.max_tool_iterations` is clamped to `4..60`.
+- `limits.runner.max_subtask_wall_clock_seconds` is clamped to `60..86400`.
+- `limits.runner.max_model_context_tokens` is clamped to `2048..500000`.
+- `limits.runner.max_state_summary_chars` is clamped to `120..20000`.
+- `limits.runner.max_verification_summary_chars` is clamped to `400..40000`.
+- `limits.runner.default_tool_result_output_chars` is clamped to `400..40000`.
+- `limits.runner.heavy_tool_result_output_chars` is clamped to `200..20000`.
+- `limits.runner.compact_tool_result_output_chars` is clamped to `80..20000`.
+- `limits.runner.compact_text_output_chars` is clamped to `80..20000`.
+- `limits.runner.minimal_text_output_chars` is clamped to `40..10000`.
+- `limits.runner.tool_call_argument_context_chars` is clamped to `80..20000`.
+- `limits.runner.compact_tool_call_argument_chars` is clamped to `40..10000`.
+- Invalid `limits.runner.runner_compaction_policy_mode` falls back to `"tiered"`.
 - `limits.runner.artifact_telemetry_max_metadata_chars` is clamped to `120..20000`.
 - `limits.runner.ingest_artifact_retention_max_age_days` is clamped to `0..3650`.
 - `limits.runner.ingest_artifact_retention_max_files_per_scope` is clamped to `1..200000`.
 - `limits.runner.ingest_artifact_retention_max_bytes_per_scope` is clamped to `1024..20000000000`.
+- `limits.runner.preserve_recent_critical_messages` is clamped to `2..30`.
+- `limits.runner.compaction_pressure_ratio_soft` is clamped to `0.4..2.5`.
+- `limits.runner.compaction_pressure_ratio_hard` is clamped to `0.41..3.0` and kept above `soft + 0.01`.
+- `limits.runner.compaction_no_gain_min_delta_chars` is clamped to `1..5000`.
+- `limits.runner.compaction_no_gain_attempt_limit` is clamped to `1..25`.
+- `limits.runner.compaction_timeout_guard_seconds` is clamped to `0..3600`.
+- `limits.runner.extractor_timeout_guard_seconds` is clamped to `0..3600`.
+- `limits.runner.extractor_tool_args_max_chars` is clamped to `80..20000`.
+- `limits.runner.extractor_tool_trace_max_chars` is clamped to `200..80000`.
+- `limits.runner.extractor_prompt_max_chars` is clamped to `400..120000`.
+- `limits.runner.compaction_churn_warning_calls` is clamped to `1..500`.
+- `limits.verifier.max_tool_args_chars` is clamped to `80..20000`.
+- `limits.verifier.max_tool_status_chars` is clamped to `80..20000`.
+- `limits.verifier.max_tool_calls_tokens` is clamped to `400..60000`.
+- `limits.verifier.max_verifier_prompt_tokens` is clamped to `800..120000`.
+- `limits.verifier.max_result_summary_chars` is clamped to `200..100000`.
+- `limits.verifier.compact_result_summary_chars` is clamped to `120..100000`.
+- `limits.verifier.max_evidence_section_chars` is clamped to `200..100000`.
+- `limits.verifier.max_evidence_section_compact_chars` is clamped to `120..100000`.
+- `limits.verifier.max_artifact_section_chars` is clamped to `200..100000`.
+- `limits.verifier.max_artifact_section_compact_chars` is clamped to `120..100000`.
+- `limits.verifier.max_tool_output_excerpt_chars` is clamped to `120..40000`.
+- `limits.verifier.max_artifact_file_excerpt_chars` is clamped to `120..40000`.
+- `limits.compactor.max_chunk_chars` is clamped to `300..200000`.
+- `limits.compactor.max_chunks_per_round` is clamped to `1..100`.
+- `limits.compactor.max_reduction_rounds` is clamped to `1..20`.
+- `limits.compactor.min_compact_target_chars` is clamped to `20..20000`.
+- `limits.compactor.response_tokens_floor` is clamped to `0..100000`.
+- `limits.compactor.response_tokens_ratio` is clamped to `0.0..8.0`.
+- `limits.compactor.response_tokens_buffer` is clamped to `0..100000`.
+- `limits.compactor.json_headroom_chars_floor` is clamped to `0..20000`.
+- `limits.compactor.json_headroom_chars_ratio` is clamped to `0.0..2.0`.
+- `limits.compactor.json_headroom_chars_cap` is clamped to `0..100000`.
+- `limits.compactor.chars_per_token_estimate` is clamped to `0.1..16.0`.
+- `limits.compactor.token_headroom` is clamped to `0..20000`.
+- `limits.compactor.target_chars_ratio` is clamped to `0.01..1.0`.
 - MCP `timeout_seconds` falls back to `30` when invalid/non-positive.

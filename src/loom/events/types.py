@@ -45,6 +45,7 @@ VERIFICATION_FALSE_NEGATIVE_CANDIDATE = "verification_false_negative_candidate"
 VERIFICATION_INCONCLUSIVE_RATE = "verification_inconclusive_rate"
 VERIFICATION_RULE_FAILURE_BY_TYPE = "rule_failure_by_type"
 VERIFICATION_DETERMINISTIC_BLOCK_RATE = "deterministic_block_rate"
+VERIFICATION_CONTRADICTION_DETECTED = "verification_contradiction_detected"
 
 # Human interaction events
 APPROVAL_REQUESTED = "approval_requested"
@@ -59,6 +60,8 @@ REMEDIATION_ATTEMPT = "remediation_attempt"
 REMEDIATION_RESOLVED = "remediation_resolved"
 REMEDIATION_FAILED = "remediation_failed"
 REMEDIATION_EXPIRED = "remediation_expired"
+REMEDIATION_TERMINAL = "remediation_terminal"
+UNCONFIRMED_DATA_QUEUED = "unconfirmed_data_queued"
 
 # Streaming events
 TOKEN_STREAMED = "token_streamed"

@@ -38,7 +38,11 @@ from loom.events.types import (
 )
 from loom.models.base import ModelConnectionError, ModelResponse, TokenUsage, ToolCall
 from loom.models.router import ModelRouter
-from loom.processes.schema import PhaseTemplate, ProcessDefinition
+from loom.processes.schema import (
+    PhaseTemplate,
+    ProcessDefinition,
+    VerificationRemediationContract,
+)
 from loom.prompts.assembler import PromptAssembler
 from loom.recovery.retry import AttemptRecord, RetryStrategy
 from loom.state.task_state import (
@@ -124,6 +128,23 @@ def _make_mock_prompts():
 
 def _make_task(goal="Write hello world", workspace="") -> Task:
     return create_task(goal=goal, workspace=workspace)
+
+
+def _make_process_with_critical_behavior(behavior: str) -> ProcessDefinition:
+    return ProcessDefinition(
+        name=f"proc-{behavior}",
+        schema_version=2,
+        phases=[
+            PhaseTemplate(
+                id="s1",
+                description="Critical phase",
+                is_critical_path=True,
+            ),
+        ],
+        verification_remediation=VerificationRemediationContract(
+            critical_path_behavior=behavior,
+        ),
+    )
 
 
 # --- create_task ---
@@ -1115,11 +1136,12 @@ class TestOrchestratorExecution:
         assert attempts[0].retry_strategy.value == "unconfirmed_data"
 
     @pytest.mark.asyncio
-    async def test_critical_unconfirmed_triggers_confirm_or_prune_before_abort(self, tmp_path):
+    async def test_confirm_or_prune_then_queue_policy_attempts_remediation_first(self, tmp_path):
         plan_json = json.dumps({
             "subtasks": [{"id": "s1", "description": "Critical"}]
         })
         state_manager = _make_state_manager(tmp_path)
+        process = _make_process_with_critical_behavior("confirm_or_prune_then_queue")
         cfg = Config(execution=ExecutionConfig(
             max_subtask_retries=0,
             max_loop_iterations=50,
@@ -1135,6 +1157,7 @@ class TestOrchestratorExecution:
             state_manager=state_manager,
             event_bus=_make_event_bus(),
             config=cfg,
+            process=process,
         )
         task = _make_task()
         subtask = Subtask(
@@ -1195,6 +1218,7 @@ class TestOrchestratorExecution:
             "subtasks": [{"id": "s1", "description": "Critical"}]
         })
         state_manager = _make_state_manager(tmp_path)
+        process = _make_process_with_critical_behavior("confirm_or_prune_then_queue")
         cfg = Config(
             execution=ExecutionConfig(
                 max_subtask_retries=0,
@@ -1217,6 +1241,7 @@ class TestOrchestratorExecution:
             state_manager=state_manager,
             event_bus=_make_event_bus(),
             config=cfg,
+            process=process,
         )
         task = _make_task()
         subtask = Subtask(
@@ -1283,6 +1308,101 @@ class TestOrchestratorExecution:
         assert len(rows) >= 2
         assert rows[0]["status"] == "failed"
         assert rows[-1]["status"] == "resolved"
+
+    @pytest.mark.asyncio
+    async def test_critical_unconfirmed_block_policy_aborts(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        process = _make_process_with_critical_behavior("block")
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=0)),
+            process=process,
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="s1",
+            description="Critical",
+            is_critical_path=True,
+            max_retries=0,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        result = SubtaskResult(status="failed", summary="Execution summary")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="recommendation_unconfirmed",
+            feedback="confirm-or-prune remediation required",
+        )
+
+        orch._run_confirm_or_prune_remediation = AsyncMock(return_value=(True, ""))
+        orch._abort_on_critical_path_failure = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask={},
+        )
+
+        orch._run_confirm_or_prune_remediation.assert_not_awaited()
+        orch._abort_on_critical_path_failure.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_critical_unconfirmed_queue_follow_up_policy_continues(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        process = _make_process_with_critical_behavior("queue_follow_up")
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=0)),
+            process=process,
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="s1",
+            description="Critical",
+            is_critical_path=True,
+            max_retries=0,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        result = SubtaskResult(status="failed", summary="Execution summary")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="recommendation_unconfirmed",
+            feedback="confirm-or-prune remediation required",
+        )
+        orch._handle_success = AsyncMock()
+        orch._abort_on_critical_path_failure = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask={},
+        )
+
+        orch._handle_success.assert_awaited_once()
+        orch._abort_on_critical_path_failure.assert_not_awaited()
+        queue = task.metadata.get("remediation_queue", [])
+        assert isinstance(queue, list)
+        assert queue
+        assert queue[0]["blocking"] is False
 
     @pytest.mark.asyncio
     async def test_remediation_queue_dedupes_and_promotes_blocking(self, tmp_path):
@@ -1366,6 +1486,47 @@ class TestOrchestratorExecution:
         queue = task.metadata.get("remediation_queue", [])
         assert isinstance(queue, list)
         assert queue[0]["state"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_remediation_queue_exhaustion_sets_terminal_reason(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        task.plan.subtasks = [Subtask(id="s1", description="First")]
+        task.metadata["remediation_queue"] = [{
+            "id": "rem-1",
+            "task_id": task.id,
+            "subtask_id": "s1",
+            "strategy": "unsupported",
+            "reason_code": "x",
+            "blocking": False,
+            "state": "queued",
+            "attempt_count": 0,
+            "max_attempts": 1,
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+            "next_attempt_at": "2026-01-01T00:00:00",
+        }]
+        state_manager.create(task)
+
+        await orch._process_remediation_queue(
+            task=task,
+            attempts_by_subtask={},
+            finalizing=False,
+        )
+
+        queue = task.metadata.get("remediation_queue", [])
+        assert isinstance(queue, list)
+        assert queue[0]["state"] == "failed"
+        assert queue[0]["terminal_reason"] == "max_attempts_exhausted"
 
     @pytest.mark.asyncio
     async def test_executes_subtasks_in_order(self, tmp_path):
