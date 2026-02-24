@@ -22,6 +22,19 @@ SUPPORTED_ECONOMIC_PROVIDERS = frozenset(
     {"world_bank", "oecd", "eurostat", "dbnomics", "bls"}
 )
 _SERIES_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{4,}$")
+_NULLISH_PAYLOAD_TEXT = frozenset(
+    {
+        "",
+        "null",
+        "'null'",
+        '"null"',
+        "none",
+        "'none'",
+        '"none"',
+        "(null)",
+    }
+)
+_JSON_XSSI_PREFIXES = (")]}',", "for(;;);")
 
 
 class EconomicProviderError(RuntimeError):
@@ -99,12 +112,39 @@ async def _request_json(
 ) -> Any:
     response = await client.get(url, params=params)
     response.raise_for_status()
+    return _decode_json_response(response, url=url)
+
+
+def _normalize_json_payload(payload: Any) -> Any:
+    if payload is None:
+        return {}
+    if isinstance(payload, str):
+        text = payload.strip()
+        if text.lower() in _NULLISH_PAYLOAD_TEXT:
+            return {}
+    return payload
+
+
+def _decode_json_response(response: httpx.Response, *, url: str) -> Any:
     if not response.content:
         return {}
     try:
-        return response.json()
-    except json.JSONDecodeError as e:
-        raise EconomicProviderError(f"Invalid JSON payload from {url}") from e
+        return _normalize_json_payload(response.json())
+    except json.JSONDecodeError:
+        text = response.text.lstrip("\ufeff").strip()
+        if text.lower() in _NULLISH_PAYLOAD_TEXT:
+            return {}
+        for prefix in _JSON_XSSI_PREFIXES:
+            if text.startswith(prefix):
+                _, _, remainder = text.partition("\n")
+                text = (remainder or text[len(prefix) :]).strip()
+                break
+        if text.lower() in _NULLISH_PAYLOAD_TEXT:
+            return {}
+        try:
+            return _normalize_json_payload(json.loads(text))
+        except json.JSONDecodeError as e:
+            raise EconomicProviderError(f"Invalid JSON payload from {url}") from e
 
 
 def _normalize_period(text: object) -> str:
