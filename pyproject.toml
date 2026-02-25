@@ -1,7 +1,7 @@
 [project]
 name = "loom"
 version = "0.1.0"
-description = "Local model orchestration engine — task decomposition, execution, and verification"
+description = "Local-first LLM execution harness — decomposition, verified execution, and routing"
 requires-python = ">=3.11"
 dependencies = [
     # API server

@@ -2,17 +2,17 @@
 [![CI](https://github.com/sfw/loom/actions/workflows/ci.yml/badge.svg)](https://github.com/sfw/loom/actions/workflows/ci.yml)
 [![Process Canary](https://github.com/sfw/loom/actions/workflows/process-canary.yml/badge.svg)](https://github.com/sfw/loom/actions/workflows/process-canary.yml)
 
-**Local model orchestration engine** -- task decomposition, execution, and verification using local LLMs.
+**Local-first LLM execution harness** for complex tasks.
 
-Loom turns local models into working agents. Give Kimi, Minimax, GLM, or any other model the scaffolding it needs to actually get things done: tool calling, structured planning, parallel execution, verification, and persistent memory -- without sending a single token to someone else's server.
+Loom decomposes goals, drives execution through verified steps, routes between thinking and acting models, and keeps work on track with structured state instead of chat history. Use it via TUI, CLI, API, or MCP with local or mixed local/cloud models.
 
-It handles anything a capable assistant should: writing and editing code, researching topics, analyzing documents (PDFs, Word docs, PowerPoint decks), generating reports, running multi-step business workflows, or any task you can define as a process. Ship a consulting engagement, an investment analysis, or a codebase refactor with the same engine.
+Bring Kimi, Minimax, GLM, Claude, or any OpenAI-compatible model and Loom supplies the harness: tool calling, structured planning, parallel execution, independent verification, and persistent memory.
 
-It also works with Claude and any OpenAI-compatible API, so you can mix local and cloud models in the same task.
+It handles coding, research, document analysis (PDF, Word docs, PowerPoint decks), report generation, and multi-step business workflows.
 
 **Claude-class cowork UX, local-first.** Tools like Claude Code and Claude cowork deliver strong agentic experiences, and Claude Code can be paired with local model stacks depending on your setup. Loom's focus is different: a model-agnostic harness designed to keep local and mixed local/cloud execution reliable with structured planning, tool safety, independent verification, and persistent memory. Loom is also cross-platform, while Claude cowork is currently macOS + Claude-model oriented. The result is an agentic workflow that stays robust on your own hardware without locking you to one provider.
 
-Loom also exposes a REST API and an MCP server built for agentic systems. Orchestrators like OpenClaw can call Loom's 19 REST endpoints -- or connect via the Model Context Protocol -- to offload complex multi-step tasks: decomposition, tool calling, verification, and memory. Most orchestrators are largely inept at executing these on their own. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive. The MCP integration also means any MCP-compatible agent or IDE can use Loom as a tool provider out of the box.
+Loom also exposes a REST API and an MCP server built for agentic systems. Orchestrators like OpenClaw can call Loom's 19 REST endpoints -- or connect via the Model Context Protocol -- to offload complex multi-step tasks: decomposition, tool calling, verification, and memory. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive. The MCP integration also means any MCP-compatible agent or IDE can use Loom as a tool provider out of the box.
 
 ## Why Loom Exists
 
@@ -52,13 +52,22 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Full undo.** Every file write is preceded by a snapshot. You can revert any individual change, all changes from a subtask, or the entire task. The changelog tracks creates, modifies, deletes, and renames with before-state snapshots.
 
-**Dozens of built-in tools.** File operations (read, write, edit with fuzzy match and batch edits, delete, move) with native support for PDFs, Word documents (.docx), PowerPoint presentations (.pptx), and images. Shell execution with safety checks, git with destructive command blocking, ripgrep search, glob find, web fetch (bounded streaming + truncation for large pages), web search (DuckDuckGo, no API key), code analysis (tree-sitter when installed, regex fallback), calculator (AST-based, safe), spreadsheet operations, document generation, task tracking, conversation recall, delegate_task for spawning sub-agents, ask_user for mid-execution questions, and dedicated research helpers (academic/archives/citations/fact-checking/timeline/inflation plus keyless economic data, historical currency normalization, primary-source OCR, correspondence analysis, social network mapping, and a full keyless investment suite for market data, SEC fundamentals, macro regime scoring, factor exposure, valuation, opportunity ranking, portfolio optimization/evaluation, and portfolio recommendation). All tools auto-discovered via `__init_subclass__`.
+**Dozens of built-in tools.** Loom includes file operations (read/write/edit/delete/move with fuzzy matching), shell + git safety, ripgrep + glob search, web fetch/search, code analysis (tree-sitter when installed; regex fallback), calculator + spreadsheet operations, document generation, task tracking, and conversation recall.
+
+It also ships research helpers (academic search, archives, citations, fact checking, OCR, timeline/inflation analysis, correspondence/social mapping) plus a keyless investment suite for market data, SEC fundamentals, macro regime scoring, factor exposure, valuation, ranking, and portfolio analysis/recommendation. Tools are auto-discovered via `__init_subclass__`.
 
 **Inline diffs.** Every file edit produces a unified diff in the tool result. Diffs render with Rich markup syntax highlighting in the TUI -- green additions, red removals. You always see exactly what changed.
 
 **Process definitions.** YAML-based domain specialization lets you define personas, phase blueprints, verification/remediation policy, evidence contracts, and prompt constraints for any workflow (`schema_version: 2`). A process can represent a consulting methodology, an investment analysis framework, a research protocol, or a coding standard -- the engine doesn't care. Loom ships with 6 built-in processes and supports installing more from GitHub.
 
 ## Quick Start
+
+If you're new, start with:
+
+1. `uv sync` to install dependencies.
+2. `loom -w /path/to/workspace` to launch the TUI and run setup.
+3. `/run <goal>` inside the TUI for your first harnessed task.
+4. `loom run "<goal>" -w /path/to/workspace` for autonomous execution.
 
 ```bash
 # Install
@@ -200,7 +209,7 @@ In the TUI, use `/learned` to open an interactive review screen for learned beha
 
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, file changes panel with diff viewer, tool approval modals, event log with token sparkline. Built-in setup wizard on first launch. Full session persistence, conversation recall, task delegation, session management (`/sessions`, `/new`, `/resume`, `/setup`), in-session process controls (`/process list`, `/process use <name-or-path>`, `/process off`), forced process orchestration (`/run <goal|@goal-file [goal]|close [run-id-prefix]>`), dynamic direct process commands (`/<process-name> <goal>`), learned pattern review (`/learned`), MCP config controls (`/mcp list`, `/mcp show`, `/mcp test`, `/mcp enable`, `/mcp disable`, `/mcp remove`), auth profile controls (`/auth list`, `/auth show`, `/auth use`, `/auth add`, `/auth edit`, `/auth remove`, `/auth manage`), and click-to-open workspace file previews (Markdown, code/text with syntax highlighting including TypeScript/CSS, JSON, CSV/TSV, HTML, diff/patch, Office docs, PDF text, and image metadata). `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `loom serve`; single-token file goals (`/run problem.md`) and explicit file input (`/run @problem.md optional-goal`) load file content into planning context immediately.
+- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, diff viewer, tool approval modals, event log, and setup wizard. Includes session persistence/recall, task delegation, process controls (`/process list|use|off`), in-process orchestration (`/run <goal|@goal-file [goal]|close [run-id-prefix]>`), direct process commands (`/<process-name> <goal>`), learned-pattern review (`/learned`), MCP config controls (`/mcp ...`), auth profile controls (`/auth ...`), and click-to-open workspace previews for Markdown/code/JSON/CSV/HTML/diff/Office/PDF/images. `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `loom serve`; `/run problem.md` and `/run @problem.md optional-goal` load file content into planning context.
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
@@ -240,7 +249,7 @@ Role routing note:
 
 ## Architecture
 
-53,964 lines of Python in `src/`. 1,824 tests collected. No frameworks (no LangChain, no CrewAI).
+Large Python codebase in `src/` with an extensive automated test suite (roughly ~68k LOC and ~1.8k tests as of February 2026). No frameworks (no LangChain, no CrewAI).
 
 ```
 src/loom/
@@ -266,7 +275,7 @@ src/loom/
 
 ```bash
 uv sync --extra dev     # or: pip install -e ".[dev]"
-pytest                  # 1,824 tests collected
+pytest                  # full test suite
 ruff check src/ tests/  # lint
 ```
 
