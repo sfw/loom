@@ -14,6 +14,7 @@ from loom.tools.correspondence_analysis import CorrespondenceAnalysisTool
 from loom.tools.economic_data_api import EconomicDataApiTool
 from loom.tools.fact_checker import FactCheckerTool
 from loom.tools.historical_currency_normalizer import HistoricalCurrencyNormalizerTool
+from loom.tools.humanize_writing import HumanizeWritingTool
 from loom.tools.inflation_calculator import InflationCalculatorTool
 from loom.tools.peer_review_simulator import PeerReviewSimulatorTool
 from loom.tools.primary_source_ocr import OcrPage, PrimarySourceOcrTool
@@ -554,3 +555,107 @@ class TestSocialNetworkMapperTool:
         )
         assert result.success
         assert result.data["edge_count"] >= 2
+
+
+class TestHumanizeWritingTool:
+    _ROBOTIC_TEXT = (
+        "Our platform delivers value for your business. "
+        "Our platform delivers value for your business. "
+        "It is very important to note that our platform delivers value for your business. "
+        "In conclusion, our platform is very good."
+    )
+
+    _NATURAL_TEXT = (
+        "Last quarter, the support team resolved 418 tickets in under six hours on average. "
+        "Most requests were onboarding-related, so we replaced the setup checklist with annotated "
+        "screenshots and a short walkthrough video. "
+        "Two weeks later, repeat tickets dropped by 31 percent."
+    )
+
+    async def test_analyze_returns_score_and_issues(self, ctx: ToolContext):
+        tool = HumanizeWritingTool()
+        result = await tool.execute(
+            {
+                "operation": "analyze",
+                "content": self._ROBOTIC_TEXT,
+                "mode": "report",
+            },
+            ctx,
+        )
+        assert result.success
+        assert result.data["operation"] == "analyze"
+        assert result.data["report"]["humanization_score"] < 85
+        assert len(result.data["report"]["issues"]) >= 1
+        assert len(result.data["recommended_edits"]) >= 1
+
+    async def test_plan_rewrite_applies_constraints(self, ctx: ToolContext):
+        tool = HumanizeWritingTool()
+        result = await tool.execute(
+            {
+                "operation": "plan_rewrite",
+                "content": self._ROBOTIC_TEXT,
+                "constraints": {
+                    "preserve_terms": ["Loom", "support team"],
+                    "banned_phrases": ["very important"],
+                },
+                "max_recommendations": 6,
+            },
+            ctx,
+        )
+        assert result.success
+        edits = result.data["recommended_edits"]
+        assert len(edits) >= 1
+        assert any("Preserve these exact terms" in action for action in edits)
+        assert "preserve_terms" in result.data["constraints_applied"]
+
+    async def test_compare_detects_improvement(self, ctx: ToolContext):
+        tool = HumanizeWritingTool()
+        result = await tool.execute(
+            {
+                "operation": "compare",
+                "content": self._NATURAL_TEXT,
+                "baseline_content": self._ROBOTIC_TEXT,
+                "mode": "report",
+            },
+            ctx,
+        )
+        assert result.success
+        assert result.data["improved"] is True
+        assert result.data["score_delta"] > 0
+        assert "clarity" in result.data["sub_score_delta"]
+
+    async def test_evaluate_writes_artifacts_from_path(
+        self,
+        ctx: ToolContext,
+        workspace: Path,
+    ):
+        tool = HumanizeWritingTool()
+        draft_path = workspace / "draft.md"
+        draft_path.write_text(self._NATURAL_TEXT, encoding="utf-8")
+
+        result = await tool.execute(
+            {
+                "operation": "evaluate",
+                "path": "draft.md",
+                "target_score": 40,
+                "output_path": "reports/humanized-writing.md",
+                "output_json_path": "reports/humanized-writing.json",
+            },
+            ctx,
+        )
+        assert result.success
+        assert result.data["report"]["passes_target"] is True
+        assert (workspace / "reports" / "humanized-writing.md").exists()
+        assert (workspace / "reports" / "humanized-writing.json").exists()
+
+    async def test_compare_requires_baseline(self, ctx: ToolContext):
+        tool = HumanizeWritingTool()
+        result = await tool.execute(
+            {
+                "operation": "compare",
+                "content": "Short draft",
+            },
+            ctx,
+        )
+        assert not result.success
+        assert "baseline" in result.error.lower()

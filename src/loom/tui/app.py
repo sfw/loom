@@ -180,7 +180,7 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     ),
 )
 _MAX_SLASH_HINT_LINES = 24
-_WORKSPACE_REFRESH_TOOLS = {"document_write", "document_create"}
+_WORKSPACE_REFRESH_TOOLS = {"document_write", "document_create", "humanize_writing"}
 _PROCESS_STATUS_ICON = {
     "queued": "\u25cb",
     "running": "\u25c9",
@@ -200,6 +200,7 @@ _MAX_PERSISTED_PROCESS_RUNS = 12
 _MAX_PERSISTED_PROCESS_ACTIVITY = 300
 _MAX_PERSISTED_PROCESS_RESULTS = 120
 _INFO_WRAP_WIDTH = 108
+_RUN_GOAL_FILE_CONTENT_MAX_CHARS = 32_000
 
 
 class ProcessRunList(VerticalScroll):
@@ -542,6 +543,7 @@ class ProcessRunState:
     closed: bool = False
     is_adhoc: bool = False
     recommended_tools: list[str] = field(default_factory=list)
+    goal_context_overrides: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -887,6 +889,129 @@ class LoomApp(App):
             return shlex.split(raw)
         except ValueError as e:
             raise ValueError(f"Invalid quoted argument syntax: {e}") from e
+
+    @staticmethod
+    def _truncate_run_goal_file_content(content: str) -> tuple[str, bool]:
+        """Bound file-input size for `/run` goal context and synthesis prompts."""
+        if len(content) <= _RUN_GOAL_FILE_CONTENT_MAX_CHARS:
+            return content, False
+        return content[:_RUN_GOAL_FILE_CONTENT_MAX_CHARS].rstrip(), True
+
+    def _resolve_run_goal_file_path(self, raw_path: str) -> Path | None:
+        """Resolve a `/run` file-input token to a workspace-local file path."""
+        token = str(raw_path or "").strip()
+        if not token:
+            return None
+
+        candidate = Path(token).expanduser()
+        if not candidate.is_absolute():
+            candidate = self._workspace / candidate
+        try:
+            resolved = candidate.resolve()
+            workspace_root = self._workspace.resolve()
+        except OSError:
+            return None
+        if not resolved.is_file():
+            return None
+        try:
+            resolved.relative_to(workspace_root)
+        except ValueError:
+            return None
+        return resolved
+
+    def _expand_run_goal_file_input(
+        self,
+        goal_tokens: list[str],
+    ) -> tuple[str, str, dict[str, Any], str | None]:
+        """Expand optional `/run` file shorthand into goal/context payloads.
+
+        Returns:
+            (execution_goal, synthesis_goal, context_overrides, error_message)
+        """
+        goal_text = " ".join(str(token or "").strip() for token in goal_tokens).strip()
+        if not goal_tokens:
+            return goal_text, goal_text, {}, None
+
+        first = str(goal_tokens[0] or "").strip()
+        first_path_token = first[1:] if first.startswith("@") else first
+        should_treat_as_file = bool(first.startswith("@") or len(goal_tokens) == 1)
+        if not should_treat_as_file:
+            return goal_text, goal_text, {}, None
+
+        resolved = self._resolve_run_goal_file_path(first_path_token)
+        if resolved is None:
+            if first.startswith("@"):
+                return (
+                    goal_text,
+                    goal_text,
+                    {},
+                    f"Run goal file not found (or outside workspace): {first_path_token}",
+                )
+            return goal_text, goal_text, {}, None
+
+        try:
+            raw_content = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return (
+                goal_text,
+                goal_text,
+                {},
+                f"Failed reading run goal file '{first_path_token}': {e}",
+            )
+
+        content, truncated = self._truncate_run_goal_file_content(raw_content)
+        workspace_root = self._workspace.resolve()
+        try:
+            file_label = str(resolved.relative_to(workspace_root))
+        except ValueError:
+            file_label = str(resolved)
+
+        user_goal = ""
+        if first.startswith("@") and len(goal_tokens) > 1:
+            user_goal = " ".join(
+                str(token or "").strip() for token in goal_tokens[1:]
+            ).strip()
+
+        if user_goal:
+            execution_goal = user_goal
+            preface = (
+                f"{user_goal}\n\n"
+                f"Supplemental task specification file: {file_label}\n"
+                "Use the file content below as authoritative detail."
+            )
+        else:
+            execution_goal = file_label
+            preface = (
+                f"Use the following task specification from file "
+                f"'{file_label}' as the primary goal."
+            )
+
+        truncated_note = ""
+        if truncated:
+            truncated_note = (
+                f"\n\n[File content truncated to first "
+                f"{_RUN_GOAL_FILE_CONTENT_MAX_CHARS} characters.]"
+            )
+        synthesis_goal = (
+            f"{preface}\n\n"
+            f"--- BEGIN FILE: {file_label} ---\n"
+            f"{content}\n"
+            f"--- END FILE: {file_label} ---"
+            f"{truncated_note}"
+        )
+        return (
+            execution_goal,
+            synthesis_goal,
+            {
+                "run_goal_file_input": {
+                    "path": file_label,
+                    "content": content,
+                    "truncated": truncated,
+                    "max_chars": _RUN_GOAL_FILE_CONTENT_MAX_CHARS,
+                },
+            },
+            None,
+        )
 
     @staticmethod
     def _parse_kv_assignments(
@@ -4361,6 +4486,7 @@ class LoomApp(App):
         is_adhoc: bool = False,
         recommended_tools: list[str] | None = None,
         adhoc_synthesis_notes: list[str] | None = None,
+        goal_context_overrides: dict[str, Any] | None = None,
         resume_task_id: str = "",
         run_workspace_override: Path | None = None,
     ) -> None:
@@ -4423,6 +4549,7 @@ class LoomApp(App):
             started_at=time.monotonic(),
             is_adhoc=bool(is_adhoc),
             recommended_tools=list(recommended_tools or []),
+            goal_context_overrides=dict(goal_context_overrides or {}),
         )
         self._process_runs[run_id] = run
 
@@ -4509,14 +4636,18 @@ class LoomApp(App):
         self._append_process_run_activity(run, "Run started.")
 
         try:
+            run_context = self._build_process_run_context(
+                run.goal,
+                workspace=run.run_workspace,
+            )
+            extra_context = getattr(run, "goal_context_overrides", {})
+            if isinstance(extra_context, dict) and extra_context:
+                run_context.update(extra_context)
             result = await self._tools.execute(
                 "delegate_task",
                 {
                     "goal": run.goal,
-                    "context": self._build_process_run_context(
-                        run.goal,
-                        workspace=run.run_workspace,
-                    ),
+                    "context": run_context,
                     "wait": True,
                     "_approval_mode": "disabled",
                     "_process_override": run.process_defn,
@@ -6523,6 +6654,7 @@ class LoomApp(App):
 
             run_process_name = ""
             goal = ""
+            goal_tokens: list[str] = []
             force_fresh = False
             if arg:
                 try:
@@ -6558,12 +6690,48 @@ class LoomApp(App):
                         )
                         return True
                     break
-                goal = " ".join(tokens[idx:]).strip()
+                goal_tokens = [
+                    str(item or "").strip()
+                    for item in tokens[idx:]
+                    if str(item or "").strip()
+                ]
+                goal = " ".join(goal_tokens).strip()
             else:
                 goal = ""
             if not goal:
                 chat.add_info(self._render_slash_command_usage("/run", "<goal>"))
                 return True
+
+            execution_goal = goal
+            synthesis_goal = goal
+            goal_context_overrides: dict[str, Any] = {}
+            if goal_tokens:
+                (
+                    execution_goal,
+                    synthesis_goal,
+                    goal_context_overrides,
+                    file_goal_error,
+                ) = self._expand_run_goal_file_input(goal_tokens)
+                if file_goal_error:
+                    chat.add_info(
+                        f"[bold #f7768e]{self._escape_markup(file_goal_error)}[/]"
+                    )
+                    return True
+                file_context = goal_context_overrides.get("run_goal_file_input", {})
+                if isinstance(file_context, dict) and file_context:
+                    file_label = self._escape_markup(str(file_context.get("path", "")).strip())
+                    truncated = bool(file_context.get("truncated", False))
+                    max_chars = int(
+                        file_context.get("max_chars", _RUN_GOAL_FILE_CONTENT_MAX_CHARS),
+                    )
+                    trunc_note = (
+                        f" (truncated to {max_chars:,} chars)"
+                        if truncated
+                        else ""
+                    )
+                    chat.add_info(
+                        f"Loaded /run goal file [bold]{file_label}[/bold]{trunc_note}."
+                    )
 
             process_defn = None
             recommended_tools: list[str] = []
@@ -6599,7 +6767,7 @@ class LoomApp(App):
                 else:
                     chat.add_info("Synthesizing ad hoc process for /run goal...")
                     entry, from_cache = await self._get_or_create_adhoc_process(
-                        goal,
+                        synthesis_goal,
                         fresh=force_fresh,
                     )
                     process_defn = entry.process_defn
@@ -6620,7 +6788,7 @@ class LoomApp(App):
                             + ", ".join(sorted(recommended_tools))
                         )
                     cache_key = str(
-                        getattr(entry, "key", "") or self._adhoc_cache_key(goal),
+                        getattr(entry, "key", "") or self._adhoc_cache_key(synthesis_goal),
                     )
                     chat.add_info(
                         "Ad hoc process cache: "
@@ -6644,7 +6812,9 @@ class LoomApp(App):
             }
             if adhoc_synthesis_notes:
                 start_kwargs["adhoc_synthesis_notes"] = adhoc_synthesis_notes
-            await self._start_process_run(goal, **start_kwargs)
+            if goal_context_overrides:
+                start_kwargs["goal_context_overrides"] = goal_context_overrides
+            await self._start_process_run(execution_goal, **start_kwargs)
             return True
 
         process_name = self._process_command_map.get(token)

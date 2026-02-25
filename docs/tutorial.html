@@ -889,6 +889,8 @@
 <span class="cmt"># Activate/switch process at runtime, then force orchestration</span>
 <span class="cmd">/process use</span> investment-analysis
 <span class="cmd">/run</span> Analyze Tesla for investment
+<span class="cmd">/run</span> problem.md
+<span class="cmd">/run</span> @problem.md focus on parser regressions
 
 <span class="cmt"># Resume a previous session</span>
 <span class="cmd">loom</span> <span class="flag">--resume</span> a1b2c3d4
@@ -932,7 +934,8 @@
     <tr><td><code>/process list</code></td><td>List discovered process definitions</td></tr>
     <tr><td><code>/process use &lt;name-or-path&gt;</code></td><td>Activate a process in the current session</td></tr>
     <tr><td><code>/process off</code></td><td>Disable the active process</td></tr>
-    <tr><td><code>/run &lt;goal&gt;</code></td><td>Force orchestration through the active process</td></tr>
+    <tr><td><code>/run &lt;goal&gt;</code></td><td>Force orchestration through the active process (single-token workspace files are treated as goal files)</td></tr>
+    <tr><td><code>/run @&lt;goal-file&gt; [goal]</code></td><td>Explicitly load a workspace goal file, optionally with an inline goal override</td></tr>
     <tr><td><code>/run close [run-id-prefix]</code></td><td>Close/cancel a process-run tab with confirmation</td></tr>
     <tr><td><code>/&lt;process-name&gt; &lt;goal&gt;</code></td><td>Run a discovered process directly without changing the active process</td></tr>
     <tr><td><code>/setup</code></td><td>Reconfigure models and settings</td></tr>
@@ -945,7 +948,7 @@
 
   <div class="callout callout-info">
     <strong>About /run</strong>
-    <code>/run &lt;goal&gt;</code> uses in-process orchestration via <code>delegate_task</code>. You do not need to run <code>loom serve</code> for this flow. Use <code>/run close</code> (or <code>Ctrl+W</code> on a process tab) to cancel and close a running tab.
+    <code>/run &lt;goal&gt;</code> uses in-process orchestration via <code>delegate_task</code>. You do not need to run <code>loom serve</code> for this flow. Use <code>/run problem.md</code> to load a workspace goal file directly, or <code>/run @problem.md optional-goal</code> to provide explicit file input with an inline goal. Use <code>/run close</code> (or <code>Ctrl+W</code> on a process tab) to cancel and close a running tab.
   </div>
 
   <div class="callout callout-info">
@@ -991,9 +994,11 @@
 <span class="cmd">loom</span> <span class="flag">-w</span> /tmp/project <span class="flag">--process</span> consulting-engagement
 
 <span class="cmt"># Inside the TUI: force the active process</span>
-<span class="cmd">/run</span> Analyze Tesla for investment</code></pre>
+<span class="cmd">/run</span> Analyze Tesla for investment
+<span class="cmd">/run</span> problem.md
+<span class="cmd">/run</span> @problem.md focus on parser regressions</code></pre>
 
-  <p>In interactive mode, plain chat stays conversational. Use <code>/run &lt;goal&gt;</code> when you want explicit process orchestration for the active process.</p>
+  <p>In interactive mode, plain chat stays conversational. Use <code>/run &lt;goal&gt;</code> when you want explicit process orchestration for the active process, and use a goal file form when the task spec is too large to type inline.</p>
 
   <h3>Testing a Process Package</h3>
   <pre><code><span class="cmt"># Run all declared deterministic test cases</span>

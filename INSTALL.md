@@ -299,11 +299,14 @@ To run a process from the TUI without starting the API server:
 ```text
 /process use investment-analysis
 /run Analyze Tesla for investment
+/run problem.md
+/run @problem.md focus on parser regressions
 ```
 
 `/run` uses in-process orchestration (`delegate_task`) and does not require
 `loom serve`. Timeout is configurable with
-`[execution].delegate_task_timeout_seconds` in `loom.toml`.
+`[execution].delegate_task_timeout_seconds` in `loom.toml`. Goal files must
+resolve inside the active workspace.
 
 ### Autonomous Task Mode
 

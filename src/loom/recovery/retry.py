@@ -212,6 +212,10 @@ class RetryManager:
             "unsupported_claims_and_incomplete_evidence",
             "insufficient_evidence",
             "recommendation_unconfirmed",
+            "unsupported_claims_no_evidence",
+            "unsupported_entries_remain",
+            "partial_evidence_coverage",
+            "unverified_entries_remaining",
         }
 
         # Prefer structured verification contract when available.
