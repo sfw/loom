@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from typing import Any
@@ -81,11 +82,11 @@ class PortfolioOptimizerTool(Tool):
 
         try:
             if operation == "optimize_mvo":
-                payload = _optimize_mvo(args)
+                payload = await asyncio.to_thread(_optimize_mvo, args)
             elif operation == "optimize_risk_parity":
-                payload = _optimize_risk_parity(args)
+                payload = await asyncio.to_thread(_optimize_risk_parity, args)
             else:
-                payload = _optimize_cvar(args)
+                payload = await asyncio.to_thread(_optimize_cvar, args)
         except Exception as e:
             return ToolResult.fail(str(e))
 
