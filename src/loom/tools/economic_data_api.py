@@ -31,7 +31,7 @@ class EconomicDataApiTool(Tool):
     def description(self) -> str:
         return (
             "Query keyless public economic datasets (World Bank, OECD, Eurostat, "
-            "DBnomics, BLS) with normalized outputs."
+            "DBnomics, BLS, FRED) with normalized outputs."
         )
 
     @property
@@ -47,7 +47,7 @@ class EconomicDataApiTool(Tool):
                 "provider": {
                     "type": "string",
                     "description": (
-                        "Provider name: world_bank, oecd, eurostat, dbnomics, bls."
+                        "Provider name: world_bank, oecd, eurostat, dbnomics, bls, fred."
                     ),
                 },
                 "providers": {
@@ -103,7 +103,8 @@ class EconomicDataApiTool(Tool):
         providers = _normalize_providers(args.get("providers"), args.get("provider"))
         if providers is None:
             return ToolResult.fail(
-                "provider/providers must contain only world_bank/oecd/eurostat/dbnomics/bls"
+                "provider/providers must contain only "
+                "world_bank/oecd/eurostat/dbnomics/bls/fred"
             )
         if not providers:
             providers = ["world_bank"]

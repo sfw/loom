@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import csv
+import html
+import io
 import json
 import os
 import re
@@ -19,9 +22,15 @@ MAX_RESULTS = 100
 MAX_OBSERVATIONS = 2_000
 
 SUPPORTED_ECONOMIC_PROVIDERS = frozenset(
-    {"world_bank", "oecd", "eurostat", "dbnomics", "bls"}
+    {"world_bank", "oecd", "eurostat", "dbnomics", "bls", "fred"}
 )
 _SERIES_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{4,}$")
+_FRED_SERIES_ID_RE = re.compile(r"^[A-Z0-9._-]{1,64}$")
+_FRED_SERIES_LINK_RE = re.compile(
+    r'href="/series/([A-Za-z0-9._-]+)"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 _NULLISH_PAYLOAD_TEXT = frozenset(
     {
         "",
@@ -227,6 +236,8 @@ async def economic_search(
             hits = await _search_oecd(client, query=query, max_results=max_results)
         elif provider == "eurostat":
             hits = await _search_eurostat(client, query=query, max_results=max_results)
+        elif provider == "fred":
+            hits = await _search_fred(client, query=query, max_results=max_results)
         else:
             hits = _search_bls(query=query, max_results=max_results)
         return _dedupe_hits(hits, max_results=max_results)
@@ -303,6 +314,14 @@ async def economic_get_observations(
                 end_period=end_period,
                 max_observations=max_observations,
                 filters=filters,
+            )
+        elif provider == "fred":
+            payload = await _obs_fred(
+                client,
+                series_id=series_id,
+                start_period=start_period,
+                end_period=end_period,
+                max_observations=max_observations,
             )
         else:
             payload = await _obs_bls(
@@ -805,6 +824,153 @@ async def _obs_eurostat(
             "https://ec.europa.eu/eurostat/api/dissemination/"
             f"statistics/1.0/data/{series_id}"
         ),
+        "observations": observations,
+    }
+
+
+def _looks_like_fred_series_id(query: str) -> bool:
+    text = query.strip()
+    if not text:
+        return False
+    candidate = text.upper()
+    if not _FRED_SERIES_ID_RE.match(candidate):
+        return False
+    if any(ch.isdigit() for ch in candidate):
+        return True
+    # Most canonical FRED symbols are compact uppercase tokens (e.g., UNRATE, GDP).
+    return len(candidate) <= 8 and candidate.isalpha()
+
+
+def _strip_html(text: str) -> str:
+    return _HTML_TAG_RE.sub("", text)
+
+
+async def _search_fred(
+    client: httpx.AsyncClient,
+    *,
+    query: str,
+    max_results: int,
+) -> list[dict[str, Any]]:
+    query_text = query.strip()
+    if not query_text:
+        return []
+
+    if _looks_like_fred_series_id(query_text):
+        series_id = query_text.upper()
+        return [
+            {
+                "provider": "fred",
+                "series_id": series_id,
+                "title": f"FRED series {series_id}",
+                "description": "Direct series-id lookup.",
+                "frequency": "",
+                "unit": "",
+                "dataset": "FRED",
+                "source_url": f"https://fred.stlouisfed.org/series/{series_id}",
+            }
+        ][:max_results]
+
+    response = await client.get(
+        "https://fred.stlouisfed.org/searchresults",
+        params={"st": query_text},
+    )
+    response.raise_for_status()
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for series_id_raw, title_html in _FRED_SERIES_LINK_RE.findall(response.text):
+        series_id = series_id_raw.strip().upper()
+        if not _FRED_SERIES_ID_RE.match(series_id):
+            continue
+        if series_id in seen:
+            continue
+        seen.add(series_id)
+        title = html.unescape(_strip_html(title_html)).strip() or series_id
+        rows.append(
+            {
+                "provider": "fred",
+                "series_id": series_id,
+                "title": title,
+                "description": "",
+                "frequency": "",
+                "unit": "",
+                "dataset": "FRED",
+                "source_url": f"https://fred.stlouisfed.org/series/{series_id}",
+            }
+        )
+        if len(rows) >= max_results:
+            break
+    return rows
+
+
+def _normalize_fred_bound(value: str, *, is_end: bool) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{4}", text):
+        return f"{text}-12-31" if is_end else f"{text}-01-01"
+    return text
+
+
+async def _obs_fred(
+    client: httpx.AsyncClient,
+    *,
+    series_id: str,
+    start_period: str,
+    end_period: str,
+    max_observations: int,
+) -> dict[str, Any]:
+    series_symbol = series_id.strip().upper()
+    if not _FRED_SERIES_ID_RE.match(series_symbol):
+        raise EconomicProviderError("Invalid FRED series_id format")
+
+    params: dict[str, str] = {"id": series_symbol}
+    start_bound = _normalize_fred_bound(start_period, is_end=False)
+    end_bound = _normalize_fred_bound(end_period, is_end=True)
+    if start_bound:
+        params["cosd"] = start_bound
+    if end_bound:
+        params["coed"] = end_bound
+
+    response = await client.get(
+        "https://fred.stlouisfed.org/graph/fredgraph.csv",
+        params=params,
+    )
+    response.raise_for_status()
+    csv_text = response.text.lstrip("\ufeff")
+
+    reader = csv.DictReader(io.StringIO(csv_text))
+    fieldnames = [name.strip() for name in (reader.fieldnames or []) if name]
+    if len(fieldnames) < 2 or fieldnames[0].upper() != "DATE":
+        raise EconomicProviderError(f"Unexpected FRED CSV format for series '{series_symbol}'")
+
+    date_key = fieldnames[0]
+    value_key = fieldnames[1]
+    observations: list[dict[str, Any]] = []
+    for row in reader:
+        if not isinstance(row, dict):
+            continue
+        period = _norm_text(row.get(date_key))
+        value = _safe_float(row.get(value_key))
+        if not period or value is None:
+            continue
+        observations.append({"period": period, "value": value})
+
+    observations = _filter_observations(
+        observations,
+        start_period=start_period,
+        end_period=end_period,
+        max_observations=max_observations,
+    )
+    return {
+        "provider": "fred",
+        "series_id": series_symbol,
+        "title": _norm_text(value_key, fallback=series_symbol),
+        "description": "",
+        "dataset": "FRED",
+        "unit": "",
+        "frequency": "",
+        "source_url": f"https://fred.stlouisfed.org/graph/?id={series_symbol}",
         "observations": observations,
     }
 
