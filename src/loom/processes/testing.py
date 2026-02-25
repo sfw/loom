@@ -220,8 +220,31 @@ def _executor_responses(process: ProcessDefinition) -> list[ModelResponse]:
                 tool_calls=tool_calls,
                 usage=_usage(),
             ))
+        completion_text = f"Completed {phase.id}."
+        if phase.is_synthesis:
+            upstream_inputs: list[str] = []
+            for dep_id in phase.depends_on:
+                dep_name = str(dep_id).strip()
+                if not dep_name:
+                    continue
+                dep_files = [
+                    str(path).strip()
+                    for path in deliverables.get(dep_name, [])
+                    if str(path).strip()
+                ]
+                if dep_files:
+                    input_names = ", ".join(Path(path).name for path in dep_files)
+                    upstream_inputs.append(f"{dep_name} ({input_names})")
+                else:
+                    upstream_inputs.append(dep_name)
+            if upstream_inputs:
+                completion_text = (
+                    f"Completed {phase.id} using upstream inputs: "
+                    + "; ".join(upstream_inputs)
+                    + "."
+                )
         responses.append(ModelResponse(
-            text=f"Completed {phase.id}.",
+            text=completion_text,
             usage=_usage(),
         ))
 

@@ -39,11 +39,15 @@ def _make_subtask(
     subtask_id: str = "s1",
     description: str = "Test subtask",
     acceptance_criteria: str = "",
+    depends_on: list[str] | None = None,
+    is_synthesis: bool = False,
 ) -> Subtask:
     return Subtask(
         id=subtask_id,
         description=description,
         acceptance_criteria=acceptance_criteria,
+        depends_on=list(depends_on or []),
+        is_synthesis=bool(is_synthesis),
     )
 
 
@@ -1650,6 +1654,94 @@ class TestDeterministicVerifierDeliverables:
         )
         assert result.passed
         assert not any(c.name.startswith("deliverable_") for c in result.checks)
+
+    @pytest.mark.asyncio
+    async def test_terminal_synthesis_fails_when_upstream_deliverables_missing(
+        self,
+        tmp_path,
+    ):
+        process = _make_process(deliverables={
+            "prep": ["prep.md"],
+            "synth": ["final.md"],
+        })
+        (tmp_path / "final.md").write_text("Final report", encoding="utf-8")
+
+        verifier = DeterministicVerifier(process=process)
+        result = await verifier.verify(
+            _make_subtask(
+                subtask_id="synth",
+                depends_on=["prep"],
+                is_synthesis=True,
+            ),
+            "Composed final output.",
+            [],
+            tmp_path,
+        )
+
+        assert not result.passed
+        failed = {c.name: c for c in result.checks if not c.passed}
+        assert "synthesis_input_ready_prep" in failed
+        assert "prep.md" in (failed["synthesis_input_ready_prep"].detail or "")
+
+    @pytest.mark.asyncio
+    async def test_terminal_synthesis_fails_when_upstream_inputs_not_integrated(
+        self,
+        tmp_path,
+    ):
+        process = _make_process(deliverables={
+            "prep": ["prep.md"],
+            "synth": ["final.md"],
+        })
+        (tmp_path / "prep.md").write_text("Prepared evidence", encoding="utf-8")
+        (tmp_path / "final.md").write_text("Standalone summary", encoding="utf-8")
+
+        verifier = DeterministicVerifier(process=process)
+        result = await verifier.verify(
+            _make_subtask(
+                subtask_id="synth",
+                depends_on=["prep"],
+                is_synthesis=True,
+            ),
+            "Composed final output.",
+            [],
+            tmp_path,
+        )
+
+        assert not result.passed
+        failed = {c.name: c for c in result.checks if not c.passed}
+        assert "synthesis_input_integrated_prep" in failed
+
+    @pytest.mark.asyncio
+    async def test_terminal_synthesis_passes_when_upstream_inputs_integrated(
+        self,
+        tmp_path,
+    ):
+        process = _make_process(deliverables={
+            "prep": ["prep.md"],
+            "synth": ["final.md"],
+        })
+        (tmp_path / "prep.md").write_text("Prepared evidence", encoding="utf-8")
+        (tmp_path / "final.md").write_text(
+            "Final report built from prep.md findings.",
+            encoding="utf-8",
+        )
+
+        verifier = DeterministicVerifier(process=process)
+        result = await verifier.verify(
+            _make_subtask(
+                subtask_id="synth",
+                depends_on=["prep"],
+                is_synthesis=True,
+            ),
+            "Integrated prep.md into final output.",
+            [],
+            tmp_path,
+        )
+
+        assert result.passed
+        names = {c.name for c in result.checks}
+        assert "synthesis_input_ready_prep" in names
+        assert "synthesis_input_integrated_prep" in names
 
 
 class TestDeterministicVerifierSemanticAgnostic:

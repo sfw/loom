@@ -29,6 +29,22 @@ class Scheduler:
         return len(self.runnable_subtasks(plan)) == 0
 
     @staticmethod
+    def _is_terminal_synthesis(plan: Plan, subtask: Subtask) -> bool:
+        """Return True when a synthesis subtask has no dependents.
+
+        Non-terminal synthesis subtasks can create a deadlock when paired with the
+        global synthesis gate. We only apply that gate to terminal sinks.
+        """
+        if not subtask.is_synthesis:
+            return False
+        for candidate in plan.subtasks:
+            if candidate.id == subtask.id:
+                continue
+            if subtask.id in candidate.depends_on:
+                return False
+        return True
+
+    @staticmethod
     def _deps_met(plan: Plan, subtask: Subtask) -> bool:
         """Check if all dependencies are completed."""
         if not subtask.depends_on:
@@ -50,7 +66,8 @@ class Scheduler:
 
         # Synthesis subtasks are "final integration" stages and should only
         # run after all non-synthesis work is complete.
-        if subtask.is_synthesis:
+        # Apply this gate only for terminal synthesis sinks.
+        if Scheduler._is_terminal_synthesis(plan, subtask):
             for candidate in plan.subtasks:
                 if candidate.id == subtask.id or candidate.is_synthesis:
                     continue

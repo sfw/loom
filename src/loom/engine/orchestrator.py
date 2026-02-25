@@ -15,6 +15,7 @@ import csv
 import json
 import logging
 import uuid
+from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -46,10 +47,13 @@ from loom.events.types import (
     TASK_COMPLETED,
     TASK_EXECUTING,
     TASK_FAILED,
+    TASK_PLAN_NORMALIZED,
     TASK_PLAN_READY,
     TASK_PLANNING,
     TASK_REPLAN_REJECTED,
     TASK_REPLANNING,
+    TASK_STALLED,
+    TASK_STALLED_RECOVERY_ATTEMPTED,
     TELEMETRY_RUN_SUMMARY,
     UNCONFIRMED_DATA_QUEUED,
 )
@@ -213,6 +217,12 @@ class Orchestrator:
             plan: Plan
             if reuse_existing_plan and task.plan and task.plan.subtasks:
                 plan = task.plan
+                plan = self._prepare_plan_for_execution(
+                    task=task,
+                    plan=plan,
+                    context="reused_plan",
+                )
+                task.plan = plan
                 task.status = TaskStatus.EXECUTING
                 self._state.save(task)
                 self._emit(TASK_PLAN_READY, task.id, {
@@ -225,7 +235,7 @@ class Orchestrator:
                 task.status = TaskStatus.PLANNING
                 self._emit(TASK_PLANNING, task.id, {"goal": task.goal})
 
-                plan = await self._plan_task(task)
+                plan = await self._plan_task_with_validation(task)
                 task.plan = plan
                 task.status = TaskStatus.EXECUTING
                 self._state.save(task)
@@ -241,6 +251,8 @@ class Orchestrator:
             max_parallel = self._config.execution.max_parallel_subtasks
             attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
             pending_replan: dict[str, str | None] | None = None
+            stall_recovery_attempts = 0
+            max_stall_recovery_attempts = 2
 
             while self._scheduler.has_pending(task.plan) and iteration < max_iterations:
                 if task.status == TaskStatus.CANCELLED:
@@ -249,7 +261,31 @@ class Orchestrator:
                 # Get all runnable subtasks (dependencies met)
                 runnable = self._scheduler.runnable_subtasks(task.plan)
                 if not runnable:
+                    blocked_subtasks = self._blocked_pending_subtasks(task.plan)
+                    self._emit(TASK_STALLED, task.id, {
+                        "pending_subtasks": [
+                            item["subtask_id"] for item in blocked_subtasks
+                        ],
+                        "blocked_subtasks": blocked_subtasks,
+                        "attempt": stall_recovery_attempts + 1,
+                    })
+                    recovered = False
+                    if (
+                        task.status == TaskStatus.EXECUTING
+                        and stall_recovery_attempts < max_stall_recovery_attempts
+                    ):
+                        stall_recovery_attempts += 1
+                        recovered = await self._attempt_stalled_recovery(
+                            task=task,
+                            blocked_subtasks=blocked_subtasks,
+                            attempt=stall_recovery_attempts,
+                        )
+                    if recovered:
+                        continue
+                    task.metadata["blocked_subtasks"] = blocked_subtasks
                     break
+                stall_recovery_attempts = 0
+                task.metadata.pop("blocked_subtasks", None)
 
                 # Cap to max_parallel_subtasks
                 batch = runnable[:max_parallel]
@@ -702,6 +738,342 @@ class Orchestrator:
                 ),
             )
             self._state.save(task)
+
+    def _phase_mode(self) -> str:
+        process = self._process
+        if process is None:
+            return "guided"
+        value = str(getattr(process, "phase_mode", "guided") or "").strip().lower()
+        if value in {"strict", "guided", "suggestive"}:
+            return value
+        return "guided"
+
+    def _topology_retry_attempts(self) -> int:
+        """Bounded retry budget for topology-invalid planner outputs."""
+        return 2 if self._phase_mode() == "strict" else 1
+
+    async def _plan_task_with_validation(self, task: Task) -> Plan:
+        """Plan task with bounded retries when topology validation fails."""
+        max_attempts = self._topology_retry_attempts()
+        planner_feedback = ""
+        last_error = ""
+
+        for attempt in range(1, max_attempts + 1):
+            plan = await self._plan_task(task, planner_feedback=planner_feedback)
+            try:
+                return self._prepare_plan_for_execution(
+                    task=task,
+                    plan=plan,
+                    context="planner",
+                )
+            except ValueError as e:
+                last_error = str(e).strip() or "unknown topology validation error"
+                task.add_decision(
+                    "Rejected planner output due to invalid topology "
+                    f"(attempt {attempt}/{max_attempts}): {last_error}",
+                )
+                self._state.save(task)
+                if attempt >= max_attempts:
+                    break
+                planner_feedback = (
+                    "Previous planner output was rejected for invalid topology.\n"
+                    f"Validation error: {last_error}\n"
+                    "Return corrected JSON that satisfies all dependency and "
+                    "synthesis-topology constraints."
+                )
+
+        raise ValueError(last_error or "Planner output failed topology validation.")
+
+    def _prepare_plan_for_execution(
+        self,
+        *,
+        task: Task,
+        plan: Plan,
+        context: str,
+    ) -> Plan:
+        """Normalize and validate planner output before execution."""
+        working = deepcopy(plan)
+        normalized_plan, normalized_subtasks = self._normalize_non_terminal_synthesis(
+            working,
+        )
+        if normalized_subtasks:
+            if self._phase_mode() == "strict":
+                details = ", ".join(
+                    str(item.get("subtask_id", "")).strip()
+                    for item in normalized_subtasks
+                    if str(item.get("subtask_id", "")).strip()
+                )
+                raise ValueError(
+                    "Strict phase mode does not allow non-terminal synthesis subtasks "
+                    f"in {context}: {details or 'unknown'}",
+                )
+            working = normalized_plan
+            self._emit(TASK_PLAN_NORMALIZED, task.id, {
+                "context": context,
+                "normalized_subtasks": normalized_subtasks,
+                "plan_version": int(working.version),
+            })
+
+        topology_issues = self._plan_topology_issues(working)
+        if topology_issues:
+            raise ValueError(
+                f"Invalid plan topology from {context}: " + "; ".join(topology_issues),
+            )
+        return working
+
+    @staticmethod
+    def _normalize_non_terminal_synthesis(
+        plan: Plan,
+    ) -> tuple[Plan, list[dict[str, object]]]:
+        """Demote synthesis flags on non-terminal subtasks."""
+        normalized = deepcopy(plan)
+        dependents: dict[str, list[str]] = {}
+        for subtask in normalized.subtasks:
+            for dep_id in subtask.depends_on:
+                dependents.setdefault(dep_id, []).append(subtask.id)
+
+        changes: list[dict[str, object]] = []
+        for subtask in normalized.subtasks:
+            if not subtask.is_synthesis:
+                continue
+            child_ids = sorted({
+                child
+                for child in dependents.get(subtask.id, [])
+                if child != subtask.id
+            })
+            if not child_ids:
+                continue
+            subtask.is_synthesis = False
+            changes.append({
+                "subtask_id": subtask.id,
+                "reason": "non_terminal_synthesis",
+                "dependents": child_ids,
+            })
+        return normalized, changes
+
+    @classmethod
+    def _plan_topology_issues(cls, plan: Plan) -> list[str]:
+        """Return deterministic topology issues for a plan graph."""
+        issues: list[str] = []
+        ids = [subtask.id for subtask in plan.subtasks]
+        id_set = set(ids)
+
+        if len(ids) != len(id_set):
+            duplicates: list[str] = []
+            seen: set[str] = set()
+            for subtask_id in ids:
+                if subtask_id in seen and subtask_id not in duplicates:
+                    duplicates.append(subtask_id)
+                seen.add(subtask_id)
+            duplicates.sort()
+            issues.append("duplicate subtask IDs: " + ", ".join(duplicates))
+
+        unresolved_deps: list[str] = []
+        for subtask in plan.subtasks:
+            bad = sorted(dep for dep in subtask.depends_on if dep not in id_set)
+            if bad:
+                unresolved_deps.append(f"{subtask.id} -> {', '.join(bad)}")
+        if unresolved_deps:
+            issues.append("unresolved dependencies: " + "; ".join(unresolved_deps))
+
+        adjacency: dict[str, list[str]] = {}
+        for subtask in plan.subtasks:
+            adjacency[subtask.id] = [
+                dep for dep in subtask.depends_on
+                if dep in id_set
+            ]
+        cycle = cls._detect_dependency_cycle(adjacency)
+        if cycle:
+            issues.append("dependency cycle detected: " + " -> ".join(cycle))
+
+        dependents: dict[str, list[str]] = {}
+        for subtask in plan.subtasks:
+            for dep in subtask.depends_on:
+                if dep in id_set:
+                    dependents.setdefault(dep, []).append(subtask.id)
+
+        synthesis_ids = {
+            subtask.id for subtask in plan.subtasks if bool(subtask.is_synthesis)
+        }
+        for synthesis_id in sorted(synthesis_ids):
+            child_ids = sorted({
+                child
+                for child in dependents.get(synthesis_id, [])
+                if child != synthesis_id
+            })
+            if child_ids:
+                issues.append(
+                    "synthesis subtask has dependents: "
+                    + f"{synthesis_id} -> {', '.join(child_ids)}",
+                )
+
+        for subtask in plan.subtasks:
+            if subtask.is_synthesis:
+                continue
+            bad = sorted(dep for dep in subtask.depends_on if dep in synthesis_ids)
+            if bad:
+                issues.append(
+                    "non-synthesis subtask depends on synthesis subtask: "
+                    + f"{subtask.id} -> {', '.join(bad)}",
+                )
+
+        return issues
+
+    @staticmethod
+    def _detect_dependency_cycle(
+        adjacency: dict[str, list[str]],
+    ) -> list[str] | None:
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        stack: list[str] = []
+
+        def _walk(node: str) -> list[str] | None:
+            visiting.add(node)
+            stack.append(node)
+            for neighbor in adjacency.get(node, []):
+                if neighbor in visited:
+                    continue
+                if neighbor in visiting:
+                    start = stack.index(neighbor)
+                    return stack[start:] + [neighbor]
+                cycle = _walk(neighbor)
+                if cycle:
+                    return cycle
+            stack.pop()
+            visiting.remove(node)
+            visited.add(node)
+            return None
+
+        for node in adjacency:
+            if node in visited:
+                continue
+            cycle = _walk(node)
+            if cycle:
+                return cycle
+        return None
+
+    @staticmethod
+    def _format_blocked_subtasks_feedback(blocked_subtasks: list[dict[str, object]]) -> str:
+        if not blocked_subtasks:
+            return "No blocked subtasks were identified."
+        lines = ["Blocked subtasks:"]
+        for item in blocked_subtasks:
+            subtask_id = str(item.get("subtask_id", "")).strip() or "unknown"
+            raw_reasons = item.get("reasons", [])
+            if isinstance(raw_reasons, list):
+                reasons = [
+                    str(reason).strip()
+                    for reason in raw_reasons
+                    if str(reason).strip()
+                ]
+            else:
+                reason_text = str(raw_reasons).strip()
+                reasons = [reason_text] if reason_text else []
+            lines.append(f"- {subtask_id}: {', '.join(reasons) if reasons else 'blocked'}")
+        return "\n".join(lines)
+
+    def _blocked_pending_subtasks(self, plan: Plan) -> list[dict[str, object]]:
+        """Return blocked reasons for pending/running subtasks."""
+        by_id = {subtask.id: subtask for subtask in plan.subtasks}
+        blocked: list[dict[str, object]] = []
+
+        for subtask in plan.subtasks:
+            if subtask.status not in {
+                SubtaskStatus.PENDING,
+                SubtaskStatus.RUNNING,
+            }:
+                continue
+            reasons: list[str] = []
+            if subtask.status == SubtaskStatus.RUNNING:
+                reasons.append("status=running")
+
+            for dep_id in subtask.depends_on:
+                dep = by_id.get(dep_id)
+                if dep is None:
+                    reasons.append(f"dependency_missing:{dep_id}")
+                elif dep.status != SubtaskStatus.COMPLETED:
+                    reasons.append(f"dependency_unmet:{dep_id}={dep.status.value}")
+
+            if (
+                not reasons
+                and subtask.status == SubtaskStatus.PENDING
+                and Scheduler._is_terminal_synthesis(plan, subtask)
+            ):
+                waiting: list[str] = []
+                for candidate in plan.subtasks:
+                    if candidate.id == subtask.id or candidate.is_synthesis:
+                        continue
+                    if candidate.status != SubtaskStatus.COMPLETED:
+                        waiting.append(f"{candidate.id}={candidate.status.value}")
+                if waiting:
+                    reasons.append(
+                        "synthesis_waiting_on_non_synthesis:" + ", ".join(waiting),
+                    )
+
+            if not reasons:
+                reasons.append("not_runnable_unknown")
+
+            blocked.append({
+                "subtask_id": subtask.id,
+                "reasons": reasons,
+            })
+
+        return blocked
+
+    async def _attempt_stalled_recovery(
+        self,
+        *,
+        task: Task,
+        blocked_subtasks: list[dict[str, object]],
+        attempt: int,
+    ) -> bool:
+        """Try bounded recovery when pending work is blocked."""
+        normalized_plan, normalized_subtasks = self._normalize_non_terminal_synthesis(
+            task.plan,
+        )
+        if normalized_subtasks and self._phase_mode() != "strict":
+            task.plan = normalized_plan
+            task.metadata.pop("blocked_subtasks", None)
+            task.add_decision(
+                "Recovered from scheduler stall by demoting non-terminal synthesis subtasks.",
+            )
+            async with self._state_lock:
+                self._state.save(task)
+            self._emit(TASK_PLAN_NORMALIZED, task.id, {
+                "context": "stalled_recovery",
+                "normalized_subtasks": normalized_subtasks,
+                "plan_version": int(task.plan.version),
+            })
+            self._emit(TASK_STALLED_RECOVERY_ATTEMPTED, task.id, {
+                "attempt": attempt,
+                "recovery_mode": "normalize",
+                "recovery_success": True,
+                "normalized_subtasks": normalized_subtasks,
+            })
+            return True
+
+        if normalized_subtasks and self._phase_mode() == "strict":
+            self._emit(TASK_STALLED_RECOVERY_ATTEMPTED, task.id, {
+                "attempt": attempt,
+                "recovery_mode": "normalize",
+                "recovery_success": False,
+                "reason": "strict_phase_mode_disallows_normalization",
+                "normalized_subtasks": normalized_subtasks,
+            })
+
+        feedback = self._format_blocked_subtasks_feedback(blocked_subtasks)
+        replanned = await self._replan_task(
+            task,
+            reason="scheduler_deadlock",
+            failed_subtask_id="",
+            verification_feedback=feedback,
+        )
+        self._emit(TASK_STALLED_RECOVERY_ATTEMPTED, task.id, {
+            "attempt": attempt,
+            "recovery_mode": "replan",
+            "recovery_success": bool(replanned),
+        })
+        return bool(replanned)
 
     def _critical_path_behavior(self) -> str:
         process = self._process
@@ -1855,7 +2227,12 @@ class Orchestrator:
     # Planning
     # ------------------------------------------------------------------
 
-    async def _plan_task(self, task: Task) -> Plan:
+    async def _plan_task(
+        self,
+        task: Task,
+        *,
+        planner_feedback: str = "",
+    ) -> Plan:
         """Invoke the planner model to decompose the task into subtasks."""
         workspace_listing = ""
         code_analysis = ""
@@ -1912,6 +2289,13 @@ class Orchestrator:
             code_analysis=code_analysis,
             workspace_analysis=workspace_analysis,
         )
+        planner_feedback_text = str(planner_feedback or "").strip()
+        if planner_feedback_text:
+            prompt = (
+                f"{prompt}\n\nPLANNER RETRY FEEDBACK:\n"
+                f"{planner_feedback_text}\n"
+                "Return corrected JSON only."
+            )
 
         model = self._router.select(tier=2, role="planner")
         request_messages = [{"role": "user", "content": prompt}]
@@ -2205,119 +2589,185 @@ class Orchestrator:
 
         try:
             state_yaml = self._state.to_compact_yaml(task)
-            prompt = self._prompts.build_replanner_prompt(
-                goal=task.goal,
-                current_state_yaml=state_yaml,
-                discoveries=discoveries,
-                errors=errors,
-                original_plan=task.plan,
-                replan_reason=reason,
-            )
-
             model = self._router.select(tier=2, role="planner")
-            request_messages = [{"role": "user", "content": prompt}]
             policy = ModelRetryPolicy.from_execution_config(self._config.execution)
-            invocation_attempt = 0
-            request_diag = None
+            max_structural_attempts = self._topology_retry_attempts()
+            topology_feedback = ""
 
-            async def _invoke_replanner():
-                nonlocal invocation_attempt, request_diag
-                invocation_attempt += 1
-                request_diag = collect_request_diagnostics(
-                    messages=request_messages,
-                    origin="orchestrator.replan_task.complete",
+            for structural_attempt in range(1, max_structural_attempts + 1):
+                prompt = self._prompts.build_replanner_prompt(
+                    goal=task.goal,
+                    current_state_yaml=state_yaml,
+                    discoveries=discoveries,
+                    errors=errors,
+                    original_plan=task.plan,
+                    replan_reason=reason,
                 )
-                self._emit(MODEL_INVOCATION, task.id, {
-                    "subtask_id": failed_subtask_id or "replanning",
-                    "model": model.name,
-                    "phase": "start",
-                    "operation": "complete",
-                    "invocation_attempt": invocation_attempt,
-                    "invocation_max_attempts": policy.max_attempts,
-                    **request_diag.to_event_payload(),
-                })
-                return await model.complete(
-                    request_messages,
-                    max_tokens=self._planning_response_max_tokens(),
-                )
+                feedback_parts: list[str] = []
+                base_feedback = str(verification_feedback or "").strip()
+                if base_feedback:
+                    feedback_parts.append(base_feedback)
+                if topology_feedback:
+                    feedback_parts.append(topology_feedback)
+                if feedback_parts:
+                    prompt = (
+                        f"{prompt}\n\nREPLANNER FEEDBACK:\n"
+                        + "\n\n".join(feedback_parts)
+                        + "\n\nReturn corrected JSON only."
+                    )
 
-            def _on_replanner_failure(
-                attempt: int,
-                max_attempts: int,
-                error: BaseException,
-                remaining: int,
-            ) -> None:
+                request_messages = [{"role": "user", "content": prompt}]
+                invocation_attempt = 0
+                request_diag = None
+
+                async def _invoke_replanner():
+                    nonlocal invocation_attempt, request_diag
+                    invocation_attempt += 1
+                    request_diag = collect_request_diagnostics(
+                        messages=request_messages,
+                        origin="orchestrator.replan_task.complete",
+                    )
+                    self._emit(MODEL_INVOCATION, task.id, {
+                        "subtask_id": failed_subtask_id or "replanning",
+                        "model": model.name,
+                        "phase": "start",
+                        "operation": "complete",
+                        "invocation_attempt": invocation_attempt,
+                        "invocation_max_attempts": policy.max_attempts,
+                        "structural_attempt": structural_attempt,
+                        "structural_max_attempts": max_structural_attempts,
+                        **request_diag.to_event_payload(),
+                    })
+                    return await model.complete(
+                        request_messages,
+                        max_tokens=self._planning_response_max_tokens(),
+                    )
+
+                def _on_replanner_failure(
+                    attempt: int,
+                    max_attempts: int,
+                    error: BaseException,
+                    remaining: int,
+                ) -> None:
+                    self._emit(MODEL_INVOCATION, task.id, {
+                        "subtask_id": failed_subtask_id or "replanning",
+                        "model": model.name,
+                        "phase": "done",
+                        "operation": "complete",
+                        "invocation_attempt": attempt,
+                        "invocation_max_attempts": max_attempts,
+                        "retry_queue_remaining": remaining,
+                        "origin": request_diag.origin if request_diag else "",
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "structural_attempt": structural_attempt,
+                        "structural_max_attempts": max_structural_attempts,
+                    })
+
+                response = await call_with_model_retry(
+                    _invoke_replanner,
+                    policy=policy,
+                    on_failure=_on_replanner_failure,
+                )
                 self._emit(MODEL_INVOCATION, task.id, {
                     "subtask_id": failed_subtask_id or "replanning",
                     "model": model.name,
                     "phase": "done",
                     "operation": "complete",
-                    "invocation_attempt": attempt,
-                    "invocation_max_attempts": max_attempts,
-                    "retry_queue_remaining": remaining,
+                    "invocation_attempt": invocation_attempt,
+                    "invocation_max_attempts": policy.max_attempts,
                     "origin": request_diag.origin if request_diag else "",
-                    "error_type": type(error).__name__,
-                    "error": str(error),
+                    "structural_attempt": structural_attempt,
+                    "structural_max_attempts": max_structural_attempts,
+                    **collect_response_diagnostics(response).to_event_payload(),
                 })
-
-            response = await call_with_model_retry(
-                _invoke_replanner,
-                policy=policy,
-                on_failure=_on_replanner_failure,
-            )
-            self._emit(MODEL_INVOCATION, task.id, {
-                "subtask_id": failed_subtask_id or "replanning",
-                "model": model.name,
-                "phase": "done",
-                "operation": "complete",
-                "invocation_attempt": invocation_attempt,
-                "invocation_max_attempts": policy.max_attempts,
-                "origin": request_diag.origin if request_diag else "",
-                **collect_response_diagnostics(response).to_event_payload(),
-            })
-            new_plan = self._apply_process_phase_mode(
-                self._parse_plan(response, goal=task.goal),
-            )
-            validation_error = self._validate_replan_contract(
-                current_plan=task.plan,
-                replanned_plan=new_plan,
-            )
-            if validation_error:
-                self._emit(TASK_REPLAN_REJECTED, task.id, {
-                    "failed_subtask_id": failed_subtask_id,
-                    "reason": reason,
-                    "validation_error": validation_error,
-                    "old_subtask_ids": [s.id for s in task.plan.subtasks],
-                    "new_subtask_ids": [s.id for s in new_plan.subtasks],
-                })
-                task.add_decision(
-                    f"Rejected replanned plan: {validation_error}",
+                parsed_plan = self._apply_process_phase_mode(
+                    self._parse_plan(response, goal=task.goal),
                 )
+                new_plan = parsed_plan
+                topology_error = ""
+                try:
+                    new_plan = self._prepare_plan_for_execution(
+                        task=task,
+                        plan=parsed_plan,
+                        context="replanner",
+                    )
+                except ValueError as e:
+                    topology_error = str(e).strip() or "invalid replanned topology"
+
+                if topology_error:
+                    self._emit(TASK_REPLAN_REJECTED, task.id, {
+                        "failed_subtask_id": failed_subtask_id,
+                        "reason": reason,
+                        "validation_error": topology_error,
+                        "old_subtask_ids": [s.id for s in task.plan.subtasks],
+                        "new_subtask_ids": [s.id for s in parsed_plan.subtasks],
+                        "attempt": structural_attempt,
+                        "max_attempts": max_structural_attempts,
+                    })
+                    task.add_decision(f"Rejected replanned plan: {topology_error}")
+                    self._state.save(task)
+                    if structural_attempt >= max_structural_attempts:
+                        return False
+                    topology_feedback = (
+                        "Previous replanned plan was rejected for invalid topology.\n"
+                        f"Validation error: {topology_error}\n"
+                        "Return corrected JSON that preserves existing IDs and "
+                        "satisfies all dependency and synthesis-topology constraints."
+                    )
+                    continue
+
+                validation_error = self._validate_replan_contract(
+                    current_plan=task.plan,
+                    replanned_plan=new_plan,
+                )
+                if validation_error:
+                    self._emit(TASK_REPLAN_REJECTED, task.id, {
+                        "failed_subtask_id": failed_subtask_id,
+                        "reason": reason,
+                        "validation_error": validation_error,
+                        "old_subtask_ids": [s.id for s in task.plan.subtasks],
+                        "new_subtask_ids": [s.id for s in new_plan.subtasks],
+                        "attempt": structural_attempt,
+                        "max_attempts": max_structural_attempts,
+                    })
+                    task.add_decision(
+                        f"Rejected replanned plan: {validation_error}",
+                    )
+                    self._state.save(task)
+                    if structural_attempt >= max_structural_attempts:
+                        return False
+                    topology_feedback = (
+                        "Previous replanned plan violated contract constraints.\n"
+                        f"Validation error: {validation_error}\n"
+                        "Preserve all existing subtask IDs and provide valid dependencies."
+                    )
+                    continue
+
+                # Preserve completed subtask state
+                completed_ids = {
+                    s.id for s in task.plan.subtasks
+                    if s.status == SubtaskStatus.COMPLETED
+                }
+                new_plan.version = task.plan.version + 1
+                new_plan.last_replanned = datetime.now().isoformat()
+
+                for s in new_plan.subtasks:
+                    if s.id in completed_ids:
+                        s.status = SubtaskStatus.COMPLETED
+
+                task.plan = new_plan
                 self._state.save(task)
-                return False
 
-            # Preserve completed subtask state
-            completed_ids = {
-                s.id for s in task.plan.subtasks
-                if s.status == SubtaskStatus.COMPLETED
-            }
-            new_plan.version = task.plan.version + 1
-            new_plan.last_replanned = datetime.now().isoformat()
+                self._emit(TASK_PLAN_READY, task.id, {
+                    "subtask_count": len(new_plan.subtasks),
+                    "version": new_plan.version,
+                    "replanned": True,
+                    "subtask_ids": [s.id for s in new_plan.subtasks],
+                })
+                return True
 
-            for s in new_plan.subtasks:
-                if s.id in completed_ids:
-                    s.status = SubtaskStatus.COMPLETED
-
-            task.plan = new_plan
-            self._state.save(task)
-
-            self._emit(TASK_PLAN_READY, task.id, {
-                "subtask_count": len(new_plan.subtasks),
-                "version": new_plan.version,
-                "replanned": True,
-                "subtask_ids": [s.id for s in new_plan.subtasks],
-            })
-            return True
+            return False
 
         except Exception as e:
             task.add_error("replanner", str(e))
@@ -2365,6 +2815,10 @@ class Orchestrator:
                 unresolved_deps.append(f"{subtask.id} -> {', '.join(bad)}")
         if unresolved_deps:
             return "replanned plan contains unresolved dependencies: " + "; ".join(unresolved_deps)
+
+        topology_issues = Orchestrator._plan_topology_issues(replanned_plan)
+        if topology_issues:
+            return "replanned plan has invalid topology: " + "; ".join(topology_issues)
 
         return None
 
@@ -2607,6 +3061,30 @@ class Orchestrator:
         """Finalize task: set status, emit events."""
         completed, total = task.progress
         blocking_remediation_failures: list[str] = []
+        blocked_subtasks: list[dict[str, object]] = []
+        raw_blocked_subtasks = task.metadata.get("blocked_subtasks")
+        if isinstance(raw_blocked_subtasks, list):
+            for item in raw_blocked_subtasks:
+                if not isinstance(item, dict):
+                    continue
+                subtask_id = str(item.get("subtask_id", "")).strip()
+                raw_reasons = item.get("reasons", [])
+                reasons: list[str] = []
+                if isinstance(raw_reasons, list):
+                    for reason in raw_reasons:
+                        text = str(reason).strip()
+                        if text:
+                            reasons.append(text)
+                else:
+                    text = str(raw_reasons).strip()
+                    if text:
+                        reasons.append(text)
+                if not subtask_id:
+                    continue
+                blocked_subtasks.append({
+                    "subtask_id": subtask_id,
+                    "reasons": reasons,
+                })
         queue = task.metadata.get("remediation_queue")
         if isinstance(queue, list):
             for item in queue:
@@ -2655,11 +3133,22 @@ class Orchestrator:
                     "Blocking remediation unresolved for: "
                     + ", ".join(blocking_remediation_failures),
                 )
+            if blocked_subtasks:
+                labels = ", ".join(
+                    entry["subtask_id"] for entry in blocked_subtasks
+                    if isinstance(entry, dict) and entry.get("subtask_id")
+                )
+                task.add_error(
+                    "scheduler",
+                    "Execution stalled with blocked pending subtasks: "
+                    + (labels or "unknown"),
+                )
             self._emit(TASK_FAILED, task.id, {
                 "completed": completed,
                 "total": total,
                 "failed_subtasks": [s.id for s in failed],
                 "blocking_remediation_failures": blocking_remediation_failures,
+                "blocked_subtasks": blocked_subtasks,
             })
 
         self._emit_telemetry_run_summary(task)

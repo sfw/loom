@@ -294,6 +294,14 @@ class DeterministicVerifier:
                             if not found_file else None
                         ),
                     ))
+            checks.extend(
+                self._synthesis_input_integrity_checks(
+                    subtask=subtask,
+                    result_summary=result_summary,
+                    tool_calls=tool_calls,
+                    workspace=workspace,
+                ),
+            )
 
         # NOTE: Tier 1 remains process-agnostic by design. Semantic, domain-
         # specific quality checks are handled by Tier 2/3 LLM verification.
@@ -463,6 +471,176 @@ class DeterministicVerifier:
             "response too large",
         )
         return any(marker in text for marker in advisory_markers)
+
+    @classmethod
+    def _flatten_text_values(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if isinstance(value, (int, float, bool)):
+            return [str(value)]
+        if isinstance(value, dict):
+            pieces: list[str] = []
+            for key in sorted(value.keys(), key=lambda item: str(item)):
+                pieces.extend(cls._flatten_text_values(key))
+                pieces.extend(cls._flatten_text_values(value.get(key)))
+            return pieces
+        if isinstance(value, (list, tuple, set)):
+            pieces: list[str] = []
+            for item in value:
+                pieces.extend(cls._flatten_text_values(item))
+            return pieces
+        text = str(value).strip()
+        return [text] if text else []
+
+    @staticmethod
+    def _read_text_file_if_small(path: Path, *, max_bytes: int = 300_000) -> str:
+        try:
+            if not path.exists() or not path.is_file():
+                return ""
+            if path.stat().st_size > max_bytes:
+                return ""
+            return path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def _synthesis_reference_haystack(
+        self,
+        *,
+        subtask: Subtask,
+        result_summary: str,
+        tool_calls: list,
+        workspace: Path | None,
+    ) -> str:
+        pieces: list[str] = []
+        summary = str(result_summary or "").strip()
+        if summary:
+            pieces.append(summary)
+
+        for tc in tool_calls:
+            tool_name = str(getattr(tc, "tool", "") or "").strip()
+            if tool_name:
+                pieces.append(tool_name)
+            args = getattr(tc, "args", {})
+            pieces.extend(self._flatten_text_values(args))
+            result = getattr(tc, "result", None)
+            changed = getattr(result, "files_changed", [])
+            if isinstance(changed, list):
+                pieces.extend(
+                    str(item).strip()
+                    for item in changed
+                    if str(item).strip()
+                )
+
+        if workspace is not None:
+            expected_current = self._expected_deliverables_for_subtask(subtask)
+            for rel_path in expected_current:
+                text = self._read_text_file_if_small(workspace / rel_path)
+                if text:
+                    pieces.append(text[:60_000])
+
+        return "\n".join(pieces).lower()
+
+    def _synthesis_input_integrity_checks(
+        self,
+        *,
+        subtask: Subtask,
+        result_summary: str,
+        tool_calls: list,
+        workspace: Path | None,
+    ) -> list[Check]:
+        """Verify synthesis subtasks integrate declared upstream preparation."""
+        if not self._process or not subtask.is_synthesis or workspace is None:
+            return []
+        dependency_ids = [
+            str(dep).strip()
+            for dep in subtask.depends_on
+            if str(dep).strip()
+        ]
+        if not dependency_ids:
+            return []
+
+        deliverables = self._process.get_deliverables()
+        if not deliverables:
+            return []
+
+        dependency_inputs: dict[str, list[str]] = {}
+        for dep_id in dependency_ids:
+            raw_paths = deliverables.get(dep_id, [])
+            if not isinstance(raw_paths, list):
+                continue
+            paths: list[str] = []
+            for item in raw_paths:
+                text = str(item).strip()
+                if text and text not in paths:
+                    paths.append(text)
+            if paths:
+                dependency_inputs[dep_id] = paths
+        if not dependency_inputs:
+            return []
+
+        checks: list[Check] = []
+        available_inputs: dict[str, list[str]] = {}
+        for dep_id, rel_paths in dependency_inputs.items():
+            existing: list[str] = []
+            missing: list[str] = []
+            for rel_path in rel_paths:
+                path = workspace / rel_path
+                try:
+                    if path.exists() and path.is_file() and path.stat().st_size > 0:
+                        existing.append(rel_path)
+                    else:
+                        missing.append(rel_path)
+                except OSError:
+                    missing.append(rel_path)
+            if existing:
+                available_inputs[dep_id] = existing
+                checks.append(Check(
+                    name=f"synthesis_input_ready_{dep_id}",
+                    passed=True,
+                ))
+                continue
+            checks.append(Check(
+                name=f"synthesis_input_ready_{dep_id}",
+                passed=False,
+                detail=(
+                    "Missing non-empty upstream deliverables for "
+                    f"'{dep_id}': {', '.join(missing) if missing else 'unknown'}"
+                ),
+            ))
+
+        if not available_inputs:
+            return checks
+
+        haystack = self._synthesis_reference_haystack(
+            subtask=subtask,
+            result_summary=result_summary,
+            tool_calls=tool_calls,
+            workspace=workspace,
+        )
+        for dep_id, rel_paths in available_inputs.items():
+            signals: list[str] = [dep_id.lower()]
+            for rel_path in rel_paths:
+                lowered = rel_path.lower()
+                if lowered not in signals:
+                    signals.append(lowered)
+                basename = Path(rel_path).name.lower()
+                if basename and basename not in signals:
+                    signals.append(basename)
+            integrated = any(signal in haystack for signal in signals if signal)
+            checks.append(Check(
+                name=f"synthesis_input_integrated_{dep_id}",
+                passed=integrated,
+                detail=(
+                    "Synthesis output did not reference upstream dependency "
+                    f"'{dep_id}' ({', '.join(rel_paths)})."
+                    if not integrated else None
+                ),
+            ))
+
+        return checks
 
     @staticmethod
     def _build_feedback(checks: list[Check]) -> str:

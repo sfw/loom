@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 
 import pytest
 
+from loom.research.finance import generate_weight_grid
 from loom.tools.factor_exposure_engine import FactorExposureEngineTool
 from loom.tools.filing_event_parser import FilingEventParserTool
 from loom.tools.macro_regime_engine import MacroRegimeEngineTool
@@ -290,6 +292,16 @@ class TestOpportunityRankerTool:
 
 
 class TestPortfolioOptimizerTool:
+    def test_generate_weight_grid_is_lazy_and_capped(self):
+        assets = [f"A{i}" for i in range(12)]
+        grid = generate_weight_grid(assets, step=0.1, max_portfolios=25)
+        assert not isinstance(grid, list)
+
+        sample = list(itertools.islice(grid, 25))
+        assert len(sample) == 25
+        for weights in sample:
+            assert abs(sum(weights.values()) - 1.0) < 1e-9
+
     async def test_optimize_mvo(self, ctx: ToolContext):
         tool = PortfolioOptimizerTool()
         result = await tool.execute(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 import math
 from collections.abc import Iterable
 from statistics import mean, pstdev
@@ -253,24 +252,41 @@ def generate_weight_grid(
     max_portfolios: int = 50_000,
 ) -> Iterable[dict[str, float]]:
     if not assets:
-        return []
+        return ()
     if len(assets) == 1:
-        return [{assets[0]: 1.0}]
+        return ({assets[0]: 1.0},)
 
     step = clamp(step, 0.01, 1.0)
     buckets = max(1, int(round(1.0 / step)))
-    out: list[dict[str, float]] = []
+    limit = max(1, int(max_portfolios))
+    asset_count = len(assets)
 
-    # Enumerate integer partitions of `buckets` over N assets.
-    ranges = [range(0, buckets + 1) for _ in assets]
-    for combo in itertools.product(*ranges):
-        if sum(combo) != buckets:
-            continue
-        weights = {assets[i]: combo[i] / float(buckets) for i in range(len(assets))}
-        out.append(weights)
-        if len(out) >= max_portfolios:
-            break
-    return out
+    def _iter() -> Iterable[dict[str, float]]:
+        produced = 0
+        combo = [0] * asset_count
+
+        def _walk(index: int, remaining: int) -> Iterable[dict[str, float]]:
+            nonlocal produced
+            if produced >= limit:
+                return
+            if index == asset_count - 1:
+                combo[index] = remaining
+                produced += 1
+                yield {
+                    assets[i]: combo[i] / float(buckets)
+                    for i in range(asset_count)
+                }
+                return
+
+            for value in range(remaining + 1):
+                if produced >= limit:
+                    break
+                combo[index] = value
+                yield from _walk(index + 1, remaining - value)
+
+        yield from _walk(0, buckets)
+
+    return _iter()
 
 
 def percentile(values: list[float], p: float) -> float:

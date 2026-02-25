@@ -139,6 +139,16 @@ class TestSchedulerRunnableSubtasks:
         runnable = scheduler.runnable_subtasks(plan)
         assert [s.id for s in runnable] == ["synthesize"]
 
+    def test_non_terminal_synthesis_is_not_globally_gated(self):
+        scheduler = Scheduler()
+        plan = _plan(
+            _subtask("prep", status="completed"),
+            _subtask("synthesize", depends_on=["prep"], is_synthesis=True),
+            _subtask("post-process", depends_on=["synthesize"]),
+        )
+        runnable = scheduler.runnable_subtasks(plan)
+        assert [s.id for s in runnable] == ["synthesize"]
+
 
 class TestSchedulerHasPending:
     def test_has_pending_true(self):

@@ -34,4 +34,6 @@ constraints: |
   - Do NOT re-do completed subtasks.
   - Address discovered issues in the revised plan.
   - If errors suggest the approach is fundamentally wrong, propose a new approach.
+  - Use is_synthesis=true ONLY for terminal final integration/reporting subtasks.
+  - Never mark a subtask as synthesis if any other subtask depends on it.
   - Keep it concise. Fewer subtasks is better.

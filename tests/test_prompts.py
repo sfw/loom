@@ -126,6 +126,13 @@ class TestPlannerPrompt:
         assert '"subtasks"' in prompt
         assert '"id"' in prompt
 
+    def test_planner_constrains_synthesis_to_terminal_steps(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+    ):
+        prompt = assembler.build_planner_prompt(sample_task)
+        assert "Never mark a subtask as synthesis if any other subtask depends on it." in prompt
 
 class TestExecutorPrompt:
     """Test executor prompt assembly."""
@@ -326,6 +333,21 @@ class TestReplannerPrompt:
         )
         assert "install-deps" in prompt
         assert "completed" in prompt
+
+    def test_replanner_constrains_synthesis_to_terminal_steps(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+    ):
+        prompt = assembler.build_replanner_prompt(
+            goal=sample_task.goal,
+            current_state_yaml="task: {}",
+            discoveries=[],
+            errors=[],
+            original_plan=sample_task.plan,
+            replan_reason="test",
+        )
+        assert "Never mark a subtask as synthesis if any other subtask depends on it." in prompt
 
 
 class TestExtractorPrompt:
