@@ -201,6 +201,7 @@ _MAX_PERSISTED_PROCESS_ACTIVITY = 300
 _MAX_PERSISTED_PROCESS_RESULTS = 120
 _INFO_WRAP_WIDTH = 108
 _RUN_GOAL_FILE_CONTENT_MAX_CHARS = 32_000
+_MAX_INPUT_HISTORY = 500
 
 
 class ProcessRunList(VerticalScroll):
@@ -679,6 +680,11 @@ class LoomApp(App):
         self._slash_cycle_candidates: list[str] = []
         self._applying_slash_tab_completion = False
         self._skip_slash_cycle_reset_once = False
+        self._input_history: list[str] = []
+        self._input_history_nav_index: int | None = None
+        self._input_history_nav_draft: str = ""
+        self._applying_input_history_navigation = False
+        self._skip_input_history_reset_once = False
         self._process_runs: dict[str, ProcessRunState] = {}
         self._process_elapsed_timer = None
         self._process_command_map: dict[str, str] = {}
@@ -3584,6 +3590,8 @@ class LoomApp(App):
                 ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
             )
 
+        self._hydrate_input_history_from_session()
+
         # Bind session-dependent tools
         self._bind_session_tools()
 
@@ -3777,6 +3785,26 @@ class LoomApp(App):
             "runs": serialized_runs,
         }
 
+    def _sync_input_history_into_session_state(self) -> None:
+        """Mirror input history into SessionState.ui_state."""
+        session = self._session
+        if session is None:
+            return
+        state = getattr(session, "session_state", None)
+        if state is None:
+            return
+        ui_state = getattr(state, "ui_state", None)
+        if not isinstance(ui_state, dict):
+            ui_state = {}
+            try:
+                state.ui_state = ui_state
+            except Exception:
+                return
+        ui_state["input_history"] = {
+            "version": 1,
+            "items": list(self._input_history[-_MAX_INPUT_HISTORY:]),
+        }
+
     async def _persist_process_run_ui_state(
         self, *, is_active: bool | None = None,
     ) -> None:
@@ -3790,6 +3818,7 @@ class LoomApp(App):
             return
 
         self._sync_process_runs_into_session_state()
+        self._sync_input_history_into_session_state()
         payload: dict = {}
         state = getattr(session, "session_state", None)
         to_dict = getattr(state, "to_dict", None)
@@ -4910,6 +4939,112 @@ class LoomApp(App):
         self._slash_cycle_seed = ""
         self._slash_cycle_candidates = []
 
+    def _reset_input_history_navigation(self) -> None:
+        """Clear active input-history navigation state."""
+        self._input_history_nav_index = None
+        self._input_history_nav_draft = ""
+
+    def _clear_input_history(self) -> None:
+        """Drop in-memory input history and reset navigation."""
+        self._input_history = []
+        self._reset_input_history_navigation()
+
+    def _append_input_history(self, value: str) -> None:
+        """Record one executed user input in bounded history."""
+        entry = str(value or "").strip()
+        if not entry:
+            return
+        self._input_history.append(entry)
+        if len(self._input_history) > _MAX_INPUT_HISTORY:
+            del self._input_history[:-_MAX_INPUT_HISTORY]
+        self._sync_input_history_into_session_state()
+        self._reset_input_history_navigation()
+
+    def _hydrate_input_history_from_session(self) -> None:
+        """Populate input history from the active session's user messages."""
+        self._clear_input_history()
+        if self._session is None:
+            return
+        state = getattr(self._session, "session_state", None)
+        ui_state = getattr(state, "ui_state", None) if state is not None else None
+        if isinstance(ui_state, dict):
+            payload = ui_state.get("input_history")
+            items: list[object] | None = None
+            if isinstance(payload, dict):
+                raw_items = payload.get("items")
+                if isinstance(raw_items, list):
+                    items = raw_items
+            elif isinstance(payload, list):
+                items = payload
+            if items is not None:
+                self._input_history = [
+                    str(item).strip() for item in items
+                    if str(item).strip()
+                ][-_MAX_INPUT_HISTORY:]
+                return
+        restored: list[str] = []
+        messages = getattr(self._session, "messages", [])
+        if not isinstance(messages, list):
+            messages = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "")).strip().lower()
+            if role != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            text = content.strip()
+            if text:
+                restored.append(text)
+        if len(restored) > _MAX_INPUT_HISTORY:
+            restored = restored[-_MAX_INPUT_HISTORY:]
+        self._input_history = restored
+
+    def _set_user_input_text(self, value: str, *, from_history_navigation: bool = False) -> None:
+        """Update the main input box value and keep the cursor at the end."""
+        input_widget = self.query_one("#user-input", Input)
+        if from_history_navigation:
+            self._applying_input_history_navigation = True
+            self._skip_input_history_reset_once = True
+        try:
+            input_widget.value = value
+            input_widget.cursor_position = len(value)
+        finally:
+            if from_history_navigation:
+                self._applying_input_history_navigation = False
+
+    def _apply_input_history_navigation(self, *, older: bool) -> bool:
+        """Move through recorded input history like a shell."""
+        if not self._input_history:
+            return False
+        input_widget = self.query_one("#user-input", Input)
+        if self._input_history_nav_index is None:
+            self._input_history_nav_index = len(self._input_history)
+            self._input_history_nav_draft = input_widget.value
+        index = self._input_history_nav_index
+        if index is None:
+            return False
+
+        if older:
+            next_index = max(0, index - 1)
+            self._input_history_nav_index = next_index
+            text = self._input_history[next_index]
+        else:
+            if index >= len(self._input_history):
+                return False
+            next_index = index + 1
+            if next_index >= len(self._input_history):
+                self._input_history_nav_index = len(self._input_history)
+                text = self._input_history_nav_draft
+            else:
+                self._input_history_nav_index = next_index
+                text = self._input_history[next_index]
+
+        self._set_user_input_text(text, from_history_navigation=True)
+        return True
+
     def _slash_completion_candidates(self, token: str) -> list[str]:
         """Return slash command completions for a token prefix."""
         self._refresh_process_command_index()
@@ -5212,6 +5347,7 @@ class LoomApp(App):
         )
         self._total_tokens = 0
         self._bind_session_tools()
+        self._hydrate_input_history_from_session()
         self._clear_files_panel()
         chat = self.query_one("#chat-log", ChatLog)
         await self._restore_process_run_tabs(chat)
@@ -5251,6 +5387,7 @@ class LoomApp(App):
         self._session = new_session
         self._total_tokens = new_session.total_tokens
         self._bind_session_tools()
+        self._hydrate_input_history_from_session()
         self._clear_files_panel()
         chat = self.query_one("#chat-log", ChatLog)
         await self._restore_process_run_tabs(chat)
@@ -5350,22 +5487,30 @@ class LoomApp(App):
         input_widget = self.query_one("#user-input", Input)
         input_widget.value = ""
         self._reset_slash_tab_cycle()
+        self._reset_input_history_navigation()
         self._set_slash_hint("")
 
         # Handle slash commands
         if text.startswith("/"):
             handled = await self._handle_slash_command(text)
             if handled:
+                self._append_input_history(text)
+                await self._persist_process_run_ui_state()
                 return
 
         if self._chat_busy:
             return
 
+        self._append_input_history(text)
         self._run_turn(text)
 
     @on(Input.Changed, "#user-input")
     def on_user_input_changed(self, _event: Input.Changed) -> None:
         """Show slash-command hints as the user types."""
+        if self._skip_input_history_reset_once:
+            self._skip_input_history_reset_once = False
+        elif not self._applying_input_history_navigation:
+            self._reset_input_history_navigation()
         if self._skip_slash_cycle_reset_once:
             self._skip_slash_cycle_reset_once = False
         elif not self._applying_slash_tab_completion:
@@ -5401,6 +5546,14 @@ class LoomApp(App):
                 event.stop()
                 event.prevent_default()
                 self.action_close_process_tab()
+            return
+
+        if event.key in ("up", "down"):
+            focused = self.focused
+            if isinstance(focused, Input) and focused.id == "user-input":
+                if self._apply_input_history_navigation(older=event.key == "up"):
+                    event.stop()
+                    event.prevent_default()
             return
 
         if event.key not in ("tab", "shift+tab"):
@@ -7939,9 +8092,9 @@ class LoomApp(App):
 
     def _prefill_user_input(self, text: str) -> None:
         """Seed the chat input with a command template and focus it."""
+        self._reset_input_history_navigation()
         input_widget = self.query_one("#user-input", Input)
-        input_widget.value = text
-        input_widget.cursor_position = len(text)
+        self._set_user_input_text(text)
         input_widget.focus()
         self._set_slash_hint(self._render_slash_hint(text))
 

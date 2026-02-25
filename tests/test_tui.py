@@ -1653,6 +1653,72 @@ class TestStartupSessionResume:
         assert auto is False
         app._store.list_sessions.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_initialize_session_auto_resume_restores_input_history(self, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        class FakeSession:
+            def __init__(self, **_kwargs):
+                self.total_tokens = 12
+                self.session_id = "latest-session"
+                self.session_state = SimpleNamespace(
+                    turn_count=4,
+                    ui_state={
+                        "input_history": {
+                            "version": 1,
+                            "items": ["/help", "summarize the doc"],
+                        },
+                    },
+                )
+                self.messages = [{"role": "system", "content": "system"}]
+
+            async def resume(self, _session_id: str) -> None:
+                self.messages = [
+                    {"role": "system", "content": "system"},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": "summarize the doc"},
+                ]
+
+        monkeypatch.setattr("loom.tui.app.CoworkSession", FakeSession)
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._store = MagicMock()
+        app._resolve_startup_resume_target = AsyncMock(return_value=("latest-session", True))
+        app._refresh_tool_registry = MagicMock()
+        app._load_process_definition = MagicMock()
+        app._refresh_process_command_index = MagicMock()
+        app._ensure_persistence_tools = MagicMock()
+        app._apply_process_tool_policy = MagicMock()
+        app._build_system_prompt = MagicMock(return_value="system")
+        app._bind_session_tools = MagicMock()
+        app._restore_process_run_tabs = AsyncMock()
+        app._set_slash_hint = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._tools.list_tools = MagicMock(return_value=[])
+
+        chat = MagicMock()
+        status = SimpleNamespace(workspace_name="", model_name="", process_name="")
+        input_widget = SimpleNamespace(focus=MagicMock())
+
+        def _query_one(selector: str, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#status-bar":
+                return status
+            if selector == "#user-input":
+                return input_widget
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        await app._initialize_session()
+
+        assert app._input_history == ["/help", "summarize the doc"]
+
 
 class TestQuitConfirmation:
     @pytest.mark.asyncio
@@ -6670,6 +6736,131 @@ class TestCommandPaletteProcessActions:
         input_widget.focus.assert_called_once()
         app._render_slash_hint.assert_called_once_with("/process use ")
         app._set_slash_hint.assert_called_once_with("hint text")
+
+    def test_hydrate_input_history_from_session_filters_non_user_messages(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "  /setup  "},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "   "},
+            {"role": "user", "content": "final request"},
+        ])
+
+        app._hydrate_input_history_from_session()
+
+        assert app._input_history == ["/setup", "final request"]
+
+    def test_hydrate_input_history_prefers_ui_state_payload(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(
+            session_state=SimpleNamespace(
+                ui_state={
+                    "input_history": {
+                        "version": 1,
+                        "items": ["/clear", "plan next steps"],
+                    },
+                },
+            ),
+            messages=[
+                {"role": "user", "content": "this should not win"},
+            ],
+        )
+
+        app._hydrate_input_history_from_session()
+
+        assert app._input_history == ["/clear", "plan next steps"]
+
+    @pytest.mark.asyncio
+    async def test_up_down_keys_navigate_input_history_and_restore_draft(self):
+        from textual.widgets import Input
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+        app._input_history = ["first command", "second command"]
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#user-input", Input)
+            input_widget.focus()
+            input_widget.value = "draft message"
+            input_widget.cursor_position = len("draft message")
+            await pilot.pause()
+
+            await pilot.press("up")
+            await pilot.pause()
+            assert input_widget.value == "second command"
+
+            await pilot.press("up")
+            await pilot.pause()
+            assert input_widget.value == "first command"
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert input_widget.value == "second command"
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert input_widget.value == "draft message"
+
+    @pytest.mark.asyncio
+    async def test_user_submit_records_history_for_slash_commands(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app.query_one = MagicMock(return_value=SimpleNamespace(value=""))
+        app._handle_slash_command = AsyncMock(return_value=True)
+        app._persist_process_run_ui_state = AsyncMock()
+        app._set_slash_hint = MagicMock()
+        app._run_turn = MagicMock()
+
+        event = SimpleNamespace(value="/help")
+        await app.on_user_submit(event)
+
+        assert app._input_history == ["/help"]
+        app._run_turn.assert_not_called()
+        app._persist_process_run_ui_state.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_user_submit_records_history_for_messages(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app.query_one = MagicMock(return_value=SimpleNamespace(value=""))
+        app._handle_slash_command = AsyncMock(return_value=False)
+        app._set_slash_hint = MagicMock()
+        app._run_turn = MagicMock()
+
+        event = SimpleNamespace(value="hello loom")
+        await app.on_user_submit(event)
+
+        assert app._input_history == ["hello loom"]
+        app._run_turn.assert_called_once_with("hello loom")
 
     def test_slash_tab_completion_cycles_forward(self):
         from loom.tui.app import LoomApp
