@@ -98,7 +98,7 @@ phases:
     depends_on: [analyze-market-trends]
     model_tier: 2
     verification_tier: 2
-    is_critical_path: true
+    is_critical_path: false
     acceptance_criteria: >
       Competitor universe is segmented by geography and service line, with
       competitor type and competitive threat rationale.
