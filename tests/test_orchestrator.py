@@ -31,9 +31,11 @@ from loom.events.types import (
     TASK_COMPLETED,
     TASK_EXECUTING,
     TASK_FAILED,
+    TASK_PLAN_NORMALIZED,
     TASK_PLAN_READY,
     TASK_PLANNING,
     TASK_REPLAN_REJECTED,
+    TASK_STALLED,
     TELEMETRY_RUN_SUMMARY,
     TOOL_CALL_COMPLETED,
 )
@@ -71,16 +73,23 @@ def _make_state_manager(tmp_path) -> TaskStateManager:
     return TaskStateManager(data_dir=tmp_path)
 
 
-def _make_mock_router(plan_response_text: str = "", executor_responses=None):
+def _make_mock_router(
+    plan_response_text: str = "",
+    executor_responses=None,
+    planner_responses=None,
+):
     """Create a mock router that returns prescribed responses."""
     router = MagicMock(spec=ModelRouter)
 
     planner_model = AsyncMock()
     planner_model.name = "mock-planner"
-    planner_model.complete = AsyncMock(return_value=ModelResponse(
-        text=plan_response_text,
-        usage=TokenUsage(input_tokens=100, output_tokens=50, total_tokens=150),
-    ))
+    if planner_responses is None:
+        planner_model.complete = AsyncMock(return_value=ModelResponse(
+            text=plan_response_text,
+            usage=TokenUsage(input_tokens=100, output_tokens=50, total_tokens=150),
+        ))
+    else:
+        planner_model.complete = AsyncMock(side_effect=planner_responses)
 
     executor_model = AsyncMock()
     executor_model.name = "mock-executor"
@@ -540,6 +549,185 @@ class TestOrchestratorProcessPhaseMode:
         assert [s.id for s in result.plan.subtasks] == ["analyze", "synthesize"]
         assert result.plan.subtasks[1].is_synthesis is True
 
+    @pytest.mark.asyncio
+    async def test_guided_plan_normalizes_non_terminal_synthesis(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [
+                {"id": "gather-data", "description": "Gather"},
+                {
+                    "id": "intermediate-synth",
+                    "description": "Intermediate synthesis",
+                    "depends_on": ["gather-data"],
+                    "is_synthesis": True,
+                },
+                {
+                    "id": "post-step",
+                    "description": "Downstream step",
+                    "depends_on": ["intermediate-synth"],
+                },
+            ],
+        })
+        bus = _make_event_bus()
+        events_received = []
+        bus.subscribe_all(lambda e: events_received.append(e))
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=_make_config(),
+        )
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert result.get_subtask("intermediate-synth") is not None
+        assert result.get_subtask("intermediate-synth").is_synthesis is False
+        assert TASK_PLAN_NORMALIZED in [e.event_type for e in events_received]
+
+    @pytest.mark.asyncio
+    async def test_strict_mode_retries_planner_on_topology_rejection(self, tmp_path):
+        invalid_plan_json = json.dumps({
+            "subtasks": [
+                {"id": "prep", "description": "Prepare data"},
+                {
+                    "id": "synth",
+                    "description": "Intermediate synth",
+                    "depends_on": ["prep"],
+                    "is_synthesis": True,
+                },
+                {"id": "post", "description": "Post", "depends_on": ["synth"]},
+            ],
+        })
+        valid_plan_json = json.dumps({
+            "subtasks": [
+                {"id": "prep", "description": "Prepare data"},
+                {
+                    "id": "synth",
+                    "description": "Final synth",
+                    "depends_on": ["prep"],
+                    "is_synthesis": True,
+                },
+            ],
+        })
+        planner_responses = [
+            ModelResponse(
+                text=invalid_plan_json,
+                usage=TokenUsage(input_tokens=100, output_tokens=60, total_tokens=160),
+            ),
+            ModelResponse(
+                text=valid_plan_json,
+                usage=TokenUsage(input_tokens=100, output_tokens=60, total_tokens=160),
+            ),
+        ]
+        process = ProcessDefinition(name="strict-topology", phase_mode="strict")
+        router = _make_mock_router(
+            planner_responses=planner_responses,
+        )
+
+        orch = Orchestrator(
+            model_router=router,
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+
+        result = await orch.execute_task(_make_task())
+
+        assert result.status == TaskStatus.COMPLETED
+        planner_model = router.select(tier=2, role="planner")
+        assert planner_model.complete.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_strict_mode_retries_replanner_on_topology_rejection(self, tmp_path):
+        invalid_replan_json = json.dumps({
+            "subtasks": [
+                {"id": "prep", "description": "Prepare data"},
+                {
+                    "id": "synth",
+                    "description": "Intermediate synth",
+                    "depends_on": ["prep"],
+                    "is_synthesis": True,
+                },
+                {"id": "post", "description": "Downstream", "depends_on": ["synth"]},
+            ],
+        })
+        valid_replan_json = json.dumps({
+            "subtasks": [
+                {"id": "prep", "description": "Prepare data"},
+                {
+                    "id": "synth",
+                    "description": "Final synth",
+                    "depends_on": ["prep"],
+                    "is_synthesis": True,
+                },
+            ],
+        })
+        planner_responses = [
+            ModelResponse(
+                text=invalid_replan_json,
+                usage=TokenUsage(input_tokens=100, output_tokens=60, total_tokens=160),
+            ),
+            ModelResponse(
+                text=valid_replan_json,
+                usage=TokenUsage(input_tokens=100, output_tokens=60, total_tokens=160),
+            ),
+        ]
+        process = ProcessDefinition(name="strict-topology", phase_mode="strict")
+        router = _make_mock_router(
+            planner_responses=planner_responses,
+        )
+        orch = Orchestrator(
+            model_router=router,
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="prep",
+                    description="Prepare",
+                    status=SubtaskStatus.COMPLETED,
+                ),
+                Subtask(
+                    id="synth",
+                    description="Synthesize",
+                    status=SubtaskStatus.PENDING,
+                    depends_on=["prep"],
+                    is_synthesis=True,
+                ),
+            ],
+            version=1,
+        )
+
+        replanned = await orch._replan_task(
+            task,
+            reason="scheduler_deadlock",
+            verification_feedback="Blocked subtasks: synth",
+        )
+
+        assert replanned is True
+        assert task.plan.version == 2
+        assert task.get_subtask("prep") is not None
+        assert task.get_subtask("prep").status == SubtaskStatus.COMPLETED
+        planner_model = router.select(tier=2, role="planner")
+        assert planner_model.complete.await_count == 2
+
 
 class TestOrchestratorCriticalPathBehavior:
     @pytest.mark.asyncio
@@ -857,6 +1045,52 @@ class TestOrchestratorExecution:
         assert kwargs["edit_existing_only"] is True
         assert kwargs["retry_strategy"] == RetryStrategy.UNCONFIRMED_DATA.value
         assert "CANONICAL DELIVERABLE FILES FOR THIS SUBTASK" in kwargs["retry_context"]
+
+    @pytest.mark.asyncio
+    async def test_stalled_plan_emits_blocked_subtasks_on_failure(self, tmp_path):
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda e: events.append(e))
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text="{}"),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=_make_config(),
+        )
+        orch._replan_task = AsyncMock(return_value=False)
+
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="failed-upstream",
+                    description="Failed upstream work",
+                    status=SubtaskStatus.FAILED,
+                ),
+                Subtask(
+                    id="downstream-pending",
+                    description="Blocked by failed step",
+                    status=SubtaskStatus.PENDING,
+                    depends_on=["failed-upstream"],
+                ),
+            ],
+            version=1,
+        )
+
+        result = await orch.execute_task(task, reuse_existing_plan=True)
+
+        assert result.status == TaskStatus.FAILED
+        assert TASK_STALLED in [e.event_type for e in events]
+        failed_events = [e for e in events if e.event_type == TASK_FAILED]
+        assert failed_events
+        blocked_subtasks = failed_events[-1].data.get("blocked_subtasks")
+        assert isinstance(blocked_subtasks, list)
+        assert blocked_subtasks[0]["subtask_id"] == "downstream-pending"
+        orch._replan_task.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_single_subtask_exception_retries_instead_of_fatal_abort(self, tmp_path):

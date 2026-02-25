@@ -60,4 +60,5 @@ constraints: |
   - Set model_tier: 1 for simple file ops, 2 for code generation, 3 for complex reasoning.
   - Set verification_tier: 1 for file checks, 2 for LLM review of complex output.
   - Mark is_critical_path: true if failure blocks all downstream work.
-  - Mark is_synthesis: true for final integration/synthesis subtasks.
+  - Mark is_synthesis: true ONLY for terminal final integration/reporting subtasks.
+  - Never mark a subtask as synthesis if any other subtask depends on it.

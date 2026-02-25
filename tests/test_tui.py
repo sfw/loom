@@ -5945,6 +5945,90 @@ class TestProcessSlashCommands:
         assert "Verification inconclusive" not in message
         assert "environmental-scan - Perform environmental scans" in message
 
+    def test_process_progress_event_formats_plan_normalized(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        message = app._format_process_progress_event({
+            "event_type": "task_plan_normalized",
+            "event_data": {
+                "context": "planner",
+                "normalized_subtasks": [
+                    {"subtask_id": "intermediate-synth"},
+                ],
+            },
+        })
+
+        assert message is not None
+        assert "Normalized plan (planner)" in message
+        assert "intermediate-synth" in message
+
+    def test_process_progress_event_formats_stalled_reason(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        message = app._format_process_progress_event({
+            "event_type": "task_stalled",
+            "event_data": {
+                "attempt": 1,
+                "blocked_subtasks": [
+                    {
+                        "subtask_id": "downstream",
+                        "reasons": ["dependency_unmet:upstream=failed"],
+                    },
+                ],
+            },
+        })
+
+        assert message is not None
+        assert "Execution stalled (attempt 1)" in message
+        assert "downstream blocked" in message
+        assert "dependency_unmet:upstream=failed" in message
+
+    def test_process_progress_event_formats_stall_recovery(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        success = app._format_process_progress_event({
+            "event_type": "task_stalled_recovery_attempted",
+            "event_data": {
+                "attempt": 1,
+                "recovery_mode": "normalize",
+                "recovery_success": True,
+            },
+        })
+        failure = app._format_process_progress_event({
+            "event_type": "task_stalled_recovery_attempted",
+            "event_data": {
+                "attempt": 2,
+                "recovery_mode": "replan",
+                "recovery_success": False,
+                "reason": "strict_phase_mode_disallows_normalization",
+            },
+        })
+
+        assert success == "Stall recovery via normalize succeeded (attempt 1)."
+        assert (
+            failure
+            == "Stall recovery via replan failed (attempt 2): "
+            "strict_phase_mode_disallows_normalization"
+        )
+
     def test_mark_process_run_failed_shows_timeout_guidance(self):
         from loom.tui.app import LoomApp
 

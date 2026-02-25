@@ -7677,6 +7677,90 @@ class LoomApp(App):
             if reason:
                 return f"Replanning task: {reason}"
             return "Replanning task..."
+        if event_type == "task_plan_normalized":
+            normalized = event_data.get("normalized_subtasks", [])
+            if not isinstance(normalized, list):
+                normalized = []
+            changed_ids: list[str] = []
+            for item in normalized:
+                if not isinstance(item, dict):
+                    continue
+                subtask_id = str(item.get("subtask_id", "")).strip()
+                if subtask_id:
+                    changed_ids.append(subtask_id)
+            context = str(event_data.get("context", "")).strip()
+            if changed_ids:
+                joined = ", ".join(changed_ids[:3])
+                if len(changed_ids) > 3:
+                    joined += ", ..."
+                if context:
+                    return (
+                        f"Normalized plan ({context}): demoted non-terminal synthesis "
+                        f"for {joined}."
+                    )
+                return (
+                    "Normalized plan: demoted non-terminal synthesis for "
+                    f"{joined}."
+                )
+            return "Normalized plan topology."
+        if event_type == "task_stalled":
+            blocked = event_data.get("blocked_subtasks", [])
+            if not isinstance(blocked, list):
+                blocked = []
+            attempt = event_data.get("attempt")
+            attempt_text = ""
+            try:
+                attempt_num = int(attempt)
+                if attempt_num > 0:
+                    attempt_text = f" (attempt {attempt_num})"
+            except (TypeError, ValueError):
+                attempt_text = ""
+            if blocked and isinstance(blocked[0], dict):
+                first = blocked[0]
+                first_id = str(first.get("subtask_id", "")).strip() or "subtask"
+                reasons = first.get("reasons", [])
+                if isinstance(reasons, list):
+                    reason_text = self._one_line(
+                        ", ".join(
+                            str(reason).strip()
+                            for reason in reasons
+                            if str(reason).strip()
+                        ),
+                        120,
+                    )
+                else:
+                    reason_text = self._one_line(reasons, 120)
+                if reason_text:
+                    return (
+                        f"Execution stalled{attempt_text}: "
+                        f"{first_id} blocked ({reason_text})."
+                    )
+                return f"Execution stalled{attempt_text}: {first_id} blocked."
+            return f"Execution stalled{attempt_text}: no runnable subtasks."
+        if event_type == "task_stalled_recovery_attempted":
+            mode = str(event_data.get("recovery_mode", "")).strip().lower()
+            success = event_data.get("recovery_success")
+            attempt = event_data.get("attempt")
+            attempt_suffix = ""
+            try:
+                attempt_num = int(attempt)
+                if attempt_num > 0:
+                    attempt_suffix = f" (attempt {attempt_num})"
+            except (TypeError, ValueError):
+                attempt_suffix = ""
+            mode_label = mode or "recovery"
+            if success is True:
+                return (
+                    f"Stall recovery via {mode_label} succeeded"
+                    f"{attempt_suffix}."
+                )
+            reason = self._one_line(event_data.get("reason", ""), 120)
+            if reason:
+                return (
+                    f"Stall recovery via {mode_label} failed"
+                    f"{attempt_suffix}: {reason}"
+                )
+            return f"Stall recovery via {mode_label} failed{attempt_suffix}."
         if event_type == "task_completed":
             return "Process run completed."
         if event_type == "task_failed":
