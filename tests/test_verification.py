@@ -128,6 +128,46 @@ class TestDeterministicVerifier:
         assert "Permission denied" in result.feedback
 
     @pytest.mark.asyncio
+    async def test_safety_integrity_policy_downgrades_non_safety_tool_failures(self):
+        process = _make_process(static_checks={
+            "tool_success_policy": "safety_integrity_only",
+        })
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="edit_file",
+            args={"path": "pricing-access-grid.csv"},
+            result=ToolResult.fail(
+                "edit[0]: old_str appears 2 times in pricing-access-grid.csv",
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert result.passed
+        assert any(
+            c.name == "tool_edit_file_advisory" and c.passed
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_safety_integrity_policy_keeps_safety_failures_hard(self):
+        process = _make_process(static_checks={
+            "tool_success_policy": "safety_integrity_only",
+        })
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="web_fetch",
+            args={"url": "http://localhost:8080"},
+            result=ToolResult.fail(
+                "Blocked host: localhost (private/internal network)",
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert any(
+            c.name == "tool_web_fetch_success" and not c.passed
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
     async def test_web_tool_transient_failure_is_advisory(self):
         v = DeterministicVerifier()
         tc = MockToolCallRecord(
@@ -1530,11 +1570,13 @@ class TestVerificationGates:
 def _make_process(
     deliverables: dict[str, list[str]] | None = None,
     regex_rules: list | None = None,
+    static_checks: dict[str, object] | None = None,
 ):
     """Build a mock ProcessDefinition for verification tests."""
     from loom.processes.schema import (
         PhaseTemplate,
         ProcessDefinition,
+        VerificationPolicyContract,
         VerificationRule,
     )
 
@@ -1552,10 +1594,15 @@ def _make_process(
         for r in regex_rules:
             rules.append(VerificationRule(**r))
 
+    policy = VerificationPolicyContract(
+        static_checks=dict(static_checks or {}),
+    )
+
     return ProcessDefinition(
         name="test-proc",
         phases=phases,
         verification_rules=rules,
+        verification_policy=policy,
     )
 
 

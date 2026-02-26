@@ -161,6 +161,10 @@ class DeterministicVerifier:
     """
 
     _ADVISORY_TOOL_FAILURES = frozenset({"web_fetch", "web_fetch_html", "web_search"})
+    _TOOL_SUCCESS_POLICIES = frozenset({
+        "all_tools_hard",
+        "safety_integrity_only",
+    })
 
     def __init__(
         self,
@@ -170,12 +174,29 @@ class DeterministicVerifier:
         regex_default_advisory: bool = True,
     ):
         self._process = process
+        self._tool_success_policy = self._resolve_tool_success_policy(process)
         normalized_scope = str(phase_scope_default or "current_phase").strip().lower()
         self._phase_scope_default = (
             normalized_scope if normalized_scope in {"current_phase", "global"}
             else "current_phase"
         )
         self._regex_default_advisory = bool(regex_default_advisory)
+
+    @classmethod
+    def _resolve_tool_success_policy(
+        cls,
+        process: ProcessDefinition | None,
+    ) -> str:
+        if process is None:
+            return "all_tools_hard"
+        policy = getattr(process, "verification_policy", None)
+        static_checks = getattr(policy, "static_checks", {})
+        if not isinstance(static_checks, dict):
+            return "all_tools_hard"
+        raw = str(static_checks.get("tool_success_policy", "") or "").strip().lower()
+        if raw in cls._TOOL_SUCCESS_POLICIES:
+            return raw
+        return "all_tools_hard"
 
     async def verify(
         self,
@@ -442,18 +463,17 @@ class DeterministicVerifier:
         error: str | None,
     ) -> bool:
         """Return True if a failed tool call should be treated as advisory."""
-        if tool_name not in self._ADVISORY_TOOL_FAILURES or not error:
+        if not error:
+            return False
+
+        if self._tool_success_policy == "safety_integrity_only":
+            return not self._is_hard_safety_or_integrity_failure(error)
+
+        if tool_name not in self._ADVISORY_TOOL_FAILURES:
             return False
 
         text = error.lower()
-        hard_fail_markers = (
-            "blocked host:",
-            "safety violation:",
-            "only http:// and https:// urls are allowed",
-            "no url provided",
-            "no search query provided",
-        )
-        if any(marker in text for marker in hard_fail_markers):
+        if self._is_hard_safety_or_integrity_failure(error):
             return False
 
         status_code = _extract_http_status(error)
@@ -471,6 +491,23 @@ class DeterministicVerifier:
             "response too large",
         )
         return any(marker in text for marker in advisory_markers)
+
+    @staticmethod
+    def _is_hard_safety_or_integrity_failure(error: str | None) -> bool:
+        text = str(error or "").lower()
+        hard_fail_markers = (
+            "blocked host:",
+            "safety violation:",
+            "only http:// and https:// urls are allowed",
+            "no url provided",
+            "no search query provided",
+            "permission denied",
+            "operation not permitted",
+            "read-only file system",
+            "outside writable roots",
+            "path escapes",
+        )
+        return any(marker in text for marker in hard_fail_markers)
 
     @classmethod
     def _flatten_text_values(cls, value: object) -> list[str]:

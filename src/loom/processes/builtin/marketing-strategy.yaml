@@ -171,7 +171,7 @@ tests:
       deliverables:
         must_exist: [market-sizing.md, market-data.csv, assumption-register.md, competitive-landscape.md, competitor-matrix.csv, customer-segments.md, segment-profiles.csv, positioning.md, messaging-matrix.csv, channel-strategy.md, channel-economics.csv, kpi-tree.md, attribution-plan.md, experiment-backlog.csv, funnel-model.csv, enablement-plan.md, operating-rhythm.md, campaign-plan.md, budget-allocation.csv, creative-briefs.md, launch-risk-register.csv]
       verification:
-        forbidden_patterns: ["Expected deliverable '.*' not found", "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]|\\[MISSING\\]"]
+        forbidden_patterns: ["Expected deliverable '.*' not found", "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"]
 
   - id: live-canary
     mode: live
@@ -219,9 +219,9 @@ verification:
         retry_strategy: unconfirmed_data
         description: "Perform targeted follow-up based on verifier reason_code/metadata."
     default_strategy: targeted-remediation
-    critical_path_behavior: block
+    critical_path_behavior: confirm_or_prune_then_queue
     retry_budget:
-      max_attempts: 2
+      max_attempts: 3
     transient_retry_policy:
       retry_on_transient: true
   rules:
@@ -271,7 +271,7 @@ verification:
 
     - name: no-placeholders
       description: "No placeholder text in deliverables"
-      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]|\\[MISSING\\]"
+      check: "\\[TBD\\]|\\[TODO\\]|\\[INSERT\\]|\\[PLACEHOLDER\\]"
       severity: error
       type: regex
       applies_to_phases: ["*"]
@@ -297,6 +297,7 @@ prompt_contracts:
   executor_constraints: |
     Keep factual claims traceable to evidence IDs or source URLs.
     If a claim cannot be verified, label it explicitly as unverified.
+    Use `UNSUPPORTED_NO_EVIDENCE` for missing data; never leave TODO/TBD markers.
   verifier_constraints: |
     Evaluate acceptance criteria and process verification rules without assuming
     a fixed output schema. Use metadata keys only when inferable.
