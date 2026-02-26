@@ -22,9 +22,9 @@ Loom is that help. It's the harness that turns a local model into a working agen
 
 ## Two Ways to Work
 
-**Interactive** (`loom`) -- Work with a model in a rich terminal UI. You talk, the model responds and uses tools, you see what it's doing in real time. Streaming text, inline diffs, per-tool-call approval, session persistence, conversation recall, and slash commands for control.
+**Interactive** (`uv run loom`) -- Work with a model in a rich terminal UI. You talk, the model responds and uses tools, you see what it's doing in real time. Streaming text, inline diffs, per-tool-call approval, session persistence, conversation recall, and slash commands for control.
 
-**Autonomous** (`loom run`) -- Give Loom a goal, walk away. It decomposes the work into subtasks with a dependency graph, runs independent subtasks in parallel, verifies each result with an independent model, and replans when things go wrong.
+**Autonomous** (`uv run loom run`) -- Give Loom a goal, walk away. It decomposes the work into subtasks with a dependency graph, runs independent subtasks in parallel, verifies each result with an independent model, and replans when things go wrong.
 
 ```
                     +----------------------------+
@@ -44,7 +44,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Built for local model weaknesses.** Cloud models reproduce strings precisely. Local models don't -- they drift on whitespace, swap tabs for spaces, drop trailing newlines. Loom's edit tool handles this with fuzzy matching: when an exact string match fails, it normalizes whitespace and finds the closest candidate above a similarity threshold. It also rejects ambiguous matches (two similar regions) so it won't silently edit the wrong place. This is the difference between a tool that works with MiniMax and one that fails 30% of the time.
 
-**Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every cowork turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. Resume any previous session exactly where you left off with `--resume`. This archival guarantee is for cowork history; `/run` and `loom run` may semantically compact model-facing payloads to stay within context budgets, while preserving source artifacts/logs.
+**Lossless memory, not lossy summarization.** Most agents compress old conversation turns into summaries when context fills up. This destroys information. Loom takes a different approach: every cowork turn is persisted verbatim to SQLite. When context fills up, old turns drop out of the model's window but remain fully searchable. The model has a `conversation_recall` tool to retrieve anything it needs -- specific turns, tool call history, full-text search. Resume any previous session exactly where you left off with `--resume`. This archival guarantee is for cowork history; `/run` and `uv run loom run` may semantically compact model-facing payloads to stay within context budgets, while preserving source artifacts/logs.
 
 **The harness drives, not the model.** The model is a reasoning engine called repeatedly with scoped prompts. The orchestrator decides what happens next: which subtasks to run, when to verify, when to replan, when to escalate. This means a weaker model in a strong harness outperforms a stronger model in a weak one.
 
@@ -65,21 +65,21 @@ It also ships research helpers (academic search, archives, citations, fact check
 If you're new, start with:
 
 1. `uv sync` to install dependencies.
-2. `loom -w /path/to/workspace` to launch the TUI and run setup.
+2. `uv run loom -w /path/to/workspace` to launch the TUI and run setup.
 3. `/run <goal>` inside the TUI for your first harnessed task.
-4. `loom run "<goal>" -w /path/to/workspace` for autonomous execution.
+4. `uv run loom run "<goal>" -w /path/to/workspace` for autonomous execution.
 
 ```bash
 # Install
 uv sync          # or: pip install -e .
 
 # Launch — the setup wizard runs automatically on first start
-loom -w /path/to/workspace
+uv run loom -w /path/to/workspace
 
 # With a process definition
-loom -w /path/to/workspace --process consulting-engagement
+uv run loom -w /path/to/workspace --process consulting-engagement
 
-# Force process orchestration from inside the TUI (no loom serve required)
+# Force process orchestration from inside the TUI (no uv run loom serve required)
 # /process use investment-analysis
 # /run Analyze Tesla for investment
 # /run problem.md            # load goal from workspace file
@@ -88,20 +88,20 @@ loom -w /path/to/workspace --process consulting-engagement
 # /investment-analysis Analyze Tesla for investment
 
 # Resume a previous session
-loom --resume <session-id>
+uv run loom --resume <session-id>
 
 # Autonomous task execution
-loom run "Refactor the auth module to use JWT" --workspace /path/to/project
-loom run "Research competitive landscape for X and produce a briefing" -w /tmp/research
-loom run "Analyze Q3 financials and flag anomalies" -w /tmp/analysis
+uv run loom run "Refactor the auth module to use JWT" --workspace /path/to/project
+uv run loom run "Research competitive landscape for X and produce a briefing" -w /tmp/research
+uv run loom run "Analyze Q3 financials and flag anomalies" -w /tmp/analysis
 
 # Start the API server (for programmatic access)
-loom serve
+uv run loom serve
 ```
 
 ## Configuration
 
-On first launch, Loom's built-in setup wizard walks you through provider selection, model configuration, and role assignment — all inside the TUI. The wizard writes `~/.loom/loom.toml` for you. Run `/setup` from inside the TUI at any time to reconfigure, or `loom setup` from the CLI.
+On first launch, Loom's built-in setup wizard walks you through provider selection, model configuration, and role assignment — all inside the TUI. The wizard writes `~/.loom/loom.toml` for you. Run `/setup` from inside the TUI at any time to reconfigure, or `uv run loom setup` from the CLI.
 
 You can also create the config manually. Loom reads `loom.toml` from the current directory or `~/.loom/loom.toml`:
 
@@ -172,11 +172,11 @@ For large fetched binaries/documents (PDFs, Office files, archives), tune
 A process definition injects a persona, phase blueprint, verification/remediation policy, evidence schema, and prompt constraints without changing engine code. Loom ships with 6 built-in processes: investment analysis, marketing strategy, research report, competitive intelligence, consulting engagement, and market research. You can [create your own](docs/creating-packages.md) or install them from GitHub:
 
 ```bash
-loom processes                              # list available
-loom -w /tmp/acme --process consulting-engagement
-loom install user/repo                      # install from GitHub
-loom install user/repo --isolated-deps      # per-process dependency env
-loom process test consulting-engagement     # run process test cases
+uv run loom processes                              # list available
+uv run loom -w /tmp/acme --process consulting-engagement
+uv run loom install user/repo                      # install from GitHub
+uv run loom install user/repo --isolated-deps      # per-process dependency env
+uv run loom process test consulting-engagement     # run process test cases
 ```
 
 Process-required tools are enforced at runtime: if `tools.required` contains
@@ -198,44 +198,44 @@ Loom learns from your interactions so you never repeat yourself. Two learning mo
 Patterns are frequency-weighted -- the more a pattern is observed, the higher it ranks. High-frequency patterns persist indefinitely; low-frequency ones are pruned after 90 days. All data stays local in your SQLite database.
 
 ```bash
-loom learned                              # review learned behavioral patterns
-loom learned --all                        # include internal operational patterns
-loom learned --type behavioral_gap        # filter by type
-loom learned --delete 5                   # remove a specific pattern
-loom reset-learning                       # clear everything
+uv run loom learned                              # review learned behavioral patterns
+uv run loom learned --all                        # include internal operational patterns
+uv run loom learned --type behavioral_gap        # filter by type
+uv run loom learned --delete 5                   # remove a specific pattern
+uv run loom reset-learning                       # clear everything
 ```
 
 In the TUI, use `/learned` to open an interactive review screen for learned behavioral patterns, where you can inspect and delete individual items.
 
 ## Interfaces
 
-- **Interactive TUI** (`loom`) -- rich terminal interface with chat panel, sidebar, diff viewer, tool approval modals, event log, and setup wizard. Includes session persistence/recall, task delegation, process controls (`/process list|use|off`), in-process orchestration (`/run <goal|@goal-file [goal]|close [run-id-prefix]>`), direct process commands (`/<process-name> <goal>`), learned-pattern review (`/learned`), MCP config controls (`/mcp ...`), auth profile controls (`/auth ...`), and click-to-open workspace previews for Markdown/code/JSON/CSV/HTML/diff/Office/PDF/images. `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `loom serve`; `/run problem.md` and `/run @problem.md optional-goal` load file content into planning context.
+- **Interactive TUI** (`uv run loom`) -- rich terminal interface with chat panel, sidebar, diff viewer, tool approval modals, event log, and setup wizard. Includes session persistence/recall, task delegation, process controls (`/process list|use|off`), in-process orchestration (`/run <goal|@goal-file [goal]|close [run-id-prefix]>`), direct process commands (`/<process-name> <goal>`), learned-pattern review (`/learned`), MCP config controls (`/mcp ...`), auth profile controls (`/auth ...`), and click-to-open workspace previews for Markdown/code/JSON/CSV/HTML/diff/Office/PDF/images. `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `uv run loom serve`; `/run problem.md` and `/run @problem.md optional-goal` load file content into planning context.
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
 ## CLI Commands
 
 ```
-loom                    Launch the interactive TUI (default; setup wizard on first run)
-loom cowork             Alias for the interactive TUI
-loom setup              Run the configuration wizard (CLI fallback)
-loom run GOAL           Autonomous task execution (server-backed) with `/run`-equivalent process resolution
-loom serve              Start the API server
-loom status ID          Check task status
-loom cancel ID          Cancel a running task
-loom models             List configured models
-loom auth ...           Manage auth profiles/default selectors
-loom processes          List available process definitions
-loom install SOURCE     Install a process package
-loom uninstall NAME     Remove a process package
-loom process test NAME  Run process package test cases
-loom mcp ...            Manage MCP server config (list/show/add/edit/remove/test/migrate)
-loom mcp-serve          Start the MCP server (stdio transport)
-loom learned            Review learned patterns (behavioral by default)
-loom reset-learning     Clear all learned patterns
+uv run loom                    Launch the interactive TUI (default; setup wizard on first run)
+uv run loom cowork             Alias for the interactive TUI
+uv run loom setup              Run the configuration wizard (CLI fallback)
+uv run loom run GOAL           Autonomous task execution (server-backed) with `/run`-equivalent process resolution
+uv run loom serve              Start the API server
+uv run loom status ID          Check task status
+uv run loom cancel ID          Cancel a running task
+uv run loom models             List configured models
+uv run loom auth ...           Manage auth profiles/default selectors
+uv run loom processes          List available process definitions
+uv run loom install SOURCE     Install a process package
+uv run loom uninstall NAME     Remove a process package
+uv run loom process test NAME  Run process package test cases
+uv run loom mcp ...            Manage MCP server config (list/show/add/edit/remove/test/migrate)
+uv run loom mcp-serve          Start the MCP server (stdio transport)
+uv run loom learned            Review learned patterns (behavioral by default)
+uv run loom reset-learning     Clear all learned patterns
 ```
 
-Common flags for `loom` / `loom cowork`:
+Common flags for `uv run loom` / `uv run loom cowork`:
 - `-w /path` -- workspace directory
 - `--mcp-config /path/to/mcp.toml` -- explicit MCP config layer
 - `-m model` -- explicit cowork model override from config (can bypass role routing)

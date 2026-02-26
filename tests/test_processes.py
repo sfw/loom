@@ -1774,7 +1774,7 @@ verification:
             for err in exc_info.value.errors
         )
 
-    def test_marketing_strategy_includes_missing_placeholder_and_metadata_fields(self):
+    def test_marketing_strategy_placeholder_and_metadata_fields(self):
         loader = ProcessLoader()
         defn = loader.load("marketing-strategy")
         no_placeholders = next(
@@ -1782,7 +1782,10 @@ verification:
             None,
         )
         assert no_placeholders is not None
-        assert "\\[MISSING\\]" in str(no_placeholders.check)
+        pattern = str(no_placeholders.check)
+        assert "\\[TBD\\]" in pattern
+        assert "\\[TODO\\]" in pattern
+        assert "\\[MISSING\\]" not in pattern
         metadata_fields = defn.verifier_metadata_fields()
         assert "remediation_required" in metadata_fields
         assert "remediation_mode" in metadata_fields

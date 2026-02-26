@@ -443,7 +443,7 @@
     <span class="dim">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>Execute + Verify&nbsp;&nbsp;&nbsp;&nbsp;Execute + Verify
   </div>
 
-  <p>Loom is a <strong>local model orchestration engine</strong>. Give it a goal in plain English, and it will:</p>
+  <p>Loom is a <strong>local-first LLM execution harness</strong>. Give it a goal in plain English, and it will:</p>
 
   <div class="card-grid">
     <div class="card">
@@ -464,7 +464,7 @@
     </div>
   </div>
 
-  <p>Everything runs locally. Your code never leaves your machine. Loom works with <strong>Ollama</strong>, <strong>LM Studio</strong>, or any <strong>OpenAI-compatible API</strong>.</p>
+  <p>Loom is local-first and can run fully on your machine. It also supports mixed local/cloud setups with <strong>Ollama</strong>, <strong>LM Studio</strong>, <strong>Anthropic/Claude</strong>, or any <strong>OpenAI-compatible API</strong>.</p>
 </section>
 
 <!-- ======================== INSTALL ======================== -->
@@ -488,7 +488,7 @@
 
   <h3>Install with uv (Recommended)</h3>
   <pre><code><span class="cmt"># Clone the repository</span>
-<span class="cmd">git clone</span> https://github.com/your-org/loom.git
+<span class="cmd">git clone</span> https://github.com/sfw/loom.git
 <span class="cmd">cd</span> loom
 
 <span class="cmt"># Install dependencies (creates .venv automatically)</span>
@@ -529,7 +529,7 @@
     <div class="progress-step"></div>
   </div>
 
-  <p>Loom needs at least one LLM running locally. Choose your backend:</p>
+  <p>Loom needs at least one configured LLM backend. Choose your backend:</p>
 
   <details class="accordion">
     <summary>Ollama (Recommended)</summary>
