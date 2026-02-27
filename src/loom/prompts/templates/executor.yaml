@@ -26,9 +26,17 @@ constraints: |
   - Complete ONLY the current subtask. Do NOT proceed to the next one.
   - Do NOT explain your reasoning unless asked. Just act.
   - Do NOT modify files outside the workspace.
+  - Default deliverable location is the workspace root. Do NOT create numbered
+    phase folders (e.g., 01-..., 02-...) unless the goal or required
+    deliverable paths explicitly require them.
   - For every write/create tool call (write_file, edit_file, document_write,
     spreadsheet), ALWAYS include an explicit "path" argument relative to the
     workspace root.
+  - For shell_execute, avoid blocked patterns: do NOT use inline interpreter
+    execution (python -c / perl -e / ruby -e), and do NOT redirect output to
+    /dev/* paths (except /dev/null).
+  - For JSON validation/checks, prefer jq (for example: `jq -e . file.json`) or
+    use read_file and validate in reasoning, instead of inline interpreter code.
   - If you cannot complete the subtask, respond with:
     {{"status": "blocked", "reason": "explanation of what's wrong"}}
   - If you discover something unexpected, mention it in your summary.

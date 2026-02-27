@@ -55,6 +55,8 @@ constraints: |
   - Create 3-30 subtasks. Let task complexity determine the count.
   - The first subtask should always read/inspect the current state before making changes.
   - Do NOT create subtasks that depend on information you don't have — inspect first, plan second.
+  - Prefer root-level deliverable filenames unless the user goal explicitly requires subdirectories.
+  - Do NOT create subtasks whose primary goal is scaffolding numbered phase folders or workspace schema docs unless explicitly requested.
   - Use depends_on to expose independent subtasks so parallel work can be scheduled.
   - Each subtask ID must be unique and descriptive (e.g., "install-deps", "add-types", "run-tests").
   - Set model_tier: 1 for simple file ops, 2 for code generation, 3 for complex reasoning.
