@@ -186,6 +186,13 @@ class TestSystemEndpoints:
         assert "server" in data
         assert "execution" in data
 
+    @pytest.mark.asyncio
+    async def test_slo_disabled_by_default(self, client):
+        response = await client.get("/slo")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["enabled"] is False
+
 
 # --- Task CRUD ---
 

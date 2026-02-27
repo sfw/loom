@@ -349,14 +349,14 @@ class TestOrchestratorPlan:
             event for event in events_received
             if event.event_type == TELEMETRY_RUN_SUMMARY
         )
-        assert summary_event.data == {
-            "artifact_ingests": 2,
-            "artifact_reads": 1,
-            "artifact_retention_deletes": 3,
-            "compaction_policy_decisions": 4,
-            "overflow_fallback_count": 1,
-            "compactor_warning_count": 2,
-        }
+        assert summary_event.data["artifact_ingests"] == 2
+        assert summary_event.data["artifact_reads"] == 1
+        assert summary_event.data["artifact_retention_deletes"] == 3
+        assert summary_event.data["compaction_policy_decisions"] == 4
+        assert summary_event.data["overflow_fallback_count"] == 1
+        assert summary_event.data["compactor_warning_count"] == 2
+        assert "run_id" in summary_event.data
+        assert "budget_snapshot" in summary_event.data
 
     @pytest.mark.asyncio
     async def test_execute_task_reuses_existing_plan_when_requested(self, tmp_path):

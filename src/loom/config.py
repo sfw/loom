@@ -112,6 +112,20 @@ class ExecutionConfig:
     max_parallel_subtasks: int = 3
     auto_approve_confidence_threshold: float = 0.8
     enable_streaming: bool = False
+    enable_global_run_budget: bool = False
+    max_task_wall_clock_seconds: int = 0
+    max_task_total_tokens: int = 0
+    max_task_model_invocations: int = 0
+    max_task_tool_calls: int = 0
+    max_task_mutating_tool_calls: int = 0
+    max_task_replans: int = 0
+    max_task_remediation_attempts: int = 0
+    executor_completion_contract_mode: str = "off"  # off | warn | enforce
+    planner_degraded_mode: str = "allow"  # allow | require_approval | deny
+    enable_sqlite_remediation_queue: bool = False
+    enable_durable_task_runner: bool = False
+    enable_mutation_idempotency: bool = False
+    enable_slo_metrics: bool = False
     delegate_task_timeout_seconds: int = 3600
     model_call_max_attempts: int = 5
     model_call_retry_base_delay_seconds: float = 0.5
@@ -544,11 +558,114 @@ def load_config(path: Path | None = None) -> Config:
             "auto_approve_confidence_threshold", 0.8
         ),
         enable_streaming=exec_data.get("enable_streaming", False),
+        enable_global_run_budget=_bool_from(
+            exec_data,
+            "enable_global_run_budget",
+            ExecutionConfig.enable_global_run_budget,
+        ),
+        max_task_wall_clock_seconds=_int_from(
+            exec_data,
+            "max_task_wall_clock_seconds",
+            ExecutionConfig.max_task_wall_clock_seconds,
+            minimum=0,
+            maximum=7 * 24 * 3600,
+        ),
+        max_task_total_tokens=_int_from(
+            exec_data,
+            "max_task_total_tokens",
+            ExecutionConfig.max_task_total_tokens,
+            minimum=0,
+            maximum=5_000_000,
+        ),
+        max_task_model_invocations=_int_from(
+            exec_data,
+            "max_task_model_invocations",
+            ExecutionConfig.max_task_model_invocations,
+            minimum=0,
+            maximum=100_000,
+        ),
+        max_task_tool_calls=_int_from(
+            exec_data,
+            "max_task_tool_calls",
+            ExecutionConfig.max_task_tool_calls,
+            minimum=0,
+            maximum=100_000,
+        ),
+        max_task_mutating_tool_calls=_int_from(
+            exec_data,
+            "max_task_mutating_tool_calls",
+            ExecutionConfig.max_task_mutating_tool_calls,
+            minimum=0,
+            maximum=100_000,
+        ),
+        max_task_replans=_int_from(
+            exec_data,
+            "max_task_replans",
+            ExecutionConfig.max_task_replans,
+            minimum=0,
+            maximum=1000,
+        ),
+        max_task_remediation_attempts=_int_from(
+            exec_data,
+            "max_task_remediation_attempts",
+            ExecutionConfig.max_task_remediation_attempts,
+            minimum=0,
+            maximum=100_000,
+        ),
+        executor_completion_contract_mode=(
+            str(
+                exec_data.get(
+                    "executor_completion_contract_mode",
+                    ExecutionConfig.executor_completion_contract_mode,
+                ),
+            ).strip().lower()
+        ),
+        planner_degraded_mode=(
+            str(
+                exec_data.get(
+                    "planner_degraded_mode",
+                    ExecutionConfig.planner_degraded_mode,
+                ),
+            ).strip().lower()
+        ),
+        enable_sqlite_remediation_queue=_bool_from(
+            exec_data,
+            "enable_sqlite_remediation_queue",
+            ExecutionConfig.enable_sqlite_remediation_queue,
+        ),
+        enable_durable_task_runner=_bool_from(
+            exec_data,
+            "enable_durable_task_runner",
+            ExecutionConfig.enable_durable_task_runner,
+        ),
+        enable_mutation_idempotency=_bool_from(
+            exec_data,
+            "enable_mutation_idempotency",
+            ExecutionConfig.enable_mutation_idempotency,
+        ),
+        enable_slo_metrics=_bool_from(
+            exec_data,
+            "enable_slo_metrics",
+            ExecutionConfig.enable_slo_metrics,
+        ),
         delegate_task_timeout_seconds=delegate_task_timeout_seconds,
         model_call_max_attempts=model_call_max_attempts,
         model_call_retry_base_delay_seconds=model_call_retry_base_delay_seconds,
         model_call_retry_max_delay_seconds=model_call_retry_max_delay_seconds,
         model_call_retry_jitter_seconds=model_call_retry_jitter_seconds,
+    )
+    completion_mode = execution.executor_completion_contract_mode
+    if completion_mode not in {"off", "warn", "enforce"}:
+        completion_mode = ExecutionConfig.executor_completion_contract_mode
+    planner_mode = execution.planner_degraded_mode
+    if planner_mode not in {"allow", "require_approval", "deny"}:
+        planner_mode = ExecutionConfig.planner_degraded_mode
+    execution = ExecutionConfig(
+        **{
+            **execution.__dict__,
+            "executor_completion_contract_mode": completion_mode,
+            "planner_degraded_mode": planner_mode,
+        },
     )
 
     verif_data = raw.get("verification", {})

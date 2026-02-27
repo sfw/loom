@@ -14,6 +14,7 @@ import asyncio
 import csv
 import json
 import logging
+import time
 import uuid
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -43,15 +44,18 @@ from loom.events.types import (
     SUBTASK_OUTCOME_STALE,
     SUBTASK_RETRYING,
     SUBTASK_STARTED,
+    TASK_BUDGET_EXHAUSTED,
     TASK_CANCELLED,
     TASK_COMPLETED,
     TASK_EXECUTING,
     TASK_FAILED,
+    TASK_PLAN_DEGRADED,
     TASK_PLAN_NORMALIZED,
     TASK_PLAN_READY,
     TASK_PLANNING,
     TASK_REPLAN_REJECTED,
     TASK_REPLANNING,
+    TASK_RUN_ACQUIRED,
     TASK_STALLED,
     TASK_STALLED_RECOVERY_ATTEMPTED,
     TELEMETRY_RUN_SUMMARY,
@@ -99,6 +103,102 @@ __all__ = [
     "ToolCallRecord",
     "create_task",
 ]
+
+
+class _RunBudget:
+    """Tracks task-level resource usage and limit enforcement."""
+
+    def __init__(self, config: Config):
+        execution = getattr(config, "execution", None)
+        self.enabled = bool(getattr(execution, "enable_global_run_budget", False))
+        self.wall_clock_seconds_limit = int(
+            max(0, getattr(execution, "max_task_wall_clock_seconds", 0) or 0),
+        )
+        self.total_tokens_limit = int(
+            max(0, getattr(execution, "max_task_total_tokens", 0) or 0),
+        )
+        self.model_invocations_limit = int(
+            max(0, getattr(execution, "max_task_model_invocations", 0) or 0),
+        )
+        self.tool_calls_limit = int(
+            max(0, getattr(execution, "max_task_tool_calls", 0) or 0),
+        )
+        self.mutating_tool_calls_limit = int(
+            max(0, getattr(execution, "max_task_mutating_tool_calls", 0) or 0),
+        )
+        self.replans_limit = int(
+            max(0, getattr(execution, "max_task_replans", 0) or 0),
+        )
+        self.remediation_attempts_limit = int(
+            max(0, getattr(execution, "max_task_remediation_attempts", 0) or 0),
+        )
+
+        self.started_monotonic = time.monotonic()
+        self.total_tokens = 0
+        self.model_invocations = 0
+        self.tool_calls = 0
+        self.mutating_tool_calls = 0
+        self.replans = 0
+        self.remediation_attempts = 0
+
+    def observe_result(self, result: SubtaskResult) -> None:
+        self.total_tokens += max(0, int(getattr(result, "tokens_used", 0) or 0))
+        counters = getattr(result, "telemetry_counters", None)
+        if isinstance(counters, dict):
+            self.model_invocations += max(0, int(counters.get("model_invocations", 0) or 0))
+            self.tool_calls += max(0, int(counters.get("tool_calls", 0) or 0))
+            self.mutating_tool_calls += max(
+                0,
+                int(counters.get("mutating_tool_calls", 0) or 0),
+            )
+
+    def observe_replan(self) -> None:
+        self.replans += 1
+
+    def observe_remediation_attempt(self) -> None:
+        self.remediation_attempts += 1
+
+    def snapshot(self) -> dict[str, int | float]:
+        elapsed = max(0.0, time.monotonic() - self.started_monotonic)
+        return {
+            "elapsed_seconds": round(elapsed, 3),
+            "total_tokens": int(self.total_tokens),
+            "model_invocations": int(self.model_invocations),
+            "tool_calls": int(self.tool_calls),
+            "mutating_tool_calls": int(self.mutating_tool_calls),
+            "replans": int(self.replans),
+            "remediation_attempts": int(self.remediation_attempts),
+        }
+
+    def exceeded(self) -> tuple[bool, str, int | float, int]:
+        if not self.enabled:
+            return False, "", 0, 0
+        elapsed = max(0.0, time.monotonic() - self.started_monotonic)
+        checks: tuple[tuple[str, float, int], ...] = (
+            ("max_task_wall_clock_seconds", elapsed, self.wall_clock_seconds_limit),
+            ("max_task_total_tokens", float(self.total_tokens), self.total_tokens_limit),
+            (
+                "max_task_model_invocations",
+                float(self.model_invocations),
+                self.model_invocations_limit,
+            ),
+            ("max_task_tool_calls", float(self.tool_calls), self.tool_calls_limit),
+            (
+                "max_task_mutating_tool_calls",
+                float(self.mutating_tool_calls),
+                self.mutating_tool_calls_limit,
+            ),
+            ("max_task_replans", float(self.replans), self.replans_limit),
+            (
+                "max_task_remediation_attempts",
+                float(self.remediation_attempts),
+                self.remediation_attempts_limit,
+            ),
+        )
+        for key, current, limit in checks:
+            if limit > 0 and current > float(limit):
+                return True, key, current, limit
+        return False, "", 0, 0
 
 
 class Orchestrator:
@@ -168,6 +268,8 @@ class Orchestrator:
         self._state_lock = asyncio.Lock()
         self._changelog_cache: dict[str, ChangeLog] = {}
         self._telemetry_rollup: dict[str, int] = self._new_telemetry_rollup()
+        self._run_budget = _RunBudget(config)
+        self._active_run_id = ""
 
         # Inject process into prompt assembler
         if process is not None:
@@ -214,6 +316,13 @@ class Orchestrator:
         """Main entry point. Drives the full task lifecycle."""
         try:
             self._telemetry_rollup = self._new_telemetry_rollup()
+            self._run_budget = _RunBudget(self._config)
+            run_id = self._initialize_task_run_id(task)
+            self._emit(TASK_RUN_ACQUIRED, task.id, {
+                "run_id": run_id,
+            })
+            if bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
+                await self._hydrate_remediation_queue_from_db(task)
             plan: Plan
             if reuse_existing_plan and task.plan and task.plan.subtasks:
                 plan = task.plan
@@ -229,11 +338,15 @@ class Orchestrator:
                     "subtask_count": len(plan.subtasks),
                     "subtask_ids": [s.id for s in plan.subtasks],
                     "reused": True,
+                    "run_id": run_id,
                 })
             else:
                 # 1. Planning phase
                 task.status = TaskStatus.PLANNING
-                self._emit(TASK_PLANNING, task.id, {"goal": task.goal})
+                self._emit(TASK_PLANNING, task.id, {
+                    "goal": task.goal,
+                    "run_id": run_id,
+                })
 
                 plan = await self._plan_task_with_validation(task)
                 task.plan = plan
@@ -242,10 +355,11 @@ class Orchestrator:
                 self._emit(TASK_PLAN_READY, task.id, {
                     "subtask_count": len(plan.subtasks),
                     "subtask_ids": [s.id for s in plan.subtasks],
+                    "run_id": run_id,
                 })
 
             # 2. Execution loop — parallel dispatch of independent subtasks
-            self._emit(TASK_EXECUTING, task.id, {})
+            self._emit(TASK_EXECUTING, task.id, {"run_id": run_id})
             iteration = 0
             max_iterations = self._config.execution.max_loop_iterations
             max_parallel = self._config.execution.max_parallel_subtasks
@@ -255,6 +369,8 @@ class Orchestrator:
             max_stall_recovery_attempts = 2
 
             while self._scheduler.has_pending(task.plan) and iteration < max_iterations:
+                if await self._enforce_global_budget(task):
+                    break
                 if task.status == TaskStatus.CANCELLED:
                     break
 
@@ -331,6 +447,7 @@ class Orchestrator:
                 # Replanning is deferred until the whole batch is processed.
                 for subtask, result, verification in outcomes:
                     self._accumulate_subtask_telemetry(result)
+                    self._run_budget.observe_result(result)
                     if batch_plan_version != task.plan.version:
                         self._record_stale_outcome(
                             task=task,
@@ -351,6 +468,7 @@ class Orchestrator:
                         )
 
                 if pending_replan is not None and task.status == TaskStatus.EXECUTING:
+                    self._run_budget.observe_replan()
                     await self._replan_task(
                         task,
                         reason=str(pending_replan.get("reason", "subtask_failures")),
@@ -372,6 +490,8 @@ class Orchestrator:
                     attempts_by_subtask=attempts_by_subtask,
                     finalizing=False,
                 )
+                if bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
+                    await self._sync_remediation_queue_to_db(task)
 
             # 3. Completion
             await self._process_remediation_queue(
@@ -379,6 +499,8 @@ class Orchestrator:
                 attempts_by_subtask=attempts_by_subtask,
                 finalizing=True,
             )
+            if bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
+                await self._sync_remediation_queue_to_db(task)
             result_task = self._finalize_task(task)
             self._export_evidence_ledger_csv(result_task)
 
@@ -541,6 +663,12 @@ class Orchestrator:
             missing_targets=missing_targets,
         )
         attempt_list.append(attempt_record)
+        await self._persist_subtask_attempt_record(
+            task=task,
+            subtask_id=subtask.id,
+            attempt_record=attempt_record,
+            verification=verification,
+        )
 
         # Parse failures in verifier output should retry verification only
         # instead of re-running full subtask execution.
@@ -751,6 +879,77 @@ class Orchestrator:
     def _topology_retry_attempts(self) -> int:
         """Bounded retry budget for topology-invalid planner outputs."""
         return 2 if self._phase_mode() == "strict" else 1
+
+    def _planner_degraded_mode(self) -> str:
+        raw = str(
+            getattr(self._config.execution, "planner_degraded_mode", "allow"),
+        ).strip().lower()
+        if raw in {"allow", "require_approval", "deny"}:
+            return raw
+        return "allow"
+
+    async def _build_planner_degraded_plan(
+        self,
+        *,
+        task: Task,
+        reason_code: str,
+        detail: str,
+    ) -> Plan:
+        mode = self._planner_degraded_mode()
+        if mode == "deny":
+            raise ValueError(
+                f"Planner degraded mode denied ({reason_code}): {detail}",
+            )
+        if mode == "require_approval":
+            async with self._state_lock:
+                task.status = TaskStatus.WAITING_APPROVAL
+                self._state.save(task)
+            approved = await self._approval.request_approval(
+                ApprovalRequest(
+                    task_id=task.id,
+                    subtask_id="planning",
+                    reason=f"Planner degraded: {reason_code}",
+                    proposed_action="Use fallback execute-goal plan",
+                    risk_level="high",
+                    details={
+                        "reason_code": reason_code,
+                        "detail": detail,
+                    },
+                    auto_approve_timeout=None,
+                ),
+            )
+            async with self._state_lock:
+                task.status = TaskStatus.PLANNING
+                self._state.save(task)
+            if not approved:
+                raise ValueError(
+                    f"Planner degraded fallback not approved ({reason_code})",
+                )
+
+        fallback = Plan(
+            subtasks=[Subtask(
+                id="execute-goal",
+                description=task.goal or "Execute the task goal directly",
+                model_tier=2,
+                max_retries=self._config.execution.max_subtask_retries,
+            )],
+            version=1,
+        )
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["planner_degraded"] = True
+        metadata["planner_degraded_reason"] = reason_code
+        metadata["planner_degraded_detail"] = detail
+        task.metadata = metadata
+        self._emit(TASK_PLAN_DEGRADED, task.id, {
+            "run_id": self._task_run_id(task),
+            "reason_code": reason_code,
+            "detail": detail,
+            "policy_mode": mode,
+            "fallback_subtasks": ["execute-goal"],
+        })
+        return self._apply_process_phase_mode(fallback)
 
     async def _plan_task_with_validation(self, task: Task) -> Plan:
         """Plan task with bounded retries when topology validation fails."""
@@ -1062,6 +1261,7 @@ class Orchestrator:
             })
 
         feedback = self._format_blocked_subtasks_feedback(blocked_subtasks)
+        self._run_budget.observe_replan()
         replanned = await self._replan_task(
             task,
             reason="scheduler_deadlock",
@@ -1513,6 +1713,7 @@ class Orchestrator:
         last_failure = "process remediation failed"
 
         for attempt_number in range(1, max_attempts + 1):
+            self._run_budget.observe_remediation_attempt()
             self._emit(SUBTASK_RETRYING, task.id, {
                 "subtask_id": subtask.id,
                 "mode": "confirm_or_prune",
@@ -1527,6 +1728,14 @@ class Orchestrator:
                 "max_attempts": max_attempts,
                 "phase": "start",
             })
+            await self._persist_remediation_attempt(
+                task=task,
+                remediation_id=remediation_id or "",
+                subtask_id=subtask.id,
+                attempt=attempt_number,
+                max_attempts=max_attempts,
+                phase="start",
+            )
 
             prior_successful_tool_calls: list[ToolCallRecord] = []
             prior_evidence_records = self._evidence_for_subtask(task.id, subtask.id)
@@ -1595,6 +1804,17 @@ class Orchestrator:
                     "phase": "done",
                     "outcome": "resolved",
                 })
+                await self._persist_remediation_attempt(
+                    task=task,
+                    remediation_id=remediation_id or "",
+                    subtask_id=subtask.id,
+                    attempt=attempt_number,
+                    max_attempts=max_attempts,
+                    phase="done",
+                    outcome="resolved",
+                    retry_strategy="resolved",
+                    reason_code=str(remediation_verification.reason_code or ""),
+                )
                 self._record_confirm_or_prune_attempt(
                     task=task,
                     subtask_id=subtask.id,
@@ -1667,6 +1887,19 @@ class Orchestrator:
                 "retry_strategy": remediation_strategy.value,
                 "transient": transient,
             })
+            await self._persist_remediation_attempt(
+                task=task,
+                remediation_id=remediation_id or "",
+                subtask_id=subtask.id,
+                attempt=attempt_number,
+                max_attempts=max_attempts,
+                phase="done",
+                outcome="failed",
+                retry_strategy=remediation_strategy.value,
+                transient=transient,
+                reason_code=str(remediation_verification.reason_code or ""),
+                error=combined_error,
+            )
             last_failure = combined_error
 
             more_attempts_remain = attempt_number < max_attempts
@@ -1715,6 +1948,133 @@ class Orchestrator:
         })
         if len(rows) > 25:
             del rows[:-25]
+
+    async def _persist_subtask_attempt_record(
+        self,
+        *,
+        task: Task,
+        subtask_id: str,
+        attempt_record: AttemptRecord,
+        verification: VerificationResult,
+    ) -> None:
+        if not bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
+            return
+        try:
+            await self._memory.insert_subtask_attempt(
+                task_id=task.id,
+                run_id=self._task_run_id(task),
+                subtask_id=subtask_id,
+                attempt=int(getattr(attempt_record, "attempt", 0) or 0),
+                tier=int(getattr(attempt_record, "tier", 1) or 1),
+                retry_strategy=str(
+                    getattr(getattr(attempt_record, "retry_strategy", None), "value", "")
+                    or getattr(attempt_record, "retry_strategy", "")
+                    or RetryStrategy.GENERIC.value
+                ),
+                reason_code=str(getattr(verification, "reason_code", "") or ""),
+                feedback=str(getattr(attempt_record, "feedback", "") or ""),
+                error=str(getattr(attempt_record, "error", "") or ""),
+                missing_targets=list(getattr(attempt_record, "missing_targets", []) or []),
+                error_category=str(
+                    getattr(
+                        getattr(attempt_record, "error_category", None),
+                        "value",
+                        "",
+                    ) or ""
+                ),
+            )
+        except Exception:
+            logger.debug(
+                "Failed persisting subtask attempt for %s/%s",
+                task.id,
+                subtask_id,
+                exc_info=True,
+            )
+
+    async def _sync_remediation_queue_to_db(self, task: Task) -> None:
+        if not bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
+            return
+        queue = task.metadata.get("remediation_queue")
+        if not isinstance(queue, list):
+            return
+        for item in queue:
+            if not isinstance(item, dict):
+                continue
+            payload = dict(item)
+            payload["task_id"] = task.id
+            payload.setdefault("run_id", self._task_run_id(task))
+            try:
+                await self._memory.upsert_remediation_item(payload)
+            except Exception:
+                logger.debug(
+                    "Failed syncing remediation item %s for task %s",
+                    str(item.get("id", "")),
+                    task.id,
+                    exc_info=True,
+                )
+
+    async def _hydrate_remediation_queue_from_db(self, task: Task) -> None:
+        if not bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
+            return
+        try:
+            db_items = await self._memory.list_remediation_items(task_id=task.id)
+        except Exception:
+            logger.debug("Failed loading remediation queue from db for %s", task.id, exc_info=True)
+            return
+        if not db_items:
+            return
+        queue = self._remediation_queue(task)
+        existing_ids = {
+            str(item.get("id", "")).strip()
+            for item in queue
+            if isinstance(item, dict)
+        }
+        for item in db_items:
+            item_id = str(item.get("id", "")).strip()
+            if not item_id or item_id in existing_ids:
+                continue
+            queue.append(item)
+        self._state.save(task)
+
+    async def _persist_remediation_attempt(
+        self,
+        *,
+        task: Task,
+        remediation_id: str,
+        subtask_id: str,
+        attempt: int,
+        max_attempts: int,
+        phase: str,
+        outcome: str = "",
+        retry_strategy: str = "",
+        transient: bool = False,
+        reason_code: str = "",
+        error: str = "",
+    ) -> None:
+        if not bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
+            return
+        try:
+            await self._memory.insert_remediation_attempt(
+                remediation_id=remediation_id,
+                task_id=task.id,
+                run_id=self._task_run_id(task),
+                subtask_id=subtask_id,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                phase=phase,
+                outcome=outcome,
+                retry_strategy=retry_strategy,
+                transient=transient,
+                reason_code=reason_code,
+                error=error,
+            )
+        except Exception:
+            logger.debug(
+                "Failed persisting remediation attempt for %s/%s",
+                task.id,
+                remediation_id,
+                exc_info=True,
+            )
 
     def _remediation_queue(self, task: Task) -> list[dict]:
         queue = task.metadata.get("remediation_queue")
@@ -2356,16 +2716,11 @@ class Orchestrator:
                 task.id,
                 e,
             )
-            fallback = Plan(
-                subtasks=[Subtask(
-                    id="execute-goal",
-                    description=task.goal or "Execute the task goal directly",
-                    model_tier=2,
-                    max_retries=self._config.execution.max_subtask_retries,
-                )],
-                version=1,
+            return await self._build_planner_degraded_plan(
+                task=task,
+                reason_code="planner_model_failure",
+                detail=f"{type(e).__name__}: {e}",
             )
-            return self._apply_process_phase_mode(fallback)
         self._emit(MODEL_INVOCATION, task.id, {
             "subtask_id": "planning",
             "model": model.name,
@@ -2377,7 +2732,14 @@ class Orchestrator:
             **collect_response_diagnostics(response).to_event_payload(),
         })
 
-        plan = self._parse_plan(response, goal=task.goal)
+        try:
+            plan = self._parse_plan(response, goal=task.goal)
+        except ValueError as e:
+            return await self._build_planner_degraded_plan(
+                task=task,
+                reason_code="planner_json_parse_failed",
+                detail=str(e),
+            )
         return self._apply_process_phase_mode(plan)
 
     @staticmethod
@@ -2681,9 +3043,33 @@ class Orchestrator:
                     "structural_max_attempts": max_structural_attempts,
                     **collect_response_diagnostics(response).to_event_payload(),
                 })
-                parsed_plan = self._apply_process_phase_mode(
-                    self._parse_plan(response, goal=task.goal),
-                )
+                try:
+                    parsed_plan = self._apply_process_phase_mode(
+                        self._parse_plan(response, goal=task.goal),
+                    )
+                except ValueError as e:
+                    parse_error = str(e).strip() or "invalid replanner JSON"
+                    self._emit(TASK_REPLAN_REJECTED, task.id, {
+                        "failed_subtask_id": failed_subtask_id,
+                        "reason": reason,
+                        "validation_error": parse_error,
+                        "old_subtask_ids": [s.id for s in task.plan.subtasks],
+                        "new_subtask_ids": [],
+                        "attempt": structural_attempt,
+                        "max_attempts": max_structural_attempts,
+                    })
+                    task.add_decision(
+                        f"Rejected replanned plan: {parse_error}",
+                    )
+                    self._state.save(task)
+                    if structural_attempt >= max_structural_attempts:
+                        return False
+                    topology_feedback = (
+                        "Previous replanned output was not valid JSON.\n"
+                        f"Validation error: {parse_error}\n"
+                        "Return corrected JSON only."
+                    )
+                    continue
                 new_plan = parsed_plan
                 topology_error = ""
                 try:
@@ -2829,14 +3215,7 @@ class Orchestrator:
         )
 
         if not validation.valid or validation.parsed is None:
-            return Plan(
-                subtasks=[Subtask(
-                    id="execute-goal",
-                    description=goal or "Execute the task goal directly",
-                    model_tier=2,
-                )],
-                version=1,
-            )
+            raise ValueError(validation.error or "planner output JSON parse failed")
 
         subtasks = []
         for s in validation.parsed.get("subtasks", []):
@@ -3165,13 +3544,90 @@ class Orchestrator:
             logger.warning("Post-task learning failed for %s: %s", task.id, e)
 
     def _emit(self, event_type: str, task_id: str, data: dict) -> None:
+        payload = dict(data or {})
+        run_id = str(payload.get("run_id", "") or "").strip()
+        if not run_id:
+            run_id = str(getattr(self, "_active_run_id", "") or "").strip()
+        if run_id and not str(payload.get("run_id", "")).strip():
+            payload["run_id"] = run_id
         self._events.emit(Event(
-            event_type=event_type, task_id=task_id, data=data
+            event_type=event_type,
+            task_id=task_id,
+            data=payload,
         ))
+
+    @staticmethod
+    def _task_run_id(task: Task) -> str:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        return str(metadata.get("run_id", "") or "").strip()
+
+    def _initialize_task_run_id(self, task: Task) -> str:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        run_id = str(metadata.get("run_id", "") or "").strip()
+        if not run_id:
+            run_id = f"run-{uuid.uuid4().hex[:12]}"
+            metadata["run_id"] = run_id
+            task.metadata = metadata
+            self._state.save(task)
+        self._active_run_id = run_id
+        return run_id
+
+    def _apply_budget_metadata(
+        self,
+        task: Task,
+        budget_name: str,
+        observed: int | float,
+        limit: int,
+    ) -> None:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["budget_exhausted"] = {
+            "name": budget_name,
+            "observed": observed,
+            "limit": limit,
+            "snapshot": self._run_budget.snapshot(),
+            "at": datetime.now().isoformat(),
+            "run_id": self._task_run_id(task),
+        }
+        task.metadata = metadata
+
+    async def _enforce_global_budget(self, task: Task) -> bool:
+        exceeded, budget_name, observed, limit = self._run_budget.exceeded()
+        if not exceeded:
+            return False
+        self._apply_budget_metadata(task, budget_name, observed, limit)
+        for candidate in task.plan.subtasks:
+            if candidate.status == SubtaskStatus.PENDING:
+                candidate.status = SubtaskStatus.SKIPPED
+                candidate.summary = (
+                    "Skipped: global run budget exhausted "
+                    f"({budget_name})."
+                )
+        task.status = TaskStatus.FAILED
+        task.add_error(
+            "budget",
+            f"Global run budget exhausted: {budget_name} "
+            f"(observed={observed}, limit={limit})",
+        )
+        self._state.save(task)
+        self._emit(TASK_BUDGET_EXHAUSTED, task.id, {
+            "run_id": self._task_run_id(task),
+            "budget_name": budget_name,
+            "observed": observed,
+            "limit": limit,
+            "snapshot": self._run_budget.snapshot(),
+        })
+        return True
 
     @staticmethod
     def _new_telemetry_rollup() -> dict[str, int]:
         return {
+            "model_invocations": 0,
+            "tool_calls": 0,
+            "mutating_tool_calls": 0,
             "artifact_ingests": 0,
             "artifact_reads": 0,
             "artifact_retention_deletes": 0,
@@ -3189,6 +3645,9 @@ class Orchestrator:
             self._telemetry_rollup = self._new_telemetry_rollup()
             rollup = self._telemetry_rollup
         for key in (
+            "model_invocations",
+            "tool_calls",
+            "mutating_tool_calls",
             "artifact_ingests",
             "artifact_reads",
             "artifact_retention_deletes",
@@ -3212,12 +3671,17 @@ class Orchestrator:
         if not isinstance(rollup, dict):
             rollup = self._new_telemetry_rollup()
         self._emit(TELEMETRY_RUN_SUMMARY, task.id, {
+            "run_id": self._task_run_id(task),
+            "model_invocations": int(rollup.get("model_invocations", 0)),
+            "tool_calls": int(rollup.get("tool_calls", 0)),
+            "mutating_tool_calls": int(rollup.get("mutating_tool_calls", 0)),
             "artifact_ingests": int(rollup.get("artifact_ingests", 0)),
             "artifact_reads": int(rollup.get("artifact_reads", 0)),
             "artifact_retention_deletes": int(rollup.get("artifact_retention_deletes", 0)),
             "compaction_policy_decisions": int(rollup.get("compaction_policy_decisions", 0)),
             "overflow_fallback_count": int(rollup.get("overflow_fallback_count", 0)),
             "compactor_warning_count": int(rollup.get("compactor_warning_count", 0)),
+            "budget_snapshot": self._run_budget.snapshot(),
         })
 
     def cancel_task(self, task: Task) -> None:

@@ -208,6 +208,66 @@ class TestDatabase:
         typed = await db.query_events("t1", event_type="task_started")
         assert len(typed) == 1
 
+    async def test_task_run_lifecycle(self, db: Database):
+        await db.insert_task(task_id="t1", goal="Test")
+        await db.insert_task_run(
+            run_id="run-1",
+            task_id="t1",
+            status="queued",
+            process_name="demo",
+        )
+        acquired = await db.acquire_task_run_lease(
+            run_id="run-1",
+            lease_owner="worker-A",
+            lease_seconds=30,
+        )
+        assert acquired is True
+        heartbeat = await db.heartbeat_task_run(
+            run_id="run-1",
+            lease_owner="worker-A",
+            lease_seconds=30,
+        )
+        assert heartbeat is True
+        await db.complete_task_run(run_id="run-1", status="completed")
+        row = await db.get_task_run("run-1")
+        assert row is not None
+        assert row["status"] == "completed"
+
+    async def test_mutation_ledger_roundtrip(self, db: Database):
+        await db.insert_task(task_id="t1", goal="Test")
+        await db.upsert_mutation_ledger_entry(
+            idempotency_key="idem-1",
+            task_id="t1",
+            run_id="run-1",
+            subtask_id="s1",
+            tool_name="write_file",
+            args_hash="abc123",
+            status="success",
+            result_json="{\"success\":true}",
+        )
+        row = await db.get_mutation_ledger_entry("idem-1")
+        assert row is not None
+        assert row["tool_name"] == "write_file"
+        assert row["status"] == "success"
+
+    async def test_remediation_item_roundtrip(self, db: Database):
+        await db.insert_task(task_id="t1", goal="Test")
+        await db.upsert_remediation_item({
+            "id": "rem-1",
+            "task_id": "t1",
+            "run_id": "run-1",
+            "subtask_id": "s1",
+            "strategy": "unconfirmed_data",
+            "state": "queued",
+            "blocking": True,
+            "missing_targets": ["a", "b"],
+        })
+        rows = await db.list_remediation_items(task_id="t1")
+        assert len(rows) == 1
+        assert rows[0]["id"] == "rem-1"
+        assert rows[0]["blocking"] is True
+        assert rows[0]["missing_targets"] == ["a", "b"]
+
 
 class TestMemoryManager:
     """Test the high-level memory manager."""

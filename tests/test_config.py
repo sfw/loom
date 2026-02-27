@@ -28,6 +28,20 @@ class TestDefaultConfig:
         assert config.execution.max_subtask_retries == 3
         assert config.execution.max_loop_iterations == 50
         assert config.execution.auto_approve_confidence_threshold == 0.8
+        assert config.execution.enable_global_run_budget is False
+        assert config.execution.max_task_wall_clock_seconds == 0
+        assert config.execution.max_task_total_tokens == 0
+        assert config.execution.max_task_model_invocations == 0
+        assert config.execution.max_task_tool_calls == 0
+        assert config.execution.max_task_mutating_tool_calls == 0
+        assert config.execution.max_task_replans == 0
+        assert config.execution.max_task_remediation_attempts == 0
+        assert config.execution.executor_completion_contract_mode == "off"
+        assert config.execution.planner_degraded_mode == "allow"
+        assert config.execution.enable_sqlite_remediation_queue is False
+        assert config.execution.enable_durable_task_runner is False
+        assert config.execution.enable_mutation_idempotency is False
+        assert config.execution.enable_slo_metrics is False
         assert config.execution.delegate_task_timeout_seconds == 3600
         assert config.execution.model_call_max_attempts == 5
         assert config.execution.model_call_retry_base_delay_seconds == 0.5
@@ -222,6 +236,41 @@ model_call_retry_jitter_seconds = -0.5
         assert config.execution.model_call_retry_base_delay_seconds == 0.0
         assert config.execution.model_call_retry_max_delay_seconds == 0.0
         assert config.execution.model_call_retry_jitter_seconds == 0.0
+
+    def test_execution_refactor_flags_loaded(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[execution]
+enable_global_run_budget = true
+max_task_wall_clock_seconds = 7200
+max_task_total_tokens = 250000
+max_task_model_invocations = 5000
+max_task_tool_calls = 4000
+max_task_mutating_tool_calls = 250
+max_task_replans = 10
+max_task_remediation_attempts = 120
+executor_completion_contract_mode = "enforce"
+planner_degraded_mode = "require_approval"
+enable_sqlite_remediation_queue = true
+enable_durable_task_runner = true
+enable_mutation_idempotency = true
+enable_slo_metrics = true
+""")
+        config = load_config(toml_file)
+        assert config.execution.enable_global_run_budget is True
+        assert config.execution.max_task_wall_clock_seconds == 7200
+        assert config.execution.max_task_total_tokens == 250000
+        assert config.execution.max_task_model_invocations == 5000
+        assert config.execution.max_task_tool_calls == 4000
+        assert config.execution.max_task_mutating_tool_calls == 250
+        assert config.execution.max_task_replans == 10
+        assert config.execution.max_task_remediation_attempts == 120
+        assert config.execution.executor_completion_contract_mode == "enforce"
+        assert config.execution.planner_degraded_mode == "require_approval"
+        assert config.execution.enable_sqlite_remediation_queue is True
+        assert config.execution.enable_durable_task_runner is True
+        assert config.execution.enable_mutation_idempotency is True
+        assert config.execution.enable_slo_metrics is True
 
     def test_verification_policy_flags_loaded(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

@@ -315,6 +315,10 @@ class WriteFileTool(Tool):
         return "write_file"
 
     @property
+    def is_mutating(self) -> bool:
+        return True
+
+    @property
     def description(self) -> str:
         return "Write content to a file. Creates parent directories if needed. Max 1 MB."
 
@@ -365,6 +369,10 @@ class DeleteFileTool(Tool):
     @property
     def name(self) -> str:
         return "delete_file"
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
 
     @property
     def description(self) -> str:
@@ -425,6 +433,10 @@ class MoveFileTool(Tool):
     @property
     def name(self) -> str:
         return "move_file"
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
 
     @property
     def description(self) -> str:
@@ -491,6 +503,10 @@ class EditFileTool(Tool):
     @property
     def name(self) -> str:
         return "edit_file"
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
 
     @property
     def description(self) -> str:

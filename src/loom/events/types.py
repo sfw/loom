@@ -10,6 +10,8 @@ TASK_REPLANNING = "task_replanning"
 TASK_REPLAN_REJECTED = "task_replan_rejected"
 TASK_STALLED = "task_stalled"
 TASK_STALLED_RECOVERY_ATTEMPTED = "task_stalled_recovery_attempted"
+TASK_BUDGET_EXHAUSTED = "task_budget_exhausted"
+TASK_PLAN_DEGRADED = "task_plan_degraded"
 TASK_COMPLETED = "task_completed"
 TASK_FAILED = "task_failed"
 TASK_CANCELLED = "task_cancelled"
@@ -24,6 +26,7 @@ SUBTASK_BLOCKED = "subtask_blocked"
 # Tool events
 TOOL_CALL_STARTED = "tool_call_started"
 TOOL_CALL_COMPLETED = "tool_call_completed"
+TOOL_CALL_DEDUPLICATED = "tool_call_deduplicated"
 ARTIFACT_CONFINEMENT_VIOLATION = "artifact_confinement_violation"
 ARTIFACT_INGEST_CLASSIFIED = "artifact_ingest_classified"
 ARTIFACT_INGEST_COMPLETED = "artifact_ingest_completed"
@@ -65,6 +68,11 @@ REMEDIATION_FAILED = "remediation_failed"
 REMEDIATION_EXPIRED = "remediation_expired"
 REMEDIATION_TERMINAL = "remediation_terminal"
 UNCONFIRMED_DATA_QUEUED = "unconfirmed_data_queued"
+
+# Durable run lifecycle
+TASK_RUN_ACQUIRED = "task_run_acquired"
+TASK_RUN_HEARTBEAT = "task_run_heartbeat"
+TASK_RUN_RECOVERED = "task_run_recovered"
 
 # Streaming events
 TOKEN_STREAMED = "token_streamed"
