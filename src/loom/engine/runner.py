@@ -37,6 +37,7 @@ from loom.events.types import (
     OVERFLOW_FALLBACK_APPLIED,
     TOKEN_STREAMED,
     TOOL_CALL_COMPLETED,
+    TOOL_CALL_DEDUPLICATED,
     TOOL_CALL_STARTED,
 )
 from loom.models.base import ModelResponse
@@ -163,6 +164,8 @@ class SubtaskRunner:
     ENABLE_ARTIFACT_TELEMETRY_EVENTS = True
     ARTIFACT_TELEMETRY_MAX_METADATA_CHARS = 1200
     ENABLE_MODEL_OVERFLOW_FALLBACK = True
+    EXECUTOR_COMPLETION_CONTRACT_MODE = "off"
+    ENABLE_MUTATION_IDEMPOTENCY = False
     OVERFLOW_FALLBACK_TOOL_MESSAGE_MIN_CHARS = 4_000
     OVERFLOW_FALLBACK_TOOL_OUTPUT_EXCERPT_CHARS = 1_200
     _OVERFLOW_BINARY_CONTENT_KINDS = frozenset({
@@ -499,6 +502,24 @@ class SubtaskRunner:
                 ),
             ),
         )
+        execution_cfg = getattr(config, "execution", None)
+        completion_mode = str(
+            getattr(
+                execution_cfg,
+                "executor_completion_contract_mode",
+                self.EXECUTOR_COMPLETION_CONTRACT_MODE,
+            ),
+        ).strip().lower()
+        if completion_mode not in {"off", "warn", "enforce"}:
+            completion_mode = self.EXECUTOR_COMPLETION_CONTRACT_MODE
+        self._executor_completion_contract_mode = completion_mode
+        self._enable_mutation_idempotency = bool(
+            getattr(
+                execution_cfg,
+                "enable_mutation_idempotency",
+                self.ENABLE_MUTATION_IDEMPOTENCY,
+            ),
+        )
         self._evidence_context_text_max_chars = int(
             getattr(
                 getattr(config, "limits", None),
@@ -708,6 +729,9 @@ class SubtaskRunner:
     @staticmethod
     def _new_subtask_telemetry_counters() -> dict[str, int]:
         return {
+            "model_invocations": 0,
+            "tool_calls": 0,
+            "mutating_tool_calls": 0,
             "artifact_ingests": 0,
             "artifact_reads": 0,
             "artifact_retention_deletes": 0,
@@ -893,6 +917,94 @@ class SubtaskRunner:
         self._event_bus.emit(Event(event_type=event_type, task_id=task_id, data=data))
         if counter_key:
             self._increment_subtask_counter(counter_key, counter_amount)
+
+    @staticmethod
+    def _normalize_run_id(task: Task) -> str:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            return ""
+        return str(metadata.get("run_id", "") or "").strip()
+
+    @staticmethod
+    def _mutation_target_from_args(arguments: dict[str, Any]) -> str:
+        for key in ("path", "dest_path", "destination", "target", "url", "uri"):
+            value = arguments.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text.lower()
+        return ""
+
+    def _mutation_idempotency_key(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str, str]:
+        args_hash = self._stable_json_digest(arguments)
+        seed = "|".join([
+            self._normalize_run_id(task) or task.id,
+            subtask.id,
+            tool_name,
+            self._mutation_target_from_args(arguments),
+            args_hash,
+        ])
+        idem_key = hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()
+        return idem_key, args_hash
+
+    @staticmethod
+    def _extract_completion_json(text: str) -> dict[str, Any] | None:
+        payload = str(text or "").strip()
+        if not payload:
+            return None
+        payload = ResponseValidator._strip_markdown_fences(payload)
+        decoder = json.JSONDecoder()
+        candidates: list[dict[str, Any]] = []
+
+        def _consider(candidate: Any) -> None:
+            if not isinstance(candidate, dict):
+                return
+            required = {"status", "deliverables_touched", "verification_notes"}
+            if required.issubset(set(candidate.keys())):
+                candidates.append(candidate)
+
+        try:
+            parsed = decoder.decode(payload)
+            _consider(parsed)
+        except json.JSONDecodeError:
+            pass
+
+        for i, ch in enumerate(payload):
+            if ch != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(payload[i:])
+            except json.JSONDecodeError:
+                continue
+            _consider(candidate)
+
+        return candidates[0] if candidates else None
+
+    def _validate_completion_contract(self, response_text: str) -> tuple[bool, str]:
+        contract = self._extract_completion_json(response_text)
+        if contract is None:
+            return False, (
+                "Missing completion JSON contract. Include keys: "
+                "status, deliverables_touched, verification_notes."
+            )
+        status = str(contract.get("status", "")).strip().lower()
+        if status not in {"success", "partial", "failed"}:
+            return False, "Completion contract 'status' must be one of success|partial|failed."
+        touched = contract.get("deliverables_touched")
+        if not isinstance(touched, list):
+            return False, "Completion contract 'deliverables_touched' must be an array."
+        notes = contract.get("verification_notes")
+        if not isinstance(notes, str):
+            return False, "Completion contract 'verification_notes' must be a string."
+        return True, ""
 
     def _artifact_event_common_payload(
         self,
@@ -1365,6 +1477,7 @@ class SubtaskRunner:
             async def _invoke_model():
                 nonlocal invocation_attempt, request_diag
                 invocation_attempt += 1
+                self._increment_subtask_counter("model_invocations")
                 request_diag = collect_request_diagnostics(
                     messages=messages,
                     tools=tool_schemas,
@@ -1523,6 +1636,11 @@ class SubtaskRunner:
                         TOOL_CALL_STARTED, task.id, subtask.id,
                         tc.name, tc.arguments,
                     )
+                    tool_obj = self._tools.get(tc.name)
+                    is_mutating_tool = bool(getattr(tool_obj, "is_mutating", False))
+                    self._increment_subtask_counter("tool_calls")
+                    if is_mutating_tool:
+                        self._increment_subtask_counter("mutating_tool_calls")
                     policy_error = self._validate_deliverable_write_policy(
                         tool_name=tc.name,
                         tool_args=tc.arguments,
@@ -1534,29 +1652,89 @@ class SubtaskRunner:
                     if policy_error:
                         tool_result = ToolResult.fail(policy_error)
                     else:
+                        deduped = False
+                        idempotency_key = ""
+                        args_hash = ""
+                        if self._enable_mutation_idempotency and is_mutating_tool:
+                            idempotency_key, args_hash = self._mutation_idempotency_key(
+                                task=task,
+                                subtask=subtask,
+                                tool_name=tc.name,
+                                arguments=tc.arguments,
+                            )
+                            try:
+                                ledger_entry = await self._memory.get_mutation_ledger_entry(
+                                    idempotency_key,
+                                )
+                            except Exception:
+                                ledger_entry = None
+                            if (
+                                isinstance(ledger_entry, dict)
+                                and str(ledger_entry.get("status", "")).strip().lower()
+                                == "success"
+                            ):
+                                tool_result = ToolResult.from_json(
+                                    str(ledger_entry.get("result_json", "") or ""),
+                                )
+                                deduped = True
+                                self._emit_telemetry_event(
+                                    event_type=TOOL_CALL_DEDUPLICATED,
+                                    task_id=task.id,
+                                    data={
+                                        "subtask_id": subtask.id,
+                                        "tool": tc.name,
+                                        "tool_call_id": str(getattr(tc, "id", "") or ""),
+                                        "idempotency_key": idempotency_key,
+                                        "run_id": self._normalize_run_id(task),
+                                    },
+                                )
                         execute_args = dict(tc.arguments)
-                        if tc.name in {"web_fetch", "web_fetch_html"}:
-                            execute_args["_enable_filetype_ingest_router"] = bool(
-                                self._enable_filetype_ingest_router,
+                        if not deduped:
+                            if tc.name in {"web_fetch", "web_fetch_html"}:
+                                execute_args["_enable_filetype_ingest_router"] = bool(
+                                    self._enable_filetype_ingest_router,
+                                )
+                                execute_args["_artifact_retention_max_age_days"] = int(
+                                    self._ingest_artifact_retention_max_age_days,
+                                )
+                                execute_args["_artifact_retention_max_files_per_scope"] = int(
+                                    self._ingest_artifact_retention_max_files_per_scope,
+                                )
+                                execute_args["_artifact_retention_max_bytes_per_scope"] = int(
+                                    self._ingest_artifact_retention_max_bytes_per_scope,
+                                )
+                            tool_result = await self._tools.execute(
+                                tc.name, execute_args,
+                                workspace=workspace,
+                                read_roots=read_roots,
+                                scratch_dir=self._config.scratch_path,
+                                changelog=changelog,
+                                subtask_id=subtask.id,
+                                auth_context=auth_context,
                             )
-                            execute_args["_artifact_retention_max_age_days"] = int(
-                                self._ingest_artifact_retention_max_age_days,
-                            )
-                            execute_args["_artifact_retention_max_files_per_scope"] = int(
-                                self._ingest_artifact_retention_max_files_per_scope,
-                            )
-                            execute_args["_artifact_retention_max_bytes_per_scope"] = int(
-                                self._ingest_artifact_retention_max_bytes_per_scope,
-                            )
-                        tool_result = await self._tools.execute(
-                            tc.name, execute_args,
-                            workspace=workspace,
-                            read_roots=read_roots,
-                            scratch_dir=self._config.scratch_path,
-                            changelog=changelog,
-                            subtask_id=subtask.id,
-                            auth_context=auth_context,
-                        )
+                        if (
+                            self._enable_mutation_idempotency
+                            and is_mutating_tool
+                            and idempotency_key
+                            and not deduped
+                        ):
+                            try:
+                                await self._memory.upsert_mutation_ledger_entry(
+                                    idempotency_key=idempotency_key,
+                                    task_id=task.id,
+                                    run_id=self._normalize_run_id(task),
+                                    subtask_id=subtask.id,
+                                    tool_name=tc.name,
+                                    args_hash=args_hash,
+                                    status="success" if tool_result.success else "failure",
+                                    result_json=tool_result.to_json(),
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Failed persisting idempotency ledger entry %s",
+                                    idempotency_key,
+                                    exc_info=True,
+                                )
                     record = ToolCallRecord(
                         tool=tc.name,
                         args=tc.arguments,
@@ -1624,7 +1802,45 @@ class SubtaskRunner:
                     "content": self._build_todo_reminder(task, subtask),
                 })
             else:
-                # Text-only response — subtask complete
+                # Text-only response. Depending on configured mode, require
+                # explicit completion contract payload before termination.
+                mode = str(
+                    getattr(
+                        self,
+                        "_executor_completion_contract_mode",
+                        self.EXECUTOR_COMPLETION_CONTRACT_MODE,
+                    ),
+                ).strip().lower()
+                if mode in {"warn", "enforce"}:
+                    valid_contract, contract_error = self._validate_completion_contract(
+                        response.text or "",
+                    )
+                    if not valid_contract and mode == "enforce":
+                        messages.append({
+                            "role": "assistant",
+                            "content": response.text or "",
+                        })
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                "COMPLETION CONTRACT ERROR: "
+                                f"{contract_error}\n"
+                                "Respond with a JSON object containing keys: "
+                                "status, deliverables_touched, verification_notes."
+                            ),
+                        })
+                        continue
+                    if not valid_contract and mode == "warn":
+                        self._emit_model_event(
+                            task_id=task.id,
+                            subtask_id=subtask.id,
+                            model_name=model.name,
+                            phase="done",
+                            details={
+                                "operation": "completion_contract_warn",
+                                "warning": contract_error,
+                            },
+                        )
                 completed_normally = True
                 break
         else:

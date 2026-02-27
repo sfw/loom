@@ -37,6 +37,20 @@ max_subtask_retries = 3
 max_loop_iterations = 50
 delegate_task_timeout_seconds = 3600
 auto_approve_confidence_threshold = 0.8
+enable_global_run_budget = false
+max_task_wall_clock_seconds = 0
+max_task_total_tokens = 0
+max_task_model_invocations = 0
+max_task_tool_calls = 0
+max_task_mutating_tool_calls = 0
+max_task_replans = 0
+max_task_remediation_attempts = 0
+executor_completion_contract_mode = "off" # off | warn | enforce
+planner_degraded_mode = "allow" # allow | require_approval | deny
+enable_sqlite_remediation_queue = false
+enable_durable_task_runner = false
+enable_mutation_idempotency = false
+enable_slo_metrics = false
 
 [verification]
 tier1_enabled = true

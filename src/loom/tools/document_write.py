@@ -20,6 +20,10 @@ class DocumentWriteTool(Tool):
         return "document_write"
 
     @property
+    def is_mutating(self) -> bool:
+        return True
+
+    @property
     def description(self) -> str:
         return (
             "Create a structured Markdown document. Provide the file path "

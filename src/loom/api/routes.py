@@ -140,36 +140,37 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
     if task.callback_url:
         engine.webhook_delivery.register(task.id, task.callback_url)
 
-    # Launch execution in background
-    asyncio.create_task(_execute_in_background(engine, task, process_def))
+    # Launch execution in background via engine run manager
+    run_id = await engine.submit_task(
+        task=task,
+        process=process_def,
+        process_name=effective_process or "",
+    )
 
     return TaskCreateResponse(
         task_id=task.id,
         status=task.status.value,
         message="Task created and execution started.",
+        run_id=run_id,
     )
 
 
 async def _execute_in_background(engine: Engine, task, process_def=None) -> None:
-    """Run task execution without blocking the API response."""
+    """Legacy helper retained for test compatibility."""
     import logging
     _bg_logger = logging.getLogger(__name__)
     try:
-        # Process-aware runs use an isolated orchestrator to avoid
-        # cross-task state leakage on shared engine.orchestrator.
         orchestrator = engine.orchestrator
         if process_def is not None:
             orchestrator = engine.create_task_orchestrator(process_def)
 
         result = await orchestrator.execute_task(task)
-        # Sync final status to SQLite
         try:
             await engine.database.update_task_status(result.id, result.status.value)
         except Exception:
             _bg_logger.warning("Failed to sync task %s status to DB", result.id)
     except Exception as e:
         _bg_logger.exception("Task %s failed with uncaught exception: %s", task.id, e)
-        # Ensure task is marked failed even if orchestrator didn't catch it
         try:
             task.status = TaskStatus.FAILED
             engine.state_manager.save(task)
@@ -242,9 +243,13 @@ async def get_task(request: Request, task_id: str):
         running=running,
         percent_complete=(completed / total * 100) if total > 0 else 0,
     )
+    run_id = ""
+    if isinstance(task.metadata, dict):
+        run_id = str(task.metadata.get("run_id", "") or "")
 
     return TaskResponse(
         task_id=task.id,
+        run_id=run_id,
         goal=task.goal,
         status=task.status.value,
         workspace=task.workspace or None,
@@ -697,5 +702,33 @@ async def get_config(request: Request):
         "execution": {
             "max_loop_iterations": config.execution.max_loop_iterations,
             "max_subtask_retries": config.execution.max_subtask_retries,
+            "enable_global_run_budget": bool(config.execution.enable_global_run_budget),
+            "executor_completion_contract_mode": str(
+                config.execution.executor_completion_contract_mode,
+            ),
+            "planner_degraded_mode": str(config.execution.planner_degraded_mode),
+            "enable_sqlite_remediation_queue": bool(
+                config.execution.enable_sqlite_remediation_queue,
+            ),
+            "enable_durable_task_runner": bool(
+                config.execution.enable_durable_task_runner,
+            ),
+            "enable_mutation_idempotency": bool(
+                config.execution.enable_mutation_idempotency,
+            ),
+            "enable_slo_metrics": bool(config.execution.enable_slo_metrics),
         },
     }
+
+
+@router.get("/slo")
+async def get_slo_snapshot(request: Request):
+    """Return aggregate SLO-oriented metrics derived from persisted runs/events."""
+    engine = _get_engine(request)
+    if not bool(getattr(engine.config.execution, "enable_slo_metrics", False)):
+        return {
+            "enabled": False,
+            "message": "SLO metrics disabled. Set execution.enable_slo_metrics=true.",
+        }
+    snapshot = await engine.database.compute_slo_snapshot()
+    return {"enabled": True, **snapshot}

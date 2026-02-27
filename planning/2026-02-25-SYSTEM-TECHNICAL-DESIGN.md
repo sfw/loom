@@ -14,6 +14,11 @@ It explains:
 
 This is based on the current implementation in `src/loom/*`.
 
+Implementation refresh status (2026-02-27):
+- Reliability hardening workstreams `#1,#2,#3,#4,#5,#6,#10` are implemented behind execution flags.
+- Validation snapshot (2026-02-27): `uv run ruff check` passed; `uv run pytest` passed (`1864 passed, 50 skipped`).
+- Default posture remains conservative: hardening controls are mostly opt-in via config.
+
 ## 2. High-Level Architecture
 
 Loom has two primary operating modes:
@@ -108,13 +113,19 @@ Validation and normalization checks include:
 
 If planner output is invalid topology:
 - Planner retries with structural feedback (attempts depend on phase mode).
-- If planner call fails entirely, a fallback single-subtask plan is created (`execute-goal`).
+
+If planner output parse/model invocation fails after retries:
+- Degraded behavior is controlled by `execution.planner_degraded_mode`.
+- `allow`: fallback single-subtask plan (`execute-goal`) + `task_plan_degraded` event.
+- `require_approval`: task pauses for approval before degraded plan activation.
+- `deny`: planning fails fast.
 
 ### 3.1.2 Execution loop
 
 The orchestrator executes while:
 - There are pending/running subtasks, and
 - Loop iterations are below `execution.max_loop_iterations`.
+- Global run budget has not been exhausted (when `execution.enable_global_run_budget=true`).
 
 Each loop iteration:
 1. Ask scheduler for runnable subtasks.
@@ -130,6 +141,12 @@ Each loop iteration:
    - Success -> `_handle_success`.
    - Failure -> `_handle_failure` (retry/replan/remediation decisions).
 6. Process remediation queue opportunistically between batches.
+7. Re-check aggregate budget counters (tokens, model calls, tool calls, mutating tool calls, replans, remediation attempts).
+
+On global budget breach:
+- Emit `task_budget_exhausted`.
+- Mark pending subtasks as skipped due to budget policy.
+- Finalize task as failed with budget snapshot metadata.
 
 ### 3.1.3 Subtask runner loop
 
@@ -147,10 +164,16 @@ Per iteration:
 - If model emits tool calls:
   - Validate tool-call schema.
   - Enforce deliverable write policy when in retry/remediation context.
+  - For mutating tools, optionally apply idempotency-ledger dedupe (`execution.enable_mutation_idempotency`).
   - Execute tools.
   - Serialize compact tool results back into context.
   - Append anti-amnesia TODO reminder.
 - Else (text-only response): subtask loop ends successfully.
+
+Completion semantics:
+- `execution.executor_completion_contract_mode=off`: legacy text-only completion.
+- `warn`: allow completion without contract but emit warning.
+- `enforce`: require valid completion block; otherwise runner prompts correction and continues loop.
 
 Interruption paths produce failure result:
 - Deadline exceeded.
@@ -195,6 +218,7 @@ Remediation queue:
 - Supports dedupe/merge for matching unresolved items.
 - Per-item attempt counts, bounded exponential backoff, TTL expiry.
 - Finalization step forces unresolved blocking remediations to terminal failed state.
+- Optional SQLite dual-write/read hydration (`execution.enable_sqlite_remediation_queue`) via `remediation_items` and `remediation_attempts`.
 
 ### 3.1.6 Finalization
 
@@ -256,6 +280,10 @@ Notable characteristics:
 - `runner_compaction_policy_mode` constrained to `legacy|tiered|off`.
 - Verification scan suffix list normalization.
 - Retry-delay range normalization (max >= base).
+- Hardening flags for budgeting, planner degradation policy, completion protocol, remediation persistence, durability, idempotency, and SLO snapshots.
+- Normalized enum validation for:
+  - `execution.executor_completion_contract_mode` (`off|warn|enforce`)
+  - `execution.planner_degraded_mode` (`allow|require_approval|deny`)
 
 Impact:
 - This config drives almost every decision threshold in orchestration, verification, retries, and compaction.
@@ -269,6 +297,9 @@ Impact:
 - Coordinates planning, dispatch, retry, remediation, replan, and finalization.
 - Emits domain events for observability.
 - Delegates subtask execution internals to runner.
+- Initializes and propagates stable `run_id` per task execution attempt.
+- Enforces optional task-level aggregate budgets across loop dispatch, retries, replans, remediation, and runner counters.
+- Optionally hydrates/syncs remediation queue state to SQLite.
 
 ### 4.2.2 Scheduler semantics
 
@@ -295,6 +326,8 @@ Key protections:
 - Tool-iteration budget cap.
 - Deliverable variant suppression in remediation.
 - Artifact telemetry and confinement violation eventing.
+- Optional explicit completion contract (`off|warn|enforce`) to reduce false-success text exits.
+- Optional mutating-tool idempotency dedupe via SQLite mutation ledger.
 
 ## 4.4 Verification subsystem
 
@@ -358,6 +391,7 @@ Important capabilities:
 - Execution wrappers with timeout and error handling.
 - Workspace/read-root path confinement.
 - Optional MCP refresh hook with throttling.
+- Tool mutability metadata (`Tool.is_mutating`) used for budget accounting and idempotency dedupe.
 
 ### 4.7.2 Discovery
 
@@ -466,6 +500,11 @@ Templates in `prompts/templates/*.yaml` define text protocol and output contract
 - `learned_patterns`
 - `cowork_sessions`
 - `conversation_turns`
+- `task_runs`
+- `subtask_attempts`
+- `remediation_items`
+- `remediation_attempts`
+- `tool_mutation_ledger`
 
 Conversation storage is append-only for full traceability.
 
@@ -478,10 +517,12 @@ Conversation storage is append-only for full traceability.
   - process availability
   - required tools availability
   - auth profile resolution
-- Background execution task launch.
+- Durable submission path with `run_id`, run-lease acquisition, heartbeat, and startup recovery when enabled.
+- Background execution task tracking and lifecycle cleanup.
 - SSE streams for events and token streaming.
 - Approval and steering endpoints.
 - Model/tool/config inspection endpoints.
+- SLO snapshot endpoint (`/slo`) behind `execution.enable_slo_metrics`.
 
 ## 4.13 Event system and webhook delivery
 
@@ -489,7 +530,14 @@ Conversation storage is append-only for full traceability.
 - In-process pub/sub with sync and async handler support.
 - Event persistence via `EventPersister`.
 - Terminal webhook delivery with retry/backoff.
-- Large event taxonomy covers lifecycle, tool, verification, remediation, telemetry.
+- Large event taxonomy covers lifecycle, tool, verification, remediation, and run telemetry.
+- Additional hardening events include:
+  - `task_budget_exhausted`
+  - `task_plan_degraded`
+  - `task_run_acquired`
+  - `task_run_heartbeat`
+  - `task_run_recovered`
+  - `tool_call_deduplicated`
 
 ## 4.14 Learning and reflection
 
@@ -538,6 +586,14 @@ Outcomes support nuanced semantics:
 - Artifact refs (`af_<id>`) map persisted binary payloads to summaries and follow-up reads.
 - Evidence ledger can be exported as workspace CSV.
 
+## 5.5 Run durability and idempotency model
+
+- `task.metadata.run_id` tracks the active execution run.
+- `task_runs` persists queued/running/terminal run lifecycle with lease/heartbeat fields for crash recovery.
+- `subtask_attempts` stores attempt lineage by task/subtask/run.
+- `remediation_items` and `remediation_attempts` persist remediation lifecycle and retries.
+- `tool_mutation_ledger` records mutating tool execution signatures and cached results for dedupe.
+
 ## 6. Decision Point Catalog
 
 This section catalogs major decision points and impacts.
@@ -571,13 +627,13 @@ This section catalogs major decision points and impacts.
 
 6. Planner JSON parse fallback.
 - Inputs: planner response parse validity.
-- Decision: on invalid JSON, fallback to single `execute-goal` subtask.
-- Impact: run can continue in degraded planning mode.
+- Decision: follow `execution.planner_degraded_mode` (`allow|require_approval|deny`).
+- Impact: explicit operator control over degraded planning behavior.
 
 7. Planner model invocation fallback.
 - Inputs: call-with-retry success/failure.
-- Decision: fallback single-subtask plan after exhausted model attempts.
-- Impact: avoids full task crash due planner unavailability.
+- Decision: same policy gate as parse fallback.
+- Impact: deterministic degraded-plan handling with evented reason context.
 
 ## 6.2 Scheduler and dispatch decisions
 
@@ -654,9 +710,12 @@ This section catalogs major decision points and impacts.
 - Impact: enables artifact pipeline and retention governance.
 
 22. Completion criterion for subtask loop.
-- Inputs: has tool calls?
-- Decision: continue loop or finish on text-only output.
-- Impact: core executor loop termination.
+- Inputs: has tool calls, completion contract mode, completion payload validity.
+- Decision: continue loop or finish based on contract policy (`off|warn|enforce`).
+- Impact: tighter completion guarantees when strict mode is enabled.
+
+When `execution.enable_mutation_idempotency=true`, mutating tool calls are checked against
+`tool_mutation_ledger` before execution and can be deduplicated with cached results.
 
 ## 6.4 Verification decisions
 
@@ -994,6 +1053,9 @@ Layer 2 SQLite:
 - Event log.
 - Learned patterns.
 - Cowork session/turn history.
+- Durable task run lifecycle (`task_runs` with lease/heartbeat and terminal status).
+- Retry/remediation lineage (`subtask_attempts`, `remediation_items`, `remediation_attempts`).
+- Mutating-tool idempotency ledger (`tool_mutation_ledger`).
 
 Artifact/evidence stores:
 - Artifact files + manifest per scope.
@@ -1009,6 +1071,7 @@ Major event classes:
 - Verification outcomes and shadow/contradiction metrics.
 - Remediation queue lifecycle.
 - Run telemetry summary.
+- Hardening-specific lifecycle events (`task_budget_exhausted`, `task_plan_degraded`, run lease/heartbeat/recovery, mutating call dedupe).
 
 The event model supports:
 - SSE live streaming.
@@ -1045,6 +1108,16 @@ Primary knobs:
 - `execution.max_loop_iterations`
 - `limits.runner.max_subtask_wall_clock_seconds`
 - `limits.runner.max_tool_iterations`
+- `execution.enable_global_run_budget`
+- `execution.max_task_wall_clock_seconds`
+- `execution.max_task_total_tokens`
+- `execution.max_task_model_invocations`
+- `execution.max_task_tool_calls`
+- `execution.max_task_mutating_tool_calls`
+- `execution.max_task_replans`
+- `execution.max_task_remediation_attempts`
+- `execution.executor_completion_contract_mode`
+- `execution.planner_degraded_mode`
 
 Tradeoff:
 - Tight limits reduce runaway risk but can truncate complex tasks.
@@ -1130,7 +1203,7 @@ Tradeoff:
 Representative failure cases and system response:
 
 1. Planner returns malformed JSON.
-- Response: parser fallback plan (`execute-goal`).
+- Response: policy-gated degrade path (`allow|require_approval|deny`).
 
 2. Planner returns invalid graph topology.
 - Response: topology retry with feedback; eventual rejection.
@@ -1155,6 +1228,15 @@ Representative failure cases and system response:
 
 9. Artifact path unsafe or URL unsafe.
 - Response: request rejected with safety error.
+
+10. Process restart while runs are in-flight.
+- Response: durable runner can recover queued/lease-expired runs and resume dispatch.
+
+11. Duplicate mutating tool call due to retries/remediation.
+- Response: optional idempotency ledger returns cached result and emits dedupe event.
+
+12. Aggregate task budget exhausted.
+- Response: deterministic task failure with pending subtasks skipped and budget telemetry emitted.
 
 ## 14. Extension Points and Customization
 

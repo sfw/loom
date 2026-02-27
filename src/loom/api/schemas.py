@@ -44,6 +44,7 @@ class TaskCreateResponse(BaseModel):
     task_id: str
     status: str
     message: str
+    run_id: str = ""
 
 
 class SubtaskSummaryResponse(BaseModel):
@@ -71,6 +72,7 @@ class ProgressResponse(BaseModel):
 
 class TaskResponse(BaseModel):
     task_id: str
+    run_id: str = ""
     goal: str
     status: str
     workspace: str | None

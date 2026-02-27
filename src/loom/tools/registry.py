@@ -143,6 +143,11 @@ class Tool(ABC):
     def timeout_seconds(self) -> int:
         return 30
 
+    @property
+    def is_mutating(self) -> bool:
+        """Whether this tool mutates local/external state."""
+        return False
+
     @abstractmethod
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         ...

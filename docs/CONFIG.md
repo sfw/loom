@@ -71,6 +71,20 @@ Recommended two-model split:
 | `max_parallel_subtasks` | `int` | `3` | Max concurrently runnable subtasks. |
 | `auto_approve_confidence_threshold` | `float` | `0.8` | Auto-approval threshold in confidence-gated flows. |
 | `enable_streaming` | `bool` | `false` | Enables streaming behavior where supported. |
+| `enable_global_run_budget` | `bool` | `false` | Enforces task-level global resource budgets when limits are configured. |
+| `max_task_wall_clock_seconds` | `int` | `0` | Task-level wall-clock cap (`0` disables). |
+| `max_task_total_tokens` | `int` | `0` | Task-level total model token cap (`0` disables). |
+| `max_task_model_invocations` | `int` | `0` | Task-level model invocation cap (`0` disables). |
+| `max_task_tool_calls` | `int` | `0` | Task-level total tool call cap (`0` disables). |
+| `max_task_mutating_tool_calls` | `int` | `0` | Task-level mutating tool call cap (`0` disables). |
+| `max_task_replans` | `int` | `0` | Task-level replan cap (`0` disables). |
+| `max_task_remediation_attempts` | `int` | `0` | Task-level remediation-attempt cap (`0` disables). |
+| `executor_completion_contract_mode` | `string` | `"off"` | Executor completion protocol (`off`, `warn`, `enforce`). |
+| `planner_degraded_mode` | `string` | `"allow"` | Planner fallback policy (`allow`, `require_approval`, `deny`). |
+| `enable_sqlite_remediation_queue` | `bool` | `false` | Dual-write remediation queue and retry lineage to SQLite tables. |
+| `enable_durable_task_runner` | `bool` | `false` | Enables durable queued/running task run leasing and recovery. |
+| `enable_mutation_idempotency` | `bool` | `false` | Enables mutating-tool idempotency ledger dedupe. |
+| `enable_slo_metrics` | `bool` | `false` | Enables `/slo` snapshot endpoint. |
 | `delegate_task_timeout_seconds` | `int` | `3600` | Timeout for delegated orchestration calls (`/run`, `delegate_task`). |
 | `model_call_max_attempts` | `int` | `5` | Max retry attempts for model invocation retry policy. |
 | `model_call_retry_base_delay_seconds` | `float` | `0.5` | Base exponential backoff delay. |
@@ -207,6 +221,12 @@ run-log events (`.events.jsonl`) from orchestration boundaries:
 - `compaction_policy_decision`
 - `overflow_fallback_applied` (only when fallback rewrite executes)
 - `telemetry_run_summary` (once per task finalization)
+- `task_budget_exhausted`
+- `task_plan_degraded`
+- `tool_call_deduplicated`
+- `task_run_acquired`
+- `task_run_heartbeat`
+- `task_run_recovered`
 
 Artifact event required fields:
 - `subtask_id`, `tool`, `url` (sanitized), `content_kind`, `content_type`, `status` (`ok|error`)
@@ -233,12 +253,17 @@ Overflow fallback fields:
 - `rewritten_messages`, `chars_reduced`, `preserved_recent_messages`
 
 Run summary fields:
+- `run_id`
+- `model_invocations`
+- `tool_calls`
+- `mutating_tool_calls`
 - `artifact_ingests`
 - `artifact_reads`
 - `artifact_retention_deletes`
 - `compaction_policy_decisions`
 - `overflow_fallback_count`
 - `compactor_warning_count`
+- `budget_snapshot`
 
 Safety notes:
 - Telemetry events do not include raw extracted document text or binary payload snippets.
