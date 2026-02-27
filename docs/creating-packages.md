@@ -179,6 +179,46 @@ tools:
 
 The required and excluded lists must not overlap.
 
+### Auth requirements
+
+If your process needs authenticated APIs/MCPs, declare them explicitly so Loom
+can resolve credentials before execution starts:
+
+```yaml
+auth:
+  required:
+    - provider: notion
+      source: mcp
+      resource_ref: mcp:notion
+      modes: [env_passthrough]
+      required_env_keys: [NOTION_TOKEN]
+      mcp_server: notion
+    - provider: acme_issues
+      source: api
+      resource_ref: api_integration:acme_issues
+      modes: [api_key]
+```
+
+- `auth.required` — list of required auth resources for preflight
+- `provider` — auth provider key from auth profiles (optional when
+  `resource_ref` or `resource_id` is supplied)
+- `source` — `api` or `mcp`
+- `resource_ref` — optional stable resource selector (`mcp:<alias>`,
+  `api_integration:<name>`, `tool:<name>`)
+- `resource_id` — optional workspace-specific immutable resource id
+- `modes` — optional allowed credential modes (`api_key`, `oauth2_pkce`,
+  `oauth2_device`, `env_passthrough`, `cli_passthrough`)
+- `required_env_keys` — optional env keys that must be present in profile `env`
+- `mcp_server` — optional MCP alias constraint (only valid when `source: mcp`)
+
+When exactly one profile matches a required resource, Loom auto-selects it for
+the run. If multiple profiles match, Loom requires an explicit selection.
+
+Migration note for older packages: if a tool currently reads keys directly from
+`os.environ` without declaring auth requirements, add `auth_requirements` on the
+tool (and/or `auth.required` in `process.yaml`) so preflight can fail early with
+clear remediation instead of failing mid-run.
+
 ### Phase mode
 
 ```yaml
@@ -475,6 +515,63 @@ class MyDomainTool(Tool):
 6. **File names** in `tools/` must not start with `_` (those are skipped)
 7. **One class per file** is conventional but not required — all `Tool` subclasses in the module are registered
 
+If a tool calls an authenticated API, declare that requirement in the tool:
+
+```python
+@property
+def auth_requirements(self) -> list[dict[str, object]]:
+    return [
+        {
+            "provider": "acme_issues",
+            "source": "api",
+            "resource_ref": "api_integration:acme_issues",
+            "modes": ["api_key"],
+            "required_env_keys": ["ACME_API_KEY"],
+        }
+    ]
+```
+
+- Use the same shape as `auth.required` in `process.yaml`
+- `process.yaml` `auth.required` is still supported as a fallback
+- Prefer tool-level declarations when possible so Loom can infer auth needs from
+  `tools.required` automatically
+
+For tools that require OAuth, make the declaration explicit and resolve tokens
+through `ctx.auth_context` at execution time:
+
+```python
+@property
+def auth_requirements(self) -> list[dict[str, object]]:
+    return [
+        {
+            "provider": "notion",
+            "source": "api",
+            "resource_ref": "api_integration:notion",
+            "modes": ["oauth2_pkce", "oauth2_device"],
+        }
+    ]
+
+async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+    auth_ctx = getattr(ctx, "auth_context", None)
+    if auth_ctx is None:
+        return ToolResult.fail("Auth context is missing.")
+    profile = auth_ctx.profile_for_selector("api_integration:notion")
+    if profile is None:
+        profile = auth_ctx.profile_for_provider("notion")
+    if profile is None:
+        return ToolResult.fail("No selected profile for Notion auth resource.")
+    token = auth_ctx.resolve_secret_ref(profile.token_ref)
+    # Use token in your API client...
+    return ToolResult.ok("done")
+```
+
+Runtime UX note:
+- Users do not need to run `/auth select ...` before `/run`.
+- Loom resolves required auth at run start and prompts for selection only when
+  multiple profiles match.
+- Non-interactive clients must provide explicit `auth_profile_overrides` in task
+  metadata when resolution is ambiguous.
+
 ### Tool naming and collision policy
 
 - Bundled tool names must be globally unique across built-in tools and all loaded packages.
@@ -490,6 +587,7 @@ The `ctx` object provides:
 | `workspace` | `Path \| None` | The user's workspace directory |
 | `scratch_dir` | `Path \| None` | Temp directory for intermediate files |
 | `subtask_id` | `str` | Current subtask identifier |
+| `auth_context` | `RunAuthContext \| None` | Run-scoped selected auth profiles and secret resolver |
 
 Use `workspace` to resolve file paths. Use `_resolve_path(raw, workspace)` for safe path resolution that prevents directory traversal.
 

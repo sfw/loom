@@ -144,6 +144,11 @@ class Tool(ABC):
         return 30
 
     @property
+    def auth_requirements(self) -> list[dict[str, Any]]:
+        """Optional auth requirements consumed during run preflight."""
+        return []
+
+    @property
     def is_mutating(self) -> bool:
         """Whether this tool mutates local/external state."""
         return False
@@ -303,6 +308,10 @@ class ToolRegistry:
         self._mcp_refresh_interval_seconds: float = 30.0
         self._mcp_last_refresh_at: float = 0.0
         self._mcp_refresh_running = False
+        self._mcp_discovery_hook: Any = None
+        self._mcp_discovery_hook_supports_auth = False
+        self._mcp_discovery_interval_seconds: float = 30.0
+        self._mcp_auth_view_cache: dict[str, tuple[float, dict[str, Tool]]] = {}
 
     def set_mcp_refresh_hook(
         self,
@@ -327,6 +336,112 @@ class ToolRegistry:
         self._mcp_refresh_hook_supports_auth = supports_auth
         self._mcp_refresh_interval_seconds = max(1.0, float(interval_seconds))
         self._mcp_last_refresh_at = 0.0
+
+    def set_mcp_discovery_hook(
+        self,
+        hook: Any,
+        *,
+        interval_seconds: float = 30.0,
+    ) -> None:
+        """Register auth-scoped MCP discovery hook returning tool-name->tool map."""
+        self._mcp_discovery_hook = hook
+        supports_auth = False
+        try:
+            params = inspect.signature(hook).parameters
+            if "auth_context" in params:
+                supports_auth = True
+            else:
+                supports_auth = any(
+                    param.kind == inspect.Parameter.VAR_KEYWORD
+                    for param in params.values()
+                )
+        except (TypeError, ValueError):
+            supports_auth = False
+        self._mcp_discovery_hook_supports_auth = supports_auth
+        self._mcp_discovery_interval_seconds = max(1.0, float(interval_seconds))
+        self._mcp_auth_view_cache.clear()
+
+    @staticmethod
+    def _auth_context_fingerprint(auth_context: Any) -> str:
+        if auth_context is None:
+            return ""
+
+        fingerprint_fn = getattr(auth_context, "mcp_discovery_fingerprint", None)
+        if callable(fingerprint_fn):
+            try:
+                fingerprint = str(fingerprint_fn() or "").strip()
+            except Exception:
+                fingerprint = ""
+            if fingerprint:
+                return fingerprint
+
+        mapping = getattr(auth_context, "selected_by_mcp_alias", None)
+        if isinstance(mapping, dict):
+            parts: list[str] = []
+            for alias, profile in sorted(mapping.items(), key=lambda item: str(item[0])):
+                clean_alias = str(alias or "").strip()
+                profile_id = str(getattr(profile, "profile_id", "") or "").strip()
+                if clean_alias and profile_id:
+                    parts.append(f"{clean_alias}:{profile_id}")
+            if parts:
+                return "|".join(parts)
+
+        return f"context:{id(auth_context)}"
+
+    def _discover_mcp_view(
+        self,
+        *,
+        auth_context: Any = None,
+        force: bool = False,
+    ) -> dict[str, Tool]:
+        if self._mcp_discovery_hook is None or auth_context is None:
+            return {}
+
+        fingerprint = self._auth_context_fingerprint(auth_context)
+        if not fingerprint:
+            return {}
+
+        now = time.monotonic()
+        cached = self._mcp_auth_view_cache.get(fingerprint)
+        if (
+            not force
+            and cached is not None
+            and (now - cached[0]) < self._mcp_discovery_interval_seconds
+        ):
+            return cached[1]
+
+        try:
+            if self._mcp_discovery_hook_supports_auth:
+                raw_discovered = self._mcp_discovery_hook(auth_context=auth_context)
+            else:
+                raw_discovered = self._mcp_discovery_hook()
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "MCP discovery hook failed: %s",
+                e,
+            )
+            if cached is not None:
+                return cached[1]
+            return {}
+
+        discovered: dict[str, Tool] = {}
+        if isinstance(raw_discovered, dict):
+            for name, tool in raw_discovered.items():
+                clean_name = str(name or "").strip()
+                if not clean_name.startswith("mcp."):
+                    continue
+                if not isinstance(tool, Tool):
+                    continue
+                discovered[clean_name] = tool
+        elif isinstance(raw_discovered, list):
+            for name in raw_discovered:
+                clean_name = str(name or "").strip()
+                tool = self._tools.get(clean_name)
+                if clean_name.startswith("mcp.") and isinstance(tool, Tool):
+                    discovered[clean_name] = tool
+
+        self._mcp_auth_view_cache[fingerprint] = (time.monotonic(), discovered)
+        return discovered
 
     def _maybe_refresh_mcp(self, *, force: bool = False, auth_context: Any = None) -> None:
         if self._mcp_refresh_hook is None:
@@ -368,9 +483,17 @@ class ToolRegistry:
         """Remove a tool. Returns True if it existed."""
         return self._tools.pop(name, None) is not None
 
-    def has(self, name: str) -> bool:
+    def has(self, name: str, *, auth_context: Any = None) -> bool:
         """Check if tool is registered."""
         if name.startswith("mcp."):
+            if auth_context is not None and self._mcp_discovery_hook is not None:
+                discovered = self._discover_mcp_view(auth_context=auth_context)
+                if name in discovered:
+                    return True
+                # Auth-scoped MCP lookup must not fall back to global registry
+                # refresh, otherwise one run can leak account-scoped MCP tools
+                # into other runs.
+                return False
             self._maybe_refresh_mcp()
         return name in self._tools
 
@@ -386,11 +509,27 @@ class ToolRegistry:
         auth_context: Any = None,
     ) -> ToolResult:
         """Execute a tool by name with timeout and context."""
-        self._maybe_refresh_mcp(auth_context=auth_context)
-        tool = self._tools.get(name)
-        if tool is None and name.startswith("mcp."):
-            self._maybe_refresh_mcp(force=True, auth_context=auth_context)
-            tool = self._tools.get(name)
+        tool: Tool | None = None
+        if name.startswith("mcp.") and auth_context is not None and self._mcp_discovery_hook:
+            discovered = self._discover_mcp_view(auth_context=auth_context)
+            tool = discovered.get(name)
+            if tool is None:
+                discovered = self._discover_mcp_view(
+                    auth_context=auth_context,
+                    force=True,
+                )
+                tool = discovered.get(name)
+            if tool is None:
+                return ToolResult.fail(f"Unknown tool: {name}")
+        if tool is None:
+            if name.startswith("mcp."):
+                self._maybe_refresh_mcp()
+                tool = self._tools.get(name)
+            else:
+                tool = self._tools.get(name)
+            if tool is None and name.startswith("mcp."):
+                self._maybe_refresh_mcp(force=True)
+                tool = self._tools.get(name)
         if tool is None:
             return ToolResult.fail(f"Unknown tool: {name}")
 
@@ -426,12 +565,31 @@ class ToolRegistry:
         except Exception as e:
             return ToolResult.fail(f"Tool error: {type(e).__name__}: {e}")
 
-    def all_schemas(self) -> list[dict]:
+    def all_schemas(self, *, auth_context: Any = None) -> list[dict]:
         """Return all tool schemas for model consumption."""
+        if auth_context is not None and self._mcp_discovery_hook is not None:
+            non_mcp_schemas = [
+                tool.schema()
+                for name, tool in self._tools.items()
+                if not name.startswith("mcp.")
+            ]
+            discovered = self._discover_mcp_view(auth_context=auth_context)
+            mcp_schemas = [
+                discovered[name].schema()
+                for name in sorted(discovered.keys())
+            ]
+            return [*non_mcp_schemas, *mcp_schemas]
         self._maybe_refresh_mcp()
         return [tool.schema() for tool in self._tools.values()]
 
-    def list_tools(self) -> list[str]:
+    def list_tools(self, *, auth_context: Any = None) -> list[str]:
         """Return registered tool names."""
+        if auth_context is not None and self._mcp_discovery_hook is not None:
+            non_mcp_tools = [
+                name for name in self._tools.keys()
+                if not name.startswith("mcp.")
+            ]
+            discovered = self._discover_mcp_view(auth_context=auth_context)
+            return [*non_mcp_tools, *sorted(discovered.keys())]
         self._maybe_refresh_mcp()
         return list(self._tools.keys())

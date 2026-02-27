@@ -165,8 +165,7 @@ class _MCPStdioClient:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+            bufsize=0,
             cwd=cwd,
             env=env,
         )
@@ -194,7 +193,9 @@ class _MCPStdioClient:
         if params is not None:
             payload["params"] = params
         try:
-            process.stdin.write(json.dumps(payload, ensure_ascii=True) + "\n")
+            process.stdin.write(
+                (json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8")
+            )
             process.stdin.flush()
         except (BrokenPipeError, OSError) as e:
             # Child exited between spawn and write/flush.
@@ -219,7 +220,9 @@ class _MCPStdioClient:
         if params is not None:
             payload["params"] = params
         try:
-            process.stdin.write(json.dumps(payload, ensure_ascii=True) + "\n")
+            process.stdin.write(
+                (json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8")
+            )
             process.stdin.flush()
         except (BrokenPipeError, OSError):
             # Best-effort notification; caller will fail on next request if needed.
@@ -241,7 +244,11 @@ class _MCPStdioClient:
         stderr = ""
         if code is not None and process.stderr is not None:
             try:
-                stderr = process.stderr.read().strip()
+                raw = process.stderr.read()
+                if isinstance(raw, bytes):
+                    stderr = raw.decode("utf-8", errors="replace").strip()
+                else:
+                    stderr = str(raw).strip()
             except Exception:
                 stderr = ""
         if stderr:
@@ -254,21 +261,14 @@ class _MCPStdioClient:
         *,
         deadline: float,
         selector: selectors.BaseSelector,
+        line_buffer: bytearray,
     ) -> dict[str, Any]:
         if process.stdout is None:
             raise RuntimeError("MCP process stdout unavailable")
 
         while True:
-            line = ""
-            raw_stdout = getattr(process.stdout, "buffer", None)
-            if raw_stdout is not None and hasattr(raw_stdout, "peek"):
-                try:
-                    if raw_stdout.peek(1):
-                        line = process.stdout.readline()
-                except Exception:
-                    line = ""
-
-            if not line:
+            newline_pos = line_buffer.find(b"\n")
+            if newline_pos < 0:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
@@ -281,20 +281,38 @@ class _MCPStdioClient:
                         f"MCP request timed out for server {self.alias!r}"
                     )
 
-                line = process.stdout.readline()
+                try:
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                except OSError as e:
+                    raise RuntimeError(
+                        f"MCP server {self.alias!r} read failed: {e}"
+                    ) from e
+                if not chunk:
+                    stderr = ""
+                    if process.stderr is not None:
+                        try:
+                            raw = process.stderr.read()
+                            if isinstance(raw, bytes):
+                                stderr = raw.decode(
+                                    "utf-8",
+                                    errors="replace",
+                                ).strip()
+                            else:
+                                stderr = str(raw).strip()
+                        except Exception:
+                            stderr = ""
+                    message = (
+                        f"MCP server {self.alias!r} exited before replying"
+                    )
+                    if stderr:
+                        message += f": {stderr}"
+                    raise RuntimeError(message)
+                line_buffer.extend(chunk)
+                continue
 
-            if line == "":
-                stderr = ""
-                if process.stderr is not None:
-                    stderr = process.stderr.read().strip()
-                message = (
-                    f"MCP server {self.alias!r} exited before replying"
-                )
-                if stderr:
-                    message += f": {stderr}"
-                raise RuntimeError(message)
-
-            payload = line.strip()
+            raw_line = bytes(line_buffer[:newline_pos])
+            del line_buffer[:newline_pos + 1]
+            payload = raw_line.decode("utf-8", errors="replace").strip()
             if not payload:
                 continue
 
@@ -318,6 +336,7 @@ class _MCPStdioClient:
         request_id: int,
         deadline: float,
         selector: selectors.BaseSelector,
+        line_buffer: bytearray,
     ) -> tuple[dict[str, Any], bool]:
         saw_list_changed = False
         while True:
@@ -325,6 +344,7 @@ class _MCPStdioClient:
                 process,
                 deadline=deadline,
                 selector=selector,
+                line_buffer=line_buffer,
             )
             method = str(message.get("method", ""))
             if method == "notifications/tools/list_changed":
@@ -356,6 +376,7 @@ class _MCPStdioClient:
         process = self._spawn(env_overrides=env_overrides)
         timeout_seconds = self._timeout_seconds()
         deadline = time.monotonic() + timeout_seconds
+        line_buffer = bytearray()
         try:
             if process.stdout is None:
                 raise RuntimeError("MCP process stdout unavailable")
@@ -379,6 +400,7 @@ class _MCPStdioClient:
                         request_id=1,
                         deadline=min(deadline, time.monotonic() + 5),
                         selector=selector,
+                        line_buffer=line_buffer,
                     )
                 except Exception:
                     # Some lightweight JSON-RPC servers (including Loom's fallback)
@@ -402,6 +424,7 @@ class _MCPStdioClient:
                     request_id=request_id,
                     deadline=deadline,
                     selector=selector,
+                    line_buffer=line_buffer,
                 )
         finally:
             self._terminate(process)
@@ -595,6 +618,7 @@ def register_mcp_tools(
     )
     registered = synchronizer.refresh(force=True)
     registry.set_mcp_refresh_hook(synchronizer.refresh, interval_seconds=15.0)
+    registry.set_mcp_discovery_hook(synchronizer.discover, interval_seconds=15.0)
     # Keep a strong reference so the hook target isn't GC'ed.
     setattr(registry, "_mcp_synchronizer", synchronizer)
     return registered
@@ -617,7 +641,12 @@ class _MCPRegistrySynchronizer:
         self._clients[alias] = client
         return client
 
-    def _discover(self, *, auth_context: Any = None) -> dict[str, MCPToolProxy]:
+    def _discover(
+        self,
+        *,
+        auth_context: Any = None,
+        enable_registry_refresh: bool = True,
+    ) -> dict[str, MCPToolProxy]:
         discovered: dict[str, MCPToolProxy] = {}
 
         for alias_raw, server in self._mcp_config.servers.items():
@@ -677,7 +706,7 @@ class _MCPRegistrySynchronizer:
                     timeout_seconds=_normalize_timeout_seconds(
                         server.timeout_seconds
                     ),
-                    refresh_callback=self.refresh,
+                    refresh_callback=self.refresh if enable_registry_refresh else None,
                 )
 
         return discovered
@@ -709,3 +738,11 @@ class _MCPRegistrySynchronizer:
                     self._registry.register(incoming)
 
             return sorted(desired)
+
+    def discover(self, *, auth_context: Any = None) -> dict[str, MCPToolProxy]:
+        """Return auth-scoped MCP discovery map without mutating global registry."""
+        with self._lock:
+            return self._discover(
+                auth_context=auth_context,
+                enable_registry_refresh=False,
+            )

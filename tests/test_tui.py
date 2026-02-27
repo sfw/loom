@@ -310,6 +310,149 @@ class TestExitConfirmScreen:
             event.prevent_default.assert_called_once()
 
 
+class TestAuthAndMCPManagerScreens:
+    def test_auth_manager_mode_encoding_round_trip(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        assert AuthManagerScreen._encode_mode_value("") == "__mode_unset__"
+        assert AuthManagerScreen._encode_mode_value(" OAUTH2_PKCE ") == "oauth2_pkce"
+        assert AuthManagerScreen._decode_mode_value("__mode_unset__") == ""
+        assert AuthManagerScreen._decode_mode_value("api_key") == "api_key"
+
+    def test_auth_manager_mode_options_include_supported_modes(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+
+        options = screen._mode_options()
+        values = [value for _label, value in options]
+
+        assert "__mode_unset__" in values
+        assert "api_key" in values
+        assert "oauth2_pkce" in values
+        assert "oauth2_device" in values
+        assert "cli_passthrough" in values
+        assert "env_passthrough" in values
+
+    def test_auth_manager_mcp_target_encoding_round_trip(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        assert AuthManagerScreen._encode_mcp_server_value("") == "__none__"
+        assert AuthManagerScreen._encode_mcp_server_value(" notion ") == "notion"
+        assert AuthManagerScreen._decode_mcp_server_value("__none__") == ""
+        assert AuthManagerScreen._decode_mcp_server_value("notion") == "notion"
+
+    def test_auth_manager_mcp_target_options_include_none_sorted_aliases(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._mcp_aliases = ["prod", "dev"]
+
+        options = screen._mcp_target_options()
+
+        assert options == [
+            ("None (provider-wide)", "__none__"),
+            ("MCP: dev", "dev"),
+            ("MCP: prod", "prod"),
+        ]
+
+    def test_auth_manager_mcp_target_options_include_active_alias(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._mcp_aliases = ["dev"]
+
+        options = screen._mcp_target_options(include_alias="staging")
+
+        assert ("MCP: dev", "dev") in options
+        assert ("MCP: staging", "staging") in options
+
+    def test_auth_manager_workspace_default_detection(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._workspace_defaults = {"notion": "notion_dev"}
+
+        assert screen._is_workspace_default(
+            provider="notion",
+            profile_id="notion_dev",
+        )
+        assert not screen._is_workspace_default(
+            provider="notion",
+            profile_id="notion_prod",
+        )
+
+    def test_auth_manager_render_summary_populates_rows(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        table = MagicMock()
+        table.move_cursor = MagicMock()
+        screen.query_one = MagicMock(return_value=table)
+        screen._profiles = {
+            "notion_dev": SimpleNamespace(
+                profile_id="notion_dev",
+                provider="notion",
+                mode="oauth2_pkce",
+                mcp_server="",
+                account_label="Dev",
+            ),
+        }
+        screen._active_profile_id = "notion_dev"
+
+        screen._render_summary()
+
+        table.clear.assert_called_once()
+        table.add_row.assert_called_once()
+        table.move_cursor.assert_called_once()
+
+    def test_auth_manager_next_duplicate_profile_id(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._profiles = {
+            "notion_dev": SimpleNamespace(),
+            "notion_dev_copy": SimpleNamespace(),
+        }
+        assert screen._next_duplicate_profile_id("notion_dev") == "notion_dev_copy2"
+
+    def test_mcp_manager_render_summary_populates_rows(self):
+        from loom.tui.screens.mcp_manager import MCPManagerScreen
+
+        screen = MCPManagerScreen(manager=MagicMock())
+        table = MagicMock()
+        table.move_cursor = MagicMock()
+        screen.query_one = MagicMock(return_value=table)
+        screen._views = [
+            SimpleNamespace(
+                alias="notion",
+                server=SimpleNamespace(
+                    enabled=True,
+                    command="python",
+                    args=["-m", "notion_server"],
+                ),
+                source="workspace",
+            ),
+        ]
+        screen._active_alias = "notion"
+
+        screen._render_summary()
+
+        table.clear.assert_called_once()
+        table.add_row.assert_called_once()
+        table.move_cursor.assert_called_once()
+
+    def test_mcp_manager_stores_explicit_auth_path(self):
+        from loom.tui.screens.mcp_manager import MCPManagerScreen
+
+        auth_path = Path("/tmp/auth.toml")
+        screen = MCPManagerScreen(
+            manager=MagicMock(),
+            explicit_auth_path=auth_path,
+        )
+        assert screen._explicit_auth_path == auth_path
+
+
 # --- Theme tests ---
 
 
@@ -6484,6 +6627,7 @@ class TestAuthSlashCommands:
             provider="notion",
             mode="oauth2_pkce",
             account_label="",
+            mcp_server="",
             secret_ref="",
             token_ref="",
             scopes=[],
@@ -6564,6 +6708,112 @@ class TestAuthSlashCommands:
         assert handled is True
         chat.add_info.assert_called_once()
         assert "MCP selectors are no longer supported" in chat.add_info.call_args.args[0]
+
+
+class TestRunStartAuthResolution:
+    def test_collect_required_auth_resources_includes_allowed_tool_requirements(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._tools = SimpleNamespace(
+            list_tools=lambda: ["tool_included", "tool_excluded"],
+            get=lambda name: {
+                "tool_included": SimpleNamespace(
+                    auth_requirements=[
+                        {"provider": "ga_provider", "source": "api"},
+                    ]
+                ),
+                "tool_excluded": SimpleNamespace(
+                    auth_requirements=[
+                        {"provider": "excluded_provider", "source": "api"},
+                    ]
+                ),
+            }.get(name),
+        )
+        process_defn = SimpleNamespace(
+            auth=SimpleNamespace(required=[{"provider": "notion", "source": "mcp"}]),
+            tools=SimpleNamespace(required=[], excluded=["tool_excluded"]),
+        )
+
+        required = app._collect_required_auth_resources_for_process(process_defn)
+        selectors = {
+            (item["provider"], item.get("source", "api"))
+            for item in required
+        }
+        assert ("notion", "mcp") in selectors
+        assert ("ga_provider", "api") in selectors
+        assert ("excluded_provider", "api") not in selectors
+
+    @pytest.mark.asyncio
+    async def test_blocking_unresolved_auth_opens_manager_and_retries(self, monkeypatch):
+        from loom.auth.runtime import (
+            AuthResourceRequirement,
+            UnresolvedAuthResource,
+            UnresolvedAuthResourcesError,
+        )
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._collect_required_auth_resources_for_process = MagicMock(return_value=[
+            {"provider": "notion", "source": "api"},
+        ])
+        app._prompt_auth_choice = AsyncMock(return_value="Open Auth Manager")
+        app._open_auth_manager_for_run_start = AsyncMock(return_value=True)
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app._config = SimpleNamespace(mcp=SimpleNamespace(servers={}))
+
+        unresolved_error = UnresolvedAuthResourcesError(
+            "blocked",
+            unresolved=[
+                UnresolvedAuthResource(
+                    provider="notion",
+                    source="api",
+                    reason="auth_missing",
+                    message="token missing",
+                )
+            ],
+            defaults_user={},
+            defaults_workspace={},
+            explicit_overrides={},
+            required_resources=[AuthResourceRequirement(provider="notion", source="api")],
+        )
+        fake_context = SimpleNamespace(
+            profile_for_provider=lambda provider: (
+                SimpleNamespace(profile_id="notion_dev")
+                if provider == "notion" else None
+            )
+        )
+        call_count = {"value": 0}
+
+        def _fake_build_run_auth_context(**_kwargs):
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                raise unresolved_error
+            return fake_context
+
+        monkeypatch.setattr(
+            "loom.auth.runtime.build_run_auth_context",
+            _fake_build_run_auth_context,
+        )
+
+        overrides, required_resources = await app._resolve_auth_overrides_for_run_start(
+            process_defn=SimpleNamespace(),
+            base_overrides={},
+        )
+
+        assert required_resources == [{"provider": "notion", "source": "api"}]
+        assert overrides == {"notion": "notion_dev"}
+        app._open_auth_manager_for_run_start.assert_awaited_once()
+        assert call_count["value"] == 2
 
 
 class TestCommandPaletteProcessActions:

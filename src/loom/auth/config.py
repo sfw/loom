@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import re
 import tomllib
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,6 +23,7 @@ class AuthProfile:
     provider: str
     mode: str
     account_label: str = ""
+    mcp_server: str = ""
     secret_ref: str = ""
     token_ref: str = ""
     scopes: list[str] = field(default_factory=list)
@@ -28,6 +31,7 @@ class AuthProfile:
     command: str = ""
     auth_check: list[str] = field(default_factory=list)
     metadata: dict[str, str] = field(default_factory=dict)
+    status: str = "ready"
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,7 @@ class AuthConfig:
 
     profiles: dict[str, AuthProfile] = field(default_factory=dict)
     defaults: dict[str, str] = field(default_factory=dict)
+    resource_defaults: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,28 @@ def _atomic_write_text(path: Path, content: str) -> None:
                 tmp_path.unlink()
         except OSError:
             pass
+
+
+@contextmanager
+def _file_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as handle:
+        try:
+            import fcntl  # POSIX only
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            # Best effort on non-POSIX platforms.
+            pass
+        try:
+            yield
+        finally:
+            try:
+                import fcntl  # POSIX only
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
 
 
 def default_user_auth_path() -> Path:
@@ -186,12 +213,14 @@ def _parse_profile(profile_id: str, raw: object, *, path: Path) -> AuthProfile:
         "provider",
         "mode",
         "account_label",
+        "mcp_server",
         "secret_ref",
         "token_ref",
         "scopes",
         "env",
         "command",
         "auth_check",
+        "status",
     }
     metadata: dict[str, str] = {}
     for key, value in raw.items():
@@ -202,11 +231,12 @@ def _parse_profile(profile_id: str, raw: object, *, path: Path) -> AuthProfile:
         if isinstance(value, (str, int, float, bool)):
             metadata[key] = str(value)
 
-    return AuthProfile(
+    profile = AuthProfile(
         profile_id=profile_id,
         provider=provider,
         mode=mode,
         account_label=str(raw.get("account_label", "")).strip(),
+        mcp_server=str(raw.get("mcp_server", "")).strip(),
         secret_ref=str(raw.get("secret_ref", "")).strip(),
         token_ref=str(raw.get("token_ref", "")).strip(),
         scopes=scopes,
@@ -214,7 +244,66 @@ def _parse_profile(profile_id: str, raw: object, *, path: Path) -> AuthProfile:
         command=str(raw.get("command", "")).strip(),
         auth_check=auth_check,
         metadata=metadata,
+        status=str(raw.get("status", "ready")).strip().lower() or "ready",
     )
+    _validate_profile(profile, path=path)
+    return profile
+
+
+def _validate_profile(profile: AuthProfile, *, path: Path | None = None) -> None:
+    """Validate one auth profile shape and mode-specific requirements."""
+    location = f" in {path}" if path is not None else ""
+    profile_id = str(profile.profile_id or "").strip() or "<unknown>"
+    provider = str(profile.provider or "").strip()
+    mode = str(profile.mode or "").strip().lower()
+    status = str(profile.status or "").strip().lower() or "ready"
+
+    if status not in {"draft", "ready", "archived"}:
+        raise AuthConfigError(
+            f"Auth profile '{profile_id}'{location} has invalid status {status!r}."
+        )
+
+    if not provider:
+        raise AuthConfigError(
+            f"Auth profile '{profile_id}'{location} is missing required 'provider'."
+        )
+    if not mode:
+        raise AuthConfigError(
+            f"Auth profile '{profile_id}'{location} is missing required 'mode'."
+        )
+    mcp_server = str(profile.mcp_server or "").strip()
+    if mcp_server and any(ch.isspace() for ch in mcp_server):
+        raise AuthConfigError(
+            f"Auth profile '{profile_id}'{location} has invalid mcp_server "
+            f"{mcp_server!r}: whitespace is not allowed."
+        )
+
+    has_env = bool(profile.env)
+    has_secret_ref = bool(str(profile.secret_ref or "").strip())
+    has_token_ref = bool(str(profile.token_ref or "").strip())
+    has_command = bool(str(profile.command or "").strip())
+
+    if status == "draft":
+        return
+
+    if mode == "api_key" and not (has_secret_ref or has_env):
+        raise AuthConfigError(
+            f"Auth profile '{profile_id}'{location} mode='api_key' requires "
+            "'secret_ref' or at least one 'env' mapping."
+        )
+    if mode in {"oauth2_pkce", "oauth2_device"} and not has_token_ref:
+        raise AuthConfigError(
+            f"Auth profile '{profile_id}'{location} mode={mode!r} requires 'token_ref'."
+        )
+    if mode == "cli_passthrough" and not has_command:
+        raise AuthConfigError(
+            f"Auth profile '{profile_id}'{location} mode='cli_passthrough' requires 'command'."
+        )
+    if mode == "env_passthrough" and not has_env:
+        raise AuthConfigError(
+            f"Auth profile '{profile_id}'{location} mode='env_passthrough' requires "
+            "at least one 'env' mapping."
+        )
 
 
 def _parse_auth_section(raw: object, *, path: Path) -> AuthConfig:
@@ -224,8 +313,27 @@ def _parse_auth_section(raw: object, *, path: Path) -> AuthConfig:
         raise AuthConfigError(
             f"Invalid [auth] section in {path}: expected table/dict."
         )
+    if "mcp_alias_profiles" in raw:
+        warnings.warn(
+            (
+                f"{path}: [auth.mcp_alias_profiles] is deprecated and ignored. "
+                "Use [auth.profiles.<id>].mcp_server plus provider defaults "
+                "or run-time selection."
+            ),
+            FutureWarning,
+            stacklevel=3,
+        )
 
-    defaults = _parse_string_map(raw.get("defaults", {}), field_name="auth.defaults", path=path)
+    defaults = _parse_string_map(
+        raw.get("defaults", {}),
+        field_name="auth.defaults",
+        path=path,
+    )
+    resource_defaults = _parse_string_map(
+        raw.get("resource_defaults", {}),
+        field_name="auth.resource_defaults",
+        path=path,
+    )
     profiles_raw = raw.get("profiles", {})
     if profiles_raw is None:
         profiles_raw = {}
@@ -243,6 +351,7 @@ def _parse_auth_section(raw: object, *, path: Path) -> AuthConfig:
     return AuthConfig(
         profiles=profiles,
         defaults=defaults,
+        resource_defaults=resource_defaults,
     )
 
 
@@ -296,9 +405,13 @@ def merge_auth_config(base: AuthConfig, overlay: AuthConfig) -> AuthConfig:
     merged_defaults = dict(base.defaults)
     merged_defaults.update(overlay.defaults)
 
+    merged_resource_defaults = dict(base.resource_defaults)
+    merged_resource_defaults.update(overlay.resource_defaults)
+
     return AuthConfig(
         profiles=merged_profiles,
         defaults=merged_defaults,
+        resource_defaults=merged_resource_defaults,
     )
 
 
@@ -319,6 +432,15 @@ def render_auth_toml(config: AuthConfig) -> str:
             lines.append(f"{_toml_key(selector)} = {_toml_escape(profile_id)}")
         lines.append("")
 
+    if config.resource_defaults:
+        lines.append("[auth.resource_defaults]")
+        for resource_id in sorted(config.resource_defaults):
+            profile_id = str(config.resource_defaults.get(resource_id, "")).strip()
+            if not profile_id:
+                continue
+            lines.append(f"{_toml_key(resource_id)} = {_toml_escape(profile_id)}")
+        lines.append("")
+
     for profile_id in sorted(config.profiles):
         profile = config.profiles[profile_id]
         profile_key = _toml_key(profile_id)
@@ -327,6 +449,8 @@ def render_auth_toml(config: AuthConfig) -> str:
         lines.append(f"mode = {_toml_escape(profile.mode)}")
         if profile.account_label:
             lines.append(f"account_label = {_toml_escape(profile.account_label)}")
+        if profile.mcp_server:
+            lines.append(f"mcp_server = {_toml_escape(profile.mcp_server)}")
         if profile.secret_ref:
             lines.append(f"secret_ref = {_toml_escape(profile.secret_ref)}")
         if profile.token_ref:
@@ -337,6 +461,10 @@ def render_auth_toml(config: AuthConfig) -> str:
             lines.append(f"command = {_toml_escape(profile.command)}")
         if profile.auth_check:
             lines.append(f"auth_check = {_toml_array(list(profile.auth_check))}")
+        if str(profile.status or "").strip().lower() not in {"", "ready"}:
+            lines.append(
+                f"status = {_toml_escape(str(profile.status).strip().lower())}"
+            )
         for key in sorted(profile.metadata):
             value = str(profile.metadata.get(key, "")).strip()
             if not value:
@@ -354,7 +482,19 @@ def render_auth_toml(config: AuthConfig) -> str:
 
 def write_auth_file(path: Path, config: AuthConfig) -> None:
     """Atomically write auth.toml."""
-    _atomic_write_text(path, render_auth_toml(config))
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _file_lock(lock_path):
+        _atomic_write_text(path, render_auth_toml(config))
+
+
+def _mutate_auth_file(path: Path, mutator) -> AuthConfig:
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _file_lock(lock_path):
+        current = load_auth_file(path)
+        updated = mutator(current)
+        if updated != current:
+            _atomic_write_text(path, render_auth_toml(updated))
+        return updated
 
 
 def resolve_auth_write_path(
@@ -375,20 +515,23 @@ def upsert_auth_profile(
     must_exist: bool | None = None,
 ) -> AuthConfig:
     """Add or replace one auth profile in auth.toml."""
-    current = load_auth_file(path)
-    exists = profile.profile_id in current.profiles
-    if must_exist is True and not exists:
-        raise AuthConfigError(f"Auth profile not found: {profile.profile_id}")
-    if must_exist is False and exists:
-        raise AuthConfigError(f"Auth profile already exists: {profile.profile_id}")
-    profiles = dict(current.profiles)
-    profiles[profile.profile_id] = profile
-    updated = AuthConfig(
-        profiles=profiles,
-        defaults=dict(current.defaults),
-    )
-    write_auth_file(path, updated)
-    return updated
+    _validate_profile(profile)
+
+    def _mutate(current: AuthConfig) -> AuthConfig:
+        exists = profile.profile_id in current.profiles
+        if must_exist is True and not exists:
+            raise AuthConfigError(f"Auth profile not found: {profile.profile_id}")
+        if must_exist is False and exists:
+            raise AuthConfigError(f"Auth profile already exists: {profile.profile_id}")
+        profiles = dict(current.profiles)
+        profiles[profile.profile_id] = profile
+        return AuthConfig(
+            profiles=profiles,
+            defaults=dict(current.defaults),
+            resource_defaults=dict(current.resource_defaults),
+        )
+
+    return _mutate_auth_file(path, _mutate)
 
 
 def remove_auth_profile(path: Path, profile_id: str) -> AuthConfig:
@@ -396,23 +539,28 @@ def remove_auth_profile(path: Path, profile_id: str) -> AuthConfig:
     clean_profile_id = str(profile_id or "").strip()
     if not clean_profile_id:
         raise AuthConfigError("Auth profile id cannot be empty.")
-    current = load_auth_file(path)
-    if clean_profile_id not in current.profiles:
-        raise AuthConfigError(f"Auth profile not found: {clean_profile_id}")
-    profiles = dict(current.profiles)
-    del profiles[clean_profile_id]
+    def _mutate(current: AuthConfig) -> AuthConfig:
+        if clean_profile_id not in current.profiles:
+            raise AuthConfigError(f"Auth profile not found: {clean_profile_id}")
+        profiles = dict(current.profiles)
+        del profiles[clean_profile_id]
 
-    defaults = {
-        selector: mapped
-        for selector, mapped in current.defaults.items()
-        if mapped != clean_profile_id
-    }
-    updated = AuthConfig(
-        profiles=profiles,
-        defaults=defaults,
-    )
-    write_auth_file(path, updated)
-    return updated
+        defaults = {
+            selector: mapped
+            for selector, mapped in current.defaults.items()
+            if mapped != clean_profile_id
+        }
+        return AuthConfig(
+            profiles=profiles,
+            defaults=defaults,
+            resource_defaults={
+                selector: mapped
+                for selector, mapped in current.resource_defaults.items()
+                if mapped != clean_profile_id
+            },
+        )
+
+    return _mutate_auth_file(path, _mutate)
 
 
 def set_auth_default(
@@ -425,21 +573,51 @@ def set_auth_default(
     clean_selector = str(selector or "").strip()
     if not clean_selector:
         raise AuthConfigError("Auth default selector cannot be empty.")
-    current = load_auth_file(path)
-    defaults = dict(current.defaults)
-    if profile_id is None:
-        defaults.pop(clean_selector, None)
-    else:
-        clean_profile_id = str(profile_id or "").strip()
-        if not clean_profile_id:
-            raise AuthConfigError("Auth default profile id cannot be empty.")
-        defaults[clean_selector] = clean_profile_id
-    updated = AuthConfig(
-        profiles=dict(current.profiles),
-        defaults=defaults,
-    )
-    write_auth_file(path, updated)
-    return updated
+
+    def _mutate(current: AuthConfig) -> AuthConfig:
+        defaults = dict(current.defaults)
+        if profile_id is None:
+            defaults.pop(clean_selector, None)
+        else:
+            clean_profile_id = str(profile_id or "").strip()
+            if not clean_profile_id:
+                raise AuthConfigError("Auth default profile id cannot be empty.")
+            defaults[clean_selector] = clean_profile_id
+        return AuthConfig(
+            profiles=dict(current.profiles),
+            defaults=defaults,
+            resource_defaults=dict(current.resource_defaults),
+        )
+
+    return _mutate_auth_file(path, _mutate)
+
+
+def set_auth_resource_default(
+    path: Path,
+    *,
+    resource_id: str,
+    profile_id: str | None,
+) -> AuthConfig:
+    """Set or clear user-scoped resource default mapping in auth.toml."""
+    clean_resource_id = str(resource_id or "").strip()
+    if not clean_resource_id:
+        raise AuthConfigError("Auth resource_id selector cannot be empty.")
+    def _mutate(current: AuthConfig) -> AuthConfig:
+        defaults = dict(current.resource_defaults)
+        if profile_id is None:
+            defaults.pop(clean_resource_id, None)
+        else:
+            clean_profile_id = str(profile_id or "").strip()
+            if not clean_profile_id:
+                raise AuthConfigError("Auth default profile id cannot be empty.")
+            defaults[clean_resource_id] = clean_profile_id
+        return AuthConfig(
+            profiles=dict(current.profiles),
+            defaults=dict(current.defaults),
+            resource_defaults=defaults,
+        )
+
+    return _mutate_auth_file(path, _mutate)
 
 
 def render_workspace_auth_defaults(defaults: dict[str, str]) -> str:
@@ -461,7 +639,19 @@ def render_workspace_auth_defaults(defaults: dict[str, str]) -> str:
 
 def write_workspace_auth_defaults(path: Path, defaults: dict[str, str]) -> None:
     """Atomically write workspace auth defaults file."""
-    _atomic_write_text(path, render_workspace_auth_defaults(defaults))
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _file_lock(lock_path):
+        _atomic_write_text(path, render_workspace_auth_defaults(defaults))
+
+
+def _mutate_workspace_auth_defaults(path: Path, mutator) -> dict[str, str]:
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _file_lock(lock_path):
+        current = load_workspace_auth_defaults(path)
+        updated = mutator(dict(current))
+        if updated != current:
+            _atomic_write_text(path, render_workspace_auth_defaults(updated))
+        return updated
 
 
 def set_workspace_auth_default(
@@ -471,19 +661,21 @@ def set_workspace_auth_default(
     profile_id: str | None,
 ) -> dict[str, str]:
     """Set or clear one workspace auth default and write the file."""
-    current = load_workspace_auth_defaults(path)
     clean_selector = str(selector or "").strip()
     if not clean_selector:
         raise AuthConfigError("Auth default selector cannot be empty.")
-    if profile_id is None:
-        current.pop(clean_selector, None)
-    else:
-        clean_profile = str(profile_id or "").strip()
-        if not clean_profile:
-            raise AuthConfigError("Auth default profile id cannot be empty.")
-        current[clean_selector] = clean_profile
-    write_workspace_auth_defaults(path, current)
-    return current
+
+    def _mutate(current: dict[str, str]) -> dict[str, str]:
+        if profile_id is None:
+            current.pop(clean_selector, None)
+        else:
+            clean_profile = str(profile_id or "").strip()
+            if not clean_profile:
+                raise AuthConfigError("Auth default profile id cannot be empty.")
+            current[clean_selector] = clean_profile
+        return current
+
+    return _mutate_workspace_auth_defaults(path, _mutate)
 
 
 def load_merged_auth_config(

@@ -649,7 +649,12 @@ class TestGitCommand:
     async def test_git_status(self, ctx: ToolContext, workspace: Path):
         # Init a git repo in workspace
         import subprocess
-        subprocess.run(["git", "init"], cwd=workspace, capture_output=True)
+        init_result = subprocess.run(["git", "init"], cwd=workspace, capture_output=True)
+        if init_result.returncode != 0 and (
+            b"xcode license" in init_result.stderr.lower()
+            or b"xcode" in init_result.stderr.lower()
+        ):
+            pytest.skip("git unavailable until Xcode license is accepted in this environment")
         subprocess.run(
             ["git", "config", "user.email", "test@test.com"],
             cwd=workspace, capture_output=True,
@@ -661,6 +666,10 @@ class TestGitCommand:
 
         tool = GitCommandTool()
         result = await tool.execute({"args": ["status"]}, ctx)
+        if (result.output and "xcode license" in result.output.lower()) or (
+            result.error and "xcode license" in result.error.lower()
+        ):
+            pytest.skip("git unavailable until Xcode license is accepted in this environment")
         assert result.success
         assert result.data["subcommand"] == "status"
 

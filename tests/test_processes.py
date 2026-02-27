@@ -1741,6 +1741,73 @@ tools:
         assert defn.tools.excluded == ["shell_execute"]
 
 
+class TestAuthRequirementValidation:
+    """Tests for process auth.required parsing and validation."""
+
+    def _load_yaml_str(self, tmp_path, content):
+        f = tmp_path / "test-auth.yaml"
+        f.write_text(content)
+        loader = ProcessLoader()
+        return loader.load(str(f))
+
+    def test_auth_required_parses(self, tmp_path):
+        yaml_content = """\
+name: auth-required
+version: '1.0'
+auth:
+  required:
+    - provider: notion
+      source: mcp
+      modes: [env_passthrough]
+      required_env_keys: [NOTION_TOKEN]
+      mcp_server: notion
+"""
+        defn = self._load_yaml_str(tmp_path, yaml_content)
+        assert len(defn.auth.required) == 1
+        requirement = defn.auth.required[0]
+        assert requirement.provider == "notion"
+        assert requirement.source == "mcp"
+        assert requirement.modes == ["env_passthrough"]
+        assert requirement.required_env_keys == ["NOTION_TOKEN"]
+        assert requirement.mcp_server == "notion"
+        assert defn.auth_required_resources() == [
+            {
+                "provider": "notion",
+                "source": "mcp",
+                "modes": ["env_passthrough"],
+                "required_env_keys": ["NOTION_TOKEN"],
+                "mcp_server": "notion",
+            }
+        ]
+
+    def test_auth_required_rejects_invalid_source(self, tmp_path):
+        yaml_content = """\
+name: auth-bad-source
+version: '1.0'
+auth:
+  required:
+    - provider: notion
+      source: oauth
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("invalid source" in err for err in exc_info.value.errors)
+
+    def test_auth_required_rejects_mcp_server_for_api_source(self, tmp_path):
+        yaml_content = """\
+name: auth-bad-mcp-server
+version: '1.0'
+auth:
+  required:
+    - provider: notion
+      source: api
+      mcp_server: notion
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("mcp_server is only valid" in err for err in exc_info.value.errors)
+
+
 class TestRemediationCriticalPathBehavior:
     def test_process_definition_normalizes_critical_path_behavior(self):
         defn = ProcessDefinition(name="x")

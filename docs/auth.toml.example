@@ -19,6 +19,7 @@ secret_ref = "keychain://loom/google_analytics/ga_acme_prod/api_key"
 provider = "notion"
 mode = "oauth2_pkce"
 account_label = "Marketing Workspace"
+mcp_server = "notion"
 scopes = ["read:content", "write:content"]
 token_ref = "keychain://loom/notion/notion_marketing/tokens"
 

@@ -16,7 +16,7 @@ This is based on the current implementation in `src/loom/*`.
 
 Implementation refresh status (2026-02-27):
 - Reliability hardening workstreams `#1,#2,#3,#4,#5,#6,#10` are implemented behind execution flags.
-- Validation snapshot (2026-02-27): `uv run ruff check` passed; `uv run pytest` passed (`1864 passed, 50 skipped`).
+- Validation snapshot (2026-02-27): `uv run ruff check` passed; `uv run pytest` passed (`1879 passed, 50 skipped, 1 warning`).
 - Default posture remains conservative: hardening controls are mostly opt-in via config.
 
 ## 2. High-Level Architecture
@@ -391,6 +391,8 @@ Important capabilities:
 - Execution wrappers with timeout and error handling.
 - Workspace/read-root path confinement.
 - Optional MCP refresh hook with throttling.
+- Auth-scoped MCP discovery hook with per-auth-view cache and fingerprinting.
+- Auth-scoped MCP lookup/execute path avoids global refresh fallback to prevent cross-run account leakage.
 - Tool mutability metadata (`Tool.is_mutating`) used for budget accounting and idempotency dedupe.
 
 ### 4.7.2 Discovery
@@ -516,7 +518,8 @@ Conversation storage is append-only for full traceability.
   - workspace validity
   - process availability
   - required tools availability
-  - auth profile resolution
+  - auth profile resolution across process requirements plus allowed-tool auth declarations
+  - structured unresolved-auth response (`code=auth_unresolved`) for non-interactive callers
 - Durable submission path with `run_id`, run-lease acquisition, heartbeat, and startup recovery when enabled.
 - Background execution task tracking and lifecycle cleanup.
 - SSE streams for events and token streaming.
@@ -670,9 +673,32 @@ This section catalogs major decision points and impacts.
 ## 6.3 Runner decisions
 
 14. Auth preflight pass/fail.
-- Inputs: workspace + task metadata auth settings.
+- Inputs: workspace + task metadata auth settings + required auth resources.
+- Required auth resources are the union of:
+  - process `auth.required`
+  - tool `auth_requirements` from allowed tools (excluding `process.tools.excluded`)
+- Resource lifecycle state is loaded from `.loom/auth.resources.toml`
+  (registry + bindings + workspace resource defaults).
 - Decision: fail fast if unresolved auth context.
-- Impact: prevents hidden downstream tool failures.
+- Unresolved taxonomy includes at least:
+  - `ambiguous`, `missing`, `missing_mcp_binding`, `mcp_binding_mismatch`, `unknown_mcp_server`, `mcp_alias_conflict`
+  - resource-first states: `blocked_missing_resource`, `blocked_ambiguous_binding`, `needs_rebind`, `draft_incomplete`, `draft_invalid`
+  - oauth lifecycle reasons: `auth_missing`, `auth_invalid`, `auth_expired`
+- Impact: prevents hidden downstream tool failures and enables deterministic client remediation.
+- Effective resolver precedence (current implementation):
+  1. explicit run overrides (`resource_id` / `resource_ref` / provider selector)
+  2. workspace resource defaults (`.loom/auth.resources.toml`)
+  3. user resource defaults (`~/.loom/auth.toml` `[auth.resource_defaults]`)
+  4. legacy provider defaults (workspace then user)
+  5. single-candidate auto-select
+- Operational tooling:
+  - `loom auth sync [--scope active|full]` seeds missing draft profiles.
+  - `loom auth audit` reports orphaned/dangling auth state.
+  - `loom auth migrate` creates snapshots and infers resource bindings/defaults.
+  - `loom auth migrate --rollback <snapshot>` restores snapshot files.
+- Mutation safety:
+  - auth config writes (`auth.toml`, `.loom/auth.defaults.toml`,
+    `.loom/auth.resources.toml`) use lock-guarded atomic file writes.
 
 15. Iteration budget selection.
 - Inputs: configured base budget (current implementation does not vary per strategy yet).

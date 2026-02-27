@@ -2604,6 +2604,7 @@ class Orchestrator:
             auth_context = build_run_auth_context(
                 workspace=Path(task.workspace) if task.workspace else None,
                 metadata=metadata,
+                available_mcp_aliases=set(self._config.mcp.servers.keys()),
             )
         except AuthResolutionError as e:
             logger.warning("Auth context unavailable during planning for %s: %s", task.id, e)

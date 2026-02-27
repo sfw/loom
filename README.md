@@ -210,6 +210,7 @@ CLI:
   (provider selector or resource selector such as `api_integration:notion`).
 - `uv run loom auth audit` reports orphaned/dangling auth state and exits non-zero on findings.
 - `uv run loom auth migrate` infers resource bindings/defaults from legacy provider state.
+- `uv run loom auth migrate` takes a preflight snapshot and auto-rolls back if migration fails.
 - `uv run loom auth migrate --rollback <snapshot-dir>` restores auth files from a migration snapshot.
 
 API behavior:

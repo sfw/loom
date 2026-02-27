@@ -671,6 +671,21 @@
     Configured MCP servers are auto-discovered and exposed as namespaced tools in Loom (for example <code>mcp.notion.search</code>). Merge precedence is <code>--mcp-config</code> &gt; workspace <code>./.loom/mcp.toml</code> &gt; user <code>~/.loom/mcp.toml</code> &gt; legacy <code>[mcp]</code> in <code>loom.toml</code>.
   </div>
 
+  <pre><code><span class="cmt"># ~/.loom/auth.toml (profile metadata + secret refs; no plaintext secrets)</span>
+<span class="key">[auth.defaults]</span>
+<span class="key">notion</span> = <span class="str">"notion_marketing"</span>
+
+<span class="key">[auth.profiles.notion_marketing]</span>
+<span class="key">provider</span> = <span class="str">"notion"</span>
+<span class="key">mode</span> = <span class="str">"oauth2_pkce"</span>
+<span class="key">mcp_server</span> = <span class="str">"notion"</span>
+<span class="key">token_ref</span> = <span class="str">"keychain://loom/notion/notion_marketing/tokens"</span></code></pre>
+
+  <div class="callout callout-info">
+    <strong>Run-start auth resolution</strong>
+    Loom resolves auth at run start from process requirements and tool declarations. If one matching profile exists, it is selected automatically. If multiple profiles match, Loom prompts in the TUI. API clients receive a structured <code>auth_unresolved</code> payload and retry with explicit profile overrides.
+  </div>
+
   <div class="callout callout-warn">
     <strong>Single model?</strong>
     If you only have one model, assign it all four roles: <code>["planner", "executor", "extractor", "verifier"]</code>
@@ -931,6 +946,12 @@
     <tr><td><code>/mcp show &lt;alias&gt;</code></td><td>Show one MCP config entry (redacted env values)</td></tr>
     <tr><td><code>/mcp test &lt;alias&gt;</code></td><td>Run a <code>tools/list</code> probe against one MCP server</td></tr>
     <tr><td><code>/mcp enable|disable|remove &lt;alias&gt;</code></td><td>Mutate MCP config and refresh runtime MCP tools</td></tr>
+    <tr><td><code>/auth</code> / <code>/auth manage</code></td><td>Open the auth profile manager</td></tr>
+    <tr><td><code>/auth use selector=profile_id</code></td><td>Set run-local auth override for the next <code>/run</code> (selector can be provider, <code>resource_ref</code>, or <code>resource_id</code>)</td></tr>
+    <tr><td><code>/auth select &lt;selector&gt;=&lt;profile_id&gt;</code></td><td>Persist workspace default mapping (selector can be provider, <code>resource_ref</code>, or <code>resource_id</code>)</td></tr>
+    <tr><td><code>loom auth sync [--scope active|full]</code></td><td>Auto-discover auth resources and create missing draft profiles</td></tr>
+    <tr><td><code>loom auth audit</code></td><td>Report orphaned/dangling auth state (non-zero exit when findings exist)</td></tr>
+    <tr><td><code>loom auth migrate [--rollback &lt;snapshot&gt;]</code></td><td>Migrate legacy provider defaults to resource bindings/defaults (auto-rollback on failure), or restore from snapshot</td></tr>
     <tr><td><code>/process list</code></td><td>List discovered process definitions</td></tr>
     <tr><td><code>/process use &lt;name-or-path&gt;</code></td><td>Activate a process in the current session</td></tr>
     <tr><td><code>/process off</code></td><td>Disable the active process</td></tr>
@@ -948,7 +969,11 @@
 
   <div class="callout callout-info">
     <strong>About /run</strong>
-    <code>/run &lt;goal&gt;</code> uses in-process orchestration via <code>delegate_task</code>. You do not need to run <code>loom serve</code> for this flow. Use <code>/run problem.md</code> to load a workspace goal file directly, or <code>/run @problem.md optional-goal</code> to provide explicit file input with an inline goal. Use <code>/run close</code> (or <code>Ctrl+W</code> on a process tab) to cancel and close a running tab.
+    <code>/run &lt;goal&gt;</code> uses in-process orchestration via <code>delegate_task</code>. You do not need to run <code>loom serve</code> for this flow. Use <code>/run problem.md</code> to load a workspace goal file directly, or <code>/run @problem.md optional-goal</code> to provide explicit file input with an inline goal. Use <code>/run close</code> (or <code>Ctrl+W</code> on a process tab) to cancel and close a running tab. If the run needs credentials, Loom resolves auth before execution and prompts for profile selection only when required.
+  </div>
+  <div class="callout callout-info">
+    <strong>Auth UX</strong>
+    Opening <code>/auth</code> auto-syncs discovered MCP/API/tool auth requirements and creates draft profiles for missing coverage. Provider is derived from the selected target resource in the manager.
   </div>
 
   <div class="callout callout-info">

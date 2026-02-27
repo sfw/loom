@@ -27,7 +27,13 @@ from loom.api.schemas import (
     TaskSteerRequest,
     ToolInfo,
 )
-from loom.auth.runtime import AuthResolutionError, build_run_auth_context
+from loom.auth.runtime import (
+    AuthResolutionError,
+    UnresolvedAuthResourcesError,
+    build_run_auth_context,
+    coerce_auth_requirements,
+    serialize_auth_requirements,
+)
 from loom.engine.orchestrator import create_task
 from loom.events.bus import Event
 from loom.state.memory import MemoryEntry
@@ -35,6 +41,49 @@ from loom.state.task_state import SubtaskStatus, TaskStatus
 from loom.tools.workspace import validate_workspace
 
 router = APIRouter()
+
+
+def _required_auth_resources_for_process(
+    process_def: object | None,
+    *,
+    tool_registry: object | None = None,
+) -> list[dict[str, object]]:
+    """Collect auth requirement declarations from process + allowed tools."""
+    if process_def is None:
+        return []
+
+    raw_items: list[object] = []
+    auth_block = getattr(process_def, "auth", None)
+    process_required = getattr(auth_block, "required", [])
+    if isinstance(process_required, list):
+        raw_items.extend(process_required)
+
+    if tool_registry is not None:
+        tools_cfg = getattr(process_def, "tools", None)
+        excluded = {
+            str(item).strip()
+            for item in (getattr(tools_cfg, "excluded", []) or [])
+            if str(item).strip()
+        }
+        list_tools = getattr(tool_registry, "list_tools", None)
+        get_tool = getattr(tool_registry, "get", None)
+        if callable(list_tools) and callable(get_tool):
+            for tool_name in sorted(
+                {
+                    str(name).strip()
+                    for name in list_tools()
+                    if str(name).strip() and str(name).strip() not in excluded
+                }
+            ):
+                tool = get_tool(tool_name)
+                if tool is None:
+                    continue
+                declared = getattr(tool, "auth_requirements", [])
+                if isinstance(declared, list):
+                    raw_items.extend(declared)
+
+    normalized = coerce_auth_requirements(raw_items)
+    return serialize_auth_requirements(normalized)
 
 
 def _get_engine(request: Request) -> Engine:
@@ -78,17 +127,17 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         except ProcessNotFoundError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    registry_for_process: object | None = None
     # Validate required tools early so clients get immediate feedback.
     if process_def is not None:
         tools_cfg = getattr(process_def, "tools", None)
         required = list(getattr(tools_cfg, "required", []) or [])
         excluded = set(getattr(tools_cfg, "excluded", []) or [])
-        if required:
-            from loom.tools import create_default_registry
+        from loom.tools import create_default_registry
 
-            available = set(
-                create_default_registry(engine.config).list_tools()
-            ) - excluded
+        registry_for_process = create_default_registry(engine.config)
+        if required:
+            available = set(registry_for_process.list_tools()) - excluded
             missing = sorted(name for name in required if name not in available)
             if missing:
                 raise HTTPException(
@@ -102,6 +151,12 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
     metadata = body.metadata if isinstance(body.metadata, dict) else {}
     metadata = dict(metadata)
     metadata["process"] = effective_process or ""
+    required_auth_resources = _required_auth_resources_for_process(
+        process_def,
+        tool_registry=registry_for_process,
+    )
+    if required_auth_resources:
+        metadata["auth_required_resources"] = required_auth_resources
 
     # Validate auth profile selection early so auth errors fail fast.
     workspace_path = Path(body.workspace) if body.workspace else None
@@ -109,7 +164,11 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         build_run_auth_context(
             workspace=workspace_path,
             metadata=metadata,
+            required_resources=coerce_auth_requirements(required_auth_resources),
+            available_mcp_aliases=set(engine.config.mcp.servers.keys()),
         )
+    except UnresolvedAuthResourcesError as e:
+        raise HTTPException(status_code=400, detail=e.to_payload())
     except AuthResolutionError as e:
         raise HTTPException(status_code=400, detail=f"Auth preflight failed: {e}")
 
