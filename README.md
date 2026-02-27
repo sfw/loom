@@ -2,7 +2,7 @@
 [![CI](https://github.com/sfw/loom/actions/workflows/ci.yml/badge.svg)](https://github.com/sfw/loom/actions/workflows/ci.yml)
 [![Process Canary](https://github.com/sfw/loom/actions/workflows/process-canary.yml/badge.svg)](https://github.com/sfw/loom/actions/workflows/process-canary.yml)
 
-**Local-first LLM execution harness** for complex tasks.
+**Local-ready LLM execution harness** for complex tasks.
 
 Loom decomposes goals, drives execution through verified steps, routes between thinking and acting models, and keeps work on track with structured state instead of chat history. Use it via TUI, CLI, API, or MCP with local or mixed local/cloud models.
 
@@ -10,15 +10,21 @@ Bring Kimi, Minimax, GLM, Claude, or any OpenAI-compatible model and Loom suppli
 
 It handles coding, research, document analysis (PDF, Word docs, PowerPoint decks), report generation, and multi-step business workflows.
 
-**Claude-class cowork UX, local-first.** Tools like Claude Code and Claude cowork deliver strong agentic experiences, and Claude Code can be paired with local model stacks depending on your setup. Loom's focus is different: a model-agnostic harness designed to keep local and mixed local/cloud execution reliable with structured planning, tool safety, independent verification, and persistent memory. Loom is also cross-platform, while Claude cowork is currently macOS + Claude-model oriented. The result is an agentic workflow that stays robust on your own hardware without locking you to one provider.
+**Claude-class cowork UX, local-ready.** Tools like Claude Code and Claude cowork deliver strong agentic experiences, and Claude Code can be paired with local model stacks depending on your setup. Loom's focus is different: a model-agnostic harness designed to keep local and mixed local/cloud execution reliable with structured planning, tool safety, independent verification, and persistent memory. Loom is also cross-platform, while Claude cowork is currently macOS + Claude-model oriented. The result is an agentic workflow that stays robust on your own hardware without locking you to one provider.
 
 Loom also exposes a REST API and an MCP server built for agentic systems. Orchestrators like OpenClaw can call Loom's 19 REST endpoints -- or connect via the Model Context Protocol -- to offload complex multi-step tasks: decomposition, tool calling, verification, and memory. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive. The MCP integration also means any MCP-compatible agent or IDE can use Loom as a tool provider out of the box.
 
 ## Why Loom Exists
 
-Cloud-hosted agents are good but come with constraints: token costs, rate limits, privacy concerns, and vendor lock-in. Local models are getting capable enough for real work, but they lack the scaffolding that makes cloud agents useful. A 14B model can write correct code, draft a solid analysis, or answer complex questions -- but it can't plan multi-step work, verify its own output, recover from mistakes, or remember what it did three turns ago without help.
+LLMs are phenomenal at answering a single, well-formed question. Give them a bounded task, and they can produce remarkably strong results.
 
-Loom is that help. It's the harness that turns a local model into a working agent -- for code, research, analysis, or whatever process you define.
+But real work is rarely a single question. It is a chain of decisions, dependencies, checks, and revisions. In that setting, even strong models can drift: they skip steps, lose context, or confidently invent details. The problem is not intelligence. The problem is process.
+
+Loom exists to provide that process.
+
+Loom breaks complex work into smaller, solvable units, runs them in sequence, and verifies each result before moving forward. That lets you use model intelligence where it is strongest while reducing hallucinations, compounding errors, and dead-end reasoning.
+
+Loom is local-ready and supports local models natively, so you get privacy, control, and lower operating cost. It is not limited to local inference: you can use cloud models too, and apply Loom to far more than coding, including research, analysis, and operational workflows.
 
 ## Two Ways to Work
 
@@ -154,6 +160,9 @@ NOTION_TOKEN = "${NOTION_TOKEN}"
 
 MCP merge precedence is: `--mcp-config` > `./.loom/mcp.toml` > `~/.loom/mcp.toml` > legacy `[mcp]` in `loom.toml`.
 Configured MCP servers are auto-discovered at startup and registered as namespaced tools (`mcp.<server>.<tool>`).
+When a run has an auth context, MCP discovery is scoped to that run's selected
+profiles; auth-scoped MCP tools are not leaked into the global registry view
+used by other concurrent runs.
 `delegate_task` (used by `/run`) defaults to a 3600s timeout. Configure this in
 `loom.toml` under `[execution].delegate_task_timeout_seconds`; env override
 `LOOM_DELEGATE_TIMEOUT_SECONDS` still applies when set.
@@ -166,6 +175,32 @@ For large fetched binaries/documents (PDFs, Office files, archives), tune
 `ingest_artifact_retention_max_age_days`,
 `ingest_artifact_retention_max_files_per_scope`, and
 `ingest_artifact_retention_max_bytes_per_scope`.
+
+## Auth Profiles and Run-Time Resolution
+
+Loom stores credential metadata (not plaintext secrets) in `~/.loom/auth.toml`.
+Workspace defaults can be set in `./.loom/auth.defaults.toml`.
+
+Auth resolution happens at run start using this order:
+1. Explicit run overrides (`--auth-profile` / API `auth_profile_overrides`)
+2. Workspace defaults
+3. User defaults
+4. Auto-select when exactly one profile matches a required resource
+
+Required auth resources are collected from:
+- Process `auth.required`
+- Declared tool `auth_requirements` on all allowed tools for the process
+  (tools excluded by `process.tools.excluded` are not considered)
+
+UX behavior:
+- TUI `/run` does not require a pre-step `/auth select ...`.
+- If multiple profiles match, Loom prompts for a choice at run start.
+- If auth is missing/invalid/expired, run start offers opening Auth Manager and
+  retries preflight after changes.
+
+API behavior:
+- Non-interactive unresolved auth returns HTTP 400 with structured
+  `code=auth_unresolved` payload so clients can choose a profile and retry.
 
 ## Process Definitions
 
