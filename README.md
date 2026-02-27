@@ -10,6 +10,8 @@ Bring Kimi, Minimax, GLM, Claude, or any OpenAI-compatible model and Loom suppli
 
 It handles coding, research, document analysis (PDF, Word docs, PowerPoint decks), report generation, and multi-step business workflows.
 
+![Loom screenshot](docs/images/loom.png)
+
 **Claude-class cowork UX, local-ready.** Tools like Claude Code and Claude cowork deliver strong agentic experiences, and Claude Code can be paired with local model stacks depending on your setup. Loom's focus is different: a model-agnostic harness designed to keep local and mixed local/cloud execution reliable with structured planning, tool safety, independent verification, and persistent memory. Loom is also cross-platform, while Claude cowork is currently macOS + Claude-model oriented. The result is an agentic workflow that stays robust on your own hardware without locking you to one provider.
 
 Loom also exposes a REST API and an MCP server built for agentic systems. Orchestrators like OpenClaw can call Loom's 19 REST endpoints -- or connect via the Model Context Protocol -- to offload complex multi-step tasks: decomposition, tool calling, verification, and memory. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive. The MCP integration also means any MCP-compatible agent or IDE can use Loom as a tool provider out of the box.
@@ -180,12 +182,14 @@ For large fetched binaries/documents (PDFs, Office files, archives), tune
 
 Loom stores credential metadata (not plaintext secrets) in `~/.loom/auth.toml`.
 Workspace defaults can be set in `./.loom/auth.defaults.toml`.
+Resource registry + bindings are stored in `./.loom/auth.resources.toml`.
 
 Auth resolution happens at run start using this order:
-1. Explicit run overrides (`--auth-profile` / API `auth_profile_overrides`)
-2. Workspace defaults
-3. User defaults
-4. Auto-select when exactly one profile matches a required resource
+1. Explicit run overrides by `resource_id` / `resource_ref` / provider selector
+2. Workspace resource defaults (`resource_id -> profile_id`)
+3. User resource defaults (`resource_id -> profile_id`)
+4. Legacy provider defaults (workspace, then user)
+5. Auto-select when exactly one profile matches a required resource
 
 Required auth resources are collected from:
 - Process `auth.required`
@@ -193,10 +197,20 @@ Required auth resources are collected from:
   (tools excluded by `process.tools.excluded` are not considered)
 
 UX behavior:
+- TUI `/auth` auto-discovers missing resource contracts and seeds draft profiles.
 - TUI `/run` does not require a pre-step `/auth select ...`.
 - If multiple profiles match, Loom prompts for a choice at run start.
-- If auth is missing/invalid/expired, run start offers opening Auth Manager and
+- If auth is missing/invalid/expired/unbound, run start offers opening Auth Manager and
   retries preflight after changes.
+- If exactly one profile exists for a resource, it is auto-defaulted for that workspace.
+
+CLI:
+- `uv run loom auth sync` runs the same draft/resource sync flow headlessly.
+- `uv run loom auth select <selector> <profile_id>` persists a workspace default
+  (provider selector or resource selector such as `api_integration:notion`).
+- `uv run loom auth audit` reports orphaned/dangling auth state and exits non-zero on findings.
+- `uv run loom auth migrate` infers resource bindings/defaults from legacy provider state.
+- `uv run loom auth migrate --rollback <snapshot-dir>` restores auth files from a migration snapshot.
 
 API behavior:
 - Non-interactive unresolved auth returns HTTP 400 with structured
