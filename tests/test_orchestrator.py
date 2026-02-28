@@ -3181,7 +3181,7 @@ class TestSubtaskRunnerContextBudget:
         )
         assert violation.data["attempted_path"] == "../outside.md"
 
-    def test_tool_call_completed_payload_contract_unchanged(self):
+    def test_tool_call_completed_payload_contract_additive(self):
         runner = self._make_runner_for_telemetry()
         events = []
         runner._event_bus.subscribe_all(lambda event: events.append(event))
@@ -3202,6 +3202,7 @@ class TestSubtaskRunnerContextBudget:
             "args": {"url": "https://example.com/report.pdf"},
             "success": True,
             "error": "",
+            "files_changed": [],
         }
 
     def test_artifact_ingest_telemetry_required_fields_and_redaction(self):

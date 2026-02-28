@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import shlex
 import textwrap
@@ -205,7 +206,19 @@ _SLASH_COMMAND_PRIORITY: dict[str, int] = {
     "/clear": 45,
     "/quit": 46,
 }
-_WORKSPACE_REFRESH_TOOLS = {"document_write", "document_create", "humanize_writing"}
+_MUTATING_TOOL_FALLBACK = frozenset({"document_write", "humanize_writing"})
+_WORKSPACE_SCAN_EXCLUDE_DIRS = frozenset({
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".venv",
+    "venv",
+    "node_modules",
+    "dist",
+    "build",
+})
 _PROCESS_STATUS_ICON = {
     "queued": "\u25cb",
     "running": "\u25c9",
@@ -229,6 +242,15 @@ _RUN_GOAL_FILE_CONTENT_MAX_CHARS = 32_000
 _MAX_INPUT_HISTORY = 500
 _DEFAULT_CHAT_RESUME_PAGE_SIZE = 250
 _DEFAULT_CHAT_RESUME_MAX_RENDERED_ROWS = 1200
+_DEFAULT_TUI_REALTIME_REFRESH_ENABLED = True
+_DEFAULT_TUI_WORKSPACE_WATCH_BACKEND = "poll"
+_DEFAULT_TUI_WORKSPACE_POLL_INTERVAL_MS = 1000
+_DEFAULT_TUI_WORKSPACE_REFRESH_DEBOUNCE_MS = 250
+_DEFAULT_TUI_WORKSPACE_REFRESH_MAX_WAIT_MS = 1500
+_DEFAULT_TUI_WORKSPACE_SCAN_MAX_ENTRIES = 20_000
+_DEFAULT_TUI_CHAT_STREAM_FLUSH_INTERVAL_MS = 120
+_DEFAULT_TUI_FILES_PANEL_MAX_ROWS = 2000
+_DEFAULT_TUI_DELEGATE_PROGRESS_MAX_LINES = 150
 _PROCESS_COMMAND_INDEX_REFRESH_INTERVAL_SECONDS = 2.0
 _EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS = 0.5
 _EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS = 0.05
@@ -742,11 +764,26 @@ class LoomApp(App):
         self._chat_history_oldest_seq: int | None = None
         self._chat_history_oldest_turn: int | None = None
         self._chat_trimmed_total = 0
+        self._active_delegate_streams: dict[str, dict[str, Any]] = {}
+        self._workspace_refresh_pending_reasons: set[str] = set()
+        self._workspace_refresh_first_request_at = 0.0
+        self._workspace_refresh_timer_pending = False
+        self._workspace_refresh_timer = None
+        self._workspace_poll_timer = None
+        self._workspace_poll_inflight = False
+        self._workspace_signature: tuple[int, int, int] | None = None
+        self._workspace_scan_overflow_notified = False
+        self._files_panel_recent_ops: dict[str, float] = {}
+        self._files_panel_dedupe_window_seconds = 1.5
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="main-layout"):
-            yield Sidebar(self._workspace, id="sidebar")
+            yield Sidebar(
+                self._workspace,
+                progress_auto_follow=self._tui_progress_auto_follow(),
+                id="sidebar",
+            )
             with Vertical(id="main-area"):
                 with TabbedContent(id="tabs"):
                     with TabPane("Chat", id="tab-chat"):
@@ -789,6 +826,7 @@ class LoomApp(App):
             return
 
         await self._initialize_session()
+        self._start_workspace_watch()
         # Keep input focus deterministic even when _initialize_session is mocked
         # in tests or returns early in partial startup paths.
         try:
@@ -811,6 +849,17 @@ class LoomApp(App):
                     fields={"threshold_ms": int(_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS * 1000)},
                 )
             expected = now + _EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS
+
+    def on_unmount(self) -> None:
+        """Cleanup runtime timers when app unmounts."""
+        self._stop_workspace_watch()
+        timer = self._process_elapsed_timer
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._process_elapsed_timer = None
 
     def _on_setup_complete(self, result: list[dict] | None) -> None:
         """Handle setup wizard dismissal."""
@@ -857,6 +906,7 @@ class LoomApp(App):
             self._session = None
 
         await self._initialize_session()
+        self._start_workspace_watch()
 
     def _refresh_tool_registry(self) -> None:
         """Reset registry to discovered tools."""
@@ -3705,6 +3755,127 @@ class LoomApp(App):
         except Exception:
             return True
 
+    def _tui_progress_auto_follow(self) -> bool:
+        return True
+
+    def _tui_realtime_refresh_enabled(self) -> bool:
+        tui_cfg = getattr(self._config, "tui", None)
+        if tui_cfg is None:
+            return _DEFAULT_TUI_REALTIME_REFRESH_ENABLED
+        try:
+            return bool(
+                getattr(
+                    tui_cfg,
+                    "realtime_refresh_enabled",
+                    _DEFAULT_TUI_REALTIME_REFRESH_ENABLED,
+                )
+            )
+        except Exception:
+            return _DEFAULT_TUI_REALTIME_REFRESH_ENABLED
+
+    def _tui_workspace_watch_backend(self) -> str:
+        tui_cfg = getattr(self._config, "tui", None)
+        if tui_cfg is None:
+            return _DEFAULT_TUI_WORKSPACE_WATCH_BACKEND
+        value = str(
+            getattr(
+                tui_cfg,
+                "workspace_watch_backend",
+                _DEFAULT_TUI_WORKSPACE_WATCH_BACKEND,
+            )
+            or _DEFAULT_TUI_WORKSPACE_WATCH_BACKEND,
+        ).strip().lower()
+        return value if value in {"poll", "native"} else _DEFAULT_TUI_WORKSPACE_WATCH_BACKEND
+
+    def _tui_workspace_poll_interval_seconds(self) -> float:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_WORKSPACE_POLL_INTERVAL_MS
+        if tui_cfg is None:
+            return default / 1000.0
+        try:
+            value_ms = int(getattr(tui_cfg, "workspace_poll_interval_ms", default))
+        except Exception:
+            value_ms = default
+        return max(0.2, min(value_ms, 10_000) / 1000.0)
+
+    def _tui_workspace_refresh_debounce_seconds(self) -> float:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_WORKSPACE_REFRESH_DEBOUNCE_MS
+        if tui_cfg is None:
+            return default / 1000.0
+        try:
+            value_ms = int(getattr(tui_cfg, "workspace_refresh_debounce_ms", default))
+        except Exception:
+            value_ms = default
+        return max(0.05, min(value_ms, 5000) / 1000.0)
+
+    def _tui_workspace_refresh_max_wait_seconds(self) -> float:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_WORKSPACE_REFRESH_MAX_WAIT_MS
+        if tui_cfg is None:
+            return default / 1000.0
+        try:
+            value_ms = int(getattr(tui_cfg, "workspace_refresh_max_wait_ms", default))
+        except Exception:
+            value_ms = default
+        return max(0.2, min(value_ms, 30_000) / 1000.0)
+
+    def _tui_workspace_scan_max_entries(self) -> int:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_WORKSPACE_SCAN_MAX_ENTRIES
+        if tui_cfg is None:
+            return default
+        try:
+            value = int(getattr(tui_cfg, "workspace_scan_max_entries", default))
+        except Exception:
+            value = default
+        return max(500, min(value, 200_000))
+
+    def _tui_chat_stream_flush_interval_ms(self) -> int:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_CHAT_STREAM_FLUSH_INTERVAL_MS
+        if tui_cfg is None:
+            return default
+        try:
+            value = int(getattr(tui_cfg, "chat_stream_flush_interval_ms", default))
+        except Exception:
+            value = default
+        return max(40, min(value, 2000))
+
+    def _tui_files_panel_max_rows(self) -> int:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_FILES_PANEL_MAX_ROWS
+        if tui_cfg is None:
+            return default
+        try:
+            value = int(getattr(tui_cfg, "files_panel_max_rows", default))
+        except Exception:
+            value = default
+        return max(100, min(value, 20_000))
+
+    def _tui_delegate_progress_max_lines(self) -> int:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_DELEGATE_PROGRESS_MAX_LINES
+        if tui_cfg is None:
+            return default
+        try:
+            value = int(getattr(tui_cfg, "delegate_progress_max_lines", default))
+        except Exception:
+            value = default
+        return max(20, min(value, 5000))
+
+    def _is_mutating_tool(self, tool_name: str) -> bool:
+        name = str(tool_name or "").strip()
+        if not name:
+            return False
+        tool = self._tools.get(name)
+        if tool is not None:
+            try:
+                return bool(getattr(tool, "is_mutating", False))
+            except Exception:
+                return name in _MUTATING_TOOL_FALLBACK
+        return name in _MUTATING_TOOL_FALLBACK
+
     async def _initialize_session(self) -> None:
         """Initialize tools, session, and welcome message.
 
@@ -3714,6 +3885,8 @@ class LoomApp(App):
         chat = self.query_one("#chat-log", ChatLog)
         self._total_tokens = 0
         self._sidebar_cowork_tasks = []
+        self._active_delegate_streams = {}
+        chat.set_stream_flush_interval_ms(self._tui_chat_stream_flush_interval_ms())
 
         # Load process definition first. This may import bundled tool modules
         # into the global tool class registry.
@@ -3754,6 +3927,7 @@ class LoomApp(App):
                 ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
                 ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
+                delegate_progress_callback=self._on_cowork_delegate_progress_event,
             )
             try:
                 await self._session.resume(resume_target)
@@ -3801,6 +3975,7 @@ class LoomApp(App):
                 ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
                 ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
+                delegate_progress_callback=self._on_cowork_delegate_progress_event,
             )
         else:
             # Ephemeral session (no database)
@@ -3818,6 +3993,7 @@ class LoomApp(App):
                 ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
                 ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
+                delegate_progress_callback=self._on_cowork_delegate_progress_event,
             )
 
         self._hydrate_input_history_from_session()
@@ -5304,7 +5480,7 @@ class LoomApp(App):
                     f"[bold #f7768e]Process run {run.run_id} failed:[/] {error}"
                 )
                 self.notify(error, severity="error", timeout=5)
-            self._refresh_workspace_tree()
+            self._request_workspace_refresh("process-run-finished")
         except asyncio.CancelledError:
             if run.closed:
                 return
@@ -5911,12 +6087,17 @@ class LoomApp(App):
         panel = self.query_one("#files-panel", FilesChangedPanel)
         panel.clear_files()
         panel.show_diff("")
+        self._files_panel_recent_ops.clear()
 
     def _clear_chat_widgets(self) -> None:
         """Drop all currently mounted chat widgets."""
         chat = self.query_one("#chat-log", ChatLog)
         for child in list(chat.children):
             child.remove()
+        reset_runtime_state = getattr(chat, "reset_runtime_state", None)
+        if callable(reset_runtime_state):
+            reset_runtime_state()
+        self._active_delegate_streams = {}
 
     def _reset_chat_history_state(self) -> None:
         """Reset in-memory replay state for the active chat transcript."""
@@ -6026,6 +6207,7 @@ class LoomApp(App):
                 chat.add_tool_call(
                     str(payload.get("tool_name", "") or ""),
                     args,
+                    tool_call_id=str(payload.get("tool_call_id", "") or ""),
                     success=(
                         None
                         if event_type == "tool_call_started"
@@ -6034,6 +6216,63 @@ class LoomApp(App):
                     elapsed_ms=self._coerce_int(payload.get("elapsed_ms", 0), default=0),
                     output=str(payload.get("output", "") or ""),
                     error=str(payload.get("error", "") or ""),
+                )
+                return True
+            if event_type == "delegate_progress_started":
+                tool_call_id = str(payload.get("tool_call_id", "") or "").strip()
+                title = str(payload.get("title", "Delegated progress") or "Delegated progress")
+                if not tool_call_id:
+                    return False
+                self._ensure_delegate_progress_widget(
+                    tool_call_id=tool_call_id,
+                    title=title,
+                    status="running",
+                    elapsed_ms=0,
+                    lines=[],
+                )
+                return True
+            if event_type == "delegate_progress_line":
+                tool_call_id = str(payload.get("tool_call_id", "") or "").strip()
+                line = str(payload.get("line", "") or "")
+                if not tool_call_id or not line.strip():
+                    return False
+                title = str(payload.get("title", "Delegated progress") or "Delegated progress")
+                if tool_call_id not in self._active_delegate_streams:
+                    self._ensure_delegate_progress_widget(
+                        tool_call_id=tool_call_id,
+                        title=title,
+                        status="running",
+                        elapsed_ms=0,
+                        lines=[],
+                    )
+                self._append_delegate_progress_widget_line(tool_call_id, line)
+                return True
+            if event_type == "delegate_progress_finalized":
+                tool_call_id = str(payload.get("tool_call_id", "") or "").strip()
+                title = str(payload.get("title", "Delegated progress") or "Delegated progress")
+                status = str(payload.get("status", "completed") or "completed").strip().lower()
+                if status not in {"completed", "failed"}:
+                    status = "completed"
+                elapsed_ms = self._coerce_int(payload.get("elapsed_ms", 0), default=0)
+                raw_lines = payload.get("lines", [])
+                lines = (
+                    [str(item or "") for item in raw_lines]
+                    if isinstance(raw_lines, list)
+                    else []
+                )
+                if not tool_call_id:
+                    return False
+                self._ensure_delegate_progress_widget(
+                    tool_call_id=tool_call_id,
+                    title=title,
+                    status=status,
+                    elapsed_ms=elapsed_ms,
+                    lines=lines,
+                )
+                chat.finalize_delegate_progress_section(
+                    tool_call_id,
+                    success=(status == "completed"),
+                    elapsed_ms=elapsed_ms,
                 )
                 return True
             if event_type == "content_indicator":
@@ -6392,6 +6631,7 @@ class LoomApp(App):
             ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
             ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
             ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
+            delegate_progress_callback=self._on_cowork_delegate_progress_event,
         )
         self._total_tokens = 0
         self._bind_session_tools()
@@ -6438,6 +6678,7 @@ class LoomApp(App):
             ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
             ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
             ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
+            delegate_progress_callback=self._on_cowork_delegate_progress_event,
         )
         await new_session.resume(session_id)
 
@@ -8378,6 +8619,251 @@ class LoomApp(App):
             chat.add_model_text(f"[bold #f7768e]Error:[/] {e}", markup=True)
             self.notify(str(e), severity="error", timeout=5)
 
+    @staticmethod
+    def _delegate_target_for_tool_call(tool_name: str, args: dict | None) -> str:
+        """Return delegated target tool name when this call wraps another tool."""
+        name = str(tool_name or "").strip()
+        payload = args if isinstance(args, dict) else {}
+        if name == "delegate_task":
+            return "delegate_task"
+        if name != "run_tool":
+            return ""
+        target = str(
+            payload.get("name", payload.get("tool_name", "")) or "",
+        ).strip()
+        return target
+
+    @staticmethod
+    def _delegate_progress_title(caller_tool_name: str) -> str:
+        caller = str(caller_tool_name or "").strip()
+        if caller == "run_tool":
+            return "Delegated progress (run_tool)"
+        return "Delegated progress"
+
+    def _ensure_delegate_progress_widget(
+        self,
+        *,
+        tool_call_id: str,
+        title: str,
+        status: str = "running",
+        elapsed_ms: int = 0,
+        lines: list[str] | None = None,
+    ) -> bool:
+        key = str(tool_call_id or "").strip()
+        if not key:
+            return False
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_delegate_progress_section(
+            key,
+            title=title,
+            max_lines=self._tui_delegate_progress_max_lines(),
+            status=status,
+            elapsed_ms=elapsed_ms,
+            lines=lines,
+        )
+        normalized_lines = [
+            " ".join(str(item or "").split())
+            for item in (lines or [])
+            if " ".join(str(item or "").split())
+        ]
+        max_lines_cap = self._tui_delegate_progress_max_lines()
+        if len(normalized_lines) > max_lines_cap:
+            normalized_lines = normalized_lines[-max_lines_cap:]
+        stream = self._active_delegate_streams.get(key, {})
+        if not isinstance(stream, dict):
+            stream = {}
+        stream.update({
+            "tool_call_id": key,
+            "title": str(title or "Delegated progress").strip() or "Delegated progress",
+            "status": str(status or "running").strip().lower() or "running",
+            "elapsed_ms": max(0, int(elapsed_ms)),
+            "lines": normalized_lines,
+            "started_at": float(stream.get("started_at", time.monotonic()) or time.monotonic()),
+            "finalized": str(status or "").strip().lower() in {"completed", "failed"},
+        })
+        self._active_delegate_streams[key] = stream
+        return True
+
+    def _append_delegate_progress_widget_line(self, tool_call_id: str, line: str) -> bool:
+        key = str(tool_call_id or "").strip()
+        if not key:
+            return False
+        stream = self._active_delegate_streams.get(key)
+        if not isinstance(stream, dict):
+            return False
+        if bool(stream.get("finalized", False)):
+            return False
+        chat = self.query_one("#chat-log", ChatLog)
+        accepted = chat.append_delegate_progress_line(key, line)
+        if not accepted:
+            return False
+        compact = " ".join(str(line or "").split())
+        if not compact:
+            return False
+        lines = stream.get("lines")
+        if not isinstance(lines, list):
+            lines = []
+        lines.append(compact)
+        max_lines_cap = self._tui_delegate_progress_max_lines()
+        if len(lines) > max_lines_cap:
+            del lines[:-max_lines_cap]
+        stream["lines"] = lines
+        self._active_delegate_streams[key] = stream
+        return True
+
+    async def _start_delegate_progress_stream(
+        self,
+        *,
+        tool_call_id: str,
+        caller_tool_name: str,
+        persist: bool = True,
+    ) -> None:
+        key = str(tool_call_id or "").strip()
+        if not key:
+            return
+        existing = self._active_delegate_streams.get(key)
+        if isinstance(existing, dict):
+            # Late callback events can arrive after tool completion; never
+            # reopen/reset a finalized section.
+            if bool(existing.get("finalized", False)):
+                return
+            return
+        title = self._delegate_progress_title(caller_tool_name)
+        if not self._ensure_delegate_progress_widget(
+            tool_call_id=key,
+            title=title,
+            status="running",
+            elapsed_ms=0,
+            lines=[],
+        ):
+            return
+        if not persist:
+            return
+        await self._append_chat_replay_event(
+            "delegate_progress_started",
+            {
+                "tool_call_id": key,
+                "title": title,
+                "status": "running",
+            },
+        )
+
+    async def _finalize_delegate_progress_stream(
+        self,
+        *,
+        tool_call_id: str,
+        success: bool,
+        elapsed_ms: int = 0,
+        persist: bool = True,
+    ) -> None:
+        key = str(tool_call_id or "").strip()
+        if not key:
+            return
+        stream = self._active_delegate_streams.get(key)
+        if not isinstance(stream, dict):
+            return
+        status = "completed" if success else "failed"
+        normalized_elapsed = max(0, int(elapsed_ms))
+        if normalized_elapsed <= 0:
+            started_at = float(stream.get("started_at", 0.0) or 0.0)
+            if started_at > 0:
+                normalized_elapsed = max(
+                    1,
+                    int((time.monotonic() - started_at) * 1000),
+                )
+        title = str(stream.get("title", "Delegated progress") or "Delegated progress")
+        lines = stream.get("lines")
+        if not isinstance(lines, list):
+            lines = []
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.finalize_delegate_progress_section(
+            key,
+            success=bool(success),
+            elapsed_ms=normalized_elapsed,
+        )
+        stream.update({
+            "status": status,
+            "elapsed_ms": normalized_elapsed,
+            "finalized": True,
+            "lines": lines,
+            "title": title,
+        })
+        self._active_delegate_streams[key] = stream
+        if not persist:
+            return
+        await self._append_chat_replay_event(
+            "delegate_progress_finalized",
+            {
+                "tool_call_id": key,
+                "title": title,
+                "status": status,
+                "elapsed_ms": normalized_elapsed,
+                "lines": list(lines),
+            },
+        )
+
+    async def _on_cowork_delegate_progress_event(self, payload: dict[str, Any]) -> None:
+        """Handle delegate_task incremental progress for cowork chat streams."""
+        if not isinstance(payload, dict):
+            return
+        tool_call_id = str(payload.get("tool_call_id", "") or "").strip()
+        if not tool_call_id:
+            return
+        existing = self._active_delegate_streams.get(tool_call_id)
+        if isinstance(existing, dict) and bool(existing.get("finalized", False)):
+            return
+
+        caller_tool_name = str(
+            payload.get("caller_tool_name", payload.get("tool_name", "delegate_task"))
+            or "delegate_task",
+        ).strip() or "delegate_task"
+        await self._start_delegate_progress_stream(
+            tool_call_id=tool_call_id,
+            caller_tool_name=caller_tool_name,
+            persist=True,
+        )
+
+        self._update_sidebar_tasks(payload)
+
+        event_type = str(payload.get("event_type", "") or "").strip()
+        event_data = payload.get("event_data", {})
+        if not isinstance(event_data, dict):
+            event_data = {}
+        if event_type == "tool_call_completed":
+            nested_tool = str(event_data.get("tool", "") or "").strip()
+            if nested_tool and self._is_mutating_tool(nested_tool):
+                self._request_workspace_refresh(f"delegate:{nested_tool}")
+            self._ingest_files_panel_from_paths(
+                event_data.get("files_changed", []),
+                operation_hint="modify",
+            )
+        if event_type in {
+            "subtask_completed",
+            "subtask_failed",
+            "task_completed",
+            "task_failed",
+        }:
+            self._request_workspace_refresh(f"delegate:{event_type}")
+        if event_type == "token_streamed":
+            # Token bursts are noisy; keep cowork progress sections high-signal.
+            return
+
+        message = self._format_process_progress_event(
+            payload,
+            context="cowork_delegate",
+        )
+        if message and self._append_delegate_progress_widget_line(tool_call_id, message):
+            if event_type != "token_streamed":
+                try:
+                    events_panel = self.query_one("#events-panel", EventPanel)
+                    events_panel.add_event(
+                        _now_str(),
+                        "delegate",
+                        message[:140],
+                    )
+                except Exception:
+                    pass
+
     async def _run_interaction(self, message: str) -> None:
         """Execute a turn interaction with the model.
 
@@ -8398,14 +8884,29 @@ class LoomApp(App):
             elif isinstance(event, ToolCallEvent):
                 if event.result is None:
                     # Tool starting
-                    chat.add_tool_call(event.name, event.args)
+                    chat.add_tool_call(
+                        event.name,
+                        event.args,
+                        tool_call_id=event.tool_call_id,
+                    )
                     await self._append_chat_replay_event(
                         "tool_call_started",
                         {
                             "tool_name": event.name,
+                            "tool_call_id": event.tool_call_id,
                             "args": dict(event.args or {}),
                         },
                     )
+                    delegated_target = self._delegate_target_for_tool_call(
+                        event.name,
+                        event.args,
+                    )
+                    if delegated_target == "delegate_task":
+                        await self._start_delegate_progress_stream(
+                            tool_call_id=event.tool_call_id,
+                            caller_tool_name=event.name,
+                            persist=True,
+                        )
                     status.state = f"Running {event.name}..."
                     events_panel.add_event(
                         _now_str(), "tool_start",
@@ -8422,6 +8923,7 @@ class LoomApp(App):
                     error = event.result.error or ""
                     chat.add_tool_call(
                         event.name, event.args,
+                        tool_call_id=event.tool_call_id,
                         success=event.result.success,
                         elapsed_ms=event.elapsed_ms,
                         output=output,
@@ -8431,6 +8933,7 @@ class LoomApp(App):
                         "tool_call_completed",
                         {
                             "tool_name": event.name,
+                            "tool_call_id": event.tool_call_id,
                             "args": dict(event.args or {}),
                             "success": bool(event.result.success),
                             "elapsed_ms": int(event.elapsed_ms or 0),
@@ -8438,6 +8941,17 @@ class LoomApp(App):
                             "error": error,
                         },
                     )
+                    delegated_target = self._delegate_target_for_tool_call(
+                        event.name,
+                        event.args,
+                    )
+                    if delegated_target == "delegate_task":
+                        await self._finalize_delegate_progress_stream(
+                            tool_call_id=event.tool_call_id,
+                            success=bool(event.result.success),
+                            elapsed_ms=int(event.elapsed_ms or 0),
+                            persist=True,
+                        )
 
                     # Show multimodal content indicators
                     if (
@@ -8468,12 +8982,13 @@ class LoomApp(App):
                         _now_str(), etype,
                         f"{event.name} {event.elapsed_ms}ms",
                     )
-                    if event.result.success and event.name in _WORKSPACE_REFRESH_TOOLS:
-                        self._refresh_workspace_tree()
+                    if event.result.success and self._is_mutating_tool(event.name):
+                        self._request_workspace_refresh(f"tool:{event.name}")
+                    self._ingest_files_panel_from_tool_call_event(event)
 
-                    if (
+                    if event.result.data and (
                         event.name in {"task_tracker", "delegate_task"}
-                        and event.result.data
+                        or delegated_target == "delegate_task"
                     ):
                         self._update_sidebar_tasks(event.result.data)
 
@@ -8572,15 +9087,19 @@ class LoomApp(App):
             event_type = str(data.get("event_type") or "")
             if event_type == "tool_call_completed":
                 tool_name = str(data.get("event_data", {}).get("tool", "")).strip()
-                if tool_name in _WORKSPACE_REFRESH_TOOLS:
-                    self._refresh_workspace_tree()
+                if self._is_mutating_tool(tool_name):
+                    self._request_workspace_refresh(f"process:{tool_name}")
+                self._ingest_files_panel_from_paths(
+                    data.get("event_data", {}).get("files_changed", []),
+                    operation_hint="modify",
+                )
             if event_type in {
                 "subtask_completed",
                 "subtask_failed",
                 "task_completed",
                 "task_failed",
             }:
-                self._refresh_workspace_tree()
+                self._request_workspace_refresh(f"process:{event_type}")
 
             self._update_process_run_visuals(run)
             self._refresh_sidebar_progress_summary()
@@ -8612,15 +9131,19 @@ class LoomApp(App):
         event_type = str(data.get("event_type") or "")
         if event_type == "tool_call_completed":
             tool_name = str(data.get("event_data", {}).get("tool", "")).strip()
-            if tool_name in _WORKSPACE_REFRESH_TOOLS:
-                self._refresh_workspace_tree()
+            if self._is_mutating_tool(tool_name):
+                self._request_workspace_refresh(f"process:{tool_name}")
+            self._ingest_files_panel_from_paths(
+                data.get("event_data", {}).get("files_changed", []),
+                operation_hint="modify",
+            )
         if event_type in {
             "subtask_completed",
             "subtask_failed",
             "task_completed",
             "task_failed",
         }:
-            self._refresh_workspace_tree()
+            self._request_workspace_refresh(f"process:{event_type}")
         message = self._format_process_progress_event(data)
         if not message:
             return
@@ -8881,6 +9404,7 @@ class LoomApp(App):
         data: dict,
         *,
         run: ProcessRunState | None = None,
+        context: str = "process_run",
     ) -> str | None:
         """Format orchestrator progress events into concise chat messages."""
         event_type = str(data.get("event_type") or "")
@@ -8889,6 +9413,7 @@ class LoomApp(App):
             return None
         if not isinstance(event_data, dict):
             event_data = {}
+        mode = str(context or "process_run").strip().lower()
 
         subtask_id = str(event_data.get("subtask_id", "")).strip()
         subtask_content = self._subtask_content(data, subtask_id, run)
@@ -8897,11 +9422,17 @@ class LoomApp(App):
             subtask_label = f"{subtask_label} - {self._one_line(subtask_content, 90)}"
 
         if event_type == "task_planning":
+            if mode == "cowork_delegate":
+                return "Planning delegated task..."
             return "Planning process run..."
         if event_type == "task_plan_ready":
             count = len(data.get("tasks", [])) if isinstance(data.get("tasks"), list) else 0
+            if mode == "cowork_delegate":
+                return f"Delegation plan ready: {count} subtasks."
             return f"Plan ready: {count} subtasks."
         if event_type == "task_executing":
+            if mode == "cowork_delegate":
+                return "Executing delegated subtasks..."
             return "Executing subtasks..."
         if event_type == "model_invocation":
             phase = str(event_data.get("phase", "")).strip()
@@ -9102,6 +9633,8 @@ class LoomApp(App):
                 )
             return f"Stall recovery via {mode_label} failed{attempt_suffix}."
         if event_type == "task_completed":
+            if mode == "cowork_delegate":
+                return "Delegated task completed."
             return "Process run completed."
         if event_type == "task_failed":
             reason = self._one_line(
@@ -9110,6 +9643,10 @@ class LoomApp(App):
                 or "",
                 140,
             )
+            if mode == "cowork_delegate":
+                if reason:
+                    return f"Delegated task failed: {reason}"
+                return "Delegated task failed."
             if reason:
                 return f"Process run failed: {reason}"
             return "Process run failed."
@@ -9258,6 +9795,190 @@ class LoomApp(App):
         sidebar.update_tasks(rows)
         self._sync_process_runs_into_session_state()
 
+    def _compute_workspace_signature(
+        self,
+    ) -> tuple[tuple[int, int, int] | None, bool]:
+        """Return a bounded filesystem signature for change detection."""
+        max_entries = self._tui_workspace_scan_max_entries()
+        try:
+            root = self._workspace.resolve()
+        except OSError:
+            return None, False
+
+        file_count = 0
+        newest_mtime_ns = 0
+        total_size = 0
+        overflow = False
+
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+            dirnames[:] = [
+                name
+                for name in sorted(dirnames)
+                if name not in _WORKSPACE_SCAN_EXCLUDE_DIRS
+                and not name.endswith(".egg-info")
+            ]
+            for filename in sorted(filenames):
+                if file_count >= max_entries:
+                    overflow = True
+                    break
+                path = Path(dirpath) / filename
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                file_count += 1
+                size = int(getattr(stat, "st_size", 0) or 0)
+                mtime_ns = int(
+                    getattr(
+                        stat,
+                        "st_mtime_ns",
+                        int(float(getattr(stat, "st_mtime", 0.0)) * 1_000_000_000),
+                    ),
+                )
+                total_size += size
+                if mtime_ns > newest_mtime_ns:
+                    newest_mtime_ns = mtime_ns
+            if overflow:
+                break
+
+        return (file_count, newest_mtime_ns, total_size), overflow
+
+    def _start_workspace_watch(self) -> None:
+        """Start realtime workspace polling when enabled."""
+        self._stop_workspace_watch()
+        if not self._tui_realtime_refresh_enabled():
+            return
+        if not self.is_running:
+            return
+
+        signature, overflow = self._compute_workspace_signature()
+        self._workspace_signature = signature
+        self._workspace_scan_overflow_notified = bool(overflow)
+
+        backend = self._tui_workspace_watch_backend()
+        if backend == "native":
+            logger.info(
+                "tui_workspace_watch: native backend requested; using poll fallback",
+            )
+        interval = self._tui_workspace_poll_interval_seconds()
+        self._workspace_poll_timer = self.set_interval(
+            interval,
+            self._on_workspace_poll_tick,
+        )
+
+    def _stop_workspace_watch(self) -> None:
+        """Stop realtime workspace polling and clear pending refresh timers."""
+        timer = self._workspace_poll_timer
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._workspace_poll_timer = None
+        self._workspace_poll_inflight = False
+        self._cancel_workspace_refresh_timer()
+
+    def _on_workspace_poll_tick(self) -> None:
+        """Poll workspace signature and schedule a debounced refresh on change."""
+        if not self._tui_realtime_refresh_enabled():
+            return
+        if self._workspace_poll_inflight:
+            return
+        self._workspace_poll_inflight = True
+
+        async def _scan() -> None:
+            try:
+                signature, overflow = await asyncio.to_thread(
+                    self._compute_workspace_signature,
+                )
+                if overflow and not self._workspace_scan_overflow_notified:
+                    self._workspace_scan_overflow_notified = True
+                    logger.info(
+                        "tui_workspace_watch: scan cap reached at %s entries",
+                        self._tui_workspace_scan_max_entries(),
+                    )
+                elif not overflow:
+                    self._workspace_scan_overflow_notified = False
+
+                if signature is None:
+                    return
+                if self._workspace_signature is None:
+                    self._workspace_signature = signature
+                    return
+                if signature != self._workspace_signature:
+                    self._workspace_signature = signature
+                    self._request_workspace_refresh("watch-poll")
+            finally:
+                self._workspace_poll_inflight = False
+
+        self.run_worker(
+            _scan(),
+            group="workspace-watch-scan",
+            exclusive=False,
+        )
+
+    def _cancel_workspace_refresh_timer(self) -> None:
+        timer = self._workspace_refresh_timer
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._workspace_refresh_timer = None
+        self._workspace_refresh_timer_pending = False
+
+    def _request_workspace_refresh(
+        self,
+        reason: str,
+        *,
+        immediate: bool = False,
+    ) -> None:
+        """Coalesce workspace refresh requests to avoid thrashing the UI."""
+        clean_reason = str(reason or "").strip() or "unspecified"
+        if not self.is_running:
+            self._workspace_refresh_pending_reasons.clear()
+            self._workspace_refresh_first_request_at = 0.0
+            self._refresh_workspace_tree()
+            return
+        now = time.monotonic()
+        if not self._workspace_refresh_pending_reasons:
+            self._workspace_refresh_first_request_at = now
+        self._workspace_refresh_pending_reasons.add(clean_reason)
+
+        if immediate:
+            self._flush_workspace_refresh_requests()
+            return
+
+        debounce = self._tui_workspace_refresh_debounce_seconds()
+        max_wait = self._tui_workspace_refresh_max_wait_seconds()
+        first = self._workspace_refresh_first_request_at or now
+        elapsed = max(0.0, now - first)
+        if elapsed >= max_wait:
+            self._flush_workspace_refresh_requests()
+            return
+
+        self._cancel_workspace_refresh_timer()
+        delay = min(debounce, max(0.01, max_wait - elapsed))
+        self._workspace_refresh_timer_pending = True
+
+        def _fire() -> None:
+            self._workspace_refresh_timer_pending = False
+            self._workspace_refresh_timer = None
+            self._flush_workspace_refresh_requests()
+
+        self._workspace_refresh_timer = self.set_timer(delay, _fire)
+
+    def _flush_workspace_refresh_requests(self) -> None:
+        if not self._workspace_refresh_pending_reasons:
+            return
+        self._cancel_workspace_refresh_timer()
+        reasons = sorted(self._workspace_refresh_pending_reasons)
+        self._workspace_refresh_pending_reasons.clear()
+        self._workspace_refresh_first_request_at = 0.0
+        self._refresh_workspace_tree()
+        self._refresh_process_command_index(background=True)
+        logger.debug("tui_workspace_refresh reasons=%s", ",".join(reasons))
+
     def _refresh_workspace_tree(self) -> None:
         """Reload sidebar workspace tree to pick up new files."""
         try:
@@ -9281,66 +10002,162 @@ class LoomApp(App):
             return None
         return resolved
 
+    def _normalize_files_changed_paths(self, raw_paths: object) -> list[str]:
+        """Normalize tool result file paths into display-safe relative paths."""
+        if not isinstance(raw_paths, (list, tuple, set)):
+            return []
+        normalized: list[str] = []
+        workspace_root: Path | None = None
+        try:
+            workspace_root = self._workspace.resolve()
+        except OSError:
+            workspace_root = None
+        for item in raw_paths:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if text.startswith("(") and text.endswith(")") and "files " in text:
+                # delegate_task summary markers are not concrete file paths.
+                continue
+            if " -> " in text:
+                if text not in normalized:
+                    normalized.append(text)
+                continue
+            candidate = Path(text).expanduser()
+            if candidate.is_absolute() and workspace_root is not None:
+                try:
+                    candidate = candidate.resolve().relative_to(workspace_root)
+                except Exception:
+                    candidate = Path(text)
+            rel = str(candidate).strip()
+            if rel and rel not in normalized:
+                normalized.append(rel)
+        return normalized
+
+    @staticmethod
+    def _operation_hint_for_tool(tool_name: str) -> str:
+        name = str(tool_name or "").strip()
+        if name == "write_file":
+            return "create"
+        if name == "edit_file":
+            return "modify"
+        if name == "delete_file":
+            return "delete"
+        if name == "move_file":
+            return "rename"
+        return "modify"
+
+    def _ingest_files_panel_from_paths(
+        self,
+        raw_paths: object,
+        *,
+        operation_hint: str = "modify",
+    ) -> int:
+        """Append file rows into the Files panel with dedupe + bounded history."""
+        paths = self._normalize_files_changed_paths(raw_paths)
+        if not paths:
+            return 0
+        try:
+            panel = self.query_one("#files-panel", FilesChangedPanel)
+        except Exception:
+            return 0
+
+        now = time.monotonic()
+        for key, seen_at in list(self._files_panel_recent_ops.items()):
+            if (now - seen_at) > self._files_panel_dedupe_window_seconds:
+                self._files_panel_recent_ops.pop(key, None)
+
+        accepted: list[dict] = []
+        for path in paths:
+            op = operation_hint
+            if " -> " in path:
+                op = "rename"
+            dedupe_key = f"{op}:{path}"
+            seen_at = self._files_panel_recent_ops.get(dedupe_key, 0.0)
+            if (now - seen_at) < self._files_panel_dedupe_window_seconds:
+                continue
+            self._files_panel_recent_ops[dedupe_key] = now
+            accepted.append({
+                "operation": op,
+                "path": path,
+                "timestamp": _now_str(),
+            })
+        if not accepted:
+            return 0
+
+        panel.update_files(accepted)
+        max_rows = self._tui_files_panel_max_rows()
+        all_entries = getattr(panel, "_all_entries", None)
+        if isinstance(all_entries, list) and len(all_entries) > max_rows:
+            overflow = len(all_entries) - max_rows
+            del all_entries[:overflow]
+            try:
+                panel._refresh_table()
+            except Exception:
+                pass
+        return len(accepted)
+
+    def _ingest_files_panel_from_tool_call_event(self, event: ToolCallEvent) -> int:
+        """Consume one completed tool call into the Files panel, if relevant."""
+        result = getattr(event, "result", None)
+        if result is None or not bool(getattr(result, "success", False)):
+            return 0
+
+        count = self._ingest_files_panel_from_paths(
+            getattr(result, "files_changed", []),
+            operation_hint=self._operation_hint_for_tool(event.name),
+        )
+
+        fallback_entries: list[str] = []
+        if count <= 0:
+            if event.name in {"write_file", "edit_file", "delete_file"}:
+                path = str(
+                    event.args.get("path", event.args.get("file_path", "")) or "",
+                ).strip()
+                if path:
+                    fallback_entries.append(path)
+            elif event.name == "move_file":
+                src = str(event.args.get("source", "") or "").strip()
+                dst = str(event.args.get("destination", "") or "").strip()
+                if src and dst:
+                    fallback_entries.append(f"{src} -> {dst}")
+            if fallback_entries:
+                count += self._ingest_files_panel_from_paths(
+                    fallback_entries,
+                    operation_hint=self._operation_hint_for_tool(event.name),
+                )
+
+        if event.name == "edit_file":
+            output = str(getattr(result, "output", "") or "")
+            marker = "--- a/"
+            idx = output.find(marker)
+            if idx != -1:
+                try:
+                    panel = self.query_one("#files-panel", FilesChangedPanel)
+                    panel.show_diff(output[idx:])
+                except Exception:
+                    pass
+
+        return count
+
     def _update_files_panel(self, turn: CoworkTurn) -> None:
         """Update the Files Changed panel from tool call events."""
-        file_entries: list[dict] = []
-        last_diff = ""
+        changed_count = 0
         refresh_workspace = False
         for tc in turn.tool_calls:
             if not tc.result or not tc.result.success:
                 continue
-            if tc.name in _WORKSPACE_REFRESH_TOOLS:
+            if self._is_mutating_tool(tc.name):
                 refresh_workspace = True
-            path = tc.args.get(
-                "path", tc.args.get("file_path", "?"),
-            )
-            now = _now_str()
-            if tc.name == "write_file":
-                file_entries.append({
-                    "operation": "create",
-                    "path": path,
-                    "timestamp": now,
-                })
-            elif tc.name == "edit_file":
-                file_entries.append({
-                    "operation": "modify",
-                    "path": path,
-                    "timestamp": now,
-                })
-                # Extract diff from edit output for the diff viewer
-                output = tc.result.output or ""
-                marker = "--- a/"
-                idx = output.find(marker)
-                if idx != -1:
-                    last_diff = output[idx:]
-            elif tc.name == "delete_file":
-                file_entries.append({
-                    "operation": "delete",
-                    "path": path,
-                    "timestamp": now,
-                })
-            elif tc.name == "move_file":
-                src = tc.args.get("source", "?")
-                dst = tc.args.get("destination", "?")
-                file_entries.append({
-                    "operation": "rename",
-                    "path": f"{src} -> {dst}",
-                    "timestamp": now,
-                })
-        if file_entries:
-            panel = self.query_one("#files-panel", FilesChangedPanel)
-            panel.update_files(file_entries)
-            if last_diff:
-                panel.show_diff(last_diff)
-            self._refresh_workspace_tree()
-            count = len(file_entries)
+            changed_count += self._ingest_files_panel_from_tool_call_event(tc)
+        if changed_count > 0:
+            count = int(changed_count)
             s = "s" if count != 1 else ""
             self.notify(
                 f"{count} file{s} changed", timeout=3,
             )
-            return
         if refresh_workspace:
-            self._refresh_workspace_tree()
+            self._request_workspace_refresh("turn-summary")
 
     # ------------------------------------------------------------------
     # Actions
@@ -9354,8 +10171,7 @@ class LoomApp(App):
 
     def action_reload_workspace(self) -> None:
         """Reload sidebar workspace tree to show external file changes."""
-        self._refresh_workspace_tree()
-        self._refresh_process_command_index()
+        self._request_workspace_refresh("manual", immediate=True)
         self.notify("Workspace reloaded", timeout=2)
 
     def action_close_process_tab(self) -> None:

@@ -58,6 +58,15 @@ chat_resume_page_size = 250
 chat_resume_max_rendered_rows = 1200
 chat_resume_use_event_journal = true
 chat_resume_enable_legacy_fallback = true
+realtime_refresh_enabled = true
+workspace_watch_backend = "poll" # poll | native
+workspace_poll_interval_ms = 1000
+workspace_refresh_debounce_ms = 250
+workspace_refresh_max_wait_ms = 1500
+workspace_scan_max_entries = 20000
+chat_stream_flush_interval_ms = 120
+files_panel_max_rows = 2000
+delegate_progress_max_lines = 150
 
 [verification]
 tier1_enabled = true

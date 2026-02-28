@@ -16,11 +16,12 @@ Complex work can be delegated to the task orchestrator via delegate_task.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -53,6 +54,7 @@ class ToolCallEvent:
 
     name: str
     args: dict
+    tool_call_id: str = ""
     result: ToolResult | None = None
     elapsed_ms: int = 0
 
@@ -470,6 +472,9 @@ class CoworkSession:
         ingest_artifact_retention_max_age_days: int = 14,
         ingest_artifact_retention_max_files_per_scope: int = 96,
         ingest_artifact_retention_max_bytes_per_scope: int = 268_435_456,
+        delegate_progress_callback: (
+            Callable[[dict[str, Any]], Awaitable[None] | None] | None
+        ) = None,
     ):
         self._model = model
         self._tools = tools
@@ -516,6 +521,7 @@ class CoworkSession:
             1024,
             int(ingest_artifact_retention_max_bytes_per_scope),
         )
+        self._delegate_progress_callback = delegate_progress_callback
 
         # Learned behaviors section (injected into system prompt)
         self._behaviors_section = ""
@@ -687,10 +693,19 @@ class CoworkSession:
 
                 ask_user_pending = False
                 for tc in response.tool_calls:
-                    event = ToolCallEvent(name=tc.name, args=tc.arguments)
+                    event = ToolCallEvent(
+                        name=tc.name,
+                        args=tc.arguments,
+                        tool_call_id=str(getattr(tc, "id", "") or ""),
+                    )
                     yield event  # signal: tool call starting
 
-                    result, elapsed_ms = await self._execute_tool_call(tc.name, tc.arguments)
+                    result, elapsed_ms = await self._execute_tool_call(
+                        tc.name,
+                        tc.arguments,
+                        tool_call_id=event.tool_call_id,
+                        caller_tool_name=tc.name,
+                    )
                     event.result = result
                     event.elapsed_ms = elapsed_ms
                     all_tool_events.append(event)
@@ -912,10 +927,19 @@ class CoworkSession:
 
                 ask_user_pending = False
                 for tc in final_tool_calls:
-                    event = ToolCallEvent(name=tc.name, args=tc.arguments)
+                    event = ToolCallEvent(
+                        name=tc.name,
+                        args=tc.arguments,
+                        tool_call_id=str(getattr(tc, "id", "") or ""),
+                    )
                     yield event
 
-                    result, elapsed_ms = await self._execute_tool_call(tc.name, tc.arguments)
+                    result, elapsed_ms = await self._execute_tool_call(
+                        tc.name,
+                        tc.arguments,
+                        tool_call_id=event.tool_call_id,
+                        caller_tool_name=tc.name,
+                    )
                     event.result = result
                     event.elapsed_ms = elapsed_ms
                     all_tool_events.append(event)
@@ -1375,14 +1399,30 @@ class CoworkSession:
         self,
         tool_name: str,
         arguments: dict,
+        *,
+        tool_call_id: str = "",
+        caller_tool_name: str = "",
     ) -> tuple[ToolResult, int]:
         """Execute one tool call with approval + context handling."""
-        execute_args = self._prepare_tool_execute_arguments(tool_name, arguments)
+        approval_args = self._prepare_tool_execute_arguments(
+            tool_name,
+            arguments,
+            tool_call_id=tool_call_id,
+            caller_tool_name=caller_tool_name or tool_name,
+            include_delegate_callback=False,
+        )
         if self._approver is not None:
-            decision = await self._approver.check(tool_name, execute_args)
+            decision = await self._approver.check(tool_name, approval_args)
             if decision == ApprovalDecision.DENY:
                 return ToolResult.fail(f"Tool call '{tool_name}' denied by user."), 0
 
+        execute_args = self._prepare_tool_execute_arguments(
+            tool_name,
+            arguments,
+            tool_call_id=tool_call_id,
+            caller_tool_name=caller_tool_name or tool_name,
+            include_delegate_callback=True,
+        )
         start = time.monotonic()
         result = await self._tools.execute(
             tool_name,
@@ -1412,9 +1452,63 @@ class CoworkSession:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         return result, elapsed_ms
 
-    def _prepare_tool_execute_arguments(self, tool_name: str, arguments: dict) -> dict:
+    def _prepare_tool_execute_arguments(
+        self,
+        tool_name: str,
+        arguments: dict,
+        *,
+        tool_call_id: str = "",
+        caller_tool_name: str = "",
+        include_delegate_callback: bool = True,
+    ) -> dict:
         """Inject runtime-only knobs used by selected tools."""
         execute_args = dict(arguments or {})
+        normalized_call_id = str(tool_call_id or "").strip()
+        caller_name = str(caller_tool_name or tool_name or "").strip()
+
+        if tool_name == "run_tool" and normalized_call_id:
+            delegated_args = execute_args.get("arguments")
+            if isinstance(delegated_args, dict):
+                delegated_copy = dict(delegated_args)
+                delegated_copy.setdefault("_loom_parent_tool_call_id", normalized_call_id)
+                delegated_copy.setdefault("_loom_parent_tool_name", caller_name or "run_tool")
+                execute_args["arguments"] = delegated_copy
+
+        if (
+            tool_name == "delegate_task"
+            and include_delegate_callback
+            and callable(self._delegate_progress_callback)
+        ):
+            existing_callback = execute_args.get("_progress_callback")
+            delegate_callback = self._delegate_progress_callback
+
+            def _wrapped_progress_callback(raw_payload: dict | None) -> None:
+                payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+                if normalized_call_id:
+                    payload.setdefault("tool_call_id", normalized_call_id)
+                payload.setdefault("tool_name", "delegate_task")
+                if caller_name:
+                    payload.setdefault("caller_tool_name", caller_name)
+                try:
+                    maybe = delegate_callback(payload)
+                    if inspect.isawaitable(maybe):
+                        asyncio.create_task(maybe)
+                except Exception:
+                    logger.debug("Delegate progress callback failed", exc_info=True)
+
+                if callable(existing_callback):
+                    try:
+                        maybe_existing = existing_callback(payload)
+                        if inspect.isawaitable(maybe_existing):
+                            asyncio.create_task(maybe_existing)
+                    except Exception:
+                        logger.debug(
+                            "Existing delegate progress callback failed",
+                            exc_info=True,
+                        )
+
+            execute_args["_progress_callback"] = _wrapped_progress_callback
+
         if tool_name in {"web_fetch", "web_fetch_html"}:
             execute_args["_enable_filetype_ingest_router"] = bool(
                 self._enable_filetype_ingest_router,
@@ -1792,17 +1886,37 @@ class CoworkSession:
             )
         if not isinstance(arguments, dict):
             return ToolResult.fail("run_tool 'arguments' must be an object.")
+        execute_input = dict(arguments)
+        parent_tool_call_id = str(
+            execute_input.pop("_loom_parent_tool_call_id", "") or "",
+        ).strip()
+        parent_tool_name = str(
+            execute_input.pop("_loom_parent_tool_name", "") or "",
+        ).strip()
 
         auth_context = getattr(ctx, "auth_context", self._auth_context)
         if not self._tools.has(target, auth_context=auth_context):
             return ToolResult.fail(f"Unknown tool: {target}")
 
-        execute_args = self._prepare_tool_execute_arguments(target, arguments)
+        approval_args = self._prepare_tool_execute_arguments(
+            target,
+            execute_input,
+            tool_call_id=parent_tool_call_id,
+            caller_tool_name=parent_tool_name or "run_tool",
+            include_delegate_callback=False,
+        )
         if self._approver is not None:
-            decision = await self._approver.check(target, execute_args)
+            decision = await self._approver.check(target, approval_args)
             if decision == ApprovalDecision.DENY:
                 return ToolResult.fail(f"Tool call '{target}' denied by user.")
 
+        execute_args = self._prepare_tool_execute_arguments(
+            target,
+            execute_input,
+            tool_call_id=parent_tool_call_id,
+            caller_tool_name=parent_tool_name or "run_tool",
+            include_delegate_callback=True,
+        )
         return await self._tools.execute(
             target,
             execute_args,

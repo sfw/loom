@@ -217,6 +217,15 @@ class TUIConfig:
     chat_resume_max_rendered_rows: int = 1200
     chat_resume_use_event_journal: bool = True
     chat_resume_enable_legacy_fallback: bool = True
+    realtime_refresh_enabled: bool = True
+    workspace_watch_backend: str = "poll"  # poll | native
+    workspace_poll_interval_ms: int = 1000
+    workspace_refresh_debounce_ms: int = 250
+    workspace_refresh_max_wait_ms: int = 1500
+    workspace_scan_max_entries: int = 20_000
+    chat_stream_flush_interval_ms: int = 120
+    files_panel_max_rows: int = 2000
+    delegate_progress_max_lines: int = 150
 
 
 @dataclass(frozen=True)
@@ -861,6 +870,11 @@ def load_config(path: Path | None = None) -> Config:
     tui_data = raw.get("tui", {})
     if not isinstance(tui_data, dict):
         tui_data = {}
+    workspace_watch_backend = str(
+        tui_data.get("workspace_watch_backend", TUIConfig.workspace_watch_backend),
+    ).strip().lower()
+    if workspace_watch_backend not in {"poll", "native"}:
+        workspace_watch_backend = TUIConfig.workspace_watch_backend
     tui = TUIConfig(
         chat_resume_page_size=_int_from(
             tui_data,
@@ -885,6 +899,61 @@ def load_config(path: Path | None = None) -> Config:
             tui_data,
             "chat_resume_enable_legacy_fallback",
             TUIConfig.chat_resume_enable_legacy_fallback,
+        ),
+        realtime_refresh_enabled=_bool_from(
+            tui_data,
+            "realtime_refresh_enabled",
+            TUIConfig.realtime_refresh_enabled,
+        ),
+        workspace_watch_backend=workspace_watch_backend,
+        workspace_poll_interval_ms=_int_from(
+            tui_data,
+            "workspace_poll_interval_ms",
+            TUIConfig.workspace_poll_interval_ms,
+            minimum=200,
+            maximum=10_000,
+        ),
+        workspace_refresh_debounce_ms=_int_from(
+            tui_data,
+            "workspace_refresh_debounce_ms",
+            TUIConfig.workspace_refresh_debounce_ms,
+            minimum=50,
+            maximum=5000,
+        ),
+        workspace_refresh_max_wait_ms=_int_from(
+            tui_data,
+            "workspace_refresh_max_wait_ms",
+            TUIConfig.workspace_refresh_max_wait_ms,
+            minimum=200,
+            maximum=30_000,
+        ),
+        workspace_scan_max_entries=_int_from(
+            tui_data,
+            "workspace_scan_max_entries",
+            TUIConfig.workspace_scan_max_entries,
+            minimum=500,
+            maximum=200_000,
+        ),
+        chat_stream_flush_interval_ms=_int_from(
+            tui_data,
+            "chat_stream_flush_interval_ms",
+            TUIConfig.chat_stream_flush_interval_ms,
+            minimum=40,
+            maximum=2000,
+        ),
+        files_panel_max_rows=_int_from(
+            tui_data,
+            "files_panel_max_rows",
+            TUIConfig.files_panel_max_rows,
+            minimum=100,
+            maximum=20_000,
+        ),
+        delegate_progress_max_lines=_int_from(
+            tui_data,
+            "delegate_progress_max_lines",
+            TUIConfig.delegate_progress_max_lines,
+            minimum=20,
+            maximum=5000,
         ),
     )
 
