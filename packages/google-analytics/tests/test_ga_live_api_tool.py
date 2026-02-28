@@ -20,8 +20,8 @@ def _load_ga_live_module():
     if existing is not None:
         return existing
 
-    root = Path(__file__).resolve().parents[1]
-    module_path = root / "packages" / "google-analytics" / "tools" / "ga_live_api.py"
+    package_root = Path(__file__).resolve().parents[1]
+    module_path = package_root / "tools" / "ga_live_api.py"
     spec = importlib.util.spec_from_file_location(_TEST_MODULE_NAME, module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
