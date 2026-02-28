@@ -676,6 +676,12 @@ def build_run_auth_context(
     def _is_profile_archived(profile: AuthProfile) -> bool:
         return _profile_status(profile) == "archived"
 
+    def _is_profile_draft(profile: AuthProfile) -> bool:
+        return _profile_status(profile) == "draft"
+
+    def _is_profile_candidate(profile: AuthProfile) -> bool:
+        return not _is_profile_archived(profile) and not _is_profile_draft(profile)
+
     def _is_resource_selector(selector: str) -> bool:
         clean = str(selector or "").strip()
         if not clean:
@@ -724,7 +730,7 @@ def build_run_auth_context(
     # Auto-select single unambiguous provider profiles.
     profiles_by_provider: dict[str, list[AuthProfile]] = {}
     for profile in merged.config.profiles.values():
-        if _is_profile_archived(profile):
+        if not _is_profile_candidate(profile):
             continue
         profiles_by_provider.setdefault(profile.provider, []).append(profile)
     for provider, provider_profiles in profiles_by_provider.items():
@@ -881,7 +887,7 @@ def build_run_auth_context(
                 profile
                 for profile in candidates
                 if profile is not None
-                and not _is_profile_archived(profile)
+                and _is_profile_candidate(profile)
                 and _profile_matches_requirement(profile, effective_requirement)
             ]
         else:
@@ -889,7 +895,7 @@ def build_run_auth_context(
                 (
                     profile
                     for profile in merged.config.profiles.values()
-                    if not _is_profile_archived(profile)
+                    if _is_profile_candidate(profile)
                     and _profile_matches_requirement(profile, effective_requirement)
                 ),
                 key=lambda item: item.profile_id,
@@ -943,7 +949,7 @@ def build_run_auth_context(
                     (
                         profile
                         for profile in merged.config.profiles.values()
-                        if not _is_profile_archived(profile)
+                        if _is_profile_candidate(profile)
                         and _profile_matches_requirement(profile, effective_requirement)
                     ),
                     key=lambda item: item.profile_id,
