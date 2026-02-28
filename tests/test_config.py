@@ -84,6 +84,15 @@ class TestDefaultConfig:
         assert config.tui.chat_resume_max_rendered_rows == 1200
         assert config.tui.chat_resume_use_event_journal is True
         assert config.tui.chat_resume_enable_legacy_fallback is True
+        assert config.tui.realtime_refresh_enabled is True
+        assert config.tui.workspace_watch_backend == "poll"
+        assert config.tui.workspace_poll_interval_ms == 1000
+        assert config.tui.workspace_refresh_debounce_ms == 250
+        assert config.tui.workspace_refresh_max_wait_ms == 1500
+        assert config.tui.workspace_scan_max_entries == 20_000
+        assert config.tui.chat_stream_flush_interval_ms == 120
+        assert config.tui.files_panel_max_rows == 2000
+        assert config.tui.delegate_progress_max_lines == 150
 
     def test_default_limits(self):
         config = Config()
@@ -380,12 +389,53 @@ chat_resume_page_size = 180
 chat_resume_max_rendered_rows = 2500
 chat_resume_use_event_journal = false
 chat_resume_enable_legacy_fallback = false
+realtime_refresh_enabled = false
+workspace_watch_backend = "native"
+workspace_poll_interval_ms = 900
+workspace_refresh_debounce_ms = 300
+workspace_refresh_max_wait_ms = 2400
+workspace_scan_max_entries = 30000
+chat_stream_flush_interval_ms = 180
+files_panel_max_rows = 1600
+delegate_progress_max_lines = 360
 """)
         config = load_config(toml_file)
         assert config.tui.chat_resume_page_size == 180
         assert config.tui.chat_resume_max_rendered_rows == 2500
         assert config.tui.chat_resume_use_event_journal is False
         assert config.tui.chat_resume_enable_legacy_fallback is False
+        assert config.tui.realtime_refresh_enabled is False
+        assert config.tui.workspace_watch_backend == "native"
+        assert config.tui.workspace_poll_interval_ms == 900
+        assert config.tui.workspace_refresh_debounce_ms == 300
+        assert config.tui.workspace_refresh_max_wait_ms == 2400
+        assert config.tui.workspace_scan_max_entries == 30000
+        assert config.tui.chat_stream_flush_interval_ms == 180
+        assert config.tui.files_panel_max_rows == 1600
+        assert config.tui.delegate_progress_max_lines == 360
+
+    def test_tui_realtime_bounds_and_backend_fallback(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[tui]
+workspace_watch_backend = "mystery"
+workspace_poll_interval_ms = 1
+workspace_refresh_debounce_ms = 0
+workspace_refresh_max_wait_ms = -5
+workspace_scan_max_entries = 1
+chat_stream_flush_interval_ms = 1
+files_panel_max_rows = 1
+delegate_progress_max_lines = 1
+""")
+        config = load_config(toml_file)
+        assert config.tui.workspace_watch_backend == "poll"
+        assert config.tui.workspace_poll_interval_ms == 200
+        assert config.tui.workspace_refresh_debounce_ms == 50
+        assert config.tui.workspace_refresh_max_wait_ms == 200
+        assert config.tui.workspace_scan_max_entries == 500
+        assert config.tui.chat_stream_flush_interval_ms == 40
+        assert config.tui.files_panel_max_rows == 100
+        assert config.tui.delegate_progress_max_lines == 20
 
     def test_load_mcp_servers(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

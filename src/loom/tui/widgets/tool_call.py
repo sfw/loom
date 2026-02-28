@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from textual.app import ComposeResult
 from textual.widgets import Collapsible, Static
 
@@ -210,3 +212,131 @@ class ToolCallWidget(Static):
                 )
             else:
                 yield Static(title)
+
+
+class DelegateProgressWidget(Static):
+    """Collapsed live stream of delegated subagent progress."""
+
+    DEFAULT_CSS = """
+    DelegateProgressWidget {
+        height: auto;
+        margin: 0 0;
+        padding: 0 1;
+    }
+    DelegateProgressWidget Collapsible {
+        padding: 0;
+        margin: 0;
+        border: none;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        tool_call_id: str,
+        title: str = "Delegated progress",
+        max_lines: int = 150,
+    ) -> None:
+        super().__init__()
+        self._tool_call_id = str(tool_call_id or "").strip()
+        self._base_title = str(title or "Delegated progress").strip()
+        self._max_lines = max(20, int(max_lines))
+        self._lines: list[str] = []
+        self._trimmed_count = 0
+        self._status: str = "running"  # running | completed | failed
+        self._elapsed_ms = 0
+        self._last_line = ""
+        self._last_line_at = 0.0
+        self._line_dedupe_window_seconds = 1.5
+
+    def compose(self) -> ComposeResult:
+        yield Collapsible(
+            Static("", id="delegate-progress-body"),
+            title=self._render_title(),
+            collapsed=True,
+            id="delegate-progress-collapsible",
+        )
+
+    def append_line(self, line: str) -> bool:
+        """Append one line; returns True when it was accepted."""
+        text = " ".join(str(line or "").split())
+        if not text:
+            return False
+        now = time.monotonic()
+        if (
+            text == self._last_line
+            and (now - self._last_line_at) < self._line_dedupe_window_seconds
+        ):
+            return False
+        self._last_line = text
+        self._last_line_at = now
+        self._lines.append(text)
+        if len(self._lines) > self._max_lines:
+            overflow = len(self._lines) - self._max_lines
+            if overflow > 0:
+                self._lines = self._lines[overflow:]
+                self._trimmed_count += overflow
+        self._render_body()
+        return True
+
+    def finalize(self, *, success: bool, elapsed_ms: int = 0) -> None:
+        self._status = "completed" if success else "failed"
+        self._elapsed_ms = max(0, int(elapsed_ms))
+        self._render_title_only()
+
+    def restore_state(
+        self,
+        *,
+        status: str = "running",
+        elapsed_ms: int = 0,
+        lines: list[str] | None = None,
+    ) -> None:
+        """Restore widget state from replay hydration."""
+        normalized = str(status or "running").strip().lower()
+        if normalized not in {"running", "completed", "failed"}:
+            normalized = "running"
+        self._status = normalized
+        self._elapsed_ms = max(0, int(elapsed_ms))
+        restored = [str(item or "").strip() for item in (lines or [])]
+        self._lines = [item for item in restored if item]
+        if len(self._lines) > self._max_lines:
+            overflow = len(self._lines) - self._max_lines
+            self._lines = self._lines[overflow:]
+            self._trimmed_count += overflow
+        self._render_body()
+        self._render_title_only()
+
+    def _render_title(self) -> str:
+        elapsed = ""
+        if self._elapsed_ms > 0:
+            elapsed = (
+                f"{self._elapsed_ms}ms"
+                if self._elapsed_ms < 1000
+                else f"{self._elapsed_ms / 1000.0:.1f}s"
+            )
+        if self._status == "running":
+            return f"  [dim]{_escape(self._base_title)}[/dim] [dim]running[/dim]"
+        if self._status == "completed":
+            suffix = f" [dim]{elapsed}[/dim]" if elapsed else ""
+            return f"  [#9ece6a]ok[/] [dim]{_escape(self._base_title)}[/dim]{suffix}"
+        suffix = f" [dim]{elapsed}[/dim]" if elapsed else ""
+        return f"  [#f7768e]err[/] [dim]{_escape(self._base_title)}[/dim]{suffix}"
+
+    def _render_title_only(self) -> None:
+        try:
+            collapsible = self.query_one("#delegate-progress-collapsible", Collapsible)
+            collapsible.title = self._render_title()
+        except Exception:
+            pass
+
+    def _render_body(self) -> None:
+        try:
+            body = self.query_one("#delegate-progress-body", Static)
+        except Exception:
+            return
+        rendered = [f"[dim]{_escape(line)}[/dim]" for line in self._lines]
+        if self._trimmed_count > 0:
+            rendered.append(
+                f"[dim]... {self._trimmed_count} older line(s) omitted ...[/dim]"
+            )
+        body.update("\n".join(rendered))

@@ -881,6 +881,26 @@ class TestChatLogStreaming:
         assert log._stream_widget.expand is True
         assert mounted == [log._stream_widget]
 
+    def test_delegate_progress_section_lifecycle(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_delegate_progress_section("call_1", title="Delegated progress")
+        assert log.has_delegate_progress_section("call_1") is True
+        assert log.append_delegate_progress_line("call_1", "Started subtask.") is True
+        assert log.finalize_delegate_progress_section(
+            "call_1",
+            success=True,
+            elapsed_ms=1250,
+        ) is True
+
+        log.reset_runtime_state()
+        assert log.has_delegate_progress_section("call_1") is False
+
 
 # --- CoworkSession total_tokens tests ---
 
@@ -1634,6 +1654,200 @@ class TestWorkspaceRefresh:
 
         files_panel.update_files.assert_not_called()
         sidebar.refresh_workspace_tree.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cowork_delegate_progress_updates_chat_section(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        chat.append_delegate_progress_line.return_value = True
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        app.query_one = MagicMock(side_effect=lambda selector, *_args, **_kwargs: {
+            "#chat-log": chat,
+            "#sidebar": sidebar,
+            "#events-panel": events_panel,
+        }[selector])
+        app._append_chat_replay_event = AsyncMock()
+        app._request_workspace_refresh = MagicMock()
+        app._ingest_files_panel_from_paths = MagicMock(return_value=1)
+
+        await app._on_cowork_delegate_progress_event({
+            "tool_call_id": "call_1",
+            "caller_tool_name": "delegate_task",
+            "event_type": "tool_call_completed",
+            "event_data": {
+                "tool": "write_file",
+                "subtask_id": "scope",
+                "files_changed": ["notes.md"],
+            },
+            "tasks": [
+                {"id": "scope", "status": "completed", "content": "Scope work"},
+            ],
+        })
+
+        chat.add_delegate_progress_section.assert_called()
+        chat.append_delegate_progress_line.assert_called_once()
+        replay_events = [call.args[0] for call in app._append_chat_replay_event.await_args_list]
+        assert replay_events == ["delegate_progress_started"]
+        app._request_workspace_refresh.assert_called_once()
+        app._ingest_files_panel_from_paths.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cowork_delegate_progress_ignores_late_events_after_finalize(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        app.query_one = MagicMock(side_effect=lambda selector, *_args, **_kwargs: {
+            "#chat-log": chat,
+            "#sidebar": sidebar,
+            "#events-panel": events_panel,
+        }[selector])
+        app._append_chat_replay_event = AsyncMock()
+        app._request_workspace_refresh = MagicMock()
+        app._ingest_files_panel_from_paths = MagicMock(return_value=0)
+        app._active_delegate_streams["call_done"] = {
+            "tool_call_id": "call_done",
+            "title": "Delegated progress",
+            "status": "completed",
+            "elapsed_ms": 1200,
+            "lines": ["Delegated task completed."],
+            "started_at": 1.0,
+            "finalized": True,
+        }
+
+        await app._on_cowork_delegate_progress_event({
+            "tool_call_id": "call_done",
+            "caller_tool_name": "delegate_task",
+            "event_type": "subtask_started",
+            "event_data": {
+                "subtask_id": "late",
+            },
+        })
+
+        chat.add_delegate_progress_section.assert_not_called()
+        chat.append_delegate_progress_line.assert_not_called()
+        app._append_chat_replay_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cowork_delegate_progress_skips_token_streamed_lines(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        chat.append_delegate_progress_line.return_value = True
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        app.query_one = MagicMock(side_effect=lambda selector, *_args, **_kwargs: {
+            "#chat-log": chat,
+            "#sidebar": sidebar,
+            "#events-panel": events_panel,
+        }[selector])
+        app._append_chat_replay_event = AsyncMock()
+        app._request_workspace_refresh = MagicMock()
+        app._ingest_files_panel_from_paths = MagicMock(return_value=0)
+
+        await app._on_cowork_delegate_progress_event({
+            "tool_call_id": "call_tokens",
+            "caller_tool_name": "delegate_task",
+            "event_type": "token_streamed",
+            "event_data": {
+                "subtask_id": "scope",
+                "token_count": 12,
+            },
+        })
+
+        chat.add_delegate_progress_section.assert_called_once()
+        chat.append_delegate_progress_line.assert_not_called()
+        replay_events = [call.args[0] for call in app._append_chat_replay_event.await_args_list]
+        assert replay_events == ["delegate_progress_started"]
+
+    def test_format_process_progress_event_uses_cowork_delegate_terminal_phrasing(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        assert (
+            app._format_process_progress_event(
+                {"event_type": "task_completed", "event_data": {}},
+                context="cowork_delegate",
+            )
+            == "Delegated task completed."
+        )
+        assert (
+            app._format_process_progress_event(
+                {
+                    "event_type": "task_failed",
+                    "event_data": {"reason": "rate limited"},
+                },
+                context="cowork_delegate",
+            )
+            == "Delegated task failed: rate limited"
+        )
+
+    def test_render_chat_event_delegate_progress_rehydrates(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        chat.append_delegate_progress_line.return_value = True
+        app.query_one = MagicMock(return_value=chat)
+
+        assert app._render_chat_event({
+            "event_type": "delegate_progress_started",
+            "payload": {
+                "tool_call_id": "call_2",
+                "title": "Delegated progress",
+            },
+        })
+        assert app._render_chat_event({
+            "event_type": "delegate_progress_line",
+            "payload": {
+                "tool_call_id": "call_2",
+                "line": "Started scope.",
+            },
+        })
+        assert app._render_chat_event({
+            "event_type": "delegate_progress_finalized",
+            "payload": {
+                "tool_call_id": "call_2",
+                "title": "Delegated progress",
+                "status": "completed",
+                "elapsed_ms": 320,
+                "lines": ["Started scope.", "Completed scope."],
+            },
+        })
+
+        assert chat.add_delegate_progress_section.call_count >= 2
+        chat.append_delegate_progress_line.assert_called_once()
+        chat.finalize_delegate_progress_section.assert_called_once()
+        stream = app._active_delegate_streams.get("call_2")
+        assert isinstance(stream, dict)
+        assert stream.get("status") == "completed"
 
     @pytest.mark.asyncio
     async def test_switch_session_clears_files_panel(self, monkeypatch):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -189,6 +190,65 @@ class TestCoworkSession:
         assert completed[0].result is not None
         assert completed[0].result.success is False
         assert "list_tools" in (completed[0].result.error or "")
+
+    async def test_delegate_progress_callback_adds_tool_call_metadata(self, workspace, tools):
+        progress: list[dict] = []
+
+        def _capture(payload: dict) -> None:
+            progress.append(dict(payload))
+
+        session = CoworkSession(
+            model=MockProvider([ModelResponse(text="ok", usage=TokenUsage(total_tokens=1))]),
+            tools=tools,
+            workspace=workspace,
+            delegate_progress_callback=_capture,
+        )
+        existing_progress: list[dict] = []
+        execute_args = session._prepare_tool_execute_arguments(
+            "delegate_task",
+            {"goal": "Analyze", "_progress_callback": existing_progress.append},
+            tool_call_id="call_123",
+            caller_tool_name="run_tool",
+            include_delegate_callback=True,
+        )
+        wrapped = execute_args.get("_progress_callback")
+        assert callable(wrapped)
+        wrapped({"event_type": "subtask_started", "event_data": {"subtask_id": "scope"}})
+
+        assert progress
+        assert progress[0]["tool_call_id"] == "call_123"
+        assert progress[0]["caller_tool_name"] == "run_tool"
+        assert progress[0]["tool_name"] == "delegate_task"
+        assert existing_progress
+        assert existing_progress[0]["tool_call_id"] == "call_123"
+
+    async def test_run_tool_dispatch_strips_internal_parent_metadata(self, workspace, tools):
+        session = CoworkSession(
+            model=MockProvider([ModelResponse(text="ok", usage=TokenUsage(total_tokens=1))]),
+            tools=tools,
+            workspace=workspace,
+            delegate_progress_callback=lambda _payload: None,
+        )
+        session._tools.has = lambda *_args, **_kwargs: True
+        execute_mock = AsyncMock(return_value=ToolResult.ok("ok"))
+        session._tools.execute = execute_mock
+
+        result = await session._dispatch_run_tool(
+            "delegate_task",
+            {
+                "goal": "Analyze",
+                "_loom_parent_tool_call_id": "call_parent",
+                "_loom_parent_tool_name": "run_tool",
+            },
+            ctx=SimpleNamespace(auth_context=None),
+        )
+
+        assert result.success is True
+        assert execute_mock.await_count == 1
+        executed_args = execute_mock.await_args.args[1]
+        assert "_loom_parent_tool_call_id" not in executed_args
+        assert "_loom_parent_tool_name" not in executed_args
+        assert callable(executed_args.get("_progress_callback"))
 
     async def test_hybrid_mode_retries_with_fallback_hint_on_tool_stall(
         self,

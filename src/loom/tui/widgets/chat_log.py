@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from rich.markdown import Markdown as RichMarkdown
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
-from loom.tui.widgets.tool_call import ToolCallWidget
+from loom.tui.widgets.tool_call import DelegateProgressWidget, ToolCallWidget
 
 
 class ChatLog(VerticalScroll):
@@ -51,6 +53,9 @@ class ChatLog(VerticalScroll):
         self._stream_buffer: list[str] = []
         self._stream_widget: Static | None = None
         self._stream_text: str = ""
+        self._stream_flush_interval_s = 0.12
+        self._stream_flush_timer_pending = False
+        self._delegate_widgets: dict[str, DelegateProgressWidget] = {}
 
     def add_user_message(self, text: str) -> None:
         """Append a user message to the chat."""
@@ -98,8 +103,37 @@ class ChatLog(VerticalScroll):
         # Flush every 5 chunks or when text is large
         if len(self._stream_buffer) >= 5 or len(text) > 100:
             self._flush_stream_buffer()
+        else:
+            self._schedule_stream_flush()
 
         self._scroll_to_end()
+
+    def set_stream_flush_interval_ms(self, interval_ms: int) -> None:
+        """Set sparse streaming flush cadence for buffered chunks."""
+        interval = max(40, int(interval_ms))
+        self._stream_flush_interval_s = interval / 1000.0
+
+    def _schedule_stream_flush(self) -> None:
+        if self._stream_flush_timer_pending:
+            return
+        self._stream_flush_timer_pending = True
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Unit tests may exercise widgets outside a running event loop.
+            self._stream_flush_timer_pending = False
+            self._flush_stream_buffer()
+            return
+
+        def _on_timer() -> None:
+            self._stream_flush_timer_pending = False
+            if self._stream_widget is None or not self._stream_buffer:
+                return
+            self._flush_stream_buffer()
+            if self._stream_buffer:
+                self._schedule_stream_flush()
+
+        self.set_timer(self._stream_flush_interval_s, _on_timer)
 
     def _flush_stream_buffer(self) -> None:
         """Flush buffered streaming chunks to the widget."""
@@ -117,12 +151,14 @@ class ChatLog(VerticalScroll):
             self._stream_widget.update(RichMarkdown(self._stream_text))
         self._stream_widget = None
         self._stream_text = ""
+        self._stream_flush_timer_pending = False
 
     def add_tool_call(
         self,
         tool_name: str,
         args: dict,
         *,
+        tool_call_id: str = "",
         success: bool | None = None,
         elapsed_ms: int = 0,
         output: str = "",
@@ -139,6 +175,83 @@ class ChatLog(VerticalScroll):
             error=error,
         ))
         self._scroll_to_end()
+
+    def add_delegate_progress_section(
+        self,
+        tool_call_id: str,
+        *,
+        title: str = "Delegated progress",
+        max_lines: int = 150,
+        status: str = "running",
+        elapsed_ms: int = 0,
+        lines: list[str] | None = None,
+    ) -> None:
+        """Mount (or restore) a delegate progress section keyed by tool call id."""
+        key = str(tool_call_id or "").strip()
+        if not key:
+            return
+        existing = self._delegate_widgets.get(key)
+        if existing is not None:
+            existing.restore_state(status=status, elapsed_ms=elapsed_ms, lines=lines)
+            self._scroll_to_end()
+            return
+        self._flush_and_reset_stream()
+        widget = DelegateProgressWidget(
+            tool_call_id=key,
+            title=title,
+            max_lines=max_lines,
+        )
+        if lines or status != "running" or elapsed_ms:
+            widget.restore_state(status=status, elapsed_ms=elapsed_ms, lines=lines)
+        self.mount(widget)
+        self._delegate_widgets[key] = widget
+        self._scroll_to_end()
+
+    def append_delegate_progress_line(self, tool_call_id: str, line: str) -> bool:
+        """Append one progress line to an existing delegate section."""
+        key = str(tool_call_id or "").strip()
+        if not key:
+            return False
+        widget = self._delegate_widgets.get(key)
+        if widget is None:
+            return False
+        accepted = widget.append_line(line)
+        if accepted:
+            self._scroll_to_end()
+        return accepted
+
+    def finalize_delegate_progress_section(
+        self,
+        tool_call_id: str,
+        *,
+        success: bool,
+        elapsed_ms: int = 0,
+    ) -> bool:
+        """Mark delegate progress section as completed/failed."""
+        key = str(tool_call_id or "").strip()
+        if not key:
+            return False
+        widget = self._delegate_widgets.get(key)
+        if widget is None:
+            return False
+        widget.finalize(success=success, elapsed_ms=elapsed_ms)
+        self._scroll_to_end()
+        return True
+
+    def has_delegate_progress_section(self, tool_call_id: str) -> bool:
+        key = str(tool_call_id or "").strip()
+        return bool(key and key in self._delegate_widgets)
+
+    def clear_delegate_progress_sections(self) -> None:
+        self._delegate_widgets.clear()
+
+    def reset_runtime_state(self) -> None:
+        """Reset transient tracking state after external widget removal."""
+        self._stream_buffer.clear()
+        self._stream_widget = None
+        self._stream_text = ""
+        self._stream_flush_timer_pending = False
+        self.clear_delegate_progress_sections()
 
     def add_turn_separator(
         self,

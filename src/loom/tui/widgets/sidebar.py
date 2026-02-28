@@ -116,9 +116,16 @@ class Sidebar(Vertical):
     }
     """
 
-    def __init__(self, workspace: Path, **kwargs) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        progress_auto_follow: bool = False,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self._workspace = workspace
+        self._progress_auto_follow = bool(progress_auto_follow)
 
     def compose(self) -> ComposeResult:
         yield Label("Workspace", id="sidebar-label")
@@ -126,7 +133,10 @@ class Sidebar(Vertical):
         divider = "\u2500" * 10
         yield Label(divider, id="sidebar-divider")
         yield Label("Progress", id="progress-label")
-        yield TaskProgressPanel(id="task-progress")
+        yield TaskProgressPanel(
+            id="task-progress",
+            auto_follow=self._progress_auto_follow,
+        )
 
     def toggle(self) -> None:
         """Toggle visibility."""

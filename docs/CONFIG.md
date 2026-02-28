@@ -303,6 +303,15 @@ Safety notes:
 | `chat_resume_max_rendered_rows` | `int` | `1200` | Maximum chat transcript rows kept mounted before oldest rows are trimmed. |
 | `chat_resume_use_event_journal` | `bool` | `true` | Prefer replaying persisted chat event journal rows when available. |
 | `chat_resume_enable_legacy_fallback` | `bool` | `true` | Fallback to synthesizing chat transcript rows from `conversation_turns` when needed. |
+| `realtime_refresh_enabled` | `bool` | `true` | Enables live UI refresh for workspace tree, files panel, and progress surfaces. |
+| `workspace_watch_backend` | `string` | `"poll"` | Workspace watch backend (`poll`, `native`). `native` currently falls back to polling. |
+| `workspace_poll_interval_ms` | `int` | `1000` | Poll interval for workspace change detection when realtime refresh is enabled. |
+| `workspace_refresh_debounce_ms` | `int` | `250` | Debounce window for coalescing repeated workspace refresh requests. |
+| `workspace_refresh_max_wait_ms` | `int` | `1500` | Maximum delay before forcing a queued workspace refresh. |
+| `workspace_scan_max_entries` | `int` | `20000` | Max filesystem entries sampled per poll signature snapshot. |
+| `chat_stream_flush_interval_ms` | `int` | `120` | Sparse flush cadence for buffered streaming chat chunks. |
+| `files_panel_max_rows` | `int` | `2000` | Maximum retained rows in the Files panel before oldest rows are dropped. |
+| `delegate_progress_max_lines` | `int` | `150` | Maximum retained lines per collapsed delegate-progress section. |
 
 ### Legacy `[mcp]` in `loom.toml` (supported)
 
@@ -401,4 +410,12 @@ definitions inside `loom.toml`:
 - `limits.compactor.target_chars_ratio` is clamped to `0.01..1.0`.
 - `tui.chat_resume_page_size` is clamped to `20..500`.
 - `tui.chat_resume_max_rendered_rows` is clamped to `100..10000`.
+- Invalid `tui.workspace_watch_backend` falls back to `"poll"`.
+- `tui.workspace_poll_interval_ms` is clamped to `200..10000`.
+- `tui.workspace_refresh_debounce_ms` is clamped to `50..5000`.
+- `tui.workspace_refresh_max_wait_ms` is clamped to `200..30000`.
+- `tui.workspace_scan_max_entries` is clamped to `500..200000`.
+- `tui.chat_stream_flush_interval_ms` is clamped to `40..2000`.
+- `tui.files_panel_max_rows` is clamped to `100..20000`.
+- `tui.delegate_progress_max_lines` is clamped to `20..5000`.
 - MCP `timeout_seconds` falls back to `30` when invalid/non-positive.
