@@ -259,6 +259,45 @@ class TestToolApprovalScreen:
         assert screen._tool_name == "shell_execute"
         assert screen._args_preview == "ls -la"
 
+    def test_on_key_approve(self):
+        screen = ToolApprovalScreen("shell_execute", "ls -la")
+        dismissed = []
+        screen.dismiss = lambda value: dismissed.append(value)
+        event = MagicMock()
+        event.key = "y"
+
+        screen.on_key(event)
+
+        assert dismissed == ["approve"]
+        event.stop.assert_called_once()
+        event.prevent_default.assert_called_once()
+
+    def test_on_key_approve_all(self):
+        screen = ToolApprovalScreen("shell_execute", "ls -la")
+        dismissed = []
+        screen.dismiss = lambda value: dismissed.append(value)
+        event = MagicMock()
+        event.key = "a"
+
+        screen.on_key(event)
+
+        assert dismissed == ["approve_all"]
+        event.stop.assert_called_once()
+        event.prevent_default.assert_called_once()
+
+    def test_on_key_deny_paths(self):
+        screen = ToolApprovalScreen("shell_execute", "ls -la")
+        dismissed = []
+        screen.dismiss = lambda value: dismissed.append(value)
+
+        for key in ("n", "escape"):
+            event = MagicMock()
+            event.key = key
+            screen.on_key(event)
+            assert dismissed[-1] == "deny"
+            event.stop.assert_called_once()
+            event.prevent_default.assert_called_once()
+
 
 class TestAskUserScreen:
     def test_init_no_options(self):
@@ -716,6 +755,8 @@ class TestChatLogStreaming:
         assert log._stream_buffer == []
 
     def test_flush_and_reset_stream_clears_state(self):
+        from rich.markdown import Markdown as RichMarkdown
+
         from loom.tui.widgets.chat_log import ChatLog
 
         log = ChatLog()
@@ -726,7 +767,9 @@ class TestChatLogStreaming:
 
         log._flush_and_reset_stream()
 
-        widget.update.assert_called_once_with("chunk!")
+        assert widget.update.call_count == 2
+        assert widget.update.call_args_list[0].args[0] == "chunk!"
+        assert isinstance(widget.update.call_args_list[1].args[0], RichMarkdown)
         assert log._stream_widget is None
         assert log._stream_text == ""
         assert log._stream_buffer == []
@@ -746,6 +789,59 @@ class TestChatLogStreaming:
 
         assert mounted
         assert all(getattr(widget, "expand", False) for widget in mounted)
+
+    def test_turn_separator_renders_latency_and_throughput(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_turn_separator(
+            tool_count=2,
+            tokens=42,
+            model="test-model",
+            tokens_per_second=21.0,
+            latency_ms=450,
+            total_time_ms=2200,
+        )
+
+        rendered = str(mounted[-1].render())
+        assert "2 tools" in rendered
+        assert "42 tokens" in rendered
+        assert "21.0 tok/s" in rendered
+        assert "450ms latency" in rendered
+        assert "2.2s total" in rendered
+        assert "test-model" in rendered
+
+    def test_model_text_uses_markdown_renderer(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_model_text("## Heading\n\n- a\n- b\n\n`code`")
+
+        assert mounted
+        rendered = mounted[-1].render()
+        assert type(rendered).__name__ == "RichVisual"
+
+    def test_model_text_markup_mode_keeps_rich_markup(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_model_text("[bold]Error[/]", markup=True)
+
+        assert mounted
+        rendered = mounted[-1].render()
+        assert str(rendered) == "Error"
 
     def test_streaming_widget_expands_to_available_width(self):
         from loom.tui.widgets.chat_log import ChatLog
@@ -1660,6 +1756,7 @@ class TestDelegateBindingProcess:
         from loom.tui.app import LoomApp
 
         captured: dict[str, object] = {}
+        created_registry_args: dict[str, object] = {}
 
         class FakeOrchestrator:
             def __init__(self, **kwargs):
@@ -1676,7 +1773,9 @@ class TestDelegateBindingProcess:
         monkeypatch.setattr("loom.state.task_state.TaskStateManager", lambda _dir: MagicMock())
         monkeypatch.setattr(
             "loom.tools.create_default_registry",
-            lambda _config=None: MagicMock(),
+            lambda _config=None: (
+                created_registry_args.update({"config": _config}) or MagicMock()
+            ),
         )
 
         registry = ToolRegistry()
@@ -1710,6 +1809,7 @@ class TestDelegateBindingProcess:
         assert app._delegate_tool._factory is not None
         await app._delegate_tool._factory()
         assert captured["process"] is app._process_defn
+        assert created_registry_args.get("config") is app._config
 
     def test_apply_process_tool_policy_reports_missing_required_tools(self):
         """Missing required process tools should produce a visible warning."""

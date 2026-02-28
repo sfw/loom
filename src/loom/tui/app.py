@@ -86,6 +86,7 @@ from loom.tui.widgets import (
     StatusBar,
 )
 from loom.tui.widgets.tool_call import tool_args_preview
+from loom.utils.latency import diagnostics_enabled, log_latency_event
 
 if TYPE_CHECKING:
     from loom.config import Config
@@ -202,6 +203,9 @@ _MAX_PERSISTED_PROCESS_RESULTS = 120
 _INFO_WRAP_WIDTH = 108
 _RUN_GOAL_FILE_CONTENT_MAX_CHARS = 32_000
 _MAX_INPUT_HISTORY = 500
+_PROCESS_COMMAND_INDEX_REFRESH_INTERVAL_SECONDS = 2.0
+_EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS = 0.5
+_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS = 0.05
 
 
 class ProcessRunList(VerticalScroll):
@@ -692,6 +696,8 @@ class LoomApp(App):
         self._process_command_map: dict[str, str] = {}
         self._blocked_process_commands: list[str] = []
         self._cached_process_catalog: list[dict[str, str]] = []
+        self._process_command_index_last_refresh_at: float = 0.0
+        self._process_command_index_refresh_inflight = False
         self._adhoc_process_cache: dict[str, AdhocProcessCacheEntry] = {}
         self._adhoc_package_doc_cache: str | None = None
         self._sidebar_cowork_tasks: list[dict] = []
@@ -726,6 +732,12 @@ class LoomApp(App):
         # Register and activate theme
         self.register_theme(LOOM_DARK)
         self.theme = "loom-dark"
+        if diagnostics_enabled():
+            self.run_worker(
+                self._monitor_event_loop_lag(),
+                group="tui-event-loop-lag",
+                exclusive=True,
+            )
         self._process_elapsed_timer = self.set_interval(
             1.0,
             self._tick_process_run_elapsed,
@@ -745,6 +757,22 @@ class LoomApp(App):
             self.query_one("#user-input", Input).focus()
         except Exception:
             pass
+
+    async def _monitor_event_loop_lag(self) -> None:
+        """Emit periodic event-loop lag diagnostics when enabled."""
+        expected = time.monotonic() + _EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS
+        while True:
+            await asyncio.sleep(_EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS)
+            now = time.monotonic()
+            lag = max(0.0, now - expected)
+            if lag >= _EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS:
+                log_latency_event(
+                    logger,
+                    event="tui_event_loop_lag",
+                    duration_seconds=lag,
+                    fields={"threshold_ms": int(_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS * 1000)},
+                )
+            expected = now + _EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS
 
     def _on_setup_complete(self, result: list[dict] | None) -> None:
         """Handle setup wizard dismissal."""
@@ -796,7 +824,10 @@ class LoomApp(App):
         """Reset registry to discovered tools."""
         from loom.tools import create_default_registry
 
-        self._tools = create_default_registry(self._config)
+        self._tools = create_default_registry(
+            self._config,
+            mcp_startup_mode="background",
+        )
 
     def _create_process_loader(self):
         """Create a process loader for the current workspace/config."""
@@ -1095,9 +1126,6 @@ class LoomApp(App):
                 self._process_defn = None
                 self._process_name = None
                 return
-            # Process load may import bundled tool modules; rebuild to include
-            # them in the active registry.
-            self._refresh_tool_registry()
             chat.add_info(
                 f"Process: [bold]{self._process_defn.name}[/bold] "
                 f"v{self._process_defn.version}"
@@ -3167,21 +3195,13 @@ class LoomApp(App):
         """Return True when process name collides with built-in slash command."""
         return name.strip().lower() in self._reserved_slash_command_names()
 
-    def _refresh_process_command_index(
+    def _compute_process_command_index(
         self,
-        *,
-        chat: ChatLog | None = None,
-        notify_conflicts: bool = False,
-    ) -> None:
-        """Refresh process catalog and dynamic slash-command map."""
-        try:
-            loader = self._create_process_loader()
-            available = loader.list_available()
-        except Exception:
-            self._cached_process_catalog = []
-            self._process_command_map = {}
-            self._blocked_process_commands = []
-            return
+    ) -> tuple[list[dict[str, str]], dict[str, str], list[str]]:
+        """Compute selectable process catalog and dynamic command map."""
+        started = time.monotonic()
+        loader = self._create_process_loader()
+        available = loader.list_available()
 
         selectable: list[dict[str, str]] = []
         command_map: dict[str, str] = {}
@@ -3199,9 +3219,81 @@ class LoomApp(App):
             selectable.append(proc)
             command_map[f"/{lowered}"] = name
 
+        log_latency_event(
+            logger,
+            event="process_command_index_refresh",
+            duration_seconds=time.monotonic() - started,
+            fields={"available": len(available), "selectable": len(selectable)},
+        )
+        return selectable, command_map, sorted(blocked, key=str.lower)
+
+    def _refresh_process_command_index(
+        self,
+        *,
+        chat: ChatLog | None = None,
+        notify_conflicts: bool = False,
+        background: bool = False,
+        force: bool = False,
+    ) -> None:
+        """Refresh process catalog and dynamic slash-command map."""
+        if background and not self.is_running:
+            # In tests and pre-run contexts, background workers may not be available.
+            background = False
+
+        if background:
+            now = time.monotonic()
+            if self._process_command_index_refresh_inflight:
+                return
+            if (
+                not force
+                and self._cached_process_catalog
+                and (now - self._process_command_index_last_refresh_at)
+                < _PROCESS_COMMAND_INDEX_REFRESH_INTERVAL_SECONDS
+            ):
+                return
+            self._process_command_index_refresh_inflight = True
+
+            async def _refresh_in_background() -> None:
+                try:
+                    selectable, command_map, blocked = await asyncio.to_thread(
+                        self._compute_process_command_index,
+                    )
+                except Exception:
+                    selectable, command_map, blocked = [], {}, []
+                try:
+                    self._cached_process_catalog = selectable
+                    self._process_command_map = command_map
+                    self._blocked_process_commands = blocked
+                    self._process_command_index_last_refresh_at = time.monotonic()
+                    if notify_conflicts and chat and self._blocked_process_commands:
+                        blocked_cmds = ", ".join(
+                            f"/{name}" for name in self._blocked_process_commands
+                        )
+                        chat.add_info(
+                            "[bold #f7768e]Process command name collision:[/] "
+                            f"{blocked_cmds}\n"
+                            "[dim]These process names collide with built-in slash commands "
+                            "and were skipped in TUI.[/dim]"
+                        )
+                finally:
+                    self._process_command_index_refresh_inflight = False
+
+            self.run_worker(
+                _refresh_in_background(),
+                group="process-command-index-refresh",
+                exclusive=False,
+            )
+            return
+
+        try:
+            selectable, command_map, blocked = self._compute_process_command_index()
+        except Exception:
+            selectable, command_map, blocked = [], {}, []
+
         self._cached_process_catalog = selectable
         self._process_command_map = command_map
-        self._blocked_process_commands = sorted(blocked, key=str.lower)
+        self._blocked_process_commands = blocked
+        self._process_command_index_last_refresh_at = time.monotonic()
 
         if notify_conflicts and chat and self._blocked_process_commands:
             blocked_cmds = ", ".join(f"/{name}" for name in self._blocked_process_commands)
@@ -3469,6 +3561,17 @@ class LoomApp(App):
             return ModelRetryPolicy()
         return ModelRetryPolicy.from_execution_config(self._config.execution)
 
+    def _cowork_tool_exposure_mode(self) -> str:
+        if self._config is None:
+            return "adaptive"
+        mode = str(
+            getattr(self._config.execution, "cowork_tool_exposure_mode", "adaptive")
+            or "adaptive",
+        ).strip().lower()
+        if mode in {"full", "adaptive", "hybrid"}:
+            return mode
+        return "adaptive"
+
     def _cowork_scratch_dir(self) -> Path | None:
         if self._config is None:
             return None
@@ -3521,12 +3624,12 @@ class LoomApp(App):
         self._total_tokens = 0
         self._sidebar_cowork_tasks = []
 
-        # Start from a clean registry each initialization to avoid stale
-        # excludes/bindings when setup or process configuration changes.
-        self._refresh_tool_registry()
-
-        # Load process definition (imports bundled tools, then refreshes).
+        # Load process definition first. This may import bundled tool modules
+        # into the global tool class registry.
         self._load_process_definition(chat)
+        # Build a clean registry exactly once after optional process load so
+        # bundled tools are included without duplicate registry construction.
+        self._refresh_tool_registry()
         self._refresh_process_command_index(chat=chat, notify_conflicts=True)
 
         # Ensure persistence-dependent tools are present and tracked.
@@ -3553,6 +3656,7 @@ class LoomApp(App):
                 approver=approver,
                 store=self._store,
                 model_retry_policy=self._model_retry_policy(),
+                tool_exposure_mode=self._cowork_tool_exposure_mode(),
                 enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
                 ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
@@ -3598,6 +3702,7 @@ class LoomApp(App):
                 store=self._store,
                 session_id=session_id,
                 model_retry_policy=self._model_retry_policy(),
+                tool_exposure_mode=self._cowork_tool_exposure_mode(),
                 enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
                 ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
@@ -3613,6 +3718,7 @@ class LoomApp(App):
                 system_prompt=system_prompt,
                 approver=approver,
                 model_retry_policy=self._model_retry_policy(),
+                tool_exposure_mode=self._cowork_tool_exposure_mode(),
                 enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
                 ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
@@ -5257,7 +5363,7 @@ class LoomApp(App):
         if not text.startswith("/"):
             return "", []
         # Keep dynamic process slash commands in sync as the user types.
-        self._refresh_process_command_index()
+        self._refresh_process_command_index(background=True)
         token = text.split()[0].lower()
         if token == "/":
             return token, self._slash_command_catalog()
@@ -5403,7 +5509,7 @@ class LoomApp(App):
 
     def _slash_completion_candidates(self, token: str) -> list[str]:
         """Return slash command completions for a token prefix."""
-        self._refresh_process_command_index()
+        self._refresh_process_command_index(background=True)
         if token == "/":
             builtins = [spec.canonical for spec in _SLASH_COMMANDS]
             dynamic = sorted(self._process_command_map)
@@ -5440,7 +5546,7 @@ class LoomApp(App):
         base = "/process use"
         seed = f"{base} {prefix}" if prefix else base
 
-        self._refresh_process_command_index()
+        self._refresh_process_command_index(background=True)
         available = self._cached_process_catalog
 
         candidates: list[str] = []
@@ -5468,7 +5574,7 @@ class LoomApp(App):
             return None
 
         prefix = (match.group("prefix") or "").strip()
-        self._refresh_process_command_index()
+        self._refresh_process_command_index(background=True)
         available = self._cached_process_catalog
 
         if not available:
@@ -5648,7 +5754,7 @@ class LoomApp(App):
                 ):
                     return Orchestrator(
                         model_router=router,
-                        tool_registry=_create_tools(),
+                        tool_registry=_create_tools(config),
                         memory_manager=MemoryManager(db),
                         prompt_assembler=PromptAssembler(),
                         state_manager=TaskStateManager(data_dir),
@@ -5696,6 +5802,7 @@ class LoomApp(App):
             store=self._store,
             session_id=session_id,
             model_retry_policy=self._model_retry_policy(),
+            tool_exposure_mode=self._cowork_tool_exposure_mode(),
             enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
             ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
             ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
@@ -5733,6 +5840,7 @@ class LoomApp(App):
             approver=approver,
             store=self._store,
             model_retry_policy=self._model_retry_policy(),
+            tool_exposure_mode=self._cowork_tool_exposure_mode(),
             enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
             ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
             ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
@@ -5939,7 +6047,9 @@ class LoomApp(App):
             return
         event.stop()
         event.prevent_default()
-        self.push_screen(FileViewerScreen(selected, self._workspace))
+        self.push_screen(
+            FileViewerScreen(selected, self._workspace, defer_heavy_load=True)
+        )
 
     async def _handle_slash_command(self, text: str) -> bool:
         """Handle slash commands. Returns True if handled."""
@@ -7735,6 +7845,9 @@ class LoomApp(App):
                     len(event.tool_calls),
                     event.tokens_used,
                     event.model,
+                    tokens_per_second=event.tokens_per_second,
+                    latency_ms=event.latency_ms,
+                    total_time_ms=event.total_time_ms,
                 )
                 events_panel.add_event(
                     _now_str(), "turn",

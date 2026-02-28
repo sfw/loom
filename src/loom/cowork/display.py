@@ -78,12 +78,27 @@ def display_turn_summary(turn: CoworkTurn) -> None:
     """Display summary after a complete turn."""
     if turn.tool_calls:
         n = len(turn.tool_calls)
+        parts = [
+            f"{n} tool call{'s' if n != 1 else ''}",
+            f"{turn.tokens_used} tokens",
+        ]
+        if turn.tokens_per_second > 0:
+            parts.append(f"{turn.tokens_per_second:.1f} tok/s")
+        if turn.latency_ms > 0:
+            parts.append(_format_duration_ms(turn.latency_ms) + " latency")
+        if turn.total_time_ms > 0:
+            parts.append(_format_duration_ms(turn.total_time_ms) + " total")
+        parts.append(turn.model)
         sys.stdout.write(
-            f"\n{_C.DIM}[{n} tool call{'s' if n != 1 else ''}"
-            f" | {turn.tokens_used} tokens"
-            f" | {turn.model}]{_C.RESET}\n"
+            f"\n{_C.DIM}[{' | '.join(parts)}]{_C.RESET}\n"
         )
         sys.stdout.flush()
+
+
+def _format_duration_ms(duration_ms: int) -> str:
+    if duration_ms >= 1000:
+        return f"{duration_ms / 1000.0:.1f}s"
+    return f"{duration_ms}ms"
 
 
 def display_ask_user(event: ToolCallEvent) -> str:

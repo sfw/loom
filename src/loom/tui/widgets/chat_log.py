@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from rich.markdown import Markdown as RichMarkdown
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
@@ -9,7 +10,7 @@ from loom.tui.widgets.tool_call import ToolCallWidget
 
 
 class ChatLog(VerticalScroll):
-    """Scrollable chat log that holds Static messages and ToolCallWidgets.
+    """Scrollable chat log that holds Markdown/text messages and tool widgets.
 
     Unlike a plain RichLog, this supports embedded interactive widgets
     (Collapsible tool calls, etc.) alongside static text.
@@ -64,11 +65,21 @@ class ChatLog(VerticalScroll):
         self._scroll_to_end()
 
     def add_model_text(self, text: str, *, markup: bool = False) -> None:
-        """Append model response text."""
+        """Append model response text.
+
+        `markup=True` keeps Rich markup behavior for system/error lines.
+        Normal model output is rendered as Markdown.
+        """
         self._flush_and_reset_stream()
-        self.mount(
-            Static(text, classes="model-text", expand=True, markup=markup),
-        )
+        if markup:
+            widget = Static(text, classes="model-text", expand=True, markup=True)
+        else:
+            widget = Static(
+                RichMarkdown(text or ""),
+                classes="model-text",
+                expand=True,
+            )
+        self.mount(widget)
         self._scroll_to_end()
 
     def add_streaming_text(self, text: str) -> None:
@@ -101,6 +112,9 @@ class ChatLog(VerticalScroll):
     def _flush_and_reset_stream(self) -> None:
         """Flush any buffered stream data and reset stream state."""
         self._flush_stream_buffer()
+        # Convert streamed plain text into Markdown once the message segment ends.
+        if self._stream_widget is not None and self._stream_text:
+            self._stream_widget.update(RichMarkdown(self._stream_text))
         self._stream_widget = None
         self._stream_text = ""
 
@@ -131,6 +145,10 @@ class ChatLog(VerticalScroll):
         tool_count: int,
         tokens: int,
         model: str,
+        *,
+        tokens_per_second: float = 0.0,
+        latency_ms: int = 0,
+        total_time_ms: int = 0,
     ) -> None:
         """Add a turn separator line with stats."""
         self._flush_and_reset_stream()
@@ -139,12 +157,24 @@ class ChatLog(VerticalScroll):
             s = "s" if tool_count != 1 else ""
             parts.append(f"{tool_count} tool{s}")
         parts.append(f"{tokens:,} tokens")
+        if tokens_per_second > 0:
+            parts.append(f"{tokens_per_second:.1f} tok/s")
+        if latency_ms > 0:
+            parts.append(f"{self._format_ms(latency_ms)} latency")
+        if total_time_ms > 0:
+            parts.append(f"{self._format_ms(total_time_ms)} total")
         if model:
             parts.append(model)
         detail = " | ".join(parts)
         line = f"[dim]\u2500\u2500\u2500 {detail} \u2500\u2500\u2500[/dim]"
         self.mount(Static(line, classes="turn-separator", expand=True))
         self._scroll_to_end()
+
+    @staticmethod
+    def _format_ms(duration_ms: int) -> str:
+        if duration_ms >= 1000:
+            return f"{duration_ms / 1000.0:.1f}s"
+        return f"{duration_ms}ms"
 
     def add_info(self, text: str, *, markup: bool = True) -> None:
         """Add an informational message (e.g. welcome text)."""

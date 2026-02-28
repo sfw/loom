@@ -15,7 +15,7 @@ from loom.cowork.session import (
 )
 from loom.models.base import ModelProvider, ModelResponse, TokenUsage, ToolCall
 from loom.tools import create_default_registry
-from loom.tools.registry import ToolResult
+from loom.tools.registry import Tool, ToolResult
 
 # --- Fixtures ---
 
@@ -26,8 +26,10 @@ class MockProvider(ModelProvider):
     def __init__(self, responses: list[ModelResponse | Exception]):
         self._responses = list(responses)
         self._call_count = 0
+        self.tool_payloads: list[list[dict] | None] = []
 
     async def complete(self, messages, tools=None, **kwargs):
+        self.tool_payloads.append(tools)
         if self._call_count < len(self._responses):
             resp = self._responses[self._call_count]
             self._call_count += 1
@@ -84,6 +86,195 @@ class TestCoworkSession:
         assert len(turns) == 1
         assert turns[0].text == "Hello! How can I help?"
         assert turns[0].tokens_used == 10
+
+    async def test_small_talk_uses_compact_tool_schemas(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(text="Hello!", usage=TokenUsage(total_tokens=3)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        async for _ in session.send("hi"):
+            pass
+
+        assert provider.tool_payloads
+        first_call = provider.tool_payloads[0] or []
+        names = {schema.get("name", "") for schema in first_call}
+        assert names == {"ask_user", "task_tracker", "conversation_recall", "delegate_task"}
+        assert len(first_call) < len(tools.all_schemas())
+
+    async def test_file_request_includes_coding_tools(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(text="Sure.", usage=TokenUsage(total_tokens=5)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        async for _ in session.send("Read src/main.py and explain it."):
+            pass
+
+        assert provider.tool_payloads
+        first_call = provider.tool_payloads[0] or []
+        names = {schema.get("name", "") for schema in first_call}
+        assert "read_file" in names
+        assert "ripgrep_search" in names
+        assert "glob_find" in names
+
+    async def test_hybrid_mode_includes_fallback_tools(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(text="Hello!", usage=TokenUsage(total_tokens=3)),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            tool_exposure_mode="hybrid",
+        )
+
+        async for _ in session.send("hi"):
+            pass
+
+        assert provider.tool_payloads
+        first_call = provider.tool_payloads[0] or []
+        names = {schema.get("name", "") for schema in first_call}
+        assert "list_tools" in names
+        assert "run_tool" in names
+        assert len(first_call) <= 18
+
+    async def test_full_mode_sends_all_tool_schemas(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(text="Hello!", usage=TokenUsage(total_tokens=3)),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            tool_exposure_mode="full",
+        )
+
+        async for _ in session.send("hi"):
+            pass
+
+        assert provider.tool_payloads
+        first_call = provider.tool_payloads[0] or []
+        assert len(first_call) == len(tools.all_schemas())
+
+    async def test_hybrid_unknown_tool_error_suggests_list_tools(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="tc1",
+                    name="definitely_unknown_tool_name",
+                    arguments={},
+                )],
+                usage=TokenUsage(total_tokens=8),
+            ),
+            ModelResponse(text="done", usage=TokenUsage(total_tokens=2)),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            tool_exposure_mode="hybrid",
+        )
+
+        events = []
+        async for event in session.send("try tool"):
+            events.append(event)
+
+        completed = [e for e in events if isinstance(e, ToolCallEvent) and e.result is not None]
+        assert completed
+        assert completed[0].result is not None
+        assert completed[0].result.success is False
+        assert "list_tools" in (completed[0].result.error or "")
+
+    async def test_hybrid_mode_retries_with_fallback_hint_on_tool_stall(
+        self,
+        workspace,
+        tools,
+    ):
+        provider = MockProvider([
+            ModelResponse(
+                text=(
+                    "I can see the MCP Notion tool is available, but I don't have "
+                    "a direct tool to call it from my immediate tool set."
+                ),
+                usage=TokenUsage(total_tokens=12),
+            ),
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="tc1",
+                    name="list_tools",
+                    arguments={"query": "notion", "limit": 3},
+                )],
+                usage=TokenUsage(total_tokens=8),
+            ),
+            ModelResponse(
+                text="I'll proceed with the discovered tool now.",
+                usage=TokenUsage(total_tokens=6),
+            ),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            tool_exposure_mode="hybrid",
+        )
+
+        events = []
+        async for event in session.send("Search Notion for chicken recipes"):
+            events.append(event)
+
+        completed = [e for e in events if isinstance(e, ToolCallEvent) and e.result is not None]
+        assert any(e.name == "list_tools" and e.result and e.result.success for e in completed)
+        assert provider._call_count == 3
+
+    async def test_adaptive_mode_includes_mcp_tools_when_alias_is_mentioned(
+        self,
+        workspace,
+        tools,
+    ):
+        class _DummyMCPTool(Tool):
+            __loom_register__ = False
+
+            def __init__(self, tool_name: str) -> None:
+                self._tool_name = tool_name
+
+            @property
+            def name(self) -> str:
+                return self._tool_name
+
+            @property
+            def description(self) -> str:
+                return "Dummy MCP tool"
+
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+
+            async def execute(self, args: dict, ctx) -> ToolResult:
+                return ToolResult.ok("ok")
+
+        tools.register(_DummyMCPTool("mcp.notion.search"))
+        tools.register(_DummyMCPTool("mcp.notion.query_database"))
+
+        provider = MockProvider([
+            ModelResponse(text="Sure.", usage=TokenUsage(total_tokens=5)),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            tool_exposure_mode="adaptive",
+        )
+
+        async for _ in session.send("use notion mcp to find meeting notes"):
+            pass
+
+        assert provider.tool_payloads
+        first_call = provider.tool_payloads[0] or []
+        names = {schema.get("name", "") for schema in first_call}
+        assert any(name.startswith("mcp.notion.") for name in names)
 
     async def test_tool_call_then_response(self, workspace, tools):
         """Model calls a tool, then responds with text."""
@@ -273,6 +464,48 @@ class TestCoworkSession:
         assert len(turns) == 1
         assert turns[0].text == "Recovered stream."
         assert provider._call_count == 2
+
+    async def test_send_streaming_estimates_tokens_when_usage_missing(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(
+                text="Token estimation fallback should prevent zero token turns.",
+                usage=TokenUsage(),
+            ),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        async for event in session.send_streaming("estimate tokens"):
+            events.append(event)
+
+        turns = [e for e in events if isinstance(e, CoworkTurn)]
+        assert len(turns) == 1
+        assert turns[0].tokens_used > 0
+        assert session.total_tokens == turns[0].tokens_used
+        assert turns[0].latency_ms > 0
+        assert turns[0].total_time_ms >= turns[0].latency_ms
+        assert turns[0].tokens_per_second > 0
+
+    async def test_send_estimates_tokens_when_usage_missing(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(
+                text="Token estimation fallback should also work for non-streaming sends.",
+                usage=TokenUsage(),
+            ),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        async for event in session.send("estimate tokens"):
+            events.append(event)
+
+        turns = [e for e in events if isinstance(e, CoworkTurn)]
+        assert len(turns) == 1
+        assert turns[0].tokens_used > 0
+        assert session.total_tokens == turns[0].tokens_used
+        assert turns[0].latency_ms > 0
+        assert turns[0].total_time_ms >= turns[0].latency_ms
+        assert turns[0].tokens_per_second > 0
 
 
 class TestBuildSystemPrompt:
