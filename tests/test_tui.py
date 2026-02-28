@@ -815,6 +815,30 @@ class TestChatLogStreaming:
         assert "2.2s total" in rendered
         assert "test-model" in rendered
 
+    def test_turn_separator_renders_context_telemetry(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_turn_separator(
+            tool_count=0,
+            tokens=12,
+            model="test-model",
+            context_tokens=19221,
+            context_messages=45,
+            omitted_messages=57,
+            recall_index_used=True,
+        )
+
+        rendered = str(mounted[-1].render())
+        assert "ctx 19,221 tok" in rendered
+        assert "45 ctx msg" in rendered
+        assert "57 archived" in rendered
+        assert "recall-index" in rendered
+
     def test_model_text_uses_markdown_renderer(self):
         from loom.tui.widgets.chat_log import ChatLog
 

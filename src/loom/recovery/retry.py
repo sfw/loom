@@ -37,6 +37,7 @@ class AttemptRecord:
     evidence_records: list[dict] = field(default_factory=list)
     retry_strategy: RetryStrategy = RetryStrategy.GENERIC
     missing_targets: list[str] = field(default_factory=list)
+    resolution_plan: str = ""
     error_category: ErrorCategory | None = None
     timestamp: str = ""
 
@@ -101,6 +102,12 @@ class RetryManager:
                 lines.append(f"  Verification feedback: {a.feedback}")
             if a.error:
                 lines.append(f"  Error: {a.error}")
+            if a.resolution_plan:
+                lines.append("  Model-planned remediation:")
+                for row in str(a.resolution_plan).splitlines():
+                    text = row.strip()
+                    if text:
+                        lines.append(f"    {text}")
             if a.retry_strategy and a.retry_strategy != RetryStrategy.GENERIC:
                 lines.append(f"  Retry strategy: {a.retry_strategy.value}")
             if a.missing_targets:

@@ -149,6 +149,10 @@ class ChatLog(VerticalScroll):
         tokens_per_second: float = 0.0,
         latency_ms: int = 0,
         total_time_ms: int = 0,
+        context_tokens: int = 0,
+        context_messages: int = 0,
+        omitted_messages: int = 0,
+        recall_index_used: bool = False,
     ) -> None:
         """Add a turn separator line with stats."""
         self._flush_and_reset_stream()
@@ -163,6 +167,14 @@ class ChatLog(VerticalScroll):
             parts.append(f"{self._format_ms(latency_ms)} latency")
         if total_time_ms > 0:
             parts.append(f"{self._format_ms(total_time_ms)} total")
+        if context_tokens > 0:
+            parts.append(f"ctx {context_tokens:,} tok")
+        if context_messages > 0:
+            parts.append(f"{context_messages} ctx msg")
+        if omitted_messages > 0:
+            parts.append(f"{omitted_messages} archived")
+        if recall_index_used:
+            parts.append("recall-index")
         if model:
             parts.append(model)
         detail = " | ".join(parts)

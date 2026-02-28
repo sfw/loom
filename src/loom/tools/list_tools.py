@@ -12,9 +12,10 @@ from typing import Any
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
-DEFAULT_LIMIT = 20
+DEFAULT_SCHEMA_LIMIT = 20
 MAX_LIMIT = 50
-DEFAULT_MAX_PAYLOAD_BYTES = 12_000
+DEFAULT_SCHEMA_MAX_PAYLOAD_BYTES = 12_000
+DEFAULT_COMPACT_MAX_PAYLOAD_BYTES = 65_536
 MIN_MAX_PAYLOAD_BYTES = 1_024
 MAX_MAX_PAYLOAD_BYTES = 65_536
 
@@ -79,9 +80,10 @@ class ListToolsTool(Tool):
 
     name = "list_tools"
     description = (
-        "List currently available tools in compact form. Supports filtering by "
-        "query, category, mutating_only, and auth_required_only. Use this when "
-        "you need a tool not present in the typed tool subset."
+        "List currently available tools. Use detail='compact' first to discover "
+        "tool names, then detail='schema' to inspect argument schemas for selected "
+        "tools before calling run_tool. In schema mode, always narrow scope with "
+        "query/category or other filters."
     )
     parameters = {
         "type": "object",
@@ -107,21 +109,28 @@ class ListToolsTool(Tool):
                 "enum": ["compact", "schema"],
                 "description": (
                     "compact: name/summary/required args only. "
-                    "schema: include full parameters schema."
+                    "schema: include full parameters schema for a narrow filtered subset."
                 ),
             },
             "limit": {
                 "type": "integer",
-                "description": "Result page size (default 20, max 50).",
+                "description": (
+                    "Result page size (default 20, max 50). "
+                    "Applies to detail='schema'. Ignored for detail='compact'."
+                ),
             },
             "offset": {
                 "type": "integer",
-                "description": "Result offset for pagination.",
+                "description": (
+                    "Result offset for pagination. Applies to detail='schema'. "
+                    "Ignored for detail='compact'."
+                ),
             },
             "max_payload_bytes": {
                 "type": "integer",
                 "description": (
-                    "Optional response byte budget. Clamped to a safe range."
+                    "Optional response byte budget. Clamped to a safe range. "
+                    "Defaults are larger for detail='compact'."
                 ),
             },
         },
@@ -151,14 +160,39 @@ class ListToolsTool(Tool):
         category = str(args.get("category", "") or "").strip().lower()
         mutating_only = _coerce_bool(args.get("mutating_only", False))
         auth_required_only = _coerce_bool(args.get("auth_required_only", False))
-        limit = _clamp_int(args.get("limit"), default=DEFAULT_LIMIT, minimum=1, maximum=MAX_LIMIT)
+        limit = _clamp_int(
+            args.get("limit"),
+            default=DEFAULT_SCHEMA_LIMIT,
+            minimum=1,
+            maximum=MAX_LIMIT,
+        )
         offset = _clamp_int(args.get("offset"), default=0, minimum=0, maximum=100_000)
+        default_payload_budget = (
+            DEFAULT_COMPACT_MAX_PAYLOAD_BYTES
+            if detail == "compact"
+            else DEFAULT_SCHEMA_MAX_PAYLOAD_BYTES
+        )
         max_payload_bytes = _clamp_int(
             args.get("max_payload_bytes"),
-            default=DEFAULT_MAX_PAYLOAD_BYTES,
+            default=default_payload_budget,
             minimum=MIN_MAX_PAYLOAD_BYTES,
             maximum=MAX_MAX_PAYLOAD_BYTES,
         )
+
+        if (
+            detail == "schema"
+            and not query
+            and not category
+            and not mutating_only
+            and not auth_required_only
+        ):
+            return ToolResult.fail(
+                (
+                    "list_tools with detail='schema' requires a narrow filter "
+                    "(query, category, mutating_only, or auth_required_only). "
+                    "Use detail='compact' for broad discovery first."
+                ),
+            )
 
         try:
             rows = self._catalog_provider(ctx.auth_context)
@@ -207,13 +241,14 @@ class ListToolsTool(Tool):
 
         filtered.sort(key=lambda item: str(item.get("name", "")))
         total_count = len(filtered)
-        page_candidates = filtered[offset : offset + limit]
+        is_schema_detail = detail == "schema"
+        page_candidates = filtered[offset : offset + limit] if is_schema_detail else filtered
 
         response: dict[str, Any] = {
             "detail": detail,
             "total_count": total_count,
-            "offset": offset,
-            "limit": limit,
+            "offset": offset if is_schema_detail else 0,
+            "limit": limit if is_schema_detail else total_count,
             "has_more": False,
             "truncated_by_size": False,
             "max_payload_bytes": max_payload_bytes,
@@ -236,9 +271,16 @@ class ListToolsTool(Tool):
             candidate_tools = [*response["tools"], item]
             candidate_response = {**response, "tools": candidate_tools}
             if _encoded_size(candidate_response) > max_payload_bytes and response["tools"]:
-                response["truncated_by_size"] = True
-                response["has_more"] = True
-                break
+                if is_schema_detail:
+                    response["truncated_by_size"] = True
+                    response["has_more"] = True
+                    break
+                return ToolResult.fail(
+                    (
+                        "list_tools compact response exceeds max_payload_bytes. "
+                        "Increase max_payload_bytes or narrow query/category filters."
+                    ),
+                )
             if _encoded_size(candidate_response) > max_payload_bytes:
                 # Guarantee at least one item with minimal fields.
                 minimal_item = {
@@ -246,14 +288,21 @@ class ListToolsTool(Tool):
                     "summary": row["summary"],
                     "category": row["category"],
                 }
-                response["tools"] = [minimal_item]
-                response["truncated_by_size"] = True
-                response["has_more"] = True
-                break
+                if is_schema_detail:
+                    response["tools"] = [minimal_item]
+                    response["truncated_by_size"] = True
+                    response["has_more"] = True
+                    break
+                return ToolResult.fail(
+                    (
+                        "list_tools compact response exceeds max_payload_bytes. "
+                        "Increase max_payload_bytes or narrow query/category filters."
+                    ),
+                )
             response["tools"] = candidate_tools
 
         consumed = len(response["tools"])
-        if not response["has_more"] and (offset + consumed) < total_count:
+        if is_schema_detail and not response["has_more"] and (offset + consumed) < total_count:
             response["has_more"] = True
         if response["has_more"]:
             response["next_offset"] = offset + consumed

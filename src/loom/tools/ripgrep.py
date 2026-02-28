@@ -7,6 +7,7 @@ Falls back to a Python implementation if ripgrep is not installed.
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 from pathlib import Path
 
@@ -23,6 +24,7 @@ class RipgrepSearchTool(Tool):
         "Search file contents using ripgrep (rg). Much faster than search_files. "
         "Supports regex patterns, file type filtering, context lines, and "
         "gitignore-aware searching. "
+        "Returns structured counts in data (match_count, file_count). "
         "Examples: pattern='def main', type='py', context=2"
     )
     parameters = {
@@ -128,6 +130,7 @@ class RipgrepSearchTool(Tool):
         max_matches = args.get("max_matches", DEFAULT_MAX_MATCHES)
 
         cmd = [rg_path, "--color=never", f"--max-count={max_matches}"]
+        cmd.append("--stats")
 
         if args.get("case_insensitive"):
             cmd.append("-i")
@@ -158,14 +161,30 @@ class RipgrepSearchTool(Tool):
             output = stdout.decode("utf-8", errors="replace")
 
             if proc.returncode == 0:
-                match_count = output.count("\n")
+                err = stderr.decode("utf-8", errors="replace")
+                stats = self._parse_rg_stats(err)
+                match_count, file_count = self._infer_counts_from_output(
+                    output,
+                    files_only=bool(args.get("files_only")),
+                )
+                if stats.get("match_count") is not None:
+                    match_count = int(stats["match_count"])
+                if stats.get("file_count") is not None:
+                    file_count = int(stats["file_count"])
                 return ToolResult(
                     success=True,
                     output=output or "Matches found (see above).",
-                    data={"match_count": match_count},
+                    data={
+                        "match_count": match_count,
+                        "file_count": file_count,
+                    },
                 )
             elif proc.returncode == 1:
-                return ToolResult(success=True, output="No matches found.")
+                return ToolResult(
+                    success=True,
+                    output="No matches found.",
+                    data={"match_count": 0, "file_count": 0},
+                )
             else:
                 err = stderr.decode("utf-8", errors="replace")
                 return ToolResult(success=False, output=f"ripgrep error: {err}")
@@ -213,9 +232,24 @@ class RipgrepSearchTool(Tool):
             output = stdout.decode("utf-8", errors="replace")
 
             if proc.returncode == 0:
-                return ToolResult(success=True, output=output or "Matches found.")
+                match_count, file_count = self._infer_counts_from_output(
+                    output,
+                    files_only=bool(args.get("files_only")),
+                )
+                return ToolResult(
+                    success=True,
+                    output=output or "Matches found.",
+                    data={
+                        "match_count": match_count,
+                        "file_count": file_count,
+                    },
+                )
             elif proc.returncode == 1:
-                return ToolResult(success=True, output="No matches found.")
+                return ToolResult(
+                    success=True,
+                    output="No matches found.",
+                    data={"match_count": 0, "file_count": 0},
+                )
             else:
                 err = stderr.decode("utf-8", errors="replace")
                 return ToolResult(success=False, output=f"grep error: {err}")
@@ -259,11 +293,89 @@ class RipgrepSearchTool(Tool):
                     continue
 
         if not matches:
-            return ToolResult(success=True, output="No matches found.")
+            return ToolResult(
+                success=True,
+                output="No matches found.",
+                data={"match_count": 0, "file_count": 0},
+            )
 
         output = "\n".join(matches)
+        file_paths = {
+            line.split(":", 1)[0]
+            for line in matches
+            if ":" in line
+        }
         return ToolResult(
             success=True,
             output=output,
-            data={"match_count": len(matches)},
+            data={
+                "match_count": len(matches),
+                "file_count": len(file_paths),
+            },
         )
+
+    @staticmethod
+    def _parse_rg_stats(stderr_text: str) -> dict[str, int | None]:
+        """Parse ripgrep --stats summary from stderr."""
+        text = str(stderr_text or "")
+        file_count_match = re.search(
+            r"(?m)^\s*(\d+)\s+files?\s+contained\s+matches?\s*$",
+            text,
+        )
+        match_count_match = re.search(
+            r"(?m)^\s*(\d+)\s+matches?\s*$",
+            text,
+        )
+        matched_lines_match = re.search(
+            r"(?m)^\s*(\d+)\s+matched\s+lines?\s*$",
+            text,
+        )
+        match_count: int | None = None
+        if match_count_match:
+            match_count = int(match_count_match.group(1))
+        elif matched_lines_match:
+            match_count = int(matched_lines_match.group(1))
+
+        file_count: int | None = None
+        if file_count_match:
+            file_count = int(file_count_match.group(1))
+        return {
+            "match_count": match_count,
+            "file_count": file_count,
+        }
+
+    @staticmethod
+    def _infer_counts_from_output(output: str, *, files_only: bool) -> tuple[int | None, int]:
+        """Infer counts from CLI output without re-running search."""
+        lines = [line for line in str(output or "").splitlines() if line.strip()]
+        if not lines:
+            return 0, 0
+
+        if files_only:
+            files = {line.strip() for line in lines if line.strip()}
+            # In files_only mode, exact match_count is not always present unless
+            # tool-specific stats are available.
+            return None, len(files)
+
+        match_line_re = re.compile(r"^(?P<path>.+?):\d+:.+$")
+        context_line_re = re.compile(r"^(?P<path>.+?)-\d+-.+$")
+
+        match_count = 0
+        files: set[str] = set()
+        for line in lines:
+            if line == "--":
+                continue
+            match_hit = match_line_re.match(line)
+            if match_hit:
+                match_count += 1
+                files.add(match_hit.group("path"))
+                continue
+            context_hit = context_line_re.match(line)
+            if context_hit:
+                files.add(context_hit.group("path"))
+
+        if match_count == 0:
+            # Conservative fallback for unusual output shapes.
+            match_count = len(lines)
+
+        return match_count, len(files)

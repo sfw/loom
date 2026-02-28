@@ -3572,6 +3572,15 @@ class LoomApp(App):
             return mode
         return "adaptive"
 
+    def _cowork_max_context_tokens(self) -> int:
+        runner_limits = getattr(getattr(self._config, "limits", None), "runner", None)
+        if runner_limits is None:
+            return 24_000
+        return max(
+            4096,
+            int(getattr(runner_limits, "max_model_context_tokens", 24_000)),
+        )
+
     def _cowork_scratch_dir(self) -> Path | None:
         if self._config is None:
             return None
@@ -3655,6 +3664,7 @@ class LoomApp(App):
                 system_prompt=system_prompt,
                 approver=approver,
                 store=self._store,
+                max_context_tokens=self._cowork_max_context_tokens(),
                 model_retry_policy=self._model_retry_policy(),
                 tool_exposure_mode=self._cowork_tool_exposure_mode(),
                 enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
@@ -3701,6 +3711,7 @@ class LoomApp(App):
                 approver=approver,
                 store=self._store,
                 session_id=session_id,
+                max_context_tokens=self._cowork_max_context_tokens(),
                 model_retry_policy=self._model_retry_policy(),
                 tool_exposure_mode=self._cowork_tool_exposure_mode(),
                 enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
@@ -3717,6 +3728,7 @@ class LoomApp(App):
                 scratch_dir=self._cowork_scratch_dir(),
                 system_prompt=system_prompt,
                 approver=approver,
+                max_context_tokens=self._cowork_max_context_tokens(),
                 model_retry_policy=self._model_retry_policy(),
                 tool_exposure_mode=self._cowork_tool_exposure_mode(),
                 enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
@@ -5801,6 +5813,7 @@ class LoomApp(App):
             approver=approver,
             store=self._store,
             session_id=session_id,
+            max_context_tokens=self._cowork_max_context_tokens(),
             model_retry_policy=self._model_retry_policy(),
             tool_exposure_mode=self._cowork_tool_exposure_mode(),
             enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
@@ -5839,6 +5852,7 @@ class LoomApp(App):
             system_prompt=system_prompt,
             approver=approver,
             store=self._store,
+            max_context_tokens=self._cowork_max_context_tokens(),
             model_retry_policy=self._model_retry_policy(),
             tool_exposure_mode=self._cowork_tool_exposure_mode(),
             enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
@@ -7848,6 +7862,10 @@ class LoomApp(App):
                     tokens_per_second=event.tokens_per_second,
                     latency_ms=event.latency_ms,
                     total_time_ms=event.total_time_ms,
+                    context_tokens=event.context_tokens,
+                    context_messages=event.context_messages,
+                    omitted_messages=event.omitted_messages,
+                    recall_index_used=event.recall_index_used,
                 )
                 events_panel.add_event(
                     _now_str(), "turn",

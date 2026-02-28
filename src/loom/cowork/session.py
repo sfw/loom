@@ -68,6 +68,20 @@ class CoworkTurn:
     latency_ms: int = 0
     total_time_ms: int = 0
     tokens_per_second: float = 0.0
+    context_tokens: int = 0
+    context_messages: int = 0
+    omitted_messages: int = 0
+    recall_index_used: bool = False
+
+
+@dataclass(frozen=True)
+class _ContextWindowStats:
+    """Per-request context metadata for lightweight turn telemetry."""
+
+    context_tokens: int = 0
+    context_messages: int = 0
+    omitted_messages: int = 0
+    recall_index_used: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +93,14 @@ class CoworkTurn:
 _USER_INTERACTION_TOOLS = frozenset({"ask_user"})
 
 MAX_TOOL_ITERATIONS = 40
+MAX_IDENTICAL_TOOL_BATCH_STREAK = 3
+MAX_IDENTICAL_TOOL_BATCH_RECOVERY_HINTS = 1
+REPEATED_TOOL_BATCH_SYSTEM_HINT = (
+    "[System: You are repeating the same tool-call batch with identical arguments. "
+    "Do not call the same tools again unchanged. Synthesize a direct answer from "
+    "existing tool outputs. Only call another tool if arguments change and you "
+    "briefly justify why.]"
+)
 DEFAULT_TOOL_RESULT_OUTPUT_CHARS = 3_000
 HEAVY_TOOL_RESULT_OUTPUT_CHARS = 1_200
 _HEAVY_OUTPUT_TOOLS = frozenset({
@@ -308,13 +330,29 @@ _HYBRID_TOOL_STALL_MARKERS = (
 )
 _HYBRID_RECOVERY_SYSTEM_HINT = (
     "[System: In hybrid mode, if the needed tool is not directly callable, "
-    "use list_tools first to discover it, then call run_tool with the target "
-    "name and JSON arguments. Do not stop at describing tool availability.]"
+    "first call list_tools with {\"detail\":\"compact\"} to discover names, "
+    "then call list_tools with {\"detail\":\"schema\",\"query\":\"<tool name>\"} "
+    "to inspect arguments, then call run_tool with the exact tool name and JSON "
+    "arguments. Do not call list_tools schema broadly; keep schema lookup scoped "
+    "to the specific tool(s) you plan to run. Do not stop at describing tool "
+    "availability.]"
 )
 
 _TOOL_EXPOSURE_MODES = frozenset({"full", "adaptive", "hybrid"})
 _TYPED_TOOL_SCHEMA_CAP = 16
 _TYPED_TOOL_SCHEMA_BYTE_BUDGET = 12 * 1024
+_COMPACT_CONTEXT_TOKEN_CAP = 24_000
+_CONTEXT_OUTPUT_RESERVE_TOKENS = 4_000
+_CONTEXT_RECENT_MESSAGE_CAP = 48
+_RECALL_INDEX_MAX_USER_TOPICS = 4
+_RECALL_INDEX_MAX_TOOL_NAMES = 6
+_RECALL_INDEX_SNIPPET_CHARS = 96
+_RECALL_INDEX_MAX_CHARS = 1800
+_RESUMED_TOOL_OUTPUT_CHARS = 1400
+_RESUMED_TOOL_ERROR_CHARS = 600
+_RESUMED_TOOL_DATA_CHARS = 800
+_RESUMED_TOOL_RAW_CHARS = 1800
+_RESUMED_TOOL_FILES_PREVIEW = 8
 
 
 def _normalize_tool_exposure_mode(value: str) -> str:
@@ -383,6 +421,20 @@ def _tokens_per_second(tokens_used: int, total_time_ms: int) -> float:
     return float(tokens_used) / (float(total_time_ms) / 1000.0)
 
 
+def _compact_preview(text: Any, limit: int) -> tuple[str, bool]:
+    """Normalize and truncate text for compact context hints."""
+    normalized = " ".join(str(text or "").split())
+    if limit <= 0:
+        return "", bool(normalized)
+    if len(normalized) <= limit:
+        return normalized, False
+    marker = "...[truncated]"
+    if limit <= len(marker):
+        return normalized[:limit], True
+    keep = max(0, limit - len(marker))
+    return f"{normalized[:keep]}{marker}", True
+
+
 class CoworkSession:
     """Interactive cowork session.
 
@@ -409,7 +461,7 @@ class CoworkSession:
         store: ConversationStore | None = None,
         session_id: str = "",
         session_state: SessionState | None = None,
-        max_context_tokens: int = 180_000,
+        max_context_tokens: int = _COMPACT_CONTEXT_TOKEN_CAP,
         reflection: GapAnalysisEngine | None = None,
         model_retry_policy: ModelRetryPolicy | None = None,
         tool_exposure_mode: str = "adaptive",
@@ -424,7 +476,10 @@ class CoworkSession:
         self._workspace = workspace
         self._scratch_dir = scratch_dir
         self._max_context = max_context_messages
-        self._max_context_tokens = max_context_tokens
+        self._max_context_tokens = max(
+            4096,
+            int(max_context_tokens),
+        )
         self._approver = approver
         self._auth_context = auth_context
         self._total_tokens = 0
@@ -533,19 +588,30 @@ class CoworkSession:
 
         turn_started_at = time.monotonic()
         first_model_latency_ms: int | None = None
+        context_stats: _ContextWindowStats | None = None
         total_tokens = 0
         all_tool_events: list[ToolCallEvent] = []
         text_parts: list[str] = []
         turn_tool_schemas = self._tool_schemas_for_turn(user_message)
         hybrid_recovery_used = False
+        last_tool_batch_signature = ""
+        identical_tool_batch_streak = 0
+        repeated_tool_batch_recovery_hints_used = 0
 
         for _ in range(MAX_TOOL_ITERATIONS):
             # Call the model
-            response = await call_with_model_retry(
-                lambda: self._model.complete(
-                    self._context_window(),
+            async def _invoke_complete():
+                nonlocal context_stats
+                context_window, stats = self._context_window_with_stats()
+                if context_stats is None:
+                    context_stats = stats
+                return await self._model.complete(
+                    context_window,
                     tools=turn_tool_schemas or None,
-                ),
+                )
+
+            response = await call_with_model_retry(
+                _invoke_complete,
                 policy=self._model_retry_policy,
             )
             if first_model_latency_ms is None:
@@ -566,6 +632,47 @@ class CoworkSession:
                 text_parts.append(response.text)
 
             if response.has_tool_calls():
+                batch_signature = self._tool_batch_signature(response.tool_calls)
+                response_has_text = bool(str(response.text or "").strip())
+                if (
+                    batch_signature
+                    and not response_has_text
+                    and batch_signature == last_tool_batch_signature
+                ):
+                    identical_tool_batch_streak += 1
+                elif batch_signature:
+                    identical_tool_batch_streak = 1
+                else:
+                    identical_tool_batch_streak = 0
+                last_tool_batch_signature = batch_signature
+
+                if (
+                    identical_tool_batch_streak >= MAX_IDENTICAL_TOOL_BATCH_STREAK
+                    and repeated_tool_batch_recovery_hints_used
+                    < MAX_IDENTICAL_TOOL_BATCH_RECOVERY_HINTS
+                ):
+                    repeated_tool_batch_recovery_hints_used += 1
+                    self._messages.append({
+                        "role": "system",
+                        "content": REPEATED_TOOL_BATCH_SYSTEM_HINT,
+                    })
+                    await self._persist_turn(
+                        "system",
+                        content=REPEATED_TOOL_BATCH_SYSTEM_HINT,
+                    )
+                    continue
+
+                if (
+                    identical_tool_batch_streak >= MAX_IDENTICAL_TOOL_BATCH_STREAK
+                    and repeated_tool_batch_recovery_hints_used
+                    >= MAX_IDENTICAL_TOOL_BATCH_RECOVERY_HINTS
+                ):
+                    fallback = self._build_repeated_tool_batch_fallback(all_tool_events)
+                    self._messages.append({"role": "assistant", "content": fallback})
+                    await self._persist_turn("assistant", content=fallback)
+                    text_parts.append(fallback)
+                    break
+
                 tc_dicts = self._tool_calls_to_dicts(response.tool_calls)
                 self._messages.append({
                     "role": "assistant",
@@ -648,6 +755,7 @@ class CoworkSession:
         # Persist session metadata
         await self._persist_session_metadata()
 
+        final_context = context_stats or _ContextWindowStats()
         yield CoworkTurn(
             text=response_text,
             tool_calls=all_tool_events,
@@ -656,6 +764,10 @@ class CoworkSession:
             latency_ms=latency_ms,
             total_time_ms=interaction_elapsed_ms,
             tokens_per_second=tokens_per_second,
+            context_tokens=final_context.context_tokens,
+            context_messages=final_context.context_messages,
+            omitted_messages=final_context.omitted_messages,
+            recall_index_used=final_context.recall_index_used,
         )
 
     async def send_streaming(
@@ -681,22 +793,33 @@ class CoworkSession:
 
         turn_started_at = time.monotonic()
         first_model_latency_ms: int | None = None
+        context_stats: _ContextWindowStats | None = None
         total_tokens = 0
         all_tool_events: list[ToolCallEvent] = []
         all_text_parts: list[str] = []
         turn_tool_schemas = self._tool_schemas_for_turn(user_message)
         hybrid_recovery_used = False
+        last_tool_batch_signature = ""
+        identical_tool_batch_streak = 0
+        repeated_tool_batch_recovery_hints_used = 0
 
         for _ in range(MAX_TOOL_ITERATIONS):
             iter_text_parts: list[str] = []
             final_tool_calls: list[ToolCall] | None = None
             final_usage = None
 
-            async for chunk in stream_with_model_retry(
-                lambda: self._model.stream(
-                    self._context_window(),
+            def _invoke_stream():
+                nonlocal context_stats
+                context_window, stats = self._context_window_with_stats()
+                if context_stats is None:
+                    context_stats = stats
+                return self._model.stream(
+                    context_window,
                     tools=turn_tool_schemas or None,
-                ),
+                )
+
+            async for chunk in stream_with_model_retry(
+                _invoke_stream,
                 policy=self._model_retry_policy,
             ):
                 if first_model_latency_ms is None and (
@@ -734,6 +857,47 @@ class CoworkSession:
                 all_text_parts.append(response_text)
 
             if final_tool_calls:
+                batch_signature = self._tool_batch_signature(final_tool_calls)
+                response_has_text = bool(str(response_text or "").strip())
+                if (
+                    batch_signature
+                    and not response_has_text
+                    and batch_signature == last_tool_batch_signature
+                ):
+                    identical_tool_batch_streak += 1
+                elif batch_signature:
+                    identical_tool_batch_streak = 1
+                else:
+                    identical_tool_batch_streak = 0
+                last_tool_batch_signature = batch_signature
+
+                if (
+                    identical_tool_batch_streak >= MAX_IDENTICAL_TOOL_BATCH_STREAK
+                    and repeated_tool_batch_recovery_hints_used
+                    < MAX_IDENTICAL_TOOL_BATCH_RECOVERY_HINTS
+                ):
+                    repeated_tool_batch_recovery_hints_used += 1
+                    self._messages.append({
+                        "role": "system",
+                        "content": REPEATED_TOOL_BATCH_SYSTEM_HINT,
+                    })
+                    await self._persist_turn(
+                        "system",
+                        content=REPEATED_TOOL_BATCH_SYSTEM_HINT,
+                    )
+                    continue
+
+                if (
+                    identical_tool_batch_streak >= MAX_IDENTICAL_TOOL_BATCH_STREAK
+                    and repeated_tool_batch_recovery_hints_used
+                    >= MAX_IDENTICAL_TOOL_BATCH_RECOVERY_HINTS
+                ):
+                    fallback = self._build_repeated_tool_batch_fallback(all_tool_events)
+                    self._messages.append({"role": "assistant", "content": fallback})
+                    await self._persist_turn("assistant", content=fallback)
+                    all_text_parts.append(fallback)
+                    break
+
                 tc_dicts = self._tool_calls_to_dicts(final_tool_calls)
                 self._messages.append({
                     "role": "assistant",
@@ -813,6 +977,7 @@ class CoworkSession:
 
         await self._persist_session_metadata()
 
+        final_context = context_stats or _ContextWindowStats()
         yield CoworkTurn(
             text=response_text,
             tool_calls=all_tool_events,
@@ -821,6 +986,10 @@ class CoworkSession:
             latency_ms=latency_ms,
             total_time_ms=interaction_elapsed_ms,
             tokens_per_second=tokens_per_second,
+            context_tokens=final_context.context_tokens,
+            context_messages=final_context.context_messages,
+            omitted_messages=final_context.omitted_messages,
+            recall_index_used=final_context.recall_index_used,
         )
 
     # ------------------------------------------------------------------
@@ -849,21 +1018,201 @@ class CoworkSession:
 
         # Load recent turns into in-memory cache
         recent = await self._store.resume_session(session_id)
-        self._messages = [{"role": "system", "content": self._build_system_content()}] + recent
+        self._messages = [
+            {"role": "system", "content": self._build_system_content()},
+            *self._normalize_resumed_messages(recent),
+        ]
 
     # ------------------------------------------------------------------
     # Context management
     # ------------------------------------------------------------------
 
-    def _context_window(self) -> list[dict]:
-        """Return the messages to send to the model.
+    @staticmethod
+    def _normalize_resumed_messages(messages: list[dict]) -> list[dict]:
+        """Normalize DB-restored messages to compact model-facing payloads."""
+        normalized: list[dict] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            out = dict(msg)
+            if out.get("role") == "tool":
+                raw_content = out.get("content")
+                if isinstance(raw_content, str):
+                    out["content"] = CoworkSession._compact_resumed_tool_content(raw_content)
+            normalized.append(out)
+        return normalized
 
-        Token-aware: walks backward from most recent messages, adding
-        turns until the token budget is exhausted.  System prompt is
-        always included.  Ensures we never cut mid assistant→tool sequence.
-        """
+    @staticmethod
+    def _compact_resumed_tool_content(raw_content: str) -> str:
+        """Compact large persisted ToolResult JSON for resumed prompt context."""
+        if not raw_content:
+            return ""
+
+        try:
+            parsed = json.loads(raw_content)
+        except (json.JSONDecodeError, TypeError):
+            compact, _ = _compact_preview(raw_content, _RESUMED_TOOL_RAW_CHARS)
+            return compact
+
+        if not isinstance(parsed, dict):
+            compact, _ = _compact_preview(raw_content, _RESUMED_TOOL_RAW_CHARS)
+            return compact
+
+        if not any(
+            key in parsed
+            for key in (
+                "success",
+                "output",
+                "error",
+                "data",
+                "files_changed",
+                "content_blocks",
+            )
+        ):
+            compact, _ = _compact_preview(raw_content, _RESUMED_TOOL_RAW_CHARS)
+            return compact
+
+        compact_payload: dict[str, Any] = {
+            "success": bool(parsed.get("success", False)),
+        }
+
+        output = parsed.get("output")
+        if output not in (None, ""):
+            preview, truncated = _compact_preview(output, _RESUMED_TOOL_OUTPUT_CHARS)
+            compact_payload["output"] = preview
+            if truncated:
+                compact_payload["output_truncated"] = True
+
+        error = parsed.get("error")
+        if error not in (None, ""):
+            preview, truncated = _compact_preview(error, _RESUMED_TOOL_ERROR_CHARS)
+            compact_payload["error"] = preview
+            if truncated:
+                compact_payload["error_truncated"] = True
+
+        files_changed = parsed.get("files_changed")
+        if isinstance(files_changed, list) and files_changed:
+            cleaned = [
+                str(path).strip()
+                for path in files_changed
+                if str(path).strip()
+            ]
+            if cleaned:
+                compact_payload["files_changed_count"] = len(cleaned)
+                compact_payload["files_changed_preview"] = cleaned[:_RESUMED_TOOL_FILES_PREVIEW]
+
+        data = parsed.get("data")
+        if data not in (None, {}, [], ""):
+            if isinstance(data, dict):
+                compact_payload["data_keys"] = sorted(str(k) for k in data.keys())[:12]
+            data_text, data_truncated = _compact_preview(
+                json.dumps(data, ensure_ascii=False, default=str),
+                _RESUMED_TOOL_DATA_CHARS,
+            )
+            compact_payload["data_preview"] = data_text
+            if data_truncated:
+                compact_payload["data_truncated"] = True
+
+        blocks = parsed.get("content_blocks")
+        if isinstance(blocks, list) and blocks:
+            block_types = [
+                str(block.get("type", "")).strip()
+                for block in blocks
+                if isinstance(block, dict) and str(block.get("type", "")).strip()
+            ]
+            compact_payload["content_blocks"] = {
+                "count": len(blocks),
+                "types": block_types[:8],
+            }
+
+        return json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _build_recall_index_message(
+        self,
+        *,
+        omitted_messages: list[dict],
+        selected_messages: list[dict],
+    ) -> dict | None:
+        """Build a compact archive index that steers recall-tool usage."""
+        if not omitted_messages:
+            return None
+
+        archived_user_topics: list[str] = []
+        for msg in reversed(omitted_messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            snippet, _ = _compact_preview(content, _RECALL_INDEX_SNIPPET_CHARS)
+            if snippet and snippet not in archived_user_topics:
+                archived_user_topics.append(snippet)
+            if len(archived_user_topics) >= _RECALL_INDEX_MAX_USER_TOPICS:
+                break
+
+        archived_tool_names: list[str] = []
+        for msg in reversed(omitted_messages):
+            if msg.get("role") != "assistant":
+                continue
+            tool_calls = msg.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function")
+                if isinstance(fn, dict):
+                    name = str(fn.get("name", "")).strip()
+                else:
+                    name = str(call.get("name", "")).strip()
+                if name and name not in archived_tool_names:
+                    archived_tool_names.append(name)
+                if len(archived_tool_names) >= _RECALL_INDEX_MAX_TOOL_NAMES:
+                    break
+            if len(archived_tool_names) >= _RECALL_INDEX_MAX_TOOL_NAMES:
+                break
+
+        omitted_tool_messages = sum(
+            1
+            for msg in omitted_messages
+            if str(msg.get("role", "")).strip() == "tool"
+        )
+
+        lines = [
+            "[System: Compact archive index for omitted conversation history.]",
+            f"- Omitted older messages: {len(omitted_messages)}",
+            f"- Omitted tool-result messages: {omitted_tool_messages}",
+            f"- Recent messages kept live: {len(selected_messages)}",
+        ]
+        if archived_user_topics:
+            lines.append("- Archived user topics: " + " | ".join(archived_user_topics))
+        if archived_tool_names:
+            lines.append("- Archived tool activity: " + ", ".join(archived_tool_names))
+        lines.extend([
+            (
+                "- When older details are needed, use conversation_recall "
+                "before asking the user to repeat."
+            ),
+            "- Recall actions:",
+            '  * {"action":"search","query":"<keywords>","limit":5}',
+            '  * {"action":"range","start_turn":<int>,"end_turn":<int>}',
+            '  * {"action":"tool_calls","tool_name":"<tool>","limit":5}',
+            '  * {"action":"summary"}',
+        ])
+
+        content = "\n".join(lines)
+        compact_content, _ = _compact_preview(content, _RECALL_INDEX_MAX_CHARS)
+        return {"role": "system", "content": compact_content}
+
+    def _context_window(self) -> list[dict]:
+        """Return the messages to send to the model."""
+        window, _stats = self._context_window_with_stats()
+        return window
+
+    def _context_window_with_stats(self) -> tuple[list[dict], _ContextWindowStats]:
+        """Return model context plus lightweight telemetry stats."""
         if not self._messages:
-            return []
+            return [], _ContextWindowStats()
 
         # Always include system prompt
         system = []
@@ -873,13 +1222,27 @@ class CoworkSession:
             rest = self._messages[1:]
 
         system_tokens = sum(_estimate_message_tokens(m) for m in system)
-        budget = self._max_context_tokens - system_tokens - 4000  # reserve for output
+        effective_context_cap = int(self._max_context_tokens)
+        budget = max(
+            1,
+            effective_context_cap - system_tokens - _CONTEXT_OUTPUT_RESERVE_TOKENS,
+        )
+        recent_message_cap = max(
+            8,
+            min(int(self._max_context), _CONTEXT_RECENT_MESSAGE_CAP),
+        )
 
         # Walk backward, adding messages until budget is exhausted
         selected: list[dict] = []
         used = 0
         for msg in reversed(rest):
+            if len(selected) >= recent_message_cap:
+                break
             msg_tokens = _estimate_message_tokens(msg)
+            if msg_tokens > budget:
+                # One oversized message (typically a large tool result) should
+                # not collapse the entire context window.
+                continue
             if used + msg_tokens > budget:
                 break
             selected.append(msg)
@@ -892,7 +1255,121 @@ class CoworkSession:
         while selected and selected[0].get("role") == "tool":
             selected.pop(0)
 
-        return system + selected
+        omitted_messages = rest[: max(0, len(rest) - len(selected))]
+        recall_index_used = False
+        recall_index = self._build_recall_index_message(
+            omitted_messages=omitted_messages,
+            selected_messages=selected,
+        )
+        if recall_index is not None:
+            recall_tokens = _estimate_message_tokens(recall_index)
+            while selected and (used + recall_tokens) > budget:
+                removed = selected.pop(0)
+                used = max(0, used - _estimate_message_tokens(removed))
+                while selected and selected[0].get("role") == "tool":
+                    removed_tool = selected.pop(0)
+                    used = max(0, used - _estimate_message_tokens(removed_tool))
+
+            if recall_tokens <= max(1, budget - used):
+                selected = [recall_index, *selected]
+                recall_index_used = True
+
+        final_window = self._sanitize_tool_call_sequence(system + selected)
+        omitted_count = max(0, len(rest) - (len(selected) - (1 if recall_index_used else 0)))
+        context_tokens = sum(_estimate_message_tokens(msg) for msg in final_window)
+        stats = _ContextWindowStats(
+            context_tokens=context_tokens,
+            context_messages=len(final_window),
+            omitted_messages=omitted_count,
+            recall_index_used=recall_index_used,
+        )
+        return final_window, stats
+
+    @staticmethod
+    def _extract_tool_call_ids(tool_calls: list[dict]) -> list[str]:
+        """Extract normalized tool_call IDs from an assistant tool-calls payload."""
+        ids: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("id", "") or "").strip()
+            if call_id:
+                ids.append(call_id)
+        return ids
+
+    @classmethod
+    def _sanitize_tool_call_sequence(cls, messages: list[dict]) -> list[dict]:
+        """Drop malformed tool-call chains that would fail provider validation.
+
+        Providers require assistant messages containing `tool_calls` to be
+        immediately followed by tool messages for each declared call ID.
+        Interrupted turns can leave dangling assistant tool_calls or orphan tool
+        messages in persisted history. This sanitizer repairs context before model
+        invocation without mutating archived turns.
+        """
+        if not messages:
+            return []
+
+        sanitized: list[dict] = []
+        idx = 0
+        total = len(messages)
+
+        while idx < total:
+            msg = messages[idx]
+            if not isinstance(msg, dict):
+                idx += 1
+                continue
+
+            role = str(msg.get("role", "")).strip()
+            if role == "assistant":
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    expected_ids = cls._extract_tool_call_ids(tool_calls)
+                    next_idx = idx + 1
+                    contiguous_tools: list[dict] = []
+                    seen_ids: set[str] = set()
+                    while next_idx < total:
+                        candidate = messages[next_idx]
+                        if not isinstance(candidate, dict):
+                            break
+                        if str(candidate.get("role", "")).strip() != "tool":
+                            break
+                        contiguous_tools.append(candidate)
+                        tool_call_id = str(
+                            candidate.get("tool_call_id", "") or "",
+                        ).strip()
+                        if tool_call_id:
+                            seen_ids.add(tool_call_id)
+                        next_idx += 1
+
+                    has_complete_chain = (
+                        not expected_ids
+                        or all(call_id in seen_ids for call_id in expected_ids)
+                    )
+                    if has_complete_chain:
+                        sanitized.append(msg)
+                        sanitized.extend(contiguous_tools)
+                    else:
+                        repaired = dict(msg)
+                        repaired.pop("tool_calls", None)
+                        sanitized.append(repaired)
+                    idx = next_idx
+                    continue
+
+                sanitized.append(msg)
+                idx += 1
+                continue
+
+            if role == "tool":
+                # Orphan tool messages without an immediately preceding assistant
+                # tool-calls chain break provider validation.
+                idx += 1
+                continue
+
+            sanitized.append(msg)
+            idx += 1
+
+        return sanitized
 
     async def _execute_tool_call(
         self,
@@ -1402,6 +1879,64 @@ class CoworkSession:
         )
 
     @staticmethod
+    def _tool_batch_signature(tool_calls: list[ToolCall] | None) -> str:
+        """Return a stable signature for one assistant tool-call batch."""
+        if not tool_calls:
+            return ""
+        normalized: list[dict[str, Any]] = []
+        for tc in tool_calls:
+            normalized.append({
+                "name": str(getattr(tc, "name", "") or "").strip(),
+                "arguments": dict(getattr(tc, "arguments", {}) or {}),
+            })
+        return json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _build_repeated_tool_batch_fallback(
+        self,
+        tool_events: list[ToolCallEvent],
+    ) -> str:
+        """Return a deterministic user-facing fallback when tool loops stall."""
+        last_completed = next(
+            (
+                event
+                for event in reversed(tool_events)
+                if event.result is not None
+            ),
+            None,
+        )
+        if last_completed and last_completed.result:
+            output_preview, _ = _compact_preview(
+                last_completed.result.output,
+                280,
+            )
+            if output_preview:
+                return (
+                    "I stopped because the model repeated identical tool calls without "
+                    "making progress. "
+                    f"Latest {last_completed.name} result: {output_preview}"
+                )
+            if last_completed.result.error:
+                error_preview, _ = _compact_preview(
+                    last_completed.result.error,
+                    220,
+                )
+                return (
+                    "I stopped because the model repeated identical tool calls without "
+                    "making progress. "
+                    f"Latest {last_completed.name} error: {error_preview}"
+                )
+        return (
+            "I stopped because the model repeated identical tool calls without making "
+            "progress. I can continue once we change the query or tool arguments."
+        )
+
+    @staticmethod
     def _tool_output_limit(tool_name: str) -> int:
         if tool_name in _HEAVY_OUTPUT_TOOLS:
             return HEAVY_TOOL_RESULT_OUTPUT_CHARS
@@ -1615,6 +2150,11 @@ TOOL USAGE:
 - Use git_command for version control operations (including push).
 - Use task_tracker to organize multi-step work and show progress.
 - Use ask_user when you need the developer's input or decision.
+- In hybrid mode when a needed tool is not directly typed:
+  1) call list_tools with {{"detail":"compact"}} to discover tool names
+  2) call list_tools with {{"detail":"schema","query":"<tool name>"}} for argument schema
+  3) call run_tool with the exact tool name and JSON arguments
+  Do not use list_tools schema globally; always narrow with query/category/filters.
 
 CONVERSATION HISTORY:
 - Your context window contains only recent turns. The full session history
