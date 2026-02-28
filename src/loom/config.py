@@ -210,6 +210,16 @@ class ProcessConfig:
 
 
 @dataclass(frozen=True)
+class TUIConfig:
+    """Configuration for TUI replay/render behavior."""
+
+    chat_resume_page_size: int = 250
+    chat_resume_max_rendered_rows: int = 1200
+    chat_resume_use_event_journal: bool = True
+    chat_resume_enable_legacy_fallback: bool = True
+
+
+@dataclass(frozen=True)
 class RunnerLimitsConfig:
     """Execution-time sizing and compaction limits for subtask runner."""
 
@@ -326,6 +336,7 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     process: ProcessConfig = field(default_factory=ProcessConfig)
+    tui: TUIConfig = field(default_factory=TUIConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
 
@@ -847,6 +858,36 @@ def load_config(path: Path | None = None) -> Config:
         ),
     )
 
+    tui_data = raw.get("tui", {})
+    if not isinstance(tui_data, dict):
+        tui_data = {}
+    tui = TUIConfig(
+        chat_resume_page_size=_int_from(
+            tui_data,
+            "chat_resume_page_size",
+            TUIConfig.chat_resume_page_size,
+            minimum=20,
+            maximum=500,
+        ),
+        chat_resume_max_rendered_rows=_int_from(
+            tui_data,
+            "chat_resume_max_rendered_rows",
+            TUIConfig.chat_resume_max_rendered_rows,
+            minimum=100,
+            maximum=10_000,
+        ),
+        chat_resume_use_event_journal=_bool_from(
+            tui_data,
+            "chat_resume_use_event_journal",
+            TUIConfig.chat_resume_use_event_journal,
+        ),
+        chat_resume_enable_legacy_fallback=_bool_from(
+            tui_data,
+            "chat_resume_enable_legacy_fallback",
+            TUIConfig.chat_resume_enable_legacy_fallback,
+        ),
+    )
+
     limits_data = raw.get("limits", {})
     if not isinstance(limits_data, dict):
         limits_data = {}
@@ -1335,6 +1376,7 @@ def load_config(path: Path | None = None) -> Config:
         memory=memory,
         logging=logging_cfg,
         process=process,
+        tui=tui,
         limits=limits,
         mcp=MCPConfig(servers=mcp_servers),
     )

@@ -100,6 +100,24 @@ CREATE INDEX IF NOT EXISTS idx_ct_session_turn ON conversation_turns(session_id,
 CREATE INDEX IF NOT EXISTS idx_ct_role ON conversation_turns(session_id, role);
 CREATE INDEX IF NOT EXISTS idx_ct_tool_name ON conversation_turns(tool_name);
 
+-- Cowork chat replay journal (UI-facing transcript events)
+CREATE TABLE IF NOT EXISTS cowork_chat_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    payload TEXT NOT NULL,                            -- JSON payload (versioned)
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES cowork_sessions(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cce_session_seq
+    ON cowork_chat_events(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_cce_session_created
+    ON cowork_chat_events(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cce_session_id
+    ON cowork_chat_events(session_id, id);
+
 -- Durable task run lifecycle (for crash-safe background execution)
 CREATE TABLE IF NOT EXISTS task_runs (
     run_id TEXT PRIMARY KEY,

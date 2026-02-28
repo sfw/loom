@@ -1986,6 +1986,304 @@ class TestStartupSessionResume:
 
         assert app._input_history == ["/help", "summarize the doc"]
 
+    @pytest.mark.asyncio
+    async def test_initialize_session_auto_resume_replays_chat_history(self, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        class FakeSession:
+            def __init__(self, **_kwargs):
+                self.total_tokens = 12
+                self.session_id = "latest-session"
+                self.session_state = SimpleNamespace(turn_count=4, ui_state={})
+                self.messages = [{"role": "system", "content": "system"}]
+
+            async def resume(self, _session_id: str) -> None:
+                self.messages = [{"role": "system", "content": "system"}]
+
+        monkeypatch.setattr("loom.tui.app.CoworkSession", FakeSession)
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._store = MagicMock()
+        app._store.get_chat_events = AsyncMock(return_value=[
+            {
+                "seq": 1,
+                "event_type": "user_message",
+                "payload": {"text": "hello"},
+            },
+            {
+                "seq": 2,
+                "event_type": "assistant_text",
+                "payload": {"text": "world", "markup": False},
+            },
+        ])
+        app._resolve_startup_resume_target = AsyncMock(return_value=("latest-session", True))
+        app._refresh_tool_registry = MagicMock()
+        app._load_process_definition = MagicMock()
+        app._refresh_process_command_index = MagicMock()
+        app._ensure_persistence_tools = MagicMock()
+        app._apply_process_tool_policy = MagicMock()
+        app._build_system_prompt = MagicMock(return_value="system")
+        app._bind_session_tools = MagicMock()
+        app._restore_process_run_tabs = AsyncMock()
+        app._set_slash_hint = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._tools.list_tools = MagicMock(return_value=[])
+
+        chat = MagicMock()
+        chat.children = []
+        status = SimpleNamespace(workspace_name="", model_name="", process_name="")
+        input_widget = SimpleNamespace(focus=MagicMock())
+
+        def _query_one(selector: str, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#status-bar":
+                return status
+            if selector == "#user-input":
+                return input_widget
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        await app._initialize_session()
+
+        chat.add_user_message.assert_any_call("hello")
+        chat.add_model_text.assert_any_call("world", markup=False)
+
+
+class TestChatReplayHydration:
+    class _PerfChat:
+        def __init__(self):
+            self.children = []
+
+        def add_user_message(self, _text):
+            return None
+
+        def add_model_text(self, _text, *, markup=False):
+            _ = markup
+            return None
+
+        def add_tool_call(
+            self,
+            _tool_name,
+            _args,
+            *,
+            success=None,
+            elapsed_ms=0,
+            output="",
+            error="",
+        ):
+            _ = (success, elapsed_ms, output, error)
+            return None
+
+        def add_content_indicator(self, _blocks):
+            return None
+
+        def add_turn_separator(
+            self,
+            _tool_count,
+            _tokens,
+            _model,
+            *,
+            tokens_per_second=0.0,
+            latency_ms=0,
+            total_time_ms=0,
+            context_tokens=0,
+            context_messages=0,
+            omitted_messages=0,
+            recall_index_used=False,
+        ):
+            _ = (
+                tokens_per_second,
+                latency_ms,
+                total_time_ms,
+                context_tokens,
+                context_messages,
+                omitted_messages,
+                recall_index_used,
+            )
+            return None
+
+        def add_info(self, _text, *, markup=True):
+            _ = markup
+            return None
+
+    @pytest.mark.asyncio
+    async def test_hydrate_chat_history_skips_bad_row_and_keeps_rendering(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(session_id="session-1")
+        app._store = MagicMock()
+        app._store.get_chat_events = AsyncMock(return_value=[
+            {"seq": 1, "event_type": "user_message", "payload": {"text": "boom"}},
+            {
+                "seq": 2,
+                "event_type": "assistant_text",
+                "payload": {"text": "still renders", "markup": False},
+            },
+        ])
+        app._store.synthesize_chat_events_from_turns = AsyncMock(return_value=[])
+
+        chat = MagicMock()
+        chat.children = []
+        chat.add_user_message.side_effect = RuntimeError("bad row")
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._hydrate_chat_history_for_active_session()
+
+        chat.add_model_text.assert_called_once_with("still renders", markup=False)
+
+    @pytest.mark.asyncio
+    async def test_append_chat_replay_event_trims_with_continuity_sentinel(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._chat_resume_max_rendered_rows = MagicMock(return_value=2)
+
+        chat = MagicMock()
+        chat.children = []
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._append_chat_replay_event(
+            "user_message",
+            {"text": "one"},
+            persist=False,
+        )
+        await app._append_chat_replay_event(
+            "user_message",
+            {"text": "two"},
+            persist=False,
+        )
+        await app._append_chat_replay_event(
+            "user_message",
+            {"text": "three"},
+            persist=False,
+        )
+
+        assert [row["payload"]["text"] for row in app._chat_replay_events] == ["two", "three"]
+        sentinel = chat.add_info.call_args_list[-1].args[0]
+        assert "Transcript window truncated" in sentinel
+
+    @pytest.mark.asyncio
+    async def test_append_chat_replay_event_does_not_render_by_default(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        chat.children = []
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._append_chat_replay_event(
+            "user_message",
+            {"text": "hello"},
+            persist=False,
+        )
+
+        assert app._chat_replay_events[-1]["event_type"] == "user_message"
+        chat.add_user_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_chat_hydrate_perf_latest_300_rows_under_target(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(session_id="session-1")
+        app._store = MagicMock()
+        app._store.get_chat_events = AsyncMock(return_value=[
+            {
+                "seq": idx + 1,
+                "event_type": "user_message",
+                "payload": {"text": f"row {idx + 1}"},
+            }
+            for idx in range(300)
+        ])
+        app._store.synthesize_chat_events_from_turns = AsyncMock(return_value=[])
+
+        chat = self._PerfChat()
+        app.query_one = MagicMock(return_value=chat)
+
+        started = asyncio.get_running_loop().time()
+        await app._hydrate_chat_history_for_active_session()
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert elapsed < 0.8
+
+    @pytest.mark.asyncio
+    async def test_chat_hydrate_perf_older_200_rows_under_target(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(session_id="session-1")
+        app._store = MagicMock()
+
+        latest = [
+            {
+                "seq": seq,
+                "event_type": "user_message",
+                "payload": {"text": f"latest {seq}"},
+            }
+            for seq in range(201, 401)
+        ]
+        older = [
+            {
+                "seq": seq,
+                "event_type": "user_message",
+                "payload": {"text": f"older {seq}"},
+            }
+            for seq in range(1, 201)
+        ]
+
+        async def _get_chat_events(
+            _session_id: str,
+            *,
+            before_seq: int | None = None,
+            after_seq: int | None = None,
+            limit: int = 200,
+        ):
+            _ = (after_seq, limit)
+            if before_seq is None:
+                return latest
+            return older if before_seq == 201 else []
+
+        app._store.get_chat_events = AsyncMock(side_effect=_get_chat_events)
+        app._store.synthesize_chat_events_from_turns = AsyncMock(return_value=[])
+
+        chat = self._PerfChat()
+        app.query_one = MagicMock(return_value=chat)
+        await app._hydrate_chat_history_for_active_session()
+
+        started = asyncio.get_running_loop().time()
+        loaded = await app._load_older_chat_history()
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert loaded is True
+        assert elapsed < 0.35
+
 
 class TestQuitConfirmation:
     @pytest.mark.asyncio
@@ -2153,6 +2451,19 @@ class TestSlashCommandHints:
         assert "/investment-analysis <goal>" in hint
         assert "/marketing-strategy <goal>" in hint
 
+    def test_root_slash_uses_priority_ordering(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/")
+        assert hint.index("/new") < hint.index("/run")
+        assert hint.index("/run") < hint.index("/mcp")
+        assert hint.index("/mcp") < hint.index("/help")
+
     def test_prefix_filters_matches(self):
         from loom.tui.app import LoomApp
 
@@ -2203,6 +2514,20 @@ class TestSlashCommandHints:
         assert "Matching /p:" in hint
         assert "/process" in hint
 
+    def test_exact_match_keeps_prefix_siblings(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/process")
+        assert "Matching /process:" in hint
+        assert "/process " in hint
+        assert "/processes" in hint
+        assert hint.index("/process ") < hint.index("/processes")
+
     def test_process_use_hint_shows_available_processes(self):
         from loom.tui.app import LoomApp
 
@@ -2240,6 +2565,28 @@ class TestSlashCommandHints:
         assert "Process matches 'inv':" in hint
         assert "investment-analysis" in hint
         assert "marketing-strategy" not in hint
+
+    def test_process_use_hint_does_not_truncate_large_match_sets(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        catalog = [
+            {"name": f"process-{idx:02d}", "version": "1.0"}
+            for idx in range(1, 16)
+        ]
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=catalog)
+        ))
+
+        hint = app._render_slash_hint("/process use process-")
+
+        assert "... and " not in hint
+        for idx in range(1, 16):
+            assert f"process-{idx:02d}" in hint
 
     def test_prefix_r_matches_resume_and_run(self):
         from loom.tui.app import LoomApp
@@ -2311,7 +2658,27 @@ class TestSlashCommandHints:
         assert captured
         assert "/help" in captured[-1]
 
-    def test_set_slash_hint_sets_height_from_line_count(self):
+    @pytest.mark.asyncio
+    async def test_slash_hint_container_supports_overflow_scrolling(self):
+        from textual.containers import VerticalScroll
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/Users/sfw/Development/loom"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(100, 14)) as pilot:
+            await pilot.press("/")
+            await pilot.pause()
+            hint = app.query_one("#slash-hint", VerticalScroll)
+            assert hint.display is True
+            assert hint.max_scroll_y > 0
+
+    def test_set_slash_hint_updates_scroll_container(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -2321,16 +2688,17 @@ class TestSlashCommandHints:
         )
         fake_hint = SimpleNamespace(
             display=False,
-            styles=SimpleNamespace(height=None),
-            update=MagicMock(),
             scroll_home=MagicMock(),
         )
+        fake_hint_body = SimpleNamespace(update=MagicMock())
         fake_footer = SimpleNamespace(display=True)
         fake_status = SimpleNamespace(display=True)
 
         def _query_one(selector, *_args, **_kwargs):
             if selector == "#slash-hint":
                 return fake_hint
+            if selector == "#slash-hint-body":
+                return fake_hint_body
             if selector == "#status-bar":
                 return fake_status
             return fake_footer
@@ -2340,13 +2708,13 @@ class TestSlashCommandHints:
         app._set_slash_hint("a\nb\nc")
 
         assert fake_hint.display is True
-        assert fake_hint.styles.height == 3
+        fake_hint_body.update.assert_called_once_with("a\nb\nc")
         fake_hint.scroll_home.assert_called_once_with(animate=False)
         # Slash hints no longer toggle footer/status visibility.
         assert fake_footer.display is True
         assert fake_status.display is True
 
-    def test_set_slash_hint_empty_resets_auto_height(self):
+    def test_set_slash_hint_empty_hides_container_and_clears_body(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -2356,16 +2724,17 @@ class TestSlashCommandHints:
         )
         fake_hint = SimpleNamespace(
             display=True,
-            styles=SimpleNamespace(height=5),
-            update=MagicMock(),
             scroll_home=MagicMock(),
         )
+        fake_hint_body = SimpleNamespace(update=MagicMock())
         fake_footer = SimpleNamespace(display=False)
         fake_status = SimpleNamespace(display=False)
 
         def _query_one(selector, *_args, **_kwargs):
             if selector == "#slash-hint":
                 return fake_hint
+            if selector == "#slash-hint-body":
+                return fake_hint_body
             if selector == "#status-bar":
                 return fake_status
             return fake_footer
@@ -2375,7 +2744,8 @@ class TestSlashCommandHints:
         app._set_slash_hint("")
 
         assert fake_hint.display is False
-        assert fake_hint.styles.height == "auto"
+        fake_hint_body.update.assert_called_once_with("")
+        fake_hint.scroll_home.assert_called_once_with(animate=False)
         # Slash hints no longer toggle footer/status visibility.
         assert fake_footer.display is False
         assert fake_status.display is False
@@ -2392,14 +2762,14 @@ class TestSlashCommandHints:
             list_available=MagicMock(return_value=[])
         ))
         assert app._slash_completion_candidates("/s") == [
-            "/setup",
-            "/session",
             "/sessions",
+            "/session",
+            "/setup",
         ]
-        assert app._slash_completion_candidates("/h") == ["/help"]
-        assert app._slash_completion_candidates("/m") == ["/model", "/mcp"]
+        assert app._slash_completion_candidates("/h") == ["/history", "/help"]
+        assert app._slash_completion_candidates("/m") == ["/mcp", "/model"]
         assert app._slash_completion_candidates("/t") == ["/tools", "/tokens"]
-        assert app._slash_completion_candidates("/p") == ["/process", "/processes"]
+        assert app._slash_completion_candidates("/p") == ["/processes", "/process"]
         assert app._slash_completion_candidates("/r") == ["/resume", "/run"]
 
     def test_slash_completion_candidates_include_dynamic_process_commands(self):
@@ -2419,8 +2789,8 @@ class TestSlashCommandHints:
 
         assert app._slash_completion_candidates("/i") == ["/investment-analysis"]
         assert app._slash_completion_candidates("/m") == [
-            "/model",
             "/mcp",
+            "/model",
             "/marketing-strategy",
         ]
 
@@ -7337,16 +7707,16 @@ class TestCommandPaletteProcessActions:
         app.query_one = MagicMock(return_value=input_widget)
 
         assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/setup"
+        assert input_widget.value == "/sessions"
 
         assert app._apply_slash_tab_completion(reverse=False) is True
         assert input_widget.value == "/session"
 
         assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/sessions"
+        assert input_widget.value == "/setup"
 
         assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/setup"
+        assert input_widget.value == "/sessions"
 
     def test_slash_tab_completion_cycles_backward(self):
         from loom.tui.app import LoomApp
@@ -7360,7 +7730,7 @@ class TestCommandPaletteProcessActions:
         app.query_one = MagicMock(return_value=input_widget)
 
         assert app._apply_slash_tab_completion(reverse=True) is True
-        assert input_widget.value == "/sessions"
+        assert input_widget.value == "/setup"
 
     def test_slash_tab_completion_ignores_non_slash_or_args(self):
         from loom.tui.app import LoomApp
@@ -7465,7 +7835,7 @@ class TestCommandPaletteProcessActions:
 
             await pilot.press("tab")
             await pilot.pause()
-            assert input_widget.value == "/setup"
+            assert input_widget.value == "/sessions"
 
             await pilot.press("tab")
             await pilot.pause()
@@ -7563,6 +7933,7 @@ class TestSlashHelp:
         )
         rendered = "\n".join(app._help_lines())
         assert "/resume <session-id-prefix>" in rendered
+        assert "/history" in rendered
         assert "/run <goal|close" in rendered
         assert "resume <run-id-prefix|current>" in rendered
         assert "run-id-prefix" in rendered
@@ -7591,6 +7962,65 @@ class TestSlashHelp:
         assert "Usage" in message
         assert "/resume" in message
         assert "<session-id-prefix>" in message
+
+    @pytest.mark.asyncio
+    async def test_resume_while_busy_is_blocked(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._chat_busy = True
+        app._store = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/resume abc")
+
+        assert handled is True
+        message = chat.add_info.call_args.args[0]
+        assert "Cannot create/switch sessions" in message
+
+    @pytest.mark.asyncio
+    async def test_new_while_busy_is_blocked(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._chat_busy = True
+        app._store = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/new")
+
+        assert handled is True
+        message = chat.add_info.call_args.args[0]
+        assert "Cannot create/switch sessions" in message
+
+    @pytest.mark.asyncio
+    async def test_history_older_reports_result(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._load_older_chat_history = AsyncMock(return_value=True)
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/history older")
+
+        assert handled is True
+        app._load_older_chat_history.assert_awaited_once()
+        chat.add_info.assert_called_once_with("Loaded older chat history.")
 
 
 class TestFileViewer:

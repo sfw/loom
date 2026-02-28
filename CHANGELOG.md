@@ -5,6 +5,7 @@ All notable changes to Loom are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Resumable chat transcript replay in TUI sessions** (`state/schema.sql`, `state/conversation_store.py`, `tui/app.py`, `config.py`, `tests/test_conversation_store.py`, `tests/test_tui.py`) -- added persisted cowork chat event journal (`cowork_chat_events`) with legacy synthesis fallback from `conversation_turns`, wired startup/session-switch chat hydration, added `/history [older]` paging, and introduced `[tui]` config knobs for resume page size/render caps/journal fallback policy.
 - **Universal process contract v2 primitives** (`processes/schema.py`, `config.py`) -- added `schema_version: 2` support with explicit `verification.policy`, `verification.remediation`, `evidence`, and `prompt_contracts` blocks, plus optional strict config gate `process.require_v2_contract`.
 - **v1 compatibility sunset milestone** (`README.md`, `docs/creating-packages.md`, `docs/agent-integration.md`) -- documented the contract-v1 compatibility removal target date of June 30, 2026 so process authors can plan migration windows explicitly.
 - **Configurable delegated process timeout** (`config.py`, `tools/__init__.py`, `tools/delegate_task.py`) -- added `[execution].delegate_task_timeout_seconds` so `/run`/`delegate_task` timeout is configurable from `loom.toml` (with `LOOM_DELEGATE_TIMEOUT_SECONDS` retained as an env override).

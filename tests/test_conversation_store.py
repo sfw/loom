@@ -8,6 +8,7 @@ import pytest
 
 from loom.state.conversation_store import ConversationStore
 from loom.state.memory import Database
+from loom.tools.registry import ToolResult
 
 
 @pytest.fixture
@@ -31,6 +32,7 @@ class TestConversationStore:
         table_names = {t["name"] for t in tables}
         assert "conversation_turns" in table_names
         assert "cowork_sessions" in table_names
+        assert "cowork_chat_events" in table_names
 
     async def test_create_session(self, store: ConversationStore):
         session_id = await store.create_session(
@@ -198,3 +200,124 @@ class TestConversationStore:
         assert len(t2) == 1
         assert t1[0]["content"] == "Session 1 message"
         assert t2[0]["content"] == "Session 2 message"
+
+    async def test_append_and_get_chat_events(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+
+        seq1 = await store.append_chat_event(
+            sid,
+            "user_message",
+            {"text": "hello"},
+        )
+        seq2 = await store.append_chat_event(
+            sid,
+            "assistant_text",
+            {"text": "hi"},
+        )
+
+        events = await store.get_chat_events(sid, limit=10)
+        assert seq1 == 1
+        assert seq2 == 2
+        assert len(events) == 2
+        assert events[0]["event_type"] == "user_message"
+        assert events[0]["payload"]["text"] == "hello"
+        assert events[1]["event_type"] == "assistant_text"
+        assert events[1]["seq"] == 2
+
+    async def test_get_chat_events_before_seq(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        for index in range(1, 6):
+            await store.append_chat_event(
+                sid,
+                "info",
+                {"text": f"line {index}"},
+            )
+
+        page = await store.get_chat_events(sid, before_seq=5, limit=2)
+        assert len(page) == 2
+        assert [row["seq"] for row in page] == [3, 4]
+
+    async def test_get_chat_events_payload_parse_failure_non_fatal(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await store.append_chat_event(
+            sid,
+            "info",
+            "{not-json",
+        )
+
+        events = await store.get_chat_events(sid, limit=10)
+        assert len(events) == 1
+        assert events[0]["payload_parse_error"] is True
+        assert events[0]["payload"]["raw"] == "{not-json"
+
+    async def test_append_chat_event_rejects_non_positive_explicit_seq(
+        self, store: ConversationStore,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        with pytest.raises(ValueError):
+            await store.append_chat_event(
+                sid,
+                "info",
+                {"text": "x"},
+                seq=0,
+            )
+
+    async def test_synthesize_chat_events_from_turns(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+
+        await store.append_turn(sid, 1, "user", "Find TODOs")
+        tool_calls = [{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "ripgrep_search",
+                "arguments": "{\"pattern\":\"TODO\"}",
+            },
+        }]
+        await store.append_turn(
+            sid,
+            2,
+            "assistant",
+            "Searching now.",
+            tool_calls=tool_calls,
+        )
+        result = ToolResult.ok("2 matches")
+        await store.append_turn(
+            sid,
+            3,
+            "tool",
+            result.to_json(),
+            tool_call_id="call_1",
+            tool_name="ripgrep_search",
+        )
+
+        events = await store.synthesize_chat_events_from_turns(sid, limit=10)
+        assert [row["event_type"] for row in events] == [
+            "user_message",
+            "assistant_text",
+            "tool_call_started",
+            "tool_call_completed",
+        ]
+        assert events[0]["payload"]["text"] == "Find TODOs"
+        assert events[2]["payload"]["tool_name"] == "ripgrep_search"
+        assert events[3]["payload"]["success"] is True
+
+    async def test_synthesize_chat_events_handles_malformed_tool_payload(
+        self, store: ConversationStore,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await store.append_turn(
+            sid,
+            1,
+            "tool",
+            "<<<not-json>>>",
+            tool_call_id="call_1",
+            tool_name="ripgrep_search",
+        )
+
+        events = await store.synthesize_chat_events_from_turns(sid, limit=10)
+        assert [row["event_type"] for row in events] == ["tool_call_completed"]
+        payload = events[0]["payload"]
+        assert payload["success"] is False
+        assert payload["error"] == "Malformed tool result payload"
+        assert "not-json" in payload["output"]

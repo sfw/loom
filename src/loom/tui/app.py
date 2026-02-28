@@ -159,6 +159,11 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         description="resume session by ID prefix",
     ),
     SlashCommandSpec(
+        canonical="/history",
+        usage="[older]",
+        description="load older chat history for current session",
+    ),
+    SlashCommandSpec(
         canonical="/learned",
         description="review/delete learned patterns",
     ),
@@ -180,7 +185,26 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         description="run goal via process orchestrator (auto-ad-hoc when needed)",
     ),
 )
-_MAX_SLASH_HINT_LINES = 24
+_SLASH_COMMAND_PRIORITY: dict[str, int] = {
+    "/new": 10,
+    "/sessions": 11,
+    "/resume": 12,
+    "/history": 13,
+    "/session": 14,
+    "/run": 20,
+    "/processes": 21,
+    "/process": 22,
+    "/mcp": 30,
+    "/auth": 31,
+    "/tools": 32,
+    "/model": 40,
+    "/tokens": 41,
+    "/setup": 42,
+    "/learned": 43,
+    "/help": 44,
+    "/clear": 45,
+    "/quit": 46,
+}
 _WORKSPACE_REFRESH_TOOLS = {"document_write", "document_create", "humanize_writing"}
 _PROCESS_STATUS_ICON = {
     "queued": "\u25cb",
@@ -203,6 +227,8 @@ _MAX_PERSISTED_PROCESS_RESULTS = 120
 _INFO_WRAP_WIDTH = 108
 _RUN_GOAL_FILE_CONTENT_MAX_CHARS = 32_000
 _MAX_INPUT_HISTORY = 500
+_DEFAULT_CHAT_RESUME_PAGE_SIZE = 250
+_DEFAULT_CHAT_RESUME_MAX_RENDERED_ROWS = 1200
 _PROCESS_COMMAND_INDEX_REFRESH_INTERVAL_SECONDS = 2.0
 _EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS = 0.5
 _EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS = 0.05
@@ -621,12 +647,18 @@ class LoomApp(App):
         dock: bottom;
         display: none;
         margin: 0 0 4 0;
-        min-height: 1;
+        height: auto;
         max-height: 14;
-        padding: 0 1;
         background: $panel;
+        overflow-y: scroll;
+        overflow-x: hidden;
+        scrollbar-size: 1 1;
+    }
+    #slash-hint-body {
+        width: 100%;
+        min-height: 1;
+        padding: 0 1;
         color: $text-muted;
-        overflow-y: auto;
     }
     """
 
@@ -705,6 +737,11 @@ class LoomApp(App):
         self._close_process_tab_inflight = False
         self._auto_resume_workspace_on_init = True
         self._run_auth_profile_overrides: dict[str, str] = {}
+        self._chat_replay_events: list[dict] = []
+        self._chat_history_source: str = ""
+        self._chat_history_oldest_seq: int | None = None
+        self._chat_history_oldest_turn: int | None = None
+        self._chat_trimmed_total = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -718,7 +755,8 @@ class LoomApp(App):
                         yield FilesChangedPanel(id="files-panel")
                     with TabPane("Events", id="tab-events"):
                         yield EventPanel(id="events-panel")
-        yield Static("", id="slash-hint")
+        with VerticalScroll(id="slash-hint"):
+            yield Static("", id="slash-hint-body")
         yield StatusBar(id="status-bar")
         with Vertical(id="bottom-stack"):
             yield Static("", id="input-top-rule")
@@ -3259,7 +3297,8 @@ class LoomApp(App):
                         self._compute_process_command_index,
                     )
                 except Exception:
-                    selectable, command_map, blocked = [], {}, []
+                    logger.exception("Failed background process command index refresh")
+                    return
                 try:
                     self._cached_process_catalog = selectable
                     self._process_command_map = command_map
@@ -3288,7 +3327,8 @@ class LoomApp(App):
         try:
             selectable, command_map, blocked = self._compute_process_command_index()
         except Exception:
-            selectable, command_map, blocked = [], {}, []
+            logger.exception("Failed process command index refresh")
+            return
 
         self._cached_process_catalog = selectable
         self._process_command_map = command_map
@@ -3623,6 +3663,48 @@ class LoomApp(App):
             )),
         )
 
+    def _chat_resume_page_size(self) -> int:
+        tui_cfg = getattr(self._config, "tui", None)
+        if tui_cfg is None:
+            return _DEFAULT_CHAT_RESUME_PAGE_SIZE
+        try:
+            value = int(getattr(tui_cfg, "chat_resume_page_size", _DEFAULT_CHAT_RESUME_PAGE_SIZE))
+        except Exception:
+            return _DEFAULT_CHAT_RESUME_PAGE_SIZE
+        return max(20, min(value, 500))
+
+    def _chat_resume_max_rendered_rows(self) -> int:
+        tui_cfg = getattr(self._config, "tui", None)
+        if tui_cfg is None:
+            return _DEFAULT_CHAT_RESUME_MAX_RENDERED_ROWS
+        try:
+            value = int(getattr(
+                tui_cfg,
+                "chat_resume_max_rendered_rows",
+                _DEFAULT_CHAT_RESUME_MAX_RENDERED_ROWS,
+            ))
+        except Exception:
+            return _DEFAULT_CHAT_RESUME_MAX_RENDERED_ROWS
+        return max(100, min(value, 10_000))
+
+    def _chat_resume_use_event_journal(self) -> bool:
+        tui_cfg = getattr(self._config, "tui", None)
+        if tui_cfg is None:
+            return True
+        try:
+            return bool(getattr(tui_cfg, "chat_resume_use_event_journal", True))
+        except Exception:
+            return True
+
+    def _chat_resume_enable_legacy_fallback(self) -> bool:
+        tui_cfg = getattr(self._config, "tui", None)
+        if tui_cfg is None:
+            return True
+        try:
+            return bool(getattr(tui_cfg, "chat_resume_enable_legacy_fallback", True))
+        except Exception:
+            return True
+
     async def _initialize_session(self) -> None:
         """Initialize tools, session, and welcome message.
 
@@ -3652,6 +3734,7 @@ class LoomApp(App):
         approver = ToolApprover(prompt_callback=self._approval_callback)
 
         resume_target, auto_resume = await self._resolve_startup_resume_target()
+        resume_info_message: str | None = None
 
         # Create or resume session
         if self._store is not None and resume_target:
@@ -3680,7 +3763,7 @@ class LoomApp(App):
                     if auto_resume
                     else "Resumed session"
                 )
-                chat.add_info(
+                resume_info_message = (
                     f"[bold #7dcfff]{resume_label}[/bold #7dcfff]\n"
                     f"  [bold]Session ID:[/] [dim]{self._escape_markup(resume_target)}[/dim]\n"
                     f"  [bold]Turns:[/] {self._session.session_state.turn_count}"
@@ -3741,6 +3824,9 @@ class LoomApp(App):
 
         # Bind session-dependent tools
         self._bind_session_tools()
+        await self._hydrate_chat_history_for_active_session()
+        if resume_info_message:
+            chat.add_info(resume_info_message)
 
         # Configure status bar
         status = self.query_one("#status-bar", StatusBar)
@@ -5291,7 +5377,7 @@ class LoomApp(App):
     def _slash_command_catalog(self) -> list[tuple[str, str]]:
         """Return canonical slash commands with optional alias annotations."""
         entries: list[tuple[str, str]] = []
-        for spec in _SLASH_COMMANDS:
+        for spec in self._ordered_slash_specs():
             label = spec.canonical
             if spec.usage:
                 label = f"{label} {spec.usage}"
@@ -5303,6 +5389,40 @@ class LoomApp(App):
             entries.append((f"{token} <goal>", f"run goal via process '{process_name}'"))
         return entries
 
+    def _render_root_slash_hint(self) -> str:
+        """Render full root slash catalog with explicit built-in/process sections."""
+        lines = ["[bold #7dcfff]Slash commands:[/]"]
+        for spec in self._ordered_slash_specs():
+            cmd = spec.canonical
+            if spec.usage:
+                cmd = f"{cmd} {spec.usage}"
+            desc = spec.description
+            if spec.aliases:
+                desc = f"{desc} ({', '.join(spec.aliases)})"
+            safe_cmd = self._escape_markup(cmd)
+            safe_desc = self._escape_markup(desc)
+            lines.append(f"  [#73daca]{safe_cmd:<10}[/] {safe_desc}")
+        if self._process_command_map:
+            lines.append("")
+            lines.append("[bold #7dcfff]Process slash commands:[/]")
+            for token, process_name in sorted(self._process_command_map.items()):
+                safe_cmd = self._escape_markup(f"{token} <goal>")
+                safe_desc = self._escape_markup(
+                    f"run goal via process '{process_name}'",
+                )
+                lines.append(f"  [#73daca]{safe_cmd:<10}[/] {safe_desc}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _slash_spec_sort_key(spec: SlashCommandSpec) -> tuple[int, str]:
+        """Return deterministic display/completion ordering key for slash specs."""
+        canonical = spec.canonical.lower()
+        return _SLASH_COMMAND_PRIORITY.get(canonical, 999), canonical
+
+    def _ordered_slash_specs(self) -> list[SlashCommandSpec]:
+        """Return built-in slash specs in deterministic UX priority order."""
+        return sorted(_SLASH_COMMANDS, key=self._slash_spec_sort_key)
+
     @staticmethod
     def _slash_match_keys(spec: SlashCommandSpec) -> tuple[str, ...]:
         """Return normalized command tokens used for prefix matching."""
@@ -5311,7 +5431,7 @@ class LoomApp(App):
     def _help_lines(self) -> list[str]:
         """Build slash help lines from the shared command registry."""
         lines = ["[bold #7dcfff]Slash Commands[/bold #7dcfff]"]
-        for spec in _SLASH_COMMANDS:
+        for spec in self._ordered_slash_specs():
             label = spec.canonical
             if spec.usage:
                 label = f"{label} {spec.usage}"
@@ -5380,9 +5500,10 @@ class LoomApp(App):
         if token == "/":
             return token, self._slash_command_catalog()
 
-        matches: list[tuple[str, str]] = []
+        exact_matches: list[tuple[str, str]] = []
+        prefix_matches: list[tuple[str, str]] = []
         fallback_matches: list[tuple[str, str]] = []
-        for spec in _SLASH_COMMANDS:
+        for spec in self._ordered_slash_specs():
             keys = self._slash_match_keys(spec)
             label = spec.canonical
             if spec.usage:
@@ -5391,8 +5512,10 @@ class LoomApp(App):
             if spec.aliases:
                 desc = f"{desc} ({', '.join(spec.aliases)})"
             entry = (label, desc)
-            if any(key.startswith(token) for key in keys):
-                matches.append(entry)
+            if any(key == token for key in keys):
+                exact_matches.append(entry)
+            elif any(key.startswith(token) for key in keys):
+                prefix_matches.append(entry)
             elif any(token in key for key in keys):
                 fallback_matches.append(entry)
         for dynamic_token, process_name in sorted(self._process_command_map.items()):
@@ -5400,12 +5523,14 @@ class LoomApp(App):
                 f"{dynamic_token} <goal>",
                 f"run goal via process '{process_name}'",
             )
-            if dynamic_token.startswith(token):
-                matches.append(entry)
+            if dynamic_token == token:
+                exact_matches.append(entry)
+            elif dynamic_token.startswith(token):
+                prefix_matches.append(entry)
             elif token in dynamic_token:
                 fallback_matches.append(entry)
-        if matches:
-            return token, matches
+        if exact_matches or prefix_matches:
+            return token, [*exact_matches, *prefix_matches]
         return token, fallback_matches
 
     def _reset_slash_tab_cycle(self) -> None:
@@ -5523,13 +5648,13 @@ class LoomApp(App):
         """Return slash command completions for a token prefix."""
         self._refresh_process_command_index(background=True)
         if token == "/":
-            builtins = [spec.canonical for spec in _SLASH_COMMANDS]
+            builtins = [spec.canonical for spec in self._ordered_slash_specs()]
             dynamic = sorted(self._process_command_map)
             return builtins + dynamic
 
         candidates: list[str] = []
         seen: set[str] = set()
-        for spec in _SLASH_COMMANDS:
+        for spec in self._ordered_slash_specs():
             for key in (spec.canonical, *spec.aliases):
                 if key.startswith(token) and key not in seen:
                     candidates.append(key)
@@ -5626,12 +5751,8 @@ class LoomApp(App):
             else f"Process matches '{prefix}':"
         )
         lines = [f"[bold #7dcfff]{title}[/]"]
-        max_rows = 12
-        for name, version, marker in rows[:max_rows]:
+        for name, version, marker in rows:
             lines.append(f"  [#73daca]{name:<30}[/] [dim]v{version}[/]{marker}")
-        remaining = len(rows) - max_rows
-        if remaining > 0:
-            lines.append(f"  [dim]... and {remaining} more[/dim]")
         lines.append("[dim]Press Tab to autocomplete[/dim]")
         return "\n".join(lines)
 
@@ -5686,6 +5807,9 @@ class LoomApp(App):
         process_hint = self._render_process_use_hint(raw_input)
         if process_hint is not None:
             return process_hint
+        if raw_input.strip() == "/":
+            self._refresh_process_command_index(background=True)
+            return self._render_root_slash_hint()
         if " " in raw_input.strip():
             return ""
         token, matches = self._matching_slash_commands(raw_input)
@@ -5716,17 +5840,16 @@ class LoomApp(App):
 
     def _set_slash_hint(self, hint_text: str) -> None:
         """Show or hide the slash-command hint panel."""
-        hint = self.query_one("#slash-hint", Static)
+        hint = self.query_one("#slash-hint", VerticalScroll)
+        hint_body = self.query_one("#slash-hint-body", Static)
         if hint_text:
-            hint.update(hint_text)
+            hint_body.update(hint_text)
             hint.display = True
-            line_count = max(1, len(hint_text.splitlines()))
-            hint.styles.height = min(line_count, _MAX_SLASH_HINT_LINES)
             hint.scroll_home(animate=False)
         else:
             hint.display = False
-            hint.styles.height = "auto"
-            hint.update("")
+            hint_body.update("")
+            hint.scroll_home(animate=False)
 
     def _bind_session_tools(self) -> None:
         """Bind tools that hold a reference to the active session."""
@@ -5789,6 +5912,455 @@ class LoomApp(App):
         panel.clear_files()
         panel.show_diff("")
 
+    def _clear_chat_widgets(self) -> None:
+        """Drop all currently mounted chat widgets."""
+        chat = self.query_one("#chat-log", ChatLog)
+        for child in list(chat.children):
+            child.remove()
+
+    def _reset_chat_history_state(self) -> None:
+        """Reset in-memory replay state for the active chat transcript."""
+        self._chat_replay_events = []
+        self._chat_history_source = ""
+        self._chat_history_oldest_seq = None
+        self._chat_history_oldest_turn = None
+        self._chat_trimmed_total = 0
+
+    def _active_session_id(self) -> str:
+        if self._session is None:
+            return ""
+        return str(getattr(self._session, "session_id", "") or "").strip()
+
+    def _chat_event_cursor_turn(self, event: dict) -> int | None:
+        try:
+            value = int(event.get("turn_number", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _coerce_int(value: object, *, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _coerce_float(value: object, *, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _coerce_bool(value: object, *, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off", ""}:
+                return False
+        return default
+
+    def _apply_chat_render_cap(self) -> bool:
+        """Trim replay buffer to configured cap. Returns True if trimmed."""
+        max_rows = self._chat_resume_max_rendered_rows()
+        total = len(self._chat_replay_events)
+        if total <= max_rows:
+            return False
+        trimmed = total - max_rows
+        self._chat_replay_events = self._chat_replay_events[-max_rows:]
+        self._chat_trimmed_total += trimmed
+        if self._chat_history_source == "journal":
+            first = self._chat_replay_events[0] if self._chat_replay_events else {}
+            try:
+                seq = int(first.get("seq", 0) or 0)
+            except (TypeError, ValueError):
+                seq = 0
+            self._chat_history_oldest_seq = seq if seq > 0 else self._chat_history_oldest_seq
+        elif self._chat_history_source == "legacy":
+            turns = [
+                turn
+                for turn in (
+                    self._chat_event_cursor_turn(event)
+                    for event in self._chat_replay_events
+                )
+                if turn is not None
+            ]
+            self._chat_history_oldest_turn = min(turns) if turns else self._chat_history_oldest_turn
+        logger.info(
+            "chat_render_trimmed session=%s trimmed_rows=%s max_rows=%s total_trimmed=%s",
+            self._active_session_id(),
+            trimmed,
+            max_rows,
+            self._chat_trimmed_total,
+        )
+        return True
+
+    def _render_chat_event(self, event: dict, *, source: str = "unknown") -> bool:
+        """Render one normalized replay event into the chat widget."""
+        event_type = str(event.get("event_type", "") or "").strip()
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        chat = self.query_one("#chat-log", ChatLog)
+
+        try:
+            if event_type == "user_message":
+                chat.add_user_message(str(payload.get("text", "") or ""))
+                return True
+            if event_type == "assistant_text":
+                chat.add_model_text(
+                    str(payload.get("text", "") or ""),
+                    markup=self._coerce_bool(payload.get("markup", False)),
+                )
+                return True
+            if event_type in {"tool_call_started", "tool_call_completed"}:
+                args = payload.get("args", {})
+                if not isinstance(args, dict):
+                    args = {}
+                chat.add_tool_call(
+                    str(payload.get("tool_name", "") or ""),
+                    args,
+                    success=(
+                        None
+                        if event_type == "tool_call_started"
+                        else self._coerce_bool(payload.get("success", False))
+                    ),
+                    elapsed_ms=self._coerce_int(payload.get("elapsed_ms", 0), default=0),
+                    output=str(payload.get("output", "") or ""),
+                    error=str(payload.get("error", "") or ""),
+                )
+                return True
+            if event_type == "content_indicator":
+                from loom.content import deserialize_block
+
+                raw_blocks = payload.get("content_blocks", [])
+                if not isinstance(raw_blocks, list):
+                    return False
+                blocks = []
+                for block in raw_blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    try:
+                        blocks.append(deserialize_block(block))
+                    except Exception:
+                        continue
+                if blocks:
+                    chat.add_content_indicator(blocks)
+                return True
+            if event_type == "turn_separator":
+                chat.add_turn_separator(
+                    self._coerce_int(payload.get("tool_count", 0), default=0),
+                    self._coerce_int(payload.get("tokens", 0), default=0),
+                    str(payload.get("model", "") or ""),
+                    tokens_per_second=self._coerce_float(
+                        payload.get("tokens_per_second", 0.0),
+                        default=0.0,
+                    ),
+                    latency_ms=self._coerce_int(payload.get("latency_ms", 0), default=0),
+                    total_time_ms=self._coerce_int(payload.get("total_time_ms", 0), default=0),
+                    context_tokens=self._coerce_int(payload.get("context_tokens", 0), default=0),
+                    context_messages=self._coerce_int(
+                        payload.get("context_messages", 0),
+                        default=0,
+                    ),
+                    omitted_messages=self._coerce_int(
+                        payload.get("omitted_messages", 0),
+                        default=0,
+                    ),
+                    recall_index_used=self._coerce_bool(
+                        payload.get("recall_index_used", False),
+                    ),
+                )
+                return True
+            if event_type == "info":
+                chat.add_info(
+                    str(payload.get("text", "") or ""),
+                    markup=self._coerce_bool(payload.get("markup", True), default=True),
+                )
+                return True
+        except Exception as e:
+            logger.warning(
+                "chat_hydrate_row_skipped session=%s source=%s event_type=%s error_class=%s",
+                self._active_session_id(),
+                source,
+                event_type or "<unknown>",
+                e.__class__.__name__,
+            )
+            return False
+        return True
+
+    def _rerender_chat_from_replay_events(self) -> tuple[int, int]:
+        """Repaint chat panel from in-memory replay buffer."""
+        self._clear_chat_widgets()
+        chat = self.query_one("#chat-log", ChatLog)
+        if self._chat_trimmed_total > 0:
+            chat.add_info(
+                (
+                    "[dim]Transcript window truncated: "
+                    f"{self._chat_trimmed_total} older row(s) hidden.[/dim]"
+                ),
+            )
+        rendered = 0
+        skipped = 0
+        for event in self._chat_replay_events:
+            if self._render_chat_event(event, source="hydrate"):
+                rendered += 1
+            else:
+                skipped += 1
+        return rendered, skipped
+
+    async def _append_chat_replay_event(
+        self,
+        event_type: str,
+        payload: dict,
+        *,
+        turn_number: int | None = None,
+        persist: bool = True,
+        render: bool = False,
+    ) -> None:
+        """Append one UI chat event to replay state and optional journal."""
+        event: dict[str, Any] = {
+            "event_type": str(event_type or "").strip(),
+            "payload": dict(payload or {}),
+        }
+        if turn_number is not None and turn_number > 0:
+            event["turn_number"] = int(turn_number)
+
+        session_id = self._active_session_id()
+        if (
+            persist
+            and self._store is not None
+            and session_id
+            and self._chat_resume_use_event_journal()
+        ):
+            try:
+                seq = await self._store.append_chat_event(
+                    session_id,
+                    event["event_type"],
+                    event["payload"],
+                )
+                event["seq"] = seq
+                if not self._chat_history_source:
+                    self._chat_history_source = "journal"
+                if self._chat_history_source == "journal" and self._chat_history_oldest_seq is None:
+                    self._chat_history_oldest_seq = seq
+            except Exception as e:
+                logger.warning(
+                    "chat_event_append_failed session=%s event_type=%s error_class=%s",
+                    session_id,
+                    event["event_type"],
+                    e.__class__.__name__,
+                )
+
+        self._chat_replay_events.append(event)
+        trimmed = self._apply_chat_render_cap()
+        if trimmed:
+            self._rerender_chat_from_replay_events()
+        elif render:
+            self._render_chat_event(event, source="live")
+
+    async def _hydrate_chat_history_for_active_session(self) -> None:
+        """Hydrate visible chat transcript for the active session."""
+        self._reset_chat_history_state()
+        self._clear_chat_widgets()
+
+        if self._store is None:
+            return
+        session_id = self._active_session_id()
+        if not session_id:
+            return
+
+        page_size = self._chat_resume_page_size()
+        events: list[dict] = []
+        parse_failures = 0
+        source = ""
+        start = time.monotonic()
+        source_pref = (
+            "journal"
+            if self._chat_resume_use_event_journal()
+            else (
+                "legacy"
+                if self._chat_resume_enable_legacy_fallback()
+                else "none"
+            )
+        )
+        logger.info(
+            "chat_hydrate_started session=%s source=%s page_size=%s",
+            session_id,
+            source_pref,
+            page_size,
+        )
+
+        if self._chat_resume_use_event_journal():
+            try:
+                events = await self._store.get_chat_events(
+                    session_id,
+                    limit=page_size,
+                )
+            except Exception as e:
+                logger.warning(
+                    "chat_hydrate_failed session=%s source=journal error_class=%s",
+                    session_id,
+                    e.__class__.__name__,
+                )
+                events = []
+            if events:
+                source = "journal"
+                first = events[0]
+                try:
+                    self._chat_history_oldest_seq = int(first.get("seq", 0) or 0)
+                except (TypeError, ValueError):
+                    self._chat_history_oldest_seq = None
+                parse_failures = sum(
+                    1 for row in events if bool(row.get("payload_parse_error", False))
+                )
+
+        if not events and self._chat_resume_enable_legacy_fallback():
+            try:
+                events = await self._store.synthesize_chat_events_from_turns(
+                    session_id,
+                    limit=page_size,
+                )
+            except Exception as e:
+                logger.warning(
+                    "chat_hydrate_failed session=%s source=legacy error_class=%s",
+                    session_id,
+                    e.__class__.__name__,
+                )
+                events = []
+            if events:
+                source = "legacy"
+                turns = [
+                    turn
+                    for turn in (
+                        self._chat_event_cursor_turn(event)
+                        for event in events
+                    )
+                    if turn is not None
+                ]
+                self._chat_history_oldest_turn = min(turns) if turns else None
+
+        self._chat_replay_events = events
+        self._chat_history_source = source
+        self._apply_chat_render_cap()
+        rendered, skipped = self._rerender_chat_from_replay_events()
+        elapsed_ms = max(1, int((time.monotonic() - start) * 1000))
+        logger.info(
+            "chat_hydrate_completed session=%s source=%s rows_rendered=%s "
+            "rows_skipped=%s parse_failures=%s elapsed_ms=%s",
+            session_id,
+            source or "none",
+            rendered,
+            skipped,
+            parse_failures,
+            elapsed_ms,
+        )
+
+    async def _load_older_chat_history(self) -> bool:
+        """Load one older page of chat history for the active session."""
+        if self._store is None:
+            return False
+        session_id = self._active_session_id()
+        if not session_id:
+            return False
+        page_size = self._chat_resume_page_size()
+        start = time.monotonic()
+
+        older: list[dict] = []
+        parse_failures = 0
+        source = self._chat_history_source
+        logger.info(
+            "chat_hydrate_started session=%s source=%s page_size=%s mode=older",
+            session_id,
+            source or "none",
+            page_size,
+        )
+        if source == "journal":
+            before_seq = self._chat_history_oldest_seq
+            if before_seq is None or before_seq <= 1:
+                return False
+            try:
+                older = await self._store.get_chat_events(
+                    session_id,
+                    before_seq=before_seq,
+                    limit=page_size,
+                )
+            except Exception as e:
+                logger.warning(
+                    "chat_hydrate_failed session=%s source=journal "
+                    "mode=older error_class=%s",
+                    session_id,
+                    e.__class__.__name__,
+                )
+                return False
+            if older:
+                first = older[0]
+                try:
+                    self._chat_history_oldest_seq = int(first.get("seq", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+                parse_failures = sum(
+                    1 for row in older if bool(row.get("payload_parse_error", False))
+                )
+        elif source == "legacy":
+            before_turn = self._chat_history_oldest_turn
+            if before_turn is None or before_turn <= 1:
+                return False
+            try:
+                older = await self._store.synthesize_chat_events_from_turns(
+                    session_id,
+                    before_turn=before_turn,
+                    limit=page_size,
+                )
+            except Exception as e:
+                logger.warning(
+                    "chat_hydrate_failed session=%s source=legacy "
+                    "mode=older error_class=%s",
+                    session_id,
+                    e.__class__.__name__,
+                )
+                return False
+            if older:
+                turns = [
+                    turn
+                    for turn in (
+                        self._chat_event_cursor_turn(event)
+                        for event in older
+                    )
+                    if turn is not None
+                ]
+                self._chat_history_oldest_turn = (
+                    min(turns)
+                    if turns
+                    else self._chat_history_oldest_turn
+                )
+        else:
+            return False
+
+        if not older:
+            return False
+        self._chat_replay_events = [*older, *self._chat_replay_events]
+        self._apply_chat_render_cap()
+        rendered, skipped = self._rerender_chat_from_replay_events()
+        elapsed_ms = max(1, int((time.monotonic() - start) * 1000))
+        logger.info(
+            "chat_hydrate_completed session=%s source=%s rows_rendered=%s "
+            "rows_skipped=%s parse_failures=%s elapsed_ms=%s mode=older",
+            session_id,
+            source,
+            rendered,
+            skipped,
+            parse_failures,
+            elapsed_ms,
+        )
+        return True
+
     async def _new_session(self) -> None:
         """Create a fresh session, replacing the current one."""
         if self._store is None or self._session is None or self._model is None:
@@ -5825,12 +6397,19 @@ class LoomApp(App):
         self._bind_session_tools()
         self._hydrate_input_history_from_session()
         self._clear_files_panel()
+        await self._hydrate_chat_history_for_active_session()
         chat = self.query_one("#chat-log", ChatLog)
         await self._restore_process_run_tabs(chat)
         self._process_close_hint_shown = bool(self._process_runs)
-        chat.add_info(
+        info_message = (
             "[bold #7dcfff]New Session Created[/bold #7dcfff]\n"
             f"  [bold]Session ID:[/] [dim]{self._escape_markup(session_id)}[/dim]"
+        )
+        chat.add_info(info_message)
+        await self._append_chat_replay_event(
+            "info",
+            {"text": info_message, "markup": True},
+            render=False,
         )
 
     async def _switch_to_session(self, session_id: str) -> None:
@@ -5867,13 +6446,20 @@ class LoomApp(App):
         self._bind_session_tools()
         self._hydrate_input_history_from_session()
         self._clear_files_panel()
+        await self._hydrate_chat_history_for_active_session()
         chat = self.query_one("#chat-log", ChatLog)
         await self._restore_process_run_tabs(chat)
         self._process_close_hint_shown = bool(self._process_runs)
-        chat.add_info(
+        info_message = (
             "[bold #7dcfff]Switched Session[/bold #7dcfff]\n"
             f"  [bold]Session ID:[/] [dim]{self._escape_markup(session_id)}[/dim]\n"
             f"  [bold]Turns:[/] {new_session.session_state.turn_count}"
+        )
+        chat.add_info(info_message)
+        await self._append_chat_replay_event(
+            "info",
+            {"text": info_message, "markup": True},
+            render=False,
         )
 
     # ------------------------------------------------------------------
@@ -7680,6 +8266,11 @@ class LoomApp(App):
             return True
 
         if token == "/new":
+            if self._chat_busy:
+                chat.add_info(
+                    "[bold #f7768e]Cannot create/switch sessions while a turn is running.[/]"
+                )
+                return True
             if self._store:
                 await self._new_session()
             else:
@@ -7698,6 +8289,11 @@ class LoomApp(App):
             return True
 
         if token == "/resume":
+            if self._chat_busy:
+                chat.add_info(
+                    "[bold #f7768e]Cannot create/switch sessions while a turn is running.[/]"
+                )
+                return True
             if not arg:
                 chat.add_info(
                     self._render_slash_command_usage("/resume", "<session-id-prefix>")
@@ -7720,6 +8316,17 @@ class LoomApp(App):
                     chat.add_info(f"[bold #f7768e]Resume failed: {e}[/]")
             else:
                 chat.add_info(f"No session found matching '{prefix}'.")
+            return True
+
+        if token == "/history":
+            if arg and arg.lower() not in {"older", "more"}:
+                chat.add_info(self._render_slash_command_usage("/history", "[older]"))
+                return True
+            loaded = await self._load_older_chat_history()
+            if loaded:
+                chat.add_info("Loaded older chat history.")
+            else:
+                chat.add_info("No older chat history available.")
             return True
 
         if token == "/learned":
@@ -7745,6 +8352,10 @@ class LoomApp(App):
         status = self.query_one("#status-bar", StatusBar)
 
         chat.add_user_message(user_message)
+        await self._append_chat_replay_event(
+            "user_message",
+            {"text": user_message},
+        )
         status.state = "Thinking..."
 
         try:
@@ -7788,6 +8399,13 @@ class LoomApp(App):
                 if event.result is None:
                     # Tool starting
                     chat.add_tool_call(event.name, event.args)
+                    await self._append_chat_replay_event(
+                        "tool_call_started",
+                        {
+                            "tool_name": event.name,
+                            "args": dict(event.args or {}),
+                        },
+                    )
                     status.state = f"Running {event.name}..."
                     events_panel.add_event(
                         _now_str(), "tool_start",
@@ -7809,6 +8427,17 @@ class LoomApp(App):
                         output=output,
                         error=error,
                     )
+                    await self._append_chat_replay_event(
+                        "tool_call_completed",
+                        {
+                            "tool_name": event.name,
+                            "args": dict(event.args or {}),
+                            "success": bool(event.result.success),
+                            "elapsed_ms": int(event.elapsed_ms or 0),
+                            "output": output,
+                            "error": error,
+                        },
+                    )
 
                     # Show multimodal content indicators
                     if (
@@ -7817,6 +8446,17 @@ class LoomApp(App):
                     ):
                         chat.add_content_indicator(
                             event.result.content_blocks,
+                        )
+                        from loom.content import serialize_block
+
+                        await self._append_chat_replay_event(
+                            "content_indicator",
+                            {
+                                "content_blocks": [
+                                    serialize_block(block)
+                                    for block in event.result.content_blocks
+                                ],
+                            },
                         )
 
                     etype = (
@@ -7850,6 +8490,14 @@ class LoomApp(App):
             elif isinstance(event, CoworkTurn):
                 if event.text and not streamed_text:
                     chat.add_model_text(event.text)
+                if event.text:
+                    await self._append_chat_replay_event(
+                        "assistant_text",
+                        {
+                            "text": event.text,
+                            "markup": False,
+                        },
+                    )
 
                 self._total_tokens += event.tokens_used
                 status = self.query_one("#status-bar", StatusBar)
@@ -7866,6 +8514,21 @@ class LoomApp(App):
                     context_messages=event.context_messages,
                     omitted_messages=event.omitted_messages,
                     recall_index_used=event.recall_index_used,
+                )
+                await self._append_chat_replay_event(
+                    "turn_separator",
+                    {
+                        "tool_count": len(event.tool_calls),
+                        "tokens": int(event.tokens_used),
+                        "model": event.model,
+                        "tokens_per_second": float(event.tokens_per_second),
+                        "latency_ms": int(event.latency_ms),
+                        "total_time_ms": int(event.total_time_ms),
+                        "context_tokens": int(event.context_tokens),
+                        "context_messages": int(event.context_messages),
+                        "omitted_messages": int(event.omitted_messages),
+                        "recall_index_used": bool(event.recall_index_used),
+                    },
                 )
                 events_panel.add_event(
                     _now_str(), "turn",
@@ -8492,6 +9155,10 @@ class LoomApp(App):
         if answer:
             chat = self.query_one("#chat-log", ChatLog)
             chat.add_user_message(answer)
+            await self._append_chat_replay_event(
+                "user_message",
+                {"text": answer},
+            )
 
         return answer
 
@@ -8683,9 +9350,7 @@ class LoomApp(App):
         self.query_one("#sidebar", Sidebar).toggle()
 
     def action_clear_chat(self) -> None:
-        chat = self.query_one("#chat-log", ChatLog)
-        for child in list(chat.children):
-            child.remove()
+        self._clear_chat_widgets()
 
     def action_reload_workspace(self) -> None:
         """Reload sidebar workspace tree to show external file changes."""
