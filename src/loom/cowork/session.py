@@ -93,6 +93,14 @@ class _ContextWindowStats:
 _USER_INTERACTION_TOOLS = frozenset({"ask_user"})
 
 MAX_TOOL_ITERATIONS = 40
+MAX_IDENTICAL_TOOL_BATCH_STREAK = 3
+MAX_IDENTICAL_TOOL_BATCH_RECOVERY_HINTS = 1
+REPEATED_TOOL_BATCH_SYSTEM_HINT = (
+    "[System: You are repeating the same tool-call batch with identical arguments. "
+    "Do not call the same tools again unchanged. Synthesize a direct answer from "
+    "existing tool outputs. Only call another tool if arguments change and you "
+    "briefly justify why.]"
+)
 DEFAULT_TOOL_RESULT_OUTPUT_CHARS = 3_000
 HEAVY_TOOL_RESULT_OUTPUT_CHARS = 1_200
 _HEAVY_OUTPUT_TOOLS = frozenset({
@@ -586,6 +594,9 @@ class CoworkSession:
         text_parts: list[str] = []
         turn_tool_schemas = self._tool_schemas_for_turn(user_message)
         hybrid_recovery_used = False
+        last_tool_batch_signature = ""
+        identical_tool_batch_streak = 0
+        repeated_tool_batch_recovery_hints_used = 0
 
         for _ in range(MAX_TOOL_ITERATIONS):
             # Call the model
@@ -621,6 +632,47 @@ class CoworkSession:
                 text_parts.append(response.text)
 
             if response.has_tool_calls():
+                batch_signature = self._tool_batch_signature(response.tool_calls)
+                response_has_text = bool(str(response.text or "").strip())
+                if (
+                    batch_signature
+                    and not response_has_text
+                    and batch_signature == last_tool_batch_signature
+                ):
+                    identical_tool_batch_streak += 1
+                elif batch_signature:
+                    identical_tool_batch_streak = 1
+                else:
+                    identical_tool_batch_streak = 0
+                last_tool_batch_signature = batch_signature
+
+                if (
+                    identical_tool_batch_streak >= MAX_IDENTICAL_TOOL_BATCH_STREAK
+                    and repeated_tool_batch_recovery_hints_used
+                    < MAX_IDENTICAL_TOOL_BATCH_RECOVERY_HINTS
+                ):
+                    repeated_tool_batch_recovery_hints_used += 1
+                    self._messages.append({
+                        "role": "system",
+                        "content": REPEATED_TOOL_BATCH_SYSTEM_HINT,
+                    })
+                    await self._persist_turn(
+                        "system",
+                        content=REPEATED_TOOL_BATCH_SYSTEM_HINT,
+                    )
+                    continue
+
+                if (
+                    identical_tool_batch_streak >= MAX_IDENTICAL_TOOL_BATCH_STREAK
+                    and repeated_tool_batch_recovery_hints_used
+                    >= MAX_IDENTICAL_TOOL_BATCH_RECOVERY_HINTS
+                ):
+                    fallback = self._build_repeated_tool_batch_fallback(all_tool_events)
+                    self._messages.append({"role": "assistant", "content": fallback})
+                    await self._persist_turn("assistant", content=fallback)
+                    text_parts.append(fallback)
+                    break
+
                 tc_dicts = self._tool_calls_to_dicts(response.tool_calls)
                 self._messages.append({
                     "role": "assistant",
@@ -747,6 +799,9 @@ class CoworkSession:
         all_text_parts: list[str] = []
         turn_tool_schemas = self._tool_schemas_for_turn(user_message)
         hybrid_recovery_used = False
+        last_tool_batch_signature = ""
+        identical_tool_batch_streak = 0
+        repeated_tool_batch_recovery_hints_used = 0
 
         for _ in range(MAX_TOOL_ITERATIONS):
             iter_text_parts: list[str] = []
@@ -802,6 +857,47 @@ class CoworkSession:
                 all_text_parts.append(response_text)
 
             if final_tool_calls:
+                batch_signature = self._tool_batch_signature(final_tool_calls)
+                response_has_text = bool(str(response_text or "").strip())
+                if (
+                    batch_signature
+                    and not response_has_text
+                    and batch_signature == last_tool_batch_signature
+                ):
+                    identical_tool_batch_streak += 1
+                elif batch_signature:
+                    identical_tool_batch_streak = 1
+                else:
+                    identical_tool_batch_streak = 0
+                last_tool_batch_signature = batch_signature
+
+                if (
+                    identical_tool_batch_streak >= MAX_IDENTICAL_TOOL_BATCH_STREAK
+                    and repeated_tool_batch_recovery_hints_used
+                    < MAX_IDENTICAL_TOOL_BATCH_RECOVERY_HINTS
+                ):
+                    repeated_tool_batch_recovery_hints_used += 1
+                    self._messages.append({
+                        "role": "system",
+                        "content": REPEATED_TOOL_BATCH_SYSTEM_HINT,
+                    })
+                    await self._persist_turn(
+                        "system",
+                        content=REPEATED_TOOL_BATCH_SYSTEM_HINT,
+                    )
+                    continue
+
+                if (
+                    identical_tool_batch_streak >= MAX_IDENTICAL_TOOL_BATCH_STREAK
+                    and repeated_tool_batch_recovery_hints_used
+                    >= MAX_IDENTICAL_TOOL_BATCH_RECOVERY_HINTS
+                ):
+                    fallback = self._build_repeated_tool_batch_fallback(all_tool_events)
+                    self._messages.append({"role": "assistant", "content": fallback})
+                    await self._persist_turn("assistant", content=fallback)
+                    all_text_parts.append(fallback)
+                    break
+
                 tc_dicts = self._tool_calls_to_dicts(final_tool_calls)
                 self._messages.append({
                     "role": "assistant",
@@ -1143,6 +1239,10 @@ class CoworkSession:
             if len(selected) >= recent_message_cap:
                 break
             msg_tokens = _estimate_message_tokens(msg)
+            if msg_tokens > budget:
+                # One oversized message (typically a large tool result) should
+                # not collapse the entire context window.
+                continue
             if used + msg_tokens > budget:
                 break
             selected.append(msg)
@@ -1776,6 +1876,64 @@ class CoworkSession:
         await self._persist_turn(
             "tool", content=persisted_content,
             tool_call_id=tool_call_id, tool_name=tool_name,
+        )
+
+    @staticmethod
+    def _tool_batch_signature(tool_calls: list[ToolCall] | None) -> str:
+        """Return a stable signature for one assistant tool-call batch."""
+        if not tool_calls:
+            return ""
+        normalized: list[dict[str, Any]] = []
+        for tc in tool_calls:
+            normalized.append({
+                "name": str(getattr(tc, "name", "") or "").strip(),
+                "arguments": dict(getattr(tc, "arguments", {}) or {}),
+            })
+        return json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _build_repeated_tool_batch_fallback(
+        self,
+        tool_events: list[ToolCallEvent],
+    ) -> str:
+        """Return a deterministic user-facing fallback when tool loops stall."""
+        last_completed = next(
+            (
+                event
+                for event in reversed(tool_events)
+                if event.result is not None
+            ),
+            None,
+        )
+        if last_completed and last_completed.result:
+            output_preview, _ = _compact_preview(
+                last_completed.result.output,
+                280,
+            )
+            if output_preview:
+                return (
+                    "I stopped because the model repeated identical tool calls without "
+                    "making progress. "
+                    f"Latest {last_completed.name} result: {output_preview}"
+                )
+            if last_completed.result.error:
+                error_preview, _ = _compact_preview(
+                    last_completed.result.error,
+                    220,
+                )
+                return (
+                    "I stopped because the model repeated identical tool calls without "
+                    "making progress. "
+                    f"Latest {last_completed.name} error: {error_preview}"
+                )
+        return (
+            "I stopped because the model repeated identical tool calls without making "
+            "progress. I can continue once we change the query or tool arguments."
         )
 
     @staticmethod

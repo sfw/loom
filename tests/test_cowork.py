@@ -548,6 +548,59 @@ class TestCoworkSession:
         window = session._context_window()
         assert all(str(msg.get("role", "")) != "tool" for msg in window)
 
+    async def test_context_window_skips_oversized_latest_message_instead_of_collapsing(
+        self,
+        workspace,
+        tools,
+    ):
+        provider = MockProvider([
+            ModelResponse(text="ok", usage=TokenUsage(total_tokens=2)),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            system_prompt="test",
+            max_context_messages=12,
+            max_context_tokens=4600,
+        )
+
+        # With max_context_tokens=4600 and a fixed output reserve of 4000,
+        # context budget is intentionally tight (~hundreds of tokens).
+        huge_tool_payload = json.dumps({
+            "success": True,
+            "output": "X" * 12000,
+            "error": "",
+            "files_changed": [],
+        })
+        session._messages = [
+            {"role": "system", "content": "test"},
+            {"role": "user", "content": "is that in all subdirectories too?"},
+            {
+                "role": "assistant",
+                "content": "Let me verify with ripgrep.",
+                "tool_calls": [
+                    {
+                        "id": "tc-big",
+                        "type": "function",
+                        "function": {"name": "ripgrep_search", "arguments": "{}"},
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "tc-big",
+                "content": huge_tool_payload,
+            },
+        ]
+
+        window = session._context_window()
+        assert any(
+            msg.get("role") == "user"
+            and "all subdirectories" in str(msg.get("content", ""))
+            for msg in window
+        )
+
     async def test_resume_compacts_persisted_tool_payload_for_model_context(
         self,
         tmp_path: Path,
@@ -648,6 +701,39 @@ class TestCoworkSession:
         assert turns[0].tokens_per_second > 0
         assert turns[0].context_tokens > 0
         assert turns[0].context_messages > 0
+
+    async def test_send_streaming_stops_repeated_identical_tool_batches(
+        self,
+        workspace,
+        tools,
+    ):
+        repeated_tool_response = ModelResponse(
+            text="",
+            tool_calls=[ToolCall(
+                id="tc-repeat",
+                name="ripgrep_search",
+                arguments={"pattern": "spark"},
+            )],
+            usage=TokenUsage(total_tokens=8),
+        )
+        provider = MockProvider([
+            repeated_tool_response,
+            repeated_tool_response,
+            repeated_tool_response,
+            repeated_tool_response,
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        async for event in session.send_streaming("can you check again?"):
+            events.append(event)
+
+        turns = [e for e in events if isinstance(e, CoworkTurn)]
+        assert len(turns) == 1
+        assert "repeated identical tool calls" in turns[0].text.lower()
+
+        # Two executions, then recovery hint, then deterministic stop.
+        assert len(turns[0].tool_calls) == 2
 
     async def test_send_estimates_tokens_when_usage_missing(self, workspace, tools):
         provider = MockProvider([
