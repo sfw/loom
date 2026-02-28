@@ -67,6 +67,9 @@ workspace_scan_max_entries = 20000
 chat_stream_flush_interval_ms = 120
 files_panel_max_rows = 2000
 delegate_progress_max_lines = 150
+run_launch_heartbeat_interval_ms = 6000
+run_launch_timeout_seconds = 300
+run_preflight_async_enabled = true
 
 [verification]
 tier1_enabled = true

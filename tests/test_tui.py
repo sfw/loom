@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 import yaml
@@ -723,6 +724,193 @@ class TestProcessRunPane:
             panel._scroll_to_latest()
 
         panel.scroll_to.assert_called_once_with(y=1, animate=False, force=True)
+
+    def test_process_run_stage_rows_render_when_tasks_empty(self):
+        from loom.tui.app import LoomApp, ProcessRunState
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        run = ProcessRunState(
+            run_id="abc123",
+            process_name="market-research",
+            goal="Analyze EPCOR",
+            run_workspace=Path("/tmp"),
+            process_defn=None,
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="queued",
+            launch_stage="auth_preflight",
+            tasks=[],
+        )
+
+        rows = app._process_run_stage_rows(run)
+
+        assert rows
+        assert any(row["content"] == "Auth preflight" for row in rows)
+        assert any(row["status"] == "in_progress" for row in rows)
+
+    def test_process_run_heartbeat_emits_liveness_line(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        run = SimpleNamespace(
+            closed=False,
+            status="queued",
+            launch_stage="auth_preflight",
+            launch_last_progress_at=0.0,
+            launch_last_heartbeat_at=0.0,
+            launch_silent_warning_emitted=False,
+            launch_stage_heartbeat_stage="",
+            launch_stage_heartbeat_dots=0,
+            activity_log=[],
+            launch_stage_activity_indices={},
+            pane=MagicMock(),
+        )
+
+        app._maybe_emit_process_run_heartbeat(run)
+
+        assert run.activity_log
+        assert run.activity_log[-1].startswith("Auth preflight.")
+        assert "Still working" not in run.activity_log[-1]
+        assert run.launch_last_heartbeat_at > 0.0
+
+    def test_process_run_heartbeat_updates_same_stage_line_with_more_dots(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        run = SimpleNamespace(
+            closed=False,
+            status="queued",
+            launch_stage="resolving_process",
+            launch_last_progress_at=0.0,
+            launch_last_heartbeat_at=0.0,
+            launch_silent_warning_emitted=False,
+            launch_stage_heartbeat_stage="",
+            launch_stage_heartbeat_dots=0,
+            activity_log=[],
+            launch_stage_activity_indices={},
+            pane=MagicMock(),
+        )
+
+        app._maybe_emit_process_run_heartbeat(run)
+        first = run.activity_log[-1]
+        run.launch_last_progress_at -= 7.0
+        run.launch_last_heartbeat_at -= 7.0
+        app._maybe_emit_process_run_heartbeat(run)
+        second = run.activity_log[-1]
+
+        assert len(run.activity_log) == 1
+        assert first == "Resolving process."
+        assert second == "Resolving process.."
+
+    def test_process_run_heartbeat_updates_running_stage_line(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        run = SimpleNamespace(
+            closed=False,
+            status="running",
+            launch_stage="running",
+            launch_last_progress_at=0.0,
+            launch_last_heartbeat_at=0.0,
+            launch_silent_warning_emitted=False,
+            launch_stage_heartbeat_stage="",
+            launch_stage_heartbeat_dots=0,
+            activity_log=[],
+            launch_stage_activity_indices={},
+            pane=MagicMock(),
+        )
+
+        app._maybe_emit_process_run_heartbeat(run)
+        first = run.activity_log[-1]
+        run.launch_last_progress_at -= 7.0
+        run.launch_last_heartbeat_at -= 7.0
+        app._maybe_emit_process_run_heartbeat(run)
+        second = run.activity_log[-1]
+
+        assert len(run.activity_log) == 1
+        assert first == "Running."
+        assert second == "Running.."
+        run.pane.upsert_activity.assert_called()
+
+    def test_set_process_run_launch_stage_finalizes_previous_phase_with_elapsed(self):
+        from loom.tui.app import LoomApp, ProcessRunState
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        run = ProcessRunState(
+            run_id="abc777",
+            process_name="market-research",
+            goal="Analyze EPCOR",
+            run_workspace=Path("/tmp"),
+            process_defn=None,
+            pane_id="tab-run-abc777",
+            pane=pane,
+            status="queued",
+            launch_stage="resolving_process",
+            launch_stage_started_at=time.monotonic() - 12.0,
+        )
+
+        app._set_process_run_launch_stage(run, "provisioning_workspace", note="")
+
+        assert any("Resolving process." in line and "00:12" in line for line in run.activity_log)
+        assert any(line.startswith("Provisioning workspace.") for line in run.activity_log)
+
+    def test_process_run_progress_keeps_stage_summary_when_tasks_ready(self):
+        from loom.tui.app import LoomApp, ProcessRunState
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        run = ProcessRunState(
+            run_id="abc125",
+            process_name="market-research",
+            goal="Analyze EPCOR",
+            run_workspace=Path("/tmp"),
+            process_defn=None,
+            pane_id="tab-run-abc125",
+            pane=pane,
+            status="running",
+            launch_stage="auth_preflight",
+            tasks=[
+                {
+                    "id": "scope-companies",
+                    "status": "in_progress",
+                    "content": "Scope requested companies",
+                },
+            ],
+        )
+
+        app._refresh_process_run_progress(run)
+
+        rows = pane.set_tasks.call_args.args[0]
+        assert rows[0]["id"] == "stage:summary"
+        assert rows[0]["status"] == "in_progress"
+        assert "Auth preflight" in rows[0]["content"]
+        assert rows[1]["id"] == "scope-companies"
 
 
 class TestSidebarWidget:
@@ -1583,6 +1771,30 @@ class TestFilesPanelReset:
 
 
 class TestWorkspaceRefresh:
+    def test_ingest_files_panel_falls_back_to_summary_markers(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        panel = MagicMock()
+        panel._all_entries = []
+        app.query_one = MagicMock(return_value=panel)
+
+        count = app._ingest_files_panel_from_paths(
+            ["(2 files created)", "(1 files modified)"],
+            operation_hint="modify",
+        )
+
+        assert count == 2
+        entries = panel.update_files.call_args.args[0]
+        assert entries[0]["operation"] == "create"
+        assert entries[0]["path"] == "(2 files created)"
+        assert entries[1]["operation"] == "modify"
+        assert entries[1]["path"] == "(1 files modified)"
+
     def test_update_files_panel_refreshes_sidebar_tree(self):
         from loom.tui.app import LoomApp
 
@@ -3272,14 +3484,6 @@ class TestProcessSlashCommands:
         )
         app._process_defn = None
         app._config = SimpleNamespace(process=SimpleNamespace(default=""))
-        adhoc_process = SimpleNamespace(name="adhoc-report", phases=[])
-        app._get_or_create_adhoc_process = AsyncMock(return_value=(
-            SimpleNamespace(
-                process_defn=adhoc_process,
-                recommended_tools=["web_search"],
-            ),
-            False,
-        ))
         app._start_process_run = AsyncMock()
         chat = MagicMock()
         app.query_one = MagicMock(return_value=chat)
@@ -3287,18 +3491,14 @@ class TestProcessSlashCommands:
         handled = await app._handle_slash_command("/run analyze tesla")
 
         assert handled is True
-        app._get_or_create_adhoc_process.assert_awaited_once_with(
-            "analyze tesla",
-            fresh=False,
-        )
         app._start_process_run.assert_awaited_once()
         assert app._start_process_run.await_args.args == ("analyze tesla",)
         kwargs = app._start_process_run.await_args.kwargs
-        assert kwargs["process_defn"] is adhoc_process
+        assert kwargs["process_defn"] is None
+        assert kwargs["process_name_override"] is None
         assert kwargs["is_adhoc"] is True
-        assert kwargs["recommended_tools"] == ["web_search"]
-        assert isinstance(kwargs.get("adhoc_synthesis_notes"), list)
-        assert kwargs.get("adhoc_synthesis_notes")
+        assert kwargs["synthesis_goal"] == "analyze tesla"
+        assert kwargs["force_fresh"] is False
 
     @pytest.mark.asyncio
     async def test_run_fresh_flag_bypasses_cache_lookup(self):
@@ -3311,14 +3511,6 @@ class TestProcessSlashCommands:
         )
         app._process_defn = None
         app._config = SimpleNamespace(process=SimpleNamespace(default=""))
-        adhoc_process = SimpleNamespace(name="adhoc-report", phases=[])
-        app._get_or_create_adhoc_process = AsyncMock(return_value=(
-            SimpleNamespace(
-                process_defn=adhoc_process,
-                recommended_tools=[],
-            ),
-            False,
-        ))
         app._start_process_run = AsyncMock()
         chat = MagicMock()
         app.query_one = MagicMock(return_value=chat)
@@ -3326,18 +3518,14 @@ class TestProcessSlashCommands:
         handled = await app._handle_slash_command("/run --fresh analyze tesla")
 
         assert handled is True
-        app._get_or_create_adhoc_process.assert_awaited_once_with(
-            "analyze tesla",
-            fresh=True,
-        )
         app._start_process_run.assert_awaited_once()
         assert app._start_process_run.await_args.args == ("analyze tesla",)
         kwargs = app._start_process_run.await_args.kwargs
-        assert kwargs["process_defn"] is adhoc_process
+        assert kwargs["process_defn"] is None
+        assert kwargs["process_name_override"] is None
         assert kwargs["is_adhoc"] is True
-        assert kwargs["recommended_tools"] == []
-        assert isinstance(kwargs.get("adhoc_synthesis_notes"), list)
-        assert kwargs.get("adhoc_synthesis_notes")
+        assert kwargs["synthesis_goal"] == "analyze tesla"
+        assert kwargs["force_fresh"] is True
 
     @pytest.mark.asyncio
     async def test_run_file_goal_loads_content_for_adhoc(self, tmp_path):
@@ -3354,14 +3542,6 @@ class TestProcessSlashCommands:
         )
         app._process_defn = None
         app._config = SimpleNamespace(process=SimpleNamespace(default=""))
-        adhoc_process = SimpleNamespace(name="adhoc-report", phases=[])
-        app._get_or_create_adhoc_process = AsyncMock(return_value=(
-            SimpleNamespace(
-                process_defn=adhoc_process,
-                recommended_tools=[],
-            ),
-            False,
-        ))
         app._start_process_run = AsyncMock()
         chat = MagicMock()
         app.query_one = MagicMock(return_value=chat)
@@ -3369,15 +3549,14 @@ class TestProcessSlashCommands:
         handled = await app._handle_slash_command("/run problem.md")
 
         assert handled is True
-        called_goal = app._get_or_create_adhoc_process.await_args.args[0]
-        assert "problem.md" in called_goal
-        assert "Implement a deterministic CSV export." in called_goal
         app._start_process_run.assert_awaited_once()
         assert app._start_process_run.await_args.args == ("problem.md",)
         kwargs = app._start_process_run.await_args.kwargs
-        assert kwargs["process_defn"] is adhoc_process
+        assert kwargs["process_defn"] is None
+        assert kwargs["process_name_override"] is None
         assert kwargs["is_adhoc"] is True
-        assert kwargs["recommended_tools"] == []
+        assert "problem.md" in kwargs["synthesis_goal"]
+        assert "Implement a deterministic CSV export." in kwargs["synthesis_goal"]
         assert kwargs["goal_context_overrides"]["run_goal_file_input"]["path"] == "problem.md"
         assert kwargs["goal_context_overrides"]["run_goal_file_input"]["truncated"] is False
         assert "Implement a deterministic CSV export." in (
@@ -3410,8 +3589,10 @@ class TestProcessSlashCommands:
         app._start_process_run.assert_awaited_once_with(
             "focus only on risk items",
             process_defn=app._process_defn,
+            process_name_override=None,
             is_adhoc=False,
-            recommended_tools=[],
+            synthesis_goal=ANY,
+            force_fresh=False,
             goal_context_overrides={
                 "run_goal_file_input": {
                     "path": "problem.md",
@@ -5089,8 +5270,10 @@ class TestProcessSlashCommands:
         app._start_process_run.assert_awaited_once_with(
             "Analyze Tesla for investment",
             process_defn=app._process_defn,
+            process_name_override=None,
             is_adhoc=False,
-            recommended_tools=[],
+            synthesis_goal="Analyze Tesla for investment",
+            force_fresh=False,
         )
 
     @pytest.mark.asyncio
@@ -5215,9 +5398,10 @@ class TestProcessSlashCommands:
         assert run.worker is not None
         assert captured["kwargs"]["name"] == "process-run-abc123"
         assert captured["kwargs"]["group"] == "process-run-abc123"
-        run.pane.set_tasks.assert_called_once_with(
-            [{"id": "old", "status": "pending", "content": "old"}]
-        )
+        task_rows = run.pane.set_tasks.call_args.args[0]
+        assert task_rows[0]["id"] == "stage:summary"
+        assert "Queueing delegate" in task_rows[0]["content"]
+        assert task_rows[1:] == [{"id": "old", "status": "pending", "content": "old"}]
         app._persist_process_run_ui_state.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -5274,10 +5458,6 @@ class TestProcessSlashCommands:
         )
         app._refresh_process_command_index = MagicMock()
         app._process_command_map = {"/investment-analysis": "investment-analysis"}
-        loader = MagicMock()
-        process_defn = SimpleNamespace(name="investment-analysis", version="1.0")
-        loader.load.return_value = process_defn
-        app._create_process_loader = MagicMock(return_value=loader)
         app._start_process_run = AsyncMock()
         chat = MagicMock()
         app.query_one = MagicMock(return_value=chat)
@@ -5287,10 +5467,9 @@ class TestProcessSlashCommands:
         )
 
         assert handled is True
-        loader.load.assert_called_once_with("investment-analysis")
         app._start_process_run.assert_awaited_once_with(
             "Analyze Tesla for investment",
-            process_defn=process_defn,
+            process_name_override="investment-analysis",
             command_prefix="/investment-analysis",
         )
 
@@ -5372,9 +5551,103 @@ class TestProcessSlashCommands:
         assert len(app._process_runs) == 1
         run = next(iter(app._process_runs.values()))
         assert run.status == "queued"
-        assert run.run_workspace == Path("/tmp/process-run")
+        assert run.run_workspace == Path("/tmp")
+        assert run.launch_stage == "accepted"
         assert tabs.active == run.pane_id
         chat.add_user_message.assert_called_once_with("/run Analyze Tesla")
+
+    @pytest.mark.asyncio
+    async def test_start_process_run_uses_inline_preflight_when_disabled(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                tui=SimpleNamespace(run_preflight_async_enabled=False),
+            ),
+        )
+        app._process_defn = SimpleNamespace(name="investment-analysis")
+        app._tools.has.return_value = True
+        chat = MagicMock()
+        events_panel = MagicMock()
+        tabs = MagicMock()
+        tabs.add_pane = AsyncMock()
+        tabs.active = "tab-chat"
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#tabs":
+                return tabs
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        app._prepare_process_run_with_timeout = AsyncMock(return_value=True)
+        captured: dict[str, object] = {}
+
+        def fake_run_worker(coro, **kwargs):
+            captured["kwargs"] = kwargs
+            captured["coro_name"] = coro.cr_code.co_name
+            coro.close()
+            return MagicMock()
+
+        app.run_worker = fake_run_worker
+
+        await app._start_process_run("Analyze Tesla")
+
+        app._prepare_process_run_with_timeout.assert_awaited_once()
+        assert captured["coro_name"] == "_execute_process_run"
+        assert captured["kwargs"]["group"].startswith("process-run-")
+
+    @pytest.mark.asyncio
+    async def test_prepare_process_run_launch_refreshes_workspace_immediately(self, tmp_path):
+        from loom.tui.app import LoomApp, ProcessRunLaunchRequest, ProcessRunState
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        app._request_workspace_refresh = MagicMock()
+        app._ingest_files_panel_from_paths = MagicMock(return_value=1)
+        app._resolve_auth_overrides_for_run_start = AsyncMock(return_value=({}, []))
+        app._prepare_process_run_workspace = AsyncMock(
+            return_value=tmp_path / "runs" / "market-research-run",
+        )
+        pane = MagicMock()
+        run = ProcessRunState(
+            run_id="abc123",
+            process_name="market-research",
+            goal="Analyze EPCOR",
+            run_workspace=tmp_path,
+            process_defn=SimpleNamespace(name="market-research"),
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="queued",
+        )
+        app._process_runs = {"abc123": run}
+
+        prepared = await app._prepare_process_run_launch(
+            "abc123",
+            ProcessRunLaunchRequest(
+                goal="Analyze EPCOR",
+                process_defn=SimpleNamespace(name="market-research"),
+            ),
+        )
+
+        assert prepared is True
+        app._request_workspace_refresh.assert_called_once_with(
+            "run-workspace-created",
+            immediate=True,
+        )
+        app._ingest_files_panel_from_paths.assert_called_once_with(
+            ["runs/market-research-run"],
+            operation_hint="create",
+        )
 
     @pytest.mark.asyncio
     async def test_start_process_run_respects_concurrency_limit(self):
@@ -5402,9 +5675,6 @@ class TestProcessSlashCommands:
             raise AssertionError(f"Unexpected selector: {selector}")
 
         app.query_one = MagicMock(side_effect=_query_one)
-        app._prepare_process_run_workspace = AsyncMock(
-            side_effect=[Path("/tmp/process-run-a"), Path("/tmp/process-run-b")],
-        )
         app.run_worker = MagicMock()
 
         await app._start_process_run("Analyze Tesla")

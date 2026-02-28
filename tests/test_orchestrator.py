@@ -3203,6 +3203,7 @@ class TestSubtaskRunnerContextBudget:
             "success": True,
             "error": "",
             "files_changed": [],
+            "files_changed_paths": [],
         }
 
     def test_artifact_ingest_telemetry_required_fields_and_redaction(self):

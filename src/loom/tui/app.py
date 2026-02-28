@@ -251,9 +251,33 @@ _DEFAULT_TUI_WORKSPACE_SCAN_MAX_ENTRIES = 20_000
 _DEFAULT_TUI_CHAT_STREAM_FLUSH_INTERVAL_MS = 120
 _DEFAULT_TUI_FILES_PANEL_MAX_ROWS = 2000
 _DEFAULT_TUI_DELEGATE_PROGRESS_MAX_LINES = 150
+_DEFAULT_TUI_RUN_LAUNCH_HEARTBEAT_INTERVAL_MS = 6000
+_DEFAULT_TUI_RUN_LAUNCH_TIMEOUT_SECONDS = 300
+_DEFAULT_TUI_RUN_PREFLIGHT_ASYNC_ENABLED = True
 _PROCESS_COMMAND_INDEX_REFRESH_INTERVAL_SECONDS = 2.0
 _EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS = 0.5
 _EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS = 0.05
+_PROCESS_RUN_LAUNCH_STAGES: tuple[tuple[str, str], ...] = (
+    ("accepted", "Accepted"),
+    ("resolving_process", "Resolving process"),
+    ("provisioning_workspace", "Provisioning workspace"),
+    ("auth_preflight", "Auth preflight"),
+    ("queueing_delegate", "Queueing delegate"),
+    ("running", "Running"),
+)
+_PROCESS_RUN_LAUNCH_STAGE_INDEX = {
+    stage: idx for idx, (stage, _label) in enumerate(_PROCESS_RUN_LAUNCH_STAGES)
+}
+_PROCESS_RUN_LAUNCH_STAGE_LABEL = {
+    stage: label for stage, label in _PROCESS_RUN_LAUNCH_STAGES
+}
+_PROCESS_RUN_HEARTBEAT_STAGES: frozenset[str] = frozenset({
+    "resolving_process",
+    "provisioning_workspace",
+    "auth_preflight",
+    "queueing_delegate",
+    "running",
+})
 
 
 class ProcessRunList(VerticalScroll):
@@ -431,6 +455,7 @@ class ProcessRunPane(Vertical):
         self._pending_tasks: list[dict] | None = None
         self._pending_outputs: list[dict] | None = None
         self._pending_activity: list[str] = []
+        self._pending_keyed_activity: dict[str, str] = {}
         self._pending_results: list[tuple[str, bool]] = []
         self._header = Static(classes="process-run-header")
         self._meta = Static(classes="process-run-meta")
@@ -523,6 +548,18 @@ class ProcessRunPane(Vertical):
             return
         self._log.add_info(safe_text)
 
+    def upsert_activity(self, key: str, text: str) -> None:
+        """Insert or update one keyed informational activity line."""
+        safe_text = _escape_markup_text(text)
+        clean_key = str(key or "").strip()
+        if not clean_key:
+            self.add_activity(text)
+            return
+        if not self.is_attached:
+            self._pending_keyed_activity[clean_key] = safe_text
+            return
+        self._log.upsert_info_line(clean_key, safe_text)
+
     def add_result(self, text: str, *, success: bool) -> None:
         """Append final result text."""
         safe_text = _escape_markup_text(text)
@@ -549,6 +586,10 @@ class ProcessRunPane(Vertical):
             for line in self._pending_activity:
                 self._log.add_info(line)
             self._pending_activity.clear()
+        if self._pending_keyed_activity:
+            for key, line in self._pending_keyed_activity.items():
+                self._log.upsert_info_line(key, line)
+            self._pending_keyed_activity.clear()
         if self._pending_results:
             for text, success in self._pending_results:
                 if success:
@@ -599,6 +640,34 @@ class ProcessRunState:
     goal_context_overrides: dict[str, Any] = field(default_factory=dict)
     auth_profile_overrides: dict[str, str] = field(default_factory=dict)
     auth_required_resources: list[dict[str, Any]] = field(default_factory=list)
+    launch_stage: str = "accepted"
+    launch_stage_started_at: float = field(default_factory=time.monotonic)
+    launch_last_progress_at: float = field(default_factory=time.monotonic)
+    launch_last_heartbeat_at: float = 0.0
+    launch_error: str = ""
+    launch_tab_created_at: float = 0.0
+    launch_silent_warning_emitted: bool = False
+    launch_stage_heartbeat_dots: int = 0
+    launch_stage_heartbeat_stage: str = ""
+    launch_stage_activity_indices: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class ProcessRunLaunchRequest:
+    """Runtime launch request used to preflight and execute one process run."""
+
+    goal: str
+    command_prefix: str = "/run"
+    process_defn: ProcessDefinition | None = None
+    process_name_override: str = ""
+    is_adhoc: bool = False
+    recommended_tools: list[str] = field(default_factory=list)
+    adhoc_synthesis_notes: list[str] = field(default_factory=list)
+    goal_context_overrides: dict[str, Any] = field(default_factory=dict)
+    resume_task_id: str = ""
+    run_workspace_override: Path | None = None
+    synthesis_goal: str = ""
+    force_fresh: bool = False
 
 
 @dataclass
@@ -3864,6 +3933,43 @@ class LoomApp(App):
             value = default
         return max(20, min(value, 5000))
 
+    def _tui_run_launch_heartbeat_interval_seconds(self) -> float:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_RUN_LAUNCH_HEARTBEAT_INTERVAL_MS
+        if tui_cfg is None:
+            return default / 1000.0
+        try:
+            value_ms = int(getattr(tui_cfg, "run_launch_heartbeat_interval_ms", default))
+        except Exception:
+            value_ms = default
+        return max(0.5, min(value_ms, 30_000) / 1000.0)
+
+    def _tui_run_launch_timeout_seconds(self) -> float:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_RUN_LAUNCH_TIMEOUT_SECONDS
+        if tui_cfg is None:
+            return float(default)
+        try:
+            value = float(getattr(tui_cfg, "run_launch_timeout_seconds", default))
+        except Exception:
+            value = float(default)
+        return max(5.0, min(value, 600.0))
+
+    def _tui_run_preflight_async_enabled(self) -> bool:
+        tui_cfg = getattr(self._config, "tui", None)
+        if tui_cfg is None:
+            return _DEFAULT_TUI_RUN_PREFLIGHT_ASYNC_ENABLED
+        try:
+            return bool(
+                getattr(
+                    tui_cfg,
+                    "run_preflight_async_enabled",
+                    _DEFAULT_TUI_RUN_PREFLIGHT_ASYNC_ENABLED,
+                )
+            )
+        except Exception:
+            return _DEFAULT_TUI_RUN_PREFLIGHT_ASYNC_ENABLED
+
     def _is_mutating_tool(self, tool_name: str) -> bool:
         name = str(tool_name or "").strip()
         if not name:
@@ -4084,12 +4190,156 @@ class LoomApp(App):
                 log = None
         if isinstance(log, list):
             log.append(text)
-            if len(log) > _MAX_PERSISTED_PROCESS_ACTIVITY:
-                del log[:-_MAX_PERSISTED_PROCESS_ACTIVITY]
+            self._trim_process_run_activity_log(run)
+        now = time.monotonic()
+        run.launch_last_progress_at = now
+        run.launch_last_heartbeat_at = 0.0
+        run.launch_silent_warning_emitted = False
         try:
             run.pane.add_activity(text)
         except Exception:
             pass
+
+    def _trim_process_run_activity_log(self, run: ProcessRunState) -> None:
+        """Bound persisted run activity log and rebase keyed line indices."""
+        log = getattr(run, "activity_log", None)
+        if not isinstance(log, list):
+            return
+        if len(log) <= _MAX_PERSISTED_PROCESS_ACTIVITY:
+            return
+        overflow = len(log) - _MAX_PERSISTED_PROCESS_ACTIVITY
+        if overflow <= 0:
+            return
+        del log[:overflow]
+        index_map = getattr(run, "launch_stage_activity_indices", None)
+        if not isinstance(index_map, dict):
+            return
+        rebased: dict[str, int] = {}
+        for raw_stage, raw_index in index_map.items():
+            stage_id = str(raw_stage or "").strip()
+            if not stage_id:
+                continue
+            try:
+                index = int(raw_index) - overflow
+            except Exception:
+                continue
+            if index >= 0:
+                rebased[stage_id] = index
+        run.launch_stage_activity_indices = rebased
+
+    @staticmethod
+    def _process_run_stage_activity_key(stage: str) -> str:
+        """Stable keyed widget id for one launch-stage activity line."""
+        return f"launch-stage:{str(stage or '').strip() or 'unknown'}"
+
+    def _upsert_process_run_stage_activity(
+        self,
+        run: ProcessRunState,
+        *,
+        stage: str,
+        text: str,
+    ) -> None:
+        """Insert/update one launch-stage activity line without duplicating rows."""
+        stage_id = str(stage or "").strip()
+        rendered = self._one_line(text, 1200)
+        if not stage_id or not rendered:
+            return
+        log = getattr(run, "activity_log", None)
+        if not isinstance(log, list):
+            try:
+                run.activity_log = []
+                log = run.activity_log
+            except Exception:
+                log = None
+        index_map = getattr(run, "launch_stage_activity_indices", None)
+        if not isinstance(index_map, dict):
+            try:
+                run.launch_stage_activity_indices = {}
+                index_map = run.launch_stage_activity_indices
+            except Exception:
+                index_map = None
+        if isinstance(log, list) and isinstance(index_map, dict):
+            try:
+                idx = int(index_map.get(stage_id, -1))
+            except Exception:
+                idx = -1
+            if 0 <= idx < len(log):
+                log[idx] = rendered
+            else:
+                log.append(rendered)
+                index_map[stage_id] = len(log) - 1
+                self._trim_process_run_activity_log(run)
+                idx = int(index_map.get(stage_id, -1))
+                if idx < 0 and isinstance(log, list):
+                    for offset, line in enumerate(log):
+                        if str(line) == rendered:
+                            index_map[stage_id] = offset
+                            break
+        now = time.monotonic()
+        run.launch_last_progress_at = now
+        try:
+            run.pane.upsert_activity(self._process_run_stage_activity_key(stage_id), rendered)
+        except Exception:
+            try:
+                run.pane.add_activity(rendered)
+            except Exception:
+                pass
+
+    def _render_process_run_stage_activity_text(
+        self,
+        stage: str,
+        *,
+        dots: int,
+        duration_seconds: float | None = None,
+    ) -> str:
+        """Render one launch-stage activity line with dot animation + optional elapsed."""
+        label = self._process_run_launch_stage_label(str(stage or "").strip())
+        dot_count = max(1, int(dots))
+        text = f"{label}{'.' * dot_count}"
+        if duration_seconds is None:
+            return text
+        elapsed = self._format_elapsed(max(0.0, float(duration_seconds)))
+        return f"{text} {elapsed}"
+
+    def _start_process_run_stage_activity_line(self, run: ProcessRunState, stage: str) -> None:
+        """Start (or reset) the active keyed line for stage heartbeat updates."""
+        stage_id = str(stage or "").strip()
+        if stage_id not in _PROCESS_RUN_HEARTBEAT_STAGES:
+            return
+        run.launch_stage_heartbeat_stage = stage_id
+        run.launch_stage_heartbeat_dots = 1
+        self._upsert_process_run_stage_activity(
+            run,
+            stage=stage_id,
+            text=self._render_process_run_stage_activity_text(stage_id, dots=1),
+        )
+
+    def _finalize_process_run_stage_activity_line(
+        self,
+        run: ProcessRunState,
+        *,
+        stage: str,
+        duration_seconds: float,
+    ) -> None:
+        """Finalize a stage heartbeat line with elapsed timer."""
+        stage_id = str(stage or "").strip()
+        if stage_id not in _PROCESS_RUN_HEARTBEAT_STAGES:
+            return
+        dots = int(getattr(run, "launch_stage_heartbeat_dots", 1) or 1)
+        if str(getattr(run, "launch_stage_heartbeat_stage", "")).strip() != stage_id:
+            dots = max(dots, 1)
+        self._upsert_process_run_stage_activity(
+            run,
+            stage=stage_id,
+            text=self._render_process_run_stage_activity_text(
+                stage_id,
+                dots=dots,
+                duration_seconds=duration_seconds,
+            ),
+        )
+        if str(getattr(run, "launch_stage_heartbeat_stage", "")).strip() == stage_id:
+            run.launch_stage_heartbeat_stage = ""
+            run.launch_stage_heartbeat_dots = 0
 
     def _append_process_run_result(
         self, run: ProcessRunState, text: str, *, success: bool,
@@ -4113,6 +4363,264 @@ class LoomApp(App):
             run.pane.add_result(message, success=success)
         except Exception:
             pass
+
+    @staticmethod
+    def _process_run_launch_stage_label(stage: str) -> str:
+        """Return display label for a launch-stage identifier."""
+        return _PROCESS_RUN_LAUNCH_STAGE_LABEL.get(stage, "Initializing")
+
+    def _process_run_stage_rows(self, run: ProcessRunState) -> list[dict]:
+        """Render launch/provisioning checklist rows while plan tasks are not ready."""
+        current = str(getattr(run, "launch_stage", "accepted") or "accepted").strip()
+        current_idx = _PROCESS_RUN_LAUNCH_STAGE_INDEX.get(current, 0)
+        status = str(getattr(run, "status", "queued") or "queued").strip()
+        rows: list[dict] = []
+        for idx, (stage_id, label) in enumerate(_PROCESS_RUN_LAUNCH_STAGES):
+            row_status = "pending"
+            if idx < current_idx:
+                row_status = "completed"
+            elif idx == current_idx:
+                if status == "failed":
+                    row_status = "failed"
+                elif status == "cancelled":
+                    row_status = "skipped"
+                elif status == "completed":
+                    row_status = "completed"
+                else:
+                    row_status = "in_progress"
+            rows.append({
+                "id": f"stage:{stage_id}",
+                "status": row_status,
+                "content": label,
+            })
+
+        if status == "failed":
+            detail = self._one_line(getattr(run, "launch_error", ""), 180) or "Run failed."
+            rows.append({
+                "id": "stage:failed",
+                "status": "failed",
+                "content": f"Failed: {detail}",
+            })
+        elif status == "cancelled":
+            rows.append({
+                "id": "stage:cancelled",
+                "status": "skipped",
+                "content": "Cancelled",
+            })
+        return rows
+
+    def _process_run_stage_summary_row(self, run: ProcessRunState) -> dict | None:
+        """Return a compact launch-stage summary row to prepend above task rows."""
+        if not hasattr(run, "launch_stage"):
+            return None
+        stage = str(getattr(run, "launch_stage", "accepted") or "accepted").strip()
+        if stage not in _PROCESS_RUN_LAUNCH_STAGE_LABEL:
+            stage = "accepted"
+        status = str(getattr(run, "status", "queued") or "queued").strip()
+        if status == "failed":
+            row_status = "failed"
+        elif status == "cancelled":
+            row_status = "skipped"
+        elif status == "completed":
+            row_status = "completed"
+        else:
+            row_status = "in_progress"
+        return {
+            "id": "stage:summary",
+            "status": row_status,
+            "content": f"Launch stage: {self._process_run_launch_stage_label(stage)}",
+        }
+
+    def _refresh_process_run_progress(self, run: ProcessRunState) -> None:
+        """Refresh process progress list with tasks or launch-stage rows."""
+        tasks = [
+            dict(row)
+            for row in getattr(run, "tasks", [])
+            if isinstance(row, dict)
+        ]
+        if not tasks:
+            tasks = self._process_run_stage_rows(run)
+        else:
+            summary = self._process_run_stage_summary_row(run)
+            if summary is not None and not any(
+                str(row.get("id", "")).strip() == "stage:summary"
+                for row in tasks
+                if isinstance(row, dict)
+            ):
+                tasks = [summary, *tasks]
+        try:
+            run.pane.set_tasks(tasks)
+        except Exception:
+            pass
+
+    def _set_process_run_launch_stage(
+        self,
+        run: ProcessRunState,
+        stage: str,
+        *,
+        note: str = "",
+    ) -> None:
+        """Update launch stage and keep progress/timestamps coherent."""
+        clean_stage = str(stage or "").strip() or "accepted"
+        now = time.monotonic()
+        previous_stage = str(getattr(run, "launch_stage", "")).strip()
+        previous_started = float(getattr(run, "launch_stage_started_at", 0.0) or 0.0)
+        if previous_stage and previous_stage != clean_stage and previous_started > 0:
+            duration = max(0.0, now - previous_started)
+            log_latency_event(
+                logger,
+                event="run_stage_duration",
+                duration_seconds=duration,
+                fields={
+                    "run_id": str(getattr(run, "run_id", "")).strip(),
+                    "process": str(getattr(run, "process_name", "")).strip(),
+                    "stage": previous_stage,
+                    "next_stage": clean_stage,
+                    "run_stage_duration_ms": int(duration * 1000),
+                },
+            )
+            logger.debug(
+                "run_stage_transition run_id=%s from=%s to=%s duration_ms=%s",
+                str(getattr(run, "run_id", "")).strip(),
+                previous_stage,
+                clean_stage,
+                int(duration * 1000),
+            )
+            self._finalize_process_run_stage_activity_line(
+                run,
+                stage=previous_stage,
+                duration_seconds=duration,
+            )
+        run.launch_stage = clean_stage
+        run.launch_stage_started_at = now
+        run.launch_last_progress_at = now
+        run.launch_silent_warning_emitted = False
+        if clean_stage in _PROCESS_RUN_HEARTBEAT_STAGES:
+            self._start_process_run_stage_activity_line(run, clean_stage)
+        else:
+            run.launch_stage_heartbeat_stage = ""
+            run.launch_stage_heartbeat_dots = 0
+        if note:
+            self._append_process_run_activity(run, note)
+        self._refresh_process_run_progress(run)
+        self._update_process_run_visuals(run)
+        self._refresh_sidebar_progress_summary()
+
+    def _fail_process_run_launch(self, run: ProcessRunState, message: str) -> None:
+        """Transition a run into failed state during launch/preflight."""
+        if run.closed:
+            return
+        detail = self._one_line(message, 1200) or "Process run failed during launch."
+        run.status = "failed"
+        run.ended_at = time.monotonic()
+        run.launch_error = detail
+        self._log_terminal_stage_duration(run, terminal_state="failed")
+        run.launch_last_progress_at = time.monotonic()
+        run.launch_silent_warning_emitted = False
+        self._append_process_run_activity(run, detail)
+        self._append_process_run_result(run, detail, success=False)
+        self._refresh_process_run_progress(run)
+        self._update_process_run_visuals(run)
+        self._refresh_sidebar_progress_summary()
+        try:
+            events_panel = self.query_one("#events-panel", EventPanel)
+            events_panel.add_event(
+                _now_str(),
+                "process_err",
+                f"{run.process_name} #{run.run_id}",
+            )
+        except Exception:
+            pass
+        try:
+            chat = self.query_one("#chat-log", ChatLog)
+            chat.add_info(f"[bold #f7768e]Process run {run.run_id} failed:[/] {detail}")
+        except Exception:
+            pass
+        self.notify(detail, severity="error", timeout=5)
+
+    def _maybe_emit_process_run_heartbeat(self, run: ProcessRunState) -> None:
+        """Emit a periodic liveness heartbeat while launch/execution is active."""
+        if getattr(run, "closed", False):
+            return
+        if str(getattr(run, "status", "")) not in {"queued", "running"}:
+            return
+        stage = str(getattr(run, "launch_stage", "")).strip()
+        if stage not in _PROCESS_RUN_HEARTBEAT_STAGES:
+            return
+        now = time.monotonic()
+        interval = self._tui_run_launch_heartbeat_interval_seconds()
+        last_progress = float(getattr(run, "launch_last_progress_at", 0.0) or 0.0)
+        last_heartbeat = float(getattr(run, "launch_last_heartbeat_at", 0.0) or 0.0)
+        if last_progress and (now - last_progress) < interval:
+            return
+        if last_heartbeat and (now - last_heartbeat) < interval:
+            return
+        silent_window = max(0.0, now - last_progress) if last_progress > 0 else interval
+        if not bool(getattr(run, "launch_silent_warning_emitted", False)):
+            log_latency_event(
+                logger,
+                event="run_silent_window",
+                duration_seconds=silent_window,
+                fields={
+                    "run_id": str(getattr(run, "run_id", "")).strip(),
+                    "process": str(getattr(run, "process_name", "")).strip(),
+                    "stage": str(getattr(run, "launch_stage", "")).strip(),
+                    "run_silent_window_ms": int(silent_window * 1000),
+                },
+            )
+            run.launch_silent_warning_emitted = True
+        current_stage = str(getattr(run, "launch_stage_heartbeat_stage", "")).strip()
+        if current_stage != stage:
+            run.launch_stage_heartbeat_stage = stage
+            run.launch_stage_heartbeat_dots = 1
+        else:
+            run.launch_stage_heartbeat_dots = int(
+                getattr(run, "launch_stage_heartbeat_dots", 0) or 0,
+            ) + 1
+            run.launch_stage_heartbeat_dots = min(run.launch_stage_heartbeat_dots, 48)
+        self._upsert_process_run_stage_activity(
+            run,
+            stage=stage,
+            text=self._render_process_run_stage_activity_text(
+                stage,
+                dots=run.launch_stage_heartbeat_dots,
+            ),
+        )
+        run.launch_last_heartbeat_at = now
+        run.launch_last_progress_at = now
+        run.launch_silent_warning_emitted = True
+
+    def _log_terminal_stage_duration(
+        self,
+        run: ProcessRunState,
+        *,
+        terminal_state: str,
+    ) -> None:
+        """Log final duration for the current launch stage on terminal transitions."""
+        started = float(getattr(run, "launch_stage_started_at", 0.0) or 0.0)
+        if started <= 0:
+            return
+        stage = str(getattr(run, "launch_stage", "")).strip()
+        now = time.monotonic()
+        duration = max(0.0, now - started)
+        log_latency_event(
+            logger,
+            event="run_stage_duration",
+            duration_seconds=duration,
+            fields={
+                "run_id": str(getattr(run, "run_id", "")).strip(),
+                "process": str(getattr(run, "process_name", "")).strip(),
+                "stage": stage,
+                "terminal_state": str(terminal_state or "").strip(),
+                "run_stage_duration_ms": int(duration * 1000),
+            },
+        )
+        self._finalize_process_run_stage_activity_line(
+            run,
+            stage=stage,
+            duration_seconds=duration,
+        )
+        run.launch_stage_started_at = now
 
     def _serialize_process_run_state(self, run: ProcessRunState) -> dict:
         """Serialize one in-memory process run for session UI persistence."""
@@ -4149,6 +4657,9 @@ class LoomApp(App):
             "status": status,
             "task_id": str(getattr(run, "task_id", "")).strip(),
             "elapsed_seconds": float(self._elapsed_seconds_for_run(run)),
+            "launch_stage": str(getattr(run, "launch_stage", "accepted")).strip() or "accepted",
+            "launch_error": str(getattr(run, "launch_error", "")).strip(),
+            "launch_tab_created_at": float(getattr(run, "launch_tab_created_at", 0.0) or 0.0),
             "tasks": tasks,
             "task_labels": {str(k): str(v) for k, v in labels.items()},
             "activity_log": activity,
@@ -4350,6 +4861,12 @@ class LoomApp(App):
             if status not in _PROCESS_STATUS_LABEL:
                 status = "completed"
             task_id = str(raw.get("task_id", "")).strip()
+            launch_stage = str(raw.get("launch_stage", "accepted")).strip() or "accepted"
+            launch_error = str(raw.get("launch_error", "")).strip()
+            try:
+                launch_tab_created_at = float(raw.get("launch_tab_created_at", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                launch_tab_created_at = 0.0
             try:
                 elapsed_seconds = max(0.0, float(raw.get("elapsed_seconds", 0.0)))
             except (TypeError, ValueError):
@@ -4437,6 +4954,11 @@ class LoomApp(App):
                 result_log=result_log,
                 auth_profile_overrides=auth_profile_overrides,
                 auth_required_resources=auth_required_resources,
+                launch_stage=launch_stage if launch_stage in _PROCESS_RUN_LAUNCH_STAGE_INDEX else (
+                    "queueing_delegate" if status == "queued" else "running"
+                ),
+                launch_error=launch_error,
+                launch_tab_created_at=launch_tab_created_at,
             )
 
             if run.status in {"queued", "running"}:
@@ -4456,7 +4978,7 @@ class LoomApp(App):
                 ),
                 after="tab-events",
             )
-            run.pane.set_tasks(run.tasks)
+            self._refresh_process_run_progress(run)
             self._refresh_process_run_outputs(run)
             for line in run.activity_log:
                 run.pane.add_activity(line)
@@ -4518,6 +5040,7 @@ class LoomApp(App):
         for run in self._process_runs.values():
             if run.status in {"queued", "running"}:
                 active = True
+                self._maybe_emit_process_run_heartbeat(run)
                 self._update_process_run_visuals(run)
         if active:
             self._refresh_sidebar_progress_summary()
@@ -4911,11 +5434,19 @@ class LoomApp(App):
         run.status = "queued"
         run.started_at = time.monotonic()
         run.ended_at = None
+        run.launch_error = ""
+        run.launch_stage = "queueing_delegate"
+        run.launch_stage_started_at = time.monotonic()
+        run.launch_last_progress_at = time.monotonic()
+        run.launch_last_heartbeat_at = 0.0
+        run.launch_stage_heartbeat_dots = 0
+        run.launch_stage_heartbeat_stage = ""
+        run.launch_stage_activity_indices = {}
         run.tasks, run.task_labels = self._resume_seed_task_rows(run)
         run.last_progress_message = ""
         run.last_progress_at = 0.0
         self._update_process_run_visuals(run)
-        run.pane.set_tasks(run.tasks)
+        self._refresh_process_run_progress(run)
         self._refresh_process_run_outputs(run)
         self._append_process_run_activity(
             run,
@@ -5236,18 +5767,13 @@ class LoomApp(App):
         goal_context_overrides: dict[str, Any] | None = None,
         resume_task_id: str = "",
         run_workspace_override: Path | None = None,
+        synthesis_goal: str = "",
+        force_fresh: bool = False,
     ) -> None:
         """Create a run tab and launch process execution in a background worker."""
+        submit_started = time.monotonic()
         chat = self.query_one("#chat-log", ChatLog)
         events_panel = self.query_one("#events-panel", EventPanel)
-
-        selected_process = process_defn or self._process_defn
-        if selected_process is None and not resume_task_id:
-            chat.add_info(
-                "[bold #f7768e]No active process. Use /process use "
-                "<name-or-path> first.[/]"
-            )
-            return
 
         if not self._tools.has("delegate_task"):
             chat.add_info(
@@ -5267,25 +5793,38 @@ class LoomApp(App):
             )
             return
 
-        process_name = str(process_name_override or "").strip()
+        selected_process = process_defn
+        requested_process_name = str(process_name_override or "").strip()
+        process_name = requested_process_name
+        if selected_process is None and not requested_process_name:
+            selected_process = self._process_defn
         if not process_name and selected_process is not None:
-            process_name = selected_process.name
+            process_name = str(selected_process.name).strip()
+        resolve_adhoc = bool(is_adhoc)
+        if selected_process is None and not process_name and not resume_task_id:
+            resolve_adhoc = True
         if not process_name:
-            process_name = "resumed-process-run"
-        if run_workspace_override is not None:
-            run_workspace = Path(run_workspace_override).expanduser()
-        else:
-            run_workspace = await self._prepare_process_run_workspace(process_name, goal)
-        run_auth_overrides = dict(self._run_auth_profile_overrides)
-        resolved_auth_overrides, required_auth_resources = (
-            await self._resolve_auth_overrides_for_run_start(
-                process_defn=selected_process,
-                base_overrides=run_auth_overrides,
-            )
+            process_name = "adhoc-process-run" if resolve_adhoc else "process-run"
+
+        launch_request = ProcessRunLaunchRequest(
+            goal=goal,
+            command_prefix=command_prefix,
+            process_defn=selected_process,
+            process_name_override=requested_process_name,
+            is_adhoc=resolve_adhoc,
+            recommended_tools=list(recommended_tools or []),
+            adhoc_synthesis_notes=list(adhoc_synthesis_notes or []),
+            goal_context_overrides=dict(goal_context_overrides or {}),
+            resume_task_id=str(resume_task_id or "").strip(),
+            run_workspace_override=(
+                Path(run_workspace_override).expanduser()
+                if run_workspace_override is not None
+                else None
+            ),
+            synthesis_goal=str(synthesis_goal or "").strip(),
+            force_fresh=bool(force_fresh),
         )
-        if resolved_auth_overrides is None:
-            return
-        run_auth_overrides = resolved_auth_overrides
+
         run_id = self._new_process_run_id()
         pane_id = f"tab-run-{run_id}"
         pane = ProcessRunPane(
@@ -5297,18 +5836,16 @@ class LoomApp(App):
             run_id=run_id,
             process_name=process_name,
             goal=goal,
-            run_workspace=run_workspace,
+            run_workspace=self._workspace,
             process_defn=selected_process,
             pane_id=pane_id,
             pane=pane,
             status="queued",
-            task_id=str(resume_task_id or "").strip(),
+            task_id=launch_request.resume_task_id,
             started_at=time.monotonic(),
-            is_adhoc=bool(is_adhoc),
-            recommended_tools=list(recommended_tools or []),
-            goal_context_overrides=dict(goal_context_overrides or {}),
-            auth_profile_overrides=dict(run_auth_overrides),
-            auth_required_resources=list(required_auth_resources),
+            is_adhoc=resolve_adhoc,
+            recommended_tools=list(launch_request.recommended_tools),
+            goal_context_overrides=dict(launch_request.goal_context_overrides),
         )
         self._process_runs[run_id] = run
 
@@ -5322,40 +5859,33 @@ class LoomApp(App):
             after="tab-events",
         )
         tabs.active = pane_id
+        run.launch_tab_created_at = time.monotonic()
         self._update_process_run_visuals(run)
-        run.pane.set_tasks(run.tasks)
+        self._refresh_process_run_progress(run)
         self._refresh_process_run_outputs(run)
         self._refresh_sidebar_progress_summary()
+        submit_to_tab = max(0.0, run.launch_tab_created_at - submit_started)
+        log_latency_event(
+            logger,
+            event="run_submit_to_tab",
+            duration_seconds=submit_to_tab,
+            fields={
+                "run_id": run_id,
+                "process": process_name,
+                "run_submit_to_tab_ms": int(submit_to_tab * 1000),
+            },
+        )
+        self._set_process_run_launch_stage(
+            run,
+            "accepted",
+            note="Accepted /run request.",
+        )
 
         chat.add_user_message(f"{command_prefix} {goal}")
         chat.add_info(
             f"Started process run [dim]{run_id}[/dim] "
             f"([bold]{process_name}[/bold])."
         )
-        self._append_process_run_activity(
-            run,
-            f"Run workspace: {run_workspace}",
-        )
-        if bool(getattr(run, "is_adhoc", False)):
-            self._append_process_run_activity(run, "Run mode: synthesized ad hoc process.")
-            for note in list(adhoc_synthesis_notes or []):
-                self._append_process_run_activity(run, note)
-            if run.recommended_tools:
-                self._append_process_run_activity(
-                    run,
-                    "Recommended extra tools: " + ", ".join(sorted(run.recommended_tools)),
-                )
-        if run.auth_profile_overrides:
-            rendered = ", ".join(
-                f"{selector}={profile_id}"
-                for selector, profile_id in sorted(run.auth_profile_overrides.items())
-            )
-            self._append_process_run_activity(run, f"Run auth overrides: {rendered}")
-        if run.task_id:
-            self._append_process_run_activity(
-                run,
-                f"Resuming task state: {run.task_id}",
-            )
         self._append_process_run_activity(run, "Queued process run.")
         if not self._process_close_hint_shown:
             chat.add_info(
@@ -5369,13 +5899,267 @@ class LoomApp(App):
             f"{process_name} #{run_id}: {goal[:120]}",
         )
 
-        run.worker = self.run_worker(
-            self._execute_process_run(run_id),
-            name=f"process-run-{run_id}",
-            group=f"process-run-{run_id}",
-            exclusive=False,
-        )
+        if self._tui_run_preflight_async_enabled():
+            run.worker = self.run_worker(
+                self._prepare_and_execute_process_run(run_id, launch_request),
+                name=f"process-run-{run_id}",
+                group=f"process-run-{run_id}",
+                exclusive=False,
+            )
+        else:
+            self._append_process_run_activity(
+                run,
+                "Run launch mode: inline preflight (run_preflight_async_enabled=false).",
+            )
+            prepared = await self._prepare_process_run_with_timeout(run_id, launch_request)
+            if prepared and not run.closed:
+                run.worker = self.run_worker(
+                    self._execute_process_run(run_id),
+                    name=f"process-run-{run_id}",
+                    group=f"process-run-{run_id}",
+                    exclusive=False,
+                )
+            else:
+                run.worker = None
         await self._persist_process_run_ui_state()
+
+    async def _prepare_process_run_with_timeout(
+        self,
+        run_id: str,
+        launch_request: ProcessRunLaunchRequest,
+    ) -> bool:
+        """Run preflight with timeout/error normalization."""
+        launch_timeout = self._tui_run_launch_timeout_seconds()
+        try:
+            return bool(
+                await asyncio.wait_for(
+                    self._prepare_process_run_launch(run_id, launch_request),
+                    timeout=launch_timeout,
+                )
+            )
+        except TimeoutError:
+            run = self._process_runs.get(run_id)
+            if run is not None:
+                stage = self._process_run_launch_stage_label(run.launch_stage).lower()
+                self._fail_process_run_launch(
+                    run,
+                    (
+                        f"Run launch timed out after {int(launch_timeout)}s "
+                        f"during {stage}."
+                    ),
+                )
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - defensive guard
+            run = self._process_runs.get(run_id)
+            if run is not None:
+                self._fail_process_run_launch(run, str(e))
+            return False
+
+    async def _prepare_and_execute_process_run(
+        self,
+        run_id: str,
+        launch_request: ProcessRunLaunchRequest,
+    ) -> None:
+        """Resolve launch prerequisites, then execute the delegated run."""
+        run = self._process_runs.get(run_id)
+        if run is None or run.closed:
+            return
+        needs_cleanup = True
+        prepared = False
+        try:
+            prepared = await self._prepare_process_run_with_timeout(run_id, launch_request)
+            if not prepared:
+                return
+            await self._execute_process_run(run_id)
+            needs_cleanup = False
+        finally:
+            if needs_cleanup:
+                run = self._process_runs.get(run_id)
+                if run is not None:
+                    run.worker = None
+                    await self._persist_process_run_ui_state()
+
+    async def _prepare_process_run_launch(
+        self,
+        run_id: str,
+        launch_request: ProcessRunLaunchRequest,
+    ) -> bool:
+        """Resolve process/workspace/auth preflight before delegate execution."""
+        run = self._process_runs.get(run_id)
+        if run is None or run.closed:
+            return False
+
+        selected_process = launch_request.process_defn
+        process_name = str(launch_request.process_name_override or "").strip()
+        synthesized_now = False
+
+        self._set_process_run_launch_stage(
+            run,
+            "resolving_process",
+            note="Resolving process configuration...",
+        )
+        if selected_process is None and process_name:
+            loader = self._create_process_loader()
+            try:
+                selected_process = loader.load(process_name)
+            except Exception as e:
+                self._fail_process_run_launch(
+                    run,
+                    f"Failed to load process '{process_name}': {e}",
+                )
+                return False
+        if selected_process is None and launch_request.is_adhoc:
+            synthesis_goal = str(launch_request.synthesis_goal or "").strip() or launch_request.goal
+            self._set_process_run_launch_stage(
+                run,
+                "resolving_process",
+                note="Synthesizing ad hoc process for /run goal...",
+            )
+            try:
+                entry, from_cache = await self._get_or_create_adhoc_process(
+                    synthesis_goal,
+                    fresh=bool(launch_request.force_fresh),
+                )
+            except Exception as e:
+                self._fail_process_run_launch(run, f"Ad hoc synthesis failed: {e}")
+                return False
+            if run.closed:
+                return False
+            synthesized_now = True
+            selected_process = entry.process_defn
+            process_name = str(getattr(selected_process, "name", "") or process_name).strip()
+            run.is_adhoc = True
+            run.recommended_tools = list(getattr(entry, "recommended_tools", []) or [])
+            if from_cache:
+                self._append_process_run_activity(
+                    run,
+                    f"Using cached ad hoc process {process_name}.",
+                )
+            else:
+                self._append_process_run_activity(
+                    run,
+                    (
+                        f"Synthesized ad hoc process {process_name} "
+                        f"with {len(getattr(selected_process, 'phases', []) or [])} phases."
+                    ),
+                )
+            if run.recommended_tools:
+                self._append_process_run_activity(
+                    run,
+                    "Recommended extra tools: " + ", ".join(sorted(run.recommended_tools)),
+                )
+            cache_key = str(
+                getattr(entry, "key", "") or self._adhoc_cache_key(synthesis_goal),
+            )
+            self._append_process_run_activity(
+                run,
+                f"Ad hoc process cache: {self._adhoc_cache_path(cache_key)}",
+            )
+            adhoc_notes = self._adhoc_synthesis_activity_lines(
+                entry,
+                from_cache=from_cache,
+                fresh=bool(launch_request.force_fresh),
+            )
+            for note in adhoc_notes:
+                self._append_process_run_activity(run, note)
+        elif selected_process is None and not run.task_id:
+            self._fail_process_run_launch(
+                run,
+                "Unable to resolve process for /run.",
+            )
+            return False
+
+        if selected_process is not None:
+            process_name = str(getattr(selected_process, "name", "") or process_name).strip()
+            if process_name and self._is_reserved_process_name(process_name):
+                self._fail_process_run_launch(
+                    run,
+                    (
+                        f"Process '{process_name}' conflicts with a built-in slash command "
+                        "and cannot be loaded in TUI."
+                    ),
+                )
+                return False
+        if not process_name:
+            process_name = "process-run"
+        run.process_name = process_name
+        run.process_defn = selected_process
+        run.goal_context_overrides = dict(launch_request.goal_context_overrides)
+        if run.is_adhoc and not synthesized_now:
+            self._append_process_run_activity(run, "Run mode: synthesized ad hoc process.")
+            for note in list(launch_request.adhoc_synthesis_notes):
+                self._append_process_run_activity(run, note)
+            if run.recommended_tools:
+                self._append_process_run_activity(
+                    run,
+                    "Recommended extra tools: " + ", ".join(sorted(run.recommended_tools)),
+                )
+        self._update_process_run_visuals(run)
+
+        self._set_process_run_launch_stage(
+            run,
+            "provisioning_workspace",
+            note="Provisioning run workspace...",
+        )
+        if launch_request.run_workspace_override is not None:
+            run_workspace = Path(launch_request.run_workspace_override).expanduser()
+        else:
+            run_workspace = await self._prepare_process_run_workspace(process_name, run.goal)
+        if run.closed:
+            return False
+        run.run_workspace = run_workspace
+        self._append_process_run_activity(run, f"Run workspace: {run_workspace}")
+        self._request_workspace_refresh("run-workspace-created", immediate=True)
+        try:
+            rel_workspace = str(run_workspace.resolve().relative_to(self._workspace.resolve()))
+        except Exception:
+            rel_workspace = ""
+        if rel_workspace and rel_workspace not in {".", "./"}:
+            self._ingest_files_panel_from_paths([rel_workspace], operation_hint="create")
+
+        self._set_process_run_launch_stage(
+            run,
+            "auth_preflight",
+            note="Resolving auth preflight...",
+        )
+        run_auth_overrides = dict(self._run_auth_profile_overrides)
+        resolved_auth_overrides, required_auth_resources = (
+            await self._resolve_auth_overrides_for_run_start(
+                process_defn=selected_process,
+                base_overrides=run_auth_overrides,
+            )
+        )
+        if run.closed:
+            return False
+        if resolved_auth_overrides is None:
+            self._fail_process_run_launch(
+                run,
+                "Run cancelled: unresolved auth requirements.",
+            )
+            return False
+        run.auth_profile_overrides = dict(resolved_auth_overrides)
+        run.auth_required_resources = list(required_auth_resources)
+        if run.auth_profile_overrides:
+            rendered = ", ".join(
+                f"{selector}={profile_id}"
+                for selector, profile_id in sorted(run.auth_profile_overrides.items())
+            )
+            self._append_process_run_activity(run, f"Run auth overrides: {rendered}")
+        if run.task_id:
+            self._append_process_run_activity(
+                run,
+                f"Resuming task state: {run.task_id}",
+            )
+
+        self._set_process_run_launch_stage(
+            run,
+            "queueing_delegate",
+            note="Queueing delegate task...",
+        )
+        self._refresh_process_run_progress(run)
+        return True
 
     async def _execute_process_run(self, run_id: str) -> None:
         """Execute one process run and stream updates into its dedicated tab."""
@@ -5390,9 +6174,25 @@ class LoomApp(App):
         run.status = "running"
         run.started_at = time.monotonic()
         run.ended_at = None
-        self._update_process_run_visuals(run)
-        self._refresh_sidebar_progress_summary()
-        self._append_process_run_activity(run, "Run started.")
+        run.launch_error = ""
+        tab_created_at = float(getattr(run, "launch_tab_created_at", 0.0) or 0.0)
+        if tab_created_at > 0:
+            tab_to_delegate = max(0.0, run.started_at - tab_created_at)
+            log_latency_event(
+                logger,
+                event="run_tab_to_delegate_start",
+                duration_seconds=tab_to_delegate,
+                fields={
+                    "run_id": str(getattr(run, "run_id", "")).strip(),
+                    "process": str(getattr(run, "process_name", "")).strip(),
+                    "run_tab_to_delegate_start_ms": int(tab_to_delegate * 1000),
+                },
+            )
+        self._set_process_run_launch_stage(
+            run,
+            "running",
+            note="Run started.",
+        )
 
         try:
             run_context = self._build_process_run_context(
@@ -5442,7 +6242,7 @@ class LoomApp(App):
                 if isinstance(tasks, list):
                     normalized = self._normalize_process_run_tasks(run, tasks)
                     run.tasks = normalized
-                    run.pane.set_tasks(normalized)
+                    self._refresh_process_run_progress(run)
                     self._refresh_process_run_outputs(run)
             delegated_status = ""
             if isinstance(data, dict):
@@ -5455,6 +6255,10 @@ class LoomApp(App):
                 self._append_process_run_result(run, output, success=True)
                 run.status = "completed"
                 run.ended_at = time.monotonic()
+                run.launch_error = ""
+                self._log_terminal_stage_duration(run, terminal_state="completed")
+                run.launch_last_progress_at = time.monotonic()
+                self._refresh_process_run_progress(run)
                 self._update_process_run_visuals(run)
                 self._refresh_sidebar_progress_summary()
                 events_panel.add_event(
@@ -5471,6 +6275,10 @@ class LoomApp(App):
                     self._append_process_run_result(run, error, success=False)
                 run.status = "failed"
                 run.ended_at = time.monotonic()
+                run.launch_error = str(error)
+                self._log_terminal_stage_duration(run, terminal_state="failed")
+                run.launch_last_progress_at = time.monotonic()
+                self._refresh_process_run_progress(run)
                 self._update_process_run_visuals(run)
                 self._refresh_sidebar_progress_summary()
                 events_panel.add_event(
@@ -5486,7 +6294,10 @@ class LoomApp(App):
                 return
             run.status = "cancelled"
             run.ended_at = time.monotonic()
+            run.launch_error = "Process run cancelled."
+            self._log_terminal_stage_duration(run, terminal_state="cancelled")
             self._append_process_run_result(run, "Process run cancelled.", success=False)
+            self._refresh_process_run_progress(run)
             self._update_process_run_visuals(run)
             self._refresh_sidebar_progress_summary()
             events_panel.add_event(
@@ -5498,6 +6309,9 @@ class LoomApp(App):
             self._append_process_run_result(run, str(e), success=False)
             run.status = "failed"
             run.ended_at = time.monotonic()
+            run.launch_error = str(e)
+            self._log_terminal_stage_duration(run, terminal_state="failed")
+            self._refresh_process_run_progress(run)
             self._update_process_run_visuals(run)
             self._refresh_sidebar_progress_summary()
             events_panel.add_event(
@@ -8384,20 +9198,11 @@ class LoomApp(App):
                     )
 
             process_defn = None
-            recommended_tools: list[str] = []
+            process_name_override = ""
             is_adhoc = False
-            adhoc_synthesis_notes: list[str] = []
 
             if run_process_name:
-                loader = self._create_process_loader()
-                try:
-                    process_defn = loader.load(run_process_name)
-                except Exception as e:
-                    chat.add_info(
-                        f"[bold #f7768e]Failed to load process "
-                        f"'{run_process_name}': {e}[/]"
-                    )
-                    return True
+                process_name_override = run_process_name
             elif self._process_defn is not None:
                 process_defn = self._process_defn
             else:
@@ -8405,63 +9210,17 @@ class LoomApp(App):
                     getattr(getattr(self._config, "process", None), "default", "") or "",
                 ).strip()
                 if default_process:
-                    loader = self._create_process_loader()
-                    try:
-                        process_defn = loader.load(default_process)
-                    except Exception as e:
-                        chat.add_info(
-                            f"[bold #f7768e]Failed to load default process "
-                            f"'{default_process}': {e}[/]"
-                        )
-                        return True
+                    process_name_override = default_process
                 else:
-                    chat.add_info("Synthesizing ad hoc process for /run goal...")
-                    entry, from_cache = await self._get_or_create_adhoc_process(
-                        synthesis_goal,
-                        fresh=force_fresh,
-                    )
-                    process_defn = entry.process_defn
-                    recommended_tools = list(entry.recommended_tools)
                     is_adhoc = True
-                    if from_cache:
-                        chat.add_info(
-                            f"Using cached ad hoc process [bold]{process_defn.name}[/bold]."
-                        )
-                    else:
-                        chat.add_info(
-                            f"Synthesized ad hoc process [bold]{process_defn.name}[/bold] "
-                            f"with {len(process_defn.phases)} phases."
-                        )
-                    if recommended_tools:
-                        chat.add_info(
-                            "Recommended additional tools: "
-                            + ", ".join(sorted(recommended_tools))
-                        )
-                    cache_key = str(
-                        getattr(entry, "key", "") or self._adhoc_cache_key(synthesis_goal),
-                    )
-                    chat.add_info(
-                        "Ad hoc process cache: "
-                        f"[dim]{self._adhoc_cache_path(cache_key)}[/dim]"
-                    )
-                    adhoc_synthesis_notes = self._adhoc_synthesis_activity_lines(
-                        entry,
-                        from_cache=from_cache,
-                        fresh=force_fresh,
-                    )
 
-            if process_defn is None:
-                chat.add_info(
-                    "[bold #f7768e]Unable to resolve process for /run.[/]"
-                )
-                return True
             start_kwargs: dict[str, Any] = {
                 "process_defn": process_defn,
+                "process_name_override": process_name_override or None,
                 "is_adhoc": is_adhoc,
-                "recommended_tools": recommended_tools,
+                "synthesis_goal": synthesis_goal,
+                "force_fresh": force_fresh,
             }
-            if adhoc_synthesis_notes:
-                start_kwargs["adhoc_synthesis_notes"] = adhoc_synthesis_notes
             if goal_context_overrides:
                 start_kwargs["goal_context_overrides"] = goal_context_overrides
             await self._start_process_run(execution_goal, **start_kwargs)
@@ -8475,24 +9234,9 @@ class LoomApp(App):
                     self._render_slash_command_usage(f"/{process_name}", "<goal>")
                 )
                 return True
-            loader = self._create_process_loader()
-            try:
-                process_defn = loader.load(process_name)
-            except Exception as e:
-                chat.add_info(
-                    f"[bold #f7768e]Failed to load process "
-                    f"'{process_name}': {e}[/]"
-                )
-                return True
-            if self._is_reserved_process_name(process_defn.name):
-                chat.add_info(
-                    f"[bold #f7768e]Process '{process_defn.name}' conflicts with "
-                    "a built-in slash command and cannot be run from TUI.[/]"
-                )
-                return True
             await self._start_process_run(
                 goal,
-                process_defn=process_defn,
+                process_name_override=process_name,
                 command_prefix=f"/{process_name}",
             )
             return True
@@ -8834,7 +9578,7 @@ class LoomApp(App):
             if nested_tool and self._is_mutating_tool(nested_tool):
                 self._request_workspace_refresh(f"delegate:{nested_tool}")
             self._ingest_files_panel_from_paths(
-                event_data.get("files_changed", []),
+                event_data.get("files_changed_paths", event_data.get("files_changed", [])),
                 operation_hint="modify",
             )
         if event_type in {
@@ -9073,11 +9817,14 @@ class LoomApp(App):
         if run is not None:
             if run.closed:
                 return
+            run.launch_last_progress_at = time.monotonic()
+            run.launch_last_heartbeat_at = 0.0
+            run.launch_silent_warning_emitted = False
             tasks = data.get("tasks", [])
             if isinstance(tasks, list):
                 normalized = self._normalize_process_run_tasks(run, tasks)
                 run.tasks = normalized
-                run.pane.set_tasks(normalized)
+                self._refresh_process_run_progress(run)
                 self._refresh_process_run_outputs(run)
 
             task_id = str(data.get("task_id", "")).strip()
@@ -9090,7 +9837,10 @@ class LoomApp(App):
                 if self._is_mutating_tool(tool_name):
                     self._request_workspace_refresh(f"process:{tool_name}")
                 self._ingest_files_panel_from_paths(
-                    data.get("event_data", {}).get("files_changed", []),
+                    data.get("event_data", {}).get(
+                        "files_changed_paths",
+                        data.get("event_data", {}).get("files_changed", []),
+                    ),
                     operation_hint="modify",
                 )
             if event_type in {
@@ -9134,7 +9884,10 @@ class LoomApp(App):
             if self._is_mutating_tool(tool_name):
                 self._request_workspace_refresh(f"process:{tool_name}")
             self._ingest_files_panel_from_paths(
-                data.get("event_data", {}).get("files_changed", []),
+                data.get("event_data", {}).get(
+                    "files_changed_paths",
+                    data.get("event_data", {}).get("files_changed", []),
+                ),
                 operation_hint="modify",
             )
         if event_type in {
@@ -10035,6 +10788,27 @@ class LoomApp(App):
         return normalized
 
     @staticmethod
+    def _summary_files_changed_markers(raw_paths: object) -> list[tuple[str, str]]:
+        """Extract fallback summary markers from files_changed payloads."""
+        if not isinstance(raw_paths, (list, tuple, set)):
+            return []
+        markers: list[tuple[str, str]] = []
+        for item in raw_paths:
+            text = str(item or "").strip()
+            lower = text.lower()
+            if not text.startswith("(") or not text.endswith(")") or "file" not in lower:
+                continue
+            op = "modify"
+            if "created" in lower:
+                op = "create"
+            elif "deleted" in lower:
+                op = "delete"
+            marker = (op, text)
+            if marker not in markers:
+                markers.append(marker)
+        return markers
+
+    @staticmethod
     def _operation_hint_for_tool(tool_name: str) -> str:
         name = str(tool_name or "").strip()
         if name == "write_file":
@@ -10055,7 +10829,15 @@ class LoomApp(App):
     ) -> int:
         """Append file rows into the Files panel with dedupe + bounded history."""
         paths = self._normalize_files_changed_paths(raw_paths)
-        if not paths:
+        path_entries: list[tuple[str, str]] = []
+        for path in paths:
+            op = operation_hint
+            if " -> " in path:
+                op = "rename"
+            path_entries.append((op, path))
+        if not path_entries:
+            path_entries = self._summary_files_changed_markers(raw_paths)
+        if not path_entries:
             return 0
         try:
             panel = self.query_one("#files-panel", FilesChangedPanel)
@@ -10068,10 +10850,7 @@ class LoomApp(App):
                 self._files_panel_recent_ops.pop(key, None)
 
         accepted: list[dict] = []
-        for path in paths:
-            op = operation_hint
-            if " -> " in path:
-                op = "rename"
+        for op, path in path_entries:
             dedupe_key = f"{op}:{path}"
             seen_at = self._files_panel_recent_ops.get(dedupe_key, 0.0)
             if (now - seen_at) < self._files_panel_dedupe_window_seconds:

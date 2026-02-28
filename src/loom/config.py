@@ -226,6 +226,9 @@ class TUIConfig:
     chat_stream_flush_interval_ms: int = 120
     files_panel_max_rows: int = 2000
     delegate_progress_max_lines: int = 150
+    run_launch_heartbeat_interval_ms: int = 6000
+    run_launch_timeout_seconds: int = 300
+    run_preflight_async_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -954,6 +957,25 @@ def load_config(path: Path | None = None) -> Config:
             TUIConfig.delegate_progress_max_lines,
             minimum=20,
             maximum=5000,
+        ),
+        run_launch_heartbeat_interval_ms=_int_from(
+            tui_data,
+            "run_launch_heartbeat_interval_ms",
+            TUIConfig.run_launch_heartbeat_interval_ms,
+            minimum=500,
+            maximum=30_000,
+        ),
+        run_launch_timeout_seconds=_int_from(
+            tui_data,
+            "run_launch_timeout_seconds",
+            TUIConfig.run_launch_timeout_seconds,
+            minimum=5,
+            maximum=600,
+        ),
+        run_preflight_async_enabled=_bool_from(
+            tui_data,
+            "run_preflight_async_enabled",
+            TUIConfig.run_preflight_async_enabled,
         ),
     )
 

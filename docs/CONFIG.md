@@ -312,6 +312,9 @@ Safety notes:
 | `chat_stream_flush_interval_ms` | `int` | `120` | Sparse flush cadence for buffered streaming chat chunks. |
 | `files_panel_max_rows` | `int` | `2000` | Maximum retained rows in the Files panel before oldest rows are dropped. |
 | `delegate_progress_max_lines` | `int` | `150` | Maximum retained lines per collapsed delegate-progress section. |
+| `run_launch_heartbeat_interval_ms` | `int` | `6000` | Heartbeat cadence for `/run` launch/running stage lines when progress is quiet. |
+| `run_launch_timeout_seconds` | `int` | `300` | Timeout for `/run` preflight launch stages before delegate execution starts. |
+| `run_preflight_async_enabled` | `bool` | `true` | Runs `/run` preflight in a background worker; set `false` for rollback to inline preflight behavior. |
 
 ### Legacy `[mcp]` in `loom.toml` (supported)
 
@@ -418,4 +421,6 @@ definitions inside `loom.toml`:
 - `tui.chat_stream_flush_interval_ms` is clamped to `40..2000`.
 - `tui.files_panel_max_rows` is clamped to `100..20000`.
 - `tui.delegate_progress_max_lines` is clamped to `20..5000`.
+- `tui.run_launch_heartbeat_interval_ms` is clamped to `500..30000`.
+- `tui.run_launch_timeout_seconds` is clamped to `5..600`.
 - MCP `timeout_seconds` falls back to `30` when invalid/non-positive.
