@@ -11,6 +11,7 @@ tags: [analytics, google-analytics, ga4, measurement, conversion, attribution]
 
 dependencies:
   - pyyaml
+  - httpx>=0.27
 
 persona: |
   You are a senior digital analytics consultant specializing in Google Analytics 4.
@@ -23,6 +24,9 @@ persona: |
 phase_mode: guided
 
 tool_guidance: |
+  Use ga_live_api to retrieve live GA4 property metadata and reports when API
+  credentials are configured. Prefer pulling fresh data first, then write
+  analysis outputs based on retrieved evidence.
   Use CSV for all tabular data (event inventories, funnel metrics, segment
   comparisons). Use Markdown for narrative analysis and recommendations.
   Use the calculator for conversion rate lifts, attribution weighting, and
@@ -30,10 +34,17 @@ tool_guidance: |
 
 tools:
   required:
+    - ga_live_api
     - calculator
     - spreadsheet
     - document_write
   excluded: []
+
+auth:
+  required:
+    - provider: google_analytics
+      source: api
+      modes: [api_key, oauth2_pkce, oauth2_device, env_passthrough]
 
 phases:
   - id: tracking-audit
