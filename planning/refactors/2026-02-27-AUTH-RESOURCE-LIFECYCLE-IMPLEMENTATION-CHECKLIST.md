@@ -225,7 +225,7 @@ Status:
 3. `src/loom/tui/app.py`
 4. `src/loom/tui/screens/auth_manager.py`
 5. `docs/creating-packages.md`
-6. `planning/2026-02-25-SYSTEM-TECHNICAL-DESIGN.md`
+6. `docs/2026-02-28-SYSTEM-TECHNICAL-DESIGN.md`
 7. `tests/*` targeted cleanup updates
 
 ## Tasks

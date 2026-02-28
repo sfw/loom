@@ -6,7 +6,7 @@ This document is a code-level technical deep dive for the Loom system in `/Users
 
 It explains:
 - All major subsystems and their responsibilities.
-- Runtime control flow in both task orchestration mode and cowork interactive mode.
+- Runtime control flow in task orchestration mode, cowork interactive mode, and TUI process-run control flows.
 - Core data structures, state and persistence model.
 - Decision points, including what inputs drive them and what outcomes they cause.
 - Retry, remediation, fallback, and tuning logic.
@@ -14,16 +14,18 @@ It explains:
 
 This is based on the current implementation in `src/loom/*`.
 
-Implementation refresh status (2026-02-27):
-- Reliability hardening workstreams `#1,#2,#3,#4,#5,#6,#10` are implemented behind execution flags.
-- Validation snapshot (2026-02-27): `uv run ruff check` passed; `uv run pytest` passed (`1879 passed, 50 skipped, 1 warning`).
+Implementation refresh status (2026-02-28):
+- Reliability hardening workstreams `#1,#2,#3,#4,#5,#6,#10` remain implemented behind execution flags.
+- Additional Feb 27-28 coverage includes cowork hybrid-tool exposure, chat replay journaling, delegated-progress streaming, `/run` launch liveness staging, and cancel-first process-tab close semantics.
+- Validation snapshot (2026-02-28): `uv run ruff check` passed; `uv run pytest` passed (`2000 passed, 50 skipped, 2 warnings`).
 - Default posture remains conservative: hardening controls are mostly opt-in via config.
 
 ## 2. High-Level Architecture
 
-Loom has two primary operating modes:
+Loom has two primary execution modes plus a TUI control plane:
 - Task mode: plan -> execute subtasks -> verify -> remediate/replan -> finalize.
-- Cowork mode: interactive turn-by-turn assistant with tools and persistent conversation state.
+- Cowork mode: interactive turn-by-turn assistant with tool loops and persistent conversation state.
+- TUI process-run control plane: `/run` preflight staging, concurrent run tabs, delegated progress streaming, and cancel-first close workflow.
 
 ### 2.1 Component map
 
@@ -31,6 +33,7 @@ Loom has two primary operating modes:
 flowchart TD
     CLI["CLI/TUI/API entrypoints"] --> CFG["Config loader"]
     CFG --> ENG["Engine wiring"]
+    CLI --> TUI["Textual TUI Runtime"]
 
     ENG --> ORCH["Orchestrator"]
     ORCH --> SCH["Scheduler"]
@@ -54,6 +57,13 @@ flowchart TD
     COW --> DB
     COW --> REFL["GapAnalysisEngine"]
     REFL --> LEARN["LearningManager"]
+
+    TUI --> COW
+    TUI --> DB
+    TUI --> EV
+    TUI --> PRT["Process Run Tabs + Launch/Cancel Control"]
+    PRT --> TOOLS
+    PRT --> ORCH
 ```
 
 ### 2.2 Source domains
@@ -68,6 +78,9 @@ flowchart TD
 - API/server: `src/loom/api/*`
 - Events: `src/loom/events/*`
 - Cowork interactive mode: `src/loom/cowork/*`
+- TUI runtime and screens/widgets: `src/loom/tui/*`
+- Auth/runtime resolution: `src/loom/auth/*`
+- MCP integration bridge: `src/loom/integrations/*`
 - Learning and reflection: `src/loom/learning/*`
 
 ## 3. End-to-End Runtime Flows
@@ -208,6 +221,7 @@ Pipeline behavior:
 
 Main outcomes:
 - Verifier parse failures can trigger verification-only retry (no executor rerun).
+- Failure-resolution planner can generate compact actionable remediation snippets from bounded verification metadata.
 - If retries remain: increment retry count and return subtask to pending.
 - If retries exhausted:
   - Critical path failures can abort, or run confirm-or-prune remediation, or queue follow-up depending on process policy.
@@ -244,17 +258,49 @@ Primary implementation: `cowork/session.py`.
 Flow:
 1. User message appended and persisted.
 2. Optional recall hint injected if user message suggests dangling context reference.
-3. Model called (streaming or non-streaming).
-4. If tool calls are returned:
+3. Turn-scoped tool schema set is selected by `execution.cowork_tool_exposure_mode`:
+   - `full`: expose all tool schemas.
+   - `adaptive`: expose intent-ranked typed schemas.
+   - `hybrid`: expose typed schemas + fallback lane (`list_tools`, `run_tool`).
+4. Context window is built with token budget + archive recall index (when older turns are omitted), then sanitized to repair dangling tool-call chains before provider invocation.
+5. Model called (streaming or non-streaming).
+6. If tool calls are returned:
    - Tool approval check (`ToolApprover`).
    - Tool execution and result persistence.
+   - Repeated identical tool-call batches are bounded; a system recovery hint and deterministic fallback stop infinite loops.
    - Loop continues.
    - If `ask_user` tool called, loop pauses and returns to user.
-5. If text-only response, turn completes.
-6. Session state updated from tool events.
-7. Reflection/gap analysis runs best-effort and updates learned behavior section.
+7. If text-only response, turn completes.
+8. Session state updated from tool events.
+9. Reflection/gap analysis runs best-effort and updates learned behavior section.
 
 Cowork has token-aware context windowing and trims in-memory cache while preserving full archive in SQLite conversation tables.
+
+Chat replay durability:
+- UI transcript events are persisted in `cowork_chat_events` and replayed on resume.
+- Legacy fallback can synthesize replay rows from `conversation_turns` when journal rows are unavailable.
+- `/history older` pages older replay rows from either source.
+
+## 3.3 TUI `/run` Process Flow
+
+Primary implementation: `tui/app.py`, `tools/delegate_task.py`, `tui/screens/process_run_close.py`.
+
+Flow:
+1. `/run <goal>` creates a process tab immediately (`accepted` launch stage).
+2. Preflight resolves process, provisions run workspace, performs auth preflight, and queues delegate execution.
+   - Default path is async preflight (`tui.run_preflight_async_enabled=true`), with inline rollback mode available.
+   - Launch stages render as a checklist and single in-place heartbeat line (dot animation + elapsed timer).
+3. TUI executes `delegate_task` with process override, run auth overrides, run context handoff, and progress/cancel callbacks.
+4. Delegate event stream updates:
+   - Run progress checklist + outputs.
+   - Sidebar progress rollup.
+   - Files panel/workspace tree refresh for mutating tool completions.
+5. Close flow (`Ctrl+W`, `/run close`, palette action):
+   - Non-running tabs prompt and close.
+   - Running/queued tabs enter `cancel_requested`, call orchestrator cancel first, then optionally worker fallback.
+   - UI waits bounded time for terminal state (`tui.run_cancel_wait_timeout_seconds`).
+   - If not settled, user can keep tab open or force-close.
+6. Run tab state (tasks, activity, outputs, stage, status) persists in session UI state for resume.
 
 ## 4. Subsystem Deep Dive
 
@@ -267,6 +313,7 @@ Top-level domains:
 - `models`
 - `workspace`
 - `execution`
+- `tui`
 - `verification`
 - `memory`
 - `logging`
@@ -281,6 +328,8 @@ Notable characteristics:
 - Verification scan suffix list normalization.
 - Retry-delay range normalization (max >= base).
 - Hardening flags for budgeting, planner degradation policy, completion protocol, remediation persistence, durability, idempotency, and SLO snapshots.
+- Cowork tool exposure mode validation: `execution.cowork_tool_exposure_mode` (`full|adaptive|hybrid`).
+- TUI replay/refresh/run-control knobs are normalized/clamped (`chat_resume_*`, workspace refresh debounce/polling, stream flush cadence, run launch heartbeat/timeout, cancel wait timeout, async preflight toggle).
 - Normalized enum validation for:
   - `execution.executor_completion_contract_mode` (`off|warn|enforce`)
   - `execution.planner_degraded_mode` (`allow|require_approval|deny`)
@@ -300,6 +349,7 @@ Impact:
 - Initializes and propagates stable `run_id` per task execution attempt.
 - Enforces optional task-level aggregate budgets across loop dispatch, retries, replans, remediation, and runner counters.
 - Optionally hydrates/syncs remediation queue state to SQLite.
+- Preserves cancellation semantics in both single-dispatch and `asyncio.gather` parallel paths (`CancelledError` is re-raised, not collapsed into generic failure outcomes).
 
 ### 4.2.2 Scheduler semantics
 
@@ -326,6 +376,7 @@ Key protections:
 - Tool-iteration budget cap.
 - Deliverable variant suppression in remediation.
 - Artifact telemetry and confinement violation eventing.
+- Tool completion events include normalized `files_changed_paths` payloads for downstream live refresh surfaces.
 - Optional explicit completion contract (`off|warn|enforce`) to reduce false-success text exits.
 - Optional mutating-tool idempotency dedupe via SQLite mutation ledger.
 
@@ -352,6 +403,7 @@ Important capabilities:
 - Classifies failure strategy using verification reason code, severity, remediation metadata, and text heuristics.
 - Computes escalation tier by attempt.
 - Builds retry context including prior feedback/errors and targeted retry plans.
+- Supports model-planned remediation snippets (`diagnosis/actions/guardrails/success_criteria`) and bounded failure-metadata summarization before prompt injection to control token growth.
 
 ### 4.5.2 Confidence + Approval
 
@@ -401,6 +453,14 @@ Important capabilities:
 - Dynamic module discovery/import for built-ins.
 - Optional MCP tool registration.
 - `delegate_task` timeout wiring from config.
+- MCP startup mode supports synchronous registration or background warmup to reduce cold-start latency.
+- Default binding of hybrid fallback tools:
+  - `list_tools` catalog provider with scoped categories/metadata.
+  - `run_tool` dispatcher with blocked targets and registry safety parity.
+
+`tools/list_tools.py` + `tools/run_tool.py`:
+- `list_tools(detail="schema")` requires narrow filters (query/category/mutating/auth) to avoid broad schema dumps.
+- `run_tool` executes delegated named tools with JSON arguments and enforces non-recursive execution.
 
 ### 4.7.3 Web fetch
 
@@ -502,6 +562,7 @@ Templates in `prompts/templates/*.yaml` define text protocol and output contract
 - `learned_patterns`
 - `cowork_sessions`
 - `conversation_turns`
+- `cowork_chat_events`
 - `task_runs`
 - `subtask_attempts`
 - `remediation_items`
@@ -509,6 +570,7 @@ Templates in `prompts/templates/*.yaml` define text protocol and output contract
 - `tool_mutation_ledger`
 
 Conversation storage is append-only for full traceability.
+`cowork_chat_events` is a UI-facing transcript journal used for fast session resume and `/history older` paging, with legacy synthesis fallback from `conversation_turns`.
 
 ## 4.12 API and server
 
@@ -521,6 +583,7 @@ Conversation storage is append-only for full traceability.
   - auth profile resolution across process requirements plus allowed-tool auth declarations
   - structured unresolved-auth response (`code=auth_unresolved`) for non-interactive callers
 - Durable submission path with `run_id`, run-lease acquisition, heartbeat, and startup recovery when enabled.
+- Process-backed execution uses isolated per-task orchestrator instances (fresh prompt assembler + registry) to prevent cross-task process mutation leakage.
 - Background execution task tracking and lifecycle cleanup.
 - SSE streams for events and token streaming.
 - Approval and steering endpoints.
@@ -540,6 +603,9 @@ Conversation storage is append-only for full traceability.
   - `task_run_acquired`
   - `task_run_heartbeat`
   - `task_run_recovered`
+  - `task_cancel_requested`
+  - `task_cancel_ack`
+  - `task_cancel_timeout`
   - `tool_call_deduplicated`
 
 ## 4.14 Learning and reflection
@@ -548,6 +614,24 @@ Conversation storage is append-only for full traceability.
 - `learning/reflection.py`: per-turn gap analysis in cowork mode to learn behavioral rules from follow-up corrections/continuations.
 
 These patterns feed prompt behavior over time.
+
+## 4.15 TUI runtime and process-run control
+
+Primary implementation: `tui/app.py`, `tui/widgets/chat_log.py`, `tui/widgets/tool_call.py`, `tui/widgets/sidebar.py`.
+
+Capabilities:
+- Chat replay hydration from `cowork_chat_events` with legacy fallback synthesis and bounded render caps.
+- Sparse streaming flush (`tui.chat_stream_flush_interval_ms`) to avoid pathological UI update churn.
+- Delegate progress sections keyed by `tool_call_id` with bounded retained lines and explicit finalize semantics.
+- Real-time workspace refresh orchestration with debounce + max-wait + polling signature scans.
+- Dedicated process-run tabs with persisted UI state (progress rows, output rows, activity log, launch stage/status, auth preflight metadata).
+- Launch-stage checklist + in-place liveness heartbeat for silent windows (`resolving_process`, `provisioning_workspace`, `auth_preflight`, `queueing_delegate`, `running`).
+- Cancel-first tab close path with orchestrator cancel bridge, bounded settle wait, and optional force-close fallback.
+
+TUI slash/control ergonomics:
+- Shared slash-command registry powers `/help` + autocomplete hints to avoid drift.
+- `/history older` pages transcript history.
+- `/run close [run-id-prefix]` plus `Ctrl+W` route through the same close/cancel flow.
 
 ## 5. Core Data Structures and Contracts
 
@@ -596,6 +680,8 @@ Outcomes support nuanced semantics:
 - `subtask_attempts` stores attempt lineage by task/subtask/run.
 - `remediation_items` and `remediation_attempts` persist remediation lifecycle and retries.
 - `tool_mutation_ledger` records mutating tool execution signatures and cached results for dedupe.
+- `cowork_chat_events` persists UI transcript replay events (`seq` ordered) for resumable cowork chat and history paging.
+- `SessionState.ui_state` persists TUI process-run tab state so resumed sessions restore run panes and status context.
 
 ## 6. Decision Point Catalog
 
@@ -796,6 +882,7 @@ When `execution.enable_mutation_idempotency=true`, mutating tool calls are check
 - Inputs: reason_code, severity_class, feedback text, remediation metadata.
 - Decision: select retry strategy.
 - Impact: targeted retry context and branch behavior.
+- Additional behavior: optional failure-resolution planner call generates compact actionable plan text from bounded verification metadata.
 
 33. Verification-only retry branch.
 - Inputs: strategy `verifier_parse` + retries remaining.
@@ -935,6 +1022,33 @@ When `execution.enable_mutation_idempotency=true`, mutating tool calls are check
 - Decision: attach scheduler/remediation errors.
 - Impact: clearer diagnostics and telemetry.
 
+## 6.10 Cowork and TUI control-plane decisions
+
+59. Cowork tool exposure mode.
+- Inputs: `execution.cowork_tool_exposure_mode` + user-intent heuristics + available tools.
+- Decision: expose full tool schema set vs adaptive typed subset vs hybrid typed subset + fallback lane.
+- Impact: context size, tool discoverability, and tool-loop convergence behavior.
+
+60. Hybrid fallback retry nudge.
+- Inputs: hybrid mode + response stall markers + availability of `list_tools`/`run_tool`.
+- Decision: inject one recovery hint and retry once before accepting stalled text-only answer.
+- Impact: reduces false "tool unavailable" dead-ends without unbounded retry loops.
+
+61. Cowork repeated tool-batch breaker.
+- Inputs: repeated identical tool-call signatures without useful text progress.
+- Decision: inject anti-loop system hint; if still repeated, emit deterministic fallback summary and terminate loop.
+- Impact: prevents infinite cowork tool loops and preserves UX responsiveness.
+
+62. `/run` preflight execution mode.
+- Inputs: `tui.run_preflight_async_enabled`.
+- Decision: asynchronous preflight in background worker vs inline preflight rollback path.
+- Impact: immediate run-tab liveness vs simpler legacy behavior.
+
+63. Process-tab close behavior for active runs.
+- Inputs: run status, cancel bridge availability, cancel settle timeout.
+- Decision: request orchestrator cancel first, then optionally worker fallback; if unresolved after timeout, prompt force-close.
+- Impact: bounded UI hangs and clearer cancellation lifecycle semantics.
+
 ## 7. Retry, Backoff, and Iterative Logic
 
 ## 7.1 Iterative loops in the system
@@ -980,6 +1094,15 @@ When `execution.enable_mutation_idempotency=true`, mutating tool calls are check
 - Bound: max retries.
 - Backoff: 1s/2s/4s style exponential by base delay.
 
+11. Cowork interactive tool loop.
+- Bound: `MAX_TOOL_ITERATIONS` in `cowork/session.py` plus repeated-batch breaker thresholds.
+- Exit: text-only response, `ask_user` pause, repeated-batch fallback, or iteration bound.
+
+12. TUI run-launch liveness loop.
+- Bound: active launch/running stages and status transitions.
+- Interval: `tui.run_launch_heartbeat_interval_ms` with in-place keyed stage updates.
+- Exit: terminal run state (`completed|failed|cancelled|force_closed`) or tab close.
+
 ## 7.2 Backoff and retry matrix
 
 | Loop | Strategy | Tunables |
@@ -989,6 +1112,8 @@ When `execution.enable_mutation_idempotency=true`, mutating tool calls are check
 | Remediation queue item reschedule | Exponential delay capped by max | `verification.remediation_queue_*` |
 | Web fetch | Bounded exponential retries | constants in `tools/web.py` |
 | Webhook delivery | Exponential retries | `WebhookDelivery(max_retries, base_delay)` |
+| Cowork tool loop | Fixed iteration ceiling + repeated-batch breaker | `MAX_TOOL_ITERATIONS` + repeated-batch constants |
+| TUI launch heartbeat | Fixed interval liveness updates | `tui.run_launch_heartbeat_interval_ms` |
 
 ## 7.3 Failure classification and targeted retry context
 
@@ -1078,7 +1203,8 @@ Layer 2 SQLite:
 - Memory archive.
 - Event log.
 - Learned patterns.
-- Cowork session/turn history.
+- Cowork session/turn history (`cowork_sessions`, `conversation_turns`).
+- Cowork replay journal (`cowork_chat_events`) with seq-ordered transcript events.
 - Durable task run lifecycle (`task_runs` with lease/heartbeat and terminal status).
 - Retry/remediation lineage (`subtask_attempts`, `remediation_items`, `remediation_attempts`).
 - Mutating-tool idempotency ledger (`tool_mutation_ledger`).
@@ -1097,6 +1223,7 @@ Major event classes:
 - Verification outcomes and shadow/contradiction metrics.
 - Remediation queue lifecycle.
 - Run telemetry summary.
+- Delegate/TUI control-plane lifecycle (`task_cancel_requested`, `task_cancel_ack`, `task_cancel_timeout`, `task_cancelled`).
 - Hardening-specific lifecycle events (`task_budget_exhausted`, `task_plan_degraded`, run lease/heartbeat/recovery, mutating call dedupe).
 
 The event model supports:
@@ -1224,6 +1351,26 @@ Primary knobs:
 Tradeoff:
 - More automation speeds execution but lowers human oversight.
 
+## 12.9 Tune cowork and TUI responsiveness
+
+Primary knobs:
+- `execution.cowork_tool_exposure_mode` (`full|adaptive|hybrid`)
+- `tui.chat_resume_page_size`
+- `tui.chat_resume_max_rendered_rows`
+- `tui.chat_stream_flush_interval_ms`
+- `tui.workspace_poll_interval_ms`
+- `tui.workspace_refresh_debounce_ms`
+- `tui.workspace_refresh_max_wait_ms`
+- `tui.delegate_progress_max_lines`
+- `tui.run_launch_heartbeat_interval_ms`
+- `tui.run_launch_timeout_seconds`
+- `tui.run_cancel_wait_timeout_seconds`
+- `tui.run_progress_refresh_interval_ms`
+- `tui.run_preflight_async_enabled`
+
+Tradeoff:
+- More aggressive liveness/replay settings improve perceived responsiveness but increase UI churn and background polling overhead.
+
 ## 13. Failure Modes and Built-in Fallbacks
 
 Representative failure cases and system response:
@@ -1264,6 +1411,18 @@ Representative failure cases and system response:
 12. Aggregate task budget exhausted.
 - Response: deterministic task failure with pending subtasks skipped and budget telemetry emitted.
 
+13. Cowork tool loop repeats identical batches.
+- Response: inject anti-loop system hint once, then emit deterministic fallback response and stop loop.
+
+14. Chat resume journal unavailable/corrupt.
+- Response: fall back to synthesized replay events from `conversation_turns` (when enabled).
+
+15. `/run` preflight stalls (process/auth/workspace stage).
+- Response: launch-timeout failure with stage-specific error (`tui.run_launch_timeout_seconds`) and retained run-tab diagnostics.
+
+16. Running process tab close request cannot settle cancellation in time.
+- Response: mark `cancel_failed`, surface timeout UI, and require explicit keep-open vs force-close decision.
+
 ## 14. Extension Points and Customization
 
 1. Add new model providers via router/provider interfaces.
@@ -1286,6 +1445,8 @@ When debugging a bad run, inspect in this order:
 7. Remediation queue item state and terminal reason.
 8. Finalization criteria (blocking remediation unresolved, blocked subtasks).
 9. Evidence ledger and artifact refs for support coverage.
+10. Cowork context-window telemetry (`context_tokens`, omitted messages, recall-index usage) when chat behavior degrades.
+11. TUI run-tab launch/cancel telemetry and delegate event log path when `/run` UX is stuck or stale.
 
 ## 16. Summary
 
