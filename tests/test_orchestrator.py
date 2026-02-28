@@ -1314,6 +1314,264 @@ class TestOrchestratorExecution:
         assert attempts[0].error is not None
 
     @pytest.mark.asyncio
+    async def test_handle_failure_generates_model_resolution_plan_for_replan(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=0)),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="s1",
+            description="First",
+            max_retries=0,
+            is_critical_path=False,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+
+        result = SubtaskResult(status="failed", summary="Wrong output file")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="llm_semantic_failed",
+            feedback="Deliverable path mismatch",
+        )
+        attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
+        orch._plan_failure_resolution = AsyncMock(return_value=(
+            "Diagnosis: Output path diverged from canonical deliverable.\n"
+            "Actions:\n"
+            "1. Update canonical filename in place."
+        ))
+
+        replan_request = await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask,
+        )
+
+        orch._plan_failure_resolution.assert_awaited_once()
+        attempts = attempts_by_subtask.get("s1", [])
+        assert len(attempts) == 1
+        assert "canonical deliverable" in attempts[0].resolution_plan
+        assert isinstance(replan_request, dict)
+        assert "MODEL-PLANNED RESOLUTION" in str(
+            replan_request.get("verification_feedback", ""),
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_retry_context_includes_model_resolution_plan(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="First")
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+
+        attempts = {
+            "s1": [
+                AttemptRecord(
+                    attempt=1,
+                    tier=1,
+                    feedback="retry",
+                    error="verification failed",
+                    resolution_plan=(
+                        "Diagnosis: Wrong file path.\n"
+                        "Actions:\n"
+                        "1. Patch canonical file."
+                    ),
+                ),
+            ],
+        }
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="ok"),
+            VerificationResult(tier=1, passed=True),
+        ))
+
+        await orch._dispatch_subtask(task, subtask, attempts)
+
+        _, kwargs = orch._runner.run.await_args
+        assert "Model-planned remediation" in kwargs["retry_context"]
+        assert "Patch canonical file." in kwargs["retry_context"]
+
+    @pytest.mark.asyncio
+    async def test_failure_resolution_prompt_compacts_large_metadata(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="First")
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+
+        large_metadata = {
+            "issues": [f"issue-{i}-" + ("x" * 80) for i in range(40)],
+            "deterministic_placeholder_scan": {
+                "scan_mode": "targeted_plus_fallback",
+                "scanned_file_count": 240,
+                "matched_file_count": 0,
+                "scanned_files": [f"file-{i}.md" for i in range(200)],
+                "candidate_source_counts": {"canonical": 1, "fallback": 199},
+            },
+            "raw_blob": "Y" * 20_000,
+        }
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="llm_semantic_failed",
+            feedback="verification failed",
+            metadata=large_metadata,
+        )
+        result = SubtaskResult(status="failed", summary="Execution summary")
+
+        prompt = orch._build_failure_resolution_prompt(
+            subtask=subtask,
+            result=result,
+            verification=verification,
+            strategy=RetryStrategy.GENERIC,
+            missing_targets=[],
+            prior_attempts=[],
+        )
+
+        assert "Verification metadata:" in prompt
+        assert "raw_blob" not in prompt
+        assert "file-199.md" not in prompt
+        assert len(prompt) < 6000
+
+    @pytest.mark.asyncio
+    async def test_plan_failure_resolution_uses_fallback_when_planner_output_not_json(
+        self, tmp_path
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        config = Config(
+            execution=ExecutionConfig(
+                model_call_max_attempts=1,
+                model_call_retry_base_delay_seconds=0.0,
+                model_call_retry_max_delay_seconds=0.0,
+                model_call_retry_jitter_seconds=0.0,
+            ),
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=config,
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="First")
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        result = SubtaskResult(status="failed", summary="Execution summary")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="llm_semantic_failed",
+            feedback="verification failed",
+        )
+
+        planner_model = AsyncMock()
+        planner_model.name = "mock-planner"
+        planner_model.complete = AsyncMock(return_value=ModelResponse(
+            text="Use canonical deliverable and patch only the failing section.",
+            usage=TokenUsage(input_tokens=20, output_tokens=20, total_tokens=40),
+        ))
+        orch._router.select = MagicMock(return_value=planner_model)
+
+        plan = await orch._plan_failure_resolution(
+            task=task,
+            subtask=subtask,
+            result=result,
+            verification=verification,
+            strategy=RetryStrategy.GENERIC,
+            missing_targets=[],
+            prior_attempts=[],
+        )
+
+        assert "Use canonical deliverable" in plan
+        planner_model.complete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_plan_failure_resolution_returns_empty_on_planner_call_error(
+        self, tmp_path
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        config = Config(
+            execution=ExecutionConfig(
+                model_call_max_attempts=1,
+                model_call_retry_base_delay_seconds=0.0,
+                model_call_retry_max_delay_seconds=0.0,
+                model_call_retry_jitter_seconds=0.0,
+            ),
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=config,
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="First")
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        result = SubtaskResult(status="failed", summary="Execution summary")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="llm_semantic_failed",
+            feedback="verification failed",
+        )
+
+        planner_model = AsyncMock()
+        planner_model.name = "mock-planner"
+        planner_model.complete = AsyncMock(side_effect=RuntimeError("planner offline"))
+        orch._router.select = MagicMock(return_value=planner_model)
+
+        plan = await orch._plan_failure_resolution(
+            task=task,
+            subtask=subtask,
+            result=result,
+            verification=verification,
+            strategy=RetryStrategy.GENERIC,
+            missing_targets=[],
+            prior_attempts=[],
+        )
+
+        assert plan == ""
+        planner_model.complete.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_handle_failure_queues_noncritical_unconfirmed_for_follow_up(self, tmp_path):
         plan_json = json.dumps({
             "subtasks": [{"id": "s1", "description": "First"}]

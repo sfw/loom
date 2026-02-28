@@ -257,3 +257,25 @@ class TestRetryManager:
         assert "analysis.md" in context
         assert "evidence.csv" in context
         assert "-v2" in context
+
+    def test_build_retry_context_includes_model_planned_remediation(self):
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="verification failed",
+                resolution_plan=(
+                    "Diagnosis: canonical filename mismatch\n"
+                    "Actions:\n"
+                    "1. Update canonical file in place\n"
+                    "2. Re-run verification"
+                ),
+            ),
+        ]
+
+        context = mgr.build_retry_context(attempts)
+
+        assert "Model-planned remediation" in context
+        assert "canonical filename mismatch" in context
+        assert "Update canonical file in place" in context

@@ -96,6 +96,21 @@ _VALID_CRITICAL_PATH_BEHAVIORS = frozenset({
     "confirm_or_prune_then_queue",
     "queue_follow_up",
 })
+_FAILURE_RESOLUTION_METADATA_KEYS = (
+    "remediation_required",
+    "remediation_mode",
+    "missing_targets",
+    "unverified_claim_count",
+    "verified_claim_count",
+    "supporting_ratio",
+    "coverage_sufficient",
+    "coverage_insufficient_reason",
+    "contradiction_detected",
+    "contradiction_downgraded",
+    "contradicted_reason_code",
+    "parser_stage",
+    "issues",
+)
 
 # Re-export dataclasses that existing code imports from here
 __all__ = [
@@ -694,6 +709,18 @@ class Orchestrator:
                     if part
                 )
 
+        resolution_plan = await self._plan_failure_resolution(
+            task=task,
+            subtask=subtask,
+            result=result,
+            verification=verification,
+            strategy=strategy,
+            missing_targets=missing_targets,
+            prior_attempts=attempt_list[:-1],
+        )
+        if resolution_plan:
+            attempt_record.resolution_plan = resolution_plan
+
         critical_path_behavior = self._critical_path_behavior()
         hard_invariant_failure = self._is_hard_invariant_failure(verification)
         if (
@@ -767,6 +794,7 @@ class Orchestrator:
                 ),
                 "feedback": verification.feedback if verification else None,
                 "retry_strategy": strategy.value,
+                "resolution_plan_generated": bool(resolution_plan),
             })
         else:
             # All retries exhausted.
@@ -829,10 +857,18 @@ class Orchestrator:
                 return None
 
             # Non-critical failures request re-planning at batch boundary.
+            verification_feedback = verification.feedback
+            if resolution_plan:
+                details = (
+                    f"{verification_feedback}\n\n"
+                    "MODEL-PLANNED RESOLUTION:\n"
+                    f"{resolution_plan}"
+                )
+                verification_feedback = details.strip()
             return {
                 "reason": self._build_replan_reason(subtask, verification),
                 "failed_subtask_id": subtask.id,
-                "verification_feedback": verification.feedback,
+                "verification_feedback": verification_feedback,
             }
 
         return None
@@ -1656,6 +1692,377 @@ class Orchestrator:
             "missing_targets": list(missing_targets),
         })
 
+    @staticmethod
+    def _resolution_plan_items(raw: object, *, max_items: int = 8) -> list[str]:
+        if isinstance(raw, str):
+            parts = [
+                item.strip(" -\t")
+                for item in raw.splitlines()
+                if item.strip()
+            ]
+        elif isinstance(raw, list):
+            parts = [str(item or "").strip() for item in raw]
+        else:
+            return []
+        normalized: list[str] = []
+        for item in parts:
+            text = str(item or "").strip()
+            if not text or text in normalized:
+                continue
+            normalized.append(text)
+            if len(normalized) >= max_items:
+                break
+        return normalized
+
+    @staticmethod
+    def _compact_failure_resolution_metadata_value(
+        value: object,
+        *,
+        depth: int = 0,
+        max_depth: int = 3,
+        max_list_items: int = 8,
+        max_dict_items: int = 12,
+        max_text_chars: int = 220,
+    ) -> object:
+        if depth >= max_depth:
+            text = str(value or "").strip()
+            if len(text) > max_text_chars:
+                return text[: max_text_chars - 14] + "...[truncated]"
+            return text
+
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+
+        if isinstance(value, str):
+            text = value.strip()
+            if len(text) > max_text_chars:
+                return text[: max_text_chars - 14] + "...[truncated]"
+            return text
+
+        if isinstance(value, list):
+            items: list[object] = []
+            for item in value[:max_list_items]:
+                items.append(
+                    Orchestrator._compact_failure_resolution_metadata_value(
+                        item,
+                        depth=depth + 1,
+                        max_depth=max_depth,
+                        max_list_items=max_list_items,
+                        max_dict_items=max_dict_items,
+                        max_text_chars=max_text_chars,
+                    ),
+                )
+            remainder = len(value) - len(items)
+            if remainder > 0:
+                items.append(f"...[{remainder} more items]")
+            return items
+
+        if isinstance(value, dict):
+            compact: dict[str, object] = {}
+            items = list(value.items())[:max_dict_items]
+            for key, raw in items:
+                key_text = str(key or "").strip()[:80]
+                if not key_text:
+                    continue
+                compact[key_text] = Orchestrator._compact_failure_resolution_metadata_value(
+                    raw,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    max_list_items=max_list_items,
+                    max_dict_items=max_dict_items,
+                    max_text_chars=max_text_chars,
+                )
+            remainder = len(value) - len(items)
+            if remainder > 0:
+                compact["_truncated_keys"] = remainder
+            return compact
+
+        text = str(value or "").strip()
+        if len(text) > max_text_chars:
+            return text[: max_text_chars - 14] + "...[truncated]"
+        return text
+
+    @classmethod
+    def _summarize_failure_resolution_metadata(
+        cls,
+        metadata: dict[str, object],
+    ) -> dict[str, object]:
+        if not isinstance(metadata, dict):
+            return {}
+
+        summary: dict[str, object] = {}
+        for key in _FAILURE_RESOLUTION_METADATA_KEYS:
+            if key not in metadata:
+                continue
+            summary[key] = cls._compact_failure_resolution_metadata_value(
+                metadata.get(key),
+            )
+
+        scan = metadata.get("deterministic_placeholder_scan")
+        if isinstance(scan, dict):
+            prioritized_scan = {
+                key: scan.get(key)
+                for key in (
+                    "scan_mode",
+                    "scanned_file_count",
+                    "matched_file_count",
+                    "coverage_sufficient",
+                    "coverage_insufficient_reason",
+                    "cap_exhausted",
+                    "cap_exhaustion_reason",
+                    "candidate_source_counts",
+                )
+                if key in scan
+            }
+            if prioritized_scan:
+                summary["deterministic_placeholder_scan"] = (
+                    cls._compact_failure_resolution_metadata_value(
+                        prioritized_scan,
+                    )
+                )
+
+        if summary:
+            return summary
+
+        # Fallback for unknown schemas: include a small, compact preview.
+        for key, raw in metadata.items():
+            key_text = str(key or "").strip()
+            if not key_text:
+                continue
+            summary[key_text[:64]] = cls._compact_failure_resolution_metadata_value(raw)
+            if len(summary) >= 6:
+                break
+        return summary
+
+    def _failure_resolution_metadata_char_budget(self) -> int:
+        raw = getattr(
+            getattr(self._config, "limits", None),
+            "evidence_context_text_max_chars",
+            4000,
+        )
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 1400
+        return max(600, min(value, 2200))
+
+    def _format_failure_resolution_plan(self, response: ModelResponse) -> str:
+        validation = self._validator.validate_json_response(
+            response,
+            expected_keys=["diagnosis", "actions"],
+        )
+        if validation.valid and isinstance(validation.parsed, dict):
+            payload = validation.parsed
+            diagnosis = str(payload.get("diagnosis", "") or "").strip()
+            actions = self._resolution_plan_items(payload.get("actions"))
+            guardrails = self._resolution_plan_items(payload.get("guardrails"))
+            success = self._resolution_plan_items(
+                payload.get("success_criteria"),
+            )
+            lines: list[str] = []
+            if diagnosis:
+                lines.append(f"Diagnosis: {diagnosis}")
+            if actions:
+                lines.append("Actions:")
+                for index, action in enumerate(actions, start=1):
+                    lines.append(f"{index}. {action}")
+            if guardrails:
+                lines.append("Guardrails:")
+                for item in guardrails:
+                    lines.append(f"- {item}")
+            if success:
+                lines.append("Success criteria:")
+                for item in success:
+                    lines.append(f"- {item}")
+            rendered = "\n".join(lines).strip()
+            if rendered:
+                return rendered[:2400]
+        fallback = str(response.text or "").strip()
+        if not fallback:
+            return ""
+        return fallback[:2400]
+
+    def _build_failure_resolution_prompt(
+        self,
+        *,
+        subtask: Subtask,
+        result: SubtaskResult,
+        verification: VerificationResult,
+        strategy: RetryStrategy,
+        missing_targets: list[str],
+        prior_attempts: list[AttemptRecord],
+    ) -> str:
+        raw_metadata = (
+            verification.metadata
+            if isinstance(verification.metadata, dict)
+            else {}
+        )
+        metadata = self._summarize_failure_resolution_metadata(raw_metadata)
+        metadata_json = json.dumps(metadata, indent=2, sort_keys=True, default=str)
+        metadata_budget = self._failure_resolution_metadata_char_budget()
+        if len(metadata_json) > metadata_budget:
+            metadata_json = json.dumps(
+                {
+                    "_loom_meta": "metadata_truncated",
+                    "total_chars": len(metadata_json),
+                    "included_keys": list(metadata.keys())[:12],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        expected_deliverables = self._expected_deliverables_for_subtask(subtask)
+        changed_files = self._files_from_attempts(prior_attempts)
+        current_changed = self._files_from_tool_calls(result.tool_calls)
+        for path in current_changed:
+            if path not in changed_files:
+                changed_files.append(path)
+        lines = [
+            "You are planning a targeted remediation for a failed subtask.",
+            "Return strict JSON with keys:",
+            (
+                '{"diagnosis": "...", "actions": ["..."], '
+                '"guardrails": ["..."], "success_criteria": ["..."]}'
+            ),
+            "Keep the plan short and actionable.",
+            "",
+            "Rules:",
+            "- Handle the observed failure generically; do not hardcode one-off logic.",
+            "- Preserve validated outputs and evidence.",
+            "- Prefer minimal edits over broad reruns.",
+            (
+                "- If outputs must align to canonical deliverables, explain how to "
+                "reconcile file paths safely."
+            ),
+            "",
+            f"Subtask ID: {subtask.id}",
+            f"Subtask description: {subtask.description}",
+            f"Acceptance criteria: {subtask.acceptance_criteria}",
+            f"Retry strategy: {strategy.value}",
+            f"Verification tier: {verification.tier}",
+            f"Verification outcome: {verification.outcome}",
+            f"Reason code: {verification.reason_code}",
+            f"Severity class: {verification.severity_class}",
+            f"Verification feedback: {verification.feedback or ''}",
+            f"Execution summary: {result.summary or ''}",
+        ]
+        if missing_targets:
+            lines.append(f"Missing targets: {', '.join(missing_targets)}")
+        if expected_deliverables:
+            lines.append(
+                "Expected deliverables: " + ", ".join(expected_deliverables),
+            )
+        if changed_files:
+            lines.append("Touched files: " + ", ".join(changed_files))
+        if metadata_json != "{}":
+            lines.extend([
+                "Verification metadata:",
+                metadata_json,
+            ])
+        return "\n".join(lines)
+
+    async def _plan_failure_resolution(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        result: SubtaskResult,
+        verification: VerificationResult,
+        strategy: RetryStrategy,
+        missing_targets: list[str],
+        prior_attempts: list[AttemptRecord],
+    ) -> str:
+        prompt = self._build_failure_resolution_prompt(
+            subtask=subtask,
+            result=result,
+            verification=verification,
+            strategy=strategy,
+            missing_targets=missing_targets,
+            prior_attempts=prior_attempts,
+        )
+        if not prompt.strip():
+            return ""
+
+        model = self._router.select(tier=2, role="planner")
+        request_messages = [{"role": "user", "content": prompt}]
+        policy = ModelRetryPolicy.from_execution_config(self._config.execution)
+        invocation_attempt = 0
+        request_diag = None
+        max_tokens = self._planning_response_max_tokens()
+        if max_tokens is None:
+            max_tokens = 900
+        max_tokens = max(256, min(max_tokens, 1500))
+
+        async def _invoke_model():
+            nonlocal invocation_attempt, request_diag
+            invocation_attempt += 1
+            request_diag = collect_request_diagnostics(
+                messages=request_messages,
+                origin="orchestrator.failure_resolution.complete",
+            )
+            self._emit(MODEL_INVOCATION, task.id, {
+                "subtask_id": subtask.id,
+                "model": model.name,
+                "phase": "start",
+                "operation": "failure_resolution_plan",
+                "invocation_attempt": invocation_attempt,
+                "invocation_max_attempts": policy.max_attempts,
+                "retry_strategy": strategy.value,
+                **request_diag.to_event_payload(),
+            })
+            return await model.complete(
+                request_messages,
+                max_tokens=max_tokens,
+            )
+
+        def _on_failure(
+            attempt: int,
+            max_attempts: int,
+            error: BaseException,
+            remaining: int,
+        ) -> None:
+            self._emit(MODEL_INVOCATION, task.id, {
+                "subtask_id": subtask.id,
+                "model": model.name,
+                "phase": "done",
+                "operation": "failure_resolution_plan",
+                "invocation_attempt": attempt,
+                "invocation_max_attempts": max_attempts,
+                "retry_queue_remaining": remaining,
+                "origin": request_diag.origin if request_diag else "",
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "retry_strategy": strategy.value,
+            })
+
+        try:
+            response = await call_with_model_retry(
+                _invoke_model,
+                policy=policy,
+                on_failure=_on_failure,
+            )
+        except Exception as e:
+            logger.debug(
+                "Failure-resolution planner call failed for %s/%s: %s",
+                task.id,
+                subtask.id,
+                e,
+                exc_info=True,
+            )
+            return ""
+
+        self._emit(MODEL_INVOCATION, task.id, {
+            "subtask_id": subtask.id,
+            "model": model.name,
+            "phase": "done",
+            "operation": "failure_resolution_plan",
+            "invocation_attempt": invocation_attempt,
+            "invocation_max_attempts": policy.max_attempts,
+            "origin": request_diag.origin if request_diag else "",
+            "retry_strategy": strategy.value,
+            **collect_response_diagnostics(response).to_event_payload(),
+        })
+        return self._format_failure_resolution_plan(response)
+
     def _build_remediation_retry_context(self, *, strategy: RetryStrategy) -> str:
         lines = [
             "TARGETED REMEDIATION:",
@@ -2357,6 +2764,29 @@ class Orchestrator:
                     files.append(text)
                     if len(files) >= max_items:
                         return files
+        return files
+
+    @staticmethod
+    def _files_from_tool_calls(tool_calls: list, *, max_items: int = 24) -> list[str]:
+        files: list[str] = []
+        seen: set[str] = set()
+        if not isinstance(tool_calls, list):
+            return files
+        for call in tool_calls:
+            result = getattr(call, "result", None)
+            if not getattr(result, "success", False):
+                continue
+            changed = getattr(result, "files_changed", [])
+            if not isinstance(changed, list):
+                continue
+            for item in changed:
+                text = str(item or "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                files.append(text)
+                if len(files) >= max_items:
+                    return files
         return files
 
     def _augment_retry_context_for_outputs(
