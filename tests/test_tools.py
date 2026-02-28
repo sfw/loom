@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from loom.tools.file_ops import (
 )
 from loom.tools.git import GitCommandTool, check_git_safety, parse_subcommand
 from loom.tools.registry import (
+    Tool,
     ToolContext,
     ToolRegistry,
     ToolResult,
@@ -137,6 +139,29 @@ class TestRegistry:
         assert delegate is not None
         assert delegate.timeout_seconds == 7200
 
+    async def test_create_default_registry_binds_hybrid_fallback_tools(
+        self,
+        tmp_path: Path,
+    ):
+        registry = create_default_registry()
+        list_result = await registry.execute(
+            "list_tools",
+            {"limit": 3},
+            workspace=tmp_path,
+        )
+        assert list_result.success
+        payload = list_result.data or {}
+        assert isinstance(payload.get("tools"), list)
+
+        run_result = await registry.execute(
+            "run_tool",
+            {"name": "list_tools", "arguments": {"limit": 1}},
+            workspace=tmp_path,
+        )
+        assert run_result.success
+        assert isinstance(run_result.data, dict)
+        assert run_result.data.get("delegated_tool") == "list_tools"
+
     async def test_execute_unknown_tool(self, registry: ToolRegistry):
         result = await registry.execute("nonexistent", {})
         assert not result.success
@@ -145,6 +170,91 @@ class TestRegistry:
     async def test_execute_with_timeout(self, registry: ToolRegistry, workspace: Path):
         result = await registry.execute("read_file", {"path": "README.md"}, workspace=workspace)
         assert result.success
+
+    async def test_execute_known_mcp_tool_skips_periodic_refresh(self, workspace: Path):
+        class _EchoMCPTool(Tool):
+            __loom_register__ = False
+
+            @property
+            def name(self) -> str:
+                return "mcp.demo.echo"
+
+            @property
+            def description(self) -> str:
+                return "Echo"
+
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+
+            async def execute(self, _args: dict, _ctx: ToolContext) -> ToolResult:
+                return ToolResult.ok("ok")
+
+        registry = ToolRegistry()
+        registry.register(_EchoMCPTool())
+
+        refresh_calls = {"count": 0}
+
+        def _refresh(*, force: bool = False, auth_context=None) -> None:
+            refresh_calls["count"] += 1
+
+        registry.set_mcp_refresh_hook(_refresh, interval_seconds=1.0)
+
+        result = await registry.execute("mcp.demo.echo", {}, workspace=workspace)
+        assert result.success
+        assert refresh_calls["count"] == 0
+
+    def test_list_tools_with_loaded_mcp_skips_periodic_refresh(self):
+        class _EchoMCPTool(Tool):
+            __loom_register__ = False
+
+            @property
+            def name(self) -> str:
+                return "mcp.demo.echo"
+
+            @property
+            def description(self) -> str:
+                return "Echo"
+
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+
+            async def execute(self, _args: dict, _ctx: ToolContext) -> ToolResult:
+                return ToolResult.ok("ok")
+
+        registry = ToolRegistry()
+        registry.register(_EchoMCPTool())
+
+        refresh_calls = {"count": 0}
+
+        def _refresh(*, force: bool = False, auth_context=None) -> None:
+            refresh_calls["count"] += 1
+
+        registry.set_mcp_refresh_hook(_refresh, interval_seconds=1.0)
+
+        tools = registry.list_tools()
+        assert "mcp.demo.echo" in tools
+        assert refresh_calls["count"] == 0
+
+    def test_list_tools_refresh_runs_in_background_thread(self):
+        registry = ToolRegistry()
+        started = threading.Event()
+        hook_thread_id: list[int] = []
+
+        def _refresh(*, force: bool = False, auth_context=None) -> None:
+            del force, auth_context
+            hook_thread_id.append(threading.get_ident())
+            started.set()
+
+        registry.set_mcp_refresh_hook(_refresh, interval_seconds=1.0)
+
+        caller_thread_id = threading.get_ident()
+        tools = registry.list_tools()
+        assert tools == []
+        assert started.wait(timeout=0.5)
+        assert hook_thread_id
+        assert hook_thread_id[0] != caller_thread_id
 
 
 # --- ReadFileTool ---

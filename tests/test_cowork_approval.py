@@ -68,7 +68,8 @@ class TestAutoApprovedTools:
     def test_read_only_tools(self):
         for t in ("read_file", "search_files", "list_directory",
                    "glob_find", "ripgrep_search", "analyze_code",
-                   "ask_user", "web_search", "web_fetch", "web_fetch_html"):
+                   "ask_user", "web_search", "web_fetch", "web_fetch_html",
+                   "list_tools", "run_tool"):
             assert t in AUTO_APPROVED_TOOLS
 
     def test_write_tools_excluded(self):
@@ -270,3 +271,50 @@ class TestSessionApproval:
         unique_completed = list({id(e): e for e in completed}.values())
         assert len(unique_completed) == 1
         assert unique_completed[0].result.success
+
+    async def test_run_tool_respects_underlying_mutation_approval(self, workspace, tools):
+        """run_tool should apply approval checks for the delegated target tool."""
+        cb = AsyncMock(return_value=ApprovalDecision.DENY)
+        approver = ToolApprover(prompt_callback=cb)
+
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="tc1",
+                    name="run_tool",
+                    arguments={
+                        "name": "shell_execute",
+                        "arguments": {"command": "echo hi"},
+                    },
+                )],
+                usage=TokenUsage(total_tokens=10),
+            ),
+            ModelResponse(
+                text="Done.",
+                usage=TokenUsage(total_tokens=5),
+            ),
+        ])
+
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            approver=approver,
+            tool_exposure_mode="hybrid",
+        )
+
+        events = []
+        async for event in session.send("use run_tool to run shell command"):
+            events.append(event)
+
+        completed = [
+            e for e in events
+            if isinstance(e, ToolCallEvent) and e.result is not None
+        ]
+        assert completed
+        assert completed[0].name == "run_tool"
+        assert completed[0].result is not None
+        assert completed[0].result.success is False
+        assert "shell_execute" in (completed[0].result.error or "")
+        cb.assert_called_once_with("shell_execute", {"command": "echo hi"})

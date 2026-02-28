@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -14,6 +15,8 @@ class ToolApprovalScreen(ModalScreen[str]):
 
     Returns: "approve", "approve_all", or "deny"
     """
+
+    _inherit_bindings = False
 
     BINDINGS = [
         Binding("y", "approve", "Yes"),
@@ -86,6 +89,24 @@ class ToolApprovalScreen(ModalScreen[str]):
 
     def action_deny(self) -> None:
         self.dismiss("deny")
+
+    def on_key(self, event: events.Key) -> None:
+        """Fallback key handling for terminals where bindings are flaky."""
+        key = event.key.lower()
+        if key == "y":
+            self.dismiss("approve")
+            event.stop()
+            event.prevent_default()
+            return
+        if key == "a":
+            self.dismiss("approve_all")
+            event.stop()
+            event.prevent_default()
+            return
+        if key in {"n", "escape"}:
+            self.dismiss("deny")
+            event.stop()
+            event.prevent_default()
 
 
 def _tool_risk(tool_name: str) -> str:

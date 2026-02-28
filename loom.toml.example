@@ -51,6 +51,7 @@ enable_sqlite_remediation_queue = false
 enable_durable_task_runner = false
 enable_mutation_idempotency = false
 enable_slo_metrics = false
+cowork_tool_exposure_mode = "adaptive" # full | adaptive | hybrid
 
 [verification]
 tier1_enabled = true

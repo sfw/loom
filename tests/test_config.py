@@ -47,6 +47,7 @@ class TestDefaultConfig:
         assert config.execution.model_call_retry_base_delay_seconds == 0.5
         assert config.execution.model_call_retry_max_delay_seconds == 8.0
         assert config.execution.model_call_retry_jitter_seconds == 0.25
+        assert config.execution.cowork_tool_exposure_mode == "adaptive"
 
     def test_default_verification(self):
         config = Config()
@@ -255,6 +256,7 @@ enable_sqlite_remediation_queue = true
 enable_durable_task_runner = true
 enable_mutation_idempotency = true
 enable_slo_metrics = true
+cowork_tool_exposure_mode = "hybrid"
 """)
         config = load_config(toml_file)
         assert config.execution.enable_global_run_budget is True
@@ -271,6 +273,16 @@ enable_slo_metrics = true
         assert config.execution.enable_durable_task_runner is True
         assert config.execution.enable_mutation_idempotency is True
         assert config.execution.enable_slo_metrics is True
+        assert config.execution.cowork_tool_exposure_mode == "hybrid"
+
+    def test_execution_cowork_tool_exposure_mode_invalid_falls_back(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[execution]
+cowork_tool_exposure_mode = "wild-west"
+""")
+        config = load_config(toml_file)
+        assert config.execution.cowork_tool_exposure_mode == "adaptive"
 
     def test_verification_policy_flags_loaded(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

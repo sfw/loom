@@ -218,11 +218,11 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
     .auth-checkbox {
         margin-top: 1;
     }
-    .auth-actions {
+    .auth-actions-row {
         height: auto;
         margin-top: 1;
     }
-    .auth-actions Button {
+    .auth-actions-row Button {
         margin-right: 1;
     }
     #auth-manager-footer {
@@ -412,15 +412,16 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                         classes="auth-help",
                     )
 
-            with Horizontal(classes="auth-actions"):
+            with Horizontal(classes="auth-actions-row", id="auth-actions-primary"):
                 yield Button("Refresh", id="auth-btn-refresh")
                 yield Button("Load Profile", id="auth-btn-load")
                 yield Button("Save/Add", id="auth-btn-save", variant="primary")
                 yield Button("Duplicate", id="auth-btn-duplicate")
+                yield Button("Close", id="auth-btn-close")
+            with Horizontal(classes="auth-actions-row", id="auth-actions-secondary"):
                 yield Button("Rebind", id="auth-btn-rebind")
                 yield Button("Archive", id="auth-btn-archive")
                 yield Button("Remove", id="auth-btn-remove", variant="error")
-                yield Button("Close", id="auth-btn-close")
 
             yield Label(
                 "[dim]Profile list and missing draft profiles load automatically on open. "
