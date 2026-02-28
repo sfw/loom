@@ -295,6 +295,15 @@ Safety notes:
 | `tui_run_scoped_workspace_enabled` | `bool` | `true` | Create per-run subfolders for TUI `/run` executions. |
 | `llm_run_folder_naming_enabled` | `bool` | `true` | Allow model-generated run folder names in TUI. Low-quality/echoed names are rejected and fallback naming is used. |
 
+### `[tui]`
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `chat_resume_page_size` | `int` | `250` | Number of transcript rows loaded during initial session chat hydration. |
+| `chat_resume_max_rendered_rows` | `int` | `1200` | Maximum chat transcript rows kept mounted before oldest rows are trimmed. |
+| `chat_resume_use_event_journal` | `bool` | `true` | Prefer replaying persisted chat event journal rows when available. |
+| `chat_resume_enable_legacy_fallback` | `bool` | `true` | Fallback to synthesizing chat transcript rows from `conversation_turns` when needed. |
+
 ### Legacy `[mcp]` in `loom.toml` (supported)
 
 Preferred MCP config lives in `mcp.toml`, but Loom still accepts server
@@ -390,4 +399,6 @@ definitions inside `loom.toml`:
 - `limits.compactor.chars_per_token_estimate` is clamped to `0.1..16.0`.
 - `limits.compactor.token_headroom` is clamped to `0..20000`.
 - `limits.compactor.target_chars_ratio` is clamped to `0.01..1.0`.
+- `tui.chat_resume_page_size` is clamped to `20..500`.
+- `tui.chat_resume_max_rendered_rows` is clamped to `100..10000`.
 - MCP `timeout_seconds` falls back to `30` when invalid/non-positive.

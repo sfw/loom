@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime
+from typing import Any
 
 from loom.state.memory import Database
 from loom.utils.tokens import estimate_tokens as _estimate_tokens
@@ -20,6 +21,7 @@ class ConversationStore:
     """Append-only persistence for cowork conversation history."""
 
     MAX_QUERY_LIMIT = 1000
+    MAX_CHAT_EVENT_LIMIT = 500
 
     def __init__(self, db: Database):
         self._db = db
@@ -255,3 +257,298 @@ class ConversationStore:
                 msg["tool_call_id"] = row["tool_call_id"]
             messages.append(msg)
         return messages
+
+    # ------------------------------------------------------------------
+    # Chat replay events (UI transcript journal)
+    # ------------------------------------------------------------------
+
+    async def append_chat_event(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict | str,
+        *,
+        seq: int | None = None,
+    ) -> int:
+        """Append one chat transcript event and return its sequence number."""
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            raise ValueError("session_id is required")
+        event_type = str(event_type or "").strip()
+        if not event_type:
+            raise ValueError("event_type is required")
+
+        if isinstance(payload, str):
+            payload_json = payload
+        else:
+            payload_json = json.dumps(payload, ensure_ascii=False, default=str)
+
+        now = datetime.now().isoformat()
+        if seq is not None:
+            seq = int(seq)
+            if seq <= 0:
+                raise ValueError("seq must be > 0")
+            await self._db.execute(
+                """INSERT INTO cowork_chat_events
+                   (session_id, seq, event_type, payload, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, seq, event_type, payload_json, now),
+            )
+            return seq
+
+        # Allocate sequence in one SQL statement so SELECT(max)+INSERT are
+        # serialized together under SQLite's write lock.
+        row_id = await self._db.execute_returning_id(
+            """INSERT INTO cowork_chat_events
+               (session_id, seq, event_type, payload, created_at)
+               SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?
+               FROM cowork_chat_events
+               WHERE session_id = ?""",
+            (session_id, event_type, payload_json, now, session_id),
+        )
+        row = await self._db.query_one(
+            "SELECT seq FROM cowork_chat_events WHERE id = ?",
+            (row_id,),
+        )
+        if not row:
+            raise RuntimeError("Inserted chat event not found.")
+        return int(row.get("seq", 0) or 0)
+
+    async def get_last_chat_seq(self, session_id: str) -> int:
+        """Return the last known chat-event sequence for a session."""
+        row = await self._db.query_one(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq "
+            "FROM cowork_chat_events WHERE session_id = ?",
+            (session_id,),
+        )
+        if not row:
+            return 0
+        return int(row.get("max_seq", 0) or 0)
+
+    async def get_chat_events(
+        self,
+        session_id: str,
+        *,
+        before_seq: int | None = None,
+        after_seq: int | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        """Get chat replay events in chronological order."""
+        safe_limit = max(1, min(int(limit), self.MAX_CHAT_EVENT_LIMIT))
+        conditions = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if before_seq is not None:
+            conditions.append("seq < ?")
+            params.append(int(before_seq))
+        if after_seq is not None:
+            conditions.append("seq > ?")
+            params.append(int(after_seq))
+
+        where = " AND ".join(conditions)
+        rows = await self._db.query(
+            f"""SELECT * FROM cowork_chat_events
+                WHERE {where}
+                ORDER BY seq DESC
+                LIMIT ?""",
+            tuple([*params, safe_limit]),
+        )
+        rows = list(reversed(rows))
+        return [self._normalize_chat_event_row(row) for row in rows]
+
+    @staticmethod
+    def _normalize_chat_event_row(row: dict) -> dict:
+        payload_raw = row.get("payload", "{}")
+        payload: dict | str
+        payload_parse_error = False
+        try:
+            parsed = json.loads(payload_raw)
+            payload = parsed if isinstance(parsed, dict) else {"value": parsed}
+        except (json.JSONDecodeError, TypeError):
+            payload = {"raw": str(payload_raw)}
+            payload_parse_error = True
+
+        return {
+            "id": int(row.get("id", 0) or 0),
+            "session_id": str(row.get("session_id", "") or ""),
+            "seq": int(row.get("seq", 0) or 0),
+            "event_type": str(row.get("event_type", "") or ""),
+            "payload": payload,
+            "payload_parse_error": payload_parse_error,
+            "created_at": row.get("created_at"),
+        }
+
+    async def synthesize_chat_events_from_turns(
+        self,
+        session_id: str,
+        *,
+        before_turn: int | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        """Best-effort UI transcript synthesis from persisted conversation turns."""
+        safe_limit = max(1, min(int(limit), self.MAX_CHAT_EVENT_LIMIT))
+        conditions = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if before_turn is not None:
+            conditions.append("turn_number < ?")
+            params.append(int(before_turn))
+
+        where = " AND ".join(conditions)
+        rows = await self._db.query(
+            f"""SELECT * FROM conversation_turns
+                WHERE {where}
+                ORDER BY turn_number DESC
+                LIMIT ?""",
+            tuple([*params, safe_limit]),
+        )
+        if not rows:
+            return []
+        rows = list(reversed(rows))
+
+        events: list[dict] = []
+        for row in rows:
+            role = str(row.get("role", "") or "").strip().lower()
+            turn_number = int(row.get("turn_number", 0) or 0)
+            created_at = row.get("created_at")
+
+            if role == "user":
+                text = str(row.get("content", "") or "")
+                events.append({
+                    "event_type": "user_message",
+                    "payload": {"text": text},
+                    "turn_number": turn_number,
+                    "created_at": created_at,
+                })
+                continue
+
+            if role == "assistant":
+                content = str(row.get("content", "") or "")
+                tool_calls = self._decode_tool_calls(row.get("tool_calls"))
+                if content:
+                    events.append({
+                        "event_type": "assistant_text",
+                        "payload": {"text": content, "markup": False},
+                        "turn_number": turn_number,
+                        "created_at": created_at,
+                    })
+                for call in tool_calls:
+                    payload = self._payload_for_tool_call_start(call)
+                    if payload is None:
+                        continue
+                    events.append({
+                        "event_type": "tool_call_started",
+                        "payload": payload,
+                        "turn_number": turn_number,
+                        "created_at": created_at,
+                    })
+                continue
+
+            if role == "tool":
+                payload = self._payload_for_tool_completion(row)
+                events.append({
+                    "event_type": "tool_call_completed",
+                    "payload": payload,
+                    "turn_number": turn_number,
+                    "created_at": created_at,
+                })
+                blocks = payload.get("content_blocks")
+                if isinstance(blocks, list) and blocks:
+                    events.append({
+                        "event_type": "content_indicator",
+                        "payload": {"content_blocks": blocks},
+                        "turn_number": turn_number,
+                        "created_at": created_at,
+                    })
+                continue
+
+            # Skip most persisted system messages from model context hints.
+            if role == "system":
+                continue
+
+        return events
+
+    @staticmethod
+    def _decode_tool_calls(raw: Any) -> list[dict]:
+        if raw in (None, "", []):
+            return []
+        if isinstance(raw, list):
+            return [item for item in raw if isinstance(item, dict)]
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return []
+            if isinstance(parsed, list):
+                return [item for item in parsed if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _payload_for_tool_call_start(call: dict) -> dict | None:
+        call_id = str(call.get("id", "") or "").strip()
+        fn = call.get("function")
+        if not isinstance(fn, dict):
+            return None
+        tool_name = str(fn.get("name", "") or "").strip()
+        raw_args = fn.get("arguments")
+        args: dict = {}
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args)
+                if isinstance(parsed, dict):
+                    args = parsed
+            except json.JSONDecodeError:
+                args = {"raw": raw_args}
+        elif isinstance(raw_args, dict):
+            args = dict(raw_args)
+
+        if not tool_name:
+            return None
+        return {
+            "tool_name": tool_name,
+            "args": args,
+            "tool_call_id": call_id,
+        }
+
+    @staticmethod
+    def _payload_for_tool_completion(row: dict) -> dict:
+        from loom.tools.registry import ToolResult
+
+        raw_content = str(row.get("content", "") or "")
+        result = ToolResult.from_json(raw_content)
+        from loom.content import serialize_block
+
+        blocks = []
+        if result.content_blocks:
+            for block in result.content_blocks:
+                try:
+                    blocks.append(serialize_block(block))
+                except Exception:
+                    continue
+
+        output = str(result.output or "")
+        error = str(result.error or "")
+        if (
+            raw_content.strip()
+            and not output
+            and error.lower().startswith("invalid json")
+        ):
+            output = ConversationStore._summarize_raw_payload(raw_content)
+            error = "Malformed tool result payload"
+
+        payload: dict[str, Any] = {
+            "tool_name": str(row.get("tool_name", "") or "").strip(),
+            "tool_call_id": str(row.get("tool_call_id", "") or "").strip(),
+            "success": bool(result.success),
+            "elapsed_ms": 0,
+            "output": output,
+            "error": error,
+        }
+        if blocks:
+            payload["content_blocks"] = blocks
+        return payload
+
+    @staticmethod
+    def _summarize_raw_payload(raw: str, *, max_chars: int = 280) -> str:
+        text = " ".join(str(raw or "").split())
+        if len(text) <= max_chars:
+            return text
+        return f"{text[: max_chars - 3]}..."

@@ -78,6 +78,13 @@ class TestDefaultConfig:
         assert config.process.tui_run_scoped_workspace_enabled is True
         assert config.process.llm_run_folder_naming_enabled is True
 
+    def test_default_tui_config(self):
+        config = Config()
+        assert config.tui.chat_resume_page_size == 250
+        assert config.tui.chat_resume_max_rendered_rows == 1200
+        assert config.tui.chat_resume_use_event_journal is True
+        assert config.tui.chat_resume_enable_legacy_fallback is True
+
     def test_default_limits(self):
         config = Config()
         assert config.limits.planning_response_max_tokens == 16384
@@ -364,6 +371,21 @@ llm_run_folder_naming_enabled = false
         assert config.process.require_v2_contract is True
         assert config.process.tui_run_scoped_workspace_enabled is False
         assert config.process.llm_run_folder_naming_enabled is False
+
+    def test_tui_chat_resume_loaded(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[tui]
+chat_resume_page_size = 180
+chat_resume_max_rendered_rows = 2500
+chat_resume_use_event_journal = false
+chat_resume_enable_legacy_fallback = false
+""")
+        config = load_config(toml_file)
+        assert config.tui.chat_resume_page_size == 180
+        assert config.tui.chat_resume_max_rendered_rows == 2500
+        assert config.tui.chat_resume_use_event_journal is False
+        assert config.tui.chat_resume_enable_legacy_fallback is False
 
     def test_load_mcp_servers(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

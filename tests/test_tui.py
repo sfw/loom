@@ -1986,6 +1986,282 @@ class TestStartupSessionResume:
 
         assert app._input_history == ["/help", "summarize the doc"]
 
+    @pytest.mark.asyncio
+    async def test_initialize_session_auto_resume_replays_chat_history(self, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        class FakeSession:
+            def __init__(self, **_kwargs):
+                self.total_tokens = 12
+                self.session_id = "latest-session"
+                self.session_state = SimpleNamespace(turn_count=4, ui_state={})
+                self.messages = [{"role": "system", "content": "system"}]
+
+            async def resume(self, _session_id: str) -> None:
+                self.messages = [{"role": "system", "content": "system"}]
+
+        monkeypatch.setattr("loom.tui.app.CoworkSession", FakeSession)
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._store = MagicMock()
+        app._store.get_chat_events = AsyncMock(return_value=[
+            {
+                "seq": 1,
+                "event_type": "user_message",
+                "payload": {"text": "hello"},
+            },
+            {
+                "seq": 2,
+                "event_type": "assistant_text",
+                "payload": {"text": "world", "markup": False},
+            },
+        ])
+        app._resolve_startup_resume_target = AsyncMock(return_value=("latest-session", True))
+        app._refresh_tool_registry = MagicMock()
+        app._load_process_definition = MagicMock()
+        app._refresh_process_command_index = MagicMock()
+        app._ensure_persistence_tools = MagicMock()
+        app._apply_process_tool_policy = MagicMock()
+        app._build_system_prompt = MagicMock(return_value="system")
+        app._bind_session_tools = MagicMock()
+        app._restore_process_run_tabs = AsyncMock()
+        app._set_slash_hint = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._tools.list_tools = MagicMock(return_value=[])
+
+        chat = MagicMock()
+        chat.children = []
+        status = SimpleNamespace(workspace_name="", model_name="", process_name="")
+        input_widget = SimpleNamespace(focus=MagicMock())
+
+        def _query_one(selector: str, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#status-bar":
+                return status
+            if selector == "#user-input":
+                return input_widget
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        await app._initialize_session()
+
+        chat.add_user_message.assert_any_call("hello")
+        chat.add_model_text.assert_any_call("world", markup=False)
+
+
+class TestChatReplayHydration:
+    class _PerfChat:
+        def __init__(self):
+            self.children = []
+
+        def add_user_message(self, _text):
+            return None
+
+        def add_model_text(self, _text, *, markup=False):
+            _ = markup
+            return None
+
+        def add_tool_call(
+            self,
+            _tool_name,
+            _args,
+            *,
+            success=None,
+            elapsed_ms=0,
+            output="",
+            error="",
+        ):
+            _ = (success, elapsed_ms, output, error)
+            return None
+
+        def add_content_indicator(self, _blocks):
+            return None
+
+        def add_turn_separator(
+            self,
+            _tool_count,
+            _tokens,
+            _model,
+            *,
+            tokens_per_second=0.0,
+            latency_ms=0,
+            total_time_ms=0,
+            context_tokens=0,
+            context_messages=0,
+            omitted_messages=0,
+            recall_index_used=False,
+        ):
+            _ = (
+                tokens_per_second,
+                latency_ms,
+                total_time_ms,
+                context_tokens,
+                context_messages,
+                omitted_messages,
+                recall_index_used,
+            )
+            return None
+
+        def add_info(self, _text, *, markup=True):
+            _ = markup
+            return None
+
+    @pytest.mark.asyncio
+    async def test_hydrate_chat_history_skips_bad_row_and_keeps_rendering(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(session_id="session-1")
+        app._store = MagicMock()
+        app._store.get_chat_events = AsyncMock(return_value=[
+            {"seq": 1, "event_type": "user_message", "payload": {"text": "boom"}},
+            {
+                "seq": 2,
+                "event_type": "assistant_text",
+                "payload": {"text": "still renders", "markup": False},
+            },
+        ])
+        app._store.synthesize_chat_events_from_turns = AsyncMock(return_value=[])
+
+        chat = MagicMock()
+        chat.children = []
+        chat.add_user_message.side_effect = RuntimeError("bad row")
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._hydrate_chat_history_for_active_session()
+
+        chat.add_model_text.assert_called_once_with("still renders", markup=False)
+
+    @pytest.mark.asyncio
+    async def test_append_chat_replay_event_trims_with_continuity_sentinel(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._chat_resume_max_rendered_rows = MagicMock(return_value=2)
+
+        chat = MagicMock()
+        chat.children = []
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._append_chat_replay_event(
+            "user_message",
+            {"text": "one"},
+            persist=False,
+        )
+        await app._append_chat_replay_event(
+            "user_message",
+            {"text": "two"},
+            persist=False,
+        )
+        await app._append_chat_replay_event(
+            "user_message",
+            {"text": "three"},
+            persist=False,
+        )
+
+        assert [row["payload"]["text"] for row in app._chat_replay_events] == ["two", "three"]
+        sentinel = chat.add_info.call_args_list[-1].args[0]
+        assert "Transcript window truncated" in sentinel
+
+    @pytest.mark.asyncio
+    async def test_chat_hydrate_perf_latest_300_rows_under_target(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(session_id="session-1")
+        app._store = MagicMock()
+        app._store.get_chat_events = AsyncMock(return_value=[
+            {
+                "seq": idx + 1,
+                "event_type": "user_message",
+                "payload": {"text": f"row {idx + 1}"},
+            }
+            for idx in range(300)
+        ])
+        app._store.synthesize_chat_events_from_turns = AsyncMock(return_value=[])
+
+        chat = self._PerfChat()
+        app.query_one = MagicMock(return_value=chat)
+
+        started = asyncio.get_running_loop().time()
+        await app._hydrate_chat_history_for_active_session()
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert elapsed < 0.8
+
+    @pytest.mark.asyncio
+    async def test_chat_hydrate_perf_older_200_rows_under_target(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(session_id="session-1")
+        app._store = MagicMock()
+
+        latest = [
+            {
+                "seq": seq,
+                "event_type": "user_message",
+                "payload": {"text": f"latest {seq}"},
+            }
+            for seq in range(201, 401)
+        ]
+        older = [
+            {
+                "seq": seq,
+                "event_type": "user_message",
+                "payload": {"text": f"older {seq}"},
+            }
+            for seq in range(1, 201)
+        ]
+
+        async def _get_chat_events(
+            _session_id: str,
+            *,
+            before_seq: int | None = None,
+            after_seq: int | None = None,
+            limit: int = 200,
+        ):
+            _ = (after_seq, limit)
+            if before_seq is None:
+                return latest
+            return older if before_seq == 201 else []
+
+        app._store.get_chat_events = AsyncMock(side_effect=_get_chat_events)
+        app._store.synthesize_chat_events_from_turns = AsyncMock(return_value=[])
+
+        chat = self._PerfChat()
+        app.query_one = MagicMock(return_value=chat)
+        await app._hydrate_chat_history_for_active_session()
+
+        started = asyncio.get_running_loop().time()
+        loaded = await app._load_older_chat_history()
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert loaded is True
+        assert elapsed < 0.35
+
 
 class TestQuitConfirmation:
     @pytest.mark.asyncio
@@ -2396,7 +2672,7 @@ class TestSlashCommandHints:
             "/session",
             "/sessions",
         ]
-        assert app._slash_completion_candidates("/h") == ["/help"]
+        assert app._slash_completion_candidates("/h") == ["/help", "/history"]
         assert app._slash_completion_candidates("/m") == ["/model", "/mcp"]
         assert app._slash_completion_candidates("/t") == ["/tools", "/tokens"]
         assert app._slash_completion_candidates("/p") == ["/process", "/processes"]
@@ -7563,6 +7839,7 @@ class TestSlashHelp:
         )
         rendered = "\n".join(app._help_lines())
         assert "/resume <session-id-prefix>" in rendered
+        assert "/history" in rendered
         assert "/run <goal|close" in rendered
         assert "resume <run-id-prefix|current>" in rendered
         assert "run-id-prefix" in rendered
@@ -7591,6 +7868,65 @@ class TestSlashHelp:
         assert "Usage" in message
         assert "/resume" in message
         assert "<session-id-prefix>" in message
+
+    @pytest.mark.asyncio
+    async def test_resume_while_busy_is_blocked(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._chat_busy = True
+        app._store = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/resume abc")
+
+        assert handled is True
+        message = chat.add_info.call_args.args[0]
+        assert "Cannot create/switch sessions" in message
+
+    @pytest.mark.asyncio
+    async def test_new_while_busy_is_blocked(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._chat_busy = True
+        app._store = MagicMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/new")
+
+        assert handled is True
+        message = chat.add_info.call_args.args[0]
+        assert "Cannot create/switch sessions" in message
+
+    @pytest.mark.asyncio
+    async def test_history_older_reports_result(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._load_older_chat_history = AsyncMock(return_value=True)
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/history older")
+
+        assert handled is True
+        app._load_older_chat_history.assert_awaited_once()
+        chat.add_info.assert_called_once_with("Loaded older chat history.")
 
 
 class TestFileViewer:

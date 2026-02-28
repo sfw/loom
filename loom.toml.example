@@ -53,6 +53,12 @@ enable_mutation_idempotency = false
 enable_slo_metrics = false
 cowork_tool_exposure_mode = "adaptive" # full | adaptive | hybrid
 
+[tui]
+chat_resume_page_size = 250
+chat_resume_max_rendered_rows = 1200
+chat_resume_use_event_journal = true
+chat_resume_enable_legacy_fallback = true
+
 [verification]
 tier1_enabled = true
 tier2_enabled = true
