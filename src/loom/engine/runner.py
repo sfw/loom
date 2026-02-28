@@ -2263,9 +2263,11 @@ class SubtaskRunner:
             ]
             if len(files_changed) > 20:
                 data["files_changed"] = files_changed[:20]
+                data["files_changed_paths"] = files_changed[:20]
                 data["files_changed_count"] = len(files_changed)
             else:
                 data["files_changed"] = files_changed
+                data["files_changed_paths"] = files_changed
             if result.content_blocks:
                 from loom.content import serialize_block
                 data["content_blocks"] = [

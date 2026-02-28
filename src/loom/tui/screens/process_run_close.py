@@ -45,22 +45,43 @@ class ProcessRunCloseScreen(ModalScreen[bool]):
     }
     """
 
-    def __init__(self, *, run_label: str, running: bool) -> None:
+    def __init__(
+        self,
+        *,
+        run_label: str,
+        running: bool,
+        prompt_override: str = "",
+        detail_override: str = "",
+        confirm_label: str = "",
+        cancel_label: str = "",
+        confirm_variant: str = "error",
+    ) -> None:
         super().__init__()
         self._run_label = run_label
         self._running = running
+        self._prompt_override = str(prompt_override or "").strip()
+        self._detail_override = str(detail_override or "").strip()
+        self._confirm_label = str(confirm_label or "").strip()
+        self._cancel_label = str(cancel_label or "").strip()
+        self._confirm_variant = str(confirm_variant or "error").strip() or "error"
 
     def compose(self) -> ComposeResult:
-        prompt = (
-            f"[bold #e0af68]Close running tab {self._run_label}?[/]"
-            if self._running
-            else f"[bold #e0af68]Close tab {self._run_label}?[/]"
-        )
-        detail = (
-            "This will cancel the process run and mark it failed."
-            if self._running
-            else "You can still inspect logs in events history."
-        )
+        prompt = self._prompt_override
+        if not prompt:
+            prompt = (
+                f"[bold #e0af68]Close running tab {self._run_label}?[/]"
+                if self._running
+                else f"[bold #e0af68]Close tab {self._run_label}?[/]"
+            )
+        detail = self._detail_override
+        if not detail:
+            detail = (
+                "This requests cancellation and closes the tab once the run stops."
+                if self._running
+                else "You can still inspect logs in events history."
+            )
+        confirm_label = self._confirm_label or "Close Tab"
+        cancel_label = self._cancel_label or "Keep Open"
         yield Vertical(
             Label(prompt),
             Label(detail),
@@ -69,8 +90,12 @@ class ProcessRunCloseScreen(ModalScreen[bool]):
                 "[#f7768e]N[/]/[dim]Esc[/] to keep it open.",
             ),
             Horizontal(
-                Button("Keep Open", id="process-close-cancel"),
-                Button("Close Tab", variant="error", id="process-close-confirm"),
+                Button(cancel_label, id="process-close-cancel"),
+                Button(
+                    confirm_label,
+                    variant=self._confirm_variant,
+                    id="process-close-confirm",
+                ),
                 id="process-close-actions",
             ),
             id="process-close-dialog",

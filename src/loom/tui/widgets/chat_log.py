@@ -56,6 +56,7 @@ class ChatLog(VerticalScroll):
         self._stream_flush_interval_s = 0.12
         self._stream_flush_timer_pending = False
         self._delegate_widgets: dict[str, DelegateProgressWidget] = {}
+        self._keyed_info_widgets: dict[str, Static] = {}
 
     def add_user_message(self, text: str) -> None:
         """Append a user message to the chat."""
@@ -252,6 +253,7 @@ class ChatLog(VerticalScroll):
         self._stream_text = ""
         self._stream_flush_timer_pending = False
         self.clear_delegate_progress_sections()
+        self._keyed_info_widgets.clear()
 
     def add_turn_separator(
         self,
@@ -301,12 +303,28 @@ class ChatLog(VerticalScroll):
             return f"{duration_ms / 1000.0:.1f}s"
         return f"{duration_ms}ms"
 
-    def add_info(self, text: str, *, markup: bool = True) -> None:
+    def add_info(self, text: str, *, markup: bool = True) -> Static:
         """Add an informational message (e.g. welcome text)."""
         self._flush_and_reset_stream()
-        self.mount(
-            Static(text, classes="info-msg", expand=True, markup=markup),
-        )
+        widget = Static(text, classes="info-msg", expand=True, markup=markup)
+        self.mount(widget)
+        self._scroll_to_end()
+        return widget
+
+    def upsert_info_line(self, line_id: str, text: str, *, markup: bool = True) -> None:
+        """Insert or update a keyed informational line in place."""
+        key = str(line_id or "").strip()
+        if not key:
+            self.add_info(text, markup=markup)
+            return
+        self._flush_and_reset_stream()
+        widget = self._keyed_info_widgets.get(key)
+        if widget is None or not widget.is_attached:
+            widget = Static(text, classes="info-msg", expand=True, markup=markup)
+            self.mount(widget)
+            self._keyed_info_widgets[key] = widget
+        else:
+            widget.update(text)
         self._scroll_to_end()
 
     def add_content_indicator(self, content_blocks: list) -> None:

@@ -93,6 +93,12 @@ class TestDefaultConfig:
         assert config.tui.chat_stream_flush_interval_ms == 120
         assert config.tui.files_panel_max_rows == 2000
         assert config.tui.delegate_progress_max_lines == 150
+        assert config.tui.run_launch_heartbeat_interval_ms == 6000
+        assert config.tui.run_launch_timeout_seconds == 300
+        assert config.tui.run_close_modal_timeout_seconds == 45
+        assert config.tui.run_cancel_wait_timeout_seconds == 10
+        assert config.tui.run_progress_refresh_interval_ms == 200
+        assert config.tui.run_preflight_async_enabled is True
 
     def test_default_limits(self):
         config = Config()
@@ -398,6 +404,12 @@ workspace_scan_max_entries = 30000
 chat_stream_flush_interval_ms = 180
 files_panel_max_rows = 1600
 delegate_progress_max_lines = 360
+run_launch_heartbeat_interval_ms = 2400
+run_launch_timeout_seconds = 90
+run_close_modal_timeout_seconds = 75
+run_cancel_wait_timeout_seconds = 18
+run_progress_refresh_interval_ms = 320
+run_preflight_async_enabled = false
 """)
         config = load_config(toml_file)
         assert config.tui.chat_resume_page_size == 180
@@ -413,6 +425,12 @@ delegate_progress_max_lines = 360
         assert config.tui.chat_stream_flush_interval_ms == 180
         assert config.tui.files_panel_max_rows == 1600
         assert config.tui.delegate_progress_max_lines == 360
+        assert config.tui.run_launch_heartbeat_interval_ms == 2400
+        assert config.tui.run_launch_timeout_seconds == 90
+        assert config.tui.run_close_modal_timeout_seconds == 75
+        assert config.tui.run_cancel_wait_timeout_seconds == 18
+        assert config.tui.run_progress_refresh_interval_ms == 320
+        assert config.tui.run_preflight_async_enabled is False
 
     def test_tui_realtime_bounds_and_backend_fallback(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
@@ -426,6 +444,11 @@ workspace_scan_max_entries = 1
 chat_stream_flush_interval_ms = 1
 files_panel_max_rows = 1
 delegate_progress_max_lines = 1
+run_launch_heartbeat_interval_ms = 1
+run_launch_timeout_seconds = 1
+run_close_modal_timeout_seconds = 1
+run_cancel_wait_timeout_seconds = 0
+run_progress_refresh_interval_ms = 1
 """)
         config = load_config(toml_file)
         assert config.tui.workspace_watch_backend == "poll"
@@ -436,6 +459,11 @@ delegate_progress_max_lines = 1
         assert config.tui.chat_stream_flush_interval_ms == 40
         assert config.tui.files_panel_max_rows == 100
         assert config.tui.delegate_progress_max_lines == 20
+        assert config.tui.run_launch_heartbeat_interval_ms == 500
+        assert config.tui.run_launch_timeout_seconds == 5
+        assert config.tui.run_close_modal_timeout_seconds == 5
+        assert config.tui.run_cancel_wait_timeout_seconds == 1
+        assert config.tui.run_progress_refresh_interval_ms == 50
 
     def test_load_mcp_servers(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
