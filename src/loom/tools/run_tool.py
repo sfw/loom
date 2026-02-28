@@ -19,8 +19,9 @@ class RunToolTool(Tool):
 
     name = "run_tool"
     description = (
-        "Execute a tool by name with JSON arguments. Use after `list_tools` when "
-        "the needed tool is not in the currently typed tool schema subset."
+        "Execute a tool by name with JSON arguments. Recommended workflow: "
+        "list_tools(detail='compact') to discover names, list_tools(detail='schema') "
+        "to inspect arguments, then run_tool."
     )
     parameters = {
         "type": "object",

@@ -322,8 +322,12 @@ _HYBRID_TOOL_STALL_MARKERS = (
 )
 _HYBRID_RECOVERY_SYSTEM_HINT = (
     "[System: In hybrid mode, if the needed tool is not directly callable, "
-    "use list_tools first to discover it, then call run_tool with the target "
-    "name and JSON arguments. Do not stop at describing tool availability.]"
+    "first call list_tools with {\"detail\":\"compact\"} to discover names, "
+    "then call list_tools with {\"detail\":\"schema\",\"query\":\"<tool name>\"} "
+    "to inspect arguments, then call run_tool with the exact tool name and JSON "
+    "arguments. Do not call list_tools schema broadly; keep schema lookup scoped "
+    "to the specific tool(s) you plan to run. Do not stop at describing tool "
+    "availability.]"
 )
 
 _TOOL_EXPOSURE_MODES = frozenset({"full", "adaptive", "hybrid"})
@@ -1902,6 +1906,11 @@ TOOL USAGE:
 - Use git_command for version control operations (including push).
 - Use task_tracker to organize multi-step work and show progress.
 - Use ask_user when you need the developer's input or decision.
+- In hybrid mode when a needed tool is not directly typed:
+  1) call list_tools with {"detail":"compact"} to discover tool names
+  2) call list_tools with {"detail":"schema","query":"<tool name>"} for argument schema
+  3) call run_tool with the exact tool name and JSON arguments
+  Do not use list_tools schema globally; always narrow with query/category/filters.
 
 CONVERSATION HISTORY:
 - Your context window contains only recent turns. The full session history

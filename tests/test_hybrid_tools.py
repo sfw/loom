@@ -39,32 +39,54 @@ class TestListToolsTool:
         assert result.success is False
         assert "not bound" in (result.error or "")
 
-    async def test_compact_mode_limits_results_and_payload(self):
+    async def test_compact_mode_returns_full_filtered_set_without_paging(self):
         tool = ListToolsTool(catalog_provider=lambda _auth: _fake_rows(100))
         result = await tool.execute(
-            {"limit": 200, "max_payload_bytes": 1600},
+            {"limit": 1, "offset": 99, "max_payload_bytes": 65_536},
             ToolContext(workspace=Path.cwd()),
         )
         assert result.success is True
         assert isinstance(result.data, dict)
         payload = result.data
-        assert payload["limit"] == 50
-        assert len(payload["tools"]) <= 50
+        assert payload["detail"] == "compact"
+        assert payload["offset"] == 0
+        assert payload["limit"] == 100
+        assert payload["has_more"] is False
+        assert payload["next_offset"] is None
+        assert len(payload["tools"]) == 100
         encoded = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-        assert encoded <= 1600
+        assert encoded <= 65_536
         assert "required_args" in payload["tools"][0]
+
+    async def test_compact_mode_fails_when_payload_budget_too_small(self):
+        tool = ListToolsTool(catalog_provider=lambda _auth: _fake_rows(100))
+        result = await tool.execute(
+            {"max_payload_bytes": 1_200},
+            ToolContext(workspace=Path.cwd()),
+        )
+        assert result.success is False
+        assert "exceeds max_payload_bytes" in (result.error or "")
 
     async def test_schema_mode_includes_parameters(self):
         tool = ListToolsTool(catalog_provider=lambda _auth: _fake_rows(3))
         result = await tool.execute(
-            {"detail": "schema", "limit": 2},
+            {"detail": "schema", "query": "tool_1", "limit": 2},
             ToolContext(workspace=Path.cwd()),
         )
         assert result.success is True
         payload = result.data or {}
         assert payload["detail"] == "schema"
-        assert len(payload["tools"]) == 2
+        assert len(payload["tools"]) == 1
         assert "parameters" in payload["tools"][0]
+
+    async def test_schema_mode_requires_narrow_filter(self):
+        tool = ListToolsTool(catalog_provider=lambda _auth: _fake_rows(3))
+        result = await tool.execute(
+            {"detail": "schema", "limit": 2},
+            ToolContext(workspace=Path.cwd()),
+        )
+        assert result.success is False
+        assert "requires a narrow filter" in (result.error or "")
 
 
 class TestRunToolTool:
