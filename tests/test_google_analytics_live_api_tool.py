@@ -10,19 +10,41 @@ from typing import Any
 import pytest
 
 from loom.auth.runtime import build_run_auth_context
-from loom.tools.registry import ToolContext
+from loom.tools.registry import Tool, ToolContext
+
+_TEST_MODULE_NAME = "tests._ga_live_api_bundle"
 
 
 def _load_ga_live_module():
+    existing = sys.modules.get(_TEST_MODULE_NAME)
+    if existing is not None:
+        return existing
+
     root = Path(__file__).resolve().parents[1]
     module_path = root / "packages" / "google-analytics" / "tools" / "ga_live_api.py"
-    module_name = "tests._ga_live_api_bundle"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    spec = importlib.util.spec_from_file_location(_TEST_MODULE_NAME, module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    sys.modules[_TEST_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(autouse=True)
+def _preserve_registered_tool_classes():
+    """Prevent this test module from polluting global tool registration state."""
+    before_classes = set(Tool._registered_classes)
+    before_module = sys.modules.get(_TEST_MODULE_NAME)
+    try:
+        yield
+    finally:
+        for cls in list(Tool._registered_classes):
+            if cls not in before_classes:
+                Tool._registered_classes.discard(cls)
+        if before_module is None:
+            sys.modules.pop(_TEST_MODULE_NAME, None)
+        else:
+            sys.modules[_TEST_MODULE_NAME] = before_module
 
 
 class _FakeResponse:
