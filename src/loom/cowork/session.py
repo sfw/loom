@@ -1174,7 +1174,7 @@ class CoworkSession:
                 selected = [recall_index, *selected]
                 recall_index_used = True
 
-        final_window = system + selected
+        final_window = self._sanitize_tool_call_sequence(system + selected)
         omitted_count = max(0, len(rest) - (len(selected) - (1 if recall_index_used else 0)))
         context_tokens = sum(_estimate_message_tokens(msg) for msg in final_window)
         stats = _ContextWindowStats(
@@ -1184,6 +1184,92 @@ class CoworkSession:
             recall_index_used=recall_index_used,
         )
         return final_window, stats
+
+    @staticmethod
+    def _extract_tool_call_ids(tool_calls: list[dict]) -> list[str]:
+        """Extract normalized tool_call IDs from an assistant tool-calls payload."""
+        ids: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("id", "") or "").strip()
+            if call_id:
+                ids.append(call_id)
+        return ids
+
+    @classmethod
+    def _sanitize_tool_call_sequence(cls, messages: list[dict]) -> list[dict]:
+        """Drop malformed tool-call chains that would fail provider validation.
+
+        Providers require assistant messages containing `tool_calls` to be
+        immediately followed by tool messages for each declared call ID.
+        Interrupted turns can leave dangling assistant tool_calls or orphan tool
+        messages in persisted history. This sanitizer repairs context before model
+        invocation without mutating archived turns.
+        """
+        if not messages:
+            return []
+
+        sanitized: list[dict] = []
+        idx = 0
+        total = len(messages)
+
+        while idx < total:
+            msg = messages[idx]
+            if not isinstance(msg, dict):
+                idx += 1
+                continue
+
+            role = str(msg.get("role", "")).strip()
+            if role == "assistant":
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    expected_ids = cls._extract_tool_call_ids(tool_calls)
+                    next_idx = idx + 1
+                    contiguous_tools: list[dict] = []
+                    seen_ids: set[str] = set()
+                    while next_idx < total:
+                        candidate = messages[next_idx]
+                        if not isinstance(candidate, dict):
+                            break
+                        if str(candidate.get("role", "")).strip() != "tool":
+                            break
+                        contiguous_tools.append(candidate)
+                        tool_call_id = str(
+                            candidate.get("tool_call_id", "") or "",
+                        ).strip()
+                        if tool_call_id:
+                            seen_ids.add(tool_call_id)
+                        next_idx += 1
+
+                    has_complete_chain = (
+                        not expected_ids
+                        or all(call_id in seen_ids for call_id in expected_ids)
+                    )
+                    if has_complete_chain:
+                        sanitized.append(msg)
+                        sanitized.extend(contiguous_tools)
+                    else:
+                        repaired = dict(msg)
+                        repaired.pop("tool_calls", None)
+                        sanitized.append(repaired)
+                    idx = next_idx
+                    continue
+
+                sanitized.append(msg)
+                idx += 1
+                continue
+
+            if role == "tool":
+                # Orphan tool messages without an immediately preceding assistant
+                # tool-calls chain break provider validation.
+                idx += 1
+                continue
+
+            sanitized.append(msg)
+            idx += 1
+
+        return sanitized
 
     async def _execute_tool_call(
         self,

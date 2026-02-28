@@ -467,6 +467,87 @@ class TestCoworkSession:
             for msg in context[1:]
         )
 
+    async def test_context_window_repairs_dangling_assistant_tool_calls(
+        self,
+        workspace,
+        tools,
+    ):
+        provider = MockProvider([
+            ModelResponse(text="ok", usage=TokenUsage(total_tokens=2)),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            system_prompt="test",
+        )
+
+        session._messages = [
+            {"role": "system", "content": "test"},
+            {
+                "role": "assistant",
+                "content": "Searching once",
+                "tool_calls": [
+                    {
+                        "id": "tc-ok",
+                        "type": "function",
+                        "function": {"name": "ripgrep_search", "arguments": "{}"},
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "tc-ok",
+                "content": "{\"success\":true,\"output\":\"ok\"}",
+            },
+            {
+                "role": "assistant",
+                "content": "Dangling tool call",
+                "tool_calls": [
+                    {
+                        "id": "tc-missing",
+                        "type": "function",
+                        "function": {"name": "ripgrep_search", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "user", "content": "continue"},
+        ]
+
+        window = session._context_window()
+        dangling = [
+            msg
+            for msg in window
+            if msg.get("role") == "assistant"
+            and str(msg.get("content", "")) == "Dangling tool call"
+        ]
+        assert dangling
+        assert "tool_calls" not in dangling[0]
+
+    async def test_context_window_drops_orphan_tool_messages(
+        self,
+        workspace,
+        tools,
+    ):
+        provider = MockProvider([
+            ModelResponse(text="ok", usage=TokenUsage(total_tokens=2)),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            system_prompt="test",
+        )
+
+        session._messages = [
+            {"role": "system", "content": "test"},
+            {"role": "tool", "tool_call_id": "orphan", "content": "{\"success\":true}"},
+            {"role": "user", "content": "hello"},
+        ]
+
+        window = session._context_window()
+        assert all(str(msg.get("role", "")) != "tool" for msg in window)
+
     async def test_resume_compacts_persisted_tool_payload_for_model_context(
         self,
         tmp_path: Path,
