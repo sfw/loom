@@ -2178,6 +2178,28 @@ class TestChatReplayHydration:
         assert "Transcript window truncated" in sentinel
 
     @pytest.mark.asyncio
+    async def test_append_chat_replay_event_does_not_render_by_default(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        chat.children = []
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._append_chat_replay_event(
+            "user_message",
+            {"text": "hello"},
+            persist=False,
+        )
+
+        assert app._chat_replay_events[-1]["event_type"] == "user_message"
+        chat.add_user_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_chat_hydrate_perf_latest_300_rows_under_target(self):
         from loom.tui.app import LoomApp
 

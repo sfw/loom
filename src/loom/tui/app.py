@@ -6122,7 +6122,7 @@ class LoomApp(App):
         *,
         turn_number: int | None = None,
         persist: bool = True,
-        render: bool = True,
+        render: bool = False,
     ) -> None:
         """Append one UI chat event to replay state and optional journal."""
         event: dict[str, Any] = {
