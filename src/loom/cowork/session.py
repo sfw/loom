@@ -1907,8 +1907,8 @@ TOOL USAGE:
 - Use task_tracker to organize multi-step work and show progress.
 - Use ask_user when you need the developer's input or decision.
 - In hybrid mode when a needed tool is not directly typed:
-  1) call list_tools with {"detail":"compact"} to discover tool names
-  2) call list_tools with {"detail":"schema","query":"<tool name>"} for argument schema
+  1) call list_tools with {{"detail":"compact"}} to discover tool names
+  2) call list_tools with {{"detail":"schema","query":"<tool name>"}} for argument schema
   3) call run_tool with the exact tool name and JSON arguments
   Do not use list_tools schema globally; always narrow with query/category/filters.
 
