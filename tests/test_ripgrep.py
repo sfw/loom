@@ -41,11 +41,15 @@ class TestRipgrepSearch:
         assert result.success
         # Should find matches in main.py, README.md, and data.txt
         assert "hello" in result.output.lower()
+        assert isinstance(result.data, dict)
+        assert int(result.data.get("match_count", 0) or 0) >= 1
+        assert int(result.data.get("file_count", 0) or 0) >= 1
 
     async def test_no_matches(self, tool, ctx):
         result = await tool.execute({"pattern": "zzz_nonexistent_zzz"}, ctx)
         assert result.success
         assert "No matches" in result.output
+        assert result.data == {"match_count": 0, "file_count": 0}
 
     async def test_case_insensitive(self, tool, ctx):
         result = await tool.execute({
@@ -67,6 +71,12 @@ class TestRipgrepSearch:
             if line and "No matches" not in line:
                 # File paths should not contain ":" line numbers
                 assert ":" not in line or line.count(":") == 0 or "/" in line
+        assert isinstance(result.data, dict)
+        assert int(result.data.get("file_count", 0) or 0) >= 1
+        assert (
+            result.data.get("match_count") is None
+            or int(result.data.get("match_count") or 0) >= 1
+        )
 
     async def test_custom_path(self, tool, workspace):
         ctx = ToolContext(workspace=workspace)
