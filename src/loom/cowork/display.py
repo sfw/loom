@@ -88,6 +88,14 @@ def display_turn_summary(turn: CoworkTurn) -> None:
             parts.append(_format_duration_ms(turn.latency_ms) + " latency")
         if turn.total_time_ms > 0:
             parts.append(_format_duration_ms(turn.total_time_ms) + " total")
+        if turn.context_tokens > 0:
+            parts.append(f"ctx {turn.context_tokens:,} tok")
+        if turn.context_messages > 0:
+            parts.append(f"{turn.context_messages} ctx msg")
+        if turn.omitted_messages > 0:
+            parts.append(f"{turn.omitted_messages} archived")
+        if turn.recall_index_used:
+            parts.append("recall-index")
         parts.append(turn.model)
         sys.stdout.write(
             f"\n{_C.DIM}[{' | '.join(parts)}]{_C.RESET}\n"

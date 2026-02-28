@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -14,6 +15,8 @@ from loom.cowork.session import (
     build_cowork_system_prompt,
 )
 from loom.models.base import ModelProvider, ModelResponse, TokenUsage, ToolCall
+from loom.state.conversation_store import ConversationStore
+from loom.state.memory import Database
 from loom.tools import create_default_registry
 from loom.tools.registry import Tool, ToolResult
 
@@ -431,6 +434,83 @@ class TestCoworkSession:
         # System prompt should always be preserved
         assert context[0]["role"] == "system"
 
+    async def test_context_window_includes_recall_index_when_history_omitted(
+        self,
+        workspace,
+        tools,
+    ):
+        provider = MockProvider([
+            ModelResponse(text=f"Response {i}", usage=TokenUsage())
+            for i in range(12)
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            system_prompt="Test system prompt.",
+            max_context_messages=8,
+            max_context_tokens=6000,
+        )
+
+        for i in range(12):
+            async for _ in session.send(
+                f"Message {i} with extra context to force omission in compact mode",
+            ):
+                pass
+
+        context = session._context_window()
+        assert context[0]["role"] == "system"
+        assert any(
+            msg.get("role") == "system"
+            and "conversation_recall" in str(msg.get("content", ""))
+            and "Compact archive index" in str(msg.get("content", ""))
+            for msg in context[1:]
+        )
+
+    async def test_resume_compacts_persisted_tool_payload_for_model_context(
+        self,
+        tmp_path: Path,
+    ):
+        database = Database(tmp_path / "cowork.db")
+        await database.initialize()
+        store = ConversationStore(database)
+        sid = await store.create_session(workspace=str(tmp_path), model_name="mock")
+
+        huge_tool_payload = json.dumps({
+            "success": True,
+            "output": "X" * 12_000,
+            "error": "",
+            "data": {"raw": "Y" * 10_000, "kind": "demo"},
+            "files_changed": [f"src/file_{i}.py" for i in range(20)],
+            "content_blocks": [{"type": "text"} for _ in range(4)],
+        })
+        await store.append_turn(sid, 1, "user", "please resume this")
+        await store.append_turn(
+            sid,
+            2,
+            "tool",
+            huge_tool_payload,
+            tool_call_id="call_1",
+            tool_name="web_fetch",
+        )
+
+        provider = MockProvider([ModelResponse(text="ok", usage=TokenUsage(total_tokens=4))])
+        session = CoworkSession(
+            model=provider,
+            tools=create_default_registry(),
+            workspace=tmp_path,
+            system_prompt="test",
+            store=store,
+        )
+
+        await session.resume(sid)
+        tool_messages = [m for m in session.messages if m.get("role") == "tool"]
+        assert len(tool_messages) == 1
+        compact_content = str(tool_messages[0].get("content", ""))
+        assert len(compact_content) < 3500
+        assert "output_truncated" in compact_content
+        assert "files_changed_count" in compact_content
+
     async def test_send_retries_transient_model_failure(self, workspace, tools):
         provider = MockProvider([
             RuntimeError("transient model failure"),
@@ -485,6 +565,8 @@ class TestCoworkSession:
         assert turns[0].latency_ms > 0
         assert turns[0].total_time_ms >= turns[0].latency_ms
         assert turns[0].tokens_per_second > 0
+        assert turns[0].context_tokens > 0
+        assert turns[0].context_messages > 0
 
     async def test_send_estimates_tokens_when_usage_missing(self, workspace, tools):
         provider = MockProvider([
@@ -506,6 +588,8 @@ class TestCoworkSession:
         assert turns[0].latency_ms > 0
         assert turns[0].total_time_ms >= turns[0].latency_ms
         assert turns[0].tokens_per_second > 0
+        assert turns[0].context_tokens > 0
+        assert turns[0].context_messages > 0
 
 
 class TestBuildSystemPrompt:
