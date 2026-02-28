@@ -263,7 +263,10 @@ class DelegateProgressWidget(Static):
         if not text:
             return False
         now = time.monotonic()
-        if text == self._last_line and (now - self._last_line_at) < self._line_dedupe_window_seconds:
+        if (
+            text == self._last_line
+            and (now - self._last_line_at) < self._line_dedupe_window_seconds
+        ):
             return False
         self._last_line = text
         self._last_line_at = now
