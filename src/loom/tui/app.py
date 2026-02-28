@@ -185,7 +185,26 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         description="run goal via process orchestrator (auto-ad-hoc when needed)",
     ),
 )
-_MAX_SLASH_HINT_LINES = 24
+_SLASH_COMMAND_PRIORITY: dict[str, int] = {
+    "/new": 10,
+    "/sessions": 11,
+    "/resume": 12,
+    "/history": 13,
+    "/session": 14,
+    "/run": 20,
+    "/processes": 21,
+    "/process": 22,
+    "/mcp": 30,
+    "/auth": 31,
+    "/tools": 32,
+    "/model": 40,
+    "/tokens": 41,
+    "/setup": 42,
+    "/learned": 43,
+    "/help": 44,
+    "/clear": 45,
+    "/quit": 46,
+}
 _WORKSPACE_REFRESH_TOOLS = {"document_write", "document_create", "humanize_writing"}
 _PROCESS_STATUS_ICON = {
     "queued": "\u25cb",
@@ -628,12 +647,18 @@ class LoomApp(App):
         dock: bottom;
         display: none;
         margin: 0 0 4 0;
-        min-height: 1;
+        height: auto;
         max-height: 14;
-        padding: 0 1;
         background: $panel;
+        overflow-y: scroll;
+        overflow-x: hidden;
+        scrollbar-size: 1 1;
+    }
+    #slash-hint-body {
+        width: 100%;
+        min-height: 1;
+        padding: 0 1;
         color: $text-muted;
-        overflow-y: auto;
     }
     """
 
@@ -730,7 +755,8 @@ class LoomApp(App):
                         yield FilesChangedPanel(id="files-panel")
                     with TabPane("Events", id="tab-events"):
                         yield EventPanel(id="events-panel")
-        yield Static("", id="slash-hint")
+        with VerticalScroll(id="slash-hint"):
+            yield Static("", id="slash-hint-body")
         yield StatusBar(id="status-bar")
         with Vertical(id="bottom-stack"):
             yield Static("", id="input-top-rule")
@@ -3271,7 +3297,8 @@ class LoomApp(App):
                         self._compute_process_command_index,
                     )
                 except Exception:
-                    selectable, command_map, blocked = [], {}, []
+                    logger.exception("Failed background process command index refresh")
+                    return
                 try:
                     self._cached_process_catalog = selectable
                     self._process_command_map = command_map
@@ -3300,7 +3327,8 @@ class LoomApp(App):
         try:
             selectable, command_map, blocked = self._compute_process_command_index()
         except Exception:
-            selectable, command_map, blocked = [], {}, []
+            logger.exception("Failed process command index refresh")
+            return
 
         self._cached_process_catalog = selectable
         self._process_command_map = command_map
@@ -5349,7 +5377,7 @@ class LoomApp(App):
     def _slash_command_catalog(self) -> list[tuple[str, str]]:
         """Return canonical slash commands with optional alias annotations."""
         entries: list[tuple[str, str]] = []
-        for spec in _SLASH_COMMANDS:
+        for spec in self._ordered_slash_specs():
             label = spec.canonical
             if spec.usage:
                 label = f"{label} {spec.usage}"
@@ -5361,6 +5389,40 @@ class LoomApp(App):
             entries.append((f"{token} <goal>", f"run goal via process '{process_name}'"))
         return entries
 
+    def _render_root_slash_hint(self) -> str:
+        """Render full root slash catalog with explicit built-in/process sections."""
+        lines = ["[bold #7dcfff]Slash commands:[/]"]
+        for spec in self._ordered_slash_specs():
+            cmd = spec.canonical
+            if spec.usage:
+                cmd = f"{cmd} {spec.usage}"
+            desc = spec.description
+            if spec.aliases:
+                desc = f"{desc} ({', '.join(spec.aliases)})"
+            safe_cmd = self._escape_markup(cmd)
+            safe_desc = self._escape_markup(desc)
+            lines.append(f"  [#73daca]{safe_cmd:<10}[/] {safe_desc}")
+        if self._process_command_map:
+            lines.append("")
+            lines.append("[bold #7dcfff]Process slash commands:[/]")
+            for token, process_name in sorted(self._process_command_map.items()):
+                safe_cmd = self._escape_markup(f"{token} <goal>")
+                safe_desc = self._escape_markup(
+                    f"run goal via process '{process_name}'",
+                )
+                lines.append(f"  [#73daca]{safe_cmd:<10}[/] {safe_desc}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _slash_spec_sort_key(spec: SlashCommandSpec) -> tuple[int, str]:
+        """Return deterministic display/completion ordering key for slash specs."""
+        canonical = spec.canonical.lower()
+        return _SLASH_COMMAND_PRIORITY.get(canonical, 999), canonical
+
+    def _ordered_slash_specs(self) -> list[SlashCommandSpec]:
+        """Return built-in slash specs in deterministic UX priority order."""
+        return sorted(_SLASH_COMMANDS, key=self._slash_spec_sort_key)
+
     @staticmethod
     def _slash_match_keys(spec: SlashCommandSpec) -> tuple[str, ...]:
         """Return normalized command tokens used for prefix matching."""
@@ -5369,7 +5431,7 @@ class LoomApp(App):
     def _help_lines(self) -> list[str]:
         """Build slash help lines from the shared command registry."""
         lines = ["[bold #7dcfff]Slash Commands[/bold #7dcfff]"]
-        for spec in _SLASH_COMMANDS:
+        for spec in self._ordered_slash_specs():
             label = spec.canonical
             if spec.usage:
                 label = f"{label} {spec.usage}"
@@ -5438,9 +5500,10 @@ class LoomApp(App):
         if token == "/":
             return token, self._slash_command_catalog()
 
-        matches: list[tuple[str, str]] = []
+        exact_matches: list[tuple[str, str]] = []
+        prefix_matches: list[tuple[str, str]] = []
         fallback_matches: list[tuple[str, str]] = []
-        for spec in _SLASH_COMMANDS:
+        for spec in self._ordered_slash_specs():
             keys = self._slash_match_keys(spec)
             label = spec.canonical
             if spec.usage:
@@ -5449,8 +5512,10 @@ class LoomApp(App):
             if spec.aliases:
                 desc = f"{desc} ({', '.join(spec.aliases)})"
             entry = (label, desc)
-            if any(key.startswith(token) for key in keys):
-                matches.append(entry)
+            if any(key == token for key in keys):
+                exact_matches.append(entry)
+            elif any(key.startswith(token) for key in keys):
+                prefix_matches.append(entry)
             elif any(token in key for key in keys):
                 fallback_matches.append(entry)
         for dynamic_token, process_name in sorted(self._process_command_map.items()):
@@ -5458,12 +5523,14 @@ class LoomApp(App):
                 f"{dynamic_token} <goal>",
                 f"run goal via process '{process_name}'",
             )
-            if dynamic_token.startswith(token):
-                matches.append(entry)
+            if dynamic_token == token:
+                exact_matches.append(entry)
+            elif dynamic_token.startswith(token):
+                prefix_matches.append(entry)
             elif token in dynamic_token:
                 fallback_matches.append(entry)
-        if matches:
-            return token, matches
+        if exact_matches or prefix_matches:
+            return token, [*exact_matches, *prefix_matches]
         return token, fallback_matches
 
     def _reset_slash_tab_cycle(self) -> None:
@@ -5581,13 +5648,13 @@ class LoomApp(App):
         """Return slash command completions for a token prefix."""
         self._refresh_process_command_index(background=True)
         if token == "/":
-            builtins = [spec.canonical for spec in _SLASH_COMMANDS]
+            builtins = [spec.canonical for spec in self._ordered_slash_specs()]
             dynamic = sorted(self._process_command_map)
             return builtins + dynamic
 
         candidates: list[str] = []
         seen: set[str] = set()
-        for spec in _SLASH_COMMANDS:
+        for spec in self._ordered_slash_specs():
             for key in (spec.canonical, *spec.aliases):
                 if key.startswith(token) and key not in seen:
                     candidates.append(key)
@@ -5684,12 +5751,8 @@ class LoomApp(App):
             else f"Process matches '{prefix}':"
         )
         lines = [f"[bold #7dcfff]{title}[/]"]
-        max_rows = 12
-        for name, version, marker in rows[:max_rows]:
+        for name, version, marker in rows:
             lines.append(f"  [#73daca]{name:<30}[/] [dim]v{version}[/]{marker}")
-        remaining = len(rows) - max_rows
-        if remaining > 0:
-            lines.append(f"  [dim]... and {remaining} more[/dim]")
         lines.append("[dim]Press Tab to autocomplete[/dim]")
         return "\n".join(lines)
 
@@ -5744,6 +5807,9 @@ class LoomApp(App):
         process_hint = self._render_process_use_hint(raw_input)
         if process_hint is not None:
             return process_hint
+        if raw_input.strip() == "/":
+            self._refresh_process_command_index(background=True)
+            return self._render_root_slash_hint()
         if " " in raw_input.strip():
             return ""
         token, matches = self._matching_slash_commands(raw_input)
@@ -5774,17 +5840,16 @@ class LoomApp(App):
 
     def _set_slash_hint(self, hint_text: str) -> None:
         """Show or hide the slash-command hint panel."""
-        hint = self.query_one("#slash-hint", Static)
+        hint = self.query_one("#slash-hint", VerticalScroll)
+        hint_body = self.query_one("#slash-hint-body", Static)
         if hint_text:
-            hint.update(hint_text)
+            hint_body.update(hint_text)
             hint.display = True
-            line_count = max(1, len(hint_text.splitlines()))
-            hint.styles.height = min(line_count, _MAX_SLASH_HINT_LINES)
             hint.scroll_home(animate=False)
         else:
             hint.display = False
-            hint.styles.height = "auto"
-            hint.update("")
+            hint_body.update("")
+            hint.scroll_home(animate=False)
 
     def _bind_session_tools(self) -> None:
         """Bind tools that hold a reference to the active session."""

@@ -2429,6 +2429,19 @@ class TestSlashCommandHints:
         assert "/investment-analysis <goal>" in hint
         assert "/marketing-strategy <goal>" in hint
 
+    def test_root_slash_uses_priority_ordering(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/")
+        assert hint.index("/new") < hint.index("/run")
+        assert hint.index("/run") < hint.index("/mcp")
+        assert hint.index("/mcp") < hint.index("/help")
+
     def test_prefix_filters_matches(self):
         from loom.tui.app import LoomApp
 
@@ -2479,6 +2492,20 @@ class TestSlashCommandHints:
         assert "Matching /p:" in hint
         assert "/process" in hint
 
+    def test_exact_match_keeps_prefix_siblings(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        hint = app._render_slash_hint("/process")
+        assert "Matching /process:" in hint
+        assert "/process " in hint
+        assert "/processes" in hint
+        assert hint.index("/process ") < hint.index("/processes")
+
     def test_process_use_hint_shows_available_processes(self):
         from loom.tui.app import LoomApp
 
@@ -2516,6 +2543,28 @@ class TestSlashCommandHints:
         assert "Process matches 'inv':" in hint
         assert "investment-analysis" in hint
         assert "marketing-strategy" not in hint
+
+    def test_process_use_hint_does_not_truncate_large_match_sets(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        catalog = [
+            {"name": f"process-{idx:02d}", "version": "1.0"}
+            for idx in range(1, 16)
+        ]
+        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
+            list_available=MagicMock(return_value=catalog)
+        ))
+
+        hint = app._render_slash_hint("/process use process-")
+
+        assert "... and " not in hint
+        for idx in range(1, 16):
+            assert f"process-{idx:02d}" in hint
 
     def test_prefix_r_matches_resume_and_run(self):
         from loom.tui.app import LoomApp
@@ -2587,7 +2636,27 @@ class TestSlashCommandHints:
         assert captured
         assert "/help" in captured[-1]
 
-    def test_set_slash_hint_sets_height_from_line_count(self):
+    @pytest.mark.asyncio
+    async def test_slash_hint_container_supports_overflow_scrolling(self):
+        from textual.containers import VerticalScroll
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/Users/sfw/Development/loom"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(100, 14)) as pilot:
+            await pilot.press("/")
+            await pilot.pause()
+            hint = app.query_one("#slash-hint", VerticalScroll)
+            assert hint.display is True
+            assert hint.max_scroll_y > 0
+
+    def test_set_slash_hint_updates_scroll_container(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -2597,16 +2666,17 @@ class TestSlashCommandHints:
         )
         fake_hint = SimpleNamespace(
             display=False,
-            styles=SimpleNamespace(height=None),
-            update=MagicMock(),
             scroll_home=MagicMock(),
         )
+        fake_hint_body = SimpleNamespace(update=MagicMock())
         fake_footer = SimpleNamespace(display=True)
         fake_status = SimpleNamespace(display=True)
 
         def _query_one(selector, *_args, **_kwargs):
             if selector == "#slash-hint":
                 return fake_hint
+            if selector == "#slash-hint-body":
+                return fake_hint_body
             if selector == "#status-bar":
                 return fake_status
             return fake_footer
@@ -2616,13 +2686,13 @@ class TestSlashCommandHints:
         app._set_slash_hint("a\nb\nc")
 
         assert fake_hint.display is True
-        assert fake_hint.styles.height == 3
+        fake_hint_body.update.assert_called_once_with("a\nb\nc")
         fake_hint.scroll_home.assert_called_once_with(animate=False)
         # Slash hints no longer toggle footer/status visibility.
         assert fake_footer.display is True
         assert fake_status.display is True
 
-    def test_set_slash_hint_empty_resets_auto_height(self):
+    def test_set_slash_hint_empty_hides_container_and_clears_body(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -2632,16 +2702,17 @@ class TestSlashCommandHints:
         )
         fake_hint = SimpleNamespace(
             display=True,
-            styles=SimpleNamespace(height=5),
-            update=MagicMock(),
             scroll_home=MagicMock(),
         )
+        fake_hint_body = SimpleNamespace(update=MagicMock())
         fake_footer = SimpleNamespace(display=False)
         fake_status = SimpleNamespace(display=False)
 
         def _query_one(selector, *_args, **_kwargs):
             if selector == "#slash-hint":
                 return fake_hint
+            if selector == "#slash-hint-body":
+                return fake_hint_body
             if selector == "#status-bar":
                 return fake_status
             return fake_footer
@@ -2651,7 +2722,8 @@ class TestSlashCommandHints:
         app._set_slash_hint("")
 
         assert fake_hint.display is False
-        assert fake_hint.styles.height == "auto"
+        fake_hint_body.update.assert_called_once_with("")
+        fake_hint.scroll_home.assert_called_once_with(animate=False)
         # Slash hints no longer toggle footer/status visibility.
         assert fake_footer.display is False
         assert fake_status.display is False
@@ -2668,14 +2740,14 @@ class TestSlashCommandHints:
             list_available=MagicMock(return_value=[])
         ))
         assert app._slash_completion_candidates("/s") == [
-            "/setup",
-            "/session",
             "/sessions",
+            "/session",
+            "/setup",
         ]
-        assert app._slash_completion_candidates("/h") == ["/help", "/history"]
-        assert app._slash_completion_candidates("/m") == ["/model", "/mcp"]
+        assert app._slash_completion_candidates("/h") == ["/history", "/help"]
+        assert app._slash_completion_candidates("/m") == ["/mcp", "/model"]
         assert app._slash_completion_candidates("/t") == ["/tools", "/tokens"]
-        assert app._slash_completion_candidates("/p") == ["/process", "/processes"]
+        assert app._slash_completion_candidates("/p") == ["/processes", "/process"]
         assert app._slash_completion_candidates("/r") == ["/resume", "/run"]
 
     def test_slash_completion_candidates_include_dynamic_process_commands(self):
@@ -2695,8 +2767,8 @@ class TestSlashCommandHints:
 
         assert app._slash_completion_candidates("/i") == ["/investment-analysis"]
         assert app._slash_completion_candidates("/m") == [
-            "/model",
             "/mcp",
+            "/model",
             "/marketing-strategy",
         ]
 
@@ -7613,16 +7685,16 @@ class TestCommandPaletteProcessActions:
         app.query_one = MagicMock(return_value=input_widget)
 
         assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/setup"
+        assert input_widget.value == "/sessions"
 
         assert app._apply_slash_tab_completion(reverse=False) is True
         assert input_widget.value == "/session"
 
         assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/sessions"
+        assert input_widget.value == "/setup"
 
         assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/setup"
+        assert input_widget.value == "/sessions"
 
     def test_slash_tab_completion_cycles_backward(self):
         from loom.tui.app import LoomApp
@@ -7636,7 +7708,7 @@ class TestCommandPaletteProcessActions:
         app.query_one = MagicMock(return_value=input_widget)
 
         assert app._apply_slash_tab_completion(reverse=True) is True
-        assert input_widget.value == "/sessions"
+        assert input_widget.value == "/setup"
 
     def test_slash_tab_completion_ignores_non_slash_or_args(self):
         from loom.tui.app import LoomApp
@@ -7741,7 +7813,7 @@ class TestCommandPaletteProcessActions:
 
             await pilot.press("tab")
             await pilot.pause()
-            assert input_widget.value == "/setup"
+            assert input_widget.value == "/sessions"
 
             await pilot.press("tab")
             await pilot.pause()
