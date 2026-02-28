@@ -6,14 +6,21 @@ import asyncio
 import re
 import shlex
 from dataclasses import replace
+from pathlib import Path
 
 from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Input, Label
+from textual.widgets import Button, Collapsible, DataTable, Input, Label
 
+from loom.auth.resources import (
+    ResourceDeleteImpact,
+    cleanup_deleted_resource,
+    rename_resource_key,
+    resource_delete_impact,
+)
 from loom.mcp.config import (
     MCPConfigManager,
     MCPConfigManagerError,
@@ -58,14 +65,33 @@ class ConfirmRemoveScreen(ModalScreen[bool]):
     }
     """
 
-    def __init__(self, alias: str) -> None:
+    def __init__(
+        self,
+        alias: str,
+        *,
+        impact: ResourceDeleteImpact | None = None,
+    ) -> None:
         super().__init__()
         self._alias = alias
+        self._impact = impact or ResourceDeleteImpact()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mcp-remove-confirm-dialog"):
             yield Label("[bold #e0af68]Delete MCP server?[/]")
             yield Label(f"Alias: [bold]{self._alias}[/bold]")
+            if self._impact.resource_id:
+                yield Label(
+                    "Auth impact: "
+                    f"{len(self._impact.active_profile_ids)} profile(s), "
+                    f"{len(self._impact.active_binding_ids)} binding(s), "
+                    f"default={'yes' if self._impact.workspace_default_profile_id else 'no'}."
+                )
+                if self._impact.referencing_processes:
+                    yield Label(
+                        "Process references: "
+                        f"{len(self._impact.referencing_processes)} "
+                        "(review process auth requirements before delete)."
+                    )
             yield Label("This cannot be undone.")
             with Horizontal(id="mcp-remove-confirm-actions"):
                 yield Button("Delete", id="mcp-remove-confirm-yes", variant="error")
@@ -220,6 +246,9 @@ class MCPManagerScreen(ModalScreen[dict[str, object] | None]):
         overflow-y: auto;
         margin-bottom: 1;
     }
+    #mcp-manager-advanced {
+        margin-top: 1;
+    }
     .mcp-label {
         margin-top: 1;
     }
@@ -244,9 +273,15 @@ class MCPManagerScreen(ModalScreen[dict[str, object] | None]):
     }
     """
 
-    def __init__(self, manager: MCPConfigManager) -> None:
+    def __init__(
+        self,
+        manager: MCPConfigManager,
+        *,
+        explicit_auth_path: Path | None = None,
+    ) -> None:
         super().__init__()
         self._manager = manager
+        self._explicit_auth_path = explicit_auth_path
         self._views: list[MCPServerView] = []
         self._summary_aliases: list[str] = []
         self._active_alias = ""
@@ -300,45 +335,53 @@ class MCPManagerScreen(ModalScreen[dict[str, object] | None]):
                     "Optional command arguments; parsed like a shell command.",
                     classes="mcp-help",
                 )
-                yield Label("Cwd", classes="mcp-label")
-                yield Input(
-                    id="mcp-cwd",
-                    classes="mcp-input",
-                )
-                yield Label(
-                    "Optional working directory for server startup.",
-                    classes="mcp-help",
-                )
-                yield Label("Timeout seconds", classes="mcp-label")
-                yield Input(
-                    id="mcp-timeout",
-                    classes="mcp-input",
-                )
-                yield Label(
-                    "Request timeout for this MCP server (defaults to 30).",
-                    classes="mcp-help",
-                )
-                yield Label("Env pairs (comma-separated KEY=VALUE)", classes="mcp-label")
-                yield Input(
-                    id="mcp-env",
-                    classes="mcp-input",
-                )
-                yield Label(
-                    "Literal env values written into mcp.toml for this alias.",
-                    classes="mcp-help",
-                )
-                yield Label(
-                    "Env refs (comma-separated KEY=ENV_VAR)",
-                    classes="mcp-label",
-                )
-                yield Input(
-                    id="mcp-env-ref",
-                    classes="mcp-input",
-                )
-                yield Label(
-                    "Runtime env indirection; saved as KEY=${ENV_VAR}.",
-                    classes="mcp-help",
-                )
+                with Collapsible(
+                    title="Advanced",
+                    id="mcp-manager-advanced",
+                    collapsed=True,
+                ):
+                    yield Label("Cwd", classes="mcp-label")
+                    yield Input(
+                        id="mcp-cwd",
+                        classes="mcp-input",
+                    )
+                    yield Label(
+                        "Optional working directory for server startup.",
+                        classes="mcp-help",
+                    )
+                    yield Label("Timeout seconds", classes="mcp-label")
+                    yield Input(
+                        id="mcp-timeout",
+                        classes="mcp-input",
+                    )
+                    yield Label(
+                        "Request timeout for this MCP server (defaults to 30).",
+                        classes="mcp-help",
+                    )
+                    yield Label(
+                        "Env pairs (comma-separated KEY=VALUE)",
+                        classes="mcp-label",
+                    )
+                    yield Input(
+                        id="mcp-env",
+                        classes="mcp-input",
+                    )
+                    yield Label(
+                        "Literal env values written into mcp.toml for this alias.",
+                        classes="mcp-help",
+                    )
+                    yield Label(
+                        "Env refs (comma-separated KEY=ENV_VAR)",
+                        classes="mcp-label",
+                    )
+                    yield Input(
+                        id="mcp-env-ref",
+                        classes="mcp-input",
+                    )
+                    yield Label(
+                        "Runtime env indirection; saved as KEY=${ENV_VAR}.",
+                        classes="mcp-help",
+                    )
 
             with Horizontal(classes="mcp-actions-row", id="mcp-actions-primary"):
                 yield Button("Refresh", id="mcp-btn-refresh")
@@ -354,8 +397,8 @@ class MCPManagerScreen(ModalScreen[dict[str, object] | None]):
             yield Label(
                 "[dim]Server list loads automatically on open. "
                 "Select a server row to edit it. Save/Add upserts; new aliases start enabled. "
-                "Use Enable/Disable buttons to change activation state. "
-                "Use separate MCP aliases for multiple accounts.[/dim]",
+                "Open Advanced for cwd/timeout/env overrides. "
+                "Use Enable/Disable buttons to change activation state.[/dim]",
                 id="mcp-manager-footer",
             )
 
@@ -481,9 +524,6 @@ class MCPManagerScreen(ModalScreen[dict[str, object] | None]):
         self._render_summary()
 
     def _render_summary(self) -> None:
-        if not self.is_mounted:
-            return
-
         table = self.query_one("#mcp-manager-summary", DataTable)
         table.clear()
         self._summary_aliases = []
@@ -612,6 +652,15 @@ class MCPManagerScreen(ModalScreen[dict[str, object] | None]):
         parts = [item.strip() for item in value.split(",")]
         return tuple(item for item in parts if item)
 
+    def _manager_workspace(self) -> Path | None:
+        workspace = getattr(self._manager, "_workspace", None)
+        if workspace is None:
+            return None
+        try:
+            return Path(workspace).expanduser().resolve()
+        except Exception:
+            return None
+
     async def _save_current_form(self, *, notify_success: bool = True) -> bool:
         alias = self._current_alias()
         if not alias:
@@ -634,6 +683,9 @@ class MCPManagerScreen(ModalScreen[dict[str, object] | None]):
             self.notify(f"Invalid MCP form values: {e}", severity="error")
             return False
 
+        previous_alias = str(self._active_alias or "").strip()
+        renaming = bool(previous_alias and previous_alias != clean_alias)
+
         try:
             existing = await asyncio.to_thread(self._manager.get_view, clean_alias)
             if existing is None:
@@ -647,6 +699,8 @@ class MCPManagerScreen(ModalScreen[dict[str, object] | None]):
                     disabled=False,
                 )
                 await asyncio.to_thread(self._manager.add_server, clean_alias, server)
+                if renaming:
+                    await asyncio.to_thread(self._manager.remove_server, previous_alias)
             else:
                 new_command = command if command else None
                 new_cwd = cwd if cwd else None
@@ -672,6 +726,22 @@ class MCPManagerScreen(ModalScreen[dict[str, object] | None]):
             self.notify(f"Save failed: {e}", severity="error")
             return False
 
+        workspace = self._manager_workspace()
+        if renaming and workspace is not None:
+            try:
+                await asyncio.to_thread(
+                    rename_resource_key,
+                    workspace=workspace,
+                    resource_kind="mcp",
+                    old_key=previous_alias,
+                    new_key=clean_alias,
+                )
+            except Exception as e:
+                self.notify(
+                    f"Auth resource rename warning: {e}",
+                    severity="warning",
+                )
+
         self._changed = True
         self._active_alias = clean_alias
         self._mark_form_clean(active_alias=clean_alias)
@@ -691,31 +761,76 @@ class MCPManagerScreen(ModalScreen[dict[str, object] | None]):
         except Exception as e:
             self.notify(str(e), severity="error")
             return
+        impact = None
+        workspace = self._manager_workspace()
+        if workspace is not None:
+            try:
+                impact = await asyncio.to_thread(
+                    resource_delete_impact,
+                    workspace=workspace,
+                    resource_kind="mcp",
+                    resource_key=clean_alias,
+                )
+            except Exception:
+                impact = None
         self.app.push_screen(
-            ConfirmRemoveScreen(clean_alias),
-            callback=lambda confirmed: self._on_remove_confirmed(clean_alias, confirmed),
+            ConfirmRemoveScreen(clean_alias, impact=impact),
+            callback=lambda confirmed: self._on_remove_confirmed(
+                clean_alias,
+                confirmed,
+                impact,
+            ),
         )
 
-    def _on_remove_confirmed(self, alias: str, confirmed: bool) -> None:
+    def _on_remove_confirmed(
+        self,
+        alias: str,
+        confirmed: bool,
+        impact: ResourceDeleteImpact | None,
+    ) -> None:
         if not confirmed:
             return
         self.run_worker(
-            self._remove_alias_confirmed(alias),
+            self._remove_alias_confirmed(alias, impact),
             group="mcp-manager-remove",
             exclusive=True,
         )
 
-    async def _remove_alias_confirmed(self, alias: str) -> None:
+    async def _remove_alias_confirmed(
+        self,
+        alias: str,
+        impact: ResourceDeleteImpact | None,
+    ) -> None:
         was_active = alias == self._active_alias
         try:
             await asyncio.to_thread(self._manager.remove_server, alias)
         except Exception as e:
             self.notify(str(e), severity="error")
             return
+        workspace = self._manager_workspace()
+        if workspace is not None:
+            try:
+                await asyncio.to_thread(
+                    cleanup_deleted_resource,
+                    workspace=workspace,
+                    explicit_auth_path=self._explicit_auth_path,
+                    resource_kind="mcp",
+                    resource_key=alias,
+                )
+            except Exception as e:
+                self.notify(f"Auth cleanup warning: {e}", severity="warning")
         self._changed = True
         await self._refresh_summary()
         if was_active:
             self._set_blank_form()
+        if impact is not None and impact.resource_id:
+            self.notify(
+                "Auth cleanup: "
+                f"{len(impact.active_profile_ids)} profile(s), "
+                f"{len(impact.active_binding_ids)} binding(s), "
+                f"default={'yes' if impact.workspace_default_profile_id else 'no'}, "
+                f"process_refs={len(impact.referencing_processes)}.",
+            )
         self.notify(f"Removed MCP alias: {alias}")
 
     async def _set_alias_enabled(self, enabled: bool) -> None:

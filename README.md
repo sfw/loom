@@ -178,6 +178,28 @@ For large fetched binaries/documents (PDFs, Office files, archives), tune
 `ingest_artifact_retention_max_files_per_scope`, and
 `ingest_artifact_retention_max_bytes_per_scope`.
 
+### Latency Diagnostics and Smoke Benchmarks
+
+Enable runtime latency diagnostics:
+
+```bash
+LOOM_LATENCY_DIAGNOSTICS=1 uv run loom
+```
+
+This emits low-overhead timing lines for key paths (event-loop lag probes,
+MCP discovery/refresh, process index refresh, setup discovery, and API task
+preflight timing).
+
+Run local startup/discovery latency smoke checks:
+
+```bash
+uv run python scripts/latency_smoke.py
+uv run python scripts/latency_smoke.py --iterations 5 --workspace /path/to/workspace
+```
+
+The script reports mean/p50/p95 timings for process catalog scan and tool
+registry creation with sync vs background MCP startup modes.
+
 ## Auth Profiles and Run-Time Resolution
 
 Loom stores credential metadata (not plaintext secrets) in `~/.loom/auth.toml`.
@@ -210,6 +232,7 @@ CLI:
   (provider selector or resource selector such as `api_integration:notion`).
 - `uv run loom auth audit` reports orphaned/dangling auth state and exits non-zero on findings.
 - `uv run loom auth migrate` infers resource bindings/defaults from legacy provider state.
+- `uv run loom auth migrate` takes a preflight snapshot and auto-rolls back if migration fails.
 - `uv run loom auth migrate --rollback <snapshot-dir>` restores auth files from a migration snapshot.
 
 API behavior:

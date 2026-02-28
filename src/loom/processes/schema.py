@@ -138,6 +138,27 @@ class ToolRequirements:
 
 
 @dataclass
+class AuthRequirement:
+    """Auth resource requirement for process preflight."""
+
+    provider: str
+    source: str = "api"  # "api" | "mcp"
+    modes: list[str] = field(default_factory=list)
+    scopes: list[str] = field(default_factory=list)
+    required_env_keys: list[str] = field(default_factory=list)
+    mcp_server: str = ""
+    resource_ref: str = ""
+    resource_id: str = ""
+
+
+@dataclass
+class AuthRequirements:
+    """Auth requirements declared by process contract."""
+
+    required: list[AuthRequirement] = field(default_factory=list)
+
+
+@dataclass
 class VerificationPolicyContract:
     """Structured verification policy from process contract v2."""
 
@@ -198,6 +219,7 @@ class ProcessDefinition:
     persona: str = ""
     tool_guidance: str = ""
     tools: ToolRequirements = field(default_factory=ToolRequirements)
+    auth: AuthRequirements = field(default_factory=AuthRequirements)
     phase_mode: str = "guided"  # "strict" | "guided" | "suggestive"
     phases: list[PhaseTemplate] = field(default_factory=list)
     verification_rules: list[VerificationRule] = field(
@@ -432,6 +454,46 @@ class ProcessDefinition:
                     filenames.append(fname)
                 result[phase.id] = filenames
         return result
+
+    def auth_required_resources(self) -> list[dict[str, Any]]:
+        """Return normalized auth.required records as plain dicts."""
+        items: list[dict[str, Any]] = []
+        for requirement in self.auth.required:
+            payload: dict[str, Any] = {
+                "provider": str(requirement.provider or "").strip(),
+                "source": str(requirement.source or "api").strip().lower() or "api",
+            }
+            if requirement.modes:
+                payload["modes"] = [
+                    str(item).strip()
+                    for item in requirement.modes
+                    if str(item).strip()
+                ]
+            if requirement.scopes:
+                payload["scopes"] = [
+                    str(item).strip()
+                    for item in requirement.scopes
+                    if str(item).strip()
+                ]
+            if requirement.required_env_keys:
+                payload["required_env_keys"] = [
+                    str(item).strip()
+                    for item in requirement.required_env_keys
+                    if str(item).strip()
+                ]
+            if str(requirement.mcp_server or "").strip():
+                payload["mcp_server"] = str(requirement.mcp_server).strip()
+            if str(requirement.resource_ref or "").strip():
+                payload["resource_ref"] = str(requirement.resource_ref).strip()
+            if str(requirement.resource_id or "").strip():
+                payload["resource_id"] = str(requirement.resource_id).strip()
+            if (
+                payload.get("provider")
+                or payload.get("resource_ref")
+                or payload.get("resource_id")
+            ):
+                items.append(payload)
+        return items
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +851,55 @@ class ProcessLoader:
         else:
             tools = ToolRequirements()
 
+        # Auth requirements
+        auth_raw = raw.get("auth", {})
+        auth_required: list[AuthRequirement] = []
+        if isinstance(auth_raw, dict):
+            required_raw = auth_raw.get("required", [])
+            if not isinstance(required_raw, list):
+                required_raw = []
+            for entry in required_raw:
+                if not isinstance(entry, dict):
+                    continue
+                modes_raw = entry.get("modes", [])
+                if isinstance(modes_raw, str):
+                    modes_raw = [modes_raw]
+                if not isinstance(modes_raw, list):
+                    modes_raw = []
+                scopes_raw = entry.get("scopes", [])
+                if isinstance(scopes_raw, str):
+                    scopes_raw = [scopes_raw]
+                if not isinstance(scopes_raw, list):
+                    scopes_raw = []
+                env_keys_raw = entry.get("required_env_keys", [])
+                if isinstance(env_keys_raw, str):
+                    env_keys_raw = [env_keys_raw]
+                if not isinstance(env_keys_raw, list):
+                    env_keys_raw = []
+                auth_required.append(AuthRequirement(
+                    provider=str(entry.get("provider", "")).strip(),
+                    source=str(entry.get("source", "api") or "api").strip().lower(),
+                    modes=[
+                        str(item).strip()
+                        for item in modes_raw
+                        if str(item).strip()
+                    ],
+                    scopes=[
+                        str(item).strip()
+                        for item in scopes_raw
+                        if str(item).strip()
+                    ],
+                    required_env_keys=[
+                        str(item).strip()
+                        for item in env_keys_raw
+                        if str(item).strip()
+                    ],
+                    mcp_server=str(entry.get("mcp_server", "")).strip(),
+                    resource_ref=str(entry.get("resource_ref", "")).strip(),
+                    resource_id=str(entry.get("resource_id", "")).strip(),
+                ))
+        auth = AuthRequirements(required=auth_required)
+
         # Workspace analysis
         ws_raw = raw.get("workspace_analysis", {})
         ws_scan = ws_raw.get("scan_for", []) if isinstance(
@@ -885,6 +996,7 @@ class ProcessLoader:
             persona=raw.get("persona", ""),
             tool_guidance=tool_guidance,
             tools=tools,
+            auth=auth,
             phase_mode=raw.get("phase_mode", "guided"),
             phases=phases,
             verification_rules=rules,
@@ -1028,6 +1140,55 @@ class ProcessLoader:
                     f"Tool(s) both required and excluded: "
                     f"{', '.join(sorted(overlap))}",
                 )
+
+        # Auth requirements
+        for requirement in defn.auth.required:
+            provider = str(requirement.provider or "").strip()
+            resource_ref = str(requirement.resource_ref or "").strip()
+            resource_id = str(requirement.resource_id or "").strip()
+            if not provider and not resource_ref and not resource_id:
+                errors.append(
+                    "auth.required entry missing provider/resource_ref/resource_id"
+                )
+                continue
+            source = str(requirement.source or "api").strip().lower()
+            if source not in {"api", "mcp"}:
+                errors.append(
+                    f"auth.required entry {provider or resource_ref or resource_id!r}: "
+                    f"invalid source {source!r} "
+                    "(expected 'api' or 'mcp')",
+                )
+            if source != "mcp" and str(requirement.mcp_server or "").strip():
+                errors.append(
+                    f"auth.required entry {provider or resource_ref or resource_id!r}: "
+                    "mcp_server is only valid "
+                    "when source='mcp'",
+                )
+            if resource_ref and ":" not in resource_ref:
+                errors.append(
+                    f"auth.required entry {provider or resource_ref or resource_id!r}: "
+                    "resource_ref must look like '<kind>:<key>'",
+                )
+            for mode in requirement.modes:
+                if not str(mode).strip():
+                    errors.append(
+                        f"auth.required entry {provider or resource_ref or resource_id!r}: "
+                        "modes must not contain empty values",
+                    )
+            for env_key in requirement.required_env_keys:
+                key = str(env_key or "").strip()
+                if not key:
+                    errors.append(
+                        f"auth.required entry {provider or resource_ref or resource_id!r}: "
+                        "required_env_keys "
+                        "must not contain empty values",
+                    )
+                    continue
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                    errors.append(
+                        f"auth.required entry {provider or resource_ref or resource_id!r}: "
+                        f"invalid env key {key!r}",
+                    )
 
         # Process test validation
         seen_test_ids: set[str] = set()

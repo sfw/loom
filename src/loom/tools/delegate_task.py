@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from loom.auth.runtime import coerce_auth_requirements, serialize_auth_requirements
 from loom.state.task_state import SubtaskStatus, TaskStatus
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
@@ -162,6 +163,10 @@ class DelegateTaskTool(Tool):
                 if selector and profile_id:
                     auth_profile_overrides[selector] = profile_id
         auth_config_path = str(args.get("_auth_config_path", "") or "").strip()
+        auth_workspace = str(args.get("_auth_workspace", "") or "").strip()
+        auth_required_resources = serialize_auth_requirements(
+            coerce_auth_requirements(args.get("_auth_required_resources")),
+        )
         workspace = str(ctx.workspace) if ctx.workspace else ""
 
         # Fresh orchestrator per call to isolate concurrent delegated runs.
@@ -208,6 +213,10 @@ class DelegateTaskTool(Tool):
             task.metadata["auth_profile_overrides"] = auth_profile_overrides
         if auth_config_path:
             task.metadata["auth_config_path"] = auth_config_path
+        if auth_workspace:
+            task.metadata["auth_workspace"] = auth_workspace
+        if auth_required_resources:
+            task.metadata["auth_required_resources"] = auth_required_resources
         event_bus = getattr(orchestrator, "_events", None)
         event_log_handle = None
         event_log_path = ""

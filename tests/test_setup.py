@@ -121,6 +121,7 @@ class TestGenerateToml:
         assert parsed["models"]["test"]["provider"] == "ollama"
         assert parsed["server"]["port"] == 9000
         assert parsed["execution"]["delegate_task_timeout_seconds"] == 3600
+        assert parsed["execution"]["cowork_tool_exposure_mode"] == "adaptive"
         assert parsed["memory"]["database_path"] == "~/.loom/loom.db"
 
     def test_generated_toml_loads_as_config(self):
@@ -155,6 +156,7 @@ class TestGenerateToml:
         assert config.models["primary"].roles == ["planner", "executor"]
         assert config.server.port == 9000
         assert config.execution.delegate_task_timeout_seconds == 3600
+        assert config.execution.cowork_tool_exposure_mode == "adaptive"
 
 
 class TestRunSetup:
@@ -197,6 +199,7 @@ class TestRunSetup:
         assert 'provider = "ollama"' in content
         assert 'model = "qwen3:14b"' in content
         assert "delegate_task_timeout_seconds = 3600" in content
+        assert 'cowork_tool_exposure_mode = "adaptive"' in content
         assert "ingest_artifact_retention_max_age_days = 14" in content
         assert "ingest_artifact_retention_max_files_per_scope = 96" in content
         assert "ingest_artifact_retention_max_bytes_per_scope = 268435456" in content
@@ -498,11 +501,10 @@ class TestSetupScreen:
         assert len(screen._models) == 1
         assert screen._step == _STEP_UTILITY
 
-    def test_collect_details_autodiscovers_when_model_missing(self, monkeypatch):
-        """If model is blank, details collection should auto-discover."""
+    def test_collect_details_autodiscovers_when_model_missing(self):
+        """If model is blank, details collection should use cached discovery."""
         from types import SimpleNamespace
 
-        from loom.tui.screens import setup as setup_mod
         from loom.tui.screens.setup import (
             _STEP_ROLES,
             SetupScreen,
@@ -510,6 +512,7 @@ class TestSetupScreen:
 
         screen = SetupScreen()
         screen._provider_key = "openai_compatible"
+        screen._discovered_models = ["gpt-4o-mini", "gpt-4o"]
 
         url_input = SimpleNamespace(value="http://localhost:1234/v1", focus=lambda: None)
         api_input = SimpleNamespace(value="", focus=lambda: None)
@@ -528,12 +531,6 @@ class TestSetupScreen:
         }
         screen.query_one = lambda selector, *_args, **_kwargs: widgets[selector]
         screen.notify = lambda *_args, **_kwargs: None
-
-        monkeypatch.setattr(
-            setup_mod,
-            "discover_models",
-            lambda *_a, **_kw: ["gpt-4o-mini", "gpt-4o"],
-        )
 
         screen._collect_details()
         assert screen._model_name == "gpt-4o-mini"

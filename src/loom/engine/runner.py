@@ -1375,6 +1375,7 @@ class SubtaskRunner:
             auth_context = build_run_auth_context(
                 workspace=workspace,
                 metadata=metadata,
+                available_mcp_aliases=set(self._config.mcp.servers.keys()),
             )
         except AuthResolutionError as e:
             failure_summary = f"Auth preflight failed: {e}"
@@ -1410,7 +1411,7 @@ class SubtaskRunner:
             subtask=subtask,
             state_manager=self._state,
             memory_entries=memory_entries,
-            available_tools=self._tools.all_schemas(),
+            available_tools=self._tools.all_schemas(auth_context=auth_context),
             evidence_ledger_summary=evidence_summary,
         )
         if retry_context:
@@ -1464,7 +1465,7 @@ class SubtaskRunner:
                 task_id=task.id,
                 subtask_id=subtask.id,
             )
-            tool_schemas = self._tools.all_schemas()
+            tool_schemas = self._tools.all_schemas(auth_context=auth_context)
             operation = "stream" if streaming else "complete"
             response = None
             policy = ModelRetryPolicy.from_execution_config(self._config.execution)
@@ -1604,7 +1605,8 @@ class SubtaskRunner:
             if response.has_tool_calls():
                 # Validate tool calls before execution
                 validation = self._validator.validate_tool_calls(
-                    response, self._tools.all_schemas()
+                    response,
+                    self._tools.all_schemas(auth_context=auth_context),
                 )
                 if not validation.valid:
                     messages.append({

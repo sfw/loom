@@ -110,6 +110,14 @@ class TestPlannerPrompt:
         prompt = assembler.build_planner_prompt(sample_task)
         assert "subtask ID must be unique" in prompt
 
+    def test_planner_prefers_root_level_deliverables(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+    ):
+        prompt = assembler.build_planner_prompt(sample_task)
+        assert "Prefer root-level deliverable filenames" in prompt
+
     def test_planner_includes_workspace_listing(
         self, assembler: PromptAssembler, sample_task: Task
     ):
@@ -159,6 +167,25 @@ class TestExecutorPrompt:
         assert "No relevant prior context" in prompt  # memory (empty)
         assert "CRITICAL RULES" in prompt  # constraints
         assert "summary of what you accomplished" in prompt  # output format
+
+    def test_executor_includes_shell_safety_guidance(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+        state_manager: TaskStateManager,
+    ):
+        state_manager.create(sample_task)
+        subtask = sample_task.get_subtask("add-tsconfig")
+
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+
+        assert "python -c / perl -e / ruby -e" in prompt
+        assert "jq -e . file.json" in prompt
+        assert "Default deliverable location is the workspace root" in prompt
 
     def test_executor_includes_memory(
         self,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -27,14 +29,65 @@ from loom.api.schemas import (
     TaskSteerRequest,
     ToolInfo,
 )
-from loom.auth.runtime import AuthResolutionError, build_run_auth_context
+from loom.auth.runtime import (
+    AuthResolutionError,
+    UnresolvedAuthResourcesError,
+    build_run_auth_context,
+    coerce_auth_requirements,
+    serialize_auth_requirements,
+)
 from loom.engine.orchestrator import create_task
 from loom.events.bus import Event
 from loom.state.memory import MemoryEntry
 from loom.state.task_state import SubtaskStatus, TaskStatus
 from loom.tools.workspace import validate_workspace
+from loom.utils.latency import log_latency_event
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _required_auth_resources_for_process(
+    process_def: object | None,
+    *,
+    tool_registry: object | None = None,
+) -> list[dict[str, object]]:
+    """Collect auth requirement declarations from process + allowed tools."""
+    if process_def is None:
+        return []
+
+    raw_items: list[object] = []
+    auth_block = getattr(process_def, "auth", None)
+    process_required = getattr(auth_block, "required", [])
+    if isinstance(process_required, list):
+        raw_items.extend(process_required)
+
+    if tool_registry is not None:
+        tools_cfg = getattr(process_def, "tools", None)
+        excluded = {
+            str(item).strip()
+            for item in (getattr(tools_cfg, "excluded", []) or [])
+            if str(item).strip()
+        }
+        list_tools = getattr(tool_registry, "list_tools", None)
+        get_tool = getattr(tool_registry, "get", None)
+        if callable(list_tools) and callable(get_tool):
+            for tool_name in sorted(
+                {
+                    str(name).strip()
+                    for name in list_tools()
+                    if str(name).strip() and str(name).strip() not in excluded
+                }
+            ):
+                tool = get_tool(tool_name)
+                if tool is None:
+                    continue
+                declared = getattr(tool, "auth_requirements", [])
+                if isinstance(declared, list):
+                    raw_items.extend(declared)
+
+    normalized = coerce_auth_requirements(raw_items)
+    return serialize_auth_requirements(normalized)
 
 
 def _get_engine(request: Request) -> Engine:
@@ -48,6 +101,7 @@ def _get_engine(request: Request) -> Engine:
 @router.post("/tasks", response_model=TaskCreateResponse, status_code=201)
 async def create_new_task(request: Request, body: TaskCreateRequest):
     """Create and start a new task."""
+    started = time.monotonic()
     engine = _get_engine(request)
     effective_process = body.process or engine.config.process.default or None
 
@@ -60,6 +114,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
     # Resolve process definition if specified
     process_def = None
     if effective_process:
+        load_started = time.monotonic()
         from loom.processes.schema import ProcessLoader, ProcessNotFoundError
 
         extra = [Path(p) for p in engine.config.process.search_paths]
@@ -74,21 +129,34 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
             ),
         )
         try:
-            process_def = loader.load(effective_process)
+            process_def = await asyncio.to_thread(loader.load, effective_process)
+            log_latency_event(
+                logger,
+                event="api_task_process_load",
+                duration_seconds=time.monotonic() - load_started,
+                fields={"process": effective_process},
+            )
         except ProcessNotFoundError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    registry_for_process: object | None = None
     # Validate required tools early so clients get immediate feedback.
     if process_def is not None:
+        preflight_started = time.monotonic()
         tools_cfg = getattr(process_def, "tools", None)
         required = list(getattr(tools_cfg, "required", []) or [])
         excluded = set(getattr(tools_cfg, "excluded", []) or [])
-        if required:
-            from loom.tools import create_default_registry
+        from loom.tools import create_default_registry
 
-            available = set(
-                create_default_registry(engine.config).list_tools()
-            ) - excluded
+        registry_for_process = await asyncio.to_thread(
+            create_default_registry,
+            engine.config,
+        )
+        if required:
+            available = (
+                set(await asyncio.to_thread(registry_for_process.list_tools))
+                - excluded
+            )
             missing = sorted(name for name in required if name not in available)
             if missing:
                 raise HTTPException(
@@ -98,10 +166,23 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
                         f"requires missing tool(s): {', '.join(missing)}"
                     ),
                 )
+        log_latency_event(
+            logger,
+            event="api_task_tool_preflight",
+            duration_seconds=time.monotonic() - preflight_started,
+            fields={"required": len(required)},
+        )
 
     metadata = body.metadata if isinstance(body.metadata, dict) else {}
     metadata = dict(metadata)
     metadata["process"] = effective_process or ""
+    required_auth_resources = await asyncio.to_thread(
+        _required_auth_resources_for_process,
+        process_def,
+        tool_registry=registry_for_process,
+    )
+    if required_auth_resources:
+        metadata["auth_required_resources"] = required_auth_resources
 
     # Validate auth profile selection early so auth errors fail fast.
     workspace_path = Path(body.workspace) if body.workspace else None
@@ -109,7 +190,11 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         build_run_auth_context(
             workspace=workspace_path,
             metadata=metadata,
+            required_resources=coerce_auth_requirements(required_auth_resources),
+            available_mcp_aliases=set(engine.config.mcp.servers.keys()),
         )
+    except UnresolvedAuthResourcesError as e:
+        raise HTTPException(status_code=400, detail=e.to_payload())
     except AuthResolutionError as e:
         raise HTTPException(status_code=400, detail=f"Auth preflight failed: {e}")
 
@@ -145,6 +230,12 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         task=task,
         process=process_def,
         process_name=effective_process or "",
+    )
+    log_latency_event(
+        logger,
+        event="api_task_create",
+        duration_seconds=time.monotonic() - started,
+        fields={"has_process": bool(process_def)},
     )
 
     return TaskCreateResponse(

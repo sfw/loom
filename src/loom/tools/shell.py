@@ -19,7 +19,7 @@ BLOCKED_PATTERNS = [
     r"\brm\b.*--recursive",                              # rm --recursive
     r"\bmkfs\b",                                         # mkfs
     r"\bdd\s+if=",                                       # dd if=
-    r">\s*/dev/",                                        # > /dev/
+    r">\s*/dev/(?!null\b)",                             # > /dev/* (except /dev/null)
     r"chmod\s+-R\s+777\s+/(?:\s|$)",                     # chmod -R 777 /
     r"curl\s+.*\|\s*(?:ba)?sh",                          # curl | sh
     r"wget\s+.*\|\s*(?:ba)?sh",                          # wget | bash
@@ -42,7 +42,19 @@ def check_command_safety(command: str) -> str | None:
     """
     for pattern in BLOCKED_RE:
         if pattern.search(command):
-            return f"Blocked dangerous command pattern: {pattern.pattern}"
+            message = f"Blocked dangerous command pattern: {pattern.pattern}"
+            if pattern.pattern == r"\bpython[23]?\s+-c\s":
+                return (
+                    message
+                    + " (Avoid inline interpreter execution; use jq/read_file for checks, "
+                    "or run a script file like `python script.py`.)"
+                )
+            if pattern.pattern == r">\s*/dev/(?!null\b)":
+                return (
+                    message
+                    + " (Redirection to /dev/* is blocked except /dev/null.)"
+                )
+            return message
     return None
 
 

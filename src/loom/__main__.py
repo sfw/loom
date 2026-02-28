@@ -15,11 +15,27 @@ from loom.auth.config import (
     AuthConfigError,
     AuthProfile,
     default_workspace_auth_defaults_path,
+    load_auth_file,
     load_merged_auth_config,
     remove_auth_profile,
     resolve_auth_write_path,
     set_workspace_auth_default,
     upsert_auth_profile,
+)
+from loom.auth.resources import (
+    audit_auth_state,
+    bind_resource_to_profile,
+    cleanup_deleted_resource,
+    create_auth_snapshot,
+    default_workspace_auth_resources_path,
+    has_active_binding,
+    load_workspace_auth_resources,
+    migrate_legacy_auth,
+    resolve_resource,
+    resource_delete_impact,
+    restore_auth_snapshot,
+    set_workspace_resource_default,
+    sync_missing_drafts,
 )
 from loom.auth.runtime import (
     AuthResolutionError,
@@ -37,6 +53,7 @@ from loom.mcp.config import (
     parse_mcp_server_from_flags,
     redact_server_env,
 )
+from loom.tools import create_default_registry
 
 
 def _resolve_config_path(config_path: Path | None) -> Path | None:
@@ -304,7 +321,7 @@ def _launch_tui(
     from loom.tui.app import LoomApp
 
     ws = (workspace or Path.cwd()).resolve()
-    tools = create_default_registry(config)
+    tools = create_default_registry(config, mcp_startup_mode="background")
 
     # Resolve model — None triggers the TUI setup wizard
     provider = None
@@ -548,7 +565,7 @@ async def _prepare_server_run_payload(
     from loom.tui.app import LoomApp
 
     root_workspace = workspace.resolve()
-    tools = create_default_registry(config)
+    tools = create_default_registry(config, mcp_startup_mode="background")
     helper = LoomApp(
         model=None,
         tools=tools,
@@ -662,6 +679,49 @@ async def _run_task(
 
             response = await client.post("/tasks", json=payload)
             if response.status_code != 201:
+                try:
+                    error_payload = response.json()
+                except Exception:
+                    click.echo(f"Error: {response.text}", err=True)
+                    sys.exit(1)
+                detail = error_payload.get("detail")
+                if isinstance(detail, dict) and detail.get("code") == "auth_unresolved":
+                    click.echo(
+                        "Error: Auth preflight failed: unresolved required auth resources.",
+                        err=True,
+                    )
+                    unresolved = detail.get("unresolved", [])
+                    if isinstance(unresolved, list):
+                        for item in unresolved:
+                            if not isinstance(item, dict):
+                                continue
+                            provider = str(item.get("provider", "")).strip() or "unknown"
+                            source = str(item.get("source", "")).strip() or "unknown"
+                            reason = str(item.get("reason", "")).strip() or "unresolved"
+                            message = str(item.get("message", "")).strip()
+                            click.echo(
+                                f"  - provider={provider} source={source} reason={reason}",
+                                err=True,
+                            )
+                            if message:
+                                click.echo(f"    {message}", err=True)
+                            candidates = item.get("candidates", [])
+                            if isinstance(candidates, list) and candidates:
+                                click.echo(
+                                    f"    candidates: {', '.join(str(c) for c in candidates)}",
+                                    err=True,
+                                )
+                    remediation = detail.get("remediation", {})
+                    commands = (
+                        remediation.get("commands", [])
+                        if isinstance(remediation, dict)
+                        else []
+                    )
+                    if isinstance(commands, list) and commands:
+                        click.echo("  Suggested commands:", err=True)
+                        for command in commands[:6]:
+                            click.echo(f"    {command}", err=True)
+                    sys.exit(1)
                 click.echo(f"Error: {response.text}", err=True)
                 sys.exit(1)
 
@@ -806,7 +866,22 @@ def auth_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
     """List merged auth profiles and defaults."""
     merged = _merged_auth_config(ctx)
     profiles = merged.config.profiles
-    effective_defaults = {
+    explicit_profile_ids: set[str] = set()
+    if merged.explicit_path is not None:
+        try:
+            explicit_profiles = load_auth_file(merged.explicit_path).profiles
+            explicit_profile_ids = set(explicit_profiles)
+            profiles = explicit_profiles
+        except Exception:
+            explicit_profile_ids = set()
+
+    def _profile_sort_key(profile: AuthProfile) -> tuple[int, int, str]:
+        source_rank = 0 if profile.profile_id in explicit_profile_ids else 1
+        status = str(profile.status or "ready").strip().lower()
+        status_rank = {"ready": 0, "draft": 1, "archived": 2}.get(status, 3)
+        return (source_rank, status_rank, profile.profile_id)
+
+    provider_defaults = {
         selector: profile_id
         for selector, profile_id in {
             **merged.config.defaults,
@@ -814,6 +889,16 @@ def auth_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
         }.items()
         if not selector.startswith("mcp.")
     }
+    workspace = ctx.obj.get("workspace")
+    resources_path = default_workspace_auth_resources_path(workspace.resolve())
+    try:
+        resource_store = load_workspace_auth_resources(resources_path)
+        workspace_resource_defaults = dict(resource_store.workspace_defaults)
+    except Exception:
+        workspace_resource_defaults = {}
+    user_resource_defaults = dict(merged.config.resource_defaults)
+    effective_resource_defaults = dict(user_resource_defaults)
+    effective_resource_defaults.update(workspace_resource_defaults)
 
     payload = {
         "sources": {
@@ -826,17 +911,23 @@ def auth_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
                 str(merged.workspace_defaults_path)
                 if merged.workspace_defaults_path is not None else None
             ),
+            "workspace_resources_path": str(resources_path),
         },
-        "defaults": effective_defaults,
+        "defaults": provider_defaults,
+        "resource_defaults": {
+            "user": user_resource_defaults,
+            "workspace": workspace_resource_defaults,
+            "effective": effective_resource_defaults,
+        },
         "profiles": [],
     }
-    for profile_id in sorted(profiles):
-        profile = profiles[profile_id]
+    for profile in sorted(profiles.values(), key=_profile_sort_key):
         item = {
             "id": profile.profile_id,
             "provider": profile.provider,
             "mode": profile.mode,
             "account_label": profile.account_label,
+            "mcp_server": profile.mcp_server,
         }
         if verbose:
             item.update({
@@ -867,6 +958,8 @@ def auth_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
             )
             if item.get("account_label"):
                 click.echo(f"    label: {item['account_label']}")
+            if item.get("mcp_server"):
+                click.echo(f"    mcp_server: {item['mcp_server']}")
             if verbose:
                 env_keys = ", ".join(item.get("env_keys", [])) or "-"
                 click.echo(f"    env_keys: {env_keys}")
@@ -877,10 +970,14 @@ def auth_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
                 if item.get("command"):
                     click.echo(f"    command: {item['command']}")
 
-    if effective_defaults:
+    if provider_defaults:
         click.echo("Defaults:")
-        for selector, profile_id in sorted(effective_defaults.items()):
+        for selector, profile_id in sorted(provider_defaults.items()):
             click.echo(f"  {selector} -> {profile_id}")
+    if effective_resource_defaults:
+        click.echo("Resource defaults:")
+        for resource_id, profile_id in sorted(effective_resource_defaults.items()):
+            click.echo(f"  {resource_id} -> {profile_id}")
 
 
 @auth.command(name="show")
@@ -900,6 +997,7 @@ def auth_show(ctx: click.Context, profile_id: str, as_json: bool) -> None:
         "provider": profile.provider,
         "mode": profile.mode,
         "account_label": profile.account_label,
+        "mcp_server": profile.mcp_server,
         "secret_ref": profile.secret_ref,
         "token_ref": profile.token_ref,
         "scopes": list(profile.scopes),
@@ -916,6 +1014,7 @@ def auth_show(ctx: click.Context, profile_id: str, as_json: bool) -> None:
     click.echo(f"Provider: {payload['provider']}")
     click.echo(f"Mode: {payload['mode']}")
     click.echo(f"Label: {payload['account_label'] or '-'}")
+    click.echo(f"MCP server: {payload['mcp_server'] or '-'}")
     click.echo(f"Secret ref: {payload['secret_ref'] or '-'}")
     click.echo(f"Token ref: {payload['token_ref'] or '-'}")
     click.echo(f"Scopes: {', '.join(payload['scopes']) or '-'}")
@@ -942,6 +1041,7 @@ def auth_check(ctx: click.Context) -> None:
     }
 
     errors: list[str] = []
+    mcp_aliases = set(_effective_config(ctx).mcp.servers.keys())
     for selector, profile_id in sorted(effective_defaults.items()):
         if profile_id not in profiles:
             errors.append(
@@ -953,6 +1053,70 @@ def auth_check(ctx: click.Context) -> None:
             errors.append(
                 f"default selector {selector!r} must match profile provider {profile.provider!r}"
             )
+    for profile in profiles.values():
+        mcp_server = str(profile.mcp_server or "").strip()
+        if not mcp_server:
+            continue
+        if mcp_server not in mcp_aliases:
+            errors.append(
+                f"profile {profile.profile_id!r} references unknown mcp_server {mcp_server!r}"
+            )
+
+    workspace = ctx.obj.get("workspace")
+    resources_path = default_workspace_auth_resources_path(workspace.resolve())
+    try:
+        resource_store = load_workspace_auth_resources(resources_path)
+    except Exception as e:
+        errors.append(f"failed to read auth resources store: {e}")
+        resource_store = None
+
+    if resource_store is not None:
+        for resource_id, profile_id in sorted(resource_store.workspace_defaults.items()):
+            resource = resource_store.resources.get(resource_id)
+            if resource is None or str(resource.status).strip().lower() != "active":
+                errors.append(
+                    "workspace resource default "
+                    f"{resource_id!r} references missing/deleted resource"
+                )
+                continue
+            if profile_id not in profiles:
+                errors.append(
+                    "workspace resource default "
+                    f"{resource_id!r} references unknown profile {profile_id!r}"
+                )
+                continue
+            if not has_active_binding(
+                resource_store,
+                resource_id=resource_id,
+                profile_id=profile_id,
+            ):
+                errors.append(
+                    f"workspace resource default {resource_id!r} -> {profile_id!r} "
+                    "has no active binding"
+                )
+
+        for resource_id, profile_id in sorted(merged.config.resource_defaults.items()):
+            resource = resource_store.resources.get(resource_id)
+            if resource is None or str(resource.status).strip().lower() != "active":
+                errors.append(
+                    f"user resource default {resource_id!r} references missing/deleted resource"
+                )
+                continue
+            if profile_id not in profiles:
+                errors.append(
+                    "user resource default "
+                    f"{resource_id!r} references unknown profile {profile_id!r}"
+                )
+                continue
+            if not has_active_binding(
+                resource_store,
+                resource_id=resource_id,
+                profile_id=profile_id,
+            ):
+                errors.append(
+                    f"user resource default {resource_id!r} -> {profile_id!r} "
+                    "has no active binding"
+                )
 
     if errors:
         click.echo("Auth config validation failed:", err=True)
@@ -970,6 +1134,224 @@ def auth_check(ctx: click.Context) -> None:
     click.echo(
         f"Workspace defaults file: {defaults_path}"
     )
+    click.echo(f"Workspace resources file: {resources_path}")
+
+
+@auth.command(name="sync")
+@click.option(
+    "--scope",
+    type=click.Choice(["active", "full"], case_sensitive=False),
+    default="active",
+    show_default=True,
+    help="Discovery scope for draft profile generation.",
+)
+@click.pass_context
+def auth_sync(ctx: click.Context, scope: str) -> None:
+    """Discover required auth resources and auto-create missing drafts."""
+    workspace = ctx.obj.get("workspace")
+    manager = _mcp_manager(ctx, workspace=workspace)
+    config = _effective_config(ctx, workspace=workspace)
+    process_def = None
+    clean_scope = str(scope or "active").strip().lower() or "active"
+    if clean_scope == "active":
+        default_process = str(getattr(config.process, "default", "") or "").strip()
+        if default_process:
+            try:
+                from loom.processes.schema import ProcessLoader
+
+                loader = ProcessLoader(
+                    workspace=workspace.resolve(),
+                    extra_search_paths=[Path(p) for p in config.process.search_paths],
+                    require_rule_scope_metadata=bool(
+                        getattr(config.process, "require_rule_scope_metadata", False),
+                    ),
+                    require_v2_contract=bool(
+                        getattr(config.process, "require_v2_contract", False),
+                    ),
+                )
+                process_def = loader.load(default_process)
+            except Exception as e:
+                click.echo(
+                    (
+                        "Auth sync warning: failed to load default process "
+                        f"{default_process!r}: {e}"
+                    ),
+                    err=True,
+                )
+    try:
+        registry = create_default_registry(config)
+    except Exception:
+        registry = create_default_registry()
+
+    try:
+        result = sync_missing_drafts(
+            workspace=workspace,
+            explicit_auth_path=ctx.obj.get("explicit_auth_path"),
+            process_def=process_def,
+            tool_registry=registry,
+            mcp_manager=manager,
+            scope=clean_scope,
+        )
+    except Exception as e:
+        click.echo(f"Auth sync failed: {e}", err=True)
+        sys.exit(1)
+
+    click.echo("Auth sync complete:")
+    click.echo(f"  created resources: {result.created_resources}")
+    click.echo(f"  updated resources: {result.updated_resources}")
+    click.echo(f"  created drafts: {result.created_drafts}")
+    click.echo(f"  created bindings: {result.created_bindings}")
+    click.echo(f"  updated defaults: {result.updated_defaults}")
+    for warning in result.warnings:
+        click.echo(f"  warning: {warning}")
+
+
+@auth.command(name="audit")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def auth_audit(ctx: click.Context, as_json: bool) -> None:
+    """Audit auth resources, bindings, and legacy defaults."""
+    workspace = ctx.obj.get("workspace")
+    try:
+        report = audit_auth_state(
+            workspace=workspace,
+            explicit_auth_path=ctx.obj.get("explicit_auth_path"),
+        )
+    except Exception as e:
+        click.echo(f"Auth audit failed: {e}", err=True)
+        sys.exit(1)
+
+    payload = {
+        "orphaned_profiles": list(report.orphaned_profiles),
+        "orphaned_bindings": list(report.orphaned_bindings),
+        "deleted_resource_bindings": list(report.deleted_resource_bindings),
+        "legacy_provider_defaults": list(report.legacy_provider_defaults),
+        "dangling_workspace_resource_defaults": list(
+            report.dangling_workspace_resource_defaults
+        ),
+        "dangling_user_resource_defaults": list(
+            report.dangling_user_resource_defaults
+        ),
+    }
+    finding_count = sum(len(items) for items in payload.values())
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        click.echo("Auth audit report:")
+        for key, items in payload.items():
+            if not items:
+                click.echo(f"  {key}: 0")
+                continue
+            click.echo(f"  {key}: {len(items)}")
+            for item in items:
+                click.echo(f"    - {item}")
+        if finding_count == 0:
+            click.echo("No issues found.")
+
+    if finding_count > 0:
+        sys.exit(1)
+
+
+@auth.command(name="migrate")
+@click.option(
+    "--rollback",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Restore auth files from a snapshot directory.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def auth_migrate(
+    ctx: click.Context,
+    rollback: Path | None,
+    as_json: bool,
+) -> None:
+    """Migrate legacy provider defaults to resource bindings/defaults."""
+    workspace = ctx.obj.get("workspace")
+    explicit_auth_path = ctx.obj.get("explicit_auth_path")
+
+    if rollback is not None:
+        rollback_path = rollback.expanduser().resolve()
+        try:
+            restore_auth_snapshot(
+                workspace=workspace,
+                explicit_auth_path=explicit_auth_path,
+                snapshot_path=rollback_path,
+            )
+        except Exception as e:
+            click.echo(f"Auth rollback failed: {e}", err=True)
+            sys.exit(1)
+        payload = {
+            "rolled_back": True,
+            "snapshot_path": str(rollback_path),
+        }
+        if as_json:
+            click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            click.echo(f"Restored auth files from snapshot: {rollback_path}")
+        return
+
+    pre_snapshot = create_auth_snapshot(
+        workspace=workspace,
+        explicit_auth_path=explicit_auth_path,
+        label="migrate-preflight",
+    )
+    try:
+        result = migrate_legacy_auth(
+            workspace=workspace,
+            explicit_auth_path=explicit_auth_path,
+        )
+    except Exception as e:
+        try:
+            restore_auth_snapshot(
+                workspace=workspace,
+                explicit_auth_path=explicit_auth_path,
+                snapshot_path=pre_snapshot,
+            )
+            click.echo(
+                (
+                    "Auth migrate failed and changes were rolled back from "
+                    f"{pre_snapshot}: {e}"
+                ),
+                err=True,
+            )
+        except Exception as rollback_error:
+            click.echo(
+                (
+                    "Auth migrate failed and rollback failed. "
+                    f"preflight snapshot={pre_snapshot}; "
+                    f"migration_error={e}; rollback_error={rollback_error}"
+                ),
+                err=True,
+            )
+        sys.exit(1)
+
+    payload = {
+        "snapshot_path": str(result.snapshot_path),
+        "created_resources": result.created_resources,
+        "created_bindings": result.created_bindings,
+        "created_workspace_defaults": result.created_workspace_defaults,
+        "created_user_resource_defaults": result.created_user_resource_defaults,
+        "warnings": list(result.warnings),
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo("Auth migration complete:")
+    click.echo(f"  snapshot: {result.snapshot_path}")
+    click.echo(f"  created resources: {result.created_resources}")
+    click.echo(f"  created bindings: {result.created_bindings}")
+    click.echo(f"  created workspace defaults: {result.created_workspace_defaults}")
+    click.echo(
+        "  created user resource defaults: "
+        f"{result.created_user_resource_defaults}"
+    )
+    if result.warnings:
+        click.echo("Warnings:")
+        for warning in result.warnings:
+            click.echo(f"  - {warning}")
 
 
 @auth.command(name="select")
@@ -1004,6 +1386,24 @@ def auth_select(
 
     workspace = ctx.obj.get("workspace")
     defaults_path = default_workspace_auth_defaults_path(workspace)
+    resources_path = default_workspace_auth_resources_path(workspace.resolve())
+    try:
+        resource_store = load_workspace_auth_resources(resources_path)
+    except Exception as e:
+        click.echo(f"Auth select failed: {e}", err=True)
+        sys.exit(1)
+
+    selected_resource = None
+    if ":" in clean_selector:
+        selected_resource = resolve_resource(
+            resource_store,
+            resource_ref=clean_selector,
+        )
+    elif clean_selector in resource_store.resources:
+        selected_resource = resolve_resource(
+            resource_store,
+            resource_id=clean_selector,
+        )
 
     if unset:
         if profile_id:
@@ -1012,6 +1412,22 @@ def auth_select(
                 err=True,
             )
             sys.exit(1)
+        if selected_resource is not None:
+            try:
+                set_workspace_resource_default(
+                    resources_path,
+                    resource_id=selected_resource.resource_id,
+                    profile_id=None,
+                )
+            except Exception as e:
+                click.echo(f"Auth select failed: {e}", err=True)
+                sys.exit(1)
+            click.echo(
+                "Removed resource default mapping: "
+                f"{selected_resource.resource_ref}"
+            )
+            click.echo(f"Workspace resources file: {resources_path}")
+            return
         try:
             updated = set_workspace_auth_default(
                 defaults_path,
@@ -1034,11 +1450,50 @@ def auth_select(
     if profile is None:
         click.echo(f"Unknown auth profile: {clean_profile_id}", err=True)
         sys.exit(1)
+
+    if selected_resource is not None:
+        if profile.provider != selected_resource.provider:
+            click.echo(
+                (
+                    f"Profile {clean_profile_id!r} provider {profile.provider!r} "
+                    f"does not match resource provider {selected_resource.provider!r}."
+                ),
+                err=True,
+            )
+            sys.exit(1)
+        try:
+            if not has_active_binding(
+                resource_store,
+                resource_id=selected_resource.resource_id,
+                profile_id=clean_profile_id,
+            ):
+                bind_resource_to_profile(
+                    resources_path,
+                    resource_id=selected_resource.resource_id,
+                    profile_id=clean_profile_id,
+                    generated_from=f"cli:auth-select:{clean_selector}",
+                    priority=0,
+                )
+            set_workspace_resource_default(
+                resources_path,
+                resource_id=selected_resource.resource_id,
+                profile_id=clean_profile_id,
+            )
+        except Exception as e:
+            click.echo(f"Auth select failed: {e}", err=True)
+            sys.exit(1)
+        click.echo(
+            "Set workspace resource default: "
+            f"{selected_resource.resource_ref} -> {clean_profile_id}"
+        )
+        click.echo(f"Workspace resources file: {resources_path}")
+        return
+
     if clean_selector != profile.provider:
         click.echo(
             (
                 f"Selector {clean_selector!r} must match profile provider "
-                f"{profile.provider!r}."
+                f"{profile.provider!r}, or be a resource_id/resource_ref."
             ),
             err=True,
         )
@@ -1095,6 +1550,7 @@ def auth_profile_show(ctx: click.Context, profile_id: str, as_json: bool) -> Non
     help="Credential mode (api_key, oauth2_pkce, env_passthrough, ...).",
 )
 @click.option("--label", "account_label", default="", help="Human-friendly account label.")
+@click.option("--mcp-server", default="", help="Optional MCP alias binding for this profile.")
 @click.option("--secret-ref", default="", help="Secret ref (env://... or keychain://...).")
 @click.option("--token-ref", default="", help="OAuth token ref (env://... or keychain://...).")
 @click.option("--scope", "scopes", multiple=True, help="OAuth scope. Repeatable.")
@@ -1114,6 +1570,7 @@ def auth_profile_add(
     provider: str,
     mode: str,
     account_label: str,
+    mcp_server: str,
     secret_ref: str,
     token_ref: str,
     scopes: tuple[str, ...],
@@ -1144,6 +1601,7 @@ def auth_profile_add(
         provider=str(provider or "").strip(),
         mode=str(mode or "").strip(),
         account_label=str(account_label or "").strip(),
+        mcp_server=str(mcp_server or "").strip(),
         secret_ref=str(secret_ref or "").strip(),
         token_ref=str(token_ref or "").strip(),
         scopes=[scope for scope in (str(s).strip() for s in scopes) if scope],
@@ -1159,6 +1617,12 @@ def auth_profile_add(
     if not profile.mode:
         click.echo("--mode cannot be empty.", err=True)
         sys.exit(1)
+    if profile.mcp_server:
+        try:
+            ensure_valid_alias(profile.mcp_server)
+        except Exception as e:
+            click.echo(f"Invalid --mcp-server value: {e}", err=True)
+            sys.exit(1)
 
     target = _auth_write_path(ctx)
     try:
@@ -1180,6 +1644,8 @@ def auth_profile_add(
 @click.option("--provider", default=None, help="Provider id.")
 @click.option("--mode", default=None, help="Credential mode.")
 @click.option("--label", "account_label", default=None, help="Account label.")
+@click.option("--mcp-server", default=None, help="MCP alias binding.")
+@click.option("--clear-mcp-server", is_flag=True, default=False, help="Clear MCP alias binding.")
 @click.option("--secret-ref", default=None, help="Secret ref.")
 @click.option("--token-ref", default=None, help="Token ref.")
 @click.option("--scope", "scopes", multiple=True, help="Replace scopes.")
@@ -1208,6 +1674,8 @@ def auth_profile_edit(
     provider: str | None,
     mode: str | None,
     account_label: str | None,
+    mcp_server: str | None,
+    clear_mcp_server: bool,
     secret_ref: str | None,
     token_ref: str | None,
     scopes: tuple[str, ...],
@@ -1269,6 +1737,18 @@ def auth_profile_edit(
     next_metadata = {} if clear_meta else dict(current.metadata)
     next_metadata.update(meta_updates)
 
+    next_mcp_server = current.mcp_server
+    if clear_mcp_server:
+        next_mcp_server = ""
+    elif mcp_server is not None:
+        next_mcp_server = str(mcp_server).strip()
+        if next_mcp_server:
+            try:
+                ensure_valid_alias(next_mcp_server)
+            except Exception as e:
+                click.echo(f"Invalid --mcp-server value: {e}", err=True)
+                sys.exit(1)
+
     updated_profile = AuthProfile(
         profile_id=current.profile_id,
         provider=current.provider if provider is None else str(provider).strip(),
@@ -1277,6 +1757,7 @@ def auth_profile_edit(
             current.account_label
             if account_label is None else str(account_label).strip()
         ),
+        mcp_server=next_mcp_server,
         secret_ref=current.secret_ref if secret_ref is None else str(secret_ref).strip(),
         token_ref=current.token_ref if token_ref is None else str(token_ref).strip(),
         scopes=next_scopes,
@@ -1552,13 +2033,40 @@ def mcp_edit(
 def mcp_remove(ctx: click.Context, alias: str) -> None:
     """Remove an MCP server config entry."""
     manager = _mcp_manager(ctx)
+    workspace = ctx.obj.get("workspace")
+    impact = None
+    try:
+        impact = resource_delete_impact(
+            workspace=workspace,
+            resource_kind="mcp",
+            resource_key=str(alias or "").strip(),
+        )
+    except Exception:
+        impact = None
     try:
         clean_alias = ensure_valid_alias(alias)
         path = manager.remove_server(clean_alias)
     except MCPConfigManagerError as e:
         click.echo(f"Remove failed: {e}", err=True)
         sys.exit(1)
+    try:
+        cleanup_deleted_resource(
+            workspace=workspace,
+            explicit_auth_path=ctx.obj.get("explicit_auth_path"),
+            resource_kind="mcp",
+            resource_key=clean_alias,
+        )
+    except Exception as e:
+        click.echo(f"Auth cleanup warning: {e}", err=True)
     click.echo(f"Removed MCP server '{clean_alias}' from {path}")
+    if impact is not None and impact.resource_id:
+        click.echo(
+            "Auth cleanup impact: "
+            f"bindings={len(impact.active_binding_ids)}, "
+            f"profiles={len(impact.active_profile_ids)}, "
+            f"default={'yes' if impact.workspace_default_profile_id else 'no'}, "
+            f"process_refs={len(impact.referencing_processes)}"
+        )
 
 
 @mcp.command(name="enable")

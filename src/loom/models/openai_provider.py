@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -37,6 +38,9 @@ class OpenAICompatibleProvider(ModelProvider):
     """Provider for OpenAI-compatible API endpoints."""
 
     ASSISTANT_CONTENT_FALLBACK = "Tool call context omitted."
+    _VALID_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+    _TOOL_NAME_CLEAN_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
+    _MAX_TOOL_NAME_LENGTH = 64
 
     def __init__(self, config: ModelConfig, provider_name: str = "", tier_override: int = 0):
         self._config = config
@@ -212,8 +216,9 @@ class OpenAICompatibleProvider(ModelProvider):
         }
         if self._reasoning_effort:
             payload["reasoning_effort"] = self._reasoning_effort
+        tool_name_map: dict[str, str] = {}
         if tools:
-            payload["tools"] = self._format_tools(tools)
+            payload["tools"], tool_name_map = self._format_tools(tools)
         if response_format:
             payload["response_format"] = response_format
         diagnostics = collect_request_diagnostics(
@@ -316,9 +321,10 @@ class OpenAICompatibleProvider(ModelProvider):
                         logger.warning("Malformed tool args from OpenAI: %s", str(args)[:200])
                         args = {}
                 tc_id = str(tc.get("id", "")).strip() or f"call_{index}"
+                raw_name = str(func.get("name", "") or "").strip()
                 tool_calls.append(ToolCall(
                     id=tc_id,
-                    name=func.get("name", ""),
+                    name=tool_name_map.get(raw_name, raw_name),
                     arguments=args,
                 ))
 
@@ -371,8 +377,9 @@ class OpenAICompatibleProvider(ModelProvider):
         }
         if self._reasoning_effort:
             payload["reasoning_effort"] = self._reasoning_effort
+        tool_name_map: dict[str, str] = {}
         if tools:
-            payload["tools"] = self._format_tools(tools)
+            payload["tools"], tool_name_map = self._format_tools(tools)
         diagnostics = collect_request_diagnostics(
             messages=payload.get("messages", []),
             tools=payload.get("tools", []),
@@ -418,6 +425,7 @@ class OpenAICompatibleProvider(ModelProvider):
 
                     # Buffer tool call deltas until complete
                     tool_call_buffers: dict[int, dict] = {}
+                    latest_usage: TokenUsage | None = None
 
                     async for line in response.aiter_lines():
                         line = line.strip()
@@ -441,14 +449,16 @@ class OpenAICompatibleProvider(ModelProvider):
                                     except json.JSONDecodeError:
                                         args = {}
                                     call_id = str(buf.get("id", "")).strip() or f"call_{idx}"
+                                    raw_name = str(buf.get("name", "") or "").strip()
                                     parsed_tools.append(ToolCall(
                                         id=call_id,
-                                        name=buf.get("name", ""),
+                                        name=tool_name_map.get(raw_name, raw_name),
                                         arguments=args,
                                     ))
                             yield StreamChunk(
                                 text="", done=True,
                                 tool_calls=parsed_tools,
+                                usage=latest_usage,
                             )
                             return
 
@@ -457,8 +467,13 @@ class OpenAICompatibleProvider(ModelProvider):
                         except json.JSONDecodeError:
                             continue
 
-                        choice = data.get("choices", [{}])[0]
-                        delta = choice.get("delta", {})
+                        choices = data.get("choices")
+                        choice: dict = {}
+                        if isinstance(choices, list) and choices:
+                            first = choices[0]
+                            if isinstance(first, dict):
+                                choice = first
+                        delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
                         text = delta.get("content") or ""
 
                         # Accumulate tool call deltas
@@ -495,8 +510,9 @@ class OpenAICompatibleProvider(ModelProvider):
                                     "total_tokens", 0,
                                 ),
                             )
+                            latest_usage = usage
 
-                        if text:
+                        if text or usage is not None:
                             yield StreamChunk(
                                 text=text, done=False, usage=usage,
                             )
@@ -536,20 +552,94 @@ class OpenAICompatibleProvider(ModelProvider):
     def roles(self) -> list[str]:
         return self._roles
 
-    @staticmethod
-    def _format_tools(tools: list[dict]) -> list[dict]:
-        """Format tools for OpenAI-compatible tool calling."""
-        formatted = []
+    def _format_tools(self, tools: list[dict]) -> tuple[list[dict], dict[str, str]]:
+        """Format tools for OpenAI-compatible tool calling.
+
+        Some OpenAI-compatible providers enforce strict function-name rules
+        (`^[A-Za-z][A-Za-z0-9_-]*$`). Tool names outside that set are rewritten
+        in-request and mapped back when parsing tool calls.
+        """
+        aliases, reverse_map = self._tool_name_aliases(tools)
+        formatted: list[dict] = []
         for tool in tools:
+            raw_name = str(tool.get("name", "") or "").strip()
+            if not raw_name:
+                continue
+            request_name = aliases.get(raw_name, raw_name)
             formatted.append({
                 "type": "function",
                 "function": {
-                    "name": tool["name"],
+                    "name": request_name,
                     "description": tool.get("description", ""),
                     "parameters": tool.get("parameters", {}),
                 },
             })
-        return formatted
+        return formatted, reverse_map
+
+    @classmethod
+    def _tool_name_aliases(cls, tools: list[dict]) -> tuple[dict[str, str], dict[str, str]]:
+        """Return (original->request_name, request_name->original) mappings."""
+        original_to_request: dict[str, str] = {}
+        request_to_original: dict[str, str] = {}
+        used_request_names: set[str] = set()
+
+        for tool in tools:
+            original = str(tool.get("name", "") or "").strip()
+            if not original:
+                continue
+
+            candidate = original
+            if not cls._VALID_TOOL_NAME_PATTERN.fullmatch(original):
+                candidate = cls._sanitize_tool_name(original)
+
+            request_name = candidate
+            suffix = 2
+            while (
+                request_name in used_request_names
+                and request_to_original.get(request_name) != original
+            ):
+                base = candidate[: max(1, cls._MAX_TOOL_NAME_LENGTH - 4)]
+                request_name = f"{base}_{suffix}"
+                suffix += 1
+
+            used_request_names.add(request_name)
+            original_to_request[original] = request_name
+            request_to_original[request_name] = original
+
+        rewritten = [
+            (original, request_name)
+            for original, request_name in original_to_request.items()
+            if original != request_name
+        ]
+        if rewritten:
+            preview = ", ".join(
+                f"{original}->{request}"
+                for original, request in rewritten[:5]
+            )
+            logger.debug(
+                "Normalized %d tool names for provider %s: %s",
+                len(rewritten),
+                cls.__name__,
+                preview,
+            )
+
+        return original_to_request, request_to_original
+
+    @classmethod
+    def _sanitize_tool_name(cls, name: str) -> str:
+        """Normalize an arbitrary tool name to provider-safe function syntax."""
+        sanitized = cls._TOOL_NAME_CLEAN_PATTERN.sub("_", str(name or "").strip())
+        sanitized = re.sub(r"_+", "_", sanitized).strip("_-")
+        if not sanitized:
+            sanitized = "tool"
+        if not sanitized[0].isalpha():
+            sanitized = f"tool_{sanitized}"
+        sanitized = sanitized[: cls._MAX_TOOL_NAME_LENGTH].rstrip("_-")
+        if not sanitized:
+            sanitized = "tool"
+        if not sanitized[0].isalpha():
+            sanitized = f"tool_{sanitized}"
+        return sanitized[: cls._MAX_TOOL_NAME_LENGTH]
 
     def _build_openai_messages(self, messages: list[dict]) -> list[dict]:
         """Convert messages to OpenAI format with multimodal content parts.

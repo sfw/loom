@@ -18,16 +18,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loom.cowork.approval import ApprovalDecision, ToolApprover
 from loom.cowork.session_state import SessionState, extract_state_from_tool_events
 from loom.engine.semantic_compactor import SemanticCompactor
-from loom.models.base import ModelProvider, ToolCall
+from loom.models.base import ModelProvider, TokenUsage, ToolCall
 from loom.models.retry import (
     ModelRetryPolicy,
     call_with_model_retry,
@@ -64,6 +65,9 @@ class CoworkTurn:
     tool_calls: list[ToolCallEvent] = field(default_factory=list)
     tokens_used: int = 0
     model: str = ""
+    latency_ms: int = 0
+    total_time_ms: int = 0
+    tokens_per_second: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +100,228 @@ _DANGLING_REF_INDICATORS = [
     "what we did", "earlier", "the previous", "as I said",
     "like I mentioned", "that thing", "we already",
 ]
+
+_CORE_TOOL_NAMES = (
+    "ask_user",
+    "task_tracker",
+    "conversation_recall",
+    "delegate_task",
+)
+
+_GENERAL_TOOL_NAMES = (
+    "glob_find",
+    "ripgrep_search",
+    "read_file",
+    "list_directory",
+    "shell_execute",
+    "git_command",
+    "web_search",
+    "web_fetch",
+)
+
+_CODING_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "edit_file",
+    "move_file",
+    "delete_file",
+    "glob_find",
+    "ripgrep_search",
+    "analyze_code",
+    "read_artifact",
+    "list_directory",
+    "shell_execute",
+    "git_command",
+)
+
+_WEB_TOOL_NAMES = (
+    "web_search",
+    "web_fetch",
+    "web_fetch_html",
+    "archive_access",
+    "fact_checker",
+    "citation_manager",
+    "primary_source_ocr",
+    "document_write",
+)
+
+_WRITING_TOOL_NAMES = (
+    "document_write",
+    "humanize_writing",
+    "peer_review_simulator",
+    "citation_manager",
+    "fact_checker",
+)
+
+_FINANCE_TOOL_NAMES = (
+    "market_data_api",
+    "symbol_universe_api",
+    "sec_fundamentals_api",
+    "sentiment_feeds_api",
+    "economic_data_api",
+    "insider_trading_tracker",
+    "short_interest_analyzer",
+    "options_flow_analyzer",
+    "earnings_surprise_predictor",
+    "factor_exposure_engine",
+    "valuation_engine",
+    "portfolio_optimizer",
+    "portfolio_evaluator",
+    "portfolio_recommender",
+    "historical_currency_normalizer",
+    "inflation_calculator",
+    "macro_regime_engine",
+    "opportunity_ranker",
+    "timeline_visualizer",
+)
+
+_GREETING_TOKENS = frozenset({
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "sup",
+    "howdy",
+})
+
+_CODING_KEYWORDS = (
+    "code",
+    "coding",
+    "bug",
+    "debug",
+    "test",
+    "lint",
+    "build",
+    "compile",
+    "refactor",
+    "function",
+    "class",
+    "module",
+    "repo",
+    "repository",
+    "file",
+    "directory",
+    "path",
+    "readme",
+    "git",
+    "commit",
+    "branch",
+    "pr",
+    "shell",
+    "terminal",
+    "script",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".rs",
+    ".go",
+    ".java",
+)
+
+_WEB_KEYWORDS = (
+    "web",
+    "url",
+    "http",
+    "https",
+    "site",
+    "website",
+    "docs",
+    "documentation",
+    "article",
+    "source",
+    "citation",
+    "research",
+    "search",
+)
+
+_WRITING_KEYWORDS = (
+    "write",
+    "draft",
+    "rewrite",
+    "rephrase",
+    "tone",
+    "style",
+    "report",
+    "memo",
+    "summary",
+    "summarize",
+    "outline",
+    "proposal",
+)
+
+_FINANCE_KEYWORDS = (
+    "stock",
+    "ticker",
+    "equity",
+    "market",
+    "portfolio",
+    "valuation",
+    "earnings",
+    "sec",
+    "insider",
+    "macro",
+    "inflation",
+    "options",
+    "factor",
+    "currency",
+    "sentiment",
+    "investment",
+)
+
+_SPREADSHEET_KEYWORDS = (
+    "spreadsheet",
+    "csv",
+    "xlsx",
+    "rows",
+    "columns",
+    "table",
+)
+
+_MATH_KEYWORDS = (
+    "calculate",
+    "calculation",
+    "math",
+    "sum",
+    "average",
+    "mean",
+    "median",
+    "percent",
+    "percentage",
+    "ratio",
+)
+
+_FALLBACK_TOOL_NAMES = (
+    "list_tools",
+    "run_tool",
+)
+_HYBRID_FALLBACK_TOOLS = frozenset(_FALLBACK_TOOL_NAMES)
+_HYBRID_TOOL_STALL_MARKERS = (
+    "don't have",
+    "do not have",
+    "cannot access",
+    "can't access",
+    "no direct tool",
+    "not available",
+    "unavailable",
+    "available tools are",
+)
+_HYBRID_RECOVERY_SYSTEM_HINT = (
+    "[System: In hybrid mode, if the needed tool is not directly callable, "
+    "use list_tools first to discover it, then call run_tool with the target "
+    "name and JSON arguments. Do not stop at describing tool availability.]"
+)
+
+_TOOL_EXPOSURE_MODES = frozenset({"full", "adaptive", "hybrid"})
+_TYPED_TOOL_SCHEMA_CAP = 16
+_TYPED_TOOL_SCHEMA_BYTE_BUDGET = 12 * 1024
+
+
+def _normalize_tool_exposure_mode(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in _TOOL_EXPOSURE_MODES:
+        return mode
+    return "adaptive"
 
 
 def _estimate_message_tokens(msg: dict) -> int:
@@ -130,6 +356,33 @@ def _estimate_message_tokens(msg: dict) -> int:
     return max(1, total)
 
 
+def _fallback_response_tokens(
+    response_text: str,
+    tool_calls: list[ToolCall] | None,
+) -> int:
+    """Estimate response tokens when provider usage is unavailable."""
+    total = 0
+
+    if response_text:
+        total += _estimate_tokens(response_text)
+
+    if tool_calls:
+        serialized = [
+            {"name": tc.name, "arguments": tc.arguments}
+            for tc in tool_calls
+        ]
+        total += _estimate_tokens(json.dumps(serialized, separators=(",", ":")))
+
+    return max(1, total)
+
+
+def _tokens_per_second(tokens_used: int, total_time_ms: int) -> float:
+    """Compute turn throughput from tokens and elapsed time."""
+    if tokens_used <= 0 or total_time_ms <= 0:
+        return 0.0
+    return float(tokens_used) / (float(total_time_ms) / 1000.0)
+
+
 class CoworkSession:
     """Interactive cowork session.
 
@@ -159,6 +412,8 @@ class CoworkSession:
         max_context_tokens: int = 180_000,
         reflection: GapAnalysisEngine | None = None,
         model_retry_policy: ModelRetryPolicy | None = None,
+        tool_exposure_mode: str = "adaptive",
+        auth_context: Any | None = None,
         enable_filetype_ingest_router: bool = True,
         ingest_artifact_retention_max_age_days: int = 14,
         ingest_artifact_retention_max_files_per_scope: int = 96,
@@ -171,6 +426,7 @@ class CoworkSession:
         self._max_context = max_context_messages
         self._max_context_tokens = max_context_tokens
         self._approver = approver
+        self._auth_context = auth_context
         self._total_tokens = 0
         self._turn_counter = 0
         self._message_counter = 0  # monotonic per-message counter for DB persistence
@@ -191,6 +447,7 @@ class CoworkSession:
         self._static_system_prompt = system_prompt
         self._compactor = SemanticCompactor(model=model)
         self._model_retry_policy = model_retry_policy or ModelRetryPolicy()
+        self._tool_exposure_mode = _normalize_tool_exposure_mode(tool_exposure_mode)
         self._enable_filetype_ingest_router = bool(enable_filetype_ingest_router)
         self._ingest_artifact_retention_max_age_days = max(
             0,
@@ -214,6 +471,8 @@ class CoworkSession:
         self._messages: list[dict] = []
         if system_prompt:
             self._messages.append({"role": "system", "content": self._build_system_content()})
+
+        self._bind_hybrid_tools()
 
     @property
     def messages(self) -> list[dict]:
@@ -272,20 +531,35 @@ class CoworkSession:
             self._messages.append({"role": "system", "content": hint})
             await self._persist_turn("system", content=hint)
 
+        turn_started_at = time.monotonic()
+        first_model_latency_ms: int | None = None
         total_tokens = 0
         all_tool_events: list[ToolCallEvent] = []
         text_parts: list[str] = []
+        turn_tool_schemas = self._tool_schemas_for_turn(user_message)
+        hybrid_recovery_used = False
 
         for _ in range(MAX_TOOL_ITERATIONS):
             # Call the model
             response = await call_with_model_retry(
                 lambda: self._model.complete(
                     self._context_window(),
-                    tools=self._tools.all_schemas() or None,
+                    tools=turn_tool_schemas or None,
                 ),
                 policy=self._model_retry_policy,
             )
-            total_tokens += response.usage.total_tokens
+            if first_model_latency_ms is None:
+                first_model_latency_ms = max(
+                    1,
+                    int((time.monotonic() - turn_started_at) * 1000),
+                )
+            response_tokens = int(getattr(response.usage, "total_tokens", 0) or 0)
+            if response_tokens <= 0:
+                response_tokens = _fallback_response_tokens(
+                    response.text or "",
+                    response.tool_calls,
+                )
+            total_tokens += response_tokens
 
             # Accumulate text across iterations
             if response.text:
@@ -309,28 +583,9 @@ class CoworkSession:
                     event = ToolCallEvent(name=tc.name, args=tc.arguments)
                     yield event  # signal: tool call starting
 
-                    # Check approval
-                    if self._approver is not None:
-                        decision = await self._approver.check(tc.name, tc.arguments)
-                        if decision == ApprovalDecision.DENY:
-                            result = ToolResult.fail(f"Tool call '{tc.name}' denied by user.")
-                            event.result = result
-                            event.elapsed_ms = 0
-                            all_tool_events.append(event)
-                            yield event
-                            await self._append_tool_result(tc.id, tc.name, result)
-                            continue
-
-                    start = time.monotonic()
-                    execute_args = self._prepare_tool_execute_arguments(tc.name, tc.arguments)
-                    result = await self._tools.execute(
-                        tc.name,
-                        execute_args,
-                        workspace=self._workspace,
-                        scratch_dir=self._scratch_dir,
-                    )
+                    result, elapsed_ms = await self._execute_tool_call(tc.name, tc.arguments)
                     event.result = result
-                    event.elapsed_ms = int((time.monotonic() - start) * 1000)
+                    event.elapsed_ms = elapsed_ms
                     all_tool_events.append(event)
                     yield event
 
@@ -344,7 +599,34 @@ class CoworkSession:
             else:
                 self._messages.append({"role": "assistant", "content": response.text or ""})
                 await self._persist_turn("assistant", content=response.text or "")
+                if self._should_retry_with_hybrid_fallback(
+                    user_message=user_message,
+                    response_text=response.text or "",
+                    turn_tool_schemas=turn_tool_schemas,
+                    recovery_used=hybrid_recovery_used,
+                ):
+                    hybrid_recovery_used = True
+                    self._messages.append({
+                        "role": "system",
+                        "content": _HYBRID_RECOVERY_SYSTEM_HINT,
+                    })
+                    await self._persist_turn(
+                        "system",
+                        content=_HYBRID_RECOVERY_SYSTEM_HINT,
+                    )
+                    continue
                 break
+
+        interaction_elapsed_ms = max(
+            1,
+            int((time.monotonic() - turn_started_at) * 1000),
+        )
+        latency_ms = (
+            first_model_latency_ms
+            if isinstance(first_model_latency_ms, int) and first_model_latency_ms > 0
+            else interaction_elapsed_ms
+        )
+        tokens_per_second = _tokens_per_second(total_tokens, interaction_elapsed_ms)
 
         # Post-turn bookkeeping
         self._maybe_trim()
@@ -371,6 +653,9 @@ class CoworkSession:
             tool_calls=all_tool_events,
             tokens_used=total_tokens,
             model=self._model.name,
+            latency_ms=latency_ms,
+            total_time_ms=interaction_elapsed_ms,
+            tokens_per_second=tokens_per_second,
         )
 
     async def send_streaming(
@@ -394,9 +679,13 @@ class CoworkSession:
             self._messages.append({"role": "system", "content": hint})
             await self._persist_turn("system", content=hint)
 
+        turn_started_at = time.monotonic()
+        first_model_latency_ms: int | None = None
         total_tokens = 0
         all_tool_events: list[ToolCallEvent] = []
         all_text_parts: list[str] = []
+        turn_tool_schemas = self._tool_schemas_for_turn(user_message)
+        hybrid_recovery_used = False
 
         for _ in range(MAX_TOOL_ITERATIONS):
             iter_text_parts: list[str] = []
@@ -406,10 +695,17 @@ class CoworkSession:
             async for chunk in stream_with_model_retry(
                 lambda: self._model.stream(
                     self._context_window(),
-                    tools=self._tools.all_schemas() or None,
+                    tools=turn_tool_schemas or None,
                 ),
                 policy=self._model_retry_policy,
             ):
+                if first_model_latency_ms is None and (
+                    chunk.text or chunk.tool_calls is not None or chunk.usage is not None
+                ):
+                    first_model_latency_ms = max(
+                        1,
+                        int((time.monotonic() - turn_started_at) * 1000),
+                    )
                 if chunk.text:
                     iter_text_parts.append(chunk.text)
                     yield chunk.text
@@ -418,9 +714,21 @@ class CoworkSession:
                 if chunk.usage is not None:
                     final_usage = chunk.usage
 
-            from loom.models.base import TokenUsage
             response_text = "".join(iter_text_parts)
-            total_tokens += (final_usage or TokenUsage()).total_tokens
+            if first_model_latency_ms is None and (
+                response_text or final_tool_calls is not None or final_usage is not None
+            ):
+                first_model_latency_ms = max(
+                    1,
+                    int((time.monotonic() - turn_started_at) * 1000),
+                )
+            response_tokens = int((final_usage or TokenUsage()).total_tokens or 0)
+            if response_tokens <= 0:
+                response_tokens = _fallback_response_tokens(
+                    response_text,
+                    final_tool_calls,
+                )
+            total_tokens += response_tokens
 
             if response_text:
                 all_text_parts.append(response_text)
@@ -443,27 +751,9 @@ class CoworkSession:
                     event = ToolCallEvent(name=tc.name, args=tc.arguments)
                     yield event
 
-                    if self._approver is not None:
-                        decision = await self._approver.check(tc.name, tc.arguments)
-                        if decision == ApprovalDecision.DENY:
-                            result = ToolResult.fail(f"Tool call '{tc.name}' denied by user.")
-                            event.result = result
-                            event.elapsed_ms = 0
-                            all_tool_events.append(event)
-                            yield event
-                            await self._append_tool_result(tc.id, tc.name, result)
-                            continue
-
-                    start = time.monotonic()
-                    execute_args = self._prepare_tool_execute_arguments(tc.name, tc.arguments)
-                    result = await self._tools.execute(
-                        tc.name,
-                        execute_args,
-                        workspace=self._workspace,
-                        scratch_dir=self._scratch_dir,
-                    )
+                    result, elapsed_ms = await self._execute_tool_call(tc.name, tc.arguments)
                     event.result = result
-                    event.elapsed_ms = int((time.monotonic() - start) * 1000)
+                    event.elapsed_ms = elapsed_ms
                     all_tool_events.append(event)
                     yield event
 
@@ -477,7 +767,34 @@ class CoworkSession:
             else:
                 self._messages.append({"role": "assistant", "content": response_text or ""})
                 await self._persist_turn("assistant", content=response_text or "")
+                if self._should_retry_with_hybrid_fallback(
+                    user_message=user_message,
+                    response_text=response_text or "",
+                    turn_tool_schemas=turn_tool_schemas,
+                    recovery_used=hybrid_recovery_used,
+                ):
+                    hybrid_recovery_used = True
+                    self._messages.append({
+                        "role": "system",
+                        "content": _HYBRID_RECOVERY_SYSTEM_HINT,
+                    })
+                    await self._persist_turn(
+                        "system",
+                        content=_HYBRID_RECOVERY_SYSTEM_HINT,
+                    )
+                    continue
                 break
+
+        interaction_elapsed_ms = max(
+            1,
+            int((time.monotonic() - turn_started_at) * 1000),
+        )
+        latency_ms = (
+            first_model_latency_ms
+            if isinstance(first_model_latency_ms, int) and first_model_latency_ms > 0
+            else interaction_elapsed_ms
+        )
+        tokens_per_second = _tokens_per_second(total_tokens, interaction_elapsed_ms)
 
         self._maybe_trim()
         self._total_tokens += total_tokens
@@ -501,6 +818,9 @@ class CoworkSession:
             tool_calls=all_tool_events,
             tokens_used=total_tokens,
             model=self._model.name,
+            latency_ms=latency_ms,
+            total_time_ms=interaction_elapsed_ms,
+            tokens_per_second=tokens_per_second,
         )
 
     # ------------------------------------------------------------------
@@ -574,6 +894,47 @@ class CoworkSession:
 
         return system + selected
 
+    async def _execute_tool_call(
+        self,
+        tool_name: str,
+        arguments: dict,
+    ) -> tuple[ToolResult, int]:
+        """Execute one tool call with approval + context handling."""
+        execute_args = self._prepare_tool_execute_arguments(tool_name, arguments)
+        if self._approver is not None:
+            decision = await self._approver.check(tool_name, execute_args)
+            if decision == ApprovalDecision.DENY:
+                return ToolResult.fail(f"Tool call '{tool_name}' denied by user."), 0
+
+        start = time.monotonic()
+        result = await self._tools.execute(
+            tool_name,
+            execute_args,
+            workspace=self._workspace,
+            scratch_dir=self._scratch_dir,
+            auth_context=self._auth_context,
+        )
+        if (
+            not result.success
+            and self._tool_exposure_mode == "hybrid"
+            and isinstance(result.error, str)
+            and result.error.startswith("Unknown tool:")
+            and "list_tools" not in result.error
+        ):
+            result = ToolResult(
+                success=False,
+                output=result.output,
+                content_blocks=result.content_blocks,
+                data=result.data,
+                files_changed=list(result.files_changed),
+                error=(
+                    f"{result.error} Use list_tools to discover available tools, "
+                    "then call run_tool with the selected name and arguments."
+                ),
+            )
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        return result, elapsed_ms
+
     def _prepare_tool_execute_arguments(self, tool_name: str, arguments: dict) -> dict:
         """Inject runtime-only knobs used by selected tools."""
         execute_args = dict(arguments or {})
@@ -629,6 +990,349 @@ class CoworkSession:
                 "before proceeding.]"
             )
         return None
+
+    @staticmethod
+    def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+        lowered = text.lower()
+        return any(keyword in lowered for keyword in keywords)
+
+    @staticmethod
+    def _is_small_talk(tokens: set[str]) -> bool:
+        if not tokens:
+            return False
+        if len(tokens) > 3:
+            return False
+        return tokens.issubset(_GREETING_TOKENS)
+
+    @staticmethod
+    def _mcp_tools_for_message(
+        message: str,
+        *,
+        tokens: set[str],
+        available: set[str],
+    ) -> list[str]:
+        """Return MCP tools that are likely relevant to the user message."""
+        if not message:
+            return []
+        has_mcp_hint = "mcp" in tokens
+        matches: list[str] = []
+        for name in sorted(available):
+            if not name.startswith("mcp."):
+                continue
+            lowered = name.lower()
+            if lowered in message:
+                matches.append(name)
+                continue
+
+            parts = lowered.split(".")
+            if len(parts) < 3:
+                continue
+            alias = parts[1]
+            tool_tokens = {
+                token
+                for token in re.split(r"[._/-]+", ".".join(parts[2:]))
+                if token
+            }
+            if alias in tokens:
+                matches.append(name)
+                continue
+            if has_mcp_hint and tokens.intersection(tool_tokens):
+                matches.append(name)
+        return matches
+
+    def _should_retry_with_hybrid_fallback(
+        self,
+        *,
+        user_message: str,
+        response_text: str,
+        turn_tool_schemas: list[dict],
+        recovery_used: bool,
+    ) -> bool:
+        """Detect hybrid tool stall and inject one fallback-nudge retry."""
+        if self._tool_exposure_mode != "hybrid" or recovery_used:
+            return False
+
+        schema_names = {
+            str(schema.get("name", "")).strip()
+            for schema in turn_tool_schemas
+            if isinstance(schema, dict)
+        }
+        if not _HYBRID_FALLBACK_TOOLS.issubset(schema_names):
+            return False
+
+        message = " ".join(str(user_message or "").lower().split())
+        response = " ".join(str(response_text or "").lower().split())
+        if not message or not response:
+            return False
+
+        tokens = set(re.findall(r"[a-z0-9_./+-]+", message))
+        available = set(self._tools.list_tools(auth_context=self._auth_context))
+        mcp_aliases = {
+            parts[1]
+            for name in available
+            if name.startswith("mcp.")
+            for parts in [name.lower().split(".")]
+            if len(parts) >= 3 and parts[1]
+        }
+        response_has_integration_signal = (
+            "mcp" in response
+            or "tool set" in response
+            or "direct tool" in response
+        )
+        has_integration_hint = (
+            "mcp" in tokens
+            or bool(tokens.intersection(mcp_aliases))
+            or response_has_integration_signal
+        )
+        if not has_integration_hint:
+            return False
+
+        return any(marker in response for marker in _HYBRID_TOOL_STALL_MARKERS)
+
+    def _tool_names_for_turn(self, user_message: str) -> list[str]:
+        """Choose intent-aware typed tool names for this turn (no fallback lane)."""
+        available = set(self._tools.list_tools(auth_context=self._auth_context))
+        if not available:
+            return []
+
+        message = " ".join(str(user_message or "").lower().split())
+        tokens = set(re.findall(r"[a-z0-9_./+-]+", message))
+
+        selected: set[str] = set(_CORE_TOOL_NAMES)
+
+        if self._contains_any(message, _CODING_KEYWORDS):
+            selected.update(_CODING_TOOL_NAMES)
+        if self._contains_any(message, _WEB_KEYWORDS):
+            selected.update(_WEB_TOOL_NAMES)
+        if self._contains_any(message, _WRITING_KEYWORDS):
+            selected.update(_WRITING_TOOL_NAMES)
+        if self._contains_any(message, _FINANCE_KEYWORDS):
+            selected.update(_FINANCE_TOOL_NAMES)
+        if self._contains_any(message, _SPREADSHEET_KEYWORDS):
+            selected.add("spreadsheet")
+        if self._contains_any(message, _MATH_KEYWORDS):
+            selected.add("calculator")
+
+        explicit_mentions: list[str] = []
+        # Honor explicit tool-name mentions from the user.
+        for name in sorted(available):
+            if name.lower() in message:
+                selected.add(name)
+                explicit_mentions.append(name)
+
+        mcp_mentions = self._mcp_tools_for_message(
+            message,
+            tokens=tokens,
+            available=available,
+        )
+        if mcp_mentions:
+            selected.update(mcp_mentions)
+
+        # If the message is not obvious small talk and no category matched,
+        # include a compact general-purpose set instead of all tools.
+        if selected == set(_CORE_TOOL_NAMES) and not self._is_small_talk(tokens):
+            selected.update(_GENERAL_TOOL_NAMES)
+
+        ordered_candidates = [
+            *_CORE_TOOL_NAMES,
+            *_GENERAL_TOOL_NAMES,
+            *_CODING_TOOL_NAMES,
+            *_WEB_TOOL_NAMES,
+            *_WRITING_TOOL_NAMES,
+            *_FINANCE_TOOL_NAMES,
+            "spreadsheet",
+            "calculator",
+        ]
+
+        selected_available = {name for name in selected if name in available}
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        priority_mentions = [
+            name
+            for name in [*explicit_mentions, *mcp_mentions]
+            if name in selected_available
+        ]
+        for name in priority_mentions:
+            if name not in seen:
+                ordered.append(name)
+                seen.add(name)
+
+        for name in [*_CORE_TOOL_NAMES, *ordered_candidates]:
+            if name in selected_available and name not in seen:
+                ordered.append(name)
+                seen.add(name)
+
+        for name in sorted(selected_available):
+            if name not in seen:
+                ordered.append(name)
+                seen.add(name)
+        return ordered
+
+    def _tool_schemas_for_turn(self, user_message: str) -> list[dict]:
+        """Return tool schemas for this turn according to exposure mode."""
+        if self._tool_exposure_mode == "full":
+            return self._tools.all_schemas(auth_context=self._auth_context)
+
+        all_schemas = self._tools.all_schemas(auth_context=self._auth_context)
+        if not all_schemas:
+            return []
+
+        schema_by_name: dict[str, dict] = {}
+        for schema in all_schemas:
+            name = str(schema.get("name", "")).strip()
+            if not name:
+                continue
+            schema_by_name[name] = schema
+
+        ordered_typed_names = self._tool_names_for_turn(user_message)
+        typed_names: list[str] = []
+        typed_bytes = 0
+        for name in ordered_typed_names:
+            schema = schema_by_name.get(name)
+            if schema is None:
+                continue
+            if len(typed_names) >= _TYPED_TOOL_SCHEMA_CAP:
+                break
+            schema_size = len(
+                json.dumps(
+                    schema,
+                    ensure_ascii=False,
+                    default=str,
+                ).encode("utf-8", errors="replace"),
+            )
+            if typed_names and (typed_bytes + schema_size) > _TYPED_TOOL_SCHEMA_BYTE_BUDGET:
+                break
+            typed_names.append(name)
+            typed_bytes += schema_size
+
+        if not typed_names:
+            for fallback in _CORE_TOOL_NAMES:
+                if fallback in schema_by_name:
+                    typed_names.append(fallback)
+                if len(typed_names) >= min(_TYPED_TOOL_SCHEMA_CAP, 4):
+                    break
+
+        final_names: list[str] = list(typed_names)
+        if self._tool_exposure_mode == "hybrid":
+            for fallback in _FALLBACK_TOOL_NAMES:
+                if fallback in schema_by_name and fallback not in final_names:
+                    final_names.append(fallback)
+
+        schemas = [schema_by_name[name] for name in final_names if name in schema_by_name]
+        if schemas:
+            logger.debug(
+                (
+                    "cowork_tool_schema_selection mode=%s selected=%d typed=%d "
+                    "total_available=%d names=%s"
+                ),
+                self._tool_exposure_mode,
+                len(schemas),
+                len(typed_names),
+                len(schema_by_name),
+                ",".join(final_names),
+            )
+            return schemas
+        return all_schemas
+
+    def _bind_hybrid_tools(self) -> None:
+        """Bind session-aware callbacks for hybrid fallback tools."""
+        list_tools_tool = self._tools.get("list_tools")
+        if list_tools_tool is not None and hasattr(list_tools_tool, "bind"):
+            try:
+                list_tools_tool.bind(self._tool_catalog_rows)
+            except Exception as e:
+                logger.debug("Failed binding list_tools callback: %s", e)
+
+        run_tool_tool = self._tools.get("run_tool")
+        if run_tool_tool is not None and hasattr(run_tool_tool, "bind"):
+            try:
+                run_tool_tool.bind(self._dispatch_run_tool)
+            except Exception as e:
+                logger.debug("Failed binding run_tool callback: %s", e)
+
+    @staticmethod
+    def _tool_category(name: str) -> str:
+        if name in _CORE_TOOL_NAMES or name in _FALLBACK_TOOL_NAMES:
+            return "core"
+        if name in _CODING_TOOL_NAMES or name in {
+            "read_file",
+            "write_file",
+            "edit_file",
+            "move_file",
+            "delete_file",
+            "analyze_code",
+        }:
+            return "coding"
+        if name in _WEB_TOOL_NAMES:
+            return "web"
+        if name in _WRITING_TOOL_NAMES:
+            return "writing"
+        if name in _FINANCE_TOOL_NAMES:
+            return "finance"
+        if name.startswith("mcp."):
+            return "mcp"
+        return "other"
+
+    def _tool_catalog_rows(self, auth_context: Any | None = None) -> list[dict]:
+        """Build a compact list-tools catalog from currently available schemas."""
+        schemas = self._tools.all_schemas(auth_context=auth_context)
+        rows: list[dict] = []
+        for schema in schemas:
+            name = str(schema.get("name", "")).strip()
+            if not name:
+                continue
+            tool = self._tools.get(name)
+            description = str(schema.get("description", "") or "").strip()
+            parameters = schema.get("parameters", {})
+            rows.append({
+                "name": name,
+                "summary": " ".join(description.split()),
+                "description": description,
+                "parameters": parameters if isinstance(parameters, dict) else {},
+                "mutates": bool(getattr(tool, "is_mutating", False)),
+                "auth_required": bool(getattr(tool, "auth_requirements", [])),
+                "category": self._tool_category(name),
+            })
+        rows.sort(key=lambda item: str(item.get("name", "")))
+        return rows
+
+    async def _dispatch_run_tool(
+        self,
+        tool_name: str,
+        arguments: dict,
+        ctx: Any,
+    ) -> ToolResult:
+        """Execute a delegated tool call from run_tool with safety parity."""
+        target = str(tool_name or "").strip()
+        if not target:
+            return ToolResult.fail("run_tool requires a non-empty tool name.")
+        if target == "run_tool":
+            return ToolResult.fail("run_tool cannot invoke itself.")
+        if target in _USER_INTERACTION_TOOLS:
+            return ToolResult.fail(
+                f"Tool '{target}' must be called directly and cannot be delegated via run_tool.",
+            )
+        if not isinstance(arguments, dict):
+            return ToolResult.fail("run_tool 'arguments' must be an object.")
+
+        auth_context = getattr(ctx, "auth_context", self._auth_context)
+        if not self._tools.has(target, auth_context=auth_context):
+            return ToolResult.fail(f"Unknown tool: {target}")
+
+        execute_args = self._prepare_tool_execute_arguments(target, arguments)
+        if self._approver is not None:
+            decision = await self._approver.check(target, execute_args)
+            if decision == ApprovalDecision.DENY:
+                return ToolResult.fail(f"Tool call '{target}' denied by user.")
+
+        return await self._tools.execute(
+            target,
+            execute_args,
+            workspace=self._workspace,
+            scratch_dir=self._scratch_dir,
+            auth_context=auth_context,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers

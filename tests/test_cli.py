@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from click.testing import CliRunner
@@ -120,7 +121,7 @@ class TestCLI:
         monkeypatch.setattr(main_mod, "_init_persistence", lambda _cfg: (None, None))
         monkeypatch.setattr(
             "loom.tools.create_default_registry",
-            lambda _config=None: MagicMock(),
+            lambda _config=None, **_kwargs: MagicMock(),
         )
         monkeypatch.setattr("loom.tui.app.LoomApp", DummyApp)
 
@@ -234,6 +235,7 @@ class TestCLI:
 [auth.profiles.notion_marketing]
 provider = "notion"
 mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
 """
         )
 
@@ -307,7 +309,9 @@ class TestAuthCli:
         runner = CliRunner()
         result = runner.invoke(cli, ["auth", "--help"])
         assert result.exit_code == 0
+        assert "audit" in result.output
         assert "list" in result.output
+        assert "migrate" in result.output
         assert "show" in result.output
         assert "check" in result.output
         assert "route" not in result.output
@@ -329,6 +333,7 @@ provider = "notion"
 mode = "oauth2_pkce"
 account_label = "Marketing"
 scopes = ["read:content"]
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
 """
         )
         runner = CliRunner()
@@ -394,6 +399,7 @@ scopes = ["read:content"]
 [auth.profiles.notion_marketing]
 provider = "notion"
 mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
 """
         )
         runner = CliRunner()
@@ -448,6 +454,7 @@ mode = "oauth2_pkce"
 [auth.profiles.notion_marketing]
 provider = "notion"
 mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
 """
         )
         runner = CliRunner()
@@ -469,6 +476,259 @@ mode = "oauth2_pkce"
         )
         assert set_result.exit_code == 1
         assert "MCP selectors are no longer supported" in set_result.output
+
+    def test_auth_select_sets_resource_default_and_binding(self, tmp_path):
+        from loom.auth.resources import (
+            AuthResource,
+            AuthResourcesStore,
+            default_workspace_auth_resources_path,
+            load_workspace_auth_resources,
+            write_workspace_auth_resources,
+        )
+
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+"""
+        )
+        resources_path = default_workspace_auth_resources_path(workspace)
+        write_workspace_auth_resources(
+            resources_path,
+            AuthResourcesStore(
+                resources={
+                    "res-notion": AuthResource(
+                        resource_id="res-notion",
+                        resource_kind="api_integration",
+                        resource_key="notion",
+                        display_name="API: notion",
+                        provider="notion",
+                        source="api",
+                        status="active",
+                    ),
+                },
+            ),
+        )
+
+        runner = CliRunner()
+        set_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "select",
+                "api_integration:notion",
+                "notion_marketing",
+            ],
+        )
+        assert set_result.exit_code == 0
+        store = load_workspace_auth_resources(resources_path)
+        assert store.workspace_defaults.get("res-notion") == "notion_marketing"
+        assert any(
+            binding.status == "active"
+            and binding.resource_id == "res-notion"
+            and binding.profile_id == "notion_marketing"
+            for binding in store.bindings.values()
+        )
+
+        set_by_id_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "select",
+                "res-notion",
+                "notion_marketing",
+            ],
+        )
+        assert set_by_id_result.exit_code == 0
+
+        unset_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "select",
+                "api_integration:notion",
+                "--unset",
+            ],
+        )
+        assert unset_result.exit_code == 0
+        assert (
+            load_workspace_auth_resources(resources_path).workspace_defaults.get(
+                "res-notion"
+            )
+            is None
+        )
+
+    def test_auth_audit_reports_findings(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.defaults]
+notion = "notion_marketing"
+
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+"""
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "audit",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "legacy_provider_defaults" in result.output
+
+    def test_auth_migrate_and_rollback(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.defaults]
+notion = "notion_marketing"
+
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+"""
+        )
+        runner = CliRunner()
+
+        migrate_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "migrate",
+                "--json",
+            ],
+        )
+        assert migrate_result.exit_code == 0
+        payload = json.loads(migrate_result.output)
+        snapshot_path = Path(payload["snapshot_path"])
+        assert snapshot_path.exists()
+        assert payload["created_resources"] >= 1
+
+        mutated = auth_cfg.read_text() + "\n# mutation\n"
+        auth_cfg.write_text(mutated)
+
+        rollback_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "migrate",
+                "--rollback",
+                str(snapshot_path),
+            ],
+        )
+        assert rollback_result.exit_code == 0
+        restored = auth_cfg.read_text()
+        assert "# mutation" not in restored
+        assert "[auth.profiles.notion_marketing]" in restored
+
+    def test_auth_migrate_failure_auto_rolls_back(self, tmp_path, monkeypatch):
+        import loom.__main__ as main_mod
+
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+"""
+        )
+        snapshot_path = tmp_path / "snapshot-preflight"
+        snapshot_path.mkdir(parents=True)
+        restored: dict[str, object] = {}
+
+        def _fake_create_snapshot(**_kwargs):
+            return snapshot_path
+
+        def _fake_migrate(**_kwargs):
+            raise RuntimeError("boom")
+
+        def _fake_restore(**_kwargs):
+            restored["snapshot_path"] = _kwargs.get("snapshot_path")
+
+        monkeypatch.setattr(main_mod, "create_auth_snapshot", _fake_create_snapshot)
+        monkeypatch.setattr(main_mod, "migrate_legacy_auth", _fake_migrate)
+        monkeypatch.setattr(main_mod, "restore_auth_snapshot", _fake_restore)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "migrate",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "rolled back" in result.output
+        assert restored.get("snapshot_path") == snapshot_path
 
     def test_auth_route_subcommand_removed(self, tmp_path):
         cfg = tmp_path / "loom.toml"
@@ -511,6 +771,8 @@ mode = "oauth2_pkce"
                 "oauth2_pkce",
                 "--label",
                 "Marketing",
+                "--mcp-server",
+                "notion",
                 "--token-ref",
                 "keychain://loom/notion/notion_marketing/tokens",
                 "--scope",
@@ -538,6 +800,7 @@ mode = "oauth2_pkce"
         shown = json.loads(show_result.output)
         assert shown["provider"] == "notion"
         assert shown["account_label"] == "Marketing"
+        assert shown["mcp_server"] == "notion"
         assert shown["metadata"]["workspace"] == "marketing"
 
         edit_result = runner.invoke(
@@ -556,6 +819,7 @@ mode = "oauth2_pkce"
                 "--env",
                 "NOTION_TOKEN=${NOTION_TOKEN}",
                 "--clear-scopes",
+                "--clear-mcp-server",
             ],
         )
         assert edit_result.exit_code == 0
@@ -577,6 +841,7 @@ mode = "oauth2_pkce"
         edited = json.loads(show_after_edit.output)
         assert edited["mode"] == "env_passthrough"
         assert edited["scopes"] == []
+        assert edited["mcp_server"] == ""
         assert edited["env"]["NOTION_TOKEN"] == "${NOTION_TOKEN}"
 
         list_result = runner.invoke(

@@ -393,6 +393,50 @@ class TestOpenAIProviderErrors:
         assert payload["reasoning_effort"] == "none"
 
     @pytest.mark.asyncio
+    async def test_complete_remaps_invalid_tool_names(self):
+        provider = self._make_provider()
+        provider._client = AsyncMock()
+
+        async def _post(_path, *, json):
+            request_tools = json.get("tools", [])
+            assert request_tools
+            request_name = request_tools[0]["function"]["name"]
+            assert request_name != "mcp.notion.notion-search"
+            assert "." not in request_name
+
+            ok = MagicMock()
+            ok.raise_for_status.return_value = None
+            ok.json.return_value = {
+                "choices": [{
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "function": {
+                                "name": request_name,
+                                "arguments": "{\"query\":\"chicken\"}",
+                            },
+                        }],
+                    },
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+            return ok
+
+        provider._client.post = AsyncMock(side_effect=_post)
+
+        response = await provider.complete(
+            [{"role": "user", "content": "search notion"}],
+            tools=[{
+                "name": "mcp.notion.notion-search",
+                "description": "Search Notion",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }],
+        )
+        assert response.tool_calls is not None
+        assert response.tool_calls[0].name == "mcp.notion.notion-search"
+
+    @pytest.mark.asyncio
     async def test_complete_retry_injects_non_empty_reasoning_content_when_content_empty(self):
         provider = self._make_provider(api_key="test-key")
         provider._client = AsyncMock()
@@ -547,6 +591,96 @@ class TestOpenAIProviderErrors:
         assert chunks[-1].done is True
         assert chunks[-1].tool_calls is not None
         assert chunks[-1].tool_calls[0].id == "call_0"
+
+    @pytest.mark.asyncio
+    async def test_stream_preserves_usage_from_usage_only_chunk(self):
+        provider = self._make_provider()
+        provider._client = MagicMock()
+        response = _StreamingSuccessResponse([
+            'data: {"choices":[{"delta":{"content":"hello"}}]}',
+            (
+                'data: {"choices":[],"usage":{"prompt_tokens":10,'
+                '"completion_tokens":5,"total_tokens":15}}'
+            ),
+            "data: [DONE]",
+        ])
+        provider._client.stream = MagicMock(
+            return_value=_ErrorStreamContext(response),
+        )
+
+        chunks = []
+        async for chunk in provider.stream([{"role": "user", "content": "hi"}]):
+            chunks.append(chunk)
+
+        assert "".join(c.text for c in chunks) == "hello"
+        assert any(
+            chunk.usage is not None and chunk.usage.total_tokens == 15
+            for chunk in chunks
+        )
+        assert chunks[-1].done is True
+        assert chunks[-1].usage is not None
+        assert chunks[-1].usage.total_tokens == 15
+
+    @pytest.mark.asyncio
+    async def test_stream_remaps_invalid_tool_names(self):
+        provider = self._make_provider()
+        provider._client = MagicMock()
+
+        def _stream(_method, _path, *, json):
+            request_tools = json.get("tools", [])
+            assert request_tools
+            request_name = request_tools[0]["function"]["name"]
+            assert request_name != "mcp.notion.notion-search"
+            assert "." not in request_name
+            response = _StreamingSuccessResponse([
+                (
+                    "data: "
+                    + json_module.dumps({
+                        "choices": [{
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {"name": request_name},
+                                }],
+                            },
+                        }],
+                    })
+                ),
+                (
+                    "data: "
+                    + json_module.dumps({
+                        "choices": [{
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "function": {"arguments": "{\"query\":\"chicken\"}"},
+                                }],
+                            },
+                        }],
+                    })
+                ),
+                "data: [DONE]",
+            ])
+            return _ErrorStreamContext(response)
+
+        import json as json_module
+
+        provider._client.stream = MagicMock(side_effect=_stream)
+
+        chunks = []
+        async for chunk in provider.stream(
+            [{"role": "user", "content": "search notion"}],
+            tools=[{
+                "name": "mcp.notion.notion-search",
+                "description": "Search Notion",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }],
+        ):
+            chunks.append(chunk)
+
+        assert chunks[-1].tool_calls is not None
+        assert chunks[-1].tool_calls[0].name == "mcp.notion.notion-search"
 
 
 # ---------------------------------------------------------------------------

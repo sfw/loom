@@ -230,6 +230,60 @@ class TestTaskCreate:
         response = await client.post("/tasks", json={})
         assert response.status_code == 422
 
+    @pytest.mark.asyncio
+    async def test_create_task_returns_structured_unresolved_auth_payload(
+        self,
+        client,
+        tmp_path,
+    ):
+        process_path = tmp_path / "auth-required.process.yaml"
+        process_path.write_text(
+            """
+name: auth-required-process
+version: "1.0"
+auth:
+  required:
+    - provider: notion
+      source: api
+""",
+            encoding="utf-8",
+        )
+        auth_path = tmp_path / "auth.toml"
+        auth_path.write_text(
+            """
+[auth.profiles.notion_dev]
+provider = "notion"
+mode = "api_key"
+secret_ref = "env://NOTION_TOKEN_DEV"
+
+[auth.profiles.notion_prod]
+provider = "notion"
+mode = "api_key"
+secret_ref = "env://NOTION_TOKEN_PROD"
+""",
+            encoding="utf-8",
+        )
+
+        response = await client.post(
+            "/tasks",
+            json={
+                "goal": "Do auth-sensitive work",
+                "workspace": str(tmp_path),
+                "process": str(process_path),
+                "metadata": {"auth_config_path": str(auth_path)},
+            },
+        )
+        assert response.status_code == 400
+        payload = response.json()
+        assert isinstance(payload.get("detail"), dict)
+        detail = payload["detail"]
+        assert detail["code"] == "auth_unresolved"
+        unresolved = detail.get("unresolved", [])
+        assert isinstance(unresolved, list)
+        assert unresolved
+        assert unresolved[0]["provider"] == "notion"
+        assert unresolved[0]["reason"] == "ambiguous"
+
 
 class TestTaskGet:
     @pytest.mark.asyncio
@@ -608,6 +662,51 @@ class TestProcessField:
         detail = response.json()["detail"]
         assert "requires missing tool" in detail
         assert "definitely-missing-tool" in detail
+
+    def test_required_auth_resources_for_process_includes_allowed_tool_requirements(self):
+        from loom.api.routes import _required_auth_resources_for_process
+
+        included_tool = SimpleNamespace(
+            auth_requirements=[
+                {
+                    "provider": "ga_provider",
+                    "source": "api",
+                    "modes": ["api_key"],
+                }
+            ]
+        )
+        excluded_tool = SimpleNamespace(
+            auth_requirements=[
+                {
+                    "provider": "should_not_appear",
+                    "source": "api",
+                }
+            ]
+        )
+
+        process_def = SimpleNamespace(
+            auth=SimpleNamespace(required=[{"provider": "notion", "source": "mcp"}]),
+            tools=SimpleNamespace(required=[], excluded=["tool_excluded"]),
+        )
+        registry = SimpleNamespace(
+            list_tools=lambda: ["tool_included", "tool_excluded"],
+            get=lambda name: {
+                "tool_included": included_tool,
+                "tool_excluded": excluded_tool,
+            }.get(name),
+        )
+
+        required = _required_auth_resources_for_process(
+            process_def,
+            tool_registry=registry,
+        )
+        selectors = {
+            (item["provider"], item.get("source", "api"))
+            for item in required
+        }
+        assert ("notion", "mcp") in selectors
+        assert ("ga_provider", "api") in selectors
+        assert ("should_not_appear", "api") not in selectors
 
 
 class TestBackgroundExecution:

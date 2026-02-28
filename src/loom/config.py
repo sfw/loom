@@ -131,6 +131,7 @@ class ExecutionConfig:
     model_call_retry_base_delay_seconds: float = 0.5
     model_call_retry_max_delay_seconds: float = 8.0
     model_call_retry_jitter_seconds: float = 0.25
+    cowork_tool_exposure_mode: str = "adaptive"  # full | adaptive | hybrid
 
 
 @dataclass(frozen=True)
@@ -653,6 +654,14 @@ def load_config(path: Path | None = None) -> Config:
         model_call_retry_base_delay_seconds=model_call_retry_base_delay_seconds,
         model_call_retry_max_delay_seconds=model_call_retry_max_delay_seconds,
         model_call_retry_jitter_seconds=model_call_retry_jitter_seconds,
+        cowork_tool_exposure_mode=(
+            str(
+                exec_data.get(
+                    "cowork_tool_exposure_mode",
+                    ExecutionConfig.cowork_tool_exposure_mode,
+                ),
+            ).strip().lower()
+        ),
     )
     completion_mode = execution.executor_completion_contract_mode
     if completion_mode not in {"off", "warn", "enforce"}:
@@ -660,11 +669,15 @@ def load_config(path: Path | None = None) -> Config:
     planner_mode = execution.planner_degraded_mode
     if planner_mode not in {"allow", "require_approval", "deny"}:
         planner_mode = ExecutionConfig.planner_degraded_mode
+    cowork_tool_exposure_mode = execution.cowork_tool_exposure_mode
+    if cowork_tool_exposure_mode not in {"full", "adaptive", "hybrid"}:
+        cowork_tool_exposure_mode = ExecutionConfig.cowork_tool_exposure_mode
     execution = ExecutionConfig(
         **{
             **execution.__dict__,
             "executor_completion_contract_mode": completion_mode,
             "planner_degraded_mode": planner_mode,
+            "cowork_tool_exposure_mode": cowork_tool_exposure_mode,
         },
     )
 

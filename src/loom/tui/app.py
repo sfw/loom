@@ -86,6 +86,7 @@ from loom.tui.widgets import (
     StatusBar,
 )
 from loom.tui.widgets.tool_call import tool_args_preview
+from loom.utils.latency import diagnostics_enabled, log_latency_event
 
 if TYPE_CHECKING:
     from loom.config import Config
@@ -202,6 +203,9 @@ _MAX_PERSISTED_PROCESS_RESULTS = 120
 _INFO_WRAP_WIDTH = 108
 _RUN_GOAL_FILE_CONTENT_MAX_CHARS = 32_000
 _MAX_INPUT_HISTORY = 500
+_PROCESS_COMMAND_INDEX_REFRESH_INTERVAL_SECONDS = 2.0
+_EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS = 0.5
+_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS = 0.05
 
 
 class ProcessRunList(VerticalScroll):
@@ -545,6 +549,8 @@ class ProcessRunState:
     is_adhoc: bool = False
     recommended_tools: list[str] = field(default_factory=list)
     goal_context_overrides: dict[str, Any] = field(default_factory=dict)
+    auth_profile_overrides: dict[str, str] = field(default_factory=dict)
+    auth_required_resources: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -690,6 +696,8 @@ class LoomApp(App):
         self._process_command_map: dict[str, str] = {}
         self._blocked_process_commands: list[str] = []
         self._cached_process_catalog: list[dict[str, str]] = []
+        self._process_command_index_last_refresh_at: float = 0.0
+        self._process_command_index_refresh_inflight = False
         self._adhoc_process_cache: dict[str, AdhocProcessCacheEntry] = {}
         self._adhoc_package_doc_cache: str | None = None
         self._sidebar_cowork_tasks: list[dict] = []
@@ -724,6 +732,12 @@ class LoomApp(App):
         # Register and activate theme
         self.register_theme(LOOM_DARK)
         self.theme = "loom-dark"
+        if diagnostics_enabled():
+            self.run_worker(
+                self._monitor_event_loop_lag(),
+                group="tui-event-loop-lag",
+                exclusive=True,
+            )
         self._process_elapsed_timer = self.set_interval(
             1.0,
             self._tick_process_run_elapsed,
@@ -743,6 +757,22 @@ class LoomApp(App):
             self.query_one("#user-input", Input).focus()
         except Exception:
             pass
+
+    async def _monitor_event_loop_lag(self) -> None:
+        """Emit periodic event-loop lag diagnostics when enabled."""
+        expected = time.monotonic() + _EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS
+        while True:
+            await asyncio.sleep(_EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS)
+            now = time.monotonic()
+            lag = max(0.0, now - expected)
+            if lag >= _EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS:
+                log_latency_event(
+                    logger,
+                    event="tui_event_loop_lag",
+                    duration_seconds=lag,
+                    fields={"threshold_ms": int(_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS * 1000)},
+                )
+            expected = now + _EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS
 
     def _on_setup_complete(self, result: list[dict] | None) -> None:
         """Handle setup wizard dismissal."""
@@ -794,7 +824,10 @@ class LoomApp(App):
         """Reset registry to discovered tools."""
         from loom.tools import create_default_registry
 
-        self._tools = create_default_registry(self._config)
+        self._tools = create_default_registry(
+            self._config,
+            mcp_startup_mode="background",
+        )
 
     def _create_process_loader(self):
         """Create a process loader for the current workspace/config."""
@@ -859,7 +892,13 @@ class LoomApp(App):
             except Exception:
                 pass
 
-        self.push_screen(MCPManagerScreen(manager), callback=_handle_result)
+        self.push_screen(
+            MCPManagerScreen(
+                manager,
+                explicit_auth_path=self._explicit_auth_path,
+            ),
+            callback=_handle_result,
+        )
 
     def _open_auth_manager_screen(self) -> None:
         """Open modal auth manager."""
@@ -879,6 +918,9 @@ class LoomApp(App):
             AuthManagerScreen(
                 workspace=self._workspace,
                 explicit_auth_path=self._explicit_auth_path,
+                mcp_manager=self._mcp_manager(),
+                process_def=self._process_defn,
+                tool_registry=self._tools,
             ),
             callback=_handle_result,
         )
@@ -1084,9 +1126,6 @@ class LoomApp(App):
                 self._process_defn = None
                 self._process_name = None
                 return
-            # Process load may import bundled tool modules; rebuild to include
-            # them in the active registry.
-            self._refresh_tool_registry()
             chat.add_info(
                 f"Process: [bold]{self._process_defn.name}[/bold] "
                 f"v{self._process_defn.version}"
@@ -2584,6 +2623,12 @@ class LoomApp(App):
             "phases.\n"
             "- Every phase must include measurable acceptance_criteria.\n"
             "- Every phase must include concrete deliverable filenames (.md/.csv/etc).\n"
+            "- Deliverables should default to root-level filenames (e.g., report.md), "
+            "not numbered phase folders, unless the goal explicitly requires "
+            "subdirectories.\n"
+            "- Do not add phases whose main purpose is creating folder schemas, "
+            "workspace schema docs, or numbered directories unless the user "
+            "explicitly asks for that structure.\n"
             "- If the goal mentions local files or directories, include a phase that "
             "inspects them.\n"
             "- required_tools must be selected ONLY from available tools.\n"
@@ -2664,6 +2709,9 @@ class LoomApp(App):
                 "tool_guidance, required_tools, recommended_tools, phases.\n"
                 "Each phase object keys: id, description, depends_on, "
                 "acceptance_criteria, deliverables.\n\n"
+                "Deliverables should default to root-level filenames (e.g., "
+                "report.md) unless the user explicitly requires subdirectories.\n"
+                "Do not include folder-scaffolding-only phases unless explicitly requested.\n\n"
                 "Use this same task request:\n"
                 f"{goal}\n\n"
                 "Do not include markdown fences."
@@ -2737,6 +2785,9 @@ class LoomApp(App):
                 "required_tools, recommended_tools, phases.\n"
                 "Each phase object must contain: id, description, depends_on, "
                 "acceptance_criteria, deliverables.\n"
+                "Prefer root-level deliverable filenames unless the user explicitly "
+                "requires subdirectories.\n"
+                "Do not include folder-scaffolding-only phases unless explicitly requested.\n"
                 "Do not include markdown fences.\n\n"
                 "SOURCE OUTPUT:\n"
                 "<<<BEGIN_SOURCE>>>\n"
@@ -2812,6 +2863,9 @@ class LoomApp(App):
                 "- phase descriptions must be concise (<= 120 chars)\n"
                 "- acceptance_criteria must be a short STRING (not array)\n"
                 "- deliverables must be filename strings like report.md\n"
+                "- prefer root-level deliverables; avoid numbered phase folders unless "
+                "explicitly required by the goal\n"
+                "- do not include folder-scaffolding-only phases unless explicitly requested\n"
                 "- do not include markdown/code fences/prose\n\n"
                 f"Goal:\n{goal}\n\n"
                 f"Available tools: {tool_list}\n"
@@ -3053,6 +3107,9 @@ class LoomApp(App):
             "tags": list(dict.fromkeys([*process_defn.tags, "adhoc", "generated"])),
             "author": process_defn.author or "loom-adhoc",
         }
+        auth_required = process_defn.auth_required_resources()
+        if auth_required:
+            payload["auth"] = {"required": auth_required}
         return payload
 
     def _save_adhoc_process_package(
@@ -3138,21 +3195,13 @@ class LoomApp(App):
         """Return True when process name collides with built-in slash command."""
         return name.strip().lower() in self._reserved_slash_command_names()
 
-    def _refresh_process_command_index(
+    def _compute_process_command_index(
         self,
-        *,
-        chat: ChatLog | None = None,
-        notify_conflicts: bool = False,
-    ) -> None:
-        """Refresh process catalog and dynamic slash-command map."""
-        try:
-            loader = self._create_process_loader()
-            available = loader.list_available()
-        except Exception:
-            self._cached_process_catalog = []
-            self._process_command_map = {}
-            self._blocked_process_commands = []
-            return
+    ) -> tuple[list[dict[str, str]], dict[str, str], list[str]]:
+        """Compute selectable process catalog and dynamic command map."""
+        started = time.monotonic()
+        loader = self._create_process_loader()
+        available = loader.list_available()
 
         selectable: list[dict[str, str]] = []
         command_map: dict[str, str] = {}
@@ -3170,9 +3219,81 @@ class LoomApp(App):
             selectable.append(proc)
             command_map[f"/{lowered}"] = name
 
+        log_latency_event(
+            logger,
+            event="process_command_index_refresh",
+            duration_seconds=time.monotonic() - started,
+            fields={"available": len(available), "selectable": len(selectable)},
+        )
+        return selectable, command_map, sorted(blocked, key=str.lower)
+
+    def _refresh_process_command_index(
+        self,
+        *,
+        chat: ChatLog | None = None,
+        notify_conflicts: bool = False,
+        background: bool = False,
+        force: bool = False,
+    ) -> None:
+        """Refresh process catalog and dynamic slash-command map."""
+        if background and not self.is_running:
+            # In tests and pre-run contexts, background workers may not be available.
+            background = False
+
+        if background:
+            now = time.monotonic()
+            if self._process_command_index_refresh_inflight:
+                return
+            if (
+                not force
+                and self._cached_process_catalog
+                and (now - self._process_command_index_last_refresh_at)
+                < _PROCESS_COMMAND_INDEX_REFRESH_INTERVAL_SECONDS
+            ):
+                return
+            self._process_command_index_refresh_inflight = True
+
+            async def _refresh_in_background() -> None:
+                try:
+                    selectable, command_map, blocked = await asyncio.to_thread(
+                        self._compute_process_command_index,
+                    )
+                except Exception:
+                    selectable, command_map, blocked = [], {}, []
+                try:
+                    self._cached_process_catalog = selectable
+                    self._process_command_map = command_map
+                    self._blocked_process_commands = blocked
+                    self._process_command_index_last_refresh_at = time.monotonic()
+                    if notify_conflicts and chat and self._blocked_process_commands:
+                        blocked_cmds = ", ".join(
+                            f"/{name}" for name in self._blocked_process_commands
+                        )
+                        chat.add_info(
+                            "[bold #f7768e]Process command name collision:[/] "
+                            f"{blocked_cmds}\n"
+                            "[dim]These process names collide with built-in slash commands "
+                            "and were skipped in TUI.[/dim]"
+                        )
+                finally:
+                    self._process_command_index_refresh_inflight = False
+
+            self.run_worker(
+                _refresh_in_background(),
+                group="process-command-index-refresh",
+                exclusive=False,
+            )
+            return
+
+        try:
+            selectable, command_map, blocked = self._compute_process_command_index()
+        except Exception:
+            selectable, command_map, blocked = [], {}, []
+
         self._cached_process_catalog = selectable
         self._process_command_map = command_map
-        self._blocked_process_commands = sorted(blocked, key=str.lower)
+        self._blocked_process_commands = blocked
+        self._process_command_index_last_refresh_at = time.monotonic()
 
         if notify_conflicts and chat and self._blocked_process_commands:
             blocked_cmds = ", ".join(f"/{name}" for name in self._blocked_process_commands)
@@ -3440,6 +3561,17 @@ class LoomApp(App):
             return ModelRetryPolicy()
         return ModelRetryPolicy.from_execution_config(self._config.execution)
 
+    def _cowork_tool_exposure_mode(self) -> str:
+        if self._config is None:
+            return "adaptive"
+        mode = str(
+            getattr(self._config.execution, "cowork_tool_exposure_mode", "adaptive")
+            or "adaptive",
+        ).strip().lower()
+        if mode in {"full", "adaptive", "hybrid"}:
+            return mode
+        return "adaptive"
+
     def _cowork_scratch_dir(self) -> Path | None:
         if self._config is None:
             return None
@@ -3492,12 +3624,12 @@ class LoomApp(App):
         self._total_tokens = 0
         self._sidebar_cowork_tasks = []
 
-        # Start from a clean registry each initialization to avoid stale
-        # excludes/bindings when setup or process configuration changes.
-        self._refresh_tool_registry()
-
-        # Load process definition (imports bundled tools, then refreshes).
+        # Load process definition first. This may import bundled tool modules
+        # into the global tool class registry.
         self._load_process_definition(chat)
+        # Build a clean registry exactly once after optional process load so
+        # bundled tools are included without duplicate registry construction.
+        self._refresh_tool_registry()
         self._refresh_process_command_index(chat=chat, notify_conflicts=True)
 
         # Ensure persistence-dependent tools are present and tracked.
@@ -3524,6 +3656,7 @@ class LoomApp(App):
                 approver=approver,
                 store=self._store,
                 model_retry_policy=self._model_retry_policy(),
+                tool_exposure_mode=self._cowork_tool_exposure_mode(),
                 enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
                 ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
@@ -3569,6 +3702,7 @@ class LoomApp(App):
                 store=self._store,
                 session_id=session_id,
                 model_retry_policy=self._model_retry_policy(),
+                tool_exposure_mode=self._cowork_tool_exposure_mode(),
                 enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
                 ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
@@ -3584,6 +3718,7 @@ class LoomApp(App):
                 system_prompt=system_prompt,
                 approver=approver,
                 model_retry_policy=self._model_retry_policy(),
+                tool_exposure_mode=self._cowork_tool_exposure_mode(),
                 enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
                 ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
@@ -3744,6 +3879,16 @@ class LoomApp(App):
             "task_labels": {str(k): str(v) for k, v in labels.items()},
             "activity_log": activity,
             "result_log": result_log,
+            "auth_profile_overrides": {
+                str(k): str(v)
+                for k, v in getattr(run, "auth_profile_overrides", {}).items()
+                if str(k).strip() and str(v).strip()
+            },
+            "auth_required_resources": [
+                dict(item)
+                for item in getattr(run, "auth_required_resources", [])
+                if isinstance(item, dict)
+            ],
         }
 
     def _sync_process_runs_into_session_state(self) -> None:
@@ -3967,6 +4112,19 @@ class LoomApp(App):
                     continue
                 result_log.append({"text": text, "success": bool(item.get("success", False))})
             result_log = result_log[-_MAX_PERSISTED_PROCESS_RESULTS:]
+            auth_profile_overrides_raw = raw.get("auth_profile_overrides", {})
+            auth_profile_overrides = {}
+            if isinstance(auth_profile_overrides_raw, dict):
+                for key, value in auth_profile_overrides_raw.items():
+                    selector = str(key or "").strip()
+                    profile_id = str(value or "").strip()
+                    if selector and profile_id:
+                        auth_profile_overrides[selector] = profile_id
+            auth_required_resources = [
+                dict(item)
+                for item in raw.get("auth_required_resources", [])
+                if isinstance(item, dict)
+            ]
 
             process_defn = None
             if loader is not None:
@@ -4003,6 +4161,8 @@ class LoomApp(App):
                 task_labels=task_labels,
                 activity_log=activity_log,
                 result_log=result_log,
+                auth_profile_overrides=auth_profile_overrides,
+                auth_required_resources=auth_required_resources,
             )
 
             if run.status in {"queued", "running"}:
@@ -4505,6 +4665,290 @@ class LoomApp(App):
         await self._persist_process_run_ui_state()
         return True
 
+    @staticmethod
+    def _format_auth_profile_option(profile: Any) -> str:
+        """Render one concise auth profile choice label."""
+        profile_id = str(getattr(profile, "profile_id", "") or "").strip()
+        label = str(getattr(profile, "account_label", "") or "").strip()
+        mcp_server = str(getattr(profile, "mcp_server", "") or "").strip()
+        parts = [profile_id]
+        if label:
+            parts.append(f"label={label}")
+        if mcp_server:
+            parts.append(f"mcp_server={mcp_server}")
+        return " | ".join(parts)
+
+    async def _prompt_auth_choice(self, question: str, options: list[str]) -> str:
+        """Prompt for one auth selection via modal and return chosen option text."""
+        answer_event = asyncio.Event()
+        selected: list[str] = []
+
+        def _handle(answer: str) -> None:
+            selected.append(str(answer or "").strip())
+            answer_event.set()
+
+        self.push_screen(AskUserScreen(question, options), callback=_handle)
+        await answer_event.wait()
+        return selected[0] if selected else ""
+
+    async def _open_auth_manager_for_run_start(
+        self,
+        *,
+        process_def: ProcessDefinition | None = None,
+    ) -> bool:
+        """Open auth manager during run-start flow and wait for completion."""
+        done = asyncio.Event()
+        changed = {"value": False}
+
+        def _handle(result: dict[str, object] | None) -> None:
+            changed["value"] = bool(
+                isinstance(result, dict) and result.get("changed")
+            )
+            done.set()
+
+        self.push_screen(
+            AuthManagerScreen(
+                workspace=self._workspace,
+                explicit_auth_path=self._explicit_auth_path,
+                mcp_manager=self._mcp_manager(),
+                process_def=process_def or self._process_defn,
+                tool_registry=self._tools,
+            ),
+            callback=_handle,
+        )
+        await done.wait()
+        return bool(changed["value"])
+
+    def _collect_required_auth_resources_for_process(
+        self,
+        process_defn: ProcessDefinition | None,
+    ) -> list[dict[str, Any]]:
+        """Collect process + allowed-tool auth requirements in metadata shape."""
+        if process_defn is None:
+            return []
+
+        from loom.auth.runtime import (
+            coerce_auth_requirements,
+            serialize_auth_requirements,
+        )
+
+        raw_items: list[object] = []
+        auth_block = getattr(process_defn, "auth", None)
+        process_required = getattr(auth_block, "required", [])
+        if isinstance(process_required, list):
+            raw_items.extend(process_required)
+
+        tools_cfg = getattr(process_defn, "tools", None)
+        excluded = {
+            str(item).strip()
+            for item in (getattr(tools_cfg, "excluded", []) or [])
+            if str(item).strip()
+        }
+        for tool_name in sorted(
+            {
+                str(name).strip()
+                for name in self._tools.list_tools()
+                if str(name).strip() and str(name).strip() not in excluded
+            }
+        ):
+            tool = self._tools.get(tool_name)
+            if tool is None:
+                continue
+            declared = getattr(tool, "auth_requirements", [])
+            if isinstance(declared, list):
+                raw_items.extend(declared)
+
+        return serialize_auth_requirements(coerce_auth_requirements(raw_items))
+
+    async def _resolve_auth_overrides_for_run_start(
+        self,
+        *,
+        process_defn: ProcessDefinition | None,
+        base_overrides: dict[str, str],
+    ) -> tuple[dict[str, str] | None, list[dict[str, Any]]]:
+        """Resolve run-start auth, prompting for ambiguous resources when needed."""
+        from loom.auth.config import (
+            load_merged_auth_config,
+            set_workspace_auth_default,
+        )
+        from loom.auth.runtime import (
+            UnresolvedAuthResourcesError,
+            build_run_auth_context,
+            coerce_auth_requirements,
+        )
+
+        required_resources = self._collect_required_auth_resources_for_process(process_defn)
+        if not required_resources:
+            return dict(base_overrides), required_resources
+
+        overrides = dict(base_overrides)
+        while True:
+            metadata: dict[str, Any] = {
+                "auth_workspace": str(self._workspace.resolve()),
+                "auth_required_resources": required_resources,
+                "auth_profile_overrides": dict(overrides),
+            }
+            if self._explicit_auth_path is not None:
+                metadata["auth_config_path"] = str(self._explicit_auth_path.resolve())
+
+            try:
+                auth_context = await asyncio.to_thread(
+                    build_run_auth_context,
+                    workspace=self._workspace,
+                    metadata=metadata,
+                    required_resources=coerce_auth_requirements(required_resources),
+                    available_mcp_aliases=set(self._config.mcp.servers.keys()),
+                )
+            except UnresolvedAuthResourcesError as e:
+                unresolved = list(e.unresolved)
+                blocking = [
+                    item
+                    for item in unresolved
+                    if str(getattr(item, "reason", "")).strip()
+                    not in {"ambiguous", "blocked_ambiguous_binding"}
+                ]
+                if blocking:
+                    chat = self.query_one("#chat-log", ChatLog)
+                    lines = [
+                        "[bold #f7768e]Run auth preflight failed.[/]",
+                    ]
+                    for item in blocking:
+                        lines.append(
+                            f"  - provider={item.provider} source={item.source} "
+                            f"reason={item.reason}"
+                        )
+                        message = str(item.message or "").strip()
+                        if message:
+                            lines.append(f"    {message}")
+                    chat.add_info("\n".join(lines))
+                    choice = await self._prompt_auth_choice(
+                        "Open Auth Manager to fix auth and retry this run?",
+                        ["Open Auth Manager", "Cancel run"],
+                    )
+                    if choice != "Open Auth Manager":
+                        chat.add_info("Run cancelled: unresolved auth requirements.")
+                        return None, required_resources
+                    changed = await self._open_auth_manager_for_run_start(
+                        process_def=process_defn,
+                    )
+                    if changed:
+                        chat.add_info("Auth configuration updated. Retrying preflight.")
+                    else:
+                        chat.add_info(
+                            "Auth Manager closed without changes. Retrying preflight."
+                        )
+                    continue
+
+                made_selection = False
+                for item in unresolved:
+                    candidates = list(item.candidates)
+                    if not candidates:
+                        continue
+                    merged = await asyncio.to_thread(
+                        load_merged_auth_config,
+                        workspace=self._workspace,
+                        explicit_path=self._explicit_auth_path,
+                    )
+                    options: list[str] = []
+                    option_to_profile: dict[str, str] = {}
+                    for candidate_id in candidates:
+                        profile = merged.config.profiles.get(candidate_id)
+                        if profile is None:
+                            label = str(candidate_id)
+                        else:
+                            label = self._format_auth_profile_option(profile)
+                        option_to_profile[label] = candidate_id
+                        options.append(label)
+                    question = (
+                        "Select auth profile for "
+                        f"provider={item.provider} source={item.source}"
+                    )
+                    answer = await self._prompt_auth_choice(question, options)
+                    profile_id = option_to_profile.get(answer)
+                    if not profile_id:
+                        chat = self.query_one("#chat-log", ChatLog)
+                        chat.add_info("Run cancelled: auth selection was not completed.")
+                        return None, required_resources
+                    selector = (
+                        str(getattr(item, "resource_id", "")).strip()
+                        or str(getattr(item, "resource_ref", "")).strip()
+                        or str(getattr(item, "provider", "")).strip()
+                    )
+                    if not selector:
+                        chat = self.query_one("#chat-log", ChatLog)
+                        chat.add_info(
+                            "Run cancelled: unresolved auth item has no selector."
+                        )
+                        return None, required_resources
+                    overrides[selector] = profile_id
+                    save_default = await self._prompt_auth_choice(
+                        (
+                            "Save this as workspace default for "
+                            f"{selector}?"
+                        ),
+                        ["No", "Yes"],
+                    )
+                    if save_default == "Yes":
+                        try:
+                            if str(getattr(item, "resource_id", "")).strip():
+                                from loom.auth.resources import (
+                                    default_workspace_auth_resources_path,
+                                    set_workspace_resource_default,
+                                )
+
+                                await asyncio.to_thread(
+                                    set_workspace_resource_default,
+                                    default_workspace_auth_resources_path(
+                                        self._workspace.resolve()
+                                    ),
+                                    resource_id=str(item.resource_id).strip(),
+                                    profile_id=profile_id,
+                                )
+                            else:
+                                await asyncio.to_thread(
+                                    set_workspace_auth_default,
+                                    self._auth_defaults_path(),
+                                    selector=selector,
+                                    profile_id=profile_id,
+                                )
+                        except Exception as e:
+                            chat = self.query_one("#chat-log", ChatLog)
+                            chat.add_info(
+                                f"[bold #f7768e]Failed to save workspace auth default: {e}[/]"
+                            )
+                    made_selection = True
+                if not made_selection:
+                    chat = self.query_one("#chat-log", ChatLog)
+                    chat.add_info("Run cancelled: auth selection was not completed.")
+                    return None, required_resources
+                continue
+            except Exception as e:
+                chat = self.query_one("#chat-log", ChatLog)
+                chat.add_info(f"[bold #f7768e]Auth preflight failed: {e}[/]")
+                return None, required_resources
+
+            for req in coerce_auth_requirements(required_resources):
+                selector = (
+                    str(getattr(req, "resource_id", "")).strip()
+                    or str(getattr(req, "resource_ref", "")).strip()
+                    or str(getattr(req, "provider", "")).strip()
+                )
+                profile_for_selector = getattr(
+                    auth_context,
+                    "profile_for_selector",
+                    None,
+                )
+                profile = None
+                if callable(profile_for_selector):
+                    profile = profile_for_selector(selector)
+                if profile is None:
+                    profile = auth_context.profile_for_provider(req.provider)
+                if profile is None:
+                    continue
+                if selector:
+                    overrides[selector] = profile.profile_id
+            return overrides, required_resources
+
     async def _start_process_run(
         self,
         goal: str,
@@ -4558,6 +5002,16 @@ class LoomApp(App):
             run_workspace = Path(run_workspace_override).expanduser()
         else:
             run_workspace = await self._prepare_process_run_workspace(process_name, goal)
+        run_auth_overrides = dict(self._run_auth_profile_overrides)
+        resolved_auth_overrides, required_auth_resources = (
+            await self._resolve_auth_overrides_for_run_start(
+                process_defn=selected_process,
+                base_overrides=run_auth_overrides,
+            )
+        )
+        if resolved_auth_overrides is None:
+            return
+        run_auth_overrides = resolved_auth_overrides
         run_id = self._new_process_run_id()
         pane_id = f"tab-run-{run_id}"
         pane = ProcessRunPane(
@@ -4579,6 +5033,8 @@ class LoomApp(App):
             is_adhoc=bool(is_adhoc),
             recommended_tools=list(recommended_tools or []),
             goal_context_overrides=dict(goal_context_overrides or {}),
+            auth_profile_overrides=dict(run_auth_overrides),
+            auth_required_resources=list(required_auth_resources),
         )
         self._process_runs[run_id] = run
 
@@ -4615,10 +5071,10 @@ class LoomApp(App):
                     run,
                     "Recommended extra tools: " + ", ".join(sorted(run.recommended_tools)),
                 )
-        if self._run_auth_profile_overrides:
+        if run.auth_profile_overrides:
             rendered = ", ".join(
                 f"{selector}={profile_id}"
-                for selector, profile_id in sorted(self._run_auth_profile_overrides.items())
+                for selector, profile_id in sorted(run.auth_profile_overrides.items())
             )
             self._append_process_run_activity(run, f"Run auth overrides: {rendered}")
         if run.task_id:
@@ -4681,7 +5137,13 @@ class LoomApp(App):
                     "_approval_mode": "disabled",
                     "_process_override": run.process_defn,
                     "_read_roots": [str(self._workspace.resolve())],
-                    "_auth_profile_overrides": dict(self._run_auth_profile_overrides),
+                    "_auth_profile_overrides": dict(
+                        getattr(run, "auth_profile_overrides", self._run_auth_profile_overrides),
+                    ),
+                    "_auth_required_resources": list(
+                        getattr(run, "auth_required_resources", []),
+                    ),
+                    "_auth_workspace": str(self._workspace.resolve()),
                     "_resume_task_id": str(run.task_id or "").strip(),
                     "_progress_callback": (
                         lambda data, rid=run_id: self._on_process_progress_event(
@@ -4901,7 +5363,7 @@ class LoomApp(App):
         if not text.startswith("/"):
             return "", []
         # Keep dynamic process slash commands in sync as the user types.
-        self._refresh_process_command_index()
+        self._refresh_process_command_index(background=True)
         token = text.split()[0].lower()
         if token == "/":
             return token, self._slash_command_catalog()
@@ -5047,7 +5509,7 @@ class LoomApp(App):
 
     def _slash_completion_candidates(self, token: str) -> list[str]:
         """Return slash command completions for a token prefix."""
-        self._refresh_process_command_index()
+        self._refresh_process_command_index(background=True)
         if token == "/":
             builtins = [spec.canonical for spec in _SLASH_COMMANDS]
             dynamic = sorted(self._process_command_map)
@@ -5084,7 +5546,7 @@ class LoomApp(App):
         base = "/process use"
         seed = f"{base} {prefix}" if prefix else base
 
-        self._refresh_process_command_index()
+        self._refresh_process_command_index(background=True)
         available = self._cached_process_catalog
 
         candidates: list[str] = []
@@ -5112,7 +5574,7 @@ class LoomApp(App):
             return None
 
         prefix = (match.group("prefix") or "").strip()
-        self._refresh_process_command_index()
+        self._refresh_process_command_index(background=True)
         available = self._cached_process_catalog
 
         if not available:
@@ -5292,7 +5754,7 @@ class LoomApp(App):
                 ):
                     return Orchestrator(
                         model_router=router,
-                        tool_registry=_create_tools(),
+                        tool_registry=_create_tools(config),
                         memory_manager=MemoryManager(db),
                         prompt_assembler=PromptAssembler(),
                         state_manager=TaskStateManager(data_dir),
@@ -5340,6 +5802,7 @@ class LoomApp(App):
             store=self._store,
             session_id=session_id,
             model_retry_policy=self._model_retry_policy(),
+            tool_exposure_mode=self._cowork_tool_exposure_mode(),
             enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
             ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
             ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
@@ -5377,6 +5840,7 @@ class LoomApp(App):
             approver=approver,
             store=self._store,
             model_retry_policy=self._model_retry_policy(),
+            tool_exposure_mode=self._cowork_tool_exposure_mode(),
             enable_filetype_ingest_router=self._cowork_enable_filetype_ingest_router(),
             ingest_artifact_retention_max_age_days=self._cowork_ingest_artifact_retention_max_age_days(),
             ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
@@ -5583,7 +6047,9 @@ class LoomApp(App):
             return
         event.stop()
         event.prevent_default()
-        self.push_screen(FileViewerScreen(selected, self._workspace))
+        self.push_screen(
+            FileViewerScreen(selected, self._workspace, defer_heavy_load=True)
+        )
 
     async def _handle_slash_command(self, text: str) -> bool:
         """Handle slash commands. Returns True if handled."""
@@ -5939,9 +6405,35 @@ class LoomApp(App):
                     return True
                 try:
                     alias = ensure_valid_alias(rest)
+                    from loom.auth.resources import (
+                        cleanup_deleted_resource,
+                        resource_delete_impact,
+                    )
+
+                    impact = await asyncio.to_thread(
+                        resource_delete_impact,
+                        workspace=self._workspace,
+                        resource_kind="mcp",
+                        resource_key=alias,
+                    )
                     await asyncio.to_thread(manager.remove_server, alias)
+                    await asyncio.to_thread(
+                        cleanup_deleted_resource,
+                        workspace=self._workspace,
+                        explicit_auth_path=self._explicit_auth_path,
+                        resource_kind="mcp",
+                        resource_key=alias,
+                    )
                     await self._reload_mcp_runtime()
-                    chat.add_info(f"MCP server '{alias}' removed.")
+                    impact_text = ""
+                    if impact.resource_id:
+                        impact_text = (
+                            " "
+                            f"(auth cleanup: {len(impact.active_profile_ids)} profile(s), "
+                            f"{len(impact.active_binding_ids)} binding(s), "
+                            f"default={'yes' if impact.workspace_default_profile_id else 'no'})"
+                        )
+                    chat.add_info(f"MCP server '{alias}' removed.{impact_text}")
                 except Exception as e:
                     chat.add_info(f"[bold #f7768e]{e}[/]")
                 return True
@@ -5965,6 +6457,14 @@ class LoomApp(App):
                 resolve_auth_write_path,
                 set_workspace_auth_default,
                 upsert_auth_profile,
+            )
+            from loom.auth.resources import (
+                bind_resource_to_profile,
+                default_workspace_auth_resources_path,
+                has_active_binding,
+                load_workspace_auth_resources,
+                resolve_resource,
+                set_workspace_resource_default,
             )
             from loom.auth.runtime import AuthResolutionError, parse_auth_profile_overrides
 
@@ -6012,6 +6512,8 @@ class LoomApp(App):
                             f"  {profile.profile_id}: provider={profile.provider} "
                             f"mode={profile.mode}{label}"
                         )
+                        if profile.mcp_server:
+                            lines[-1] = lines[-1] + f" mcp_server={profile.mcp_server}"
 
                 defaults = {
                     selector: profile_id
@@ -6063,6 +6565,7 @@ class LoomApp(App):
                     f"  provider: {profile.provider}",
                     f"  mode: {profile.mode}",
                     f"  label: {profile.account_label or '-'}",
+                    f"  mcp_server: {profile.mcp_server or '-'}",
                     f"  secret_ref: {profile.secret_ref or '-'}",
                     f"  token_ref: {profile.token_ref or '-'}",
                     f"  env_keys: {env_keys}",
@@ -6100,6 +6603,16 @@ class LoomApp(App):
                     if selector != profile.provider:
                         errors.append(
                             f"default {selector!r} must match provider {profile.provider!r}"
+                        )
+                mcp_aliases = set(self._config.mcp.servers.keys())
+                for profile in profiles.values():
+                    mcp_server = str(getattr(profile, "mcp_server", "") or "").strip()
+                    if not mcp_server:
+                        continue
+                    if mcp_server not in mcp_aliases:
+                        errors.append(
+                            f"profile {profile.profile_id!r} references unknown "
+                            f"mcp_server {mcp_server!r}"
                         )
                 for selector, profile_id in sorted(self._run_auth_profile_overrides.items()):
                     profile = profiles.get(profile_id)
@@ -6161,9 +6674,34 @@ class LoomApp(App):
                         "Select MCP accounts via MCP aliases in /mcp.[/]"
                     )
                     return True
-                if selector != profile.provider:
+                resource_store = await asyncio.to_thread(
+                    load_workspace_auth_resources,
+                    default_workspace_auth_resources_path(self._workspace.resolve()),
+                )
+                resolved_resource = None
+                if ":" in selector:
+                    resolved_resource = resolve_resource(
+                        resource_store,
+                        resource_ref=selector,
+                    )
+                elif selector in resource_store.resources:
+                    resolved_resource = resolve_resource(
+                        resource_store,
+                        resource_id=selector,
+                    )
+                if resolved_resource is None and selector != profile.provider:
                     chat.add_info(
-                        "[bold #f7768e]Selector must match profile provider.[/]"
+                        "[bold #f7768e]Selector must match profile provider "
+                        "or a known resource selector.[/]"
+                    )
+                    return True
+                if (
+                    resolved_resource is not None
+                    and profile.provider != resolved_resource.provider
+                ):
+                    chat.add_info(
+                        "[bold #f7768e]Profile provider does not match resource provider: "
+                        f"{profile.provider!r} != {resolved_resource.provider!r}.[/]"
                     )
                     return True
                 self._run_auth_profile_overrides[selector] = profile_id
@@ -6215,9 +6753,66 @@ class LoomApp(App):
                         "Select MCP accounts via MCP aliases in /mcp.[/]"
                     )
                     return True
+                resources_path = default_workspace_auth_resources_path(
+                    self._workspace.resolve()
+                )
+                resource_store = await asyncio.to_thread(
+                    load_workspace_auth_resources,
+                    resources_path,
+                )
+                resolved_resource = None
+                if ":" in selector:
+                    resolved_resource = resolve_resource(
+                        resource_store,
+                        resource_ref=selector,
+                    )
+                elif selector in resource_store.resources:
+                    resolved_resource = resolve_resource(
+                        resource_store,
+                        resource_id=selector,
+                    )
+
+                if resolved_resource is not None:
+                    if profile.provider != resolved_resource.provider:
+                        chat.add_info(
+                            "[bold #f7768e]Profile provider does not match resource provider: "
+                            f"{profile.provider!r} != {resolved_resource.provider!r}.[/]"
+                        )
+                        return True
+                    try:
+                        if not has_active_binding(
+                            resource_store,
+                            resource_id=resolved_resource.resource_id,
+                            profile_id=profile_id,
+                        ):
+                            await asyncio.to_thread(
+                                bind_resource_to_profile,
+                                resources_path,
+                                resource_id=resolved_resource.resource_id,
+                                profile_id=profile_id,
+                                generated_from=f"slash:auth-select:{selector}",
+                                priority=0,
+                            )
+                        await asyncio.to_thread(
+                            set_workspace_resource_default,
+                            resources_path,
+                            resource_id=resolved_resource.resource_id,
+                            profile_id=profile_id,
+                        )
+                    except Exception as e:
+                        chat.add_info(f"[bold #f7768e]{e}[/]")
+                        return True
+                    chat.add_info(
+                        "Workspace resource default set: "
+                        f"{resolved_resource.resource_ref} -> {profile_id}\n"
+                        f"[dim]{resources_path}[/dim]"
+                    )
+                    return True
+
                 if selector != profile.provider:
                     chat.add_info(
-                        "[bold #f7768e]Selector must match profile provider.[/]"
+                        "[bold #f7768e]Selector must match profile provider "
+                        "or a known resource selector.[/]"
                     )
                     return True
 
@@ -6245,6 +6840,41 @@ class LoomApp(App):
                         self._render_slash_command_usage("/auth unset", "<selector>")
                     )
                     return True
+                resources_path = default_workspace_auth_resources_path(
+                    self._workspace.resolve()
+                )
+                resource_store = await asyncio.to_thread(
+                    load_workspace_auth_resources,
+                    resources_path,
+                )
+                resolved_resource = None
+                if ":" in clean_selector:
+                    resolved_resource = resolve_resource(
+                        resource_store,
+                        resource_ref=clean_selector,
+                    )
+                elif clean_selector in resource_store.resources:
+                    resolved_resource = resolve_resource(
+                        resource_store,
+                        resource_id=clean_selector,
+                    )
+                if resolved_resource is not None:
+                    try:
+                        await asyncio.to_thread(
+                            set_workspace_resource_default,
+                            resources_path,
+                            resource_id=resolved_resource.resource_id,
+                            profile_id=None,
+                        )
+                    except Exception as e:
+                        chat.add_info(f"[bold #f7768e]{e}[/]")
+                        return True
+                    chat.add_info(
+                        "Workspace resource default removed: "
+                        f"{resolved_resource.resource_ref}\n"
+                        f"[dim]{resources_path}[/dim]"
+                    )
+                    return True
                 defaults_path = self._auth_defaults_path()
                 try:
                     await asyncio.to_thread(
@@ -6270,6 +6900,7 @@ class LoomApp(App):
                             (
                                 "<profile-id> --provider <provider> --mode <mode> "
                                 "[--label <text>] [--secret-ref <ref>] "
+                                "[--mcp-server <alias>] "
                                 "[--token-ref <ref>] [--scope <scope>] "
                                 "[--env KEY=VALUE] [--command <cmd>] "
                                 "[--auth-check <token>] [--meta KEY=VALUE]"
@@ -6292,6 +6923,7 @@ class LoomApp(App):
                 provider = ""
                 mode = ""
                 label = ""
+                mcp_server = ""
                 secret_ref = ""
                 token_ref = ""
                 scopes: list[str] = []
@@ -6306,6 +6938,7 @@ class LoomApp(App):
                         "--provider",
                         "--mode",
                         "--label",
+                        "--mcp-server",
                         "--secret-ref",
                         "--token-ref",
                         "--scope",
@@ -6326,6 +6959,8 @@ class LoomApp(App):
                             mode = value
                         elif item == "--label":
                             label = value
+                        elif item == "--mcp-server":
+                            mcp_server = value
                         elif item == "--secret-ref":
                             secret_ref = value
                         elif item == "--token-ref":
@@ -6369,6 +7004,7 @@ class LoomApp(App):
                         provider=provider.strip(),
                         mode=mode.strip(),
                         account_label=label.strip(),
+                        mcp_server=mcp_server.strip(),
                         secret_ref=secret_ref.strip(),
                         token_ref=token_ref.strip(),
                         scopes=[str(scope).strip() for scope in scopes if str(scope).strip()],
@@ -6405,7 +7041,9 @@ class LoomApp(App):
                             "/auth edit",
                             (
                                 "<profile-id> [--provider <provider>] [--mode <mode>] "
-                                "[--label <text>] [--secret-ref <ref>] [--token-ref <ref>] "
+                                "[--label <text>] [--mcp-server <alias>] "
+                                "[--clear-mcp-server] "
+                                "[--secret-ref <ref>] [--token-ref <ref>] "
                                 "[--scope <scope>] [--clear-scopes] "
                                 "[--env KEY=VALUE] [--clear-env] "
                                 "[--command <cmd>] [--auth-check <token>] "
@@ -6429,6 +7067,8 @@ class LoomApp(App):
                 provider: str | None = None
                 mode: str | None = None
                 label: str | None = None
+                mcp_server: str | None = None
+                clear_mcp_server = False
                 secret_ref: str | None = None
                 token_ref: str | None = None
                 scopes: list[str] = []
@@ -6445,12 +7085,15 @@ class LoomApp(App):
                     item = args_tokens[index]
                     if item in {
                         "--clear-scopes",
+                        "--clear-mcp-server",
                         "--clear-env",
                         "--clear-auth-check",
                         "--clear-meta",
                     }:
                         if item == "--clear-scopes":
                             clear_scopes = True
+                        elif item == "--clear-mcp-server":
+                            clear_mcp_server = True
                         elif item == "--clear-env":
                             clear_env = True
                         elif item == "--clear-auth-check":
@@ -6463,6 +7106,7 @@ class LoomApp(App):
                         "--provider",
                         "--mode",
                         "--label",
+                        "--mcp-server",
                         "--secret-ref",
                         "--token-ref",
                         "--scope",
@@ -6483,6 +7127,8 @@ class LoomApp(App):
                             mode = value
                         elif item == "--label":
                             label = value
+                        elif item == "--mcp-server":
+                            mcp_server = value
                         elif item == "--secret-ref":
                             secret_ref = value
                         elif item == "--token-ref":
@@ -6510,6 +7156,8 @@ class LoomApp(App):
                     provider is None
                     and mode is None
                     and label is None
+                    and mcp_server is None
+                    and not clear_mcp_server
                     and secret_ref is None
                     and token_ref is None
                     and not scopes
@@ -6554,6 +7202,13 @@ class LoomApp(App):
                             for scope in scopes
                             if str(scope).strip()
                         ]
+                    next_mcp_server = (
+                        ""
+                        if clear_mcp_server
+                        else current.mcp_server
+                    )
+                    if mcp_server is not None:
+                        next_mcp_server = mcp_server.strip()
                     next_env = {} if clear_env else dict(current.env)
                     next_env.update(env_updates)
                     next_auth_check = (
@@ -6577,6 +7232,7 @@ class LoomApp(App):
                             current.account_label
                             if label is None else label.strip()
                         ),
+                        mcp_server=next_mcp_server,
                         secret_ref=(
                             current.secret_ref
                             if secret_ref is None else secret_ref.strip()
@@ -7189,6 +7845,9 @@ class LoomApp(App):
                     len(event.tool_calls),
                     event.tokens_used,
                     event.model,
+                    tokens_per_second=event.tokens_per_second,
+                    latency_ms=event.latency_ms,
+                    total_time_ms=event.total_time_ms,
                 )
                 events_panel.add_event(
                     _now_str(), "turn",
@@ -8128,7 +8787,7 @@ class LoomApp(App):
             return
         if command == "auth_add_prompt":
             self._prefill_user_input(
-                "/auth add <profile-id> --provider <provider> --mode <mode> "
+                "/auth add <profile-id> --provider <provider> --mode <mode> --mcp-server <alias> "
             )
             return
         if command == "learned_patterns":

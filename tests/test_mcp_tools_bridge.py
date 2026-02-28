@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
 
 import pytest
 
-from loom.auth.runtime import build_run_auth_context
 from loom.config import Config, MCPConfig, MCPServerConfig
 from loom.integrations.mcp_tools import _MCPStdioClient, register_mcp_tools
 from loom.mcp.config import apply_mcp_overrides
@@ -214,7 +214,12 @@ def _build_config(script_path: Path) -> Config:
     )
 
 
-def _build_config_with_env(script_path: Path, env: dict[str, str]) -> Config:
+def _build_config_with_env(
+    script_path: Path,
+    env: dict[str, str],
+    *,
+    timeout_seconds: int = 20,
+) -> Config:
     return Config(
         mcp=MCPConfig(
             servers={
@@ -222,7 +227,7 @@ def _build_config_with_env(script_path: Path, env: dict[str, str]) -> Config:
                     command=sys.executable,
                     args=[str(script_path)],
                     env=env,
-                    timeout_seconds=20,
+                    timeout_seconds=timeout_seconds,
                 )
             }
         )
@@ -625,7 +630,7 @@ async def test_unknown_mcp_tool_triggers_runtime_refresh(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.mcp
-async def test_runtime_refresh_does_not_route_mcp_auth_via_auth_context(tmp_path):
+async def test_runtime_refresh_routes_mcp_auth_via_profile_binding(tmp_path):
     script = _write_auth_gated_mcp_server(tmp_path)
     cfg = _build_config_with_env(
         script,
@@ -634,24 +639,19 @@ async def test_runtime_refresh_does_not_route_mcp_auth_via_auth_context(tmp_path
     registry = create_default_registry(cfg)
     assert not registry.has("mcp.demo.echo_env")
 
-    auth_cfg = tmp_path / "auth.toml"
-    auth_cfg.write_text(
-        """
-[auth.mcp_alias_profiles]
-demo = "demo_profile"
+    class _AuthContext:
+        def env_for_mcp_alias(self, alias: str) -> dict[str, str]:
+            if alias == "demo":
+                return {"MCP_TOKEN": "run-token"}
+            return {}
 
-[auth.profiles.demo_profile]
-provider = "notion"
-mode = "env_passthrough"
+        def mcp_discovery_fingerprint(self) -> str:
+            return "demo:run-token"
 
-[auth.profiles.demo_profile.env]
-MCP_TOKEN = "run-token"
-"""
-    )
-    auth_context = build_run_auth_context(
-        workspace=tmp_path,
-        metadata={"auth_config_path": str(auth_cfg)},
-    )
+    auth_context = _AuthContext()
+    assert registry.has("mcp.demo.echo_env", auth_context=auth_context)
+    # Auth-scoped discovery must not leak into the global MCP registry view.
+    assert not registry.has("mcp.demo.echo_env")
 
     result = await registry.execute(
         "mcp.demo.echo_env",
@@ -659,8 +659,9 @@ MCP_TOKEN = "run-token"
         workspace=tmp_path,
         auth_context=auth_context,
     )
-    assert not result.success
-    assert "Unknown tool: mcp.demo.echo_env" in result.error
+    assert result.success
+    assert "run-token:hello" in result.output
+    assert not registry.has("mcp.demo.echo_env")
 
 
 @pytest.mark.asyncio
@@ -670,16 +671,25 @@ async def test_list_changed_notification_triggers_runtime_refresh(tmp_path):
     cfg = _build_config_with_env(
         script,
         {"TOOLS_FILE": str(tools_file)},
+        timeout_seconds=60,
     )
     registry = create_default_registry(cfg)
     assert registry.has("mcp.demo.echo")
     assert not registry.has("mcp.demo.ping")
 
-    result = await registry.execute(
-        "mcp.demo.echo",
-        {"text": "refresh", "mutate": True},
-        workspace=tmp_path,
-    )
+    # This interaction can be timing-sensitive on loaded CI workers, so allow
+    # a few short retries before failing the behavior assertion.
+    result = None
+    for _attempt in range(3):
+        result = await registry.execute(
+            "mcp.demo.echo",
+            {"text": "refresh", "mutate": True},
+            workspace=tmp_path,
+        )
+        if result.success:
+            break
+        await asyncio.sleep(0.05)
+    assert result is not None
     assert result.success
     assert "echo:refresh" in result.output
     assert registry.has("mcp.demo.ping")

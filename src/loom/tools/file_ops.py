@@ -13,6 +13,7 @@ from loom.content import (
 from loom.content_utils import extract_docx_text, extract_pptx_text, get_image_dimensions
 from loom.tools.code_analysis import detect_language
 from loom.tools.registry import Tool, ToolContext, ToolResult
+from loom.utils.concurrency import run_blocking_io
 
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg"})
 _PDF_EXTENSION = ".pdf"
@@ -64,6 +65,9 @@ class ReadFileTool(Tool):
         return 10
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        return await run_blocking_io(self._execute_sync, args, ctx)
+
+    def _execute_sync(self, args: dict, ctx: ToolContext) -> ToolResult:
         if ctx.workspace is None:
             return ToolResult.fail("No workspace set")
 

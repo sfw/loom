@@ -10,6 +10,7 @@ import fnmatch
 from pathlib import Path
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
+from loom.utils.concurrency import run_blocking_io
 
 # Directories to always skip
 _SKIP_DIRS = frozenset({
@@ -53,6 +54,9 @@ class GlobFindTool(Tool):
     }
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        return await run_blocking_io(self._execute_sync, args, ctx)
+
+    def _execute_sync(self, args: dict, ctx: ToolContext) -> ToolResult:
         pattern = args.get("pattern", "")
         if not pattern:
             return ToolResult(success=False, output="No pattern provided.")

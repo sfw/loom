@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,11 +22,14 @@ from loom.state.memory import Database, MemoryManager
 from loom.state.task_state import Task, TaskStateManager, TaskStatus
 from loom.tools import create_default_registry
 from loom.tools.registry import ToolRegistry
+from loom.utils.latency import diagnostics_enabled, log_latency_event
 
 if TYPE_CHECKING:
     from loom.processes.schema import ProcessDefinition
 
 logger = logging.getLogger(__name__)
+_API_EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS = 0.5
+_API_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS = 0.05
 
 
 class Engine:
@@ -62,6 +66,10 @@ class Engine:
         self._runner_id = f"api-{uuid.uuid4().hex[:8]}"
         self._run_lease_seconds = 30
         self._run_heartbeat_interval_seconds = 10
+        if diagnostics_enabled():
+            probe_task = asyncio.create_task(self._monitor_event_loop_lag())
+            self._background_tasks.add(probe_task)
+            probe_task.add_done_callback(self._background_tasks.discard)
 
     async def shutdown(self) -> None:
         """Graceful cleanup."""
@@ -71,6 +79,22 @@ class Engine:
             await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
         await self.model_router.close()
         await self.database.close()
+
+    async def _monitor_event_loop_lag(self) -> None:
+        """Emit periodic API event-loop lag diagnostics when enabled."""
+        expected = time.monotonic() + _API_EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS
+        while True:
+            await asyncio.sleep(_API_EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS)
+            now = time.monotonic()
+            lag = max(0.0, now - expected)
+            if lag >= _API_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS:
+                log_latency_event(
+                    logger,
+                    event="api_event_loop_lag",
+                    duration_seconds=lag,
+                    fields={"threshold_ms": int(_API_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS * 1000)},
+                )
+            expected = now + _API_EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS
 
     def create_task_orchestrator(
         self, process: ProcessDefinition | None = None,
@@ -82,7 +106,10 @@ class Engine:
         """
         return Orchestrator(
             model_router=self.model_router,
-            tool_registry=create_default_registry(self.config),
+            tool_registry=create_default_registry(
+                self.config,
+                mcp_startup_mode="background",
+            ),
             memory_manager=self.memory_manager,
             prompt_assembler=PromptAssembler(),
             state_manager=self.state_manager,
@@ -382,7 +409,10 @@ async def create_engine(config: Config) -> Engine:
     model_router = ModelRouter.from_config(config)
 
     # Tools
-    tool_registry = create_default_registry(config)
+    tool_registry = create_default_registry(
+        config,
+        mcp_startup_mode="background",
+    )
 
     # Prompts
     prompt_assembler = PromptAssembler()
