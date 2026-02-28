@@ -320,7 +320,7 @@ def _launch_tui(
     from loom.tui.app import LoomApp
 
     ws = (workspace or Path.cwd()).resolve()
-    tools = create_default_registry(config)
+    tools = create_default_registry(config, mcp_startup_mode="background")
 
     # Resolve model — None triggers the TUI setup wizard
     provider = None
@@ -564,7 +564,7 @@ async def _prepare_server_run_payload(
     from loom.tui.app import LoomApp
 
     root_workspace = workspace.resolve()
-    tools = create_default_registry(config)
+    tools = create_default_registry(config, mcp_startup_mode="background")
     helper = LoomApp(
         model=None,
         tools=tools,

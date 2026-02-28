@@ -121,7 +121,7 @@ class TestCLI:
         monkeypatch.setattr(main_mod, "_init_persistence", lambda _cfg: (None, None))
         monkeypatch.setattr(
             "loom.tools.create_default_registry",
-            lambda _config=None: MagicMock(),
+            lambda _config=None, **_kwargs: MagicMock(),
         )
         monkeypatch.setattr("loom.tui.app.LoomApp", DummyApp)
 

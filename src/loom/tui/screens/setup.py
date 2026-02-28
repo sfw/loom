@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -18,6 +21,9 @@ from loom.setup import (
     _generate_toml,
     discover_models,
 )
+from loom.utils.latency import log_latency_event
+
+logger = logging.getLogger(__name__)
 
 # Step indices
 _STEP_PROVIDER = 0
@@ -133,6 +139,8 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         self._utility_model: dict | None = None
         self._adding_utility: bool = False
         self._discovered_models: list[str] = []
+        self._discover_request_id: int = 0
+        self._discover_inflight: bool = False
 
     @property
     def _models(self) -> list[dict]:
@@ -338,6 +346,11 @@ class SetupScreen(ModalScreen[list[dict] | None]):
     def _update_discovery_button(self) -> None:
         """Enable discover button only when discovery prerequisites are met."""
         button = self.query_one("#btn-discover", Button)
+        if self._discover_inflight:
+            button.label = "Discovering..."
+            button.disabled = True
+            return
+        button.label = "Discover Models"
         button.disabled = not self._can_discover()
 
     def _configure_details_step(self) -> None:
@@ -351,6 +364,8 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         self.query_one("#details-provider-label", Label).update(
             f"Provider: {provider_display}"
         )
+        self._discover_request_id += 1
+        self._discover_inflight = False
         self._discovered_models = []
         self._set_selection_feedback("No model selected yet.")
 
@@ -471,6 +486,104 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             )
         return models
 
+    def _start_discover_models(
+        self,
+        *,
+        quiet: bool = False,
+        focus_model_after: bool = False,
+    ) -> None:
+        """Launch model discovery in a background worker."""
+        if self._discover_inflight:
+            return
+
+        base_url = self.query_one("#input-url", Input).value.strip()
+        api_key = self.query_one("#input-apikey", Input).value.strip()
+
+        if not base_url:
+            self._discovered_models = []
+            self._render_discovered_models([])
+            if not quiet:
+                self.notify("Base URL is required for discovery.", severity="warning")
+            return
+        if self._provider_key == "anthropic" and not api_key:
+            self._discovered_models = []
+            self._render_discovered_models([])
+            if not quiet:
+                self.notify(
+                    "Anthropic API key is required for discovery.",
+                    severity="warning",
+                )
+            return
+
+        self._discover_request_id += 1
+        request_id = self._discover_request_id
+        provider_key = self._provider_key
+        self._discover_inflight = True
+        self._set_selection_feedback("Discovering models...")
+        self._update_discovery_button()
+        self.query_one("#discovery-results", Static).update(
+            "Discovering models from endpoint..."
+        )
+
+        async def _discover_worker() -> None:
+            started = asyncio.get_running_loop().time()
+            try:
+                models = await asyncio.to_thread(
+                    discover_models,
+                    provider_key,
+                    base_url,
+                    api_key,
+                )
+            except Exception:
+                models = []
+            if request_id != self._discover_request_id:
+                return
+            try:
+                self._discovered_models = models
+                self._render_discovered_models(models)
+                if models:
+                    model_input = self.query_one("#input-model", Input)
+                    if not model_input.value.strip():
+                        model_input.value = models[0]
+                        self._model_name = models[0]
+                    selected = model_input.value.strip()
+                    if selected:
+                        self._set_selection_feedback(f"Selected model: {selected}")
+                    if focus_model_after:
+                        model_input.focus()
+                    if not quiet:
+                        self.notify(
+                            f"Discovered {len(models)} models.",
+                            severity="information",
+                        )
+                else:
+                    if focus_model_after:
+                        self.query_one("#input-model", Input).focus()
+                    if not quiet:
+                        self._set_selection_feedback(
+                            "No model discovered. Use manual model name."
+                        )
+                        self.notify(
+                            "No models discovered; enter model name manually.",
+                            severity="warning",
+                        )
+            finally:
+                if request_id == self._discover_request_id:
+                    self._discover_inflight = False
+                    self._update_discovery_button()
+                    log_latency_event(
+                        logger,
+                        event="setup_model_discovery",
+                        duration_seconds=asyncio.get_running_loop().time() - started,
+                        fields={"provider": provider_key, "models": len(self._discovered_models)},
+                    )
+
+        self.run_worker(
+            _discover_worker(),
+            group="setup-model-discovery",
+            exclusive=False,
+        )
+
     # ------------------------------------------------------------------
     # Key handling
     # ------------------------------------------------------------------
@@ -579,7 +692,7 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         """Attempt model discovery with the current endpoint fields."""
         if self._step != _STEP_DETAILS:
             return
-        self._discover_models()
+        self._start_discover_models()
 
     @on(Input.Changed, "#input-url")
     @on(Input.Changed, "#input-apikey")
@@ -587,6 +700,9 @@ class SetupScreen(ModalScreen[list[dict] | None]):
         """Invalidate discovery when endpoint/auth changes."""
         if self._step != _STEP_DETAILS:
             return
+        if self._discover_inflight:
+            self._discover_request_id += 1
+            self._discover_inflight = False
         if self._discovered_models:
             self._discovered_models = []
             self._set_selection_feedback(
@@ -621,11 +737,9 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             if apikey_input.display:
                 apikey_input.focus()
             else:
-                self._discover_models(quiet=True)
-                self.query_one("#input-model", Input).focus()
+                self._start_discover_models(quiet=True, focus_model_after=True)
         elif input_id == "input-apikey":
-            self._discover_models(quiet=True)
-            self.query_one("#input-model", Input).focus()
+            self._start_discover_models(quiet=True, focus_model_after=True)
         elif input_id == "input-model":
             self._collect_details()
 
@@ -645,9 +759,8 @@ class SetupScreen(ModalScreen[list[dict] | None]):
             self.query_one("#input-apikey", Input).focus()
             return
         if not self._model_name:
-            discovered = self._discover_models(quiet=True)
-            if discovered:
-                self._model_name = discovered[0]
+            if self._discovered_models:
+                self._model_name = self._discovered_models[0]
                 self.query_one("#input-model", Input).value = self._model_name
                 self._set_selection_feedback(
                     f"Auto-selected discovered model: {self._model_name}",
@@ -657,10 +770,16 @@ class SetupScreen(ModalScreen[list[dict] | None]):
                     severity="information",
                 )
             else:
-                self.notify(
-                    "Model name is required (discover or type manually).",
-                    severity="error",
-                )
+                if self._discover_inflight:
+                    self.notify(
+                        "Model discovery is in progress. Wait for results or enter a model name.",
+                        severity="warning",
+                    )
+                else:
+                    self.notify(
+                        "Model name is required (discover or type manually).",
+                        severity="error",
+                    )
                 self.query_one("#input-model", Input).focus()
                 return
 

@@ -86,6 +86,7 @@ from loom.state.task_state import (
 )
 from loom.tools.registry import ToolRegistry
 from loom.tools.workspace import ChangeLog
+from loom.utils.concurrency import run_blocking_io
 
 logger = logging.getLogger(__name__)
 
@@ -2823,7 +2824,11 @@ class Orchestrator:
         try:
             from loom.tools.code_analysis import analyze_directory
 
-            structures = analyze_directory(workspace_path, max_files=20)
+            structures = await run_blocking_io(
+                analyze_directory,
+                workspace_path,
+                max_files=20,
+            )
             if structures:
                 summaries = [s.to_summary() for s in structures]
                 parts.append("\n\n".join(summaries))
@@ -2832,8 +2837,9 @@ class Orchestrator:
 
         # --- Document / non-code file scan ---
         try:
-            doc_summary = await asyncio.get_event_loop().run_in_executor(
-                None, self._scan_workspace_documents, workspace_path,
+            doc_summary = await run_blocking_io(
+                self._scan_workspace_documents,
+                workspace_path,
             )
             if doc_summary:
                 parts.append(doc_summary)
@@ -2898,6 +2904,10 @@ class Orchestrator:
         Instead of code analysis, scans for file types specified
         in the process definition's workspace_analysis.scan_for.
         """
+        return await run_blocking_io(self._analyze_workspace_for_process_sync, workspace_path)
+
+    def _analyze_workspace_for_process_sync(self, workspace_path: Path) -> str:
+        """Sync implementation for process-specific workspace scan."""
         try:
             found_files: dict[str, list[str]] = {}
             for pattern in self._process.workspace_scan:

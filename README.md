@@ -178,6 +178,28 @@ For large fetched binaries/documents (PDFs, Office files, archives), tune
 `ingest_artifact_retention_max_files_per_scope`, and
 `ingest_artifact_retention_max_bytes_per_scope`.
 
+### Latency Diagnostics and Smoke Benchmarks
+
+Enable runtime latency diagnostics:
+
+```bash
+LOOM_LATENCY_DIAGNOSTICS=1 uv run loom
+```
+
+This emits low-overhead timing lines for key paths (event-loop lag probes,
+MCP discovery/refresh, process index refresh, setup discovery, and API task
+preflight timing).
+
+Run local startup/discovery latency smoke checks:
+
+```bash
+uv run python scripts/latency_smoke.py
+uv run python scripts/latency_smoke.py --iterations 5 --workspace /path/to/workspace
+```
+
+The script reports mean/p50/p95 timings for process catalog scan and tool
+registry creation with sync vs background MCP startup modes.
+
 ## Auth Profiles and Run-Time Resolution
 
 Loom stores credential metadata (not plaintext secrets) in `~/.loom/auth.toml`.

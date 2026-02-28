@@ -6,6 +6,7 @@ import os
 import re
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
+from loom.utils.concurrency import run_blocking_io
 
 # Directories to always exclude from listings
 EXCLUDED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache"}
@@ -43,6 +44,9 @@ class SearchFilesTool(Tool):
         return 30
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        return await run_blocking_io(self._execute_sync, args, ctx)
+
+    def _execute_sync(self, args: dict, ctx: ToolContext) -> ToolResult:
         if ctx.workspace is None:
             return ToolResult.fail("No workspace set")
 
@@ -129,6 +133,9 @@ class ListDirectoryTool(Tool):
         return 10
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        return await run_blocking_io(self._execute_sync, args, ctx)
+
+    def _execute_sync(self, args: dict, ctx: ToolContext) -> ToolResult:
         if ctx.workspace is None:
             return ToolResult.fail("No workspace set")
 

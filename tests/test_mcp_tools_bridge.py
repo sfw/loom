@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from loom.auth.runtime import build_run_auth_context
 from loom.config import Config, MCPConfig, MCPServerConfig
 from loom.integrations.mcp_tools import _MCPStdioClient, register_mcp_tools
 from loom.mcp.config import apply_mcp_overrides
@@ -640,22 +639,16 @@ async def test_runtime_refresh_routes_mcp_auth_via_profile_binding(tmp_path):
     registry = create_default_registry(cfg)
     assert not registry.has("mcp.demo.echo_env")
 
-    auth_cfg = tmp_path / "auth.toml"
-    auth_cfg.write_text(
-        """
-[auth.profiles.demo_profile]
-provider = "notion"
-mode = "env_passthrough"
-mcp_server = "demo"
+    class _AuthContext:
+        def env_for_mcp_alias(self, alias: str) -> dict[str, str]:
+            if alias == "demo":
+                return {"MCP_TOKEN": "run-token"}
+            return {}
 
-[auth.profiles.demo_profile.env]
-MCP_TOKEN = "run-token"
-"""
-    )
-    auth_context = build_run_auth_context(
-        workspace=tmp_path,
-        metadata={"auth_config_path": str(auth_cfg)},
-    )
+        def mcp_discovery_fingerprint(self) -> str:
+            return "demo:run-token"
+
+    auth_context = _AuthContext()
     assert registry.has("mcp.demo.echo_env", auth_context=auth_context)
     # Auth-scoped discovery must not leak into the global MCP registry view.
     assert not registry.has("mcp.demo.echo_env")

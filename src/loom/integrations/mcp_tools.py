@@ -23,6 +23,7 @@ from typing import Any
 
 from loom.config import MCPConfig, MCPServerConfig
 from loom.tools.registry import Tool, ToolContext, ToolRegistry, ToolResult
+from loom.utils.latency import log_latency_event
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ _SAFE_SEGMENT = re.compile(r"[^a-zA-Z0-9_-]+")
 _DEFAULT_TIMEOUT_SECONDS = 30
 _MIN_TIMEOUT_SECONDS = 5
 _MAX_TIMEOUT_SECONDS = 120
+_DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 2
 _ENV_REF_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 
@@ -41,6 +43,20 @@ def _sanitize_segment(raw: str, fallback: str) -> str:
 
 def _normalize_timeout_seconds(value: int) -> int:
     return max(_MIN_TIMEOUT_SECONDS, min(_MAX_TIMEOUT_SECONDS, int(value)))
+
+
+def _normalize_discovery_timeout_seconds(value: int) -> int:
+    return max(1, min(_MAX_TIMEOUT_SECONDS, int(value)))
+
+
+def _discovery_timeout_seconds() -> int:
+    raw = os.environ.get("LOOM_MCP_DISCOVERY_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_DISCOVERY_TIMEOUT_SECONDS
+    try:
+        return _normalize_discovery_timeout_seconds(int(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_DISCOVERY_TIMEOUT_SECONDS
 
 
 def _resolve_env_map(
@@ -372,10 +388,15 @@ class _MCPStdioClient:
         params: dict[str, Any] | None = None,
         *,
         env_overrides: dict[str, str] | None = None,
+        timeout_seconds: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
         process = self._spawn(env_overrides=env_overrides)
-        timeout_seconds = self._timeout_seconds()
-        deadline = time.monotonic() + timeout_seconds
+        timeout = (
+            _normalize_discovery_timeout_seconds(timeout_seconds)
+            if timeout_seconds is not None
+            else self._timeout_seconds()
+        )
+        deadline = time.monotonic() + timeout
         line_buffer = bytearray()
         try:
             if process.stdout is None:
@@ -465,11 +486,13 @@ class _MCPStdioClient:
         self,
         *,
         env_overrides: dict[str, str] | None = None,
+        timeout_seconds: int | None = None,
     ) -> list[dict[str, Any]]:
         response, _changed = self.request(
             "tools/list",
             {},
             env_overrides=env_overrides,
+            timeout_seconds=timeout_seconds,
         )
         tools_raw: Any
         if isinstance(response, dict) and "tools" in response:
@@ -610,18 +633,37 @@ def register_mcp_tools(
     registry: ToolRegistry,
     *,
     mcp_config: MCPConfig,
+    startup_mode: str = "sync",
 ) -> list[str]:
     """Discover/register MCP tools and install runtime refresh hook."""
     synchronizer = _MCPRegistrySynchronizer(
         registry=registry,
         mcp_config=mcp_config,
     )
-    registered = synchronizer.refresh(force=True)
     registry.set_mcp_refresh_hook(synchronizer.refresh, interval_seconds=15.0)
     registry.set_mcp_discovery_hook(synchronizer.discover, interval_seconds=15.0)
     # Keep a strong reference so the hook target isn't GC'ed.
     setattr(registry, "_mcp_synchronizer", synchronizer)
-    return registered
+
+    mode = str(startup_mode or "sync").strip().lower()
+    if mode not in {"sync", "background"}:
+        mode = "sync"
+    if mode == "background":
+        def _warmup() -> None:
+            try:
+                synchronizer.refresh(force=True)
+            except Exception as e:
+                logger.warning("Background MCP warmup failed: %s", e)
+
+        thread = threading.Thread(
+            target=_warmup,
+            name="loom-mcp-startup-warmup",
+            daemon=True,
+        )
+        thread.start()
+        return []
+
+    return synchronizer.refresh(force=True)
 
 
 class _MCPRegistrySynchronizer:
@@ -632,6 +674,7 @@ class _MCPRegistrySynchronizer:
         self._mcp_config = mcp_config
         self._lock = threading.Lock()
         self._clients: dict[str, _MCPStdioClient] = {}
+        self._discovery_timeout_seconds = _discovery_timeout_seconds()
 
     def _client_for(self, alias: str, server: MCPServerConfig) -> _MCPStdioClient:
         existing = self._clients.get(alias)
@@ -674,7 +717,10 @@ class _MCPRegistrySynchronizer:
                     )
                     continue
             try:
-                tools = client.list_tools(env_overrides=env_overrides)
+                tools = client.list_tools(
+                    env_overrides=env_overrides,
+                    timeout_seconds=self._discovery_timeout_seconds,
+                )
             except Exception as e:
                 logger.warning(
                     "Failed to discover MCP tools for %s: %s",
@@ -714,13 +760,15 @@ class _MCPRegistrySynchronizer:
     def refresh(self, *, force: bool = False, auth_context: Any = None) -> list[str]:
         """Reconcile MCP tools in-place and return active MCP tool names."""
         del force  # currently always reconciles; reserved for future policies
+        started = time.monotonic()
         with self._lock:
             discovered = self._discover(auth_context=auth_context)
             desired = set(discovered.keys())
-            current = {
-                name for name in self._registry._tools.keys()  # noqa: SLF001
-                if name.startswith("mcp.")
-            }
+            with self._registry._tools_lock:  # noqa: SLF001
+                current = {
+                    name for name in self._registry._tools.keys()  # noqa: SLF001
+                    if name.startswith("mcp.")
+                }
 
             # Remove stale MCP tools.
             for name in sorted(current - desired):
@@ -729,7 +777,8 @@ class _MCPRegistrySynchronizer:
             # Add new tools and replace changed schemas.
             for name in sorted(desired):
                 incoming = discovered[name]
-                existing = self._registry._tools.get(name)  # noqa: SLF001
+                with self._registry._tools_lock:  # noqa: SLF001
+                    existing = self._registry._tools.get(name)  # noqa: SLF001
                 if existing is None:
                     self._registry.register(incoming)
                     continue
@@ -737,12 +786,27 @@ class _MCPRegistrySynchronizer:
                     self._registry.exclude(name)
                     self._registry.register(incoming)
 
-            return sorted(desired)
+            names = sorted(desired)
+            log_latency_event(
+                logger,
+                event="mcp_registry_refresh",
+                duration_seconds=time.monotonic() - started,
+                fields={"tools": len(names)},
+            )
+            return names
 
     def discover(self, *, auth_context: Any = None) -> dict[str, MCPToolProxy]:
         """Return auth-scoped MCP discovery map without mutating global registry."""
+        started = time.monotonic()
         with self._lock:
-            return self._discover(
+            discovered = self._discover(
                 auth_context=auth_context,
                 enable_registry_refresh=False,
             )
+        log_latency_event(
+            logger,
+            event="mcp_registry_discover",
+            duration_seconds=time.monotonic() - started,
+            fields={"tools": len(discovered)},
+        )
+        return discovered

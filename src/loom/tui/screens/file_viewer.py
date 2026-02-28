@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import html as html_lib
 import io
@@ -38,6 +39,7 @@ _PATH_ONLY_EXTS = frozenset({
     ".pptx",
     *_IMAGE_EXTS,
 })
+_PREVIEW_LOAD_TIMEOUT_SECONDS = 8.0
 
 _CODE_LEXERS = {
     ".txt": "text",
@@ -359,14 +361,26 @@ class FileViewerScreen(ModalScreen[None]):
     }
     """
 
-    def __init__(self, path: Path, workspace: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        workspace: Path,
+        *,
+        defer_heavy_load: bool = False,
+    ) -> None:
         super().__init__()
         self._path = path
         self._workspace = workspace
         self._viewer: Widget | None = None
         self._error: str | None = None
         self._truncated = False
-        self._load_preview()
+        self._defer_heavy_load = bool(defer_heavy_load)
+        self._loading = False
+        self._load_request_id = 0
+        if self._defer_heavy_load:
+            self._loading = True
+        else:
+            self._load_preview()
 
     def _display_path(self) -> str:
         """Return a workspace-relative display path when possible."""
@@ -376,32 +390,105 @@ class FileViewerScreen(ModalScreen[None]):
             return str(self._path)
 
     def _load_preview(self) -> None:
+        """Resolve renderer and load file content into instance preview state."""
+        viewer, error, truncated = self._load_preview_state()
+        self._viewer = viewer
+        self._error = error
+        self._truncated = truncated
+
+    def _load_preview_state(self) -> tuple[Widget | None, str | None, bool]:
         """Resolve renderer and load file content into a preview widget."""
         renderer = resolve_file_renderer(self._path)
         if renderer is None:
             suffix = self._path.suffix or "<none>"
-            self._error = (
+            return (
+                None,
                 f"No viewer renderer registered for '{suffix}'. "
                 "Supported now: markdown, code/text, JSON, CSV/TSV, HTML, "
                 "diff/patch, docx, pptx, pdf, image metadata."
+                ,
+                False,
             )
-            return
 
         try:
             if self._path.suffix.lower() in _PATH_ONLY_EXTS:
-                self._viewer = renderer(self._path, None)
-                return
+                return renderer(self._path, None), None, False
 
             raw = self._path.read_bytes()
+            truncated = False
             if len(raw) > MAX_PREVIEW_BYTES:
                 raw = raw[:MAX_PREVIEW_BYTES]
-                self._truncated = True
+                truncated = True
             content = raw.decode("utf-8", errors="replace")
             content, char_truncated = _truncate_text(content, MAX_RENDER_CHARS)
-            self._truncated = self._truncated or char_truncated
-            self._viewer = renderer(self._path, content)
+            truncated = truncated or char_truncated
+            return renderer(self._path, content), None, truncated
         except Exception as e:
-            self._error = f"Failed to read file: {e}"
+            return None, f"Failed to read file: {e}", False
+
+    def _render_body(self) -> list[Widget]:
+        """Build body widgets for current loading/error/view state."""
+        if self._loading:
+            return [Static("[dim]Loading preview...[/dim]")]
+        if self._error:
+            return [Static(f"[bold #f7768e]Unable to preview file[/]\n{self._error}")]
+        widgets: list[Widget] = []
+        if self._truncated:
+            widgets.append(
+                Static(
+                    f"[dim]Preview truncated to first {MAX_PREVIEW_BYTES:,} bytes.[/dim]",
+                    id="file-viewer-note",
+                )
+            )
+        if self._viewer is not None:
+            widgets.append(self._viewer)
+        return widgets
+
+    def _apply_body_state(self) -> None:
+        """Refresh mounted body content after async load completes."""
+        body = self.query_one("#file-viewer-body", VerticalScroll)
+        for child in list(body.children):
+            child.remove()
+        for widget in self._render_body():
+            body.mount(widget)
+
+    async def on_mount(self) -> None:
+        if not self._loading:
+            return
+        self._load_request_id += 1
+        request_id = self._load_request_id
+
+        async def _load_worker() -> None:
+            try:
+                viewer, error, truncated = await asyncio.wait_for(
+                    asyncio.to_thread(self._load_preview_state),
+                    timeout=_PREVIEW_LOAD_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                viewer, error, truncated = (
+                    None,
+                    (
+                        "Preview timed out after "
+                        f"{_PREVIEW_LOAD_TIMEOUT_SECONDS:.1f}s."
+                    ),
+                    False,
+                )
+            except Exception as e:
+                viewer, error, truncated = None, f"Failed to read file: {e}", False
+            finally:
+                if request_id != self._load_request_id:
+                    return
+                self._viewer = viewer
+                self._error = error
+                self._truncated = truncated
+                self._loading = False
+                self._apply_body_state()
+
+        self.run_worker(
+            _load_worker(),
+            group="file-viewer-preview",
+            exclusive=True,
+        )
 
     def compose(self) -> ComposeResult:
         with Vertical(id="file-viewer-dialog"):
@@ -410,18 +497,7 @@ class FileViewerScreen(ModalScreen[None]):
                 id="file-viewer-title",
             )
             with VerticalScroll(id="file-viewer-body"):
-                if self._error:
-                    yield Static(
-                        f"[bold #f7768e]Unable to preview file[/]\n{self._error}"
-                    )
-                else:
-                    if self._truncated:
-                        yield Static(
-                            f"[dim]Preview truncated to first {MAX_PREVIEW_BYTES:,} bytes.[/dim]",
-                            id="file-viewer-note",
-                        )
-                    if self._viewer is not None:
-                        yield self._viewer
+                yield from self._render_body()
             yield Label("[dim]Esc or q: close[/dim]", id="file-viewer-footer")
 
     def action_close(self) -> None:

@@ -43,6 +43,7 @@ from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.state.task_state import Subtask
+from loom.utils.concurrency import run_blocking_io
 from loom.utils.tokens import estimate_tokens
 
 if TYPE_CHECKING:
@@ -3343,7 +3344,7 @@ class VerificationGates:
             "skipped_suffix_count": skipped_suffix_count,
         }
 
-    def _apply_placeholder_contradiction_guard(
+    async def _apply_placeholder_contradiction_guard(
         self,
         *,
         subtask: Subtask,
@@ -3371,10 +3372,41 @@ class VerificationGates:
             evidence_records=evidence_records,
             expected_deliverables=expected_deliverables,
         )
-        scan = self._scan_placeholder_markers(
-            workspace=workspace,
-            candidate_data=candidate_data,
-        )
+        raw_timeout = getattr(self._config, "contradiction_scan_timeout_seconds", 8.0)
+        scan_timeout_seconds = max(1.0, min(30.0, float(raw_timeout or 8.0)))
+        try:
+            scan = await asyncio.wait_for(
+                run_blocking_io(
+                    self._scan_placeholder_markers,
+                    workspace=workspace,
+                    candidate_data=candidate_data,
+                ),
+                timeout=scan_timeout_seconds,
+            )
+        except TimeoutError:
+            scan = {
+                "scan_mode": "targeted_plus_fallback",
+                "scanned_files": [],
+                "scanned_file_count": 0,
+                "scanned_total_bytes": 0,
+                "matched_files": [],
+                "matched_file_count": 0,
+                "coverage_sufficient": False,
+                "coverage_insufficient_reason": "scan_timeout",
+                "candidate_source_counts": {
+                    "canonical": 0,
+                    "current_attempt": 0,
+                    "prior_attempt": 0,
+                    "evidence_artifact": 0,
+                    "fallback": 0,
+                },
+                "cap_exhausted": True,
+                "cap_exhaustion_reason": "scan_timeout",
+                "skipped_large_file_count": 0,
+                "skipped_binary_file_count": 0,
+                "skipped_symlink_count": 0,
+                "skipped_suffix_count": 0,
+            }
         matched_file_count = int(scan.get("matched_file_count", 0) or 0)
         coverage_sufficient = bool(scan.get("coverage_sufficient", False))
         coverage_reason = str(scan.get("coverage_insufficient_reason", "") or "")
@@ -3848,7 +3880,7 @@ class VerificationGates:
             evidence_records=evidence_records,
             task_id=task_id,
         )
-        t2 = self._apply_placeholder_contradiction_guard(
+        t2 = await self._apply_placeholder_contradiction_guard(
             subtask=subtask,
             result=t2,
             workspace=workspace,

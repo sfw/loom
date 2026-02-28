@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
+from loom.utils.concurrency import run_blocking_io
 
 # --- Extractors per language ---
 
@@ -267,6 +268,9 @@ class AnalyzeCodeTool(Tool):
         return 15
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        return await run_blocking_io(self._execute_sync, args, ctx)
+
+    def _execute_sync(self, args: dict, ctx: ToolContext) -> ToolResult:
         if ctx.workspace is None:
             return ToolResult.fail("No workspace set")
 

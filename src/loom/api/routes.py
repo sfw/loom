@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -39,8 +41,10 @@ from loom.events.bus import Event
 from loom.state.memory import MemoryEntry
 from loom.state.task_state import SubtaskStatus, TaskStatus
 from loom.tools.workspace import validate_workspace
+from loom.utils.latency import log_latency_event
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _required_auth_resources_for_process(
@@ -97,6 +101,7 @@ def _get_engine(request: Request) -> Engine:
 @router.post("/tasks", response_model=TaskCreateResponse, status_code=201)
 async def create_new_task(request: Request, body: TaskCreateRequest):
     """Create and start a new task."""
+    started = time.monotonic()
     engine = _get_engine(request)
     effective_process = body.process or engine.config.process.default or None
 
@@ -109,6 +114,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
     # Resolve process definition if specified
     process_def = None
     if effective_process:
+        load_started = time.monotonic()
         from loom.processes.schema import ProcessLoader, ProcessNotFoundError
 
         extra = [Path(p) for p in engine.config.process.search_paths]
@@ -123,21 +129,34 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
             ),
         )
         try:
-            process_def = loader.load(effective_process)
+            process_def = await asyncio.to_thread(loader.load, effective_process)
+            log_latency_event(
+                logger,
+                event="api_task_process_load",
+                duration_seconds=time.monotonic() - load_started,
+                fields={"process": effective_process},
+            )
         except ProcessNotFoundError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
     registry_for_process: object | None = None
     # Validate required tools early so clients get immediate feedback.
     if process_def is not None:
+        preflight_started = time.monotonic()
         tools_cfg = getattr(process_def, "tools", None)
         required = list(getattr(tools_cfg, "required", []) or [])
         excluded = set(getattr(tools_cfg, "excluded", []) or [])
         from loom.tools import create_default_registry
 
-        registry_for_process = create_default_registry(engine.config)
+        registry_for_process = await asyncio.to_thread(
+            create_default_registry,
+            engine.config,
+        )
         if required:
-            available = set(registry_for_process.list_tools()) - excluded
+            available = (
+                set(await asyncio.to_thread(registry_for_process.list_tools))
+                - excluded
+            )
             missing = sorted(name for name in required if name not in available)
             if missing:
                 raise HTTPException(
@@ -147,11 +166,18 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
                         f"requires missing tool(s): {', '.join(missing)}"
                     ),
                 )
+        log_latency_event(
+            logger,
+            event="api_task_tool_preflight",
+            duration_seconds=time.monotonic() - preflight_started,
+            fields={"required": len(required)},
+        )
 
     metadata = body.metadata if isinstance(body.metadata, dict) else {}
     metadata = dict(metadata)
     metadata["process"] = effective_process or ""
-    required_auth_resources = _required_auth_resources_for_process(
+    required_auth_resources = await asyncio.to_thread(
+        _required_auth_resources_for_process,
         process_def,
         tool_registry=registry_for_process,
     )
@@ -204,6 +230,12 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         task=task,
         process=process_def,
         process_name=effective_process or "",
+    )
+    log_latency_event(
+        logger,
+        event="api_task_create",
+        duration_seconds=time.monotonic() - started,
+        fields={"has_process": bool(process_def)},
     )
 
     return TaskCreateResponse(

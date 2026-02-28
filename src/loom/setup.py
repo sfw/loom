@@ -7,6 +7,7 @@ Walks users through configuring their first model provider and writes
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -112,6 +113,7 @@ def discover_models(
     else:
         return []
 
+    deadline = time.monotonic() + max(0.1, float(timeout))
     with httpx.Client(
         base_url=normalized_base,
         headers=headers,
@@ -119,9 +121,13 @@ def discover_models(
         follow_redirects=True,
     ) as client:
         for endpoint in endpoints:
+            if time.monotonic() >= deadline:
+                break
             try:
                 response = client.get(endpoint)
             except httpx.HTTPError:
+                if time.monotonic() >= deadline:
+                    break
                 continue
             if response.status_code != 200:
                 continue
@@ -311,6 +317,7 @@ def _generate_toml(models: list[dict]) -> str:
         "max_loop_iterations = 50",
         "delegate_task_timeout_seconds = 3600",
         "auto_approve_confidence_threshold = 0.8",
+        'cowork_tool_exposure_mode = "adaptive"',
         "",
         "[verification]",
         "tier1_enabled = true",
