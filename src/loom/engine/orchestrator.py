@@ -431,7 +431,9 @@ class Orchestrator:
                         outcomes = [await self._dispatch_subtask(
                             task, batch[0], attempts_by_subtask,
                         )]
-                    except BaseException as item:
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as item:
                         outcomes = [
                             self._build_subtask_exception_outcome(batch[0], item),
                         ]
@@ -449,13 +451,17 @@ class Orchestrator:
                     )
                     outcomes = []
                     for i, item in enumerate(raw_outcomes):
-                        if isinstance(item, BaseException):
+                        if isinstance(item, asyncio.CancelledError):
+                            raise item
+                        if isinstance(item, Exception):
                             outcomes.append(
                                 self._build_subtask_exception_outcome(
                                     batch[i],
                                     item,
                                 ),
                             )
+                        elif isinstance(item, BaseException):
+                            raise item
                         else:
                             outcomes.append(item)
 

@@ -35,6 +35,7 @@ import shlex
 import textwrap
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -222,6 +223,9 @@ _WORKSPACE_SCAN_EXCLUDE_DIRS = frozenset({
 _PROCESS_STATUS_ICON = {
     "queued": "\u25cb",
     "running": "\u25c9",
+    "cancel_requested": "\u25c9",
+    "cancel_failed": "!",
+    "force_closed": "\u25a1",
     "completed": "\u2713",
     "failed": "\u2717",
     "cancelled": "\u25a0",
@@ -229,6 +233,9 @@ _PROCESS_STATUS_ICON = {
 _PROCESS_STATUS_LABEL = {
     "queued": "Queued",
     "running": "Running",
+    "cancel_requested": "Cancel Requested",
+    "cancel_failed": "Cancel Failed",
+    "force_closed": "Force Closed",
     "completed": "Completed",
     "failed": "Failed",
     "cancelled": "Cancelled",
@@ -253,6 +260,9 @@ _DEFAULT_TUI_FILES_PANEL_MAX_ROWS = 2000
 _DEFAULT_TUI_DELEGATE_PROGRESS_MAX_LINES = 150
 _DEFAULT_TUI_RUN_LAUNCH_HEARTBEAT_INTERVAL_MS = 6000
 _DEFAULT_TUI_RUN_LAUNCH_TIMEOUT_SECONDS = 300
+_DEFAULT_TUI_RUN_CLOSE_MODAL_TIMEOUT_SECONDS = 45
+_DEFAULT_TUI_RUN_CANCEL_WAIT_TIMEOUT_SECONDS = 10
+_DEFAULT_TUI_RUN_PROGRESS_REFRESH_INTERVAL_MS = 200
 _DEFAULT_TUI_RUN_PREFLIGHT_ASYNC_ENABLED = True
 _PROCESS_COMMAND_INDEX_REFRESH_INTERVAL_SECONDS = 2.0
 _EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS = 0.5
@@ -607,8 +617,12 @@ class ProcessRunPane(Vertical):
             return "#9ece6a"
         if status == "failed":
             return "#f7768e"
-        if status == "running":
+        if status == "cancel_failed":
+            return "#f7768e"
+        if status in {"running", "cancel_requested"}:
             return "#7dcfff"
+        if status == "force_closed":
+            return "#e0af68"
         return "#a9b1d6"
 
 
@@ -650,6 +664,9 @@ class ProcessRunState:
     launch_stage_heartbeat_dots: int = 0
     launch_stage_heartbeat_stage: str = ""
     launch_stage_activity_indices: dict[str, int] = field(default_factory=dict)
+    close_after_cancel: bool = False
+    cancel_requested_at: float = 0.0
+    progress_ui_last_refresh_at: float = 0.0
 
 
 @dataclass
@@ -825,7 +842,11 @@ class LoomApp(App):
         self._adhoc_package_doc_cache: str | None = None
         self._sidebar_cowork_tasks: list[dict] = []
         self._process_close_hint_shown = False
-        self._close_process_tab_inflight = False
+        self._close_process_tab_inflight: set[str] = set()
+        self._process_run_cancel_handlers: dict[
+            str,
+            Callable[..., Awaitable[dict | None]],
+        ] = {}
         self._auto_resume_workspace_on_init = True
         self._run_auth_profile_overrides: dict[str, str] = {}
         self._chat_replay_events: list[dict] = []
@@ -3332,9 +3353,9 @@ class LoomApp(App):
         await self._initialize_session()
 
     def _has_active_process_runs(self) -> bool:
-        """Return True when at least one run is queued/running."""
+        """Return True when at least one run is still active."""
         return any(
-            run.status in {"queued", "running"}
+            self._is_process_run_active_status(run.status)
             for run in self._process_runs.values()
         )
 
@@ -3955,6 +3976,39 @@ class LoomApp(App):
             value = float(default)
         return max(5.0, min(value, 600.0))
 
+    def _tui_run_close_modal_timeout_seconds(self) -> float:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_RUN_CLOSE_MODAL_TIMEOUT_SECONDS
+        if tui_cfg is None:
+            return float(default)
+        try:
+            value = float(getattr(tui_cfg, "run_close_modal_timeout_seconds", default))
+        except Exception:
+            value = float(default)
+        return max(5.0, min(value, 300.0))
+
+    def _tui_run_cancel_wait_timeout_seconds(self) -> float:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_RUN_CANCEL_WAIT_TIMEOUT_SECONDS
+        if tui_cfg is None:
+            return float(default)
+        try:
+            value = float(getattr(tui_cfg, "run_cancel_wait_timeout_seconds", default))
+        except Exception:
+            value = float(default)
+        return max(1.0, min(value, 120.0))
+
+    def _tui_run_progress_refresh_interval_seconds(self) -> float:
+        tui_cfg = getattr(self._config, "tui", None)
+        default = _DEFAULT_TUI_RUN_PROGRESS_REFRESH_INTERVAL_MS
+        if tui_cfg is None:
+            return default / 1000.0
+        try:
+            value_ms = int(getattr(tui_cfg, "run_progress_refresh_interval_ms", default))
+        except Exception:
+            value_ms = default
+        return max(0.05, min(value_ms, 2000) / 1000.0)
+
     def _tui_run_preflight_async_enabled(self) -> bool:
         tui_cfg = getattr(self._config, "tui", None)
         if tui_cfg is None:
@@ -4382,7 +4436,11 @@ class LoomApp(App):
             elif idx == current_idx:
                 if status == "failed":
                     row_status = "failed"
+                elif status == "cancel_failed":
+                    row_status = "failed"
                 elif status == "cancelled":
+                    row_status = "skipped"
+                elif status == "force_closed":
                     row_status = "skipped"
                 elif status == "completed":
                     row_status = "completed"
@@ -4401,11 +4459,29 @@ class LoomApp(App):
                 "status": "failed",
                 "content": f"Failed: {detail}",
             })
+        elif status == "cancel_failed":
+            rows.append({
+                "id": "stage:cancel-failed",
+                "status": "failed",
+                "content": "Cancellation timed out",
+            })
         elif status == "cancelled":
             rows.append({
                 "id": "stage:cancelled",
                 "status": "skipped",
                 "content": "Cancelled",
+            })
+        elif status == "force_closed":
+            rows.append({
+                "id": "stage:force-closed",
+                "status": "skipped",
+                "content": "Force-closed",
+            })
+        elif status == "cancel_requested":
+            rows.append({
+                "id": "stage:cancel-requested",
+                "status": "in_progress",
+                "content": "Cancellation requested",
             })
         return rows
 
@@ -4419,7 +4495,11 @@ class LoomApp(App):
         status = str(getattr(run, "status", "queued") or "queued").strip()
         if status == "failed":
             row_status = "failed"
+        elif status == "cancel_failed":
+            row_status = "failed"
         elif status == "cancelled":
+            row_status = "skipped"
+        elif status == "force_closed":
             row_status = "skipped"
         elif status == "completed":
             row_status = "completed"
@@ -4542,7 +4622,7 @@ class LoomApp(App):
         """Emit a periodic liveness heartbeat while launch/execution is active."""
         if getattr(run, "closed", False):
             return
-        if str(getattr(run, "status", "")) not in {"queued", "running"}:
+        if not self._is_process_run_active_status(str(getattr(run, "status", ""))):
             return
         stage = str(getattr(run, "launch_stage", "")).strip()
         if stage not in _PROCESS_RUN_HEARTBEAT_STAGES:
@@ -4806,6 +4886,7 @@ class LoomApp(App):
                     worker.cancel()
                 except Exception:
                     pass
+            self._clear_process_run_cancel_handler(str(getattr(run, "run_id", "")))
             pane_id = str(getattr(run, "pane_id", "") or "").strip()
             if tabs is not None and pane_id:
                 try:
@@ -4874,7 +4955,7 @@ class LoomApp(App):
             started_at = time.monotonic() - elapsed_seconds
             ended_at = (
                 None
-                if status in {"queued", "running"}
+                if self._is_process_run_active_status(status)
                 else time.monotonic()
             )
 
@@ -4961,7 +5042,7 @@ class LoomApp(App):
                 launch_tab_created_at=launch_tab_created_at,
             )
 
-            if run.status in {"queued", "running"}:
+            if self._is_process_run_active_status(run.status):
                 interrupted += 1
                 run.status = "failed"
                 run.ended_at = time.monotonic()
@@ -5038,7 +5119,7 @@ class LoomApp(App):
         """Periodic timer to refresh elapsed text for active process runs."""
         active = False
         for run in self._process_runs.values():
-            if run.status in {"queued", "running"}:
+            if self._is_process_run_active_status(run.status):
                 active = True
                 self._maybe_emit_process_run_heartbeat(run)
                 self._update_process_run_visuals(run)
@@ -5244,6 +5325,11 @@ class LoomApp(App):
             None,
         )
 
+    @staticmethod
+    def _is_process_run_active_status(status: str) -> bool:
+        state = str(status or "").strip().lower()
+        return state in {"queued", "running", "cancel_requested"}
+
     def _resolve_process_run_target(
         self, target: str,
     ) -> tuple[ProcessRunState | None, str | None]:
@@ -5279,14 +5365,35 @@ class LoomApp(App):
             if not waiter.done():
                 waiter.set_result(bool(confirmed))
 
-        running = run.status in {"queued", "running"}
+        running = self._is_process_run_active_status(run.status)
         screen = ProcessRunCloseScreen(
             run_label=f"{run.process_name} #{run.run_id}",
             running=running,
         )
         self.push_screen(screen, callback=handle_result)
         try:
-            return await waiter
+            timeout = self._tui_run_close_modal_timeout_seconds()
+            return await asyncio.wait_for(waiter, timeout=timeout)
+        except TimeoutError:
+            try:
+                if screen is not None:
+                    screen.dismiss(False)
+            except Exception:
+                pass
+            logger.warning(
+                "process_close_confirm_timeout run_id=%s timeout_seconds=%s",
+                run.run_id,
+                int(timeout),
+            )
+            try:
+                chat = self.query_one("#chat-log", ChatLog)
+                chat.add_info(
+                    f"Close confirmation timed out for run [dim]{run.run_id}[/dim]. "
+                    "Please try Ctrl+W again."
+                )
+            except Exception:
+                pass
+            return False
         except asyncio.CancelledError:
             # If the close-flow worker is cancelled, dismiss the modal so the
             # UI doesn't end up blocked behind an orphaned confirmation screen.
@@ -5297,54 +5404,352 @@ class LoomApp(App):
                 pass
             raise
 
+    async def _confirm_force_close_process_run(
+        self,
+        run: ProcessRunState,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        """Prompt to force-close a run tab after cancellation does not settle."""
+        waiter: asyncio.Future[bool] = asyncio.Future()
+        screen = ProcessRunCloseScreen(
+            run_label=f"{run.process_name} #{run.run_id}",
+            running=False,
+            prompt_override=f"[bold #e0af68]Force close tab {run.process_name} #{run.run_id}?[/]",
+            detail_override=(
+                f"Cancellation has not settled after {int(max(1, timeout_seconds))}s. "
+                "The background run may still continue."
+            ),
+            confirm_label="Force Close Tab",
+            cancel_label="Keep Open",
+            confirm_variant="warning",
+        )
+
+        def handle_result(confirmed: bool) -> None:
+            if not waiter.done():
+                waiter.set_result(bool(confirmed))
+
+        self.push_screen(screen, callback=handle_result)
+        try:
+            timeout = self._tui_run_close_modal_timeout_seconds()
+            return await asyncio.wait_for(waiter, timeout=timeout)
+        except TimeoutError:
+            try:
+                screen.dismiss(False)
+            except Exception:
+                pass
+            logger.warning(
+                "process_force_close_confirm_timeout run_id=%s timeout_seconds=%s",
+                run.run_id,
+                int(timeout),
+            )
+            return False
+        except asyncio.CancelledError:
+            try:
+                screen.dismiss(False)
+            except Exception:
+                pass
+            raise
+
+    def _register_process_run_cancel_handler(self, run_id: str, payload: object) -> None:
+        """Store orchestrator-backed cancel callback for one process run."""
+        run = self._process_runs.get(run_id)
+        if run is None or run.closed:
+            return
+        if not isinstance(payload, dict):
+            return
+        cancel_cb = payload.get("cancel")
+        if callable(cancel_cb):
+            self._process_run_cancel_handlers[run_id] = cancel_cb
+        task_id = str(payload.get("task_id", "")).strip()
+        if task_id:
+            run.task_id = task_id
+            self._update_process_run_visuals(run)
+
+    def _clear_process_run_cancel_handler(self, run_id: str) -> None:
+        """Drop ephemeral cancel callback state for a run."""
+        self._process_run_cancel_handlers.pop(str(run_id or "").strip(), None)
+
+    async def _request_process_run_cancellation(self, run: ProcessRunState) -> dict:
+        """Request cancellation, preferring orchestrator cancel over worker fallback."""
+        run_id = str(getattr(run, "run_id", "")).strip()
+        handler_error = ""
+        handler = self._process_run_cancel_handlers.get(run_id)
+        if callable(handler):
+            try:
+                response = await handler(
+                    # Keep settle waiting centralized in TUI close flow to avoid
+                    # compounding bridge wait + UI wait into a longer hang window.
+                    wait_timeout_seconds=0.0,
+                )
+                if isinstance(response, dict):
+                    path = str(response.get("path", "orchestrator")).strip() or "orchestrator"
+                    status = str(response.get("status", "")).strip().lower()
+                    if status in {"completed", "failed", "cancelled"}:
+                        run.status = status
+                        if status != "running":
+                            run.ended_at = run.ended_at or time.monotonic()
+                    return {
+                        "requested": bool(response.get("requested", True)),
+                        "path": path,
+                        "error": str(response.get("error", "")).strip(),
+                        "timeout": bool(response.get("timeout", False)),
+                    }
+                return {
+                    "requested": True,
+                    "path": "orchestrator",
+                    "error": "",
+                    "timeout": False,
+                }
+            except Exception as e:
+                logger.warning("Process run cancel bridge failed for %s: %s", run_id, e)
+                handler_error = str(e)
+
+        worker = getattr(run, "worker", None)
+        if worker is not None and hasattr(worker, "cancel"):
+            try:
+                worker.cancel()
+                return {
+                    "requested": True,
+                    "path": "worker_fallback",
+                    "error": handler_error,
+                    "timeout": False,
+                }
+            except Exception as e:
+                error_text = str(e)
+                if handler_error:
+                    error_text = f"{handler_error}; fallback failed: {error_text}"
+                return {
+                    "requested": False,
+                    "path": "worker_fallback",
+                    "error": error_text,
+                    "timeout": False,
+                }
+        if handler_error:
+            return {
+                "requested": False,
+                "path": "orchestrator",
+                "error": handler_error,
+                "timeout": False,
+            }
+        return {
+            "requested": False,
+            "path": "none",
+            "error": "No cancellation path is available.",
+            "timeout": False,
+        }
+
+    async def _wait_for_process_run_terminal_state(
+        self,
+        run_id: str,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        """Wait for a run to reach terminal state after cancel is requested."""
+        timeout = max(0.1, float(timeout_seconds))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            run = self._process_runs.get(run_id)
+            if run is None or getattr(run, "closed", False):
+                return True
+            status = str(getattr(run, "status", "") or "").strip().lower()
+            if status in {"completed", "failed", "cancelled", "cancel_failed", "force_closed"}:
+                return True
+            await asyncio.sleep(0.1)
+        return False
+
+    async def _finalize_process_run_tab_close(
+        self,
+        run: ProcessRunState,
+        *,
+        tabs: TabbedContent,
+        cancel_worker: bool = False,
+    ) -> bool:
+        """Remove run tab + state and release transient close/cancel handlers."""
+        if run.closed and run.run_id not in self._process_runs:
+            return False
+        run.closed = True
+        if cancel_worker:
+            worker = getattr(run, "worker", None)
+            if worker is not None and hasattr(worker, "cancel"):
+                try:
+                    worker.cancel()
+                except Exception:
+                    pass
+        try:
+            await tabs.remove_pane(run.pane_id)
+        except Exception:
+            pass
+        self._process_runs.pop(run.run_id, None)
+        self._clear_process_run_cancel_handler(run.run_id)
+        self._refresh_sidebar_progress_summary()
+        await self._persist_process_run_ui_state()
+        if not tabs.active:
+            tabs.active = "tab-chat"
+        return True
+
     async def _close_process_run(self, run: ProcessRunState) -> bool:
-        """Close a process run tab; active runs are marked failed/cancelled."""
+        """Close a process run tab with cancel-first semantics for active runs."""
         if run.closed:
             return False
         chat = self.query_one("#chat-log", ChatLog)
         events_panel = self.query_one("#events-panel", EventPanel)
         tabs = self.query_one("#tabs", TabbedContent)
 
-        if not await self._confirm_close_process_run(run):
-            return False
-
-        was_running = run.status in {"queued", "running"}
-        run.closed = True
+        was_running = self._is_process_run_active_status(run.status)
+        if not was_running:
+            if not await self._confirm_close_process_run(run):
+                return False
         if was_running:
-            run.status = "failed"
-            run.ended_at = time.monotonic()
-            self._append_process_run_activity(run, "Run cancelled: tab closed by user.")
-            self._append_process_run_result(
-                run, "Run cancelled: tab closed by user.", success=False,
+            run.close_after_cancel = True
+            run.cancel_requested_at = time.monotonic()
+            run.status = "cancel_requested"
+            self._append_process_run_activity(run, "Cancellation requested...")
+            self._update_process_run_visuals(run)
+            self._refresh_process_run_progress(run)
+            self._refresh_sidebar_progress_summary()
+
+            cancel_started_at = time.monotonic()
+            cancel_response = await self._request_process_run_cancellation(run)
+            cancel_path = str(cancel_response.get("path", "unknown")).strip() or "unknown"
+            cancel_error = str(cancel_response.get("error", "")).strip()
+            cancel_requested = bool(cancel_response.get("requested", False))
+            cancel_ack_seconds = max(0.0, time.monotonic() - cancel_started_at)
+            log_latency_event(
+                logger,
+                event="run_cancel_ack",
+                duration_seconds=cancel_ack_seconds,
+                fields={
+                    "run_id": str(getattr(run, "run_id", "")).strip(),
+                    "process": str(getattr(run, "process_name", "")).strip(),
+                    "run_cancel_ack_ms": int(cancel_ack_seconds * 1000),
+                    "run_cancel_path": cancel_path,
+                    "run_cancel_result": "requested" if cancel_requested else "request_failed",
+                    "run_cancel_error": cancel_error,
+                },
+            )
+            if cancel_error:
+                self._append_process_run_activity(
+                    run,
+                    f"Cancellation request failed via {cancel_path}: {cancel_error}",
+                )
+                chat.add_info(
+                    f"[bold #f7768e]Cancel request failed[/] for run "
+                    f"[dim]{run.run_id}[/dim] via {cancel_path}: {cancel_error}"
+                )
+            else:
+                self._append_process_run_activity(
+                    run,
+                    f"Cancellation requested via {cancel_path}.",
+                )
+                chat.add_info(
+                    f"Cancel requested for process run [dim]{run.run_id}[/dim] "
+                    f"via {cancel_path}."
+                )
+            events_panel.add_event(
+                _now_str(),
+                "process",
+                f"{run.process_name} #{run.run_id} cancel requested ({cancel_path})",
+            )
+
+            wait_timeout = self._tui_run_cancel_wait_timeout_seconds()
+            settled = False
+            if cancel_path == "worker_fallback" and not str(getattr(run, "task_id", "")).strip():
+                run.status = "cancelled"
+                run.ended_at = time.monotonic()
+                settled = True
+            elif not bool(cancel_response.get("timeout", False)):
+                settled = await self._wait_for_process_run_terminal_state(
+                    run.run_id,
+                    timeout_seconds=wait_timeout,
+                )
+            if settled:
+                log_latency_event(
+                    logger,
+                    event="run_cancel_settled",
+                    duration_seconds=max(0.0, time.monotonic() - run.cancel_requested_at),
+                    fields={
+                        "run_id": str(getattr(run, "run_id", "")).strip(),
+                        "process": str(getattr(run, "process_name", "")).strip(),
+                        "run_cancel_path": cancel_path,
+                        "run_cancel_result": "settled",
+                    },
+                )
+                closed = await self._finalize_process_run_tab_close(run, tabs=tabs)
+                if closed:
+                    chat.add_info(
+                        f"Closed process run tab [dim]{run.run_id}[/dim] "
+                        "after cancellation settled."
+                    )
+                return closed
+
+            run.status = "cancel_failed"
+            self._append_process_run_activity(
+                run,
+                f"Cancellation timed out after {int(wait_timeout)}s.",
+            )
+            log_latency_event(
+                logger,
+                event="run_cancel_wait_timeout",
+                duration_seconds=wait_timeout,
+                fields={
+                    "run_id": str(getattr(run, "run_id", "")).strip(),
+                    "process": str(getattr(run, "process_name", "")).strip(),
+                    "run_cancel_path": cancel_path,
+                    "run_cancel_result": "timeout",
+                },
             )
             self._update_process_run_visuals(run)
+            self._refresh_process_run_progress(run)
+            self._refresh_sidebar_progress_summary()
             events_panel.add_event(
                 _now_str(),
                 "process_err",
-                f"{run.process_name} #{run.run_id} cancelled",
+                f"{run.process_name} #{run.run_id} cancel timeout",
             )
             chat.add_info(
-                f"[bold #f7768e]Process run {run.run_id} cancelled:[/] tab closed."
+                f"[bold #e0af68]Cancel timed out[/] for run "
+                f"[dim]{run.run_id}[/dim]. You can keep waiting or force-close the tab."
             )
-            worker = run.worker
-            if worker is not None and hasattr(worker, "cancel"):
-                try:
-                    worker.cancel()
-                except Exception:
-                    pass
+            force_close = await self._confirm_force_close_process_run(
+                run,
+                timeout_seconds=wait_timeout,
+            )
+            if not force_close:
+                run.close_after_cancel = False
+                return False
+            run.status = "force_closed"
+            run.ended_at = time.monotonic()
+            self._append_process_run_activity(
+                run,
+                "Force-close selected; tab closed while run may still be finishing.",
+            )
+            self._update_process_run_visuals(run)
+            closed = await self._finalize_process_run_tab_close(
+                run,
+                tabs=tabs,
+                cancel_worker=True,
+            )
+            log_latency_event(
+                logger,
+                event="run_force_close",
+                duration_seconds=max(0.0, time.monotonic() - run.cancel_requested_at),
+                fields={
+                    "run_id": str(getattr(run, "run_id", "")).strip(),
+                    "process": str(getattr(run, "process_name", "")).strip(),
+                    "run_cancel_path": cancel_path,
+                    "run_cancel_result": "force_closed",
+                },
+            )
+            if closed:
+                chat.add_info(
+                    f"[bold #e0af68]Force-closed[/] process run tab "
+                    f"[dim]{run.run_id}[/dim]."
+                )
+            return closed
         else:
             chat.add_info(f"Closed process run tab [dim]{run.run_id}[/dim].")
-
-        try:
-            await tabs.remove_pane(run.pane_id)
-        except Exception:
-            pass
-        self._process_runs.pop(run.run_id, None)
-        self._refresh_sidebar_progress_summary()
-        await self._persist_process_run_ui_state()
-        if not tabs.active:
-            tabs.active = "tab-chat"
-        return True
+            return await self._finalize_process_run_tab_close(run, tabs=tabs)
 
     async def _close_process_run_from_target(self, target: str) -> bool:
         """Resolve and close a process run from /run close target syntax."""
@@ -5420,7 +5825,7 @@ class LoomApp(App):
 
         chat = self.query_one("#chat-log", ChatLog)
         events_panel = self.query_one("#events-panel", EventPanel)
-        if run.status in {"queued", "running"}:
+        if self._is_process_run_active_status(run.status):
             chat.add_info(
                 f"Run [dim]{run.run_id}[/dim] is already active and cannot be {verb_denied}."
             )
@@ -5442,6 +5847,10 @@ class LoomApp(App):
         run.launch_stage_heartbeat_dots = 0
         run.launch_stage_heartbeat_stage = ""
         run.launch_stage_activity_indices = {}
+        run.close_after_cancel = False
+        run.cancel_requested_at = 0.0
+        run.progress_ui_last_refresh_at = 0.0
+        self._clear_process_run_cancel_handler(run.run_id)
         run.tasks, run.task_labels = self._resume_seed_task_rows(run)
         run.last_progress_message = ""
         run.last_progress_at = 0.0
@@ -5784,7 +6193,7 @@ class LoomApp(App):
 
         active_runs = sum(
             1 for run in self._process_runs.values()
-            if run.status in {"queued", "running"}
+            if self._is_process_run_active_status(run.status)
         )
         if active_runs >= _MAX_CONCURRENT_PROCESS_RUNS:
             chat.add_info(
@@ -6175,6 +6584,10 @@ class LoomApp(App):
         run.started_at = time.monotonic()
         run.ended_at = None
         run.launch_error = ""
+        run.close_after_cancel = False
+        run.cancel_requested_at = 0.0
+        run.progress_ui_last_refresh_at = 0.0
+        self._clear_process_run_cancel_handler(run_id)
         tab_created_at = float(getattr(run, "launch_tab_created_at", 0.0) or 0.0)
         if tab_created_at > 0:
             tab_to_delegate = max(0.0, run.started_at - tab_created_at)
@@ -6224,6 +6637,15 @@ class LoomApp(App):
                             data, run_id=rid,
                         )
                     ),
+                    "_register_cancel_handler": (
+                        lambda payload, rid=run_id: self._register_process_run_cancel_handler(
+                            rid,
+                            payload,
+                        )
+                    ),
+                    "_clear_cancel_handler": (
+                        lambda rid=run_id: self._clear_process_run_cancel_handler(rid)
+                    ),
                 },
                 workspace=run.run_workspace,
             )
@@ -6247,8 +6669,13 @@ class LoomApp(App):
             delegated_status = ""
             if isinstance(data, dict):
                 delegated_status = str(data.get("status", "")).strip().lower()
-            failed_terminal_status = delegated_status in {"failed", "cancelled"}
-            run_succeeded = bool(result.success) and not failed_terminal_status
+            delegated_failed = delegated_status == "failed"
+            delegated_cancelled = delegated_status == "cancelled"
+            run_succeeded = (
+                bool(result.success)
+                and not delegated_failed
+                and not delegated_cancelled
+            )
 
             if run_succeeded:
                 output = result.output or "Process run completed."
@@ -6265,10 +6692,25 @@ class LoomApp(App):
                     _now_str(), "process_ok", f"{run.process_name} #{run.run_id}",
                 )
                 chat.add_info(f"Process run [dim]{run.run_id}[/dim] completed.")
+            elif delegated_cancelled:
+                detail = result.output or "Process run cancelled."
+                run.status = "cancelled"
+                run.ended_at = time.monotonic()
+                run.launch_error = "Process run cancelled."
+                self._log_terminal_stage_duration(run, terminal_state="cancelled")
+                run.launch_last_progress_at = time.monotonic()
+                self._append_process_run_result(run, detail, success=False)
+                self._refresh_process_run_progress(run)
+                self._update_process_run_visuals(run)
+                self._refresh_sidebar_progress_summary()
+                events_panel.add_event(
+                    _now_str(), "process_err", f"{run.process_name} #{run.run_id}",
+                )
+                chat.add_info(f"[bold #f7768e]Process run {run.run_id} cancelled.[/]")
             else:
-                if result.success and failed_terminal_status:
-                    detail = result.output or f"Process run {delegated_status}."
-                    error = f"Process run {delegated_status}."
+                if result.success and delegated_failed:
+                    detail = result.output or "Process run failed."
+                    error = "Process run failed."
                     self._append_process_run_result(run, detail, success=False)
                 else:
                     error = result.error or result.output or "Process run failed."
@@ -6321,6 +6763,7 @@ class LoomApp(App):
             self.notify(str(e), severity="error", timeout=5)
         finally:
             run.worker = None
+            self._clear_process_run_cancel_handler(run_id)
             await self._persist_process_run_ui_state()
 
     def _ensure_persistence_tools(self) -> None:
@@ -9817,21 +10260,32 @@ class LoomApp(App):
         if run is not None:
             if run.closed:
                 return
-            run.launch_last_progress_at = time.monotonic()
+            now = time.monotonic()
+            run.launch_last_progress_at = now
             run.launch_last_heartbeat_at = 0.0
             run.launch_silent_warning_emitted = False
+            event_type = str(data.get("event_type") or "")
+            task_status = str(data.get("status", "") or "").strip().lower()
+            if task_status == "cancelled":
+                run.status = "cancelled"
+                run.ended_at = run.ended_at or now
+                run.launch_error = "Process run cancelled."
+            elif task_status == "failed" and run.status == "cancel_requested":
+                run.status = "cancel_failed"
+                run.launch_error = "Cancellation timed out."
+            elif task_status == "running" and run.status == "cancel_failed":
+                run.status = "running"
+                run.launch_error = ""
+
             tasks = data.get("tasks", [])
             if isinstance(tasks, list):
                 normalized = self._normalize_process_run_tasks(run, tasks)
                 run.tasks = normalized
-                self._refresh_process_run_progress(run)
-                self._refresh_process_run_outputs(run)
 
             task_id = str(data.get("task_id", "")).strip()
             if task_id:
                 run.task_id = task_id
 
-            event_type = str(data.get("event_type") or "")
             if event_type == "tool_call_completed":
                 tool_name = str(data.get("event_data", {}).get("tool", "")).strip()
                 if self._is_mutating_tool(tool_name):
@@ -9848,15 +10302,43 @@ class LoomApp(App):
                 "subtask_failed",
                 "task_completed",
                 "task_failed",
+                "task_cancelled",
             }:
                 self._request_workspace_refresh(f"process:{event_type}")
 
-            self._update_process_run_visuals(run)
-            self._refresh_sidebar_progress_summary()
+            force_refresh_types = {
+                "task_planning",
+                "task_plan_ready",
+                "task_executing",
+                "task_replanning",
+                "task_completed",
+                "task_failed",
+                "task_cancelled",
+                "task_cancel_requested",
+                "task_cancel_ack",
+                "task_cancel_timeout",
+                "subtask_started",
+                "subtask_retrying",
+                "subtask_completed",
+                "subtask_failed",
+                "tool_call_completed",
+            }
+            refresh_due = event_type in force_refresh_types
+            if not refresh_due:
+                last_refresh = float(getattr(run, "progress_ui_last_refresh_at", 0.0) or 0.0)
+                refresh_due = (
+                    (now - last_refresh) >= self._tui_run_progress_refresh_interval_seconds()
+                )
+            if refresh_due:
+                self._refresh_process_run_progress(run)
+                self._refresh_process_run_outputs(run)
+                self._update_process_run_visuals(run)
+                self._refresh_sidebar_progress_summary()
+                run.progress_ui_last_refresh_at = now
+
             message = self._format_process_progress_event(data, run=run)
             if not message:
                 return
-            now = time.monotonic()
             if (
                 message == run.last_progress_message
                 and (now - run.last_progress_at) < 2.0
@@ -9895,6 +10377,7 @@ class LoomApp(App):
             "subtask_failed",
             "task_completed",
             "task_failed",
+            "task_cancelled",
         }:
             self._request_workspace_refresh(f"process:{event_type}")
         message = self._format_process_progress_event(data)
@@ -10385,6 +10868,16 @@ class LoomApp(App):
                     f"{attempt_suffix}: {reason}"
                 )
             return f"Stall recovery via {mode_label} failed{attempt_suffix}."
+        if event_type == "task_cancel_requested":
+            return "Cancellation requested."
+        if event_type == "task_cancel_ack":
+            return "Cancellation acknowledged by orchestrator."
+        if event_type == "task_cancel_timeout":
+            return "Cancellation wait timed out."
+        if event_type == "task_cancelled":
+            if mode == "cowork_delegate":
+                return "Delegated task cancelled."
+            return "Process run cancelled."
         if event_type == "task_completed":
             if mode == "cowork_delegate":
                 return "Delegated task completed."
@@ -10533,8 +11026,11 @@ class LoomApp(App):
             row_status = {
                 "queued": "pending",
                 "running": "in_progress",
+                "cancel_requested": "in_progress",
                 "completed": "completed",
                 "failed": "failed",
+                "cancel_failed": "failed",
+                "force_closed": "skipped",
                 "cancelled": "skipped",
             }.get(state, "pending")
             elapsed = self._format_elapsed(self._elapsed_seconds_for_run(run))
@@ -10955,15 +11451,20 @@ class LoomApp(App):
 
     def action_close_process_tab(self) -> None:
         """Close current process run tab with confirmation."""
-        if self._close_process_tab_inflight:
+        current = self._current_process_run()
+        close_key = current.run_id if current is not None else "current"
+        if close_key in self._close_process_tab_inflight:
             return
-        self._close_process_tab_inflight = True
+        self._close_process_tab_inflight.add(close_key)
 
         async def _close_current_tab() -> None:
             try:
-                await self._close_process_run_from_target("current")
+                if current is not None:
+                    await self._close_process_run(current)
+                else:
+                    await self._close_process_run_from_target("current")
             finally:
-                self._close_process_tab_inflight = False
+                self._close_process_tab_inflight.discard(close_key)
 
         try:
             self.run_worker(
@@ -10972,7 +11473,7 @@ class LoomApp(App):
                 exclusive=False,
             )
         except Exception:
-            self._close_process_tab_inflight = False
+            self._close_process_tab_inflight.discard(close_key)
             raise
 
     def action_tab_chat(self) -> None:

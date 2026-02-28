@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import time
@@ -2125,6 +2126,56 @@ class TestOrchestratorExecution:
 
         assert result.plan.subtasks[0].status == SubtaskStatus.COMPLETED
         assert result.plan.subtasks[0].summary != ""
+
+    @pytest.mark.asyncio
+    async def test_execute_task_reraises_cancelled_error_from_single_dispatch(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        task.plan = Plan(subtasks=[Subtask(id="s1", description="only")])
+
+        orch._dispatch_subtask = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await orch.execute_task(task, reuse_existing_plan=True)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_reraises_cancelled_error_from_parallel_gather(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_parallel_subtasks=2)),
+        )
+        task = _make_task()
+        task.plan = Plan(subtasks=[
+            Subtask(id="s1", description="first"),
+            Subtask(id="s2", description="second"),
+        ])
+
+        async def _dispatch(_task, subtask, _attempts):
+            if subtask.id == "s1":
+                raise asyncio.CancelledError()
+            return (
+                subtask,
+                SubtaskResult(status="success", summary="ok"),
+                VerificationResult(tier=1, passed=True),
+            )
+
+        orch._dispatch_subtask = AsyncMock(side_effect=_dispatch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await orch.execute_task(task, reuse_existing_plan=True)
 
 
 class TestOrchestratorFinalize:

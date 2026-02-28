@@ -141,6 +141,8 @@ class DelegateTaskTool(Tool):
         wait = args.get("wait", True)
         resume_task_id = str(args.get("_resume_task_id", "") or "").strip()
         progress_callback = args.get("_progress_callback")
+        register_cancel_handler = args.get("_register_cancel_handler")
+        clear_cancel_handler = args.get("_clear_cancel_handler")
         process_override = args.get("_process_override")
         approval_mode = str(
             args.get("_approval_mode", "confidence_threshold"),
@@ -273,6 +275,22 @@ class DelegateTaskTool(Tool):
                     e,
                 )
 
+        async def _invoke_optional_callback(callback: object, *cb_args: object) -> None:
+            if not callable(callback):
+                return
+            try:
+                maybe = callback(*cb_args)
+                if inspect.isawaitable(maybe):
+                    await maybe
+            except Exception:
+                logger.debug("delegate optional callback failed", exc_info=True)
+
+        def _task_status_text(task_obj: Task) -> str:
+            raw_status = getattr(task_obj, "status", "")
+            if hasattr(raw_status, "value"):
+                return str(raw_status.value).strip().lower()
+            return str(raw_status).strip().lower()
+
         _log_event(
             "meta",
             payload={
@@ -312,6 +330,117 @@ class DelegateTaskTool(Tool):
             except Exception:
                 pass
 
+        async def _cancel_orchestrator_task(
+            *,
+            wait_timeout_seconds: float = 0.0,
+        ) -> dict[str, object]:
+            timeout_seconds = max(0.0, float(wait_timeout_seconds or 0.0))
+            _log_event(
+                "task_cancel_requested",
+                payload={
+                    "path": "orchestrator",
+                    "timeout_seconds": timeout_seconds,
+                },
+            )
+            _emit_progress("task_cancel_requested", {"path": "orchestrator"})
+            cancel_fn = getattr(orchestrator, "cancel_task", None)
+            if not callable(cancel_fn):
+                error = "Orchestrator does not expose cancel_task."
+                _log_event(
+                    "task_cancel_failed",
+                    payload={"path": "orchestrator", "error": error},
+                )
+                _emit_progress(
+                    "task_cancel_ack",
+                    {"path": "orchestrator", "requested": False, "error": error},
+                )
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": error,
+                    "timeout": False,
+                }
+            try:
+                maybe = cancel_fn(task)
+                if inspect.isawaitable(maybe):
+                    await maybe
+            except Exception as e:
+                error = str(e)
+                _log_event(
+                    "task_cancel_failed",
+                    payload={
+                        "path": "orchestrator",
+                        "error_type": type(e).__name__,
+                        "error": error,
+                    },
+                )
+                _emit_progress(
+                    "task_cancel_ack",
+                    {"path": "orchestrator", "requested": False, "error": error},
+                )
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": error,
+                    "timeout": False,
+                }
+
+            _log_event("task_cancel_ack", payload={"path": "orchestrator"})
+            _emit_progress(
+                "task_cancel_ack",
+                {"path": "orchestrator", "requested": True},
+            )
+            if timeout_seconds <= 0:
+                return {
+                    "requested": True,
+                    "path": "orchestrator",
+                    "error": "",
+                    "timeout": False,
+                }
+
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                status = _task_status_text(task)
+                if status in {
+                    TaskStatus.CANCELLED.value,
+                    TaskStatus.COMPLETED.value,
+                    TaskStatus.FAILED.value,
+                }:
+                    return {
+                        "requested": True,
+                        "path": "orchestrator",
+                        "error": "",
+                        "timeout": False,
+                        "status": status,
+                    }
+                await asyncio.sleep(0.1)
+
+            _log_event(
+                "task_cancel_timeout",
+                payload={
+                    "path": "orchestrator",
+                    "timeout_seconds": timeout_seconds,
+                },
+            )
+            _emit_progress(
+                "task_cancel_timeout",
+                {"path": "orchestrator", "timeout_seconds": timeout_seconds},
+            )
+            return {
+                "requested": True,
+                "path": "orchestrator",
+                "error": "",
+                "timeout": True,
+            }
+
+        await _invoke_optional_callback(
+            register_cancel_handler,
+            {
+                "task_id": task.id,
+                "cancel": _cancel_orchestrator_task,
+            },
+        )
+
         def _flush_token_burst() -> None:
             nonlocal token_burst_count, token_burst_subtask, last_token_emit
             if token_burst_count <= 0:
@@ -339,6 +468,7 @@ class DelegateTaskTool(Tool):
                 SUBTASK_FAILED,
                 SUBTASK_RETRYING,
                 SUBTASK_STARTED,
+                TASK_CANCELLED,
                 TASK_COMPLETED,
                 TASK_EXECUTING,
                 TASK_FAILED,
@@ -370,6 +500,7 @@ class DelegateTaskTool(Tool):
                 SUBTASK_COMPLETED,
                 SUBTASK_FAILED,
                 TASK_REPLANNING,
+                TASK_CANCELLED,
                 TASK_COMPLETED,
                 TASK_FAILED,
                 TELEMETRY_RUN_SUMMARY,
@@ -419,6 +550,7 @@ class DelegateTaskTool(Tool):
                 )
             else:
                 asyncio.create_task(orchestrator.execute_task(task))
+            await _invoke_optional_callback(clear_cancel_handler)
             return ToolResult.ok(
                 f"Task submitted (async): {task.id}\n"
                 f"Goal: {goal}\n"
@@ -462,7 +594,7 @@ class DelegateTaskTool(Tool):
                 )
 
             if status_raw == TaskStatus.CANCELLED.value:
-                _emit_progress("task_failed", {"reason": "Task cancelled"})
+                _emit_progress("task_cancelled", {"reason": "Task cancelled"})
                 return ToolResult(
                     success=False,
                     output=summary,
@@ -479,6 +611,36 @@ class DelegateTaskTool(Tool):
                 files_changed=files_changed,
                 data=payload,
             )
+        except asyncio.CancelledError:
+            _log_event(
+                "task_cancel_requested",
+                payload={"path": "delegate_task_cancelled"},
+            )
+            cancel_fn = getattr(orchestrator, "cancel_task", None)
+            if callable(cancel_fn):
+                try:
+                    maybe = cancel_fn(task)
+                    if inspect.isawaitable(maybe):
+                        await maybe
+                    _log_event(
+                        "task_cancel_ack",
+                        payload={"path": "delegate_task_cancelled"},
+                    )
+                    _emit_progress(
+                        "task_cancel_ack",
+                        {"path": "delegate_task_cancelled", "requested": True},
+                    )
+                except Exception as e:
+                    _log_event(
+                        "task_cancel_failed",
+                        payload={
+                            "path": "delegate_task_cancelled",
+                            "error_type": type(e).__name__,
+                            "error": str(e),
+                        },
+                    )
+            _emit_progress("task_cancelled", {"reason": "delegate execution cancelled"})
+            raise
         except Exception as e:
             _log_event(
                 "delegate_exception",
@@ -493,6 +655,7 @@ class DelegateTaskTool(Tool):
                 )
             return ToolResult.fail(f"Task execution failed: {e}")
         finally:
+            await _invoke_optional_callback(clear_cancel_handler)
             if event_bus is not None and subscriptions:
                 for event_type, handler in subscriptions:
                     try:

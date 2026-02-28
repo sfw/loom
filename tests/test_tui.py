@@ -1383,6 +1383,100 @@ class TestDelegateTaskUnbound:
         assert payload["event_data"]["subtask_id"] == "company-screening"
 
     @pytest.mark.asyncio
+    async def test_delegate_registers_and_clears_cancel_handler(self):
+        from loom.state.task_state import TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        captured: dict[str, object] = {}
+        cleared: list[bool] = []
+
+        async def _execute(task):
+            task.status = TaskStatus.COMPLETED
+            return task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator.cancel_task = MagicMock()
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        def _register(payload):
+            captured.update(payload)
+
+        def _clear():
+            cleared.append(True)
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+        result = await tool.execute(
+            {
+                "goal": "Analyze Tesla",
+                "_register_cancel_handler": _register,
+                "_clear_cancel_handler": _clear,
+            },
+            ctx,
+        )
+
+        assert result.success is True
+        assert isinstance(result.data, dict)
+        assert captured.get("task_id") == result.data.get("task_id")
+        assert callable(captured.get("cancel"))
+        assert cleared == [True]
+
+    @pytest.mark.asyncio
+    async def test_delegate_cancel_handler_requests_orchestrator_cancel(self):
+        from loom.state.task_state import TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        gate = asyncio.Event()
+        cancel_holder: dict[str, object] = {}
+        registered = asyncio.Event()
+
+        async def _execute(task):
+            await gate.wait()
+            return task
+
+        def _cancel_task(task):
+            task.status = TaskStatus.CANCELLED
+            gate.set()
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator.cancel_task = MagicMock(side_effect=_cancel_task)
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        def _register(payload):
+            cancel_holder.update(payload)
+            registered.set()
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+        pending = asyncio.create_task(tool.execute(
+            {
+                "goal": "Analyze Tesla",
+                "_register_cancel_handler": _register,
+            },
+            ctx,
+        ))
+        await asyncio.wait_for(registered.wait(), timeout=1.0)
+
+        cancel_fn = cancel_holder.get("cancel")
+        assert callable(cancel_fn)
+        cancel_response = await cancel_fn(wait_timeout_seconds=0.2)
+        assert cancel_response["requested"] is True
+        assert cancel_response["path"] == "orchestrator"
+        assert cancel_response["timeout"] is False
+
+        result = await pending
+        assert result.success is False
+        assert result.error == "Task execution cancelled."
+        assert isinstance(result.data, dict)
+        assert result.data.get("status") == "cancelled"
+
+    @pytest.mark.asyncio
     async def test_delegate_creates_fresh_orchestrator_per_execute(self):
         from loom.state.task_state import TaskStatus
         from loom.tools.delegate_task import DelegateTaskTool
@@ -6066,6 +6160,66 @@ class TestProcessSlashCommands:
             "[bold #f7768e]Process run abc123 failed:[/] Process run failed."
         )
 
+    @pytest.mark.asyncio
+    async def test_execute_process_run_treats_cancelled_delegate_status_as_cancelled(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        process_defn = SimpleNamespace(name="market-research")
+        pane = MagicMock()
+        app._process_runs = {
+            "abc123": SimpleNamespace(
+                run_id="abc123",
+                process_name="market-research",
+                goal="Analyze market",
+                run_workspace=Path("/tmp/process-run"),
+                process_defn=process_defn,
+                pane_id="tab-run-abc123",
+                pane=pane,
+                status="queued",
+                task_id="",
+                started_at=0.0,
+                ended_at=None,
+                tasks=[],
+                task_labels={},
+                last_progress_message="",
+                last_progress_at=0.0,
+                worker=None,
+                closed=False,
+            ),
+        }
+        app._tools.execute = AsyncMock(return_value=SimpleNamespace(
+            success=False,
+            output='Task cancelled: "Analyze market"',
+            error="Task execution cancelled.",
+            data={"task_id": "cowork-1", "status": "cancelled", "tasks": []},
+        ))
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._refresh_workspace_tree = MagicMock()
+        app.notify = MagicMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        await app._execute_process_run("abc123")
+
+        run = app._process_runs["abc123"]
+        assert run.status == "cancelled"
+        chat.add_info.assert_any_call("[bold #f7768e]Process run abc123 cancelled.[/]")
+
     def test_build_process_run_context_includes_recent_cowork_messages(self):
         from loom.tui.app import LoomApp
 
@@ -6102,7 +6256,7 @@ class TestProcessSlashCommands:
         ]
 
     @pytest.mark.asyncio
-    async def test_close_process_run_cancelled_by_user_keeps_tab(self):
+    async def test_close_process_run_nonrunning_cancelled_by_user_keeps_tab(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -6116,7 +6270,7 @@ class TestProcessSlashCommands:
             process_name="investment-analysis",
             pane_id="tab-run-abc123",
             pane=pane,
-            status="running",
+            status="completed",
             started_at=0.0,
             ended_at=None,
             closed=False,
@@ -6149,10 +6303,11 @@ class TestProcessSlashCommands:
         assert run.closed is False
         tabs.remove_pane.assert_not_awaited()
         assert "abc123" in app._process_runs
+        app._confirm_close_process_run.assert_awaited_once_with(run)
         run.worker.cancel.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_close_process_run_running_marks_failed_and_cancels_worker(self):
+    async def test_close_process_run_running_requests_cancel_and_closes_after_settle(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -6168,13 +6323,22 @@ class TestProcessSlashCommands:
             pane_id="tab-run-abc123",
             pane=pane,
             status="running",
+            goal="Analyze Tesla",
             started_at=0.0,
             ended_at=None,
             closed=False,
             worker=worker,
+            task_id="cowork-1",
         )
         app._process_runs = {"abc123": run}
         app._confirm_close_process_run = AsyncMock(return_value=True)
+        app._request_process_run_cancellation = AsyncMock(return_value={
+            "requested": True,
+            "path": "orchestrator",
+            "error": "",
+            "timeout": False,
+        })
+        app._wait_for_process_run_terminal_state = AsyncMock(return_value=True)
         app._update_process_run_visuals = MagicMock()
         app._refresh_sidebar_progress_summary = MagicMock()
         chat = MagicMock()
@@ -6198,15 +6362,248 @@ class TestProcessSlashCommands:
 
         assert closed is True
         assert run.closed is True
-        assert run.status == "failed"
+        assert run.status == "cancel_requested"
+        app._confirm_close_process_run.assert_not_awaited()
+        pane.add_activity.assert_called()
+        pane.add_result.assert_not_called()
+        worker.cancel.assert_not_called()
+        app._request_process_run_cancellation.assert_awaited_once_with(run)
+        app._wait_for_process_run_terminal_state.assert_awaited_once()
+        tabs.remove_pane.assert_awaited_once_with("tab-run-abc123")
+        assert "abc123" not in app._process_runs
+        messages = [call.args[0] for call in chat.add_info.call_args_list]
+        assert any("Cancel requested" in msg for msg in messages)
+        assert any("after cancellation settled" in msg for msg in messages)
+
+    @pytest.mark.asyncio
+    async def test_close_process_run_queued_bypasses_confirm_and_closes_via_worker_fallback(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        worker = MagicMock()
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="investment-analysis",
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="queued",
+            goal="Analyze Tesla",
+            started_at=0.0,
+            ended_at=None,
+            closed=False,
+            worker=worker,
+            task_id="",
+        )
+        app._process_runs = {"abc123": run}
+        app._confirm_close_process_run = AsyncMock(return_value=False)
+        app._request_process_run_cancellation = AsyncMock(return_value={
+            "requested": True,
+            "path": "worker_fallback",
+            "error": "",
+            "timeout": False,
+        })
+        app._wait_for_process_run_terminal_state = AsyncMock(return_value=False)
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+        tabs = MagicMock()
+        tabs.remove_pane = AsyncMock()
+        tabs.active = "tab-chat"
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#tabs":
+                return tabs
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        closed = await app._close_process_run(run)
+
+        assert closed is True
+        assert run.closed is True
+        assert run.status == "cancelled"
+        app._confirm_close_process_run.assert_not_awaited()
+        app._request_process_run_cancellation.assert_awaited_once_with(run)
+        app._wait_for_process_run_terminal_state.assert_not_awaited()
+        tabs.remove_pane.assert_awaited_once_with("tab-run-abc123")
+        assert "abc123" not in app._process_runs
+        worker.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_request_process_run_cancellation_bridge_uses_immediate_ack_wait(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        worker = MagicMock()
+        run = SimpleNamespace(
+            run_id="abc123",
+            status="running",
+            worker=worker,
+            closed=False,
+            ended_at=None,
+        )
+        app._process_runs = {"abc123": run}
+        observed: dict[str, float] = {}
+
+        async def _cancel_handler(**kwargs):
+            observed["wait_timeout_seconds"] = float(
+                kwargs.get("wait_timeout_seconds", -1.0),
+            )
+            return {
+                "requested": True,
+                "path": "orchestrator",
+                "error": "",
+                "timeout": False,
+                "status": "cancelled",
+            }
+
+        app._process_run_cancel_handlers["abc123"] = _cancel_handler
+
+        result = await app._request_process_run_cancellation(run)
+
+        assert result["requested"] is True
+        assert result["path"] == "orchestrator"
+        assert observed["wait_timeout_seconds"] == 0.0
+        assert run.status == "cancelled"
         assert run.ended_at is not None
-        pane.add_activity.assert_called_once()
-        pane.add_result.assert_called_once()
+        worker.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_process_run_cancel_timeout_keeps_tab_when_force_close_declined(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        worker = MagicMock()
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="investment-analysis",
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="running",
+            goal="Analyze Tesla",
+            started_at=0.0,
+            ended_at=None,
+            closed=False,
+            worker=worker,
+            task_id="cowork-1",
+        )
+        app._process_runs = {"abc123": run}
+        app._confirm_close_process_run = AsyncMock(return_value=True)
+        app._request_process_run_cancellation = AsyncMock(return_value={
+            "requested": True,
+            "path": "orchestrator",
+            "error": "",
+            "timeout": True,
+        })
+        app._confirm_force_close_process_run = AsyncMock(return_value=False)
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+        tabs = MagicMock()
+        tabs.remove_pane = AsyncMock()
+        tabs.active = "tab-chat"
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#tabs":
+                return tabs
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        closed = await app._close_process_run(run)
+
+        assert closed is False
+        assert run.closed is False
+        assert run.status == "cancel_failed"
+        worker.cancel.assert_not_called()
+        tabs.remove_pane.assert_not_awaited()
+        assert "abc123" in app._process_runs
+        app._confirm_force_close_process_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_close_process_run_cancel_timeout_force_closes_with_worker_cancel(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        pane = MagicMock()
+        worker = MagicMock()
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="investment-analysis",
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="running",
+            goal="Analyze Tesla",
+            started_at=0.0,
+            ended_at=None,
+            closed=False,
+            worker=worker,
+            task_id="cowork-1",
+        )
+        app._process_runs = {"abc123": run}
+        app._confirm_close_process_run = AsyncMock(return_value=True)
+        app._request_process_run_cancellation = AsyncMock(return_value={
+            "requested": True,
+            "path": "orchestrator",
+            "error": "",
+            "timeout": True,
+        })
+        app._confirm_force_close_process_run = AsyncMock(return_value=True)
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        chat = MagicMock()
+        events_panel = MagicMock()
+        tabs = MagicMock()
+        tabs.remove_pane = AsyncMock()
+        tabs.active = "tab-chat"
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#tabs":
+                return tabs
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        closed = await app._close_process_run(run)
+
+        assert closed is True
+        assert run.closed is True
+        assert run.status == "force_closed"
         worker.cancel.assert_called_once()
         tabs.remove_pane.assert_awaited_once_with("tab-run-abc123")
         assert "abc123" not in app._process_runs
-        chat.add_info.assert_called_once()
-        assert "cancelled" in chat.add_info.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_persist_process_run_ui_state_serializes_run_tabs(self):
@@ -8375,11 +8772,11 @@ class TestCommandPaletteProcessActions:
         assert app.run_worker.call_count == 1
         assert captured["kwargs"]["group"] == "close-process-tab"
         assert captured["kwargs"]["exclusive"] is False
-        assert app._close_process_tab_inflight is True
+        assert "current" in app._close_process_tab_inflight
 
         await captured["coro"]
         app._close_process_run_from_target.assert_awaited_once_with("current")
-        assert app._close_process_tab_inflight is False
+        assert "current" not in app._close_process_tab_inflight
 
     def test_action_close_process_tab_ignores_reentry(self):
         from loom.tui.app import LoomApp
@@ -8402,6 +8799,7 @@ class TestCommandPaletteProcessActions:
         app.action_close_process_tab()
 
         assert app.run_worker.call_count == 1
+        assert "current" in app._close_process_tab_inflight
         # Close pending coroutine to avoid unawaited coroutine warnings.
         first_coro["coro"].close()
 
