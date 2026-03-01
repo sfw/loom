@@ -5,12 +5,16 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from loom.config import Config, MCPConfig, MCPServerConfig, load_config
 from loom.mcp.config import (
     MCPConfigManager,
+    MCPConfigManagerError,
     load_mcp_file,
     load_merged_mcp_config,
     redact_server_env,
+    redact_server_headers,
 )
 
 
@@ -94,6 +98,64 @@ def test_redaction_preserves_env_references():
     redacted = redact_server_env(server)
     assert redacted["TOKEN"] == "<redacted>"
     assert redacted["REF"] == "${TOKEN}"
+
+
+def test_header_redaction_masks_sensitive_values():
+    server = replace(
+        _server("demo"),
+        headers={
+            "Authorization": "Bearer abc",
+            "X-Team": "analytics",
+            "X-Api-Key": "secret-key",
+        },
+    )
+    redacted = redact_server_headers(server)
+    assert redacted["Authorization"] == "<redacted>"
+    assert redacted["X-Api-Key"] == "<redacted>"
+    assert redacted["X-Team"] == "analytics"
+
+
+def test_load_mcp_file_rejects_insecure_remote_url_without_override(tmp_path: Path):
+    cfg = tmp_path / "mcp.toml"
+    cfg.write_text(
+        """
+[mcp.servers.remote]
+type = "remote"
+url = "http://example.com/mcp"
+"""
+    )
+    with pytest.raises(MCPConfigManagerError):
+        load_mcp_file(cfg)
+
+
+def test_manager_preserves_remote_fields_round_trip(tmp_path: Path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    explicit_mcp = tmp_path / "explicit.toml"
+    user_mcp = tmp_path / "user.toml"
+    manager = MCPConfigManager(
+        config=Config(),
+        workspace=workspace,
+        explicit_path=explicit_mcp,
+        user_path=user_mcp,
+    )
+    manager.add_server(
+        "remote_demo",
+        MCPServerConfig(
+            type="remote",
+            url="https://api.example.com/mcp",
+            headers={"Authorization": "${API_TOKEN}"},
+            allow_private_network=False,
+            allow_insecure_http=False,
+            timeout_seconds=40,
+            enabled=True,
+        ),
+    )
+    loaded = load_mcp_file(explicit_mcp).servers["remote_demo"]
+    assert loaded.type == "remote"
+    assert loaded.url == "https://api.example.com/mcp"
+    assert loaded.headers["Authorization"] == "${API_TOKEN}"
+    assert loaded.timeout_seconds == 40
 
 
 def test_manager_add_edit_remove_with_explicit_path(tmp_path: Path):
@@ -191,4 +253,3 @@ def test_edit_legacy_alias_writes_override_to_target(tmp_path: Path):
     view = manager.get_view("legacy_demo")
     assert view is not None
     assert view.source == "explicit"
-
