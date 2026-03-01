@@ -1152,32 +1152,45 @@ def auth_sync(ctx: click.Context, scope: str) -> None:
     manager = _mcp_manager(ctx, workspace=workspace)
     config = _effective_config(ctx, workspace=workspace)
     process_def = None
+    process_defs: list[object] = []
     clean_scope = str(scope or "active").strip().lower() or "active"
     if clean_scope == "active":
-        default_process = str(getattr(config.process, "default", "") or "").strip()
-        if default_process:
-            try:
-                from loom.processes.schema import ProcessLoader
+        try:
+            from loom.processes.schema import ProcessLoader
 
-                loader = ProcessLoader(
-                    workspace=workspace.resolve(),
-                    extra_search_paths=[Path(p) for p in config.process.search_paths],
-                    require_rule_scope_metadata=bool(
-                        getattr(config.process, "require_rule_scope_metadata", False),
-                    ),
-                    require_v2_contract=bool(
-                        getattr(config.process, "require_v2_contract", False),
-                    ),
-                )
-                process_def = loader.load(default_process)
-            except Exception as e:
-                click.echo(
-                    (
-                        "Auth sync warning: failed to load default process "
-                        f"{default_process!r}: {e}"
-                    ),
-                    err=True,
-                )
+            loader = ProcessLoader(
+                workspace=workspace.resolve(),
+                extra_search_paths=[Path(p) for p in config.process.search_paths],
+                require_rule_scope_metadata=bool(
+                    getattr(config.process, "require_rule_scope_metadata", False),
+                ),
+                require_v2_contract=bool(
+                    getattr(config.process, "require_v2_contract", False),
+                ),
+            )
+            seen_names: set[str] = set()
+            for item in loader.list_available():
+                process_name = str(item.get("name", "")).strip()
+                if not process_name or process_name in seen_names:
+                    continue
+                try:
+                    loaded = loader.load(process_name)
+                except Exception as e:
+                    click.echo(
+                        (
+                            "Auth sync warning: failed to load process "
+                            f"{process_name!r}: {e}"
+                        ),
+                        err=True,
+                    )
+                    continue
+                loaded_name = str(getattr(loaded, "name", "") or "").strip() or process_name
+                if loaded_name in seen_names:
+                    continue
+                process_defs.append(loaded)
+                seen_names.add(loaded_name)
+        except Exception as e:
+            click.echo(f"Auth sync warning: failed to list processes: {e}", err=True)
     try:
         registry = create_default_registry(config)
     except Exception:
@@ -1188,6 +1201,7 @@ def auth_sync(ctx: click.Context, scope: str) -> None:
             workspace=workspace,
             explicit_auth_path=ctx.obj.get("explicit_auth_path"),
             process_def=process_def,
+            process_defs=process_defs,
             tool_registry=registry,
             mcp_manager=manager,
             scope=clean_scope,

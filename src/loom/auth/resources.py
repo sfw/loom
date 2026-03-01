@@ -760,19 +760,43 @@ def _make_discovered_resource(
     )
 
 
+def _mcp_view_uses_external_auth(view: object) -> bool:
+    """Best-effort heuristic for MCP aliases that manage auth outside Loom."""
+    server = getattr(view, "server", None)
+    command = str(getattr(server, "command", "") or "").strip().lower()
+    raw_args = getattr(server, "args", ())
+    args: list[str] = []
+    if isinstance(raw_args, list | tuple):
+        args = [str(item).strip().lower() for item in raw_args if str(item).strip()]
+    if not command and not args:
+        return False
+    if command == "mcp-remote":
+        return True
+    return "mcp-remote" in args
+
+
 def discover_auth_resources(
     *,
     workspace: Path | None = None,
     process_def: object | None = None,
+    process_defs: list[object] | tuple[object, ...] | None = None,
     tool_registry: ToolRegistry | None = None,
     mcp_manager: MCPConfigManager | None = None,
     scope: str = "active",
 ) -> list[DiscoveredAuthResource]:
     """Discover auth resources from process requirements, tools, and MCP aliases."""
     raw_requirements: list[dict[str, object]] = []
-
+    process_candidates: list[object] = []
     if process_def is not None:
-        auth_block = getattr(process_def, "auth", None)
+        process_candidates.append(process_def)
+    if process_defs:
+        for item in process_defs:
+            if item is None:
+                continue
+            process_candidates.append(item)
+
+    for process_candidate in process_candidates:
+        auth_block = getattr(process_candidate, "auth", None)
         required = getattr(auth_block, "required", [])
         if isinstance(required, list):
             for item in required:
@@ -792,18 +816,19 @@ def discover_auth_resources(
                     if str(name).strip()
                 }
             else:
-                if process_def is not None:
-                    tools_cfg = getattr(process_def, "tools", None)
+                for process_candidate in process_candidates:
+                    tools_cfg = getattr(process_candidate, "tools", None)
                     excluded = {
                         str(item).strip()
                         for item in (getattr(tools_cfg, "excluded", []) or [])
                         if str(item).strip()
                     }
-                    tool_names = {
+                    allowed_names = {
                         str(name).strip()
                         for name in list_tools()
                         if str(name).strip() and str(name).strip() not in excluded
                     }
+                    tool_names.update(allowed_names)
             for tool_name in sorted(
                 tool_names
             ):
@@ -866,6 +891,13 @@ def discover_auth_resources(
                 alias = str(getattr(view, "alias", "")).strip()
                 if not alias:
                     continue
+                discovery_key = f"mcp:{alias}"
+                if (
+                    _mcp_view_uses_external_auth(view)
+                    and discovery_key not in discovered_by_key
+                ):
+                    # mcp-remote handles auth out-of-band; avoid misleading local drafts.
+                    continue
                 resource = DiscoveredAuthResource(
                     resource_kind="mcp",
                     resource_key=alias,
@@ -873,11 +905,11 @@ def discover_auth_resources(
                     provider=alias,
                     source="mcp",
                 )
-                existing = discovered_by_key.get(resource.discovery_key)
+                existing = discovered_by_key.get(discovery_key)
                 if existing is None:
-                    discovered_by_key[resource.discovery_key] = resource
+                    discovered_by_key[discovery_key] = resource
                 else:
-                    discovered_by_key[resource.discovery_key] = _merge(existing, resource)
+                    discovered_by_key[discovery_key] = _merge(existing, resource)
         except Exception:
             pass
 
@@ -1191,6 +1223,7 @@ def sync_missing_drafts(
     workspace: Path,
     explicit_auth_path: Path | None = None,
     process_def: object | None = None,
+    process_defs: list[object] | tuple[object, ...] | None = None,
     tool_registry: ToolRegistry | None = None,
     mcp_manager: MCPConfigManager | None = None,
     scope: str = "active",
@@ -1208,6 +1241,7 @@ def sync_missing_drafts(
     discovered = discover_auth_resources(
         workspace=ws,
         process_def=process_def,
+        process_defs=process_defs,
         tool_registry=tool_registry,
         mcp_manager=mcp_manager,
         scope=scope,

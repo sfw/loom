@@ -208,6 +208,10 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         color: $text-muted;
         margin-top: 0;
         margin-bottom: 1;
+        width: 1fr;
+        height: auto;
+        text-wrap: wrap;
+        overflow-x: hidden;
     }
     .auth-input {
         margin-top: 0;
@@ -228,6 +232,10 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
     #auth-manager-footer {
         margin-top: 1;
         color: $text-muted;
+        width: 1fr;
+        height: auto;
+        text-wrap: wrap;
+        overflow-x: hidden;
     }
     """
 
@@ -238,12 +246,14 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         explicit_auth_path=None,
         mcp_manager: MCPConfigManager | None = None,
         process_def: object | None = None,
+        process_defs: list[object] | tuple[object, ...] | None = None,
         tool_registry=None,
     ) -> None:
         super().__init__()
         self._workspace = workspace
         self._explicit_auth_path = explicit_auth_path
         self._process_def = process_def
+        self._process_defs = [item for item in (process_defs or []) if item is not None]
         self._tool_registry = tool_registry
         self._mcp_manager = mcp_manager or MCPConfigManager(
             config=None,
@@ -258,6 +268,7 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         self._resource_binding_by_profile: dict[str, str] = {}
         self._active_profile_id = ""
         self._active_provider = ""
+        self._discovery_process_names: list[str] = []
         self._baseline_form_state: dict[str, str] = {}
         self._form_dirty = False
         self._suppress_dirty_tracking = False
@@ -330,8 +341,8 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                     value=False,
                 )
                 yield Label(
-                    "When enabled, /run and /process use this profile by default "
-                    "for the provider in this workspace.",
+                    "When enabled, this profile is used by default for\n"
+                    "this provider in this workspace.",
                     classes="auth-help",
                 )
                 yield Label("Account Label", classes="auth-label")
@@ -424,11 +435,11 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                 yield Button("Remove", id="auth-btn-remove", variant="error")
 
             yield Label(
-                "[dim]Profile list and missing draft profiles load automatically on open. "
-                "Select a row to edit it. Save/Add upserts a profile and keeps resource "
-                "bindings/defaults in sync. Duplicate/Rebind/Archive are explicit lifecycle "
-                "actions. Open Advanced for optional "
-                "scopes/env/command/check/metadata fields.[/dim]",
+                "[dim]Profile list and missing draft profiles load automatically on open.\n"
+                "Draft discovery is workspace-wide using process/tool context shown above.\n"
+                "Save/Add upserts profile and resource binding/defaults.\n"
+                "Duplicate/Rebind/Archive manage lifecycle. Advanced includes\n"
+                "optional scopes/env/command/check/metadata.[/dim]",
                 id="auth-manager-footer",
             )
 
@@ -497,6 +508,8 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
     @on(Select.Changed)
     def _on_form_select_changed(self, event: Select.Changed) -> None:
         if event.select.id not in self._FORM_FIELD_IDS:
+            return
+        if self._suppress_dirty_tracking:
             return
         if event.select.id == "auth-resource-target":
             self._sync_provider_display()
@@ -624,8 +637,13 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
     def _refresh_mode_select(self, *, include_mode: str = "") -> None:
         select = self.query_one("#auth-mode", Select)
         current_mode = self._decode_mode_value(select.value)
-        options = self._mode_options(include_mode=include_mode or current_mode)
+        target_mode = str(include_mode or current_mode).strip().lower()
+        options = self._mode_options(include_mode=target_mode)
         select.set_options(options)
+        if target_mode:
+            encoded = self._encode_mode_value(target_mode)
+            if select.value != encoded:
+                select.value = encoded
 
     def _set_mode_select_value(self, mode: str) -> None:
         clean = str(mode or "").strip().lower()
@@ -677,19 +695,24 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
             provider = "-"
         self.query_one("#auth-provider-derived", Static).update(provider)
 
+    def _discovery_scope_text(self) -> str:
+        count = len(self._discovery_process_names)
+        if count > 0:
+            return (
+                "discovery scope: "
+                f"all workspace processes ({count}) + allowed tool auth + active MCP aliases"
+            )
+        return (
+            "discovery scope: "
+            "no process contracts loaded (uses loaded tool auth + active MCP aliases)"
+        )
+
     def _resource_id_for_profile(self, profile: AuthProfile) -> str:
         profile_id = str(getattr(profile, "profile_id", "")).strip()
         if profile_id:
             bound = self._resource_binding_by_profile.get(profile_id)
             if bound:
                 return bound
-        mcp_alias = str(getattr(profile, "mcp_server", "")).strip()
-        if mcp_alias:
-            for resource_id, resource in self._resources_by_id.items():
-                if str(getattr(resource, "resource_kind", "")) != "mcp":
-                    continue
-                if str(getattr(resource, "resource_key", "")) == mcp_alias:
-                    return resource_id
         return ""
 
     def _is_workspace_default(
@@ -729,10 +752,10 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         try:
             self.query_one("#auth-profile-id", Input).value = profile_id
             self._active_provider = str(provider or "").strip()
-            self._set_mode_select_value(mode)
             self.query_one("#auth-default-provider", Checkbox).value = bool(set_default)
             self.query_one("#auth-label", Input).value = label
             self._set_mcp_server_select_value(resource_id)
+            self._set_mode_select_value(mode)
             self.query_one("#auth-secret-ref", Input).value = secret_ref
             self.query_one("#auth-token-ref", Input).value = token_ref
             self.query_one("#auth-scopes", Input).value = scopes
@@ -775,6 +798,7 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                 workspace=self._workspace,
                 explicit_auth_path=self._explicit_auth_path,
                 process_def=self._process_def,
+                process_defs=self._process_defs,
                 tool_registry=registry,
                 mcp_manager=self._mcp_manager,
                 scope="active",
@@ -837,6 +861,14 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
             self._resource_binding_by_profile = {}
             self.notify(f"Auth resources unavailable: {e}", severity="warning")
 
+        process_names = sorted(
+            {
+                str(getattr(item, "name", "")).strip()
+                for item in self._process_defs
+                if str(getattr(item, "name", "")).strip()
+            }
+        )
+        self._discovery_process_names = process_names
         self._profiles = dict(merged.config.profiles)
         self._workspace_defaults = dict(merged.workspace_defaults)
         context_lines = [
@@ -844,7 +876,14 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
             f"explicit: {merged.explicit_path or '-'}",
             f"workspace defaults: {merged.workspace_defaults_path or '-'}",
             f"resource registry: {resources_path}",
+            f"discovery processes: {len(process_names)}",
+            self._discovery_scope_text(),
         ]
+        if process_names:
+            preview = ", ".join(process_names[:5])
+            if len(process_names) > 5:
+                preview = f"{preview}, ..."
+            context_lines.append(f"process sample: {preview}")
         self.query_one("#auth-manager-context", Static).update("\n".join(context_lines))
         current_alias = self._selected_resource_id()
         self._suppress_dirty_tracking = True
@@ -870,6 +909,10 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                     f"{getattr(resource, 'resource_kind', '?')}:"
                     f"{getattr(resource, 'resource_key', '?')}"
                 )
+            else:
+                mcp_alias = str(getattr(profile, "mcp_server", "")).strip()
+                if mcp_alias:
+                    resource_label = f"Unbound (mcp:{mcp_alias})"
             table.add_row(
                 profile.profile_id,
                 resource_label,

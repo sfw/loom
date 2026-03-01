@@ -26,6 +26,7 @@ from loom.auth.resources import (
     AuthResourcesStore,
     cleanup_deleted_resource,
     default_workspace_auth_resources_path,
+    discover_auth_resources,
     load_workspace_auth_resources,
     resource_delete_impact,
     restore_deleted_resource,
@@ -519,6 +520,99 @@ def test_sync_missing_drafts_creates_resource_binding_and_default(tmp_path: Path
         mapped_profile_id == profile.profile_id
         for mapped_profile_id in store.workspace_defaults.values()
     )
+
+
+def test_discover_auth_resources_skips_mcp_remote_alias_without_explicit_requirement():
+    class _FakeMCPManager:
+        def list_views(self):
+            return [
+                types.SimpleNamespace(
+                    alias="notion",
+                    server=types.SimpleNamespace(
+                        command="npx",
+                        args=["-y", "mcp-remote", "https://mcp.notion.com/mcp"],
+                    ),
+                )
+            ]
+
+    discovered = discover_auth_resources(
+        process_def=None,
+        tool_registry=None,
+        mcp_manager=_FakeMCPManager(),
+        scope="active",
+    )
+    assert discovered == []
+
+
+def test_discover_auth_resources_supports_process_defs_collection():
+    process_defs = [
+        types.SimpleNamespace(
+            name="youtube-draft-descriptions",
+            auth=types.SimpleNamespace(
+                required=[
+                    {
+                        "provider": "youtube_data_api",
+                        "source": "api",
+                        "resource_ref": "api_integration:youtube_data_api",
+                        "modes": ["oauth2_pkce", "oauth2_device", "env_passthrough"],
+                    }
+                ]
+            ),
+            tools=types.SimpleNamespace(excluded=[]),
+        )
+    ]
+    discovered = discover_auth_resources(
+        process_defs=process_defs,
+        tool_registry=None,
+        mcp_manager=None,
+        scope="active",
+    )
+    assert len(discovered) == 1
+    item = discovered[0]
+    assert item.resource_kind == "api_integration"
+    assert item.resource_key == "youtube_data_api"
+    assert item.provider == "youtube_data_api"
+
+
+def test_discover_auth_resources_keeps_explicit_mcp_requirement_even_for_mcp_remote():
+    process_def = types.SimpleNamespace(
+        auth=types.SimpleNamespace(
+            required=[
+                {
+                    "provider": "notion",
+                    "source": "mcp",
+                    "resource_ref": "mcp:notion",
+                    "mcp_server": "notion",
+                    "modes": ["oauth2_pkce"],
+                }
+            ]
+        )
+    )
+
+    class _FakeMCPManager:
+        def list_views(self):
+            return [
+                types.SimpleNamespace(
+                    alias="notion",
+                    server=types.SimpleNamespace(
+                        command="npx",
+                        args=["-y", "mcp-remote", "https://mcp.notion.com/mcp"],
+                    ),
+                )
+            ]
+
+    discovered = discover_auth_resources(
+        process_def=process_def,
+        tool_registry=None,
+        mcp_manager=_FakeMCPManager(),
+        scope="active",
+    )
+    assert len(discovered) == 1
+    item = discovered[0]
+    assert item.resource_kind == "mcp"
+    assert item.resource_key == "notion"
+    assert item.provider == "notion"
+    assert item.modes == ("oauth2_pkce",)
 
 
 def test_build_run_auth_context_uses_resource_default_selection(tmp_path: Path):

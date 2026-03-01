@@ -422,6 +422,31 @@ class TestAuthAndMCPManagerScreens:
             profile_id="notion_prod",
         )
 
+    def test_auth_manager_discovery_scope_text_without_loaded_processes(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+
+        assert "no process contracts loaded" in screen._discovery_scope_text()
+
+    def test_auth_manager_discovery_scope_text_with_workspace_processes(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._discovery_process_names = ["youtube-draft-descriptions", "research-report"]
+
+        text = screen._discovery_scope_text()
+        assert "all workspace processes (2)" in text
+
+    def test_auth_manager_resource_id_for_profile_requires_binding(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._resource_binding_by_profile = {}
+        profile = SimpleNamespace(profile_id="draft_mcp_notion", mcp_server="notion")
+
+        assert screen._resource_id_for_profile(profile) == ""
+
     def test_auth_manager_render_summary_populates_rows(self):
         from loom.tui.screens.auth_manager import AuthManagerScreen
 
@@ -445,6 +470,172 @@ class TestAuthAndMCPManagerScreens:
         table.clear.assert_called_once()
         table.add_row.assert_called_once()
         table.move_cursor.assert_called_once()
+
+    def test_auth_manager_render_summary_marks_unbound_mcp_profile(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        table = MagicMock()
+        table.move_cursor = MagicMock()
+        screen.query_one = MagicMock(return_value=table)
+        screen._profiles = {
+            "draft_mcp_notion": SimpleNamespace(
+                profile_id="draft_mcp_notion",
+                provider="notion",
+                mode="api_key",
+                mcp_server="notion",
+                account_label="MCP: notion (Draft)",
+            ),
+        }
+        screen._resource_binding_by_profile = {}
+        screen._resources_by_id = {}
+        screen._active_profile_id = "draft_mcp_notion"
+
+        screen._render_summary()
+
+        table.add_row.assert_called_once()
+        assert table.add_row.call_args.args[1] == "Unbound (mcp:notion)"
+
+    def test_auth_manager_set_form_values_sets_resource_before_mode(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        order: list[str] = []
+        profile_input = SimpleNamespace(value="")
+        default_checkbox = SimpleNamespace(value=False)
+        label_input = SimpleNamespace(value="")
+        secret_input = SimpleNamespace(value="")
+        token_input = SimpleNamespace(value="")
+        scopes_input = SimpleNamespace(value="")
+        env_input = SimpleNamespace(value="")
+        command_input = SimpleNamespace(value="")
+        auth_check_input = SimpleNamespace(value="")
+        meta_input = SimpleNamespace(value="")
+        provider_static = SimpleNamespace(update=lambda _value: None)
+
+        def _query_one(selector, _cls=None):
+            mapping = {
+                "#auth-profile-id": profile_input,
+                "#auth-default-provider": default_checkbox,
+                "#auth-label": label_input,
+                "#auth-secret-ref": secret_input,
+                "#auth-token-ref": token_input,
+                "#auth-scopes": scopes_input,
+                "#auth-env": env_input,
+                "#auth-command": command_input,
+                "#auth-auth-check": auth_check_input,
+                "#auth-meta": meta_input,
+                "#auth-provider-derived": provider_static,
+            }
+            return mapping[selector]
+
+        screen.query_one = _query_one
+        screen._set_mcp_server_select_value = lambda _alias: order.append("resource")
+        screen._set_mode_select_value = lambda _mode: order.append("mode")
+
+        screen._set_form_values(
+            profile_id="draft_api_integration_youtube_data_api",
+            provider="youtube_data_api",
+            mode="oauth2_pkce",
+            set_default=False,
+            label="API: youtube_data_api (Draft)",
+            resource_id="res-youtube",
+            secret_ref="",
+            token_ref="env://TODO_YOUTUBE_DATA_API_TOKEN",
+            scopes="",
+            env="",
+            command="",
+            auth_check="",
+            metadata="generated=true",
+        )
+
+        assert order == ["resource", "mode"]
+
+    def test_auth_manager_ignores_programmatic_select_changes_when_suppressed(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._suppress_dirty_tracking = True
+        screen._sync_provider_display = MagicMock()
+        screen._refresh_mode_select = MagicMock()
+        screen._update_form_dirty = MagicMock()
+
+        event = SimpleNamespace(select=SimpleNamespace(id="auth-resource-target"))
+        screen._on_form_select_changed(event)
+
+        screen._sync_provider_display.assert_not_called()
+        screen._refresh_mode_select.assert_not_called()
+        screen._update_form_dirty.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_auth_manager_load_profile_keeps_mode_selected_after_events(self):
+        from textual.app import App
+        from textual.widgets import Select
+
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        class _DummyMCPManager:
+            def list_views(self):
+                return []
+
+        class _AuthManagerHarnessApp(App):
+            CSS_PATH = None
+
+            def __init__(self):
+                super().__init__()
+                self.screen_under_test = AuthManagerScreen(
+                    workspace=Path("/tmp"),
+                    mcp_manager=_DummyMCPManager(),
+                    process_defs=[],
+                )
+
+            async def on_mount(self) -> None:
+                self.push_screen(self.screen_under_test)
+
+        app = _AuthManagerHarnessApp()
+        screen = app.screen_under_test
+        screen._sync_missing_drafts = AsyncMock()
+        screen._refresh_summary = AsyncMock()
+        screen.notify = MagicMock()
+
+        resource_id = "res-youtube"
+        profile_id = "draft_api_integration_youtube_data_api"
+        profile = SimpleNamespace(
+            profile_id=profile_id,
+            provider="youtube_data_api",
+            mode="oauth2_pkce",
+            account_label="API: youtube_data_api (Draft)",
+            secret_ref="",
+            token_ref="env://TODO_YOUTUBE_DATA_API_TOKEN",
+            scopes=[],
+            env={},
+            command="",
+            auth_check=[],
+            metadata={"generated": "true"},
+        )
+        screen._profiles = {profile_id: profile}
+        screen._resources_by_id = {
+            resource_id: SimpleNamespace(
+                display_name="API: youtube_data_api",
+                provider="youtube_data_api",
+                resource_kind="api_integration",
+                resource_key="youtube_data_api",
+                modes=("oauth2_pkce", "oauth2_device", "env_passthrough"),
+            ),
+        }
+        screen._resource_binding_by_profile = {profile_id: resource_id}
+        screen._workspace_defaults = {}
+        screen._workspace_resource_defaults = {}
+
+        async with app.run_test(size=(140, 44)) as pilot:
+            await pilot.pause()
+            loaded = await screen._load_profile_into_form(profile_id=profile_id)
+            await pilot.pause()
+
+            mode_select = screen.query_one("#auth-mode", Select)
+            assert loaded is True
+            assert mode_select.value == "oauth2_pkce"
+            assert screen._selected_mode() == "oauth2_pkce"
 
     def test_auth_manager_next_duplicate_profile_id(self):
         from loom.tui.screens.auth_manager import AuthManagerScreen

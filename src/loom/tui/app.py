@@ -1092,16 +1092,51 @@ class LoomApp(App):
             except Exception:
                 pass
 
+        process_defs = self._auth_discovery_process_defs()
+        if process_defs:
+            # Ensure registry sees bundled tools loaded by process contracts.
+            self._refresh_tool_registry()
         self.push_screen(
             AuthManagerScreen(
                 workspace=self._workspace,
                 explicit_auth_path=self._explicit_auth_path,
                 mcp_manager=self._mcp_manager(),
                 process_def=self._process_defn,
+                process_defs=process_defs,
                 tool_registry=self._tools,
             ),
             callback=_handle_result,
         )
+
+    def _auth_discovery_process_defs(self) -> list[ProcessDefinition]:
+        """Load all discoverable process definitions for workspace-wide auth sync."""
+        loader = self._create_process_loader()
+        process_defs: list[ProcessDefinition] = []
+        seen_names: set[str] = set()
+        try:
+            available = loader.list_available()
+        except Exception:
+            logger.exception("Failed listing process definitions for auth discovery")
+            available = []
+        for item in available:
+            name = str(item.get("name", "")).strip()
+            if not name or name in seen_names:
+                continue
+            try:
+                loaded = loader.load(name)
+            except Exception:
+                logger.exception("Failed loading process %s for auth discovery", name)
+                continue
+            loaded_name = str(getattr(loaded, "name", "")).strip() or name
+            if loaded_name in seen_names:
+                continue
+            process_defs.append(loaded)
+            seen_names.add(loaded_name)
+        if self._process_defn is not None:
+            active_name = str(getattr(self._process_defn, "name", "")).strip()
+            if active_name and active_name not in seen_names:
+                process_defs.append(self._process_defn)
+        return process_defs
 
     def _auth_defaults_path(self) -> Path:
         from loom.auth.config import default_workspace_auth_defaults_path
@@ -5920,12 +5955,22 @@ class LoomApp(App):
             )
             done.set()
 
+        process_defs = self._auth_discovery_process_defs()
+        if process_def is not None:
+            name = str(getattr(process_def, "name", "")).strip()
+            if not name or all(
+                str(getattr(item, "name", "")).strip() != name for item in process_defs
+            ):
+                process_defs.append(process_def)
+        if process_defs:
+            self._refresh_tool_registry()
         self.push_screen(
             AuthManagerScreen(
                 workspace=self._workspace,
                 explicit_auth_path=self._explicit_auth_path,
                 mcp_manager=self._mcp_manager(),
                 process_def=process_def or self._process_defn,
+                process_defs=process_defs,
                 tool_registry=self._tools,
             ),
             callback=_handle,
