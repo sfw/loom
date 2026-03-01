@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import click
@@ -42,6 +45,20 @@ from loom.auth.runtime import (
     parse_auth_profile_overrides,
 )
 from loom.config import Config, ConfigError, load_config
+from loom.integrations.mcp.oauth import (
+    MCPOAuthStoreError,
+    default_mcp_oauth_store_path,
+    oauth_state_for_alias,
+    remove_mcp_oauth_token,
+    upsert_mcp_oauth_token,
+)
+from loom.integrations.mcp_tools import (
+    runtime_connect_alias,
+    runtime_connection_states,
+    runtime_debug_snapshot,
+    runtime_disconnect_alias,
+    runtime_reconnect_alias,
+)
 from loom.mcp.config import (
     MCPConfigManager,
     MCPConfigManagerError,
@@ -52,6 +69,7 @@ from loom.mcp.config import (
     merge_server_edits,
     parse_mcp_server_from_flags,
     redact_server_env,
+    redact_server_headers,
 )
 from loom.tools import create_default_registry
 
@@ -172,20 +190,63 @@ def _serialize_mcp_view(
     view: MCPServerView,
     *,
     redacted: bool = True,
+    oauth_store_path: Path | None = None,
 ) -> dict:
     env = redact_server_env(view.server) if redacted else dict(view.server.env)
+    headers = (
+        redact_server_headers(view.server)
+        if redacted else dict(view.server.headers)
+    )
     payload = {
         "alias": view.alias,
         "source": view.source,
         "source_path": str(view.source_path) if view.source_path else None,
+        "type": view.server.type,
         "command": view.server.command,
+        "url": view.server.url,
+        "fallback_sse_url": view.server.fallback_sse_url,
         "args": list(view.server.args),
         "cwd": view.server.cwd,
+        "headers": headers,
+        "oauth": {
+            "enabled": view.server.oauth.enabled,
+            "scopes": list(view.server.oauth.scopes),
+        },
+        "allow_insecure_http": view.server.allow_insecure_http,
+        "allow_private_network": view.server.allow_private_network,
         "timeout_seconds": view.server.timeout_seconds,
         "enabled": view.server.enabled,
         "env": env,
     }
+    if view.server.oauth.enabled:
+        try:
+            payload["oauth_state"] = oauth_state_for_alias(
+                view.alias,
+                store_path=oauth_store_path,
+            )
+        except Exception:
+            payload["oauth_state"] = {
+                "state": "error",
+                "has_token": False,
+                "expired": False,
+            }
     return payload
+
+
+def _open_runtime_mcp_registry(ctx: click.Context):
+    """Create a registry instance with MCP runtime initialized."""
+    config = _effective_config(ctx)
+    return create_default_registry(config, mcp_startup_mode="sync")
+
+
+def _close_runtime_mcp_registry(registry) -> None:
+    synchronizer = getattr(registry, "_mcp_synchronizer", None)
+    close_fn = getattr(synchronizer, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            pass
 
 
 @click.group(invoke_without_command=True)
@@ -219,10 +280,6 @@ def _serialize_mcp_view(
 )
 @click.option("--model", "-m", default=None, help="Model name from config to use.")
 @click.option("--resume", "resume_session", default=None, help="Resume a previous session by ID.")
-@click.option(
-    "--process", "process_name", default=None,
-    help="Process definition name or path.",
-)
 @click.pass_context
 def cli(
     ctx: click.Context,
@@ -232,7 +289,6 @@ def cli(
     auth_config_path: Path | None,
     model: str | None,
     resume_session: str | None,
-    process_name: str | None,
 ) -> None:
     """Loom — Local model orchestration engine.
 
@@ -281,7 +337,7 @@ def cli(
         # Default: launch the TUI
         _launch_tui(
             ctx.obj["config"], workspace, model,
-            resume_session, process_name,
+            resume_session,
             ctx.obj.get("explicit_mcp_path"),
             ctx.obj.get("config_path"),
             ctx.obj.get("explicit_auth_path"),
@@ -311,7 +367,6 @@ def _launch_tui(
     workspace: Path | None,
     model_name: str | None,
     resume_session: str | None,
-    process_name: str | None,
     explicit_mcp_path: Path | None = None,
     legacy_config_path: Path | None = None,
     explicit_auth_path: Path | None = None,
@@ -343,8 +398,6 @@ def _launch_tui(
             )
             sys.exit(1)
 
-    effective_process = process_name or config.process.default or None
-
     app = LoomApp(
         model=provider,
         tools=tools,
@@ -353,7 +406,6 @@ def _launch_tui(
         db=db,
         store=store,
         resume_session=resume_session,
-        process_name=effective_process,
         explicit_mcp_path=explicit_mcp_path,
         legacy_config_path=legacy_config_path,
         explicit_auth_path=explicit_auth_path,
@@ -399,17 +451,12 @@ def _init_persistence(config: Config):
 )
 @click.option("--model", "-m", default=None, help="Model name from config to use.")
 @click.option("--resume", "resume_session", default=None, help="Resume a previous session by ID.")
-@click.option(
-    "--process", "process_name", default=None,
-    help="Process definition name or path.",
-)
 @click.pass_context
 def cowork(
     ctx: click.Context,
     workspace: Path | None,
     model: str | None,
     resume_session: str | None,
-    process_name: str | None,
 ) -> None:
     """Start an interactive cowork session (alias for default TUI).
 
@@ -426,7 +473,6 @@ def cowork(
         workspace,
         model,
         resume_session,
-        process_name,
         ctx.obj.get("explicit_mcp_path"),
         ctx.obj.get("config_path"),
         ctx.obj.get("explicit_auth_path"),
@@ -1849,7 +1895,11 @@ def mcp_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
     if as_json:
         payload = {
             "servers": [
-                _serialize_mcp_view(view, redacted=True)
+                _serialize_mcp_view(
+                    view,
+                    redacted=True,
+                    oauth_store_path=default_mcp_oauth_store_path(),
+                )
                 for view in views
             ],
             "legacy_sources_detected": legacy_present,
@@ -1865,13 +1915,42 @@ def mcp_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
     for view in views:
         status = "enabled" if view.server.enabled else "disabled"
         source_path = str(view.source_path) if view.source_path else "-"
-        click.echo(f"  {view.alias:16} {status:8} source={view.source}")
+        click.echo(
+            f"  {view.alias:16} {status:8} type={view.server.type:6} source={view.source}"
+        )
         if verbose:
-            args = " ".join(view.server.args)
-            cmd = f"{view.server.command} {args}".strip()
             click.echo(f"    path: {source_path}")
-            click.echo(f"    command: {cmd}")
-            click.echo(f"    cwd: {view.server.cwd or '-'}")
+            if view.server.type == "remote":
+                click.echo(f"    url: {view.server.url or '-'}")
+                click.echo(
+                    f"    fallback_sse_url: {view.server.fallback_sse_url or '-'}"
+                )
+                click.echo(
+                    "    oauth: "
+                    f"{'enabled' if view.server.oauth.enabled else 'disabled'}"
+                )
+                if view.server.oauth.scopes:
+                    click.echo(f"    oauth_scopes: {', '.join(view.server.oauth.scopes)}")
+                headers = redact_server_headers(view.server)
+                if headers:
+                    click.echo("    headers:")
+                    for key, value in headers.items():
+                        click.echo(f"      {key}: {value}")
+                else:
+                    click.echo("    headers: (none)")
+                click.echo(
+                    "    allow_insecure_http: "
+                    f"{'true' if view.server.allow_insecure_http else 'false'}"
+                )
+                click.echo(
+                    "    allow_private_network: "
+                    f"{'true' if view.server.allow_private_network else 'false'}"
+                )
+            else:
+                args = " ".join(view.server.args)
+                cmd = f"{view.server.command} {args}".strip()
+                click.echo(f"    command: {cmd}")
+                click.echo(f"    cwd: {view.server.cwd or '-'}")
             click.echo(f"    timeout_seconds: {view.server.timeout_seconds}")
             env = redact_server_env(view.server)
             if env:
@@ -1907,16 +1986,52 @@ def mcp_show(ctx: click.Context, alias: str, as_json: bool) -> None:
 
     payload = _serialize_mcp_view(view, redacted=True)
     if as_json:
+        payload = _serialize_mcp_view(
+            view,
+            redacted=True,
+            oauth_store_path=default_mcp_oauth_store_path(),
+        )
         click.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
 
     click.echo(f"Alias: {view.alias}")
     click.echo(f"Source: {view.source}")
     click.echo(f"Source path: {view.source_path or '-'}")
+    click.echo(f"Type: {view.server.type}")
     click.echo(f"Enabled: {view.server.enabled}")
-    click.echo(f"Command: {view.server.command}")
-    click.echo(f"Args: {' '.join(view.server.args) if view.server.args else '-'}")
-    click.echo(f"Cwd: {view.server.cwd or '-'}")
+    if view.server.type == "remote":
+        click.echo(f"URL: {view.server.url or '-'}")
+        click.echo(f"Fallback SSE URL: {view.server.fallback_sse_url or '-'}")
+        click.echo(
+            "OAuth: "
+            f"{'enabled' if view.server.oauth.enabled else 'disabled'}"
+        )
+        if view.server.oauth.enabled:
+            oauth_state = oauth_state_for_alias(view.alias)
+            click.echo(f"OAuth state: {oauth_state.get('state', 'unknown')}")
+        click.echo(
+            "OAuth scopes: "
+            f"{', '.join(view.server.oauth.scopes) if view.server.oauth.scopes else '-'}"
+        )
+        click.echo(
+            "Allow insecure HTTP: "
+            f"{'true' if view.server.allow_insecure_http else 'false'}"
+        )
+        click.echo(
+            "Allow private network: "
+            f"{'true' if view.server.allow_private_network else 'false'}"
+        )
+        headers = redact_server_headers(view.server)
+        if headers:
+            click.echo("Headers:")
+            for key, value in headers.items():
+                click.echo(f"  {key}: {value}")
+        else:
+            click.echo("Headers: (none)")
+    else:
+        click.echo(f"Command: {view.server.command}")
+        click.echo(f"Args: {' '.join(view.server.args) if view.server.args else '-'}")
+        click.echo(f"Cwd: {view.server.cwd or '-'}")
     click.echo(f"Timeout: {view.server.timeout_seconds}s")
     env = redact_server_env(view.server)
     if env:
@@ -1930,6 +2045,314 @@ def mcp_show(ctx: click.Context, alias: str, as_json: bool) -> None:
             "Note: this alias is from legacy loom.toml. "
             "Run `loom mcp migrate` to move it into mcp.toml."
         )
+
+
+@mcp.command(name="status")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def mcp_status(ctx: click.Context, as_json: bool) -> None:
+    """Show runtime MCP connection state and auth readiness."""
+    manager = _mcp_manager(ctx)
+    try:
+        views = manager.list_views()
+    except MCPConfigManagerError as e:
+        click.echo(f"Status failed: {e}", err=True)
+        sys.exit(1)
+
+    registry = _open_runtime_mcp_registry(ctx)
+    try:
+        states = runtime_connection_states(registry)
+    finally:
+        _close_runtime_mcp_registry(registry)
+
+    state_by_alias = {state.alias: state for state in states}
+    payload_servers: list[dict[str, object]] = []
+    for view in views:
+        runtime = state_by_alias.get(view.alias)
+        oauth_state = (
+            oauth_state_for_alias(view.alias)
+            if view.server.oauth.enabled
+            else {
+                "state": "disabled",
+                "has_token": False,
+                "expired": False,
+                "expires_at": None,
+                "token_type": None,
+                "scopes": [],
+            }
+        )
+        payload_servers.append(
+            {
+                "alias": view.alias,
+                "type": view.server.type,
+                "enabled": view.server.enabled,
+                "source": view.source,
+                "runtime": {
+                    "status": runtime.status if runtime is not None else (
+                        "disabled" if not view.server.enabled else "configured"
+                    ),
+                    "last_error": runtime.last_error if runtime is not None else "",
+                    "pid": runtime.pid if runtime is not None else None,
+                    "queue_depth": runtime.queue_depth if runtime is not None else 0,
+                    "in_flight": runtime.in_flight if runtime is not None else 0,
+                    "reconnect_attempts": (
+                        runtime.reconnect_attempts if runtime is not None else 0
+                    ),
+                    "circuit_state": (
+                        runtime.circuit_state if runtime is not None else "closed"
+                    ),
+                    "circuit_open_until": (
+                        runtime.circuit_open_until if runtime is not None else None
+                    ),
+                    "last_connected_at": (
+                        runtime.last_connected_at if runtime is not None else None
+                    ),
+                    "last_activity_at": (
+                        runtime.last_activity_at if runtime is not None else None
+                    ),
+                    "remediation": runtime.remediation if runtime is not None else "",
+                },
+                "oauth": oauth_state,
+            }
+        )
+
+    payload = {"servers": payload_servers}
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    if not payload_servers:
+        click.echo("No MCP servers configured.")
+        return
+    click.echo("MCP runtime status:")
+    for item in payload_servers:
+        alias = str(item["alias"])
+        server_type = str(item["type"])
+        enabled = bool(item["enabled"])
+        runtime = item["runtime"] if isinstance(item["runtime"], dict) else {}
+        oauth = item["oauth"] if isinstance(item["oauth"], dict) else {}
+        status = str(runtime.get("status", "unknown"))
+        click.echo(
+            f"  {alias:16} type={server_type:6} "
+            f"{'enabled' if enabled else 'disabled':8} runtime={status}"
+        )
+        if runtime.get("last_error"):
+            click.echo(f"    error: {runtime['last_error']}")
+        if runtime.get("circuit_state") and runtime.get("circuit_state") != "closed":
+            click.echo(f"    circuit: {runtime['circuit_state']}")
+        if runtime.get("remediation"):
+            click.echo(f"    next: {runtime['remediation']}")
+        if runtime.get("pid"):
+            click.echo(f"    pid: {runtime['pid']}")
+        oauth_state = str(oauth.get("state", "disabled"))
+        if oauth_state != "disabled":
+            click.echo(f"    oauth: {oauth_state}")
+
+
+def _serialize_runtime_state(state) -> dict[str, object]:
+    return {
+        "alias": state.alias,
+        "type": state.type,
+        "enabled": state.enabled,
+        "status": state.status,
+        "last_error": state.last_error,
+        "pid": state.pid,
+        "queue_depth": state.queue_depth,
+        "in_flight": state.in_flight,
+        "reconnect_attempts": state.reconnect_attempts,
+        "circuit_state": state.circuit_state,
+        "circuit_open_until": state.circuit_open_until,
+        "last_connected_at": state.last_connected_at,
+        "last_activity_at": state.last_activity_at,
+        "remediation": state.remediation,
+    }
+
+
+@mcp.command(name="connect")
+@click.argument("alias")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def mcp_connect(ctx: click.Context, alias: str, as_json: bool) -> None:
+    """Connect one MCP alias and refresh runtime health state."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        view = manager.get_view(clean_alias)
+    except MCPConfigManagerError as e:
+        click.echo(f"Connect failed: {e}", err=True)
+        sys.exit(1)
+    if view is None:
+        click.echo(f"MCP server not found: {clean_alias}", err=True)
+        sys.exit(1)
+
+    registry = _open_runtime_mcp_registry(ctx)
+    try:
+        state = runtime_connect_alias(registry, alias=clean_alias)
+    except Exception as e:
+        click.echo(f"Connect failed for '{clean_alias}': {e}", err=True)
+        sys.exit(1)
+    finally:
+        _close_runtime_mcp_registry(registry)
+
+    payload = _serialize_runtime_state(state)
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(f"Connected MCP server '{clean_alias}' (runtime={state.status}).")
+    if state.last_error:
+        click.echo(f"  error: {state.last_error}")
+    if state.remediation:
+        click.echo(f"  next: {state.remediation}")
+
+
+@mcp.command(name="disconnect")
+@click.argument("alias")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def mcp_disconnect(ctx: click.Context, alias: str, as_json: bool) -> None:
+    """Disconnect one MCP alias and close any persistent runtime session."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        view = manager.get_view(clean_alias)
+    except MCPConfigManagerError as e:
+        click.echo(f"Disconnect failed: {e}", err=True)
+        sys.exit(1)
+    if view is None:
+        click.echo(f"MCP server not found: {clean_alias}", err=True)
+        sys.exit(1)
+
+    registry = _open_runtime_mcp_registry(ctx)
+    try:
+        state = runtime_disconnect_alias(registry, alias=clean_alias)
+    except Exception as e:
+        click.echo(f"Disconnect failed for '{clean_alias}': {e}", err=True)
+        sys.exit(1)
+    finally:
+        _close_runtime_mcp_registry(registry)
+
+    payload = _serialize_runtime_state(state)
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(f"Disconnected MCP server '{clean_alias}' (runtime={state.status}).")
+
+
+@mcp.command(name="reconnect")
+@click.argument("alias")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def mcp_reconnect(ctx: click.Context, alias: str, as_json: bool) -> None:
+    """Reconnect one MCP alias by forcing a disconnect then connect."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        view = manager.get_view(clean_alias)
+    except MCPConfigManagerError as e:
+        click.echo(f"Reconnect failed: {e}", err=True)
+        sys.exit(1)
+    if view is None:
+        click.echo(f"MCP server not found: {clean_alias}", err=True)
+        sys.exit(1)
+
+    registry = _open_runtime_mcp_registry(ctx)
+    try:
+        state = runtime_reconnect_alias(registry, alias=clean_alias)
+    except Exception as e:
+        click.echo(f"Reconnect failed for '{clean_alias}': {e}", err=True)
+        sys.exit(1)
+    finally:
+        _close_runtime_mcp_registry(registry)
+
+    payload = _serialize_runtime_state(state)
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(f"Reconnected MCP server '{clean_alias}' (runtime={state.status}).")
+    if state.last_error:
+        click.echo(f"  error: {state.last_error}")
+    if state.remediation:
+        click.echo(f"  next: {state.remediation}")
+
+
+@mcp.command(name="debug-bundle")
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write bundle JSON to this path (defaults to ~/.loom/debug/...).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def mcp_debug_bundle(
+    ctx: click.Context,
+    output_path: Path | None,
+    as_json: bool,
+) -> None:
+    """Export redacted MCP diagnostics for support triage."""
+    manager = _mcp_manager(ctx)
+    try:
+        views = manager.list_views()
+    except MCPConfigManagerError as e:
+        click.echo(f"Debug bundle failed: {e}", err=True)
+        sys.exit(1)
+
+    registry = _open_runtime_mcp_registry(ctx)
+    try:
+        states = runtime_connection_states(registry)
+        runtime_snapshot = runtime_debug_snapshot(registry)
+    except Exception as e:
+        click.echo(f"Debug bundle failed: {e}", err=True)
+        sys.exit(1)
+    finally:
+        _close_runtime_mcp_registry(registry)
+
+    payload = {
+        "created_at_unix": int(time.time()),
+        "loom_version": __version__,
+        "workspace": str(ctx.obj.get("workspace") or Path.cwd()),
+        "config_path": (
+            str(ctx.obj.get("config_path"))
+            if ctx.obj.get("config_path") is not None
+            else None
+        ),
+        "mcp_config_path": (
+            str(ctx.obj.get("explicit_mcp_path"))
+            if ctx.obj.get("explicit_mcp_path") is not None
+            else None
+        ),
+        "servers": [
+            _serialize_mcp_view(
+                view,
+                redacted=True,
+                oauth_store_path=default_mcp_oauth_store_path(),
+            )
+            for view in views
+        ],
+        "runtime": {
+            "states": [_serialize_runtime_state(state) for state in states],
+            "diagnostics": runtime_snapshot,
+        },
+    }
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    target = output_path
+    if target is None:
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        target = Path.home() / ".loom" / "debug" / f"mcp-debug-{stamp}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    click.echo(f"Wrote MCP debug bundle to {target}")
 
 
 @mcp.command(name="add")
@@ -2093,14 +2516,7 @@ def mcp_enable(ctx: click.Context, alias: str) -> None:
         clean_alias = ensure_valid_alias(alias)
         path, _updated = manager.edit_server(
             clean_alias,
-            lambda current: current.__class__(
-                command=current.command,
-                args=list(current.args),
-                env=dict(current.env),
-                cwd=current.cwd,
-                timeout_seconds=current.timeout_seconds,
-                enabled=True,
-            ),
+            lambda current: replace(current, enabled=True),
         )
     except MCPConfigManagerError as e:
         click.echo(f"Enable failed: {e}", err=True)
@@ -2118,14 +2534,7 @@ def mcp_disable(ctx: click.Context, alias: str) -> None:
         clean_alias = ensure_valid_alias(alias)
         path, _updated = manager.edit_server(
             clean_alias,
-            lambda current: current.__class__(
-                command=current.command,
-                args=list(current.args),
-                env=dict(current.env),
-                cwd=current.cwd,
-                timeout_seconds=current.timeout_seconds,
-                enabled=False,
-            ),
+            lambda current: replace(current, enabled=False),
         )
     except MCPConfigManagerError as e:
         click.echo(f"Disable failed: {e}", err=True)
@@ -2201,6 +2610,279 @@ def mcp_migrate(ctx: click.Context) -> None:
             "Legacy mcp sections were not removed automatically. "
             "Review loom.toml if needed."
         )
+
+
+@mcp.group(name="auth")
+def mcp_auth() -> None:
+    """Manage OAuth tokens for remote MCP server aliases."""
+
+
+def _resolve_access_token(
+    *,
+    access_token: str | None,
+    access_token_env: str | None,
+) -> str:
+    direct = str(access_token or "").strip()
+    if direct:
+        return direct
+    env_name = str(access_token_env or "").strip()
+    if env_name:
+        return str(os.environ.get(env_name, "")).strip()
+    return ""
+
+
+@mcp_auth.command(name="login")
+@click.argument("alias")
+@click.option("--access-token", default=None, help="OAuth access token.")
+@click.option(
+    "--access-token-env",
+    default=None,
+    help="Environment variable containing access token.",
+)
+@click.option("--refresh-token", default="", help="Optional refresh token.")
+@click.option("--token-type", default="Bearer", show_default=True)
+@click.option("--scope", "scopes", multiple=True, help="OAuth scope. Repeatable.")
+@click.option("--expires-in", type=int, default=None, help="Token lifetime in seconds.")
+@click.option(
+    "--oauth-store",
+    "oauth_store_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Override OAuth token store path.",
+)
+@click.pass_context
+def mcp_auth_login(
+    ctx: click.Context,
+    alias: str,
+    access_token: str | None,
+    access_token_env: str | None,
+    refresh_token: str,
+    token_type: str,
+    scopes: tuple[str, ...],
+    expires_in: int | None,
+    oauth_store_path: Path | None,
+) -> None:
+    """Store OAuth token material for one MCP alias."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        view = manager.get_view(clean_alias)
+    except MCPConfigManagerError as e:
+        click.echo(f"MCP auth login failed: {e}", err=True)
+        sys.exit(1)
+    if view is None:
+        click.echo(f"MCP server not found: {clean_alias}", err=True)
+        sys.exit(1)
+    if not view.server.oauth.enabled:
+        click.echo(
+            f"MCP server '{clean_alias}' does not have oauth.enabled=true in config.",
+            err=True,
+        )
+        sys.exit(1)
+
+    token = _resolve_access_token(
+        access_token=access_token,
+        access_token_env=access_token_env,
+    )
+    if not token:
+        token = click.prompt("Access token", hide_input=True).strip()
+    if not token:
+        click.echo("Access token cannot be empty.", err=True)
+        sys.exit(1)
+
+    expires_at_unix: int | None = None
+    if expires_in is not None:
+        expires_at_unix = int(time.time()) + max(1, int(expires_in))
+    merged_scopes = [
+        str(scope).strip()
+        for scope in ([*view.server.oauth.scopes, *list(scopes)])
+        if str(scope).strip()
+    ]
+    merged_scopes = list(dict.fromkeys(merged_scopes))
+
+    try:
+        path = upsert_mcp_oauth_token(
+            alias=clean_alias,
+            access_token=token,
+            refresh_token=refresh_token,
+            token_type=token_type,
+            scopes=merged_scopes,
+            expires_at_unix=expires_at_unix,
+            store_path=oauth_store_path,
+        )
+    except MCPOAuthStoreError as e:
+        click.echo(f"MCP auth login failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Stored MCP OAuth token for '{clean_alias}' in {path}")
+
+
+@mcp_auth.command(name="status")
+@click.argument("alias", required=False)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.option(
+    "--oauth-store",
+    "oauth_store_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Override OAuth token store path.",
+)
+@click.pass_context
+def mcp_auth_status(
+    ctx: click.Context,
+    alias: str | None,
+    as_json: bool,
+    oauth_store_path: Path | None,
+) -> None:
+    """Show OAuth token readiness for MCP aliases."""
+    manager = _mcp_manager(ctx)
+    try:
+        views = manager.list_views()
+    except MCPConfigManagerError as e:
+        click.echo(f"MCP auth status failed: {e}", err=True)
+        sys.exit(1)
+
+    selected: list[MCPServerView] = []
+    if alias is not None:
+        clean_alias = ensure_valid_alias(alias)
+        view = manager.get_view(clean_alias)
+        if view is None:
+            click.echo(f"MCP server not found: {clean_alias}", err=True)
+            sys.exit(1)
+        selected = [view]
+    else:
+        selected = [view for view in views if view.server.oauth.enabled]
+
+    payload = []
+    for view in selected:
+        state = oauth_state_for_alias(
+            view.alias,
+            store_path=oauth_store_path,
+        )
+        payload.append(
+            {
+                "alias": view.alias,
+                "type": view.server.type,
+                "oauth_enabled": view.server.oauth.enabled,
+                "state": state["state"],
+                "expired": bool(state.get("expired", False)),
+                "has_token": bool(state.get("has_token", False)),
+                "expires_at": state.get("expires_at"),
+                "scopes": list(state.get("scopes", []) or []),
+            }
+        )
+
+    if as_json:
+        click.echo(json.dumps({"aliases": payload}, indent=2, sort_keys=True))
+        return
+    if not payload:
+        click.echo("No oauth-enabled MCP aliases configured.")
+        return
+    click.echo("MCP OAuth status:")
+    for item in payload:
+        click.echo(
+            f"  {item['alias']:16} state={item['state']:8} "
+            f"expired={'yes' if item['expired'] else 'no'}"
+        )
+        if item["expires_at"]:
+            click.echo(f"    expires_at: {item['expires_at']}")
+
+
+@mcp_auth.command(name="logout")
+@click.argument("alias")
+@click.option(
+    "--oauth-store",
+    "oauth_store_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Override OAuth token store path.",
+)
+def mcp_auth_logout(alias: str, oauth_store_path: Path | None) -> None:
+    """Delete stored OAuth token for one MCP alias."""
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        path = remove_mcp_oauth_token(clean_alias, store_path=oauth_store_path)
+    except (MCPConfigManagerError, MCPOAuthStoreError) as e:
+        click.echo(f"MCP auth logout failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Removed MCP OAuth token for '{clean_alias}' from {path}")
+
+
+@mcp_auth.command(name="refresh")
+@click.argument("alias")
+@click.option("--access-token", default=None, help="New access token.")
+@click.option(
+    "--access-token-env",
+    default=None,
+    help="Environment variable containing new access token.",
+)
+@click.option("--refresh-token", default="", help="Optional replacement refresh token.")
+@click.option("--token-type", default="Bearer", show_default=True)
+@click.option("--scope", "scopes", multiple=True, help="OAuth scope. Repeatable.")
+@click.option("--expires-in", type=int, default=None, help="Token lifetime in seconds.")
+@click.option(
+    "--oauth-store",
+    "oauth_store_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Override OAuth token store path.",
+)
+@click.pass_context
+def mcp_auth_refresh(
+    ctx: click.Context,
+    alias: str,
+    access_token: str | None,
+    access_token_env: str | None,
+    refresh_token: str,
+    token_type: str,
+    scopes: tuple[str, ...],
+    expires_in: int | None,
+    oauth_store_path: Path | None,
+) -> None:
+    """Manually refresh/update OAuth token payload for one MCP alias."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        view = manager.get_view(clean_alias)
+    except MCPConfigManagerError as e:
+        click.echo(f"MCP auth refresh failed: {e}", err=True)
+        sys.exit(1)
+    if view is None:
+        click.echo(f"MCP server not found: {clean_alias}", err=True)
+        sys.exit(1)
+
+    token = _resolve_access_token(
+        access_token=access_token,
+        access_token_env=access_token_env,
+    )
+    if not token:
+        click.echo(
+            "Manual refresh requires --access-token or --access-token-env.",
+            err=True,
+        )
+        sys.exit(1)
+    expires_at_unix: int | None = None
+    if expires_in is not None:
+        expires_at_unix = int(time.time()) + max(1, int(expires_in))
+    merged_scopes = [
+        str(scope).strip()
+        for scope in ([*view.server.oauth.scopes, *list(scopes)])
+        if str(scope).strip()
+    ]
+    merged_scopes = list(dict.fromkeys(merged_scopes))
+    try:
+        path = upsert_mcp_oauth_token(
+            alias=clean_alias,
+            access_token=token,
+            refresh_token=refresh_token,
+            token_type=token_type,
+            scopes=merged_scopes,
+            expires_at_unix=expires_at_unix,
+            store_path=oauth_store_path,
+        )
+    except MCPOAuthStoreError as e:
+        click.echo(f"MCP auth refresh failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Refreshed MCP OAuth token for '{clean_alias}' in {path}")
 
 
 # -- Process management commands -------------------------------------------

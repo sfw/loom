@@ -672,6 +672,52 @@ class TestAuthAndMCPManagerScreens:
         table.clear.assert_called_once()
         table.add_row.assert_called_once()
         table.move_cursor.assert_called_once()
+        added = table.add_row.call_args.args
+        assert added[0] == "notion"
+        assert added[1] == "local"
+        assert "python" in added[3]
+
+    def test_mcp_manager_render_summary_remote_target(self):
+        from loom.tui.screens.mcp_manager import MCPManagerScreen
+
+        screen = MCPManagerScreen(manager=MagicMock())
+        table = MagicMock()
+        table.move_cursor = MagicMock()
+        screen.query_one = MagicMock(return_value=table)
+        screen._views = [
+            SimpleNamespace(
+                alias="notion_remote",
+                server=SimpleNamespace(
+                    enabled=True,
+                    type="remote",
+                    url="https://mcp.notion.com/mcp",
+                ),
+                source="workspace",
+            ),
+        ]
+
+        screen._render_summary()
+
+        assert table.add_row.call_count == 1
+        added = table.add_row.call_args.args
+        assert added[0] == "notion_remote"
+        assert added[1] == "remote"
+        assert added[3] == "https://mcp.notion.com/mcp"
+
+    def test_mcp_manager_parse_csv_map(self):
+        from loom.tui.screens.mcp_manager import MCPManagerScreen
+
+        parsed = MCPManagerScreen._parse_csv_map(
+            "X-Team=alpha, Authorization=Bearer ${TOKEN}",
+            option_name="Headers",
+        )
+        assert parsed == {
+            "X-Team": "alpha",
+            "Authorization": "Bearer ${TOKEN}",
+        }
+
+        with pytest.raises(ValueError, match="KEY=VALUE"):
+            MCPManagerScreen._parse_csv_map("invalid", option_name="Headers")
 
     def test_mcp_manager_stores_explicit_auth_path(self):
         from loom.tui.screens.mcp_manager import MCPManagerScreen
@@ -2667,7 +2713,6 @@ class TestStartupSessionResume:
         app._store = MagicMock()
         app._resolve_startup_resume_target = AsyncMock(return_value=("latest-session", True))
         app._refresh_tool_registry = MagicMock()
-        app._load_process_definition = MagicMock()
         app._refresh_process_command_index = MagicMock()
         app._ensure_persistence_tools = MagicMock()
         app._apply_process_tool_policy = MagicMock()
@@ -2733,7 +2778,6 @@ class TestStartupSessionResume:
         ])
         app._resolve_startup_resume_target = AsyncMock(return_value=("latest-session", True))
         app._refresh_tool_registry = MagicMock()
-        app._load_process_definition = MagicMock()
         app._refresh_process_command_index = MagicMock()
         app._ensure_persistence_tools = MagicMock()
         app._apply_process_tool_policy = MagicMock()
@@ -3213,7 +3257,7 @@ class TestSlashCommandHints:
         assert "Matching /n:" in hint
         assert "/new" in hint
 
-    def test_prefix_p_matches_process(self):
+    def test_prefix_p_matches_processes(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -3223,9 +3267,9 @@ class TestSlashCommandHints:
         )
         hint = app._render_slash_hint("/p")
         assert "Matching /p:" in hint
-        assert "/process" in hint
+        assert "/processes" in hint
 
-    def test_exact_match_keeps_prefix_siblings(self):
+    def test_prefix_process_matches_processes(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -3235,11 +3279,9 @@ class TestSlashCommandHints:
         )
         hint = app._render_slash_hint("/process")
         assert "Matching /process:" in hint
-        assert "/process " in hint
         assert "/processes" in hint
-        assert hint.index("/process ") < hint.index("/processes")
 
-    def test_process_use_hint_shows_available_processes(self):
+    def test_process_use_hint_is_not_rendered(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -3247,18 +3289,10 @@ class TestSlashCommandHints:
             tools=MagicMock(),
             workspace=Path("/tmp"),
         )
-        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
-            list_available=MagicMock(return_value=[
-                {"name": "investment-analysis", "version": "1.0"},
-                {"name": "marketing-strategy", "version": "1.2"},
-            ])
-        ))
         hint = app._render_slash_hint("/process use")
-        assert "Available processes for /process use:" in hint
-        assert "investment-analysis" in hint
-        assert "marketing-strategy" in hint
+        assert hint == ""
 
-    def test_process_use_hint_filters_by_prefix(self):
+    def test_process_use_hint_with_prefix_is_not_rendered(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -3266,18 +3300,10 @@ class TestSlashCommandHints:
             tools=MagicMock(),
             workspace=Path("/tmp"),
         )
-        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
-            list_available=MagicMock(return_value=[
-                {"name": "investment-analysis", "version": "1.0"},
-                {"name": "marketing-strategy", "version": "1.2"},
-            ])
-        ))
         hint = app._render_slash_hint("/process use inv")
-        assert "Process matches 'inv':" in hint
-        assert "investment-analysis" in hint
-        assert "marketing-strategy" not in hint
+        assert hint == ""
 
-    def test_process_use_hint_does_not_truncate_large_match_sets(self):
+    def test_process_use_hint_large_match_sets_not_rendered(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -3285,19 +3311,10 @@ class TestSlashCommandHints:
             tools=MagicMock(),
             workspace=Path("/tmp"),
         )
-        catalog = [
-            {"name": f"process-{idx:02d}", "version": "1.0"}
-            for idx in range(1, 16)
-        ]
-        app._create_process_loader = MagicMock(return_value=SimpleNamespace(
-            list_available=MagicMock(return_value=catalog)
-        ))
 
         hint = app._render_slash_hint("/process use process-")
 
-        assert "... and " not in hint
-        for idx in range(1, 16):
-            assert f"process-{idx:02d}" in hint
+        assert hint == ""
 
     def test_prefix_r_matches_resume_and_run(self):
         from loom.tui.app import LoomApp
@@ -3480,7 +3497,7 @@ class TestSlashCommandHints:
         assert app._slash_completion_candidates("/h") == ["/history", "/help"]
         assert app._slash_completion_candidates("/m") == ["/mcp", "/model"]
         assert app._slash_completion_candidates("/t") == ["/tools", "/tokens"]
-        assert app._slash_completion_candidates("/p") == ["/processes", "/process"]
+        assert app._slash_completion_candidates("/p") == ["/processes"]
         assert app._slash_completion_candidates("/r") == ["/resume", "/run"]
 
     def test_slash_completion_candidates_include_dynamic_process_commands(self):
@@ -3539,7 +3556,7 @@ class TestProcessCatalogRendering:
 
 class TestProcessSlashCommands:
     @pytest.mark.asyncio
-    async def test_process_without_args_shows_catalog(self):
+    async def test_process_command_is_removed(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -3547,35 +3564,13 @@ class TestProcessSlashCommands:
             tools=MagicMock(),
             workspace=Path("/tmp"),
         )
-        app._process_defn = SimpleNamespace(name="marketing-strategy")
-        app._render_process_catalog = MagicMock(return_value="catalog")
         chat = MagicMock()
         app.query_one = MagicMock(return_value=chat)
 
         handled = await app._handle_slash_command("/process")
 
-        assert handled is True
-        app._render_process_catalog.assert_called_once()
-        chat.add_info.assert_called_once_with("catalog")
-
-    @pytest.mark.asyncio
-    async def test_process_list_uses_catalog_renderer(self):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-        app._render_process_catalog = MagicMock(return_value="catalog")
-
-        handled = await app._handle_slash_command("/process list")
-
-        assert handled is True
-        app._render_process_catalog.assert_called_once()
-        chat.add_info.assert_called_once_with("catalog")
+        assert handled is False
+        chat.add_info.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_processes_alias_uses_catalog_renderer(self):
@@ -3595,147 +3590,6 @@ class TestProcessSlashCommands:
         assert handled is True
         app._render_process_catalog.assert_called_once()
         chat.add_info.assert_called_once_with("catalog")
-
-    @pytest.mark.asyncio
-    async def test_process_use_requires_argument(self):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        handled = await app._handle_slash_command("/process use")
-
-        assert handled is True
-        chat.add_info.assert_called_once()
-        message = chat.add_info.call_args.args[0]
-        assert "Usage" in message
-        assert "/process use" in message
-        assert "<name-or-path>" in message
-
-    @pytest.mark.asyncio
-    async def test_process_use_load_error(self):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        loader = MagicMock()
-        loader.load.side_effect = ValueError("boom")
-        app._create_process_loader = MagicMock(return_value=loader)
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        handled = await app._handle_slash_command("/process use bad-proc")
-
-        assert handled is True
-        chat.add_info.assert_called_once()
-        assert "Failed to load process 'bad-proc'" in chat.add_info.call_args.args[0]
-
-    @pytest.mark.asyncio
-    async def test_process_use_sets_process_and_reloads_session(self):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        loader = MagicMock()
-        loader.load.return_value = SimpleNamespace(
-            name="marketing-strategy",
-            version="1.0",
-        )
-        app._create_process_loader = MagicMock(return_value=loader)
-        app._reload_session_for_process_change = AsyncMock()
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        handled = await app._handle_slash_command(
-            "/process use marketing-strategy",
-        )
-
-        assert handled is True
-        assert app._process_name == "marketing-strategy"
-        app._reload_session_for_process_change.assert_awaited_once()
-        message = chat.add_info.call_args.args[0]
-        assert "Active Process Updated" in message
-        assert "Name:[/] [bold]marketing-strategy[/bold]" in message
-        assert "Version:[/] [dim]v1.0[/dim]" in message
-
-    @pytest.mark.asyncio
-    async def test_process_use_blocks_reserved_command_name(self):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        loader = MagicMock()
-        loader.list_available.return_value = []
-        loader.load.return_value = SimpleNamespace(name="run", version="1.0")
-        app._create_process_loader = MagicMock(return_value=loader)
-        app._reload_session_for_process_change = AsyncMock()
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        handled = await app._handle_slash_command("/process use run")
-
-        assert handled is True
-        app._reload_session_for_process_change.assert_not_awaited()
-        chat.add_info.assert_called_once()
-        assert "conflicts with a built-in slash command" in (
-            chat.add_info.call_args.args[0]
-        )
-
-    @pytest.mark.asyncio
-    async def test_process_off_with_no_active_process(self):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        app._process_name = None
-        app._process_defn = None
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        handled = await app._handle_slash_command("/process off")
-
-        assert handled is True
-        chat.add_info.assert_called_once_with("No active process.")
-
-    @pytest.mark.asyncio
-    async def test_process_off_reloads_session(self):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        app._process_name = "marketing-strategy"
-        app._process_defn = SimpleNamespace(name="marketing-strategy")
-        app._reload_session_for_process_change = AsyncMock()
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        handled = await app._handle_slash_command("/process off")
-
-        assert handled is True
-        assert app._process_name is None
-        assert app._process_defn is None
-        app._reload_session_for_process_change.assert_awaited_once()
-        assert "Name:[/] none" in chat.add_info.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_run_requires_goal(self):
@@ -3813,6 +3667,30 @@ class TestProcessSlashCommands:
         assert kwargs["force_fresh"] is True
 
     @pytest.mark.asyncio
+    async def test_run_process_flag_is_not_supported_in_tui(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._start_process_run = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command(
+            "/run --process investment-analysis analyze tesla",
+        )
+
+        assert handled is True
+        app._start_process_run.assert_not_awaited()
+        chat.add_info.assert_called_once()
+        assert "/run --process is not supported in TUI" in chat.add_info.call_args.args[0]
+        assert "/investment-analysis analyze tesla" not in chat.add_info.call_args.args[0]
+        assert "/<process-name> <goal>" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
     async def test_run_file_goal_loads_content_for_adhoc(self, tmp_path):
         from loom.tui.app import LoomApp
 
@@ -3873,9 +3751,9 @@ class TestProcessSlashCommands:
         assert handled is True
         app._start_process_run.assert_awaited_once_with(
             "focus only on risk items",
-            process_defn=app._process_defn,
+            process_defn=None,
             process_name_override=None,
-            is_adhoc=False,
+            is_adhoc=True,
             synthesis_goal=ANY,
             force_fresh=False,
             goal_context_overrides={
@@ -5535,7 +5413,7 @@ class TestProcessSlashCommands:
         app._synthesize_adhoc_process.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_run_starts_process_run_for_active_process(self):
+    async def test_run_defaults_to_adhoc_even_when_process_is_loaded(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -5554,9 +5432,9 @@ class TestProcessSlashCommands:
         assert handled is True
         app._start_process_run.assert_awaited_once_with(
             "Analyze Tesla for investment",
-            process_defn=app._process_defn,
+            process_defn=None,
             process_name_override=None,
-            is_adhoc=False,
+            is_adhoc=True,
             synthesis_goal="Analyze Tesla for investment",
             force_fresh=False,
         )
@@ -8058,85 +7936,6 @@ class TestAuthSlashCommands:
         app._open_auth_manager_screen.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_auth_use_sets_run_override(self, monkeypatch):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        app._refresh_process_command_index = MagicMock()
-
-        merged = SimpleNamespace(
-            config=SimpleNamespace(
-                profiles={
-                    "notion_marketing": SimpleNamespace(provider="notion"),
-                },
-                defaults={},
-                mcp_alias_profiles={},
-            ),
-            workspace_defaults={},
-            user_path=Path("/tmp/user-auth.toml"),
-            explicit_path=None,
-            workspace_defaults_path=Path("/tmp/.loom/auth.defaults.toml"),
-        )
-        monkeypatch.setattr(
-            "loom.auth.config.load_merged_auth_config",
-            lambda **_kwargs: merged,
-        )
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        handled = await app._handle_slash_command("/auth use notion=notion_marketing")
-
-        assert handled is True
-        assert app._run_auth_profile_overrides == {
-            "notion": "notion_marketing"
-        }
-        chat.add_info.assert_called_once()
-        assert "notion -> notion_marketing" in chat.add_info.call_args.args[0]
-
-    @pytest.mark.asyncio
-    async def test_auth_add_and_remove_profile(self, monkeypatch):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        app._refresh_process_command_index = MagicMock()
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        monkeypatch.setattr(
-            "loom.auth.config.resolve_auth_write_path",
-            lambda explicit_path=None: Path("/tmp/auth.toml"),
-        )
-        monkeypatch.setattr(
-            "loom.auth.config.upsert_auth_profile",
-            lambda *args, **kwargs: None,
-        )
-        monkeypatch.setattr(
-            "loom.auth.config.remove_auth_profile",
-            lambda *args, **kwargs: None,
-        )
-
-        handled_add = await app._handle_slash_command(
-            "/auth add notion_marketing --provider notion --mode oauth2_pkce "
-            "--token-ref keychain://loom/notion/notion_marketing/tokens",
-        )
-        assert handled_add is True
-        assert "Added auth profile" in chat.add_info.call_args.args[0]
-
-        handled_remove = await app._handle_slash_command(
-            "/auth remove notion_marketing",
-        )
-        assert handled_remove is True
-        assert "Removed auth profile" in chat.add_info.call_args.args[0]
-
-    @pytest.mark.asyncio
     async def test_auth_manage_routes_to_manager_screen(self):
         from loom.tui.app import LoomApp
 
@@ -8156,7 +7955,7 @@ class TestAuthSlashCommands:
         app._open_auth_manager_screen.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_auth_routes_subcommand_is_no_longer_supported(self):
+    async def test_auth_non_manager_subcommand_shows_cli_handoff(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -8168,117 +7967,14 @@ class TestAuthSlashCommands:
         chat = MagicMock()
         app.query_one = MagicMock(return_value=chat)
 
-        handled = await app._handle_slash_command("/auth routes")
+        handled = await app._handle_slash_command("/auth list")
 
         assert handled is True
         chat.add_info.assert_called_once()
         message = chat.add_info.call_args.args[0]
-        assert "Usage" in message
-        assert "/auth" in message
-        assert "routes" not in message
-
-    @pytest.mark.asyncio
-    async def test_auth_edit_uses_explicit_auth_path(self, monkeypatch):
-        from loom.tui.app import LoomApp
-
-        explicit_path = Path("/tmp/override-auth.toml")
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-            explicit_auth_path=explicit_path,
-        )
-        app._refresh_process_command_index = MagicMock()
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        captured: dict[str, object] = {}
-        current = SimpleNamespace(
-            profile_id="notion_marketing",
-            provider="notion",
-            mode="oauth2_pkce",
-            account_label="",
-            mcp_server="",
-            secret_ref="",
-            token_ref="",
-            scopes=[],
-            env={},
-            command="",
-            auth_check=[],
-            metadata={},
-        )
-
-        def _fake_load_merged_auth_config(*, workspace, explicit_path=None):
-            captured["load_explicit_path"] = explicit_path
-            return SimpleNamespace(
-                config=SimpleNamespace(profiles={"notion_marketing": current}),
-            )
-
-        def _fake_resolve_auth_write_path(*, explicit_path=None):
-            captured["write_explicit_path"] = explicit_path
-            return Path("/tmp/auth.toml")
-
-        monkeypatch.setattr(
-            "loom.auth.config.load_merged_auth_config",
-            _fake_load_merged_auth_config,
-        )
-        monkeypatch.setattr(
-            "loom.auth.config.resolve_auth_write_path",
-            _fake_resolve_auth_write_path,
-        )
-        monkeypatch.setattr(
-            "loom.auth.config.upsert_auth_profile",
-            lambda *args, **kwargs: None,
-        )
-
-        handled = await app._handle_slash_command(
-            "/auth edit notion_marketing --label Marketing",
-        )
-
-        assert handled is True
-        assert captured["load_explicit_path"] == explicit_path
-        assert captured["write_explicit_path"] == explicit_path
-
-    @pytest.mark.asyncio
-    async def test_auth_use_rejects_mcp_selector(self, monkeypatch):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        app._refresh_process_command_index = MagicMock()
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        def _fake_load_merged_auth_config(**_kwargs):
-            return SimpleNamespace(
-                config=SimpleNamespace(
-                    profiles={
-                        "notion_marketing": SimpleNamespace(provider="notion"),
-                    },
-                    defaults={},
-                    mcp_alias_profiles={},
-                ),
-                workspace_defaults={},
-                user_path=Path("/tmp/user-auth.toml"),
-                explicit_path=None,
-                workspace_defaults_path=Path("/tmp/.loom/auth.defaults.toml"),
-            )
-
-        monkeypatch.setattr(
-            "loom.auth.config.load_merged_auth_config",
-            _fake_load_merged_auth_config,
-        )
-
-        handled = await app._handle_slash_command(
-            "/auth use mcp.notion=notion_marketing",
-        )
-
-        assert handled is True
-        chat.add_info.assert_called_once()
-        assert "MCP selectors are no longer supported" in chat.add_info.call_args.args[0]
+        assert "manager-first" in message
+        assert "/auth manage" in message
+        assert "loom auth" in message
 
 
 class TestRunStartAuthResolution:
@@ -8471,7 +8167,8 @@ class TestCommandPaletteProcessActions:
 
         await app.action_loom_command("process_info")
 
-        chat.add_info.assert_called_once_with("Active process: marketing-strategy")
+        chat.add_info.assert_called_once()
+        assert "Process Modes" in chat.add_info.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_process_list_action(self):
@@ -8490,46 +8187,6 @@ class TestCommandPaletteProcessActions:
 
         app._render_process_catalog.assert_called_once()
         chat.add_info.assert_called_once_with("catalog")
-
-    @pytest.mark.asyncio
-    async def test_process_off_action_no_active(self):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        app._process_name = None
-        app._process_defn = None
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        await app.action_loom_command("process_off")
-
-        chat.add_info.assert_called_once_with("No active process.")
-
-    @pytest.mark.asyncio
-    async def test_process_off_action_reloads(self):
-        from loom.tui.app import LoomApp
-
-        app = LoomApp(
-            model=MagicMock(name="model"),
-            tools=MagicMock(),
-            workspace=Path("/tmp"),
-        )
-        app._process_name = "marketing-strategy"
-        app._process_defn = SimpleNamespace(name="marketing-strategy")
-        app._reload_session_for_process_change = AsyncMock()
-        chat = MagicMock()
-        app.query_one = MagicMock(return_value=chat)
-
-        await app.action_loom_command("process_off")
-
-        assert app._process_name is None
-        assert app._process_defn is None
-        app._reload_session_for_process_change.assert_awaited_once()
-        assert "Active process: none" in chat.add_info.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_palette_slash_backed_actions_delegate_to_slash_handler(self):
@@ -8570,12 +8227,11 @@ class TestCommandPaletteProcessActions:
         )
         app._prefill_user_input = MagicMock()
 
-        await app.action_loom_command("process_use_prompt")
         await app.action_loom_command("run_prompt")
         await app.action_loom_command("resume_prompt")
 
         calls = [c.args[0] for c in app._prefill_user_input.call_args_list]
-        assert calls == ["/process use ", "/run ", "/resume "]
+        assert calls == ["/run ", "/resume "]
 
     @pytest.mark.asyncio
     async def test_palette_dynamic_process_prompt_action_prefills_input(self):
@@ -8634,12 +8290,12 @@ class TestCommandPaletteProcessActions:
         app._render_slash_hint = MagicMock(return_value="hint text")
         app._set_slash_hint = MagicMock()
 
-        app._prefill_user_input("/process use ")
+        app._prefill_user_input("/processes")
 
-        assert input_widget.value == "/process use "
-        assert input_widget.cursor_position == len("/process use ")
+        assert input_widget.value == "/processes"
+        assert input_widget.cursor_position == len("/processes")
         input_widget.focus.assert_called_once()
-        app._render_slash_hint.assert_called_once_with("/process use ")
+        app._render_slash_hint.assert_called_once_with("/processes")
         app._set_slash_hint.assert_called_once_with("hint text")
 
     def test_hydrate_input_history_from_session_filters_non_user_messages(self):
@@ -8819,7 +8475,7 @@ class TestCommandPaletteProcessActions:
         input_widget.value = "/resume abc"
         assert app._apply_slash_tab_completion(reverse=False) is False
 
-    def test_slash_tab_completion_process_use_prefix(self):
+    def test_slash_tab_completion_process_use_prefix_not_supported(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -8836,10 +8492,9 @@ class TestCommandPaletteProcessActions:
         input_widget = SimpleNamespace(value="/process use inv", cursor_position=0)
         app.query_one = MagicMock(return_value=input_widget)
 
-        assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/process use investment-analysis"
+        assert app._apply_slash_tab_completion(reverse=False) is False
 
-    def test_slash_tab_completion_process_use_cycles(self):
+    def test_slash_tab_completion_process_use_cycles_not_supported(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -8857,14 +8512,7 @@ class TestCommandPaletteProcessActions:
         input_widget = SimpleNamespace(value="/process use m", cursor_position=0)
         app.query_one = MagicMock(return_value=input_widget)
 
-        assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/process use marketing-strategy"
-
-        assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/process use market-research"
-
-        assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/process use marketing-strategy"
+        assert app._apply_slash_tab_completion(reverse=False) is False
 
     def test_slash_tab_completion_process_use_no_matches(self):
         from loom.tui.app import LoomApp

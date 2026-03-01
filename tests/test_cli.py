@@ -41,6 +41,7 @@ class TestCLI:
         result = runner.invoke(cli, ["run", "--help"])
         assert result.exit_code == 0
         assert "--workspace" in result.output
+        assert "--process" in result.output
 
     def test_install_help(self):
         runner = CliRunner()
@@ -96,6 +97,7 @@ class TestCLI:
         assert "--workspace" in result.output
         assert "--model" in result.output
         assert "--resume" in result.output
+        assert "--process" not in result.output
 
     def test_default_shows_help_with_workspace_and_model(self):
         runner = CliRunner()
@@ -104,8 +106,8 @@ class TestCLI:
         assert "--workspace" in result.output
         assert "--model" in result.output
 
-    def test_launch_tui_uses_default_process(self, monkeypatch):
-        """When --process is omitted, _launch_tui should use config default."""
+    def test_launch_tui_does_not_inject_default_process(self, monkeypatch):
+        """TUI launch should not inject process.default as active context."""
         import loom.__main__ as main_mod
 
         captured: dict[str, object] = {}
@@ -131,10 +133,9 @@ class TestCLI:
             workspace=None,
             model_name=None,
             resume_session=None,
-            process_name=None,
         )
 
-        assert captured["process_name"] == "marketing-strategy"
+        assert "process_name" not in captured
         assert captured["run_kwargs"] == {"mouse": True}
 
     def test_run_uses_default_process(self, tmp_path, monkeypatch):
@@ -945,6 +946,7 @@ class TestMCPCli:
         listed = json.loads(list_result.output)
         assert listed["legacy_sources_detected"] is False
         assert listed["servers"][0]["alias"] == "demo"
+        assert listed["servers"][0]["type"] == "local"
         assert listed["servers"][0]["env"]["API_KEY"] == "<redacted>"
         assert listed["servers"][0]["env"]["NOTION_TOKEN"] == "${NOTION_TOKEN}"
 
@@ -964,6 +966,7 @@ class TestMCPCli:
         assert show_result.exit_code == 0
         shown = json.loads(show_result.output)
         assert shown["alias"] == "demo"
+        assert shown["type"] == "local"
         assert shown["command"] == "python"
         assert shown["enabled"] is True
 
@@ -1169,3 +1172,330 @@ for line in sys.stdin:
         payload = json.loads(probe_result.output)
         assert payload["tool_count"] == 2
         assert payload["tools"] == ["echo", "ping"]
+
+    def test_mcp_auth_login_status_logout(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        mcp_cfg = tmp_path / "mcp.toml"
+        mcp_cfg.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+scopes = ["read:content"]
+"""
+        )
+        oauth_store = tmp_path / "mcp-oauth.json"
+        runner = CliRunner()
+
+        login_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "auth",
+                "login",
+                "remote_demo",
+                "--access-token",
+                "token-123",
+                "--expires-in",
+                "120",
+                "--oauth-store",
+                str(oauth_store),
+            ],
+        )
+        assert login_result.exit_code == 0
+        assert oauth_store.exists()
+
+        status_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "auth",
+                "status",
+                "remote_demo",
+                "--json",
+                "--oauth-store",
+                str(oauth_store),
+            ],
+        )
+        assert status_result.exit_code == 0
+        payload = json.loads(status_result.output)
+        assert payload["aliases"][0]["alias"] == "remote_demo"
+        assert payload["aliases"][0]["state"] == "ready"
+
+        logout_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "auth",
+                "logout",
+                "remote_demo",
+                "--oauth-store",
+                str(oauth_store),
+            ],
+        )
+        assert logout_result.exit_code == 0
+
+        status_after_logout = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "auth",
+                "status",
+                "remote_demo",
+                "--json",
+                "--oauth-store",
+                str(oauth_store),
+            ],
+        )
+        assert status_after_logout.exit_code == 0
+        after_payload = json.loads(status_after_logout.output)
+        assert after_payload["aliases"][0]["state"] == "missing"
+
+    def test_mcp_status_command_reports_runtime(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        mcp_cfg = tmp_path / "mcp.toml"
+        fake_server = tmp_path / "fake_mcp.py"
+        fake_server.write_text(
+            """\
+import json
+import sys
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"capabilities": {"tools": {"listChanged": True}}},
+        }), flush=True)
+        continue
+    if method == "notifications/initialized":
+        continue
+    if method == "tools/list":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]},
+        }), flush=True)
+"""
+        )
+        mcp_cfg.write_text(
+            f"""
+[mcp.servers.demo]
+command = "{sys.executable}"
+args = ["{fake_server}"]
+enabled = true
+"""
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "status",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["servers"][0]["alias"] == "demo"
+        assert payload["servers"][0]["runtime"]["status"] in {
+            "healthy",
+            "configured",
+            "connecting",
+        }
+
+    def test_mcp_connect_disconnect_reconnect_commands(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        mcp_cfg = tmp_path / "mcp.toml"
+        fake_server = tmp_path / "fake_connect_mcp.py"
+        fake_server.write_text(
+            """\
+import json
+import sys
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"capabilities": {"tools": {"listChanged": True}}},
+        }), flush=True)
+        continue
+    if method == "notifications/initialized":
+        continue
+    if method == "tools/list":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]},
+        }), flush=True)
+        continue
+"""
+        )
+        mcp_cfg.write_text(
+            f"""
+[mcp.servers.demo]
+command = "{sys.executable}"
+args = ["{fake_server}"]
+enabled = true
+"""
+        )
+        runner = CliRunner()
+
+        connect_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "connect",
+                "demo",
+                "--json",
+            ],
+        )
+        assert connect_result.exit_code == 0
+        connect_payload = json.loads(connect_result.output)
+        assert connect_payload["alias"] == "demo"
+        assert connect_payload["status"] in {"healthy", "connecting", "configured"}
+
+        disconnect_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "disconnect",
+                "demo",
+                "--json",
+            ],
+        )
+        assert disconnect_result.exit_code == 0
+        disconnect_payload = json.loads(disconnect_result.output)
+        assert disconnect_payload["status"] == "disconnected"
+
+        reconnect_result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "reconnect",
+                "demo",
+                "--json",
+            ],
+        )
+        assert reconnect_result.exit_code == 0
+        reconnect_payload = json.loads(reconnect_result.output)
+        assert reconnect_payload["status"] in {"healthy", "connecting", "configured"}
+
+    def test_mcp_debug_bundle_redacts_env_values(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        mcp_cfg = tmp_path / "mcp.toml"
+        fake_server = tmp_path / "fake_debug_mcp.py"
+        fake_server.write_text(
+            """\
+import json
+import sys
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"capabilities": {"tools": {"listChanged": True}}},
+        }), flush=True)
+        continue
+    if method == "notifications/initialized":
+        continue
+    if method == "tools/list":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]},
+        }), flush=True)
+        continue
+"""
+        )
+        mcp_cfg.write_text(
+            f"""
+[mcp.servers.demo]
+command = "{sys.executable}"
+args = ["{fake_server}"]
+enabled = true
+
+[mcp.servers.demo.env]
+API_KEY = "super-secret-value"
+"""
+        )
+        bundle_path = tmp_path / "mcp-debug.json"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "debug-bundle",
+                "--output",
+                str(bundle_path),
+            ],
+        )
+        assert result.exit_code == 0
+        assert bundle_path.exists()
+        raw = bundle_path.read_text(encoding="utf-8")
+        assert "super-secret-value" not in raw
+        assert "<redacted>" in raw
