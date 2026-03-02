@@ -82,6 +82,7 @@ from loom.tui.screens import (
 )
 from loom.tui.theme import LOOM_DARK
 from loom.tui.widgets import (
+    ActivityIndicator,
     ChatLog,
     EventPanel,
     FilesChangedPanel,
@@ -739,6 +740,12 @@ class LoomApp(App):
     #status-bar {
         display: none;
     }
+    #app-header #header-activity-indicator {
+        dock: right;
+        offset: -10 0;
+        margin: 0;
+        height: 100%;
+    }
     #footer-row {
         width: 100%;
         height: 1;
@@ -893,8 +900,62 @@ class LoomApp(App):
         self._files_panel_recent_ops: dict[str, float] = {}
         self._files_panel_dedupe_window_seconds = 1.5
 
+    def _mount_header_activity_indicator(self) -> None:
+        """Mount the header activity indicator immediately left of the clock."""
+        try:
+            header = self.query_one("#app-header", Header)
+        except Exception:
+            return
+        try:
+            header.query_one("#header-activity-indicator")
+            return
+        except Exception:
+            pass
+
+        indicator = ActivityIndicator(id="header-activity-indicator")
+        clock_widget = None
+        for child in list(header.children):
+            if type(child).__name__ in {"HeaderClock", "HeaderClockSpace"}:
+                clock_widget = child
+                break
+        try:
+            if clock_widget is not None:
+                header.mount(indicator, before=clock_widget)
+            else:
+                header.mount(indicator)
+        except Exception:
+            return
+
+    def _has_unfinalized_delegate_streams(self) -> bool:
+        """Return True when a delegate progress stream is still in progress."""
+        for stream in self._active_delegate_streams.values():
+            if not isinstance(stream, dict):
+                continue
+            if not bool(stream.get("finalized", False)):
+                return True
+        return False
+
+    def _is_background_work_active(self) -> bool:
+        """Return True while chat, process runs, or delegate streams are active."""
+        if self._chat_busy:
+            return True
+        if self._has_active_process_runs():
+            return True
+        return self._has_unfinalized_delegate_streams()
+
+    def _sync_activity_indicator(self) -> None:
+        """Sync header activity indicator animation state."""
+        try:
+            indicator = self.query_one(
+                "#header-activity-indicator",
+                ActivityIndicator,
+            )
+            indicator.set_active(self._is_background_work_active())
+        except Exception:
+            return
+
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=True, id="app-header")
         with Horizontal(id="main-layout"):
             yield Sidebar(
                 self._workspace,
@@ -938,6 +999,8 @@ class LoomApp(App):
         # Register and activate theme
         self.register_theme(LOOM_DARK)
         self.theme = "loom-dark"
+        self._mount_header_activity_indicator()
+        self._sync_activity_indicator()
         if diagnostics_enabled():
             self.run_worker(
                 self._monitor_event_loop_lag(),
@@ -4179,6 +4242,7 @@ class LoomApp(App):
         self._total_tokens = 0
         self._sidebar_cowork_tasks = []
         self._active_delegate_streams = {}
+        self._sync_activity_indicator()
         chat.set_stream_flush_interval_ms(self._tui_chat_stream_flush_interval_ms())
 
         # Build a clean registry once at session initialization.
@@ -5243,6 +5307,7 @@ class LoomApp(App):
             tab.label = self._format_process_run_tab_title(run)
         except Exception:
             pass
+        self._sync_activity_indicator()
 
     def _tick_process_run_elapsed(self) -> None:
         """Periodic timer to refresh elapsed text for active process runs."""
@@ -5254,6 +5319,7 @@ class LoomApp(App):
                 self._update_process_run_visuals(run)
         if active:
             self._refresh_sidebar_progress_summary()
+        self._sync_activity_indicator()
 
     def _build_process_run_context(self, goal: str, *, workspace: Path) -> dict:
         """Build compact cowork context to pass into delegated process runs."""
@@ -5710,6 +5776,7 @@ class LoomApp(App):
         except Exception:
             pass
         self._process_runs.pop(run.run_id, None)
+        self._sync_activity_indicator()
         self._clear_process_run_cancel_handler(run.run_id)
         self._refresh_sidebar_progress_summary()
         await self._persist_process_run_ui_state()
@@ -7391,6 +7458,7 @@ class LoomApp(App):
         if callable(reset_runtime_state):
             reset_runtime_state()
         self._active_delegate_streams = {}
+        self._sync_activity_indicator()
 
     def _reset_chat_history_state(self) -> None:
         """Reset in-memory replay state for the active chat transcript."""
@@ -8904,6 +8972,7 @@ class LoomApp(App):
             return
 
         self._chat_busy = True
+        self._sync_activity_indicator()
         chat = self.query_one("#chat-log", ChatLog)
         status = self.query_one("#status-bar", StatusBar)
 
@@ -8919,9 +8988,10 @@ class LoomApp(App):
         except Exception as e:
             chat.add_model_text(f"[bold #f7768e]Error:[/] {e}", markup=True)
             self.notify(str(e), severity="error", timeout=5)
-
-        self._chat_busy = False
-        status.state = "Ready"
+        finally:
+            self._chat_busy = False
+            status.state = "Ready"
+            self._sync_activity_indicator()
 
     async def _run_followup(self, message: str) -> None:
         """Run a follow-up turn (e.g. after ask_user answer)."""
@@ -8997,6 +9067,7 @@ class LoomApp(App):
             "finalized": str(status or "").strip().lower() in {"completed", "failed"},
         })
         self._active_delegate_streams[key] = stream
+        self._sync_activity_indicator()
         return True
 
     def _append_delegate_progress_widget_line(self, tool_call_id: str, line: str) -> bool:
@@ -9104,6 +9175,7 @@ class LoomApp(App):
             "title": title,
         })
         self._active_delegate_streams[key] = stream
+        self._sync_activity_indicator()
         if not persist:
             return
         await self._append_chat_replay_event(

@@ -1283,6 +1283,49 @@ class TestStatusBar:
         assert "12 tokens" in rendered
 
 
+class TestActivityIndicator:
+    def test_idle_render_uses_dim_static_dots(self):
+        from loom.tui.widgets.activity_indicator import ActivityIndicator
+
+        indicator = ActivityIndicator(dot_count=8, idle_hold_ms=0)
+        rendered = indicator.render()
+        assert rendered.count(indicator._GLYPH_IDLE) == 8
+        assert indicator._GLYPH_HEAD not in rendered
+
+    def test_active_frame_progression_ping_pongs(self):
+        from loom.tui.widgets.activity_indicator import ActivityIndicator
+
+        indicator = ActivityIndicator(dot_count=4, idle_hold_ms=0)
+        indicator.set_active(True)
+        sequence = [indicator._frame_index]
+        for _ in range(7):
+            indicator._advance_frame()
+            sequence.append(indicator._frame_index)
+        assert sequence == [0, 1, 2, 3, 2, 1, 0, 1]
+
+    def test_inactive_resets_to_dim_strip(self):
+        from loom.tui.widgets.activity_indicator import ActivityIndicator
+
+        indicator = ActivityIndicator(dot_count=4, idle_hold_ms=0)
+        indicator.set_active(True)
+        indicator._advance_frame()
+        indicator.set_active(False)
+        rendered = indicator.render()
+        assert indicator._frame_index == 0
+        assert rendered.count(indicator._GLYPH_IDLE) == 4
+        assert indicator._GLYPH_HEAD not in rendered
+
+    def test_repeated_idle_sync_does_not_restart_hold_window(self):
+        from loom.tui.widgets.activity_indicator import ActivityIndicator
+
+        indicator = ActivityIndicator(dot_count=8, idle_hold_ms=300)
+        indicator.set_active(True)
+        indicator.set_active(False)
+        first_hold_until = indicator._hold_until
+        indicator.set_active(False)
+        assert indicator._hold_until == first_hold_until
+
+
 class TestTaskProgressPanel:
     def test_render_empty(self):
         from loom.tui.widgets.sidebar import TaskProgressPanel
@@ -8766,6 +8809,88 @@ class TestCommandPaletteProcessActions:
             assert "^m" in mcp_label and "mcp" in mcp_label
             dividers = app.query("#footer-shortcuts .footer-shortcut-divider")
             assert len(list(dividers)) == 2
+
+    @pytest.mark.asyncio
+    async def test_header_activity_indicator_is_left_of_clock(self):
+        from textual.widgets import Header
+
+        from loom.tui.app import LoomApp
+        from loom.tui.widgets.activity_indicator import ActivityIndicator
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(140, 44)) as pilot:
+            await pilot.pause()
+            header = app.query_one("#app-header", Header)
+            indicator = app.query_one("#header-activity-indicator", ActivityIndicator)
+            clock = next(
+                child for child in header.children
+                if type(child).__name__ == "HeaderClock"
+            )
+            # Ensure indicator is rendered on the active header row and sits
+            # directly left of the clock cluster.
+            assert indicator.region.y == clock.region.y
+            assert indicator.region.x + indicator.region.width <= clock.region.x
+
+    @pytest.mark.asyncio
+    async def test_header_activity_indicator_scales_with_tall_header(self):
+        from textual.widgets import Header
+
+        from loom.tui.app import LoomApp
+        from loom.tui.widgets.activity_indicator import ActivityIndicator
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(140, 44)) as pilot:
+            await pilot.pause()
+            header = app.query_one("#app-header", Header)
+            indicator = app.query_one("#header-activity-indicator", ActivityIndicator)
+            clock = next(
+                child for child in header.children
+                if type(child).__name__ == "HeaderClock"
+            )
+            header.tall = True
+            await pilot.pause()
+            assert indicator.region.height == clock.region.height
+            assert indicator.region.y == clock.region.y
+
+    def test_background_work_active_predicate(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        app._chat_busy = False
+        app._process_runs = {}
+        app._active_delegate_streams = {}
+        assert app._is_background_work_active() is False
+
+        app._chat_busy = True
+        assert app._is_background_work_active() is True
+
+        app._chat_busy = False
+        app._process_runs = {"run_1": SimpleNamespace(status="running")}
+        assert app._is_background_work_active() is True
+
+        app._process_runs = {}
+        app._active_delegate_streams = {"call_1": {"finalized": False}}
+        assert app._is_background_work_active() is True
+
+        app._active_delegate_streams = {"call_1": {"finalized": True}}
+        assert app._is_background_work_active() is False
 
     def test_open_auth_tab_action_opens_manager(self):
         from loom.tui.app import LoomApp
