@@ -1328,26 +1328,41 @@ class TestActivityIndicator:
 
 class TestTaskProgressPanel:
     def test_render_empty(self):
+        from rich.text import Text
+
         from loom.tui.widgets.sidebar import TaskProgressPanel
         panel = TaskProgressPanel()
-        assert "No tasks tracked" in panel.render()
+        rendered = panel.render()
+        assert isinstance(rendered, Text)
+        assert "No tasks tracked" in rendered.plain
 
     def test_render_with_tasks(self):
+        from rich.console import Console
+
         from loom.tui.widgets.sidebar import TaskProgressPanel
         panel = TaskProgressPanel()
         panel.tasks = [
             {"content": "Read file", "status": "completed"},
-            {"content": "Fix bug", "status": "in_progress"},
+            {
+                "content": "crypto-externalities-article-adhoc #2f3f27 Running 29:46",
+                "status": "in_progress",
+            },
             {"content": "Run tests", "status": "pending"},
             {"content": "Handle failure", "status": "failed"},
             {"content": "Skip optional step", "status": "skipped"},
         ]
         rendered = panel.render()
-        assert "Read file" in rendered
-        assert "Fix bug" in rendered
-        assert "Run tests" in rendered
-        assert "Handle failure" in rendered
-        assert "Skip optional step" in rendered
+        console = Console(width=34, record=True)
+        console.print(rendered)
+        plain = console.export_text(styles=False)
+
+        assert "Read file" in plain
+        assert "crypto-externalities-article-adh" in plain
+        assert "oc #2f3f27 Running 29:46" in plain
+        assert "Run tests" in plain
+        assert "Handle failure" in plain
+        assert "Skip optional step" in plain
+        assert "\n◉\n" not in plain
 
     def test_task_update_triggers_scroll_hook(self):
         from loom.tui.widgets.sidebar import TaskProgressPanel

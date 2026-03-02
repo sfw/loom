@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from rich.console import RenderableType
+from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
@@ -38,31 +40,39 @@ class TaskProgressPanel(Static):
         super().__init__(**kwargs)
         self._auto_follow = bool(auto_follow)
 
-    def render(self) -> str:
-        if not self.tasks:
-            return f"[dim]{self.empty_message}[/dim]"
+    @staticmethod
+    def _status_icon(status: str) -> tuple[str, str]:
+        if status == "completed":
+            return "\u2713", "#9ece6a"
+        if status == "in_progress":
+            return "\u25c9", "#7dcfff"
+        if status == "failed":
+            return "\u2717", "#f7768e"
+        if status == "skipped":
+            return "-", "dim"
+        return "\u25cb", "dim"
 
-        lines: list[str] = []
+    def render(self) -> RenderableType:
+        if not self.tasks:
+            return Text(self.empty_message, style="dim")
+
+        grid = Table.grid(padding=(0, 1), expand=True)
+        grid.add_column("status", width=1, no_wrap=True)
+        grid.add_column("content", ratio=1, no_wrap=False, overflow="fold")
         for t in self.tasks:
-            status = t.get("status", "pending")
+            status = str(t.get("status", "pending")).strip()
             raw_content = t.get("content", "?")
             if isinstance(raw_content, Text):
                 content = raw_content.plain
             else:
                 content = str(raw_content)
-            content = content.replace("[", "\\[")
-            if status == "completed":
-                icon = "[#9ece6a]\u2713[/]"
-            elif status == "in_progress":
-                icon = "[#7dcfff]\u25c9[/]"
-            elif status == "failed":
-                icon = "[#f7768e]\u2717[/]"
-            elif status == "skipped":
-                icon = "[dim]-[/dim]"
-            else:
-                icon = "[dim]\u25cb[/dim]"
-            lines.append(f"{icon} {content}")
-        return "\n".join(lines)
+            content = content.strip() or "?"
+            icon, style = self._status_icon(status)
+            grid.add_row(
+                Text(icon, style=style, no_wrap=True),
+                Text(content, no_wrap=False, overflow="fold"),
+            )
+        return grid
 
     def watch_tasks(self, _tasks: list[dict]) -> None:
         self._scroll_to_latest()
