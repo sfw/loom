@@ -211,6 +211,35 @@ url = "http://example.com/mcp"
         load_mcp_file(cfg)
 
 
+def test_load_mcp_file_remote_defaults_oauth_enabled(tmp_path: Path):
+    cfg = tmp_path / "mcp.toml"
+    cfg.write_text(
+        """
+[mcp.servers.remote]
+type = "remote"
+url = "https://example.com/mcp"
+"""
+    )
+    loaded = load_mcp_file(cfg)
+    assert loaded.servers["remote"].oauth.enabled is True
+
+
+def test_load_mcp_file_remote_oauth_false_override(tmp_path: Path):
+    cfg = tmp_path / "mcp.toml"
+    cfg.write_text(
+        """
+[mcp.servers.remote]
+type = "remote"
+url = "https://example.com/mcp"
+
+[mcp.servers.remote.oauth]
+enabled = false
+"""
+    )
+    loaded = load_mcp_file(cfg)
+    assert loaded.servers["remote"].oauth.enabled is False
+
+
 def test_manager_preserves_remote_fields_round_trip(tmp_path: Path):
     workspace = tmp_path / "ws"
     workspace.mkdir()

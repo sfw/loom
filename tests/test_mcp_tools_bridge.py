@@ -9,6 +9,7 @@ import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 import loom.integrations.mcp_tools as mcp_tools_module
@@ -16,6 +17,7 @@ from loom.config import Config, MCPConfig, MCPOAuthConfig, MCPServerConfig
 from loom.integrations.mcp.oauth import MCPOAuthReadiness
 from loom.integrations.mcp_tools import (
     MCPConnectionManager,
+    _MCPRemoteHTTPClient,
     _MCPStdioClient,
     register_mcp_tools,
     runtime_connection_states,
@@ -887,6 +889,163 @@ def test_connection_manager_redacts_oauth_failure_reason(monkeypatch):
     assert "secret" not in state.last_error
     assert "abc123" not in state.last_error
     assert "<redacted>" in state.last_error
+
+
+def test_remote_http_client_oauth_header_overrides_static_authorization(monkeypatch):
+    server = MCPServerConfig(
+        type="remote",
+        url="https://api.example.com/mcp",
+        headers={"authorization": "Bearer stale-token"},
+        oauth=MCPOAuthConfig(enabled=True),
+    )
+    client = _MCPRemoteHTTPClient(alias="demo", server=server)
+
+    monkeypatch.setattr(
+        mcp_tools_module,
+        "bearer_auth_header_for_alias",
+        lambda _alias: "Bearer live-token",
+    )
+
+    headers = client._headers()
+    assert headers["Authorization"] == "Bearer live-token"
+    assert "authorization" not in headers
+    assert headers["Accept"] == "application/json, text/event-stream"
+
+
+def test_remote_http_client_streamable_initialize_and_tools_list(monkeypatch):
+    json_module = json
+
+    class _FakeResponse:
+        def __init__(
+            self,
+            *,
+            status_code: int,
+            headers: dict[str, str] | None = None,
+            text: str = "",
+            raise_after_lines: bool = False,
+        ) -> None:
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.text = text
+            self.content = text.encode("utf-8")
+            self._raise_after_lines = bool(raise_after_lines)
+
+        def json(self):
+            return json.loads(self.text or "{}")
+
+        def read(self) -> bytes:
+            return self.content
+
+        def iter_lines(self):  # noqa: ANN201
+            yield from self.text.splitlines()
+            if self._raise_after_lines:
+                raise RuntimeError("stream remained open")
+
+    class _FakeStream:
+        def __init__(self, response: _FakeResponse) -> None:
+            self._response = response
+
+        def __enter__(self) -> _FakeResponse:
+            return self._response
+
+        def __exit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001
+            return False
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_stream(method, url, *, headers, json, timeout):  # noqa: ANN001
+        assert method == "POST"
+        calls.append({
+            "url": url,
+            "headers": dict(headers),
+            "json": dict(json),
+            "timeout": timeout,
+        })
+        method = str(json.get("method", "")).strip()
+        if method == "initialize":
+            init_payload = json_module.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"capabilities": {"tools": {"listChanged": True}}},
+            }, separators=(",", ":"))
+            return _FakeResponse(
+                status_code=200,
+                headers={
+                    "content-type": "text/event-stream",
+                    "Mcp-Session-Id": "session-1",
+                },
+                text=(
+                    'event: message\n'
+                    f"data: {init_payload}\n\n"
+                ),
+                raise_after_lines=True,
+            )
+        if method == "notifications/initialized":
+            return _FakeStream(_FakeResponse(status_code=202, headers={}))
+        if method == "tools/list":
+            assert headers.get("Mcp-Session-Id") == "session-1"
+            tools_payload = json_module.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "demo_tool",
+                            "description": "Demo",
+                            "inputSchema": {"type": "object"},
+                        }
+                    ]
+                },
+            }, separators=(",", ":"))
+            return _FakeResponse(
+                status_code=200,
+                headers={"content-type": "text/event-stream"},
+                text=(
+                    'event: message\n'
+                    f"data: {tools_payload}\n\n"
+                ),
+                raise_after_lines=True,
+            )
+        raise AssertionError(f"Unexpected method: {method}")
+
+    def _dispatch_stream(method, url, *, headers, json, timeout):  # noqa: ANN001
+        response = _fake_stream(
+            method,
+            url,
+            headers=headers,
+            json=json,
+            timeout=timeout,
+        )
+        if isinstance(response, _FakeStream):
+            return response
+        return _FakeStream(response)
+
+    monkeypatch.setattr(httpx, "stream", _dispatch_stream)
+    monkeypatch.setattr(
+        mcp_tools_module,
+        "bearer_auth_header_for_alias",
+        lambda _alias: "Bearer oauth-token",
+    )
+
+    client = _MCPRemoteHTTPClient(
+        alias="demo",
+        server=MCPServerConfig(
+            type="remote",
+            url="https://api.example.com/mcp",
+            oauth=MCPOAuthConfig(enabled=True),
+        ),
+    )
+    tools = client.list_tools()
+
+    assert len(tools) == 1
+    assert tools[0]["name"] == "demo_tool"
+    assert [str(item["json"]["method"]) for item in calls] == [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+    ]
+    assert calls[0]["headers"].get("Accept") == "application/json, text/event-stream"
+    assert calls[2]["headers"].get("Authorization") == "Bearer oauth-token"
 
 
 @pytest.mark.asyncio

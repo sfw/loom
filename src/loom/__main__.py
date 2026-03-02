@@ -2916,6 +2916,7 @@ def _resolve_mcp_oauth_provider_config(
     authorize_url: str | None,
     token_url: str | None,
     client_id: str | None,
+    redirect_port: int,
 ) -> OAuthProviderConfig:
     if view.server.type != "remote":
         raise MCPOAuthFlowError(
@@ -2927,12 +2928,20 @@ def _resolve_mcp_oauth_provider_config(
         authorization_endpoint=authorize_url,
         token_endpoint=token_url,
         client_id=client_id,
+        redirect_uris=(
+            f"http://127.0.0.1:{max(1, int(redirect_port))}/oauth/callback",
+            f"http://localhost:{max(1, int(redirect_port))}/oauth/callback",
+            "urn:ietf:wg:oauth:2.0:oob",
+        ),
+        client_name=f"Loom MCP ({view.alias})",
     )
     return OAuthProviderConfig(
         authorization_endpoint=provider.authorization_endpoint,
         token_endpoint=provider.token_endpoint,
         client_id=provider.client_id,
         scopes=provider.scopes,
+        authorize_params=dict(provider.authorize_params),
+        token_params=dict(provider.token_params),
     )
 
 
@@ -2967,7 +2976,10 @@ def _resolve_mcp_oauth_provider_config(
 @click.option(
     "--client-id",
     default=None,
-    help="OAuth client id override (defaults to LOOM_MCP_OAUTH_CLIENT_ID or loom-cli).",
+    help=(
+        "OAuth client id override (defaults to LOOM_MCP_OAUTH_CLIENT_ID, "
+        "dynamic registration when available, or loom-cli)."
+    ),
 )
 @click.option(
     "--redirect-port",
@@ -3091,6 +3103,7 @@ def mcp_auth_login(
             authorize_url=authorize_url,
             token_url=token_url,
             client_id=client_id,
+            redirect_port=redirect_port,
         )
     except MCPOAuthFlowError as e:
         click.echo(f"MCP auth login failed: {e}", err=True)
@@ -3168,6 +3181,7 @@ def mcp_auth_login(
     expires_at_unix = _parse_expiry_epoch_from_token_payload(token_payload)
     refresh_token_value = str(token_payload.get("refresh_token", "")).strip() or refresh_token
     token_type_value = str(token_payload.get("token_type", "")).strip() or token_type
+    client_secret = str(dict(provider.token_params).get("client_secret", "")).strip()
 
     try:
         path = upsert_mcp_oauth_token(
@@ -3181,6 +3195,7 @@ def mcp_auth_login(
             authorization_endpoint=provider.authorization_endpoint,
             client_id=provider.client_id,
             obtained_via="browser_pkce",
+            extra_fields={"client_secret": client_secret} if client_secret else None,
             store_path=oauth_store_path,
         )
     except MCPOAuthStoreError as e:

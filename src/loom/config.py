@@ -1591,11 +1591,12 @@ def load_config(path: Path | None = None) -> Config:
                     if isinstance(key, str):
                         headers[key] = str(value)
 
-            oauth_enabled = False
+            oauth_enabled = server_type == MCP_SERVER_TYPE_REMOTE
             oauth_scopes: list[str] = []
             raw_oauth = server_data.get("oauth", {})
             if isinstance(raw_oauth, dict):
-                oauth_enabled = bool(raw_oauth.get("enabled", False))
+                if "enabled" in raw_oauth:
+                    oauth_enabled = bool(raw_oauth.get("enabled"))
                 raw_scopes = raw_oauth.get("scopes", [])
                 if isinstance(raw_scopes, list):
                     oauth_scopes = [

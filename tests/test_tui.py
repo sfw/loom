@@ -1058,6 +1058,44 @@ class TestAuthAndMCPManagerScreens:
         assert widgets["#mcp-btn-oauth-save"].disabled is False
         assert "disabled by config" in status_text["value"]
 
+    def test_mcp_manager_select_remote_defaults_oauth_enabled_for_new_alias(self):
+        from loom.tui.screens.mcp_manager import MCPManagerScreen
+
+        screen = MCPManagerScreen(manager=MagicMock())
+        screen._active_alias = ""
+        screen._selected_server_type = MagicMock(return_value=screen._TYPE_REMOTE_VALUE)
+        screen._sync_transport_fields = MagicMock()
+        screen._update_form_dirty = MagicMock()
+
+        checkbox = SimpleNamespace(value=False)
+        screen.query_one = MagicMock(return_value=checkbox)
+        event = SimpleNamespace(select=SimpleNamespace(id="mcp-type"))
+
+        screen._on_form_select_changed(event)
+
+        assert checkbox.value is True
+        screen._sync_transport_fields.assert_called_once()
+        screen._update_form_dirty.assert_called_once()
+
+    def test_mcp_manager_select_remote_keeps_existing_oauth_value_for_loaded_alias(self):
+        from loom.tui.screens.mcp_manager import MCPManagerScreen
+
+        screen = MCPManagerScreen(manager=MagicMock())
+        screen._active_alias = "remote_demo"
+        screen._selected_server_type = MagicMock(return_value=screen._TYPE_REMOTE_VALUE)
+        screen._sync_transport_fields = MagicMock()
+        screen._update_form_dirty = MagicMock()
+
+        checkbox = SimpleNamespace(value=False)
+        screen.query_one = MagicMock(return_value=checkbox)
+        event = SimpleNamespace(select=SimpleNamespace(id="mcp-type"))
+
+        screen._on_form_select_changed(event)
+
+        assert checkbox.value is False
+        screen._sync_transport_fields.assert_called_once()
+        screen._update_form_dirty.assert_called_once()
+
     def test_mcp_manager_oauth_copy_url_warns_when_missing(self):
         from loom.tui.screens.mcp_manager import MCPManagerScreen
 

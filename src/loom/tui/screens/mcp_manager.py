@@ -820,6 +820,9 @@ class MCPManagerScreen(Vertical):
         if event.select.id not in self._FORM_SELECT_IDS:
             return
         if event.select.id == "mcp-type":
+            is_remote = self._selected_server_type() == self._TYPE_REMOTE_VALUE
+            if not str(self._active_alias or "").strip():
+                self.query_one("#mcp-oauth-enabled", Checkbox).value = bool(is_remote)
             self._sync_transport_fields()
         self._update_form_dirty()
 
@@ -1590,6 +1593,7 @@ class MCPManagerScreen(Vertical):
         except MCPOAuthStoreError as e:
             self.notify(f"OAuth token save failed: {e}", severity="error")
             return
+        self._changed = True
         self.query_one("#mcp-oauth-access-token", Input).value = ""
         self.query_one("#mcp-oauth-refresh-token", Input).value = ""
         self.query_one("#mcp-oauth-expires-in", Input).value = ""
@@ -1637,12 +1641,20 @@ class MCPManagerScreen(Vertical):
             provider = resolve_mcp_oauth_provider(
                 server_url=view.server.url,
                 scopes=list(view.server.oauth.scopes),
+                redirect_uris=(
+                    "http://127.0.0.1:8765/oauth/callback",
+                    "http://localhost:8765/oauth/callback",
+                    "urn:ietf:wg:oauth:2.0:oob",
+                ),
+                client_name=f"Loom MCP ({clean_alias})",
             )
             provider_cfg = OAuthProviderConfig(
                 authorization_endpoint=provider.authorization_endpoint,
                 token_endpoint=provider.token_endpoint,
                 client_id=provider.client_id,
                 scopes=provider.scopes,
+                authorize_params=dict(provider.authorize_params),
+                token_params=dict(provider.token_params),
             )
             started = await asyncio.to_thread(
                 self._oauth_engine.start_auth,
@@ -1801,6 +1813,9 @@ class MCPManagerScreen(Vertical):
         )
 
         try:
+            client_secret = str(
+                dict(provider.token_params).get("client_secret", "")
+            ).strip()
             await asyncio.to_thread(
                 upsert_mcp_oauth_token,
                 alias=alias,
@@ -1813,6 +1828,9 @@ class MCPManagerScreen(Vertical):
                 authorization_endpoint=provider.authorization_endpoint,
                 client_id=provider.client_id,
                 obtained_via="browser_pkce",
+                extra_fields={
+                    "client_secret": client_secret,
+                } if client_secret else None,
             )
         except MCPOAuthStoreError as e:
             self._oauth_last_failure_by_alias[alias] = str(e)
@@ -1821,6 +1839,7 @@ class MCPManagerScreen(Vertical):
             await self._oauth_show_status(notify=False, quiet=True)
             return
 
+        self._changed = True
         self._oauth_last_failure_by_alias.pop(alias, None)
         self._clear_oauth_pending_if_current(alias=alias, state=pending_state)
         self.query_one("#mcp-oauth-access-token", Input).value = ""
@@ -1894,6 +1913,7 @@ class MCPManagerScreen(Vertical):
         except MCPOAuthStoreError as e:
             self.notify(f"OAuth clear failed: {e}", severity="error")
             return
+        self._changed = True
         await self._oauth_show_status(notify=True, quiet=False)
 
     async def _test_alias(self) -> None:
