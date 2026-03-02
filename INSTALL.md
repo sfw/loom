@@ -212,7 +212,7 @@ roles = ["planner", "executor", "extractor", "verifier"]
 | `models.<name>` | `provider` | -- | `ollama`, `openai_compatible`, or `anthropic` |
 | `models.<name>` | `base_url` | -- | Model API URL |
 | `models.<name>` | `model` | -- | Model identifier |
-| `models.<name>` | `max_tokens` | `4096` | Max response tokens |
+| `models.<name>` | `max_tokens` | `8192` | Max response tokens |
 | `models.<name>` | `temperature` | `0.1` | Sampling temperature |
 | `models.<name>` | `roles` | `["executor"]` | Assigned roles |
 | `workspace` | `default_path` | `~/projects` | Default workspace |
@@ -258,7 +258,7 @@ curl http://localhost:1234/v1/models
 
 ```bash
 pytest
-# Should show ~1,648 collected (with some skipped depending on environment)
+# Should show ~2,218 collected (with some skipped depending on environment)
 ```
 
 ### 4. Start the Server
