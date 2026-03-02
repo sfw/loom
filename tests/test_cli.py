@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1060,7 +1061,7 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         assert listed_after_remove["profiles"] == []
 
     def test_auth_profile_login_browser_flow_stores_token_payload(self, tmp_path, monkeypatch):
-        import loom.__main__ as main_mod
+        import loom.auth.oauth_profiles as oauth_profiles_mod
 
         cfg = tmp_path / "loom.toml"
         cfg.write_text("[server]\nport = 9000\n")
@@ -1087,7 +1088,7 @@ oauth_client_id = "loom-profile-client"
                 stored["stored_ref"] = secret_ref
                 stored["stored_value"] = secret_value
 
-        monkeypatch.setattr(main_mod, "SecretResolver", _FakeSecretResolver)
+        monkeypatch.setattr(oauth_profiles_mod, "SecretResolver", _FakeSecretResolver)
 
         runner = CliRunner()
         with _oauth_token_server(payload={
@@ -1163,6 +1164,188 @@ oauth_client_id = "loom-profile-client"
 
         assert result.exit_code == 1
         assert "keychain://..." in result.output
+
+    def test_auth_profile_status_reports_oauth_state(self, tmp_path, monkeypatch):
+        import loom.auth.oauth_profiles as oauth_profiles_mod
+
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+oauth_authorization_endpoint = "https://auth.example.com/authorize"
+oauth_token_endpoint = "https://auth.example.com/token"
+oauth_client_id = "loom-profile-client"
+"""
+        )
+
+        class _FakeSecretResolver:
+            def resolve(self, secret_ref: str) -> str:
+                assert secret_ref == "keychain://loom/notion/notion_marketing/tokens"
+                return json.dumps(
+                    {
+                        "access_token": "profile-token",
+                        "token_type": "Bearer",
+                        "expires_at": int(time.time()) + 3600,
+                        "scopes": ["read:content"],
+                    }
+                )
+
+        monkeypatch.setattr(oauth_profiles_mod, "SecretResolver", _FakeSecretResolver)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "profile",
+                "status",
+                "notion_marketing",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["profile_id"] == "notion_marketing"
+        assert payload["state"] == "ready"
+        assert payload["has_token"] is True
+        assert payload["expired"] is False
+
+    def test_auth_profile_logout_clears_stored_token(self, tmp_path, monkeypatch):
+        import loom.auth.oauth_profiles as oauth_profiles_mod
+
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+oauth_authorization_endpoint = "https://auth.example.com/authorize"
+oauth_token_endpoint = "https://auth.example.com/token"
+oauth_client_id = "loom-profile-client"
+"""
+        )
+        stored: dict[str, str] = {}
+
+        class _FakeSecretResolver:
+            def validate_writable(self, secret_ref: str) -> None:
+                stored["validated_ref"] = secret_ref
+
+            def store(self, secret_ref: str, secret_value: str) -> None:
+                stored["stored_ref"] = secret_ref
+                stored["stored_value"] = secret_value
+
+        monkeypatch.setattr(oauth_profiles_mod, "SecretResolver", _FakeSecretResolver)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "profile",
+                "logout",
+                "notion_marketing",
+            ],
+        )
+        assert result.exit_code == 0
+        assert stored["validated_ref"] == "keychain://loom/notion/notion_marketing/tokens"
+        assert stored["stored_ref"] == "keychain://loom/notion/notion_marketing/tokens"
+        assert stored["stored_value"] == ""
+
+    def test_auth_profile_refresh_updates_token_payload(self, tmp_path, monkeypatch):
+        import loom.auth.oauth_profiles as oauth_profiles_mod
+
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+oauth_authorization_endpoint = "https://auth.example.com/authorize"
+oauth_token_endpoint = "https://auth.example.com/token"
+oauth_client_id = "loom-profile-client"
+"""
+        )
+        stored: dict[str, str] = {}
+
+        class _FakeSecretResolver:
+            def validate_writable(self, secret_ref: str) -> None:
+                stored["validated_ref"] = secret_ref
+
+            def resolve(self, secret_ref: str) -> str:
+                assert secret_ref == "keychain://loom/notion/notion_marketing/tokens"
+                return json.dumps(
+                    {
+                        "access_token": "old-token",
+                        "refresh_token": "refresh-abc",
+                        "token_type": "Bearer",
+                        "expires_at": int(time.time()) - 10,
+                        "token_endpoint": "https://auth.example.com/token",
+                        "client_id": "loom-profile-client",
+                    }
+                )
+
+            def store(self, secret_ref: str, secret_value: str) -> None:
+                stored["stored_ref"] = secret_ref
+                stored["stored_value"] = secret_value
+
+        monkeypatch.setattr(oauth_profiles_mod, "SecretResolver", _FakeSecretResolver)
+
+        runner = CliRunner()
+        with _oauth_token_server(
+            payload={
+                "access_token": "new-token",
+                "refresh_token": "refresh-next",
+                "token_type": "Bearer",
+                "expires_in": 600,
+                "scope": "read:content write:content",
+            }
+        ) as (token_url, captured):
+            result = runner.invoke(
+                cli,
+                [
+                    "--config",
+                    str(cfg),
+                    "--auth-config",
+                    str(auth_cfg),
+                    "auth",
+                    "profile",
+                    "refresh",
+                    "notion_marketing",
+                    "--token-url",
+                    token_url,
+                    "--json",
+                ],
+            )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["profile_id"] == "notion_marketing"
+        assert payload["refreshed"] is True
+        assert captured[0]["grant_type"] == "refresh_token"
+        assert captured[0]["refresh_token"] == "refresh-abc"
+        stored_payload = json.loads(stored["stored_value"])
+        assert stored_payload["access_token"] == "new-token"
+        assert stored_payload["refresh_token"] == "refresh-next"
+        assert stored_payload["obtained_via"] == "refresh_token"
 
 class TestMCPCli:
     def test_mcp_help(self):

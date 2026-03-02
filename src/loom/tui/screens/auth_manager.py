@@ -31,6 +31,13 @@ from loom.auth.config import (
     set_workspace_auth_default,
     upsert_auth_profile,
 )
+from loom.auth.oauth_profiles import (
+    OAuthProfileError,
+    login_oauth_profile,
+    logout_oauth_profile,
+    oauth_state_for_profile,
+    refresh_oauth_profile,
+)
 from loom.auth.resources import (
     bind_resource_to_profile,
     default_workspace_auth_resources_path,
@@ -339,6 +346,11 @@ class AuthManagerScreen(Vertical):
                 yield Button("Rebind", id="auth-btn-rebind")
                 yield Button("Archive", id="auth-btn-archive")
                 yield Button("Remove", id="auth-btn-remove", variant="error")
+            with Horizontal(classes="auth-actions-row", id="auth-actions-oauth"):
+                yield Button("OAuth Login", id="auth-btn-oauth-login")
+                yield Button("OAuth Status", id="auth-btn-oauth-status")
+                yield Button("OAuth Logout", id="auth-btn-oauth-logout")
+                yield Button("OAuth Refresh", id="auth-btn-oauth-refresh")
             yield Static("", id="auth-manager-context")
             summary_table = DataTable(id="auth-manager-summary")
             summary_table.cursor_type = "row"
@@ -562,6 +574,18 @@ class AuthManagerScreen(Vertical):
             return
         if button_id == "auth-btn-remove":
             await self._remove_profile()
+            return
+        if button_id == "auth-btn-oauth-login":
+            await self._oauth_login()
+            return
+        if button_id == "auth-btn-oauth-status":
+            await self._oauth_status()
+            return
+        if button_id == "auth-btn-oauth-logout":
+            await self._oauth_logout()
+            return
+        if button_id == "auth-btn-oauth-refresh":
+            await self._oauth_refresh()
             return
 
     @on(Input.Changed)
@@ -1595,6 +1619,104 @@ class AuthManagerScreen(Vertical):
         if profile_id == self._active_profile_id:
             self._set_blank_form()
         self.notify(f"Removed profile: {profile_id}")
+
+    async def _oauth_target_profile(self) -> AuthProfile | None:
+        profile_id = self._profile_id() or self._active_profile_id
+        if not profile_id:
+            self.notify("Load an OAuth profile first.", severity="warning")
+            return None
+        profile = self._profiles.get(profile_id)
+        if profile is None:
+            await self._refresh_summary()
+            profile = self._profiles.get(profile_id)
+        if profile is None:
+            self.notify(f"Profile not found: {profile_id}", severity="error")
+            return None
+        return profile
+
+    async def _oauth_login(self) -> None:
+        profile = await self._oauth_target_profile()
+        if profile is None:
+            return
+        try:
+            result = await asyncio.to_thread(
+                login_oauth_profile,
+                profile,
+            )
+        except OAuthProfileError as e:
+            self.notify(
+                f"OAuth login failed ({e.reason_code}): {e}",
+                severity="error",
+            )
+            if e.reason_code == "callback_missing":
+                self.notify(
+                    "Manual OAuth callback input is not available in TUI; use CLI login.",
+                    severity="warning",
+                )
+            return
+        self.notify(f"OAuth login URL: {result.authorization_url}")
+        if result.callback_mode == "manual":
+            self.notify(
+                "OAuth login fell back to manual callback mode; use CLI for manual callback.",
+                severity="warning",
+            )
+        elif result.expires_at is not None:
+            self.notify(f"OAuth login complete. expires_at={result.expires_at}")
+        else:
+            self.notify("OAuth login complete.")
+
+    async def _oauth_status(self) -> None:
+        profile = await self._oauth_target_profile()
+        if profile is None:
+            return
+        try:
+            state = await asyncio.to_thread(oauth_state_for_profile, profile)
+        except Exception as e:
+            self.notify(f"OAuth status failed: {e}", severity="error")
+            return
+        message = (
+            f"OAuth state={state.state}, token={'yes' if state.has_token else 'no'}, "
+            f"expired={'yes' if state.expired else 'no'}"
+        )
+        if state.expires_at is not None:
+            message = f"{message}, expires_at={state.expires_at}"
+        self.notify(message)
+        if state.reason:
+            self.notify(f"OAuth status detail: {state.reason}", severity="warning")
+
+    async def _oauth_logout(self) -> None:
+        profile = await self._oauth_target_profile()
+        if profile is None:
+            return
+        try:
+            token_ref = await asyncio.to_thread(logout_oauth_profile, profile)
+        except OAuthProfileError as e:
+            self.notify(
+                f"OAuth logout failed ({e.reason_code}): {e}",
+                severity="error",
+            )
+            return
+        self.notify(f"Cleared OAuth token payload at {token_ref}")
+
+    async def _oauth_refresh(self) -> None:
+        profile = await self._oauth_target_profile()
+        if profile is None:
+            return
+        try:
+            result = await asyncio.to_thread(refresh_oauth_profile, profile)
+        except OAuthProfileError as e:
+            self.notify(
+                f"OAuth refresh failed ({e.reason_code}): {e}",
+                severity="error",
+            )
+            return
+        if result.expires_at is not None:
+            self.notify(
+                "OAuth refresh complete: "
+                f"expires_at={result.expires_at}"
+            )
+            return
+        self.notify("OAuth refresh complete.")
 
 
 class AuthManagerModalScreen(ModalScreen[dict[str, object] | None]):

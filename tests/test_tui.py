@@ -664,6 +664,34 @@ class TestAuthAndMCPManagerScreens:
         screen._update_form_dirty.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_auth_manager_oauth_buttons_dispatch_to_oauth_actions(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._oauth_login = AsyncMock()
+        screen._oauth_status = AsyncMock()
+        screen._oauth_logout = AsyncMock()
+        screen._oauth_refresh = AsyncMock()
+
+        await screen.on_button_pressed(
+            SimpleNamespace(button=SimpleNamespace(id="auth-btn-oauth-login"))
+        )
+        await screen.on_button_pressed(
+            SimpleNamespace(button=SimpleNamespace(id="auth-btn-oauth-status"))
+        )
+        await screen.on_button_pressed(
+            SimpleNamespace(button=SimpleNamespace(id="auth-btn-oauth-logout"))
+        )
+        await screen.on_button_pressed(
+            SimpleNamespace(button=SimpleNamespace(id="auth-btn-oauth-refresh"))
+        )
+
+        screen._oauth_login.assert_awaited_once()
+        screen._oauth_status.assert_awaited_once()
+        screen._oauth_logout.assert_awaited_once()
+        screen._oauth_refresh.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_auth_manager_load_profile_keeps_mode_selected_after_events(self):
         from textual.app import App
         from textual.widgets import Select
