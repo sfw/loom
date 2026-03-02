@@ -54,6 +54,42 @@ class SecretResolver:
             return self.resolve(stripped)
         return raw
 
+    def validate_writable(self, secret_ref: str) -> None:
+        """Validate that a secret reference supports secure writes."""
+        raw = str(secret_ref or "").strip()
+        if not raw:
+            raise SecretResolutionError("Secret reference is empty.")
+        if _ENV_REF_RE.match(raw):
+            raise SecretResolutionError(
+                "Cannot persist secrets into `${ENV_VAR}` references. "
+                "Use keychain://... for writable OAuth token storage."
+            )
+        parsed = urlparse(raw)
+        scheme = parsed.scheme.lower()
+        if scheme == "env":
+            raise SecretResolutionError(
+                "Cannot persist secrets into env:// references. "
+                "Use keychain://... for writable OAuth token storage."
+            )
+        if scheme != "keychain":
+            raise SecretResolutionError(
+                f"Unsupported writable secret reference scheme in {raw!r}. "
+                "Supported writable target: keychain://..."
+            )
+        self._parse_keychain_ref(raw_ref=raw, parsed=parsed)
+        self._load_keyring()
+
+    def store(self, secret_ref: str, secret_value: str) -> None:
+        """Persist a secret to a writable secret reference."""
+        raw = str(secret_ref or "").strip()
+        self.validate_writable(raw)
+        parsed = urlparse(raw)
+        self._store_keychain(
+            raw_ref=raw,
+            parsed=parsed,
+            secret_value=str(secret_value),
+        )
+
     @staticmethod
     def _resolve_env_var(env_name: str, *, raw_ref: str) -> str:
         resolved = os.environ.get(env_name)
@@ -66,24 +102,8 @@ class SecretResolver:
 
     @staticmethod
     def _resolve_keychain(raw_ref: str, *, parsed) -> str:
-        service = str(parsed.netloc or "").strip()
-        path_parts = [part for part in parsed.path.split("/") if part]
-        if not service:
-            raise SecretResolutionError(
-                f"Invalid keychain reference {raw_ref!r}: missing service."
-            )
-        if not path_parts:
-            raise SecretResolutionError(
-                f"Invalid keychain reference {raw_ref!r}: missing account path."
-            )
-        account = "/".join(path_parts)
-        try:
-            import keyring  # type: ignore[import-not-found]
-        except Exception as e:  # pragma: no cover - import path dependent
-            raise SecretResolutionError(
-                "Keychain secret resolution requires the `keyring` package. "
-                "Install it or switch to env:// references."
-            ) from e
+        service, account = SecretResolver._parse_keychain_ref(raw_ref=raw_ref, parsed=parsed)
+        keyring = SecretResolver._load_keyring()
 
         try:
             secret = keyring.get_password(service, account)
@@ -97,3 +117,38 @@ class SecretResolver:
             )
         return secret
 
+    @staticmethod
+    def _store_keychain(raw_ref: str, *, parsed, secret_value: str) -> None:
+        service, account = SecretResolver._parse_keychain_ref(raw_ref=raw_ref, parsed=parsed)
+        keyring = SecretResolver._load_keyring()
+        try:
+            keyring.set_password(service, account, secret_value)
+        except Exception as e:
+            raise SecretResolutionError(
+                f"Keychain write failed for {raw_ref!r}: {e}"
+            ) from e
+
+    @staticmethod
+    def _parse_keychain_ref(raw_ref: str, *, parsed) -> tuple[str, str]:
+        service = str(parsed.netloc or "").strip()
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if not service:
+            raise SecretResolutionError(
+                f"Invalid keychain reference {raw_ref!r}: missing service."
+            )
+        if not path_parts:
+            raise SecretResolutionError(
+                f"Invalid keychain reference {raw_ref!r}: missing account path."
+            )
+        return service, "/".join(path_parts)
+
+    @staticmethod
+    def _load_keyring():
+        try:
+            import keyring  # type: ignore[import-not-found]
+        except Exception as e:  # pragma: no cover - import path dependent
+            raise SecretResolutionError(
+                "Keychain secret resolution requires the `keyring` package. "
+                "Install it or switch to env:// references."
+            ) from e
+        return keyring

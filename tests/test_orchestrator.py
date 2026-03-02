@@ -468,6 +468,7 @@ class TestOrchestratorProcessPhaseMode:
 
         assert result.status == TaskStatus.COMPLETED
         assert [s.id for s in result.plan.subtasks] == ["research", "implement"]
+        assert [s.phase_id for s in result.plan.subtasks] == ["research", "implement"]
         assert result.plan.subtasks[1].depends_on == ["research"]
         assert result.plan.subtasks[1].is_critical_path is True
         assert result.plan.subtasks[1].acceptance_criteria == "Ship changes"
@@ -507,6 +508,52 @@ class TestOrchestratorProcessPhaseMode:
 
         assert result.status == TaskStatus.COMPLETED
         assert [s.id for s in result.plan.subtasks] == ["model-step"]
+        assert result.plan.subtasks[0].phase_id == "phase-a"
+
+    @pytest.mark.asyncio
+    async def test_guided_phase_mode_infers_phase_id_from_subtask_description(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [
+                {
+                    "id": "build-market-sizing-model",
+                    "description": "Estimate market sizing assumptions and TAM ranges.",
+                },
+            ]
+        })
+        process = ProcessDefinition(
+            name="guided-proc",
+            phase_mode="guided",
+            phases=[
+                PhaseTemplate(
+                    id="market-sizing",
+                    description="Estimate market sizing assumptions and TAM ranges.",
+                    deliverables=["market-sizing.md"],
+                ),
+                PhaseTemplate(
+                    id="risk-map",
+                    description="Map risks and mitigations.",
+                    deliverables=["risk-map.md"],
+                ),
+            ],
+        )
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert [s.id for s in result.plan.subtasks] == ["build-market-sizing-model"]
+        assert result.plan.subtasks[0].phase_id == "market-sizing"
 
     @pytest.mark.asyncio
     async def test_strict_phase_mode_propagates_synthesis_flag(self, tmp_path):

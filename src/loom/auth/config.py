@@ -50,6 +50,7 @@ class MergedAuthConfig:
     config: AuthConfig
     user_path: Path
     explicit_path: Path | None
+    explicit_profile_ids: tuple[str, ...] = ()
     workspace_defaults: dict[str, str] = field(default_factory=dict)
     workspace_defaults_path: Path | None = None
 
@@ -282,6 +283,15 @@ def _validate_profile(profile: AuthProfile, *, path: Path | None = None) -> None
     has_secret_ref = bool(str(profile.secret_ref or "").strip())
     has_token_ref = bool(str(profile.token_ref or "").strip())
     has_command = bool(str(profile.command or "").strip())
+    token_ref = str(profile.token_ref or "").strip().lower()
+    if token_ref and (
+        "mcp_oauth_tokens.json" in token_ref
+        or "mcp_oauth://" in token_ref
+    ):
+        raise AuthConfigError(
+            f"Auth profile '{profile_id}'{location} token_ref must not "
+            "point to MCP alias token store."
+        )
 
     if status == "draft":
         return
@@ -694,6 +704,7 @@ def load_merged_auth_config(
         if explicit_cfg_path is not None
         else AuthConfig()
     )
+    explicit_profile_ids = tuple(sorted(explicit_cfg.profiles.keys()))
     merged = merge_auth_config(user_cfg, explicit_cfg)
 
     ws_defaults: dict[str, str] = {}
@@ -706,6 +717,7 @@ def load_merged_auth_config(
         config=merged,
         user_path=user_cfg_path,
         explicit_path=explicit_cfg_path,
+        explicit_profile_ids=explicit_profile_ids,
         workspace_defaults=ws_defaults,
         workspace_defaults_path=ws_defaults_path,
     )

@@ -10,6 +10,7 @@ from loom.mcp.config import (
     default_workspace_mcp_path,
     load_mcp_file,
     redact_server_env,
+    redact_server_headers,
 )
 
 __all__ = [
@@ -22,5 +23,5 @@ __all__ = [
     "default_workspace_mcp_path",
     "load_mcp_file",
     "redact_server_env",
+    "redact_server_headers",
 ]
-

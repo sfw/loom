@@ -40,6 +40,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 from rich.text import Text
 from textual import events, on, work
@@ -66,10 +67,12 @@ from loom.cowork.session import (
 )
 from loom.models.base import ModelProvider
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.processes.phase_alignment import infer_phase_id_for_subtask
 from loom.tools.registry import ToolRegistry
 from loom.tui.commands import LoomCommands
 from loom.tui.screens import (
     AskUserScreen,
+    AuthManagerModalScreen,
     AuthManagerScreen,
     ExitConfirmScreen,
     FileViewerScreen,
@@ -81,6 +84,7 @@ from loom.tui.screens import (
 )
 from loom.tui.theme import LOOM_DARK
 from loom.tui.widgets import (
+    ActivityIndicator,
     ChatLog,
     EventPanel,
     FilesChangedPanel,
@@ -132,7 +136,8 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec(canonical="/clear", description="clear chat log"),
     SlashCommandSpec(canonical="/help", description="show command help"),
     SlashCommandSpec(canonical="/setup", description="run setup wizard"),
-    SlashCommandSpec(canonical="/model", description="show active model"),
+    SlashCommandSpec(canonical="/model", description="show active model details"),
+    SlashCommandSpec(canonical="/models", description="show configured models details"),
     SlashCommandSpec(
         canonical="/mcp",
         usage=(
@@ -143,12 +148,7 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     ),
     SlashCommandSpec(
         canonical="/auth",
-        usage=(
-            "[manage|list|show <profile-id>|check|use <selector=profile>|"
-            "clear [selector]|select <selector=profile>|unset <selector>|"
-            "add <profile-id> ...|edit <profile-id> ...|remove <profile-id>]"
-        ),
-        description="inspect/manage run auth profile selection",
+        description="open auth manager (use CLI for scriptable auth operations)",
     ),
     SlashCommandSpec(canonical="/tools", description="list available tools"),
     SlashCommandSpec(canonical="/tokens", description="show session token usage"),
@@ -170,21 +170,17 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         description="review/delete learned patterns",
     ),
     SlashCommandSpec(
-        canonical="/process",
-        usage="[list|use <name>|off]",
-        description="legacy process controls (prefer /processes)",
-    ),
-    SlashCommandSpec(
         canonical="/processes",
         description="list available process definitions",
     ),
     SlashCommandSpec(
         canonical="/run",
         usage=(
-            "<goal|close [run-id-prefix]|resume <run-id-prefix|current>|"
+            "<goal|close [run-id-prefix]|"
+            "resume <run-id-prefix|current>|"
             "save <run-id-prefix|current> <name>>"
         ),
-        description="run goal via process orchestrator (auto-ad-hoc when needed)",
+        description="run goal via process orchestrator (ad hoc by default)",
     ),
 )
 _SLASH_COMMAND_PRIORITY: dict[str, int] = {
@@ -195,17 +191,17 @@ _SLASH_COMMAND_PRIORITY: dict[str, int] = {
     "/session": 14,
     "/run": 20,
     "/processes": 21,
-    "/process": 22,
     "/mcp": 30,
     "/auth": 31,
     "/tools": 32,
     "/model": 40,
-    "/tokens": 41,
-    "/setup": 42,
-    "/learned": 43,
-    "/help": 44,
-    "/clear": 45,
-    "/quit": 46,
+    "/models": 41,
+    "/tokens": 42,
+    "/setup": 43,
+    "/learned": 44,
+    "/help": 45,
+    "/clear": 46,
+    "/quit": 47,
 }
 _MUTATING_TOOL_FALLBACK = frozenset({"document_write", "humanize_writing"})
 _WORKSPACE_SCAN_EXCLUDE_DIRS = frozenset({
@@ -528,7 +524,7 @@ class ProcessRunPane(Vertical):
             meta += f"\n[dim]Task:[/] {task_id}"
         meta += (
             "\n[dim]Close: Ctrl+W | /run close [run-id-prefix] | "
-            "Ctrl+P: Close process run tab[/dim]"
+            "Ctrl+P: Close tab[/dim]"
         )
         self._meta.update(meta)
         can_restart = status == "failed" and bool(task_id.strip())
@@ -643,6 +639,7 @@ class ProcessRunState:
     ended_at: float | None = None
     tasks: list[dict] = field(default_factory=list)
     task_labels: dict[str, str] = field(default_factory=dict)
+    subtask_phase_ids: dict[str, str] = field(default_factory=dict)
     last_progress_message: str = ""
     last_progress_at: float = 0.0
     activity_log: list[str] = field(default_factory=list)
@@ -704,6 +701,8 @@ class LoomApp(App):
 
     TITLE = "Loom"
     COMMANDS = {LoomCommands}
+    _MCP_MANAGER_TAB_ID = "tab-mcp-manager"
+    _AUTH_MANAGER_TAB_ID = "tab-auth-manager"
 
     CSS = """
     #main-layout {
@@ -746,10 +745,50 @@ class LoomApp(App):
     #status-bar {
         display: none;
     }
+    #app-header #header-activity-indicator {
+        dock: right;
+        offset: -10 0;
+        margin: 0;
+        height: 100%;
+    }
+    #footer-row {
+        width: 100%;
+        height: 1;
+    }
     #app-footer {
+        width: 1fr;
         dock: none;
         height: 1;
         border: none;
+    }
+    #footer-shortcuts {
+        width: auto;
+        height: 1;
+    }
+    #footer-shortcuts .footer-shortcut-divider {
+        width: auto;
+        height: 1;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    #footer-shortcuts .footer-shortcut-btn {
+        width: auto;
+        min-width: 0;
+        height: 1;
+        margin: 0;
+        padding: 0 1;
+        border: none;
+        background: transparent;
+        color: $text-muted;
+    }
+    #footer-shortcuts .footer-shortcut-btn:hover {
+        color: $text;
+        background: $surface-lighten-1;
+    }
+    #footer-shortcuts .footer-shortcut-btn:focus {
+        color: $text;
+        background: $surface-lighten-1;
+        text-style: bold;
     }
     #slash-hint {
         dock: bottom;
@@ -775,10 +814,12 @@ class LoomApp(App):
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True),
         Binding("ctrl+l", "clear_chat", "Clear", show=True),
         Binding("ctrl+r", "reload_workspace", "Reload", show=True),
-        Binding("ctrl+w", "close_process_tab", "Close Run", show=True),
+        Binding("ctrl+w", "close_process_tab", "Close Tab", show=True),
         Binding("ctrl+1", "tab_chat", "Chat"),
         Binding("ctrl+2", "tab_files", "Files"),
         Binding("ctrl+3", "tab_events", "Events"),
+        Binding("ctrl+a", "open_auth_tab", "Auth", show=False, priority=True),
+        Binding("ctrl+m", "open_mcp_tab", "MCP", show=False, priority=True),
     ]
 
     def __init__(
@@ -791,7 +832,6 @@ class LoomApp(App):
         db: Database | None = None,
         store: ConversationStore | None = None,
         resume_session: str | None = None,
-        process_name: str | None = None,
         explicit_mcp_path: Path | None = None,
         legacy_config_path: Path | None = None,
         explicit_auth_path: Path | None = None,
@@ -805,7 +845,6 @@ class LoomApp(App):
         self._db = db
         self._store = store
         self._resume_session = resume_session
-        self._process_name = process_name
         self._explicit_mcp_path = explicit_mcp_path
         self._legacy_config_path = legacy_config_path
         self._explicit_auth_path = explicit_auth_path
@@ -866,8 +905,62 @@ class LoomApp(App):
         self._files_panel_recent_ops: dict[str, float] = {}
         self._files_panel_dedupe_window_seconds = 1.5
 
+    def _mount_header_activity_indicator(self) -> None:
+        """Mount the header activity indicator immediately left of the clock."""
+        try:
+            header = self.query_one("#app-header", Header)
+        except Exception:
+            return
+        try:
+            header.query_one("#header-activity-indicator")
+            return
+        except Exception:
+            pass
+
+        indicator = ActivityIndicator(id="header-activity-indicator")
+        clock_widget = None
+        for child in list(header.children):
+            if type(child).__name__ in {"HeaderClock", "HeaderClockSpace"}:
+                clock_widget = child
+                break
+        try:
+            if clock_widget is not None:
+                header.mount(indicator, before=clock_widget)
+            else:
+                header.mount(indicator)
+        except Exception:
+            return
+
+    def _has_unfinalized_delegate_streams(self) -> bool:
+        """Return True when a delegate progress stream is still in progress."""
+        for stream in self._active_delegate_streams.values():
+            if not isinstance(stream, dict):
+                continue
+            if not bool(stream.get("finalized", False)):
+                return True
+        return False
+
+    def _is_background_work_active(self) -> bool:
+        """Return True while chat, process runs, or delegate streams are active."""
+        if self._chat_busy:
+            return True
+        if self._has_active_process_runs():
+            return True
+        return self._has_unfinalized_delegate_streams()
+
+    def _sync_activity_indicator(self) -> None:
+        """Sync header activity indicator animation state."""
+        try:
+            indicator = self.query_one(
+                "#header-activity-indicator",
+                ActivityIndicator,
+            )
+            indicator.set_active(self._is_background_work_active())
+        except Exception:
+            return
+
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=True, id="app-header")
         with Horizontal(id="main-layout"):
             yield Sidebar(
                 self._workspace,
@@ -891,12 +984,28 @@ class LoomApp(App):
                 placeholder="Type a message... (Enter to send)",
                 id="user-input",
             )
-            yield Footer(id="app-footer")
+            with Horizontal(id="footer-row"):
+                yield Footer(id="app-footer")
+                with Horizontal(id="footer-shortcuts"):
+                    yield Static("|", classes="footer-shortcut-divider")
+                    yield Button(
+                        "[#ff9e64]^a[/] auth",
+                        id="footer-auth-shortcut",
+                        classes="footer-shortcut-btn",
+                    )
+                    yield Static("|", classes="footer-shortcut-divider")
+                    yield Button(
+                        "[#ff9e64]^m[/] mcp",
+                        id="footer-mcp-shortcut",
+                        classes="footer-shortcut-btn",
+                    )
 
     async def on_mount(self) -> None:
         # Register and activate theme
         self.register_theme(LOOM_DARK)
         self.theme = "loom-dark"
+        self._mount_header_activity_indicator()
+        self._sync_activity_indicator()
         if diagnostics_enabled():
             self.run_worker(
                 self._monitor_event_loop_lag(),
@@ -1050,15 +1159,40 @@ class LoomApp(App):
             legacy_config_path=self._legacy_config_path,
         )
 
-    def _open_mcp_manager_screen(self) -> None:
-        """Open modal MCP manager and reload runtime when changed."""
-        manager = self._mcp_manager()
+    def _tab_exists(self, tabs: TabbedContent, pane_id: str) -> bool:
+        """Return True when TabbedContent already has pane_id registered."""
+        try:
+            tabs.get_tab(pane_id)
+        except Exception:
+            return False
+        return True
 
-        def _handle_result(result: dict[str, object] | None) -> None:
-            if not isinstance(result, dict):
-                return
-            if not result.get("changed"):
-                return
+    async def _remove_tab_if_present(
+        self,
+        pane_id: str,
+        *,
+        fallback_active: str = "tab-chat",
+    ) -> None:
+        """Remove pane if present and restore fallback active tab when needed."""
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            return
+        if not self._tab_exists(tabs, pane_id):
+            if not str(getattr(tabs, "active", "") or ""):
+                tabs.active = fallback_active
+            return
+        was_active = str(getattr(tabs, "active", "") or "") == pane_id
+        try:
+            await tabs.remove_pane(pane_id)
+        except Exception:
+            return
+        if was_active or not str(getattr(tabs, "active", "") or ""):
+            tabs.active = fallback_active
+
+    def _handle_mcp_manager_tab_close(self, result: dict[str, object]) -> None:
+        """Handle embedded MCP manager close callback."""
+        if bool(result.get("changed")):
             self.run_worker(
                 self._reload_mcp_runtime(),
                 group="mcp-manager-refresh",
@@ -1069,39 +1203,125 @@ class LoomApp(App):
                 chat.add_info("MCP configuration updated.")
             except Exception:
                 pass
-
-        self.push_screen(
-            MCPManagerScreen(
-                manager,
-                explicit_auth_path=self._explicit_auth_path,
-            ),
-            callback=_handle_result,
+        self.run_worker(
+            self._remove_tab_if_present(self._MCP_MANAGER_TAB_ID),
+            group="mcp-manager-tab-close",
+            exclusive=True,
         )
 
-    def _open_auth_manager_screen(self) -> None:
-        """Open modal auth manager."""
+    async def _open_mcp_manager_tab(self) -> None:
+        """Open MCP manager as a first-class tab."""
+        tabs = self.query_one("#tabs", TabbedContent)
+        if not self._tab_exists(tabs, self._MCP_MANAGER_TAB_ID):
+            manager = self._mcp_manager()
+            await tabs.add_pane(
+                TabPane(
+                    "MCP",
+                    MCPManagerScreen(
+                        manager,
+                        explicit_auth_path=self._explicit_auth_path,
+                        oauth_browser_login_enabled=bool(
+                            getattr(
+                                getattr(self._config, "mcp", None),
+                                "oauth_browser_login",
+                                True,
+                            )
+                        ),
+                        embedded=True,
+                        on_close=self._handle_mcp_manager_tab_close,
+                    ),
+                    id=self._MCP_MANAGER_TAB_ID,
+                ),
+                after="tab-events",
+            )
+        tabs.active = self._MCP_MANAGER_TAB_ID
 
-        def _handle_result(result: dict[str, object] | None) -> None:
-            if not isinstance(result, dict):
-                return
-            if not result.get("changed"):
-                return
+    def _open_mcp_manager_screen(self) -> None:
+        """Open MCP manager tab."""
+        self.run_worker(
+            self._open_mcp_manager_tab(),
+            group="mcp-manager-tab-open",
+            exclusive=True,
+        )
+
+    def _handle_auth_manager_tab_close(self, result: dict[str, object]) -> None:
+        """Handle embedded auth manager close callback."""
+        if bool(result.get("changed")):
             try:
                 chat = self.query_one("#chat-log", ChatLog)
                 chat.add_info("Auth configuration updated.")
             except Exception:
                 pass
-
-        self.push_screen(
-            AuthManagerScreen(
-                workspace=self._workspace,
-                explicit_auth_path=self._explicit_auth_path,
-                mcp_manager=self._mcp_manager(),
-                process_def=self._process_defn,
-                tool_registry=self._tools,
-            ),
-            callback=_handle_result,
+        self.run_worker(
+            self._remove_tab_if_present(self._AUTH_MANAGER_TAB_ID),
+            group="auth-manager-tab-close",
+            exclusive=True,
         )
+
+    async def _open_auth_manager_tab(self) -> None:
+        """Open auth manager as a first-class tab."""
+        tabs = self.query_one("#tabs", TabbedContent)
+        if not self._tab_exists(tabs, self._AUTH_MANAGER_TAB_ID):
+            process_defs = self._auth_discovery_process_defs()
+            if process_defs:
+                # Ensure registry sees bundled tools loaded by process contracts.
+                self._refresh_tool_registry()
+            await tabs.add_pane(
+                TabPane(
+                    "Auth",
+                    AuthManagerScreen(
+                        workspace=self._workspace,
+                        explicit_auth_path=self._explicit_auth_path,
+                        mcp_manager=self._mcp_manager(),
+                        process_def=self._process_defn,
+                        process_defs=process_defs,
+                        tool_registry=self._tools,
+                        embedded=True,
+                        on_close=self._handle_auth_manager_tab_close,
+                    ),
+                    id=self._AUTH_MANAGER_TAB_ID,
+                ),
+                after="tab-events",
+            )
+        tabs.active = self._AUTH_MANAGER_TAB_ID
+
+    def _open_auth_manager_screen(self) -> None:
+        """Open auth manager tab."""
+        self.run_worker(
+            self._open_auth_manager_tab(),
+            group="auth-manager-tab-open",
+            exclusive=True,
+        )
+
+    def _auth_discovery_process_defs(self) -> list[ProcessDefinition]:
+        """Load all discoverable process definitions for workspace-wide auth sync."""
+        loader = self._create_process_loader()
+        process_defs: list[ProcessDefinition] = []
+        seen_names: set[str] = set()
+        try:
+            available = loader.list_available()
+        except Exception:
+            logger.exception("Failed listing process definitions for auth discovery")
+            available = []
+        for item in available:
+            name = str(item.get("name", "")).strip()
+            if not name or name in seen_names:
+                continue
+            try:
+                loaded = loader.load(name)
+            except Exception:
+                logger.exception("Failed loading process %s for auth discovery", name)
+                continue
+            loaded_name = str(getattr(loaded, "name", "")).strip() or name
+            if loaded_name in seen_names:
+                continue
+            process_defs.append(loaded)
+            seen_names.add(loaded_name)
+        if self._process_defn is not None:
+            active_name = str(getattr(self._process_defn, "name", "")).strip()
+            if active_name and active_name not in seen_names:
+                process_defs.append(self._process_defn)
+        return process_defs
 
     def _auth_defaults_path(self) -> Path:
         from loom.auth.config import default_workspace_auth_defaults_path
@@ -1279,40 +1499,6 @@ class LoomApp(App):
             self._tools,
             mcp_config=merged.config,
         )
-
-    def _load_process_definition(self, chat: ChatLog) -> None:
-        """Load active process definition and import bundled tools."""
-        self._process_defn = None
-        if not self._process_name:
-            return
-        if self._is_reserved_process_name(self._process_name):
-            chat.add_info(
-                f"[bold #f7768e]Process '{self._process_name}' conflicts with "
-                "a built-in slash command and was not loaded.[/]"
-            )
-            self._process_name = None
-            return
-
-        loader = self._create_process_loader()
-        try:
-            self._process_defn = loader.load(self._process_name)
-            if self._is_reserved_process_name(self._process_defn.name):
-                chat.add_info(
-                    f"[bold #f7768e]Process '{self._process_defn.name}' conflicts "
-                    "with a built-in slash command and was not loaded.[/]"
-                )
-                self._process_defn = None
-                self._process_name = None
-                return
-            chat.add_info(
-                f"Process: [bold]{self._process_defn.name}[/bold] "
-                f"v{self._process_defn.version}"
-            )
-        except Exception as e:
-            chat.add_info(
-                f"[bold #f7768e]Failed to load process "
-                f"'{self._process_name}': {e}[/]"
-            )
 
     @staticmethod
     def _adhoc_cache_key(goal: str) -> str:
@@ -3334,24 +3520,6 @@ class LoomApp(App):
         )
         return package_dir
 
-    async def _reload_session_for_process_change(self, chat: ChatLog) -> None:
-        """Rebuild session after changing active process."""
-        if self._chat_busy or self._has_active_process_runs():
-            chat.add_info(
-                "[bold #f7768e]Cannot switch process while work is running.[/]"
-            )
-            return
-
-        if self._session is not None:
-            if self._store and self._session.session_id:
-                await self._store.update_session(
-                    self._session.session_id, is_active=False,
-                )
-            self._session = None
-
-        self._resume_session = None
-        await self._initialize_session()
-
     def _has_active_process_runs(self) -> bool:
         """Return True when at least one run is still active."""
         return any(
@@ -3509,18 +3677,12 @@ class LoomApp(App):
         )
 
     def _render_process_usage(self) -> str:
-        """Render `/process` usage with clear hierarchy."""
-        active = self._escape_markup(self._active_process_name())
+        """Render process execution mode guidance."""
         return "\n".join([
-            "[bold #7dcfff]Process Controls[/bold #7dcfff]",
-            f"  [bold]Active:[/] {active}",
-            "  [bold]Commands:[/]",
-            "    /processes",
-            "    /process list",
-            "    /process use <name-or-path>",
-            "    /process off",
-            "    /<process-name> <goal>",
-            "    /run <goal>",
+            "[bold #7dcfff]Process Modes[/bold #7dcfff]",
+            "  [bold]Ad hoc:[/] /run <goal>",
+            "  [bold]Explicit:[/] /<process-name> <goal>",
+            "  [bold]Catalog:[/] /processes",
         ])
 
     def _render_tools_catalog(self) -> str:
@@ -3538,6 +3700,467 @@ class LoomApp(App):
                 subsequent_indent="  ",
             )
         )
+        return "\n".join(lines)
+
+    def _configured_models(self) -> dict[str, Any]:
+        """Return configured model aliases from loaded config."""
+        models = getattr(getattr(self, "_config", None), "models", None)
+        if not isinstance(models, dict):
+            return {}
+        return {
+            str(alias): cfg
+            for alias, cfg in models.items()
+        }
+
+    @staticmethod
+    def _normalize_provider_name(provider: object | None) -> str:
+        """Normalize provider naming aliases for consistent display/matching."""
+        value = str(provider or "").strip().lower()
+        if value == "openai":
+            return "openai_compatible"
+        return value
+
+    @staticmethod
+    def _protocol_for_provider(provider: object | None) -> str:
+        """Map provider type to user-facing protocol label."""
+        normalized = LoomApp._normalize_provider_name(provider)
+        if normalized == "anthropic":
+            return "anthropic-messages"
+        if normalized == "ollama":
+            return "ollama-chat"
+        if normalized == "openai_compatible":
+            return "openai-chat-completions"
+        if normalized:
+            return "unknown"
+        return "-"
+
+    @staticmethod
+    def _sanitize_endpoint_url(raw_url: object | None) -> str:
+        """Render an endpoint URL with credentials/query/fragment stripped."""
+        value = str(raw_url or "").strip()
+        if not value:
+            return "-"
+        try:
+            parsed = urlsplit(value)
+        except Exception:
+            return "(invalid-configured-url)"
+        scheme = str(parsed.scheme or "").strip().lower()
+        host = str(parsed.hostname or "").strip()
+        if not scheme or not host:
+            return "(invalid-configured-url)"
+        try:
+            port = parsed.port
+        except ValueError:
+            return "(invalid-configured-url)"
+        safe_host = host
+        if ":" in host and not host.startswith("["):
+            safe_host = f"[{host}]"
+        netloc = f"{safe_host}:{port}" if port is not None else safe_host
+        safe = urlunsplit((scheme, netloc, parsed.path or "", "", ""))
+        return safe or "(invalid-configured-url)"
+
+    def _endpoint_for_config(self, provider: object | None, base_url: object | None) -> str:
+        """Resolve and sanitize displayed endpoint from config values."""
+        normalized = self._normalize_provider_name(provider)
+        value = str(base_url or "").strip()
+        if not value and normalized == "anthropic":
+            value = "https://api.anthropic.com"
+        if not value:
+            return "-"
+        return self._sanitize_endpoint_url(value)
+
+    def _runtime_model_provider(self, model: ModelProvider | None) -> str:
+        """Best-effort provider key for a runtime model instance."""
+        if model is None:
+            return ""
+        cfg = getattr(model, "_config", None)
+        normalized = self._normalize_provider_name(getattr(cfg, "provider", ""))
+        if normalized:
+            return normalized
+        cls_name = type(model).__name__.lower()
+        if "anthropic" in cls_name:
+            return "anthropic"
+        if "ollama" in cls_name:
+            return "ollama"
+        if "openai" in cls_name:
+            return "openai_compatible"
+        return ""
+
+    def _runtime_model_id(self, model: ModelProvider | None) -> str:
+        """Best-effort model identifier for a runtime model instance."""
+        if model is None:
+            return ""
+        for attr in ("model", "_model"):
+            value = getattr(model, attr, "")
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _runtime_model_roles(self, model: ModelProvider | None) -> list[str]:
+        """Best-effort roles for a runtime model instance."""
+        if model is None:
+            return []
+        value = getattr(model, "roles", [])
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    def _runtime_model_endpoint(self, model: ModelProvider | None) -> str:
+        """Best-effort endpoint for a runtime model instance."""
+        if model is None:
+            return "-"
+        cfg = getattr(model, "_config", None)
+        base_url = getattr(cfg, "base_url", "")
+        if not str(base_url or "").strip():
+            base_url = getattr(model, "_base_url", "")
+        return self._endpoint_for_config(self._runtime_model_provider(model), base_url)
+
+    @staticmethod
+    def _runtime_model_tier(model: ModelProvider | None) -> int | None:
+        """Best-effort runtime tier for active model."""
+        if model is None:
+            return None
+        value = getattr(model, "tier", None)
+        if isinstance(value, int):
+            return value if value > 0 else None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _infer_tier_from_config(
+        self,
+        provider: object | None,
+        model_id: object | None,
+    ) -> int | None:
+        """Infer a tier label from provider + model name when not explicit."""
+        normalized = self._normalize_provider_name(provider)
+        value = str(model_id or "").strip().lower()
+        if not value:
+            return None
+        if normalized == "openai_compatible":
+            if any(token in value for token in ("70b", "72b", "m2.1", "large")):
+                return 3
+            if any(token in value for token in ("14b", "32b", "medium")):
+                return 2
+            return 1
+        if normalized == "ollama":
+            if any(token in value for token in ("70b", "72b", "large")):
+                return 3
+            if any(token in value for token in ("14b", "32b", "medium")):
+                return 2
+            return 1
+        if normalized == "anthropic":
+            if "opus" in value:
+                return 3
+            if "sonnet" in value:
+                return 2
+            if "haiku" in value:
+                return 1
+            return 2
+        return None
+
+    @staticmethod
+    def _format_tier_label(explicit_tier: object | None, inferred_tier: int | None) -> str:
+        """Render tier label, preferring explicit value then inferred."""
+        if isinstance(explicit_tier, int) and explicit_tier > 0:
+            return str(explicit_tier)
+        try:
+            parsed = int(explicit_tier)
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed > 0:
+            return str(parsed)
+        if isinstance(inferred_tier, int) and inferred_tier > 0:
+            return f"{inferred_tier} (inferred)"
+        return "auto"
+
+    @staticmethod
+    def _format_temperature(value: object | None) -> str:
+        """Render temperature with compact formatting."""
+        if isinstance(value, (int, float)):
+            return f"{float(value):g}"
+        return "-"
+
+    @staticmethod
+    def _format_max_tokens(value: object | None) -> str:
+        """Render max token limit when set."""
+        if isinstance(value, int) and value > 0:
+            return str(value)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return "-"
+        return str(parsed) if parsed > 0 else "-"
+
+    @staticmethod
+    def _format_model_roles(roles: object | None) -> str:
+        """Render roles in deterministic order."""
+        if isinstance(roles, (list, tuple, set)):
+            cleaned = {
+                str(item).strip()
+                for item in roles
+                if str(item).strip()
+            }
+            if cleaned:
+                return ", ".join(sorted(cleaned, key=str.casefold))
+        return "-"
+
+    @staticmethod
+    def _format_capabilities(capabilities: object | None) -> str:
+        """Render capabilities as compact yes/no flags."""
+        if capabilities is None:
+            return "-"
+        fields = (
+            "vision",
+            "native_pdf",
+            "thinking",
+            "citations",
+            "audio_input",
+            "audio_output",
+        )
+        rendered: list[str] = []
+        for field_name in fields:
+            rendered.append(
+                f"{field_name}={'yes' if bool(getattr(capabilities, field_name, False)) else 'no'}",
+            )
+        return ", ".join(rendered)
+
+    def _resolve_active_model_alias(self) -> tuple[str | None, list[str]]:
+        """Resolve active model alias from config with ambiguity awareness."""
+        configured = self._configured_models()
+        if self._model is None or not configured:
+            return None, []
+
+        runtime_name = str(getattr(self._model, "name", "") or "").strip()
+        if runtime_name and runtime_name in configured:
+            return runtime_name, []
+
+        runtime_provider = self._runtime_model_provider(self._model)
+        runtime_model_id = self._runtime_model_id(self._model).lower()
+        runtime_endpoint = self._runtime_model_endpoint(self._model)
+        candidates: list[tuple[str, int]] = []
+
+        for alias, cfg in configured.items():
+            cfg_provider = self._normalize_provider_name(getattr(cfg, "provider", ""))
+            if runtime_provider and cfg_provider and cfg_provider != runtime_provider:
+                continue
+
+            score = 0
+            cfg_model_id = str(getattr(cfg, "model", "") or "").strip().lower()
+            if runtime_model_id and cfg_model_id and runtime_model_id == cfg_model_id:
+                score += 2
+
+            cfg_endpoint = self._endpoint_for_config(
+                cfg_provider,
+                getattr(cfg, "base_url", ""),
+            )
+            if (
+                runtime_endpoint not in {"-", "(invalid-configured-url)"}
+                and cfg_endpoint not in {"-", "(invalid-configured-url)"}
+                and runtime_endpoint == cfg_endpoint
+            ):
+                score += 1
+
+            if score > 0:
+                candidates.append((alias, score))
+
+        if not candidates:
+            return None, []
+
+        candidates.sort(key=lambda item: (-item[1], item[0].casefold()))
+        top_score = candidates[0][1]
+        top_aliases = [alias for alias, score in candidates if score == top_score]
+        if len(top_aliases) == 1:
+            return top_aliases[0], []
+        return None, sorted(top_aliases, key=str.casefold)
+
+    def _render_model_block(
+        self,
+        *,
+        alias: str,
+        active: bool,
+        provider: str,
+        endpoint: str,
+        model_id: str,
+        roles: object | None,
+        tier_label: str,
+        temperature: object | None,
+        max_tokens: object | None,
+        reasoning_effort: object | None,
+        capabilities: object | None,
+    ) -> str:
+        """Render one model detail block."""
+        provider_label = provider or "-"
+        reasoning = str(reasoning_effort or "").strip() or "-"
+        lines = [
+            f"[bold]{self._escape_markup(alias)}[/bold]",
+            f"  [bold]active:[/] {'yes' if active else 'no'}",
+            f"  [bold]provider:[/] {self._escape_markup(provider_label)}",
+            "  [bold]protocol:[/] "
+            f"{self._escape_markup(self._protocol_for_provider(provider_label))}",
+            f"  [bold]endpoint:[/] {self._escape_markup(endpoint)}",
+            f"  [bold]model_id:[/] {self._escape_markup(model_id or '-')}",
+            f"  [bold]roles:[/] {self._escape_markup(self._format_model_roles(roles))}",
+            f"  [bold]tier:[/] {self._escape_markup(tier_label)}",
+            f"  [bold]temperature:[/] {self._escape_markup(self._format_temperature(temperature))}",
+            f"  [bold]max_tokens:[/] {self._escape_markup(self._format_max_tokens(max_tokens))}",
+            f"  [bold]reasoning_effort:[/] {self._escape_markup(reasoning)}",
+            "  [bold]capabilities:[/] "
+            f"{self._escape_markup(self._format_capabilities(capabilities))}",
+        ]
+        return "\n".join(lines)
+
+    def _render_configured_model_block(
+        self,
+        alias: str,
+        cfg: Any,
+        *,
+        active: bool,
+        runtime_model: ModelProvider | None = None,
+    ) -> str:
+        """Render a detail block for one configured model alias."""
+        provider = self._normalize_provider_name(getattr(cfg, "provider", ""))
+        model_id = str(getattr(cfg, "model", "") or "").strip()
+        inferred_tier = (
+            self._runtime_model_tier(runtime_model)
+            if active and runtime_model is not None
+            else self._infer_tier_from_config(provider, model_id)
+        )
+        return self._render_model_block(
+            alias=alias,
+            active=active,
+            provider=provider or "-",
+            endpoint=self._endpoint_for_config(provider, getattr(cfg, "base_url", "")),
+            model_id=model_id or "-",
+            roles=getattr(cfg, "roles", []),
+            tier_label=self._format_tier_label(getattr(cfg, "tier", 0), inferred_tier),
+            temperature=getattr(cfg, "temperature", None),
+            max_tokens=getattr(cfg, "max_tokens", None),
+            reasoning_effort=getattr(cfg, "reasoning_effort", ""),
+            capabilities=getattr(cfg, "resolved_capabilities", None),
+        )
+
+    def _render_runtime_model_block(
+        self,
+        model: ModelProvider,
+        *,
+        alias_override: str,
+        active: bool,
+    ) -> str:
+        """Render a detail block for a runtime model with no config alias."""
+        provider = self._runtime_model_provider(model) or "-"
+        tier = self._runtime_model_tier(model)
+        return self._render_model_block(
+            alias=alias_override,
+            active=active,
+            provider=provider,
+            endpoint=self._runtime_model_endpoint(model),
+            model_id=self._runtime_model_id(model) or "-",
+            roles=self._runtime_model_roles(model),
+            tier_label=str(tier) if isinstance(tier, int) and tier > 0 else "auto",
+            temperature=getattr(model, "configured_temperature", None),
+            max_tokens=getattr(model, "configured_max_tokens", None),
+            reasoning_effort=getattr(getattr(model, "_config", None), "reasoning_effort", ""),
+            capabilities=getattr(model, "_capabilities", None),
+        )
+
+    def _render_active_model_info(self) -> str:
+        """Render rich `/model` output for the active runtime model."""
+        configured = self._configured_models()
+        active_alias, ambiguous_aliases = self._resolve_active_model_alias()
+        lines = ["[bold #7dcfff]Active Model[/bold #7dcfff]"]
+
+        if self._model is None:
+            lines.append("  [dim]No active model configured.[/dim]")
+            if configured:
+                lines.append("  [dim]Use /models to inspect configured aliases.[/dim]")
+            return "\n".join(lines)
+
+        if active_alias is not None:
+            lines.append(
+                self._render_configured_model_block(
+                    active_alias,
+                    configured[active_alias],
+                    active=True,
+                    runtime_model=self._model,
+                )
+            )
+        else:
+            lines.append(
+                self._render_runtime_model_block(
+                    self._model,
+                    alias_override="(runtime-only)",
+                    active=True,
+                )
+            )
+
+        if ambiguous_aliases:
+            lines.append("  [bold]active_alias:[/] ambiguous")
+            lines.append(
+                "  [bold]candidates:[/] "
+                + ", ".join(self._escape_markup(alias) for alias in ambiguous_aliases),
+            )
+        return "\n".join(lines)
+
+    def _render_models_catalog(self) -> str:
+        """Render rich `/models` output for all configured aliases."""
+        configured = self._configured_models()
+        active_alias, ambiguous_aliases = self._resolve_active_model_alias()
+        lines = ["[bold #7dcfff]Configured Models[/bold #7dcfff]"]
+
+        if not configured:
+            lines.append("  [dim]No configured models.[/dim]")
+            if self._model is not None:
+                lines.append("")
+                lines.append("[bold #7dcfff]Active Runtime Model[/bold #7dcfff]")
+                lines.append(
+                    self._render_runtime_model_block(
+                        self._model,
+                        alias_override="(runtime-only)",
+                        active=True,
+                    )
+                )
+            return "\n".join(lines)
+
+        aliases = sorted(configured.keys(), key=str.casefold)
+        if active_alias and active_alias in configured:
+            aliases = [active_alias, *[alias for alias in aliases if alias != active_alias]]
+
+        for idx, alias in enumerate(aliases):
+            if idx > 0:
+                lines.append("")
+            lines.append(
+                self._render_configured_model_block(
+                    alias,
+                    configured[alias],
+                    active=alias == active_alias,
+                    runtime_model=self._model if alias == active_alias else None,
+                )
+            )
+
+        if ambiguous_aliases:
+            lines.append("")
+            lines.append("[bold #e0af68]Active alias is ambiguous.[/bold #e0af68]")
+            lines.append(
+                "  [bold]candidates:[/] "
+                + ", ".join(self._escape_markup(alias) for alias in ambiguous_aliases),
+            )
+        elif self._model is not None and active_alias is None:
+            lines.append("")
+            lines.append(
+                "[bold #e0af68]Active runtime model is not part of configured "
+                "aliases.[/bold #e0af68]"
+            )
+            lines.append(
+                self._render_runtime_model_block(
+                    self._model,
+                    alias_override="(runtime-only)",
+                    active=True,
+                )
+            )
         return "\n".join(lines)
 
     def _render_session_info(self, state) -> str:
@@ -3636,19 +4259,17 @@ class LoomApp(App):
                 "  [dim]No process definitions found.[/dim]"
             )
 
-        active = self._process_defn.name if self._process_defn else ""
         lines = [
             "[bold #7dcfff]Available Processes[/bold #7dcfff]",
-            "[dim]Run directly with /<process-name> <goal> or /run <goal>[/dim]",
+            "[dim]Use /run <goal> for ad hoc or /<process-name> <goal> for explicit runs[/dim]",
         ]
         for proc in available:
             name = str(proc.get("name", "")).strip()
             ver = str(proc.get("version", "")).strip()
             desc = str(proc.get("description", "")).strip().split("\n")[0]
-            marker = " [cyan](active)[/cyan]" if name == active else ""
             safe_name = self._escape_markup(name)
             safe_ver = self._escape_markup(ver)
-            lines.append(f"  [bold]{safe_name}[/bold] [dim]v{safe_ver}[/dim]{marker}")
+            lines.append(f"  [bold]{safe_name}[/bold] [dim]v{safe_ver}[/dim]")
             if desc:
                 lines.append(
                     self._wrap_info_text(
@@ -3672,28 +4293,69 @@ class LoomApp(App):
         lines = ["[bold]MCP servers:[/bold]"]
         for view in views:
             status = "enabled" if view.server.enabled else "disabled"
+            server_type = str(getattr(view.server, "type", "local"))
             lines.append(
-                f"  {view.alias:16s} {status:8s} [dim]source={view.source}[/dim]"
+                f"  {view.alias:16s} {status:8s} type={server_type:6s} "
+                f"[dim]source={view.source}[/dim]"
             )
         return "\n".join(lines)
 
     @staticmethod
     def _render_mcp_view(view) -> str:
         """Build a readable MCP server details block."""
-        from loom.mcp.config import redact_server_env
+        from loom.mcp.config import redact_server_env, redact_server_headers
 
         env = redact_server_env(view.server)
+        server_type = str(getattr(view.server, "type", "local"))
         lines = [
             f"[bold]{view.alias}[/bold]",
             f"  source: {view.source}",
             f"  source_path: {view.source_path or '-'}",
+            f"  type: {server_type}",
             f"  enabled: {view.server.enabled}",
-            f"  command: {view.server.command}",
-            f"  args: {' '.join(view.server.args) if view.server.args else '-'}",
-            f"  cwd: {view.server.cwd or '-'}",
             f"  timeout_seconds: {view.server.timeout_seconds}",
             "  env:",
         ]
+        if server_type == "remote":
+            oauth_cfg = getattr(view.server, "oauth", None)
+            oauth_enabled = bool(getattr(oauth_cfg, "enabled", False))
+            oauth_scopes = list(getattr(oauth_cfg, "scopes", []) or [])
+            allow_insecure_http = bool(
+                getattr(view.server, "allow_insecure_http", False)
+            )
+            allow_private_network = bool(
+                getattr(view.server, "allow_private_network", False)
+            )
+            lines.extend(
+                [
+                    f"  url: {getattr(view.server, 'url', '') or '-'}",
+                    "  fallback_sse_url: "
+                    f"{getattr(view.server, 'fallback_sse_url', '') or '-'}",
+                    "  oauth: "
+                    f"{'enabled' if oauth_enabled else 'disabled'}",
+                    "  oauth_scopes: "
+                    f"{', '.join(oauth_scopes) if oauth_scopes else '-'}",
+                    "  allow_insecure_http: "
+                    f"{'true' if allow_insecure_http else 'false'}",
+                    "  allow_private_network: "
+                    f"{'true' if allow_private_network else 'false'}",
+                    "  headers:",
+                ]
+            )
+            headers = redact_server_headers(view.server)
+            if headers:
+                for key, value in headers.items():
+                    lines.append(f"    {key}: {value}")
+            else:
+                lines.append("    (none)")
+        else:
+            lines.extend(
+                [
+                    f"  command: {view.server.command}",
+                    f"  args: {' '.join(view.server.args) if view.server.args else '-'}",
+                    f"  cwd: {view.server.cwd or '-'}",
+                ]
+            )
         if env:
             for key, value in env.items():
                 lines.append(f"    {key}={value}")
@@ -4046,13 +4708,10 @@ class LoomApp(App):
         self._total_tokens = 0
         self._sidebar_cowork_tasks = []
         self._active_delegate_streams = {}
+        self._sync_activity_indicator()
         chat.set_stream_flush_interval_ms(self._tui_chat_stream_flush_interval_ms())
 
-        # Load process definition first. This may import bundled tool modules
-        # into the global tool class registry.
-        self._load_process_definition(chat)
-        # Build a clean registry exactly once after optional process load so
-        # bundled tools are included without duplicate registry construction.
+        # Build a clean registry once at session initialization.
         self._refresh_tool_registry()
         self._refresh_process_command_index(chat=chat, notify_conflicts=True)
 
@@ -4712,6 +5371,9 @@ class LoomApp(App):
         labels = getattr(run, "task_labels", {})
         if not isinstance(labels, dict):
             labels = {}
+        phase_map = getattr(run, "subtask_phase_ids", {})
+        if not isinstance(phase_map, dict):
+            phase_map = {}
         activity = [
             self._one_line(line, 1200)
             for line in getattr(run, "activity_log", [])
@@ -4742,6 +5404,11 @@ class LoomApp(App):
             "launch_tab_created_at": float(getattr(run, "launch_tab_created_at", 0.0) or 0.0),
             "tasks": tasks,
             "task_labels": {str(k): str(v) for k, v in labels.items()},
+            "subtask_phase_ids": {
+                str(k): str(v)
+                for k, v in phase_map.items()
+                if str(k).strip() and str(v).strip()
+            },
             "activity_log": activity,
             "result_log": result_log,
             "auth_profile_overrides": {
@@ -4970,6 +5637,12 @@ class LoomApp(App):
                 if isinstance(labels_raw, dict)
                 else {}
             )
+            phase_map_raw = raw.get("subtask_phase_ids", {})
+            subtask_phase_ids = (
+                {str(k): str(v) for k, v in phase_map_raw.items()}
+                if isinstance(phase_map_raw, dict)
+                else {}
+            )
             activity_log = [
                 self._one_line(line, 1200)
                 for line in raw.get("activity_log", [])
@@ -5031,6 +5704,7 @@ class LoomApp(App):
                 ended_at=ended_at,
                 tasks=tasks,
                 task_labels=task_labels,
+                subtask_phase_ids=subtask_phase_ids,
                 activity_log=activity_log,
                 result_log=result_log,
                 auth_profile_overrides=auth_profile_overrides,
@@ -5114,6 +5788,7 @@ class LoomApp(App):
             tab.label = self._format_process_run_tab_title(run)
         except Exception:
             pass
+        self._sync_activity_indicator()
 
     def _tick_process_run_elapsed(self) -> None:
         """Periodic timer to refresh elapsed text for active process runs."""
@@ -5125,6 +5800,7 @@ class LoomApp(App):
                 self._update_process_run_visuals(run)
         if active:
             self._refresh_sidebar_progress_summary()
+        self._sync_activity_indicator()
 
     def _build_process_run_context(self, goal: str, *, workspace: Path) -> dict:
         """Build compact cowork context to pass into delegated process runs."""
@@ -5581,6 +6257,7 @@ class LoomApp(App):
         except Exception:
             pass
         self._process_runs.pop(run.run_id, None)
+        self._sync_activity_indicator()
         self._clear_process_run_cancel_handler(run.run_id)
         self._refresh_sidebar_progress_summary()
         await self._persist_process_run_ui_state()
@@ -5852,6 +6529,22 @@ class LoomApp(App):
         run.progress_ui_last_refresh_at = 0.0
         self._clear_process_run_cancel_handler(run.run_id)
         run.tasks, run.task_labels = self._resume_seed_task_rows(run)
+        row_ids = {
+            str(row.get("id", "")).strip()
+            for row in run.tasks
+            if isinstance(row, dict) and str(row.get("id", "")).strip()
+        }
+        phase_map = getattr(run, "subtask_phase_ids", {})
+        if isinstance(phase_map, dict):
+            run.subtask_phase_ids = {
+                str(subtask_id): str(phase_id)
+                for subtask_id, phase_id in phase_map.items()
+                if str(subtask_id).strip()
+                and str(phase_id).strip()
+                and (not row_ids or str(subtask_id) in row_ids)
+            }
+        else:
+            run.subtask_phase_ids = {}
         run.last_progress_message = ""
         run.last_progress_at = 0.0
         self._update_process_run_visuals(run)
@@ -5920,12 +6613,22 @@ class LoomApp(App):
             )
             done.set()
 
+        process_defs = self._auth_discovery_process_defs()
+        if process_def is not None:
+            name = str(getattr(process_def, "name", "")).strip()
+            if not name or all(
+                str(getattr(item, "name", "")).strip() != name for item in process_defs
+            ):
+                process_defs.append(process_def)
+        if process_defs:
+            self._refresh_tool_registry()
         self.push_screen(
-            AuthManagerScreen(
+            AuthManagerModalScreen(
                 workspace=self._workspace,
                 explicit_auth_path=self._explicit_auth_path,
                 mcp_manager=self._mcp_manager(),
                 process_def=process_def or self._process_defn,
+                process_defs=process_defs,
                 tool_registry=self._tools,
             ),
             callback=_handle,
@@ -6205,8 +6908,6 @@ class LoomApp(App):
         selected_process = process_defn
         requested_process_name = str(process_name_override or "").strip()
         process_name = requested_process_name
-        if selected_process is None and not requested_process_name:
-            selected_process = self._process_defn
         if not process_name and selected_process is not None:
             process_name = str(selected_process.name).strip()
         resolve_adhoc = bool(is_adhoc)
@@ -6298,8 +6999,8 @@ class LoomApp(App):
         self._append_process_run_activity(run, "Queued process run.")
         if not self._process_close_hint_shown:
             chat.add_info(
-                "[dim]Tip: close process tabs with Ctrl+W, /run close "
-                "[run-id-prefix], or Ctrl+P -> Close process run tab.[/]"
+                "[dim]Tip: close tabs with Ctrl+W, /run close "
+                "[run-id-prefix], or Ctrl+P -> Close tab.[/]"
             )
             self._process_close_hint_shown = True
         events_panel.add_event(
@@ -6905,7 +7606,8 @@ class LoomApp(App):
             "[bold #7dcfff]Keys[/bold #7dcfff]",
             self._wrap_info_text(
                 "Ctrl+B sidebar, Ctrl+L clear, Ctrl+R reload workspace, "
-                "Ctrl+W close run tab, Ctrl+P palette, Ctrl+1/2/3 tabs",
+                "Ctrl+W close tab, Ctrl+A auth, Ctrl+M mcp, "
+                "Ctrl+P palette, Ctrl+1/2/3 tabs",
                 initial_indent="  ",
                 subsequent_indent="  ",
             ),
@@ -7098,97 +7800,6 @@ class LoomApp(App):
                 seen.add(key)
         return candidates
 
-    def _process_use_completion_candidates(
-        self,
-        raw_input: str,
-    ) -> tuple[str, list[str]] | None:
-        """Return `/process use` tab-completion seed and candidates."""
-        text = raw_input.strip()
-        match = re.fullmatch(
-            r"/process\s+use(?:\s+(?P<prefix>\S*))?",
-            text,
-            re.IGNORECASE,
-        )
-        if not match:
-            return None
-
-        prefix = (match.group("prefix") or "").strip()
-        base = "/process use"
-        seed = f"{base} {prefix}" if prefix else base
-
-        self._refresh_process_command_index(background=True)
-        available = self._cached_process_catalog
-
-        candidates: list[str] = []
-        seen: set[str] = set()
-        prefix_lower = prefix.lower()
-        for proc in available:
-            name = str(proc.get("name", "")).strip()
-            if not name or name in seen:
-                continue
-            if prefix and not name.lower().startswith(prefix_lower):
-                continue
-            candidates.append(f"{base} {name}")
-            seen.add(name)
-        return seed, candidates
-
-    def _render_process_use_hint(self, raw_input: str) -> str | None:
-        """Render contextual hint rows for `/process use ...`."""
-        text = raw_input.strip()
-        match = re.fullmatch(
-            r"/process\s+use(?:\s+(?P<prefix>\S*))?",
-            text,
-            re.IGNORECASE,
-        )
-        if not match:
-            return None
-
-        prefix = (match.group("prefix") or "").strip()
-        self._refresh_process_command_index(background=True)
-        available = self._cached_process_catalog
-
-        if not available:
-            if self._blocked_process_commands:
-                blocked = ", ".join(self._blocked_process_commands)
-                return (
-                    "[#f7768e]No selectable process definitions found.[/]  "
-                    f"[dim]Blocked: {blocked}[/]"
-                )
-            return (
-                "[#f7768e]No process definitions found.[/]  "
-                "[dim]Try /process list[/]"
-            )
-
-        active = self._process_defn.name if self._process_defn else ""
-        prefix_lower = prefix.lower()
-        rows: list[tuple[str, str, str]] = []
-        for proc in available:
-            name = str(proc.get("name", "")).strip()
-            if not name:
-                continue
-            if prefix and not name.lower().startswith(prefix_lower):
-                continue
-            version = str(proc.get("version", "?")).strip() or "?"
-            marker = " [cyan]<< active[/cyan]" if active and name == active else ""
-            rows.append((name, version, marker))
-
-        if not rows:
-            return (
-                f"[#f7768e]No processes match '{prefix}'.[/]  "
-                "[dim]Try /process list[/]"
-            )
-
-        title = (
-            "Available processes for /process use:"
-            if not prefix
-            else f"Process matches '{prefix}':"
-        )
-        lines = [f"[bold #7dcfff]{title}[/]"]
-        for name, version, marker in rows:
-            lines.append(f"  [#73daca]{name:<30}[/] [dim]v{version}[/]{marker}")
-        lines.append("[dim]Press Tab to autocomplete[/dim]")
-        return "\n".join(lines)
-
     def _apply_slash_tab_completion(self, *, reverse: bool = False) -> bool:
         """Apply slash tab completion (forward/backward)."""
         input_widget = self.query_one("#user-input", Input)
@@ -7197,13 +7808,8 @@ class LoomApp(App):
             self._reset_slash_tab_cycle()
             return False
 
-        completion_scope = "slash"
         token = current
-        process_completion = self._process_use_completion_candidates(current)
-        if process_completion is not None:
-            completion_scope = "process_use"
-            token, scoped_candidates = process_completion
-        elif " " in current:
+        if " " in current:
             self._reset_slash_tab_cycle()
             return False
 
@@ -7214,10 +7820,7 @@ class LoomApp(App):
                 (current_index - 1) if reverse else (current_index + 1)
             ) % len(candidates)
         else:
-            if completion_scope == "process_use":
-                candidates = scoped_candidates
-            else:
-                candidates = self._slash_completion_candidates(token)
+            candidates = self._slash_completion_candidates(token)
             if not candidates:
                 self._reset_slash_tab_cycle()
                 return False
@@ -7237,9 +7840,6 @@ class LoomApp(App):
 
     def _render_slash_hint(self, raw_input: str) -> str:
         """Build slash-command hint text for the current input."""
-        process_hint = self._render_process_use_hint(raw_input)
-        if process_hint is not None:
-            return process_hint
         if raw_input.strip() == "/":
             self._refresh_process_command_index(background=True)
             return self._render_root_slash_hint()
@@ -7355,6 +7955,7 @@ class LoomApp(App):
         if callable(reset_runtime_state):
             reset_runtime_state()
         self._active_delegate_streams = {}
+        self._sync_activity_indicator()
 
     def _reset_chat_history_state(self) -> None:
         """Reset in-memory replay state for the active chat transcript."""
@@ -8100,15 +8701,31 @@ class LoomApp(App):
             exclusive=False,
         )
 
+    @on(Button.Pressed, "#footer-auth-shortcut, #footer-mcp-shortcut")
+    def _on_footer_manager_shortcut_pressed(self, event: Button.Pressed) -> None:
+        button_id = str(getattr(event.button, "id", "") or "").strip()
+        event.stop()
+        event.prevent_default()
+        if button_id == "footer-auth-shortcut":
+            self.action_open_auth_tab()
+            return
+        if button_id == "footer-mcp-shortcut":
+            self.action_open_mcp_tab()
+
     def on_key(self, event: events.Key) -> None:
         """Handle user-input key captures (autocomplete + close-run shortcut)."""
-        if event.key == "ctrl+w":
+        if event.key in {"ctrl+w", "ctrl+a", "ctrl+m"}:
             focused = self.focused
             if isinstance(focused, Input) and focused.id == "user-input":
                 event.stop()
                 event.prevent_default()
-                self.action_close_process_tab()
-            return
+                if event.key == "ctrl+w":
+                    self.action_close_process_tab()
+                elif event.key == "ctrl+a":
+                    self.action_open_auth_tab()
+                elif event.key == "ctrl+m":
+                    self.action_open_mcp_tab()
+                return
 
         if event.key in ("up", "down"):
             focused = self.focused
@@ -8168,8 +8785,21 @@ class LoomApp(App):
             self._show_help()
             return True
         if token == "/model":
-            name = self._model.name if self._model else "(not configured)"
-            chat.add_info(f"Model: {name}")
+            if arg:
+                chat.add_info(
+                    self._render_slash_command_usage("/model", "(no arguments)")
+                    + "\n[dim]Runtime model switching is not supported yet.[/dim]"
+                )
+                return True
+            chat.add_info(self._render_active_model_info())
+            return True
+        if token == "/models":
+            if arg:
+                chat.add_info(
+                    self._render_slash_command_usage("/models", "(no arguments)")
+                )
+                return True
+            chat.add_info(self._render_models_catalog())
             return True
         if token == "/mcp":
             from loom.mcp.config import (
@@ -8547,856 +9177,23 @@ class LoomApp(App):
             )
             return True
         if token == "/auth":
-            from loom.auth.config import (
-                AuthConfigError,
-                AuthProfile,
-                load_merged_auth_config,
-                remove_auth_profile,
-                resolve_auth_write_path,
-                set_workspace_auth_default,
-                upsert_auth_profile,
-            )
-            from loom.auth.resources import (
-                bind_resource_to_profile,
-                default_workspace_auth_resources_path,
-                has_active_binding,
-                load_workspace_auth_resources,
-                resolve_resource,
-                set_workspace_resource_default,
-            )
-            from loom.auth.runtime import AuthResolutionError, parse_auth_profile_overrides
-
             if not arg:
                 self._open_auth_manager_screen()
                 return True
 
             subparts = arg.split(None, 1)
             subcmd = subparts[0].lower()
-            rest = subparts[1].strip() if len(subparts) > 1 else ""
-
             if subcmd == "manage":
                 self._open_auth_manager_screen()
                 return True
 
-            def _effective_defaults(merged_auth) -> dict[str, str]:
-                defaults = dict(merged_auth.config.defaults)
-                defaults.update(merged_auth.workspace_defaults)
-                return defaults
-
-            if subcmd == "list":
-                try:
-                    merged_auth = await asyncio.to_thread(
-                        load_merged_auth_config,
-                        workspace=self._workspace,
-                        explicit_path=self._explicit_auth_path,
-                    )
-                except AuthConfigError as e:
-                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
-                    return True
-
-                lines = [
-                    "[bold #7dcfff]Auth Profiles[/bold #7dcfff]",
-                    f"  user: {merged_auth.user_path}",
-                    f"  explicit: {merged_auth.explicit_path or '-'}",
-                    f"  workspace defaults: {merged_auth.workspace_defaults_path or '-'}",
-                ]
-                if not merged_auth.config.profiles:
-                    lines.append("  (none)")
-                else:
-                    for profile_id in sorted(merged_auth.config.profiles):
-                        profile = merged_auth.config.profiles[profile_id]
-                        label = f" label={profile.account_label}" if profile.account_label else ""
-                        lines.append(
-                            f"  {profile.profile_id}: provider={profile.provider} "
-                            f"mode={profile.mode}{label}"
-                        )
-                        if profile.mcp_server:
-                            lines[-1] = lines[-1] + f" mcp_server={profile.mcp_server}"
-
-                defaults = {
-                    selector: profile_id
-                    for selector, profile_id in _effective_defaults(merged_auth).items()
-                    if not selector.startswith("mcp.")
-                }
-                if defaults:
-                    lines.append("")
-                    lines.append("Defaults:")
-                    for selector, profile_id in sorted(defaults.items()):
-                        lines.append(f"  {selector} -> {profile_id}")
-
-                run_overrides = {
-                    selector: profile_id
-                    for selector, profile_id in self._run_auth_profile_overrides.items()
-                    if not selector.startswith("mcp.")
-                }
-                if run_overrides:
-                    lines.append("")
-                    lines.append("Run overrides:")
-                    for selector, profile_id in sorted(run_overrides.items()):
-                        lines.append(f"  {selector} -> {profile_id}")
-
-                chat.add_info("\n".join(lines))
-                return True
-
-            if subcmd == "show":
-                if not rest:
-                    chat.add_info(
-                        self._render_slash_command_usage("/auth show", "<profile-id>")
-                    )
-                    return True
-                try:
-                    merged_auth = await asyncio.to_thread(
-                        load_merged_auth_config,
-                        workspace=self._workspace,
-                        explicit_path=self._explicit_auth_path,
-                    )
-                except AuthConfigError as e:
-                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
-                    return True
-                profile = merged_auth.config.profiles.get(rest)
-                if profile is None:
-                    chat.add_info(f"[bold #f7768e]Auth profile not found: {rest}[/]")
-                    return True
-                env_keys = ", ".join(sorted(profile.env.keys())) or "-"
-                lines = [
-                    f"[bold #7dcfff]Profile[/bold #7dcfff] {profile.profile_id}",
-                    f"  provider: {profile.provider}",
-                    f"  mode: {profile.mode}",
-                    f"  label: {profile.account_label or '-'}",
-                    f"  mcp_server: {profile.mcp_server or '-'}",
-                    f"  secret_ref: {profile.secret_ref or '-'}",
-                    f"  token_ref: {profile.token_ref or '-'}",
-                    f"  env_keys: {env_keys}",
-                    f"  command: {profile.command or '-'}",
-                ]
-                if profile.scopes:
-                    lines.append(f"  scopes: {', '.join(profile.scopes)}")
-                chat.add_info("\n".join(lines))
-                return True
-
-            if subcmd == "check":
-                try:
-                    merged_auth = await asyncio.to_thread(
-                        load_merged_auth_config,
-                        workspace=self._workspace,
-                        explicit_path=self._explicit_auth_path,
-                    )
-                except AuthConfigError as e:
-                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
-                    return True
-
-                profiles = merged_auth.config.profiles
-                defaults = _effective_defaults(merged_auth)
-                errors: list[str] = []
-
-                for selector, profile_id in sorted(defaults.items()):
-                    if profile_id not in profiles:
-                        errors.append(
-                            f"default {selector!r} references unknown profile {profile_id!r}"
-                        )
-                        continue
-                    profile = profiles[profile_id]
-                    if selector.startswith("mcp."):
-                        continue
-                    if selector != profile.provider:
-                        errors.append(
-                            f"default {selector!r} must match provider {profile.provider!r}"
-                        )
-                mcp_aliases = set(self._config.mcp.servers.keys())
-                for profile in profiles.values():
-                    mcp_server = str(getattr(profile, "mcp_server", "") or "").strip()
-                    if not mcp_server:
-                        continue
-                    if mcp_server not in mcp_aliases:
-                        errors.append(
-                            f"profile {profile.profile_id!r} references unknown "
-                            f"mcp_server {mcp_server!r}"
-                        )
-                for selector, profile_id in sorted(self._run_auth_profile_overrides.items()):
-                    profile = profiles.get(profile_id)
-                    if profile is None:
-                        errors.append(
-                            f"run override {selector!r} references unknown profile {profile_id!r}"
-                        )
-                        continue
-                    if selector.startswith("mcp."):
-                        errors.append(
-                            f"run override {selector!r} is no longer supported; "
-                            "MCP account selection is managed via MCP aliases."
-                        )
-                        continue
-                    if selector != profile.provider:
-                        errors.append(
-                            f"run override {selector!r} must match provider {profile.provider!r}"
-                        )
-
-                if errors:
-                    chat.add_info(
-                        "[bold #f7768e]Auth config validation failed:[/]\n"
-                        + "\n".join(f"  - {err}" for err in errors)
-                    )
-                    return True
-                chat.add_info("Auth config is valid.")
-                return True
-
-            if subcmd == "use":
-                if not rest:
-                    chat.add_info(
-                        self._render_slash_command_usage("/auth use", "<selector=profile>")
-                    )
-                    return True
-                try:
-                    parsed = parse_auth_profile_overrides((rest,))
-                except AuthResolutionError as e:
-                    chat.add_info(f"[bold #f7768e]{e}[/]")
-                    return True
-                selector, profile_id = next(iter(parsed.items()))
-                try:
-                    merged_auth = await asyncio.to_thread(
-                        load_merged_auth_config,
-                        workspace=self._workspace,
-                        explicit_path=self._explicit_auth_path,
-                    )
-                except AuthConfigError as e:
-                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
-                    return True
-                profile = merged_auth.config.profiles.get(profile_id)
-                if profile is None:
-                    chat.add_info(
-                        f"[bold #f7768e]Unknown auth profile: {profile_id}[/]"
-                    )
-                    return True
-                if selector.startswith("mcp."):
-                    chat.add_info(
-                        "[bold #f7768e]MCP selectors are no longer supported in /auth use. "
-                        "Select MCP accounts via MCP aliases in /mcp.[/]"
-                    )
-                    return True
-                resource_store = await asyncio.to_thread(
-                    load_workspace_auth_resources,
-                    default_workspace_auth_resources_path(self._workspace.resolve()),
-                )
-                resolved_resource = None
-                if ":" in selector:
-                    resolved_resource = resolve_resource(
-                        resource_store,
-                        resource_ref=selector,
-                    )
-                elif selector in resource_store.resources:
-                    resolved_resource = resolve_resource(
-                        resource_store,
-                        resource_id=selector,
-                    )
-                if resolved_resource is None and selector != profile.provider:
-                    chat.add_info(
-                        "[bold #f7768e]Selector must match profile provider "
-                        "or a known resource selector.[/]"
-                    )
-                    return True
-                if (
-                    resolved_resource is not None
-                    and profile.provider != resolved_resource.provider
-                ):
-                    chat.add_info(
-                        "[bold #f7768e]Profile provider does not match resource provider: "
-                        f"{profile.provider!r} != {resolved_resource.provider!r}.[/]"
-                    )
-                    return True
-                self._run_auth_profile_overrides[selector] = profile_id
-                chat.add_info(f"Run auth override set: {selector} -> {profile_id}")
-                return True
-
-            if subcmd == "clear":
-                if rest:
-                    removed = self._run_auth_profile_overrides.pop(rest, None)
-                    if removed is None:
-                        chat.add_info(f"No run auth override set for {rest}.")
-                        return True
-                    chat.add_info(f"Removed run auth override: {rest}")
-                    return True
-                self._run_auth_profile_overrides.clear()
-                chat.add_info("Cleared all run auth overrides.")
-                return True
-
-            if subcmd == "select":
-                if not rest:
-                    chat.add_info(
-                        self._render_slash_command_usage("/auth select", "<selector=profile>")
-                    )
-                    return True
-                try:
-                    parsed = parse_auth_profile_overrides((rest,))
-                except AuthResolutionError as e:
-                    chat.add_info(f"[bold #f7768e]{e}[/]")
-                    return True
-                selector, profile_id = next(iter(parsed.items()))
-                try:
-                    merged_auth = await asyncio.to_thread(
-                        load_merged_auth_config,
-                        workspace=self._workspace,
-                        explicit_path=self._explicit_auth_path,
-                    )
-                except AuthConfigError as e:
-                    chat.add_info(f"[bold #f7768e]Auth config error: {e}[/]")
-                    return True
-                profile = merged_auth.config.profiles.get(profile_id)
-                if profile is None:
-                    chat.add_info(
-                        f"[bold #f7768e]Unknown auth profile: {profile_id}[/]"
-                    )
-                    return True
-                if selector.startswith("mcp."):
-                    chat.add_info(
-                        "[bold #f7768e]MCP selectors are no longer supported in /auth select. "
-                        "Select MCP accounts via MCP aliases in /mcp.[/]"
-                    )
-                    return True
-                resources_path = default_workspace_auth_resources_path(
-                    self._workspace.resolve()
-                )
-                resource_store = await asyncio.to_thread(
-                    load_workspace_auth_resources,
-                    resources_path,
-                )
-                resolved_resource = None
-                if ":" in selector:
-                    resolved_resource = resolve_resource(
-                        resource_store,
-                        resource_ref=selector,
-                    )
-                elif selector in resource_store.resources:
-                    resolved_resource = resolve_resource(
-                        resource_store,
-                        resource_id=selector,
-                    )
-
-                if resolved_resource is not None:
-                    if profile.provider != resolved_resource.provider:
-                        chat.add_info(
-                            "[bold #f7768e]Profile provider does not match resource provider: "
-                            f"{profile.provider!r} != {resolved_resource.provider!r}.[/]"
-                        )
-                        return True
-                    try:
-                        if not has_active_binding(
-                            resource_store,
-                            resource_id=resolved_resource.resource_id,
-                            profile_id=profile_id,
-                        ):
-                            await asyncio.to_thread(
-                                bind_resource_to_profile,
-                                resources_path,
-                                resource_id=resolved_resource.resource_id,
-                                profile_id=profile_id,
-                                generated_from=f"slash:auth-select:{selector}",
-                                priority=0,
-                            )
-                        await asyncio.to_thread(
-                            set_workspace_resource_default,
-                            resources_path,
-                            resource_id=resolved_resource.resource_id,
-                            profile_id=profile_id,
-                        )
-                    except Exception as e:
-                        chat.add_info(f"[bold #f7768e]{e}[/]")
-                        return True
-                    chat.add_info(
-                        "Workspace resource default set: "
-                        f"{resolved_resource.resource_ref} -> {profile_id}\n"
-                        f"[dim]{resources_path}[/dim]"
-                    )
-                    return True
-
-                if selector != profile.provider:
-                    chat.add_info(
-                        "[bold #f7768e]Selector must match profile provider "
-                        "or a known resource selector.[/]"
-                    )
-                    return True
-
-                defaults_path = self._auth_defaults_path()
-                try:
-                    await asyncio.to_thread(
-                        set_workspace_auth_default,
-                        defaults_path,
-                        selector=selector,
-                        profile_id=profile_id,
-                    )
-                except AuthConfigError as e:
-                    chat.add_info(f"[bold #f7768e]{e}[/]")
-                    return True
-                chat.add_info(
-                    f"Workspace auth default set: {selector} -> {profile_id}\n"
-                    f"[dim]{defaults_path}[/dim]"
-                )
-                return True
-
-            if subcmd == "unset":
-                clean_selector = rest.strip()
-                if not clean_selector:
-                    chat.add_info(
-                        self._render_slash_command_usage("/auth unset", "<selector>")
-                    )
-                    return True
-                resources_path = default_workspace_auth_resources_path(
-                    self._workspace.resolve()
-                )
-                resource_store = await asyncio.to_thread(
-                    load_workspace_auth_resources,
-                    resources_path,
-                )
-                resolved_resource = None
-                if ":" in clean_selector:
-                    resolved_resource = resolve_resource(
-                        resource_store,
-                        resource_ref=clean_selector,
-                    )
-                elif clean_selector in resource_store.resources:
-                    resolved_resource = resolve_resource(
-                        resource_store,
-                        resource_id=clean_selector,
-                    )
-                if resolved_resource is not None:
-                    try:
-                        await asyncio.to_thread(
-                            set_workspace_resource_default,
-                            resources_path,
-                            resource_id=resolved_resource.resource_id,
-                            profile_id=None,
-                        )
-                    except Exception as e:
-                        chat.add_info(f"[bold #f7768e]{e}[/]")
-                        return True
-                    chat.add_info(
-                        "Workspace resource default removed: "
-                        f"{resolved_resource.resource_ref}\n"
-                        f"[dim]{resources_path}[/dim]"
-                    )
-                    return True
-                defaults_path = self._auth_defaults_path()
-                try:
-                    await asyncio.to_thread(
-                        set_workspace_auth_default,
-                        defaults_path,
-                        selector=clean_selector,
-                        profile_id=None,
-                    )
-                except AuthConfigError as e:
-                    chat.add_info(f"[bold #f7768e]{e}[/]")
-                    return True
-                chat.add_info(
-                    f"Workspace auth default removed: {clean_selector}\n"
-                    f"[dim]{defaults_path}[/dim]"
-                )
-                return True
-
-            if subcmd == "add":
-                if not rest:
-                    chat.add_info(
-                        self._render_slash_command_usage(
-                            "/auth add",
-                            (
-                                "<profile-id> --provider <provider> --mode <mode> "
-                                "[--label <text>] [--secret-ref <ref>] "
-                                "[--mcp-server <alias>] "
-                                "[--token-ref <ref>] [--scope <scope>] "
-                                "[--env KEY=VALUE] [--command <cmd>] "
-                                "[--auth-check <token>] [--meta KEY=VALUE]"
-                            ),
-                        )
-                    )
-                    return True
-                try:
-                    tokens = self._split_slash_args(rest)
-                except ValueError as e:
-                    chat.add_info(f"[bold #f7768e]{e}[/]")
-                    return True
-                if not tokens:
-                    chat.add_info(
-                        self._render_slash_command_usage("/auth add", "<profile-id> ...")
-                    )
-                    return True
-                profile_id = str(tokens[0]).strip()
-                args_tokens = tokens[1:]
-                provider = ""
-                mode = ""
-                label = ""
-                mcp_server = ""
-                secret_ref = ""
-                token_ref = ""
-                scopes: list[str] = []
-                env_values: list[str] = []
-                command = ""
-                auth_check: list[str] = []
-                meta_values: list[str] = []
-                index = 0
-                while index < len(args_tokens):
-                    item = args_tokens[index]
-                    if item in {
-                        "--provider",
-                        "--mode",
-                        "--label",
-                        "--mcp-server",
-                        "--secret-ref",
-                        "--token-ref",
-                        "--scope",
-                        "--env",
-                        "--command",
-                        "--auth-check",
-                        "--meta",
-                    }:
-                        if index + 1 >= len(args_tokens):
-                            chat.add_info(
-                                f"[bold #f7768e]Missing value for {item}.[/]"
-                            )
-                            return True
-                        value = args_tokens[index + 1]
-                        if item == "--provider":
-                            provider = value
-                        elif item == "--mode":
-                            mode = value
-                        elif item == "--label":
-                            label = value
-                        elif item == "--mcp-server":
-                            mcp_server = value
-                        elif item == "--secret-ref":
-                            secret_ref = value
-                        elif item == "--token-ref":
-                            token_ref = value
-                        elif item == "--scope":
-                            scopes.append(value)
-                        elif item == "--env":
-                            env_values.append(value)
-                        elif item == "--command":
-                            command = value
-                        elif item == "--auth-check":
-                            auth_check.append(value)
-                        elif item == "--meta":
-                            meta_values.append(value)
-                        index += 2
-                        continue
-                    chat.add_info(
-                        f"[bold #f7768e]Unknown /auth add option: {item}[/]"
-                    )
-                    return True
-                if not profile_id:
-                    chat.add_info("[bold #f7768e]Profile id cannot be empty.[/]")
-                    return True
-                if not provider or not mode:
-                    chat.add_info(
-                        "[bold #f7768e]/auth add requires --provider and --mode.[/]"
-                    )
-                    return True
-                try:
-                    env = self._parse_kv_assignments(
-                        env_values,
-                        option_name="--env",
-                        env_keys=True,
-                    )
-                    metadata = self._parse_kv_assignments(
-                        meta_values,
-                        option_name="--meta",
-                    )
-                    profile = AuthProfile(
-                        profile_id=profile_id,
-                        provider=provider.strip(),
-                        mode=mode.strip(),
-                        account_label=label.strip(),
-                        mcp_server=mcp_server.strip(),
-                        secret_ref=secret_ref.strip(),
-                        token_ref=token_ref.strip(),
-                        scopes=[str(scope).strip() for scope in scopes if str(scope).strip()],
-                        env=env,
-                        command=command.strip(),
-                        auth_check=[
-                            str(item).strip()
-                            for item in auth_check
-                            if str(item).strip()
-                        ],
-                        metadata=metadata,
-                    )
-                    target = resolve_auth_write_path(
-                        explicit_path=self._explicit_auth_path,
-                    )
-                    await asyncio.to_thread(
-                        upsert_auth_profile,
-                        target,
-                        profile,
-                        must_exist=False,
-                    )
-                except Exception as e:
-                    chat.add_info(f"[bold #f7768e]{e}[/]")
-                    return True
-                chat.add_info(
-                    f"Added auth profile '{profile_id}'.\n[dim]{target}[/dim]"
-                )
-                return True
-
-            if subcmd == "edit":
-                if not rest:
-                    chat.add_info(
-                        self._render_slash_command_usage(
-                            "/auth edit",
-                            (
-                                "<profile-id> [--provider <provider>] [--mode <mode>] "
-                                "[--label <text>] [--mcp-server <alias>] "
-                                "[--clear-mcp-server] "
-                                "[--secret-ref <ref>] [--token-ref <ref>] "
-                                "[--scope <scope>] [--clear-scopes] "
-                                "[--env KEY=VALUE] [--clear-env] "
-                                "[--command <cmd>] [--auth-check <token>] "
-                                "[--clear-auth-check] [--meta KEY=VALUE] [--clear-meta]"
-                            ),
-                        )
-                    )
-                    return True
-                try:
-                    tokens = self._split_slash_args(rest)
-                except ValueError as e:
-                    chat.add_info(f"[bold #f7768e]{e}[/]")
-                    return True
-                if not tokens:
-                    chat.add_info(
-                        self._render_slash_command_usage("/auth edit", "<profile-id> ...")
-                    )
-                    return True
-                profile_id = str(tokens[0]).strip()
-                args_tokens = tokens[1:]
-                provider: str | None = None
-                mode: str | None = None
-                label: str | None = None
-                mcp_server: str | None = None
-                clear_mcp_server = False
-                secret_ref: str | None = None
-                token_ref: str | None = None
-                scopes: list[str] = []
-                clear_scopes = False
-                env_values: list[str] = []
-                clear_env = False
-                command: str | None = None
-                auth_check_values: list[str] = []
-                clear_auth_check = False
-                meta_values: list[str] = []
-                clear_meta = False
-                index = 0
-                while index < len(args_tokens):
-                    item = args_tokens[index]
-                    if item in {
-                        "--clear-scopes",
-                        "--clear-mcp-server",
-                        "--clear-env",
-                        "--clear-auth-check",
-                        "--clear-meta",
-                    }:
-                        if item == "--clear-scopes":
-                            clear_scopes = True
-                        elif item == "--clear-mcp-server":
-                            clear_mcp_server = True
-                        elif item == "--clear-env":
-                            clear_env = True
-                        elif item == "--clear-auth-check":
-                            clear_auth_check = True
-                        elif item == "--clear-meta":
-                            clear_meta = True
-                        index += 1
-                        continue
-                    if item in {
-                        "--provider",
-                        "--mode",
-                        "--label",
-                        "--mcp-server",
-                        "--secret-ref",
-                        "--token-ref",
-                        "--scope",
-                        "--env",
-                        "--command",
-                        "--auth-check",
-                        "--meta",
-                    }:
-                        if index + 1 >= len(args_tokens):
-                            chat.add_info(
-                                f"[bold #f7768e]Missing value for {item}.[/]"
-                            )
-                            return True
-                        value = args_tokens[index + 1]
-                        if item == "--provider":
-                            provider = value
-                        elif item == "--mode":
-                            mode = value
-                        elif item == "--label":
-                            label = value
-                        elif item == "--mcp-server":
-                            mcp_server = value
-                        elif item == "--secret-ref":
-                            secret_ref = value
-                        elif item == "--token-ref":
-                            token_ref = value
-                        elif item == "--scope":
-                            scopes.append(value)
-                        elif item == "--env":
-                            env_values.append(value)
-                        elif item == "--command":
-                            command = value
-                        elif item == "--auth-check":
-                            auth_check_values.append(value)
-                        elif item == "--meta":
-                            meta_values.append(value)
-                        index += 2
-                        continue
-                    chat.add_info(
-                        f"[bold #f7768e]Unknown /auth edit option: {item}[/]"
-                    )
-                    return True
-                if not profile_id:
-                    chat.add_info("[bold #f7768e]Profile id cannot be empty.[/]")
-                    return True
-                if (
-                    provider is None
-                    and mode is None
-                    and label is None
-                    and mcp_server is None
-                    and not clear_mcp_server
-                    and secret_ref is None
-                    and token_ref is None
-                    and not scopes
-                    and not clear_scopes
-                    and not env_values
-                    and not clear_env
-                    and command is None
-                    and not auth_check_values
-                    and not clear_auth_check
-                    and not meta_values
-                    and not clear_meta
-                ):
-                    chat.add_info(
-                        "[bold #f7768e]/auth edit requires at least one change flag.[/]"
-                    )
-                    return True
-                try:
-                    merged_auth = await asyncio.to_thread(
-                        load_merged_auth_config,
-                        workspace=self._workspace,
-                        explicit_path=self._explicit_auth_path,
-                    )
-                    current = merged_auth.config.profiles.get(profile_id)
-                    if current is None:
-                        chat.add_info(
-                            f"[bold #f7768e]Auth profile not found: {profile_id}[/]"
-                        )
-                        return True
-                    env_updates = self._parse_kv_assignments(
-                        env_values,
-                        option_name="--env",
-                        env_keys=True,
-                    )
-                    meta_updates = self._parse_kv_assignments(
-                        meta_values,
-                        option_name="--meta",
-                    )
-                    next_scopes = [] if clear_scopes else list(current.scopes)
-                    if scopes:
-                        next_scopes = [
-                            str(scope).strip()
-                            for scope in scopes
-                            if str(scope).strip()
-                        ]
-                    next_mcp_server = (
-                        ""
-                        if clear_mcp_server
-                        else current.mcp_server
-                    )
-                    if mcp_server is not None:
-                        next_mcp_server = mcp_server.strip()
-                    next_env = {} if clear_env else dict(current.env)
-                    next_env.update(env_updates)
-                    next_auth_check = (
-                        []
-                        if clear_auth_check
-                        else list(current.auth_check)
-                    )
-                    if auth_check_values:
-                        next_auth_check = [
-                            str(item).strip()
-                            for item in auth_check_values
-                            if str(item).strip()
-                        ]
-                    next_metadata = {} if clear_meta else dict(current.metadata)
-                    next_metadata.update(meta_updates)
-                    updated = AuthProfile(
-                        profile_id=current.profile_id,
-                        provider=current.provider if provider is None else provider.strip(),
-                        mode=current.mode if mode is None else mode.strip(),
-                        account_label=(
-                            current.account_label
-                            if label is None else label.strip()
-                        ),
-                        mcp_server=next_mcp_server,
-                        secret_ref=(
-                            current.secret_ref
-                            if secret_ref is None else secret_ref.strip()
-                        ),
-                        token_ref=current.token_ref if token_ref is None else token_ref.strip(),
-                        scopes=next_scopes,
-                        env=next_env,
-                        command=current.command if command is None else command.strip(),
-                        auth_check=next_auth_check,
-                        metadata=next_metadata,
-                    )
-                    if not updated.provider or not updated.mode:
-                        chat.add_info(
-                            "[bold #f7768e]Provider and mode must be non-empty.[/]"
-                        )
-                        return True
-                    target = resolve_auth_write_path(
-                        explicit_path=self._explicit_auth_path,
-                    )
-                    await asyncio.to_thread(
-                        upsert_auth_profile,
-                        target,
-                        updated,
-                        must_exist=True,
-                    )
-                except Exception as e:
-                    chat.add_info(f"[bold #f7768e]{e}[/]")
-                    return True
-                chat.add_info(
-                    f"Updated auth profile '{profile_id}'.\n[dim]{target}[/dim]"
-                )
-                return True
-
-            if subcmd == "remove":
-                profile_id = rest.strip()
-                if not profile_id:
-                    chat.add_info(
-                        self._render_slash_command_usage("/auth remove", "<profile-id>")
-                    )
-                    return True
-                target = resolve_auth_write_path(
-                    explicit_path=self._explicit_auth_path,
-                )
-                try:
-                    await asyncio.to_thread(
-                        remove_auth_profile,
-                        target,
-                        profile_id,
-                    )
-                except Exception as e:
-                    chat.add_info(f"[bold #f7768e]{e}[/]")
-                    return True
-                chat.add_info(
-                    f"Removed auth profile '{profile_id}'.\n[dim]{target}[/dim]"
-                )
-                return True
-
             chat.add_info(
-                self._render_slash_command_usage(
-                    "/auth",
-                    (
-                        "[manage|list|show <profile-id>|check|use <selector=profile>|"
-                        "clear [selector]|select <selector=profile>|unset <selector>|"
-                        "add <profile-id> ...|edit <profile-id> ...|remove <profile-id>]"
-                    ),
-                )
+                "[bold #7dcfff]TUI /auth is manager-first.[/]\n"
+                "Use [bold]/auth[/bold] or [bold]/auth manage[/bold] to open "
+                "the auth manager.\n"
+                "Use CLI for scriptable auth actions: "
+                "[bold]loom auth list|show|check|select|unset|"
+                "profile add|profile edit|profile remove[/bold]."
             )
             return True
         if token == "/setup":
@@ -9410,80 +9207,12 @@ class LoomApp(App):
         if token == "/tokens":
             chat.add_info(f"Session tokens: {self._total_tokens:,}")
             return True
-        if token in {"/process", "/processes"}:
+        if token == "/processes":
             self._refresh_process_command_index()
-            if token == "/processes":
-                if arg:
-                    chat.add_info(self._render_slash_command_usage("/processes", ""))
-                    return True
-                chat.add_info(self._render_process_catalog())
+            if arg:
+                chat.add_info(self._render_slash_command_usage("/processes", ""))
                 return True
-            if not arg:
-                chat.add_info(self._render_process_catalog())
-                return True
-
-            subparts = arg.split(None, 1)
-            subcmd = subparts[0].lower()
-            rest = subparts[1].strip() if len(subparts) > 1 else ""
-
-            if subcmd == "list":
-                chat.add_info(self._render_process_catalog())
-                return True
-
-            if subcmd == "use":
-                if not rest:
-                    chat.add_info(
-                        self._render_slash_command_usage(
-                            "/process use",
-                            "<name-or-path>",
-                        )
-                    )
-                    return True
-                loader = self._create_process_loader()
-                try:
-                    loaded = loader.load(rest)
-                except Exception as e:
-                    chat.add_info(
-                        f"[bold #f7768e]Failed to load process "
-                        f"'{rest}': {e}[/]"
-                    )
-                    return True
-                if self._is_reserved_process_name(loaded.name):
-                    chat.add_info(
-                        f"[bold #f7768e]Process '{loaded.name}' conflicts with a "
-                        "built-in slash command and cannot be loaded in TUI.[/]"
-                    )
-                    return True
-
-                self._process_name = loaded.name
-                await self._reload_session_for_process_change(chat)
-                self._refresh_process_command_index(chat=chat, notify_conflicts=True)
-                chat.add_info(
-                    "[bold #7dcfff]Active Process Updated[/bold #7dcfff]\n"
-                    f"  [bold]Name:[/] [bold]{self._escape_markup(loaded.name)}[/bold]\n"
-                    f"  [bold]Version:[/] [dim]v{self._escape_markup(loaded.version)}[/dim]"
-                )
-                return True
-
-            if subcmd in {"off", "none", "clear"}:
-                if not self._process_name and self._process_defn is None:
-                    chat.add_info("No active process.")
-                    return True
-                self._process_name = None
-                self._process_defn = None
-                await self._reload_session_for_process_change(chat)
-                chat.add_info(
-                    "[bold #7dcfff]Active Process Updated[/bold #7dcfff]\n"
-                    "  [bold]Name:[/] none"
-                )
-                return True
-
-            chat.add_info(
-                self._render_slash_command_usage(
-                    "/process",
-                    "[list|use <name-or-path>|off]",
-                )
-            )
+            chat.add_info(self._render_process_catalog())
             return True
 
         if token == "/run":
@@ -9559,7 +9288,6 @@ class LoomApp(App):
                         )
                         return True
 
-            run_process_name = ""
             goal = ""
             goal_tokens: list[str] = []
             force_fresh = False
@@ -9577,22 +9305,16 @@ class LoomApp(App):
                         idx += 1
                         continue
                     if item in {"--process", "-p"}:
-                        if idx + 1 >= len(tokens):
-                            chat.add_info(
-                                self._render_slash_command_usage(
-                                    "/run",
-                                    "--process <name> <goal>",
-                                )
-                            )
-                            return True
-                        run_process_name = tokens[idx + 1].strip()
-                        idx += 2
-                        continue
+                        chat.add_info(
+                            "[bold #f7768e]/run --process is not supported in TUI.[/]\n"
+                            "Use [bold]/<process-name> <goal>[/bold] for explicit runs."
+                        )
+                        return True
                     if item.startswith("-"):
                         chat.add_info(
                             self._render_slash_command_usage(
                                 "/run",
-                                "[--fresh] [--process <name>] <goal>",
+                                "[--fresh] <goal>",
                             )
                         )
                         return True
@@ -9641,26 +9363,10 @@ class LoomApp(App):
                     )
 
             process_defn = None
-            process_name_override = ""
-            is_adhoc = False
-
-            if run_process_name:
-                process_name_override = run_process_name
-            elif self._process_defn is not None:
-                process_defn = self._process_defn
-            else:
-                default_process = str(
-                    getattr(getattr(self._config, "process", None), "default", "") or "",
-                ).strip()
-                if default_process:
-                    process_name_override = default_process
-                else:
-                    is_adhoc = True
-
             start_kwargs: dict[str, Any] = {
                 "process_defn": process_defn,
-                "process_name_override": process_name_override or None,
-                "is_adhoc": is_adhoc,
+                "process_name_override": None,
+                "is_adhoc": True,
                 "synthesis_goal": synthesis_goal,
                 "force_fresh": force_fresh,
             }
@@ -9776,6 +9482,7 @@ class LoomApp(App):
             return
 
         self._chat_busy = True
+        self._sync_activity_indicator()
         chat = self.query_one("#chat-log", ChatLog)
         status = self.query_one("#status-bar", StatusBar)
 
@@ -9791,9 +9498,10 @@ class LoomApp(App):
         except Exception as e:
             chat.add_model_text(f"[bold #f7768e]Error:[/] {e}", markup=True)
             self.notify(str(e), severity="error", timeout=5)
-
-        self._chat_busy = False
-        status.state = "Ready"
+        finally:
+            self._chat_busy = False
+            status.state = "Ready"
+            self._sync_activity_indicator()
 
     async def _run_followup(self, message: str) -> None:
         """Run a follow-up turn (e.g. after ask_user answer)."""
@@ -9869,6 +9577,7 @@ class LoomApp(App):
             "finalized": str(status or "").strip().lower() in {"completed", "failed"},
         })
         self._active_delegate_streams[key] = stream
+        self._sync_activity_indicator()
         return True
 
     def _append_delegate_progress_widget_line(self, tool_call_id: str, line: str) -> bool:
@@ -9976,6 +9685,7 @@ class LoomApp(App):
             "title": title,
         })
         self._active_delegate_streams[key] = stream
+        self._sync_activity_indicator()
         if not persist:
             return
         await self._append_chat_replay_event(
@@ -10431,6 +10141,13 @@ class LoomApp(App):
                 run.task_labels = task_labels
             except Exception:
                 pass
+        phase_map = getattr(run, "subtask_phase_ids", None)
+        if not isinstance(phase_map, dict):
+            phase_map = {}
+            try:
+                run.subtask_phase_ids = phase_map
+            except Exception:
+                pass
 
         normalized: list[dict] = []
         for row in tasks:
@@ -10448,6 +10165,7 @@ class LoomApp(App):
             if subtask_id in phase_labels:
                 label = phase_labels[subtask_id]
                 task_labels[subtask_id] = label
+                phase_map[subtask_id] = subtask_id
             else:
                 if subtask_id:
                     existing = str(task_labels.get(subtask_id, "")).strip()
@@ -10463,11 +10181,20 @@ class LoomApp(App):
                 else:
                     label = candidate
 
-            normalized.append({
+            row_payload = {
                 "id": subtask_id or candidate,
                 "status": status,
                 "content": label,
-            })
+            }
+            row_phase_id = str(row.get("phase_id", "")).strip()
+            if not row_phase_id and subtask_id:
+                row_phase_id = str(phase_map.get(subtask_id, "")).strip()
+            if row_phase_id:
+                row_payload["phase_id"] = row_phase_id
+                if subtask_id:
+                    phase_map[subtask_id] = row_phase_id
+
+            normalized.append(row_payload)
         return normalized
 
     def _process_run_output_rows(self, run: ProcessRunState) -> list[dict]:
@@ -10509,19 +10236,6 @@ class LoomApp(App):
         if not has_deliverables:
             return []
 
-        subtask_status: dict[str, str] = {}
-        content_status: dict[str, str] = {}
-        for row in getattr(run, "tasks", []):
-            if not isinstance(row, dict):
-                continue
-            subtask_id = str(row.get("id", "")).strip()
-            status = str(row.get("status", "pending")).strip()
-            if subtask_id:
-                subtask_status[subtask_id] = status
-            content_text = self._one_line(row.get("content", ""), max_len=None)
-            if content_text:
-                content_status[content_text] = status
-
         ordered_phase_ids: list[str] = []
         phase_labels: dict[str, str] = {}
         for phase in getattr(process, "phases", []):
@@ -10541,18 +10255,31 @@ class LoomApp(App):
         run_workspace = getattr(run, "run_workspace", None)
         workspace_root = Path(run_workspace) if run_workspace else self._workspace
 
+        phase_statuses: dict[str, list[str]] = {phase_id: [] for phase_id in ordered_phase_ids}
+        phase_map = self._process_run_phase_map(run)
+        for row in getattr(run, "tasks", []):
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status", "pending")).strip()
+            if status not in {"pending", "in_progress", "completed", "failed", "skipped"}:
+                status = "pending"
+            phase_id = self._infer_process_run_task_phase_id(
+                run,
+                row=row,
+                phase_ids=ordered_phase_ids,
+                phase_labels=phase_labels,
+                deliverables_by_phase=deliverables_by_phase,
+                phase_map=phase_map,
+            )
+            if phase_id and phase_id in phase_statuses:
+                phase_statuses[phase_id].append(status)
+
         rows: list[dict] = []
         for phase_id in ordered_phase_ids:
             phase_deliverables = deliverables_by_phase.get(phase_id) or []
             if not isinstance(phase_deliverables, list):
                 continue
-            phase_state = subtask_status.get(phase_id, "").strip()
-            if not phase_state:
-                phase_label = phase_labels.get(phase_id, "")
-                if phase_label:
-                    phase_state = content_status.get(phase_label, "").strip()
-            if phase_state not in {"pending", "in_progress", "completed", "failed", "skipped"}:
-                phase_state = "pending"
+            phase_state = self._aggregate_phase_state(phase_statuses.get(phase_id, []))
             for path in phase_deliverables:
                 rel_path = str(path).strip()
                 if not rel_path:
@@ -10582,6 +10309,85 @@ class LoomApp(App):
                     "content": f"{rel_path} ({phase_id}){suffix}",
                 })
         return rows
+
+    def _process_run_phase_map(self, run: ProcessRunState) -> dict[str, str]:
+        """Return mutable subtask->phase map for the run, creating if missing."""
+        phase_map = getattr(run, "subtask_phase_ids", None)
+        if isinstance(phase_map, dict):
+            return phase_map
+        phase_map = {}
+        try:
+            run.subtask_phase_ids = phase_map
+        except Exception:
+            pass
+        return phase_map
+
+    @staticmethod
+    def _aggregate_phase_state(statuses: list[str]) -> str:
+        """Aggregate multiple subtask states into one phase-level state."""
+        normalized = [
+            str(item).strip()
+            for item in statuses
+            if str(item).strip() in {"pending", "in_progress", "completed", "failed", "skipped"}
+        ]
+        if not normalized:
+            return "pending"
+        if "failed" in normalized:
+            return "failed"
+        if "in_progress" in normalized:
+            return "in_progress"
+        if "pending" in normalized:
+            if any(item in {"completed", "skipped"} for item in normalized):
+                return "in_progress"
+            return "pending"
+        if all(item == "skipped" for item in normalized):
+            return "skipped"
+        return "completed"
+
+    def _infer_process_run_task_phase_id(
+        self,
+        run: ProcessRunState,
+        *,
+        row: dict,
+        phase_ids: list[str],
+        phase_labels: dict[str, str],
+        deliverables_by_phase: dict[str, list[str]],
+        phase_map: dict[str, str],
+    ) -> str:
+        """Infer phase ID for one task row, preserving stable mappings."""
+        phase_set = set(phase_ids)
+        subtask_id = str(row.get("id", "")).strip()
+        explicit_phase_id = str(row.get("phase_id", "")).strip()
+        if explicit_phase_id in phase_set:
+            if subtask_id:
+                phase_map[subtask_id] = explicit_phase_id
+            return explicit_phase_id
+
+        if subtask_id in phase_set:
+            phase_map[subtask_id] = subtask_id
+            return subtask_id
+
+        if subtask_id:
+            existing = str(phase_map.get(subtask_id, "")).strip()
+            if existing in phase_set:
+                return existing
+
+        content = self._one_line(row.get("content", ""), max_len=None)
+        label = ""
+        task_labels = getattr(run, "task_labels", {})
+        if subtask_id and isinstance(task_labels, dict):
+            label = self._one_line(task_labels.get(subtask_id, ""), max_len=None)
+        text = " ".join(part for part in [label, content] if part).strip()
+        inferred = infer_phase_id_for_subtask(
+            subtask_id=subtask_id,
+            text=text,
+            phase_ids=phase_ids,
+            phase_descriptions=phase_labels,
+            phase_deliverables=deliverables_by_phase,
+        )
+        if inferred in phase_set and subtask_id:
+            phase_map[subtask_id] = inferred
+        return inferred if inferred in phase_set else ""
 
     def _refresh_process_run_outputs(self, run: ProcessRunState) -> None:
         """Refresh per-run output rows in the process pane."""
@@ -11449,10 +11255,37 @@ class LoomApp(App):
         self._request_workspace_refresh("manual", immediate=True)
         self.notify("Workspace reloaded", timeout=2)
 
+    async def _request_manager_tab_close(self, pane_id: str) -> bool:
+        """Ask active manager widget to run its guarded close flow when available."""
+        selector = ""
+        if pane_id == self._MCP_MANAGER_TAB_ID:
+            selector = f"#{pane_id} MCPManagerScreen"
+        elif pane_id == self._AUTH_MANAGER_TAB_ID:
+            selector = f"#{pane_id} AuthManagerScreen"
+        if not selector:
+            return False
+        try:
+            manager_widget = self.query_one(selector)
+        except Exception:
+            return False
+        close_action = getattr(manager_widget, "action_request_close", None)
+        if not callable(close_action):
+            return False
+        result = close_action()
+        if asyncio.iscoroutine(result):
+            await result
+        return True
+
     def action_close_process_tab(self) -> None:
-        """Close current process run tab with confirmation."""
+        """Close current tab (process run tab or manager tab)."""
         current = self._current_process_run()
-        close_key = current.run_id if current is not None else "current"
+        active_tab = ""
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+            active_tab = str(getattr(tabs, "active", "") or "")
+        except Exception:
+            active_tab = ""
+        close_key = current.run_id if current is not None else (active_tab or "current")
         if close_key in self._close_process_tab_inflight:
             return
         self._close_process_tab_inflight.add(close_key)
@@ -11461,6 +11294,18 @@ class LoomApp(App):
             try:
                 if current is not None:
                     await self._close_process_run(current)
+                elif active_tab in {self._MCP_MANAGER_TAB_ID, self._AUTH_MANAGER_TAB_ID}:
+                    requested = await self._request_manager_tab_close(active_tab)
+                    if not requested:
+                        await self._remove_tab_if_present(active_tab)
+                elif not self._process_runs:
+                    try:
+                        chat = self.query_one("#chat-log", ChatLog)
+                        chat.add_info(
+                            "No closable tabs are open. Ctrl+W closes run, MCP, or Auth tabs."
+                        )
+                    except Exception:
+                        pass
                 else:
                     await self._close_process_run_from_target("current")
             finally:
@@ -11487,6 +11332,12 @@ class LoomApp(App):
     def action_tab_events(self) -> None:
         tabs = self.query_one("#tabs", TabbedContent)
         tabs.active = "tab-events"
+
+    def action_open_auth_tab(self) -> None:
+        self._open_auth_manager_screen()
+
+    def action_open_mcp_tab(self) -> None:
+        self._open_mcp_manager_screen()
 
     async def action_quit(self) -> None:
         """Compatibility action that runs the exit flow inline."""
@@ -11559,21 +11410,16 @@ class LoomApp(App):
             )
             return
         if command == "auth_list":
-            await self._handle_slash_command("/auth list")
+            await self._handle_slash_command("/auth manage")
             return
         if command == "auth_manage":
             await self._handle_slash_command("/auth manage")
             return
         if command == "auth_add_prompt":
-            self._prefill_user_input(
-                "/auth add <profile-id> --provider <provider> --mode <mode> --mcp-server <alias> "
-            )
+            await self._handle_slash_command("/auth manage")
             return
         if command == "learned_patterns":
             await self._handle_slash_command("/learned")
-            return
-        if command == "process_use_prompt":
-            self._prefill_user_input("/process use ")
             return
         if command == "run_prompt":
             self._prefill_user_input("/run ")
@@ -11584,16 +11430,6 @@ class LoomApp(App):
         if command == "close_process_tab":
             await self._close_process_run_from_target("current")
             return
-        if command == "process_off":
-            chat = self.query_one("#chat-log", ChatLog)
-            if not self._process_name and self._process_defn is None:
-                chat.add_info("No active process.")
-                return
-            self._process_name = None
-            self._process_defn = None
-            await self._reload_session_for_process_change(chat)
-            chat.add_info("Active process: none")
-            return
         actions = {
             "clear_chat": self.action_clear_chat,
             "toggle_sidebar": self.action_toggle_sidebar,
@@ -11601,8 +11437,11 @@ class LoomApp(App):
             "tab_chat": self.action_tab_chat,
             "tab_files": self.action_tab_files,
             "tab_events": self.action_tab_events,
+            "open_auth_tab": self.action_open_auth_tab,
+            "open_mcp_tab": self.action_open_mcp_tab,
             "list_tools": self._show_tools,
             "model_info": self._show_model_info,
+            "models_info": self._show_models_info,
             "process_info": self._show_process_info,
             "process_list": self._show_process_list,
             "token_info": self._show_token_info,
@@ -11626,12 +11465,15 @@ class LoomApp(App):
 
     def _show_model_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)
-        name = self._model.name if self._model else "(not configured)"
-        chat.add_info(f"Model: {name}")
+        chat.add_info(self._render_active_model_info())
+
+    def _show_models_info(self) -> None:
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(self._render_models_catalog())
 
     def _show_process_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)
-        chat.add_info(f"Active process: {self._active_process_name()}")
+        chat.add_info(self._render_process_usage())
 
     def _show_process_list(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)

@@ -5,12 +5,21 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from loom.config import Config, MCPConfig, MCPServerConfig
-from loom.integrations.mcp_tools import _MCPStdioClient, register_mcp_tools
+import loom.integrations.mcp_tools as mcp_tools_module
+from loom.config import Config, MCPConfig, MCPOAuthConfig, MCPServerConfig
+from loom.integrations.mcp.oauth import MCPOAuthReadiness
+from loom.integrations.mcp_tools import (
+    MCPConnectionManager,
+    _MCPStdioClient,
+    register_mcp_tools,
+    runtime_connection_states,
+)
 from loom.mcp.config import apply_mcp_overrides
 from loom.tools import create_default_registry
 from loom.tools.registry import ToolRegistry
@@ -418,6 +427,27 @@ def test_registers_namespaced_mcp_tools(tmp_path):
     assert registry.has("mcp.demo.echo")
 
 
+def test_register_mcp_tools_skips_remote_servers_without_bridge_support(tmp_path):
+    cfg = Config(
+        mcp=MCPConfig(
+            servers={
+                "remote_demo": MCPServerConfig(
+                    type="remote",
+                    url="https://api.example.com/mcp",
+                    headers={"Authorization": "${TOKEN}"},
+                    enabled=True,
+                )
+            }
+        )
+    )
+    registry = ToolRegistry()
+
+    registered = register_mcp_tools(registry, mcp_config=cfg.mcp)
+
+    assert registered == []
+    assert registry.list_tools() == []
+
+
 def test_mcp_client_terminate_closes_pipes_for_exited_process() -> None:
     class _BrokenPipeStream:
         def __init__(self) -> None:
@@ -493,6 +523,40 @@ def test_mcp_client_send_request_reports_process_exit_context() -> None:
     assert "Broken pipe" not in text
     assert "exit code 1" in text
     assert "oauth required" in text
+
+
+def test_persistent_stdio_session_reuses_spawn_for_same_env(tmp_path, monkeypatch):
+    script = _write_fake_mcp_server(
+        tmp_path,
+        tools=[
+            {"name": "echo", "description": "Echo tool", "inputSchema": {"type": "object"}}
+        ],
+    )
+    client = _MCPStdioClient(
+        alias="demo",
+        server=MCPServerConfig(
+            command=sys.executable,
+            args=[str(script)],
+            timeout_seconds=20,
+        ),
+    )
+    spawn_calls = 0
+    original_spawn = client._spawn
+
+    def _wrapped_spawn(*, env_overrides=None):
+        nonlocal spawn_calls
+        spawn_calls += 1
+        return original_spawn(env_overrides=env_overrides)
+
+    monkeypatch.setattr(client, "_spawn", _wrapped_spawn)
+    client.list_tools()
+    client.call_tool("echo", {"text": "one"})
+    client.call_tool("echo", {"text": "two"})
+    assert spawn_calls == 1
+
+    client.call_tool("echo", {"text": "three"}, env_overrides={"MCP_TOKEN": "alt"})
+    assert spawn_calls == 2
+    client.close()
 
 
 @pytest.mark.asyncio
@@ -662,6 +726,167 @@ async def test_runtime_refresh_routes_mcp_auth_via_profile_binding(tmp_path):
     assert result.success
     assert "run-token:hello" in result.output
     assert not registry.has("mcp.demo.echo_env")
+
+
+def test_runtime_connection_states_exposed(tmp_path):
+    script = _write_fake_mcp_server(
+        tmp_path,
+        tools=[
+            {"name": "echo", "description": "Echo tool", "inputSchema": {"type": "object"}}
+        ],
+    )
+    cfg = _build_config(script)
+    registry = ToolRegistry()
+
+    register_mcp_tools(registry, mcp_config=cfg.mcp)
+    states = runtime_connection_states(registry)
+
+    assert states
+    demo = next(state for state in states if state.alias == "demo")
+    assert demo.status in {"configured", "healthy", "connecting", "error"}
+    synchronizer = getattr(registry, "_mcp_synchronizer", None)
+    close_fn = getattr(synchronizer, "close", None)
+    if callable(close_fn):
+        close_fn()
+
+
+def test_connection_manager_opens_circuit_after_repeated_failures(monkeypatch):
+    server = MCPServerConfig(command=sys.executable, args=["-m", "demo"])
+    manager = MCPConnectionManager(
+        mcp_config=MCPConfig(servers={"demo": server})
+    )
+
+    class _FailingClient:
+        def __init__(self, configured_server: MCPServerConfig) -> None:
+            self.server = configured_server
+            self.connected_pid = None
+
+        def list_tools(self, **_kwargs):
+            raise RuntimeError("dial failed")
+
+        def call_tool(self, *_args, **_kwargs):
+            raise RuntimeError("dial failed")
+
+    failing_client = _FailingClient(server)
+    monkeypatch.setattr(
+        manager,
+        "_client_for",
+        lambda alias, srv: failing_client,
+    )
+
+    for _ in range(5):
+        with pytest.raises(RuntimeError, match="dial failed"):
+            manager.list_tools(alias="demo", server=server)
+
+    with pytest.raises(RuntimeError, match="Circuit open"):
+        manager.list_tools(alias="demo", server=server)
+
+    state = manager.state_for(alias="demo", server=server)
+    assert state.circuit_state == "open"
+    assert state.status == "degraded"
+    assert "reconnect" in state.remediation.lower()
+
+
+def test_connection_manager_backpressure_guard(monkeypatch):
+    server = MCPServerConfig(command=sys.executable, args=["-m", "demo"])
+    manager = MCPConnectionManager(
+        mcp_config=MCPConfig(servers={"demo": server})
+    )
+
+    monkeypatch.setattr(mcp_tools_module, "_MCP_GLOBAL_MAX_IN_FLIGHT", 1)
+    monkeypatch.setattr(mcp_tools_module, "_MCP_PER_SERVER_MAX_IN_FLIGHT", 1)
+    monkeypatch.setattr(mcp_tools_module, "_MCP_PER_SERVER_MAX_QUEUE", 1)
+
+    started = threading.Event()
+    release = threading.Event()
+    worker_errors: list[Exception] = []
+
+    class _SlowClient:
+        def __init__(self, configured_server: MCPServerConfig) -> None:
+            self.server = configured_server
+            self.connected_pid = None
+
+        def list_tools(self, **_kwargs):
+            return []
+
+        def call_tool(self, *_args, **_kwargs):
+            started.set()
+            release.wait(timeout=2.0)
+            return {"content": [{"type": "text", "text": "ok"}]}, False
+
+    slow_client = _SlowClient(server)
+    monkeypatch.setattr(
+        manager,
+        "_client_for",
+        lambda alias, srv: slow_client,
+    )
+
+    def _invoke_worker() -> None:
+        try:
+            manager.call_tool(
+                alias="demo",
+                server=server,
+                name="echo",
+                arguments={"text": "hello"},
+            )
+        except Exception as e:  # pragma: no cover - assertion captures failures
+            worker_errors.append(e)
+
+    first = threading.Thread(target=_invoke_worker)
+    second = threading.Thread(target=_invoke_worker)
+    first.start()
+    assert started.wait(timeout=1.0), "first worker never entered MCP call"
+    second.start()
+
+    for _ in range(100):
+        state = manager.state_for(alias="demo", server=server)
+        if state.queue_depth >= 1:
+            break
+        time.sleep(0.01)
+
+    with pytest.raises(RuntimeError, match="backpressure"):
+        manager.call_tool(
+            alias="demo",
+            server=server,
+            name="echo",
+            arguments={"text": "overflow"},
+        )
+
+    release.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+    assert first.is_alive() is False
+    assert second.is_alive() is False
+    assert worker_errors == []
+
+
+def test_connection_manager_redacts_oauth_failure_reason(monkeypatch):
+    server = MCPServerConfig(
+        type="remote",
+        url="https://api.example.com/mcp",
+        oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+    )
+    manager = MCPConnectionManager(
+        mcp_config=MCPConfig(servers={"demo": server})
+    )
+
+    monkeypatch.setattr(
+        mcp_tools_module,
+        "ensure_mcp_oauth_ready",
+        lambda _alias: MCPOAuthReadiness(
+            ready=False,
+            state="needs_auth",
+            reason="refresh_token=secret Authorization=Bearer abc123",
+        ),
+    )
+
+    ready = manager._remote_oauth_ready("demo", server)  # noqa: SLF001
+    assert ready is False
+    state = manager.state_for(alias="demo", server=server)
+    assert state.status == "needs_auth"
+    assert "secret" not in state.last_error
+    assert "abc123" not in state.last_error
+    assert "<redacted>" in state.last_error
 
 
 @pytest.mark.asyncio

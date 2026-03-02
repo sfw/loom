@@ -84,11 +84,12 @@ uv sync          # or: pip install -e .
 # Launch — the setup wizard runs automatically on first start
 uv run loom -w /path/to/workspace
 
-# With a process definition
-uv run loom -w /path/to/workspace --process consulting-engagement
+# With a process definition (explicit run command)
+uv run loom -w /path/to/workspace
+# /consulting-engagement Analyze client onboarding flow
 
 # Force process orchestration from inside the TUI (no uv run loom serve required)
-# /process use investment-analysis
+# /processes                     # process catalog
 # /run Analyze Tesla for investment
 # /run problem.md            # load goal from workspace file
 # /run @problem.md prioritize parser issues
@@ -165,6 +166,16 @@ Configured MCP servers are auto-discovered at startup and registered as namespac
 When a run has an auth context, MCP discovery is scoped to that run's selected
 profiles; auth-scoped MCP tools are not leaked into the global registry view
 used by other concurrent runs.
+For OAuth-enabled remote aliases, use browser-first login:
+
+```bash
+uv run loom mcp auth login <alias>
+```
+
+Use `--manual-token --access-token ...` only as a headless fallback.
+MCP OAuth alias tokens are stored separately in `~/.loom/mcp_oauth_tokens.json`.
+This store is intentionally separate from `/auth` profile token refs in
+`~/.loom/auth.toml`.
 `delegate_task` (used by `/run`) defaults to a 3600s timeout. Configure this in
 `loom.toml` under `[execution].delegate_task_timeout_seconds`; env override
 `LOOM_DELEGATE_TIMEOUT_SECONDS` still applies when set.
@@ -245,7 +256,8 @@ A process definition injects a persona, phase blueprint, verification/remediatio
 
 ```bash
 uv run loom processes                              # list available
-uv run loom -w /tmp/acme --process consulting-engagement
+uv run loom -w /tmp/acme
+# /consulting-engagement Draft a Q2 market strategy
 uv run loom install user/repo                      # install from GitHub
 uv run loom install user/repo --isolated-deps      # per-process dependency env
 uv run loom process test consulting-engagement     # run process test cases
@@ -281,7 +293,7 @@ In the TUI, use `/learned` to open an interactive review screen for learned beha
 
 ## Interfaces
 
-- **Interactive TUI** (`uv run loom`) -- rich terminal interface with chat panel, sidebar, diff viewer, tool approval modals, event log, and setup wizard. Includes session persistence/recall, task delegation, process controls (`/process list|use|off`), in-process orchestration (`/run <goal|@goal-file [goal]|close [run-id-prefix]>`), direct process commands (`/<process-name> <goal>`), learned-pattern review (`/learned`), MCP config controls (`/mcp ...`), auth profile controls (`/auth ...`), and click-to-open workspace previews for Markdown/code/JSON/CSV/HTML/diff/Office/PDF/images. `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `uv run loom serve`; `/run problem.md` and `/run @problem.md optional-goal` load file content into planning context.
+- **Interactive TUI** (`uv run loom`) -- rich terminal interface with chat panel, sidebar, diff viewer, tool approval modals, event log, and setup wizard. Includes session persistence/recall, task delegation, process discovery (`/processes`), in-process orchestration (`/run <goal|@goal-file [goal]|close [run-id-prefix]>`), direct process commands (`/<process-name> <goal>`), learned-pattern review (`/learned`), MCP config controls (`/mcp ...`), auth profile controls (`/auth ...`), and click-to-open workspace previews for Markdown/code/JSON/CSV/HTML/diff/Office/PDF/images. `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `uv run loom serve`; `/run problem.md` and `/run @problem.md optional-goal` load file content into planning context.
 - **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
@@ -312,7 +324,6 @@ Common flags for `uv run loom` / `uv run loom cowork`:
 - `--mcp-config /path/to/mcp.toml` -- explicit MCP config layer
 - `-m model` -- explicit cowork model override from config (can bypass role routing)
 - `--resume <id>` -- resume a previous session
-- `--process <name>` -- load a process definition
 
 Role routing note:
 - Orchestrator and verifier paths route by role (`planner`, `executor`, `extractor`, `verifier`, `compactor`).

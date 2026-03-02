@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from loom.config import Config, MemoryConfig, WorkspaceConfig, load_config
+import pytest
+
+from loom.config import Config, ConfigError, MemoryConfig, WorkspaceConfig, load_config
 
 
 class TestDefaultConfig:
@@ -485,6 +487,55 @@ NOTION_TOKEN = "secret-token"
         assert server.timeout_seconds == 45
         assert server.enabled is True
         assert server.env["NOTION_TOKEN"] == "secret-token"
+
+    def test_load_remote_mcp_server_config(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[mcp.servers.notion_remote]
+type = "remote"
+url = "https://mcp.notion.com/mcp"
+timeout_seconds = 25
+enabled = true
+
+[mcp.servers.notion_remote.headers]
+Authorization = "${NOTION_TOKEN}"
+X-Team = "analytics"
+
+[mcp.servers.notion_remote.oauth]
+enabled = true
+scopes = ["read:content", "write:content"]
+""")
+        config = load_config(toml_file)
+        server = config.mcp.servers["notion_remote"]
+        assert server.type == "remote"
+        assert server.url == "https://mcp.notion.com/mcp"
+        assert server.timeout_seconds == 25
+        assert server.headers["Authorization"] == "${NOTION_TOKEN}"
+        assert server.headers["X-Team"] == "analytics"
+        assert server.oauth.enabled is True
+        assert server.oauth.scopes == ["read:content", "write:content"]
+
+    def test_load_remote_mcp_server_rejects_insecure_http_by_default(
+        self,
+        tmp_path: Path,
+    ):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[mcp.servers.remote]
+type = "remote"
+url = "http://example.com/mcp"
+""")
+        with pytest.raises(ConfigError):
+            load_config(toml_file)
+
+    def test_load_mcp_oauth_browser_login_flag(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[mcp]
+oauth_browser_login = false
+""")
+        config = load_config(toml_file)
+        assert config.mcp.oauth_browser_login is False
 
     def test_load_limits_sections(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

@@ -41,6 +41,7 @@ from loom.models.request_diagnostics import (
 )
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
+from loom.processes.phase_alignment import infer_phase_id_for_subtask
 from loom.prompts.assembler import PromptAssembler
 from loom.state.task_state import Subtask
 from loom.utils.concurrency import run_blocking_io
@@ -446,6 +447,10 @@ class DeterministicVerifier:
         if not deliverables:
             return []
 
+        phase_hint = str(getattr(subtask, "phase_id", "") or "").strip()
+        if phase_hint in deliverables:
+            return deliverables[phase_hint]
+
         # Strict phase-mode subtasks use phase IDs directly; enforce only the
         # matching phase's deliverables to avoid cross-phase false negatives.
         if subtask.id in deliverables:
@@ -455,6 +460,28 @@ class DeterministicVerifier:
         # planner subtask ID may not match the declared phase ID exactly.
         if len(deliverables) == 1:
             return next(iter(deliverables.values()))
+
+        phase_descriptions: dict[str, str] = {}
+        process = self._process
+        for phase in getattr(process, "phases", []):
+            phase_id = str(getattr(phase, "id", "")).strip()
+            if not phase_id:
+                continue
+            phase_descriptions[phase_id] = str(
+                getattr(phase, "description", ""),
+            ).strip()
+        phase_id = infer_phase_id_for_subtask(
+            subtask_id=subtask.id,
+            text=" ".join([
+                str(getattr(subtask, "description", "")).strip(),
+                str(getattr(subtask, "acceptance_criteria", "")).strip(),
+            ]).strip(),
+            phase_ids=list(deliverables.keys()),
+            phase_descriptions=phase_descriptions,
+            phase_deliverables=deliverables,
+        )
+        if phase_id in deliverables:
+            return deliverables[phase_id]
 
         return []
 
@@ -2795,6 +2822,13 @@ class VerificationGates:
         deliverables = process.get_deliverables()
         if not deliverables:
             return []
+        phase_hint = str(getattr(subtask, "phase_id", "") or "").strip()
+        if phase_hint in deliverables:
+            return [
+                str(item).strip()
+                for item in deliverables[phase_hint]
+                if str(item).strip()
+            ]
         if subtask.id in deliverables:
             return [
                 str(item).strip()
@@ -2805,6 +2839,30 @@ class VerificationGates:
             return [
                 str(item).strip()
                 for item in next(iter(deliverables.values()))
+                if str(item).strip()
+            ]
+        phase_descriptions: dict[str, str] = {}
+        for phase in getattr(process, "phases", []):
+            phase_id = str(getattr(phase, "id", "")).strip()
+            if not phase_id:
+                continue
+            phase_descriptions[phase_id] = str(
+                getattr(phase, "description", ""),
+            ).strip()
+        phase_id = infer_phase_id_for_subtask(
+            subtask_id=subtask.id,
+            text=" ".join([
+                str(getattr(subtask, "description", "")).strip(),
+                str(getattr(subtask, "acceptance_criteria", "")).strip(),
+            ]).strip(),
+            phase_ids=list(deliverables.keys()),
+            phase_descriptions=phase_descriptions,
+            phase_deliverables=deliverables,
+        )
+        if phase_id in deliverables:
+            return [
+                str(item).strip()
+                for item in deliverables[phase_id]
                 if str(item).strip()
             ]
         return []

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import partial
 
-from textual.command import Hit, Hits, Provider
+from textual.command import DiscoveryHit, Hit, Hits, Provider
 
 _COMMANDS = [
     ("Run setup wizard", "setup", "Open the setup flow"),
@@ -20,6 +20,7 @@ _COMMANDS = [
     ("Switch to Events tab", "tab_events", "Focus the Events tab"),
     ("List tools", "list_tools", "Show all available tools"),
     ("Show model info", "model_info", "Display model details"),
+    ("Show models catalog", "models_info", "Display configured model details"),
     ("Show session info", "session_info", "Display current session details"),
     ("Start new session", "new_session", "Create a fresh session"),
     ("List recent sessions", "sessions_list", "Show recent sessions"),
@@ -27,20 +28,12 @@ _COMMANDS = [
     ("List MCP servers", "mcp_list", "Show configured MCP servers"),
     ("Manage MCP servers…", "mcp_manage", "Open MCP manager screen"),
     ("Add MCP server…", "mcp_add_prompt", "Prefill /mcp add command template"),
-    ("List auth profiles", "auth_list", "Show configured auth profiles"),
     ("Manage auth profiles…", "auth_manage", "Open auth manager screen"),
-    ("Add auth profile…", "auth_add_prompt", "Prefill /auth add command template"),
     ("Show learned patterns", "learned_patterns", "Open learned pattern manager"),
-    ("Show process info", "process_info", "Display active process"),
+    ("Show process modes", "process_info", "Show ad hoc vs explicit process modes"),
     ("List processes", "process_list", "Show available process definitions"),
-    (
-        "Use process…",
-        "process_use_prompt",
-        "Prefill /process use for process autocomplete",
-    ),
-    ("Disable process", "process_off", "Disable active process"),
-    ("Run process goal…", "run_prompt", "Prefill /run for active process"),
-    ("Close process run tab", "close_process_tab", "Close current process run tab"),
+    ("Run ad hoc goal…", "run_prompt", "Prefill /run for ad hoc process execution"),
+    ("Close tab", "close_process_tab", "Close current tab"),
     ("Show token usage", "token_info", "Display session token count"),
     ("Show help", "help", "List commands and keyboard shortcuts"),
     ("Quit", "quit", "Save session and exit"),
@@ -49,6 +42,18 @@ _COMMANDS = [
 
 class LoomCommands(Provider):
     """Custom commands for the Ctrl+P command palette."""
+
+    def _palette_entries(self) -> list[tuple[str, str, str]]:
+        """Return built-in + dynamic command palette entries."""
+        entries: list[tuple[str, str, str]] = list(_COMMANDS)
+        dynamic_getter = getattr(
+            self.app,
+            "iter_dynamic_process_palette_entries",
+            None,
+        )
+        if callable(dynamic_getter):
+            entries.extend(dynamic_getter())
+        return entries
 
     async def search(self, query: str) -> Hits:
         matcher = self.matcher(query)
@@ -82,3 +87,19 @@ class LoomCommands(Provider):
                     ),
                     help=help_text,
                 )
+
+    async def discover(self) -> Hits:
+        """Return full sorted palette list when opened with empty query."""
+        for label, action, help_text in sorted(
+            self._palette_entries(),
+            key=lambda item: item[0].casefold(),
+        ):
+            yield DiscoveryHit(
+                display=label,
+                text=label,
+                command=partial(
+                    self.app.run_action,
+                    f"loom_command('{action}')",
+                ),
+                help=help_text,
+            )

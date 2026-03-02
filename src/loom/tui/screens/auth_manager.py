@@ -1,8 +1,9 @@
-"""Auth profile management modal."""
+"""Auth profile management UI."""
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import replace
 
 from textual import events, on
@@ -134,8 +135,8 @@ class ConfirmProfileSwitchScreen(ModalScreen[str]):
             event.prevent_default()
 
 
-class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
-    """Modal form for auth profile add/edit/remove."""
+class AuthManagerScreen(Vertical):
+    """Auth profile add/edit/remove widget."""
 
     _NO_TARGET_VALUE = "__none__"
     _NO_MODE_VALUE = "__mode_unset__"
@@ -148,8 +149,9 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
     )
 
     BINDINGS = [
-        Binding("escape", "close", "Close"),
+        Binding("escape", "request_close", "Close"),
         Binding("ctrl+r", "refresh", "Refresh"),
+        Binding("ctrl+w", "request_close", "Close Tab", show=False, priority=True),
     ]
 
     _FORM_FIELD_IDS = (
@@ -167,11 +169,20 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         "auth-meta",
     )
 
-    CSS = """
+    DEFAULT_CSS = """
     AuthManagerScreen {
+        width: 1fr;
+        height: 1fr;
+        layout: vertical;
+    }
+    AuthManagerScreen.modal-mode {
         align: center middle;
     }
-    #auth-manager-dialog {
+    AuthManagerScreen.embedded-mode {
+        align: left top;
+        padding: 0;
+    }
+    AuthManagerScreen.modal-mode #auth-manager-dialog {
         width: 100;
         height: 90%;
         max-height: 46;
@@ -180,34 +191,57 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         background: $surface;
         overflow: hidden;
     }
+    AuthManagerScreen.embedded-mode #auth-manager-dialog {
+        width: 100%;
+        height: 1fr;
+        max-height: 100%;
+        border: none;
+        padding: 0 1;
+    }
+    #auth-manager-dialog {
+        width: 100%;
+        height: 1fr;
+        border: none;
+        padding: 0 1;
+        background: $surface;
+    }
     #auth-manager-title {
         text-style: bold;
-        margin-bottom: 1;
+        margin-bottom: 0;
     }
     #auth-manager-form {
         height: 1fr;
         overflow-y: auto;
-        margin-bottom: 1;
+        margin-bottom: 0;
     }
     #auth-manager-context {
         color: $text-muted;
+        margin-top: 0;
+        margin-bottom: 0;
+    }
+    #auth-summary-help {
         margin-bottom: 1;
     }
     #auth-manager-summary {
-        height: 12;
-        max-height: 14;
-        margin-bottom: 1;
+        height: 6;
+        max-height: 7;
+        margin-bottom: 0;
+        border: round $surface-lighten-1;
     }
     #auth-manager-advanced {
         margin-top: 1;
     }
     .auth-label {
-        margin-top: 1;
+        margin-top: 0;
     }
     .auth-help {
         color: $text-muted;
         margin-top: 0;
-        margin-bottom: 1;
+        margin-bottom: 0;
+        width: 1fr;
+        height: auto;
+        text-wrap: wrap;
+        overflow-x: hidden;
     }
     .auth-input {
         margin-top: 0;
@@ -216,18 +250,32 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         margin-top: 0;
     }
     .auth-checkbox {
+        margin-top: 0;
+    }
+    #auth-actions-primary {
         margin-top: 1;
+    }
+    #auth-actions-secondary {
+        margin-top: 0;
+        margin-bottom: 1;
     }
     .auth-actions-row {
         height: auto;
-        margin-top: 1;
+        margin-top: 0;
     }
     .auth-actions-row Button {
-        margin-right: 1;
+        margin-right: 0;
+        min-width: 0;
+        width: 1fr;
+        padding: 0;
     }
     #auth-manager-footer {
-        margin-top: 1;
+        margin-top: 0;
         color: $text-muted;
+        width: 1fr;
+        height: auto;
+        text-wrap: wrap;
+        overflow-x: hidden;
     }
     """
 
@@ -238,12 +286,16 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         explicit_auth_path=None,
         mcp_manager: MCPConfigManager | None = None,
         process_def: object | None = None,
+        process_defs: list[object] | tuple[object, ...] | None = None,
         tool_registry=None,
+        embedded: bool = False,
+        on_close: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         super().__init__()
         self._workspace = workspace
         self._explicit_auth_path = explicit_auth_path
         self._process_def = process_def
+        self._process_defs = [item for item in (process_defs or []) if item is not None]
         self._tool_registry = tool_registry
         self._mcp_manager = mcp_manager or MCPConfigManager(
             config=None,
@@ -258,10 +310,17 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         self._resource_binding_by_profile: dict[str, str] = {}
         self._active_profile_id = ""
         self._active_provider = ""
+        self._discovery_process_names: list[str] = []
         self._baseline_form_state: dict[str, str] = {}
         self._form_dirty = False
         self._suppress_dirty_tracking = False
         self._changed = False
+        self._embedded = bool(embedded)
+        self._on_close = on_close
+        if self._embedded:
+            self.add_class("embedded-mode")
+        else:
+            self.add_class("modal-mode")
 
     def compose(self) -> ComposeResult:
         with Vertical(id="auth-manager-dialog"):
@@ -269,25 +328,34 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                 "[bold #7dcfff]Auth Profile Manager[/bold #7dcfff]",
                 id="auth-manager-title",
             )
+            with Horizontal(classes="auth-actions-row", id="auth-actions-primary"):
+                yield Button("Refresh", id="auth-btn-refresh")
+                yield Button("Load", id="auth-btn-load")
+                yield Button("Save", id="auth-btn-save", variant="primary")
+                yield Button("Duplicate", id="auth-btn-duplicate")
+                yield Button("Close", id="auth-btn-close")
+            with Horizontal(classes="auth-actions-row", id="auth-actions-secondary"):
+                yield Button("Rebind", id="auth-btn-rebind")
+                yield Button("Archive", id="auth-btn-archive")
+                yield Button("Remove", id="auth-btn-remove", variant="error")
+            yield Static("", id="auth-manager-context")
+            summary_table = DataTable(id="auth-manager-summary")
+            summary_table.cursor_type = "row"
+            summary_table.zebra_stripes = True
+            summary_table.add_columns(
+                "Profile ID",
+                "Target Resource",
+                "Provider",
+                "Mode",
+                "Account Label",
+            )
+            yield summary_table
+            yield Label(
+                "Select a profile row to load it below for editing.",
+                classes="auth-help",
+                id="auth-summary-help",
+            )
             with VerticalScroll(id="auth-manager-form"):
-                yield Static("", id="auth-manager-context")
-
-                summary_table = DataTable(id="auth-manager-summary")
-                summary_table.cursor_type = "row"
-                summary_table.zebra_stripes = True
-                summary_table.add_columns(
-                    "Profile ID",
-                    "Target Resource",
-                    "Provider",
-                    "Mode",
-                    "Account Label",
-                )
-                yield summary_table
-                yield Label(
-                    "Select a profile row to load it below for editing.",
-                    classes="auth-help",
-                )
-
                 yield Label("Profile ID", classes="auth-label")
                 yield Input(
                     id="auth-profile-id",
@@ -330,8 +398,8 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                     value=False,
                 )
                 yield Label(
-                    "When enabled, /run and /process use this profile by default "
-                    "for the provider in this workspace.",
+                    "When enabled, this profile is used by default for\n"
+                    "this provider in this workspace.",
                     classes="auth-help",
                 )
                 yield Label("Account Label", classes="auth-label")
@@ -358,7 +426,8 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                     classes="auth-input",
                 )
                 yield Label(
-                    "Optional token storage reference for refresh/access tokens.",
+                    "Optional token storage reference for /auth OAuth tokens. "
+                    "Do not point this at MCP alias token store files.",
                     classes="auth-help",
                 )
                 with Collapsible(
@@ -411,24 +480,8 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                         "Optional non-secret tags (team, environment, purpose).",
                         classes="auth-help",
                     )
-
-            with Horizontal(classes="auth-actions-row", id="auth-actions-primary"):
-                yield Button("Refresh", id="auth-btn-refresh")
-                yield Button("Load Profile", id="auth-btn-load")
-                yield Button("Save/Add", id="auth-btn-save", variant="primary")
-                yield Button("Duplicate", id="auth-btn-duplicate")
-                yield Button("Close", id="auth-btn-close")
-            with Horizontal(classes="auth-actions-row", id="auth-actions-secondary"):
-                yield Button("Rebind", id="auth-btn-rebind")
-                yield Button("Archive", id="auth-btn-archive")
-                yield Button("Remove", id="auth-btn-remove", variant="error")
-
             yield Label(
-                "[dim]Profile list and missing draft profiles load automatically on open. "
-                "Select a row to edit it. Save/Add upserts a profile and keeps resource "
-                "bindings/defaults in sync. Duplicate/Rebind/Archive are explicit lifecycle "
-                "actions. Open Advanced for optional "
-                "scopes/env/command/check/metadata fields.[/dim]",
+                "[dim]Load a row to edit, then Save to upsert profile and bindings.[/dim]",
                 id="auth-manager-footer",
             )
 
@@ -453,8 +506,24 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         await self._refresh_summary()
         self.query_one("#auth-profile-id", Input).focus()
 
+    def on_key(self, event: events.Key) -> None:
+        if event.key.lower() != "ctrl+w":
+            return
+        self.run_worker(
+            self.action_request_close(),
+            group="auth-manager-close-request",
+            exclusive=True,
+        )
+        event.stop()
+        event.prevent_default()
+
     def action_close(self) -> None:
-        self.dismiss({"changed": self._changed})
+        result = {"changed": self._changed}
+        if callable(self._on_close):
+            self._on_close(result)
+
+    async def action_request_close(self) -> None:
+        await self._request_close()
 
     async def action_refresh(self) -> None:
         await self._sync_missing_drafts()
@@ -464,13 +533,14 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
         if button_id == "auth-btn-close":
-            self.action_close()
+            await self.action_request_close()
             return
         if button_id == "auth-btn-refresh":
             await self._refresh_summary()
             return
         if button_id == "auth-btn-load":
-            await self._request_profile_switch(self._profile_id())
+            selected = self._selected_summary_profile_id()
+            await self._request_profile_switch(selected or self._profile_id())
             return
         if button_id == "auth-btn-save":
             await self._save_profile()
@@ -497,6 +567,8 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
     @on(Select.Changed)
     def _on_form_select_changed(self, event: Select.Changed) -> None:
         if event.select.id not in self._FORM_FIELD_IDS:
+            return
+        if self._suppress_dirty_tracking:
             return
         if event.select.id == "auth-resource-target":
             self._sync_provider_display()
@@ -624,8 +696,13 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
     def _refresh_mode_select(self, *, include_mode: str = "") -> None:
         select = self.query_one("#auth-mode", Select)
         current_mode = self._decode_mode_value(select.value)
-        options = self._mode_options(include_mode=include_mode or current_mode)
+        target_mode = str(include_mode or current_mode).strip().lower()
+        options = self._mode_options(include_mode=target_mode)
         select.set_options(options)
+        if target_mode:
+            encoded = self._encode_mode_value(target_mode)
+            if select.value != encoded:
+                select.value = encoded
 
     def _set_mode_select_value(self, mode: str) -> None:
         clean = str(mode or "").strip().lower()
@@ -677,19 +754,31 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
             provider = "-"
         self.query_one("#auth-provider-derived", Static).update(provider)
 
+    def _discovery_scope_text(self) -> str:
+        count = len(self._discovery_process_names)
+        if count > 0:
+            return (
+                "discovery scope: "
+                f"all workspace processes ({count}) + allowed tool auth + active MCP aliases"
+            )
+        return (
+            "discovery scope: "
+            "no process contracts loaded (uses loaded tool auth + active MCP aliases)"
+        )
+
+    @staticmethod
+    def _compact_path(value: object, *, max_chars: int = 52) -> str:
+        raw = str(value or "-")
+        if len(raw) <= max_chars:
+            return raw
+        return f"...{raw[-(max_chars - 3):]}"
+
     def _resource_id_for_profile(self, profile: AuthProfile) -> str:
         profile_id = str(getattr(profile, "profile_id", "")).strip()
         if profile_id:
             bound = self._resource_binding_by_profile.get(profile_id)
             if bound:
                 return bound
-        mcp_alias = str(getattr(profile, "mcp_server", "")).strip()
-        if mcp_alias:
-            for resource_id, resource in self._resources_by_id.items():
-                if str(getattr(resource, "resource_kind", "")) != "mcp":
-                    continue
-                if str(getattr(resource, "resource_key", "")) == mcp_alias:
-                    return resource_id
         return ""
 
     def _is_workspace_default(
@@ -729,10 +818,10 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         try:
             self.query_one("#auth-profile-id", Input).value = profile_id
             self._active_provider = str(provider or "").strip()
-            self._set_mode_select_value(mode)
             self.query_one("#auth-default-provider", Checkbox).value = bool(set_default)
             self.query_one("#auth-label", Input).value = label
             self._set_mcp_server_select_value(resource_id)
+            self._set_mode_select_value(mode)
             self.query_one("#auth-secret-ref", Input).value = secret_ref
             self.query_one("#auth-token-ref", Input).value = token_ref
             self.query_one("#auth-scopes", Input).value = scopes
@@ -775,6 +864,7 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                 workspace=self._workspace,
                 explicit_auth_path=self._explicit_auth_path,
                 process_def=self._process_def,
+                process_defs=self._process_defs,
                 tool_registry=registry,
                 mcp_manager=self._mcp_manager,
                 scope="active",
@@ -837,15 +927,22 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
             self._resource_binding_by_profile = {}
             self.notify(f"Auth resources unavailable: {e}", severity="warning")
 
+        process_names = sorted(
+            {
+                str(getattr(item, "name", "")).strip()
+                for item in self._process_defs
+                if str(getattr(item, "name", "")).strip()
+            }
+        )
+        self._discovery_process_names = process_names
         self._profiles = dict(merged.config.profiles)
         self._workspace_defaults = dict(merged.workspace_defaults)
-        context_lines = [
-            f"user: {merged.user_path}",
-            f"explicit: {merged.explicit_path or '-'}",
-            f"workspace defaults: {merged.workspace_defaults_path or '-'}",
-            f"resource registry: {resources_path}",
-        ]
-        self.query_one("#auth-manager-context", Static).update("\n".join(context_lines))
+        source_label = "explicit" if merged.explicit_path else "user"
+        context_text = (
+            f"profiles={len(self._profiles)} source={source_label} "
+            f"discovery={len(process_names)} process(es), {len(self._mcp_aliases)} mcp alias(es)"
+        )
+        self.query_one("#auth-manager-context", Static).update(context_text)
         current_alias = self._selected_resource_id()
         self._suppress_dirty_tracking = True
         try:
@@ -870,6 +967,10 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
                     f"{getattr(resource, 'resource_kind', '?')}:"
                     f"{getattr(resource, 'resource_key', '?')}"
                 )
+            else:
+                mcp_alias = str(getattr(profile, "mcp_server", "")).strip()
+                if mcp_alias:
+                    resource_label = f"Unbound (mcp:{mcp_alias})"
             table.add_row(
                 profile.profile_id,
                 resource_label,
@@ -902,6 +1003,13 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
 
     def _profile_id(self) -> str:
         return self.query_one("#auth-profile-id", Input).value.strip()
+
+    def _selected_summary_profile_id(self) -> str:
+        table = self.query_one("#auth-manager-summary", DataTable)
+        row_index = int(getattr(table, "cursor_row", -1))
+        if 0 <= row_index < len(self._profile_ids):
+            return self._profile_ids[row_index]
+        return ""
 
     @staticmethod
     def _parse_kv_pairs(values: list[str], *, env_keys: bool = False) -> dict[str, str]:
@@ -969,6 +1077,37 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
 
         if decision == "save":
             self.notify(f"Saved changes and loaded profile: {target_profile_id}")
+
+    async def _request_close(self) -> None:
+        if not self._form_dirty:
+            self.action_close()
+            return
+        current_profile_id = self._active_profile_id or self._profile_id() or "(new profile)"
+        self.app.push_screen(
+            ConfirmProfileSwitchScreen(
+                current_profile_id=current_profile_id,
+                target_profile_id="close tab",
+            ),
+            callback=lambda decision: self._on_close_decision(
+                str(decision or "cancel").lower(),
+            ),
+        )
+
+    def _on_close_decision(self, decision: str) -> None:
+        self.run_worker(
+            self._complete_close(decision),
+            group="auth-manager-close",
+            exclusive=True,
+        )
+
+    async def _complete_close(self, decision: str) -> None:
+        if decision == "save":
+            saved = await self._save_profile(notify_success=False)
+            if not saved:
+                return
+        elif decision != "discard":
+            return
+        self.action_close()
 
     async def _load_profile_into_form(self, profile_id: str | None = None) -> bool:
         raw_profile_id = str(profile_id or self._profile_id()).strip()
@@ -1450,3 +1589,46 @@ class AuthManagerScreen(ModalScreen[dict[str, object] | None]):
         if profile_id == self._active_profile_id:
             self._set_blank_form()
         self.notify(f"Removed profile: {profile_id}")
+
+
+class AuthManagerModalScreen(ModalScreen[dict[str, object] | None]):
+    """Modal wrapper hosting the auth manager widget."""
+
+    DEFAULT_CSS = """
+    AuthManagerModalScreen {
+        align: center middle;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        workspace,
+        explicit_auth_path=None,
+        mcp_manager: MCPConfigManager | None = None,
+        process_def: object | None = None,
+        process_defs: list[object] | tuple[object, ...] | None = None,
+        tool_registry=None,
+    ) -> None:
+        super().__init__()
+        self._workspace = workspace
+        self._explicit_auth_path = explicit_auth_path
+        self._mcp_manager = mcp_manager
+        self._process_def = process_def
+        self._process_defs = process_defs
+        self._tool_registry = tool_registry
+
+    def compose(self) -> ComposeResult:
+        yield AuthManagerScreen(
+            workspace=self._workspace,
+            explicit_auth_path=self._explicit_auth_path,
+            mcp_manager=self._mcp_manager,
+            process_def=self._process_def,
+            process_defs=self._process_defs,
+            tool_registry=self._tool_registry,
+            embedded=False,
+            on_close=self._handle_close,
+        )
+
+    def _handle_close(self, result: dict[str, object]) -> None:
+        self.dismiss(result)

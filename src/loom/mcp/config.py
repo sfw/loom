@@ -9,7 +9,20 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from loom.config import Config, ConfigError, MCPConfig, MCPServerConfig
+from loom.config import (
+    MCP_DEFAULT_TIMEOUT_SECONDS,
+    MCP_SERVER_TYPE_LOCAL,
+    MCP_SERVER_TYPE_REMOTE,
+    MCP_SERVER_TYPES,
+    Config,
+    ConfigError,
+    MCPConfig,
+    MCPOAuthConfig,
+    MCPServerConfig,
+    normalize_mcp_server_type,
+    normalize_mcp_timeout_seconds,
+    validate_mcp_remote_url,
+)
 
 
 class MCPConfigManagerError(Exception):
@@ -55,11 +68,37 @@ def default_workspace_mcp_path(workspace: Path) -> Path:
 
 
 def _parse_timeout(value: object) -> int:
-    try:
-        timeout = int(value)
-    except (TypeError, ValueError):
-        timeout = 30
-    return timeout if timeout > 0 else 30
+    return normalize_mcp_timeout_seconds(
+        value,
+        default=MCP_DEFAULT_TIMEOUT_SECONDS,
+    )
+
+
+def _parse_str_map(raw: object) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    if not isinstance(raw, dict):
+        return parsed
+    for key, value in raw.items():
+        if isinstance(key, str):
+            parsed[key] = str(value)
+    return parsed
+
+
+def _parse_oauth(raw: object) -> MCPOAuthConfig:
+    if not isinstance(raw, dict):
+        return MCPOAuthConfig()
+    raw_scopes = raw.get("scopes", [])
+    scopes: list[str] = []
+    if isinstance(raw_scopes, list):
+        scopes = [
+            str(scope).strip()
+            for scope in raw_scopes
+            if str(scope).strip()
+        ]
+    return MCPOAuthConfig(
+        enabled=bool(raw.get("enabled", False)),
+        scopes=scopes,
+    )
 
 
 def _parse_servers(raw: object) -> dict[str, MCPServerConfig]:
@@ -73,19 +112,58 @@ def _parse_servers(raw: object) -> dict[str, MCPServerConfig]:
         raw_args = server_raw.get("args", [])
         args = [str(v) for v in raw_args] if isinstance(raw_args, list) else []
 
-        raw_env = server_raw.get("env", {})
-        env: dict[str, str] = {}
-        if isinstance(raw_env, dict):
-            for key, value in raw_env.items():
-                if isinstance(key, str):
-                    env[key] = str(value)
+        raw_type = server_raw.get("type", MCP_SERVER_TYPE_LOCAL)
+        server_type = normalize_mcp_server_type(raw_type)
+        if (
+            isinstance(raw_type, str)
+            and raw_type.strip()
+            and raw_type.strip().lower() not in MCP_SERVER_TYPES
+        ):
+            raise MCPConfigManagerError(
+                f"Invalid MCP server type for {alias!r}: {raw_type!r}. "
+                f"Expected one of {sorted(MCP_SERVER_TYPES)}."
+            )
+
+        env = _parse_str_map(server_raw.get("env", {}))
+        headers = _parse_str_map(server_raw.get("headers", {}))
+        oauth = _parse_oauth(server_raw.get("oauth", {}))
+        allow_insecure_http = bool(server_raw.get("allow_insecure_http", False))
+        allow_private_network = bool(server_raw.get("allow_private_network", False))
+
+        command = str(server_raw.get("command", "")).strip()
+        url = str(server_raw.get("url", "")).strip()
+        if server_type == MCP_SERVER_TYPE_LOCAL:
+            if not command:
+                raise MCPConfigManagerError(
+                    f"MCP server {alias!r} requires non-empty command for type=local."
+                )
+        elif server_type == MCP_SERVER_TYPE_REMOTE:
+            try:
+                url = validate_mcp_remote_url(
+                    url,
+                    allow_insecure_http=allow_insecure_http,
+                    allow_private_network=allow_private_network,
+                )
+            except ConfigError as e:
+                raise MCPConfigManagerError(
+                    f"Invalid remote MCP server {alias!r}: {e}"
+                ) from e
 
         servers[alias] = MCPServerConfig(
-            command=str(server_raw.get("command", "")),
+            type=server_type,
+            command=command,
             args=args,
             env=env,
+            url=url,
+            fallback_sse_url=str(server_raw.get("fallback_sse_url", "")).strip(),
+            headers=headers,
+            oauth=oauth,
+            allow_insecure_http=allow_insecure_http,
+            allow_private_network=allow_private_network,
             cwd=str(server_raw.get("cwd", "")),
-            timeout_seconds=_parse_timeout(server_raw.get("timeout_seconds", 30)),
+            timeout_seconds=_parse_timeout(
+                server_raw.get("timeout_seconds", MCP_DEFAULT_TIMEOUT_SECONDS),
+            ),
             enabled=bool(server_raw.get("enabled", True)),
         )
     return servers
@@ -139,7 +217,10 @@ def _merge_layers(
                 source=source_name,
                 source_path=source_path,
             )
-    return MCPConfig(servers=merged), sources
+    return MCPConfig(
+        servers=merged,
+        oauth_browser_login=bool(getattr(legacy, "oauth_browser_login", True)),
+    ), sources
 
 
 def _detect_legacy_path(
@@ -211,14 +292,25 @@ def apply_mcp_overrides(
     legacy_config_path: Path | None = None,
 ) -> Config:
     """Return Config with merged MCP layers applied."""
-    merged = load_merged_mcp_config(
-        config=config,
-        workspace=workspace,
-        explicit_path=explicit_path,
-        user_path=user_path,
-        legacy_config_path=legacy_config_path,
+    try:
+        merged = load_merged_mcp_config(
+            config=config,
+            workspace=workspace,
+            explicit_path=explicit_path,
+            user_path=user_path,
+            legacy_config_path=legacy_config_path,
+        )
+    except MCPConfigManagerError as e:
+        raise ConfigError(str(e)) from e
+    return replace(
+        config,
+        mcp=replace(
+            merged.config,
+            oauth_browser_login=bool(
+                getattr(config.mcp, "oauth_browser_login", True)
+            ),
+        ),
     )
-    return replace(config, mcp=merged.config)
 
 
 def is_env_reference(value: str) -> bool:
@@ -236,6 +328,37 @@ def redact_secret(value: str) -> str:
 def redact_server_env(server: MCPServerConfig) -> dict[str, str]:
     """Return redacted env map for display."""
     return {key: redact_secret(value) for key, value in sorted(server.env.items())}
+
+
+def _is_sensitive_header_key(key: str) -> bool:
+    name = str(key or "").strip().lower()
+    if not name:
+        return False
+    sensitive_tokens = (
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "token",
+        "secret",
+        "x-api-key",
+        "api-key",
+    )
+    return any(token in name for token in sensitive_tokens)
+
+
+def redact_server_headers(server: MCPServerConfig) -> dict[str, str]:
+    """Return header map with sensitive values redacted."""
+    redacted: dict[str, str] = {}
+    headers = getattr(server, "headers", {}) or {}
+    if not isinstance(headers, dict):
+        return redacted
+    for key, value in sorted(headers.items()):
+        if _is_sensitive_header_key(key):
+            redacted[key] = redact_secret(value)
+        else:
+            redacted[key] = value
+    return redacted
 
 
 def _toml_escape(value: str) -> str:
@@ -258,12 +381,39 @@ def _render_mcp_toml(servers: dict[str, MCPServerConfig]) -> str:
     for alias in sorted(servers):
         server = servers[alias]
         lines.append(f"[mcp.servers.{alias}]")
-        lines.append(f"command = {_toml_escape(server.command)}")
-        args_rendered = ", ".join(_toml_escape(arg) for arg in server.args)
-        lines.append(f"args = [{args_rendered}]")
-        lines.append(f"cwd = {_toml_escape(server.cwd)}")
+        lines.append(f"type = {_toml_escape(server.type)}")
+        if server.type == MCP_SERVER_TYPE_REMOTE:
+            lines.append(f"url = {_toml_escape(server.url)}")
+            if server.fallback_sse_url:
+                lines.append(
+                    f"fallback_sse_url = {_toml_escape(server.fallback_sse_url)}"
+                )
+            if server.allow_insecure_http:
+                lines.append("allow_insecure_http = true")
+            if server.allow_private_network:
+                lines.append("allow_private_network = true")
+        else:
+            lines.append(f"command = {_toml_escape(server.command)}")
+            args_rendered = ", ".join(_toml_escape(arg) for arg in server.args)
+            lines.append(f"args = [{args_rendered}]")
+            lines.append(f"cwd = {_toml_escape(server.cwd)}")
         lines.append(f"timeout_seconds = {server.timeout_seconds}")
         lines.append(f"enabled = {'true' if server.enabled else 'false'}")
+        if server.headers:
+            lines.append("")
+            lines.append(f"[mcp.servers.{alias}.headers]")
+            for header_key in sorted(server.headers):
+                lines.append(
+                    f"{header_key} = {_toml_escape(server.headers[header_key])}"
+                )
+        if server.oauth.enabled or server.oauth.scopes:
+            lines.append("")
+            lines.append(f"[mcp.servers.{alias}.oauth]")
+            lines.append(f"enabled = {'true' if server.oauth.enabled else 'false'}")
+            scopes_rendered = ", ".join(
+                _toml_escape(scope) for scope in server.oauth.scopes
+            )
+            lines.append(f"scopes = [{scopes_rendered}]")
         if server.env:
             lines.append("")
             lines.append(f"[mcp.servers.{alias}.env]")
@@ -553,6 +703,7 @@ def parse_mcp_server_from_flags(
         raise MCPConfigManagerError("--command is required.")
     env = parse_env_pairs(env_pairs, env_refs)
     return MCPServerConfig(
+        type=MCP_SERVER_TYPE_LOCAL,
         command=command.strip(),
         args=[arg for arg in args],
         env=env,
@@ -586,9 +737,19 @@ def merge_server_edits(
     if disabled:
         enabled = False
     return MCPServerConfig(
+        type=current.type,
         command=new_command,
         args=new_args,
         env=env,
+        url=current.url,
+        fallback_sse_url=current.fallback_sse_url,
+        headers=dict(current.headers),
+        oauth=MCPOAuthConfig(
+            enabled=current.oauth.enabled,
+            scopes=list(current.oauth.scopes),
+        ),
+        allow_insecure_http=current.allow_insecure_http,
+        allow_private_network=current.allow_private_network,
         cwd=new_cwd,
         timeout_seconds=new_timeout,
         enabled=enabled,
@@ -608,6 +769,11 @@ def validate_legacy_toml(path: Path | None) -> None:
 
 def probe_mcp_tools(view: MCPServerView) -> list[dict]:
     """Probe a configured MCP server by issuing a tools/list request."""
+    if view.server.type != MCP_SERVER_TYPE_LOCAL:
+        raise MCPConfigManagerError(
+            "MCP probe currently supports only local stdio servers "
+            f"(alias={view.alias!r}, type={view.server.type!r})."
+        )
     from loom.integrations.mcp_tools import _MCPStdioClient  # noqa: PLC2701
 
     client = _MCPStdioClient(alias=view.alias, server=view.server)

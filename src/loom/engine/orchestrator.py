@@ -69,6 +69,7 @@ from loom.models.request_diagnostics import (
 )
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
+from loom.processes.phase_alignment import infer_phase_id_for_subtask
 from loom.prompts.assembler import PromptAssembler
 from loom.recovery.approval import ApprovalDecision, ApprovalManager, ApprovalRequest
 from loom.recovery.confidence import ConfidenceScorer
@@ -1061,7 +1062,72 @@ class Orchestrator:
             raise ValueError(
                 f"Invalid plan topology from {context}: " + "; ".join(topology_issues),
             )
+        self._annotate_subtask_phase_ids(task=task, plan=working)
         return working
+
+    def _annotate_subtask_phase_ids(self, *, task: Task, plan: Plan) -> None:
+        """Annotate each subtask with the closest matching process phase id."""
+        process = self._process
+        if process is None or not getattr(process, "phases", None):
+            return
+
+        phase_ids: list[str] = []
+        phase_descriptions: dict[str, str] = {}
+        for phase in process.phases:
+            phase_id = str(getattr(phase, "id", "")).strip()
+            if not phase_id or phase_id in phase_descriptions:
+                continue
+            phase_ids.append(phase_id)
+            phase_descriptions[phase_id] = str(
+                getattr(phase, "description", ""),
+            ).strip()
+
+        if not phase_ids:
+            return
+        phase_set = set(phase_ids)
+
+        deliverables = process.get_deliverables()
+        for phase_id in deliverables.keys():
+            if phase_id in phase_set:
+                continue
+            phase_ids.append(phase_id)
+            phase_set.add(phase_id)
+            phase_descriptions.setdefault(phase_id, phase_id)
+
+        prior_assignments: dict[str, str] = {}
+        current_plan = getattr(task, "plan", None)
+        if current_plan is not None:
+            for prior in getattr(current_plan, "subtasks", []):
+                prior_id = str(getattr(prior, "id", "")).strip()
+                prior_phase_id = str(getattr(prior, "phase_id", "")).strip()
+                if prior_id and prior_phase_id in phase_set:
+                    prior_assignments[prior_id] = prior_phase_id
+
+        for subtask in plan.subtasks:
+            subtask_id = str(getattr(subtask, "id", "")).strip()
+            assigned = ""
+            if subtask_id in phase_set:
+                assigned = subtask_id
+            elif str(getattr(subtask, "phase_id", "")).strip() in phase_set:
+                assigned = str(getattr(subtask, "phase_id", "")).strip()
+            elif subtask_id and subtask_id in prior_assignments:
+                assigned = prior_assignments[subtask_id]
+            else:
+                text = " ".join([
+                    str(getattr(subtask, "description", "")).strip(),
+                    str(getattr(subtask, "acceptance_criteria", "")).strip(),
+                ]).strip()
+                assigned = infer_phase_id_for_subtask(
+                    subtask_id=subtask_id,
+                    text=text,
+                    phase_ids=phase_ids,
+                    phase_descriptions=phase_descriptions,
+                    phase_deliverables=deliverables,
+                )
+                if not assigned and len(phase_ids) == 1:
+                    assigned = phase_ids[0]
+
+            subtask.phase_id = assigned
 
     @staticmethod
     def _normalize_non_terminal_synthesis(
@@ -3670,6 +3736,7 @@ class Orchestrator:
                 id=s.get("id", f"step-{len(subtasks) + 1}"),
                 description=s.get("description", ""),
                 depends_on=s.get("depends_on", []),
+                phase_id=s.get("phase_id", ""),
                 model_tier=s.get("model_tier", 1),
                 verification_tier=s.get("verification_tier", 1),
                 is_critical_path=s.get("is_critical_path", False),
@@ -3698,6 +3765,7 @@ class Orchestrator:
                         id=phase.id,
                         description=phase.description,
                         depends_on=list(phase.depends_on),
+                        phase_id=phase.id,
                         model_tier=phase.model_tier,
                         verification_tier=phase.verification_tier,
                         is_critical_path=phase.is_critical_path,
@@ -3710,6 +3778,7 @@ class Orchestrator:
 
             existing.description = phase.description or existing.description
             existing.depends_on = list(phase.depends_on)
+            existing.phase_id = phase.id
             existing.model_tier = phase.model_tier
             existing.verification_tier = phase.verification_tier
             existing.is_critical_path = phase.is_critical_path

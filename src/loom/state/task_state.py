@@ -47,6 +47,7 @@ class Subtask:
     summary: str = ""
     active_issue: str = ""
     depends_on: list[str] = field(default_factory=list)
+    phase_id: str = ""
     model_tier: int = 1
     verification_tier: int = 1
     is_critical_path: bool = False
@@ -255,6 +256,8 @@ class TaskStateManager:
                 entry["active_issue"] = s.active_issue
             if s.depends_on:
                 entry["depends_on"] = s.depends_on
+            if s.phase_id:
+                entry["phase_id"] = s.phase_id
             if s.description:
                 entry["description"] = s.description
             if s.is_critical_path:
@@ -330,6 +333,7 @@ class TaskStateManager:
                 summary=s.get("summary", ""),
                 active_issue=s.get("active_issue", ""),
                 depends_on=s.get("depends_on", []),
+                phase_id=s.get("phase_id", ""),
                 is_critical_path=bool(s.get("is_critical_path", False)),
                 is_synthesis=bool(s.get("is_synthesis", False)),
             ))

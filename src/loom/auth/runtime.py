@@ -22,6 +22,7 @@ from loom.auth.resources import (
     resolve_resource,
 )
 from loom.auth.secrets import SecretResolutionError, SecretResolver
+from loom.oauth.engine import OAuthProviderConfig
 
 
 class AuthResolutionError(Exception):
@@ -429,6 +430,79 @@ def _extract_oauth_expiry_epoch(
     return None
 
 
+def _metadata_value(profile: AuthProfile, *keys: str) -> str:
+    metadata = profile.metadata if isinstance(profile.metadata, dict) else {}
+    for key in keys:
+        value = str(metadata.get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def oauth_provider_config_for_profile(profile: AuthProfile) -> OAuthProviderConfig | None:
+    """Build shared OAuth engine provider config for one auth profile.
+
+    This is intentionally separate from MCP alias token storage. `/auth`
+    profiles continue using `token_ref`-backed secrets, while this helper only
+    exposes reusable browser-login metadata.
+    """
+    mode = str(profile.mode or "").strip().lower()
+    if mode not in {"oauth2_pkce", "oauth2_device"}:
+        return None
+
+    authorization_endpoint = _metadata_value(
+        profile,
+        "oauth_authorization_endpoint",
+        "oauth_authorize_url",
+        "authorization_endpoint",
+    )
+    token_endpoint = _metadata_value(
+        profile,
+        "oauth_token_endpoint",
+        "oauth_token_url",
+        "token_endpoint",
+    )
+    client_id = _metadata_value(
+        profile,
+        "oauth_client_id",
+        "client_id",
+    )
+    if not authorization_endpoint or not token_endpoint or not client_id:
+        return None
+
+    scope_hint = _metadata_value(profile, "oauth_scope", "scope")
+    scopes: list[str] = []
+    if scope_hint:
+        for chunk in scope_hint.replace(",", " ").split(" "):
+            scope = str(chunk or "").strip()
+            if scope:
+                scopes.append(scope)
+    if not scopes:
+        scopes = [str(scope).strip() for scope in list(profile.scopes or []) if str(scope).strip()]
+
+    return OAuthProviderConfig(
+        authorization_endpoint=authorization_endpoint,
+        token_endpoint=token_endpoint,
+        client_id=client_id,
+        scopes=tuple(dict.fromkeys(scopes)),
+    )
+
+
+def _validate_token_ref_separation(profile: AuthProfile) -> None:
+    token_ref = str(profile.token_ref or "").strip().lower()
+    if not token_ref:
+        return
+    forbidden_fragments = (
+        "mcp_oauth_tokens.json",
+        "mcp_oauth://",
+    )
+    if any(fragment in token_ref for fragment in forbidden_fragments):
+        raise AuthResolutionError(
+            "Auth profile token_ref cannot point to MCP alias OAuth token store. "
+            "Keep `/auth` OAuth tokens separate from `~/.loom/mcp_oauth_tokens.json`."
+        )
+
+
 def _validate_oauth_requirement(
     *,
     profile: AuthProfile,
@@ -439,6 +513,21 @@ def _validate_oauth_requirement(
     mode = str(profile.mode or "").strip().lower()
     if mode not in {"oauth2_pkce", "oauth2_device"}:
         return None
+    try:
+        _validate_token_ref_separation(profile)
+    except AuthResolutionError as e:
+        return UnresolvedAuthResource(
+            provider=requirement.provider,
+            source=requirement.source,
+            reason="auth_invalid",
+            message=str(e),
+            candidates=candidate_ids,
+            modes=requirement.modes,
+            required_env_keys=requirement.required_env_keys,
+            mcp_server=requirement.mcp_server,
+            resource_ref=requirement.resource_ref,
+            resource_id=requirement.resource_id,
+        )
 
     token_ref = str(profile.token_ref or "").strip()
     if not token_ref:

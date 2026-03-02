@@ -40,6 +40,7 @@ instructions: |
     "subtasks": [
       {{
         "id": "short-kebab-id",
+        "phase_id": "canonical-phase-id (optional)",
         "description": "Clear description of what to do",
         "depends_on": ["ids-of-prerequisites"],
         "model_tier": 1,
@@ -59,6 +60,7 @@ constraints: |
   - Do NOT create subtasks whose primary goal is scaffolding numbered phase folders or workspace schema docs unless explicitly requested.
   - Use depends_on to expose independent subtasks so parallel work can be scheduled.
   - Each subtask ID must be unique and descriptive (e.g., "install-deps", "add-types", "run-tests").
+  - If a subtask maps to a known process phase but uses a custom ID, include phase_id with that phase's canonical ID.
   - Set model_tier: 1 for simple file ops, 2 for code generation, 3 for complex reasoning.
   - Set verification_tier: 1 for file checks, 2 for LLM review of complex output.
   - Mark is_critical_path: true if failure blocks all downstream work.

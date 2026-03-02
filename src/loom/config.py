@@ -6,14 +6,115 @@ Configuration is loaded once at startup and passed via dependency injection.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 class ConfigError(Exception):
     """Raised when configuration loading or validation fails."""
+
+
+MCP_SERVER_TYPE_LOCAL = "local"
+MCP_SERVER_TYPE_REMOTE = "remote"
+MCP_SERVER_TYPES = frozenset({MCP_SERVER_TYPE_LOCAL, MCP_SERVER_TYPE_REMOTE})
+
+MCP_DEFAULT_TIMEOUT_SECONDS = 30
+MCP_MIN_TIMEOUT_SECONDS = 1
+MCP_MAX_TIMEOUT_SECONDS = 120
+
+MCP_DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 2
+MCP_MIN_DISCOVERY_TIMEOUT_SECONDS = 1
+
+
+def normalize_mcp_server_type(value: object) -> str:
+    """Normalize MCP server type with local default for compatibility."""
+    raw = str(value or "").strip().lower()
+    if raw in MCP_SERVER_TYPES:
+        return raw
+    return MCP_SERVER_TYPE_LOCAL
+
+
+def normalize_mcp_timeout_seconds(
+    value: object,
+    *,
+    default: int = MCP_DEFAULT_TIMEOUT_SECONDS,
+) -> int:
+    """Clamp MCP call timeout to a safe bounded range."""
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        timeout = default
+    return max(MCP_MIN_TIMEOUT_SECONDS, min(MCP_MAX_TIMEOUT_SECONDS, timeout))
+
+
+def normalize_mcp_discovery_timeout_seconds(
+    value: object,
+    *,
+    default: int = MCP_DEFAULT_DISCOVERY_TIMEOUT_SECONDS,
+) -> int:
+    """Clamp MCP discovery timeout to a bounded range."""
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        timeout = default
+    return max(MCP_MIN_DISCOVERY_TIMEOUT_SECONDS, min(MCP_MAX_TIMEOUT_SECONDS, timeout))
+
+
+def _is_private_or_loopback_host(hostname: str) -> bool:
+    host = (hostname or "").strip().lower()
+    if not host:
+        return True
+    if host in {"localhost"}:
+        return True
+    if host.endswith(".localhost") or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+    )
+
+
+def validate_mcp_remote_url(
+    url: str,
+    *,
+    allow_insecure_http: bool,
+    allow_private_network: bool,
+) -> str:
+    """Validate remote MCP endpoint URL and return cleaned value."""
+    cleaned = str(url or "").strip()
+    if not cleaned:
+        raise ConfigError("Remote MCP server requires a non-empty url.")
+    parsed = urlparse(cleaned)
+    scheme = parsed.scheme.strip().lower()
+    if scheme not in {"https", "http"}:
+        raise ConfigError(
+            f"Remote MCP url must use https (or http with override), got {scheme or '<none>'!r}."
+        )
+    if scheme != "https" and not allow_insecure_http:
+        raise ConfigError(
+            "Remote MCP url must use https. "
+            "Set allow_insecure_http=true only for trusted local/dev endpoints."
+        )
+    hostname = parsed.hostname or ""
+    if not hostname:
+        raise ConfigError("Remote MCP url is missing hostname.")
+    if _is_private_or_loopback_host(hostname) and not allow_private_network:
+        raise ConfigError(
+            "Remote MCP url targets loopback/private network. "
+            "Set allow_private_network=true for trusted local/dev endpoints."
+        )
+    return cleaned
 
 
 @dataclass(frozen=True)
@@ -321,14 +422,29 @@ class LimitsConfig:
 
 
 @dataclass(frozen=True)
+class MCPOAuthConfig:
+    """OAuth metadata for remote MCP servers."""
+
+    enabled: bool = False
+    scopes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class MCPServerConfig:
     """Configuration for one external MCP server."""
 
+    type: str = MCP_SERVER_TYPE_LOCAL
     command: str = ""
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    url: str = ""
+    fallback_sse_url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    oauth: MCPOAuthConfig = field(default_factory=MCPOAuthConfig)
+    allow_insecure_http: bool = False
+    allow_private_network: bool = False
     cwd: str = ""
-    timeout_seconds: int = 30
+    timeout_seconds: int = MCP_DEFAULT_TIMEOUT_SECONDS
     enabled: bool = True
 
 
@@ -337,6 +453,7 @@ class MCPConfig:
     """Configuration for MCP-backed tool discovery."""
 
     servers: dict[str, MCPServerConfig] = field(default_factory=dict)
+    oauth_browser_login: bool = True
 
 
 @dataclass(frozen=True)
@@ -1455,6 +1572,8 @@ def load_config(path: Path | None = None) -> Config:
             if not isinstance(server_data, dict):
                 continue
 
+            server_type = normalize_mcp_server_type(server_data.get("type"))
+
             raw_args = server_data.get("args", [])
             args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
 
@@ -1465,18 +1584,61 @@ def load_config(path: Path | None = None) -> Config:
                     if isinstance(key, str):
                         env[key] = str(value)
 
-            timeout_raw = server_data.get("timeout_seconds", 30)
-            try:
-                timeout_seconds = int(timeout_raw)
-            except (TypeError, ValueError):
-                timeout_seconds = 30
-            if timeout_seconds <= 0:
-                timeout_seconds = 30
+            raw_headers = server_data.get("headers", {})
+            headers: dict[str, str] = {}
+            if isinstance(raw_headers, dict):
+                for key, value in raw_headers.items():
+                    if isinstance(key, str):
+                        headers[key] = str(value)
+
+            oauth_enabled = False
+            oauth_scopes: list[str] = []
+            raw_oauth = server_data.get("oauth", {})
+            if isinstance(raw_oauth, dict):
+                oauth_enabled = bool(raw_oauth.get("enabled", False))
+                raw_scopes = raw_oauth.get("scopes", [])
+                if isinstance(raw_scopes, list):
+                    oauth_scopes = [
+                        str(scope).strip()
+                        for scope in raw_scopes
+                        if str(scope).strip()
+                    ]
+
+            allow_insecure_http = bool(server_data.get("allow_insecure_http", False))
+            allow_private_network = bool(server_data.get("allow_private_network", False))
+
+            url = str(server_data.get("url", "")).strip()
+            if server_type == MCP_SERVER_TYPE_REMOTE:
+                try:
+                    url = validate_mcp_remote_url(
+                        url,
+                        allow_insecure_http=allow_insecure_http,
+                        allow_private_network=allow_private_network,
+                    )
+                except ConfigError as e:
+                    raise ConfigError(
+                        f"Invalid MCP server {alias!r}: {e}"
+                    ) from e
+
+            fallback_sse_url = str(server_data.get("fallback_sse_url", "")).strip()
+            timeout_seconds = normalize_mcp_timeout_seconds(
+                server_data.get("timeout_seconds", MCP_DEFAULT_TIMEOUT_SECONDS),
+            )
 
             mcp_servers[str(alias)] = MCPServerConfig(
+                type=server_type,
                 command=str(server_data.get("command", "")),
                 args=args,
                 env=env,
+                url=url,
+                fallback_sse_url=fallback_sse_url,
+                headers=headers,
+                oauth=MCPOAuthConfig(
+                    enabled=oauth_enabled,
+                    scopes=oauth_scopes,
+                ),
+                allow_insecure_http=allow_insecure_http,
+                allow_private_network=allow_private_network,
                 cwd=str(server_data.get("cwd", "")),
                 timeout_seconds=timeout_seconds,
                 enabled=bool(server_data.get("enabled", True)),
@@ -1493,5 +1655,10 @@ def load_config(path: Path | None = None) -> Config:
         process=process,
         tui=tui,
         limits=limits,
-        mcp=MCPConfig(servers=mcp_servers),
+        mcp=MCPConfig(
+            servers=mcp_servers,
+            oauth_browser_login=bool(
+                mcp_data.get("oauth_browser_login", True)
+            ) if isinstance(mcp_data, dict) else True,
+        ),
     )
