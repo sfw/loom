@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import threading
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -49,6 +51,7 @@ from loom.auth.resources import (
 )
 from loom.mcp.config import MCPConfigManager, ensure_valid_env_key
 from loom.tools import create_default_registry
+from loom.tui.screens.oauth_code_entry import OAuthCodeEntryScreen
 
 
 class ConfirmProfileSwitchScreen(ModalScreen[str]):
@@ -154,6 +157,27 @@ class AuthManagerScreen(Vertical):
         "cli_passthrough",
         "env_passthrough",
     )
+    _OAUTH_MODES = ("oauth2_pkce", "oauth2_device")
+    _OAUTH_METADATA_KEYS = (
+        "oauth_authorization_endpoint",
+        "oauth_token_endpoint",
+        "oauth_client_id",
+        "oauth_client_secret",
+        "oauth_scope",
+    )
+    _OAUTH_METADATA_FIELDS = (
+        ("oauth_authorization_endpoint", "auth-oauth-authorize-url"),
+        ("oauth_token_endpoint", "auth-oauth-token-url"),
+        ("oauth_client_id", "auth-oauth-client-id"),
+        ("oauth_client_secret", "auth-oauth-client-secret"),
+        ("oauth_scope", "auth-oauth-scope"),
+    )
+    _OAUTH_REQUIRED_METADATA_FIELDS = (
+        ("oauth_authorization_endpoint", "OAuth Authorization URL"),
+        ("oauth_token_endpoint", "OAuth Token URL"),
+        ("oauth_client_id", "OAuth Client ID"),
+    )
+    _SAFE_REF_FRAGMENT_RE = re.compile(r"[^a-z0-9_]+")
 
     BINDINGS = [
         Binding("escape", "request_close", "Close"),
@@ -173,6 +197,11 @@ class AuthManagerScreen(Vertical):
         "auth-env",
         "auth-command",
         "auth-auth-check",
+        "auth-oauth-authorize-url",
+        "auth-oauth-token-url",
+        "auth-oauth-client-id",
+        "auth-oauth-client-secret",
+        "auth-oauth-scope",
         "auth-meta",
     )
 
@@ -249,6 +278,29 @@ class AuthManagerScreen(Vertical):
         height: auto;
         text-wrap: wrap;
         overflow-x: hidden;
+    }
+    #auth-oauth-settings {
+        display: none;
+        margin-top: 1;
+        height: auto;
+        layout: vertical;
+    }
+    #auth-secret-ref-section,
+    #auth-token-ref-section,
+    #auth-scopes-section,
+    #auth-env-section,
+    #auth-command-section {
+        height: auto;
+        layout: vertical;
+    }
+    #auth-token-ref-section {
+        display: none;
+        margin-bottom: 1;
+    }
+    #auth-scopes-section,
+    #auth-env-section,
+    #auth-command-section {
+        display: none;
     }
     .auth-input {
         margin-top: 0;
@@ -424,57 +476,109 @@ class AuthManagerScreen(Vertical):
                     "Human-friendly name shown in listings.",
                     classes="auth-help",
                 )
-                yield Label("Secret Ref", classes="auth-label")
-                yield Input(
-                    id="auth-secret-ref",
-                    classes="auth-input",
-                )
-                yield Label(
-                    "Where the base secret comes from (env/keychain/vault reference).",
-                    classes="auth-help",
-                )
-                yield Label("Token Ref", classes="auth-label")
-                yield Input(
-                    id="auth-token-ref",
-                    classes="auth-input",
-                )
-                yield Label(
-                    "Optional token storage reference for /auth OAuth tokens. "
-                    "Do not point this at MCP alias token store files.",
-                    classes="auth-help",
-                )
+                with Vertical(id="auth-secret-ref-section"):
+                    yield Label("Secret Ref", classes="auth-label")
+                    yield Input(
+                        id="auth-secret-ref",
+                        classes="auth-input",
+                    )
+                    yield Label(
+                        "Where the base secret comes from (env/keychain/vault reference).",
+                        classes="auth-help",
+                    )
+                with Vertical(id="auth-oauth-settings"):
+                    yield Label("OAuth Authorization URL (required)", classes="auth-label")
+                    yield Input(
+                        id="auth-oauth-authorize-url",
+                        classes="auth-input",
+                    )
+                    yield Label(
+                        "OAuth authorization endpoint for browser login.",
+                        classes="auth-help",
+                    )
+                    yield Label("OAuth Token URL (required)", classes="auth-label")
+                    yield Input(
+                        id="auth-oauth-token-url",
+                        classes="auth-input",
+                    )
+                    yield Label(
+                        "OAuth token endpoint for code exchange/refresh.",
+                        classes="auth-help",
+                    )
+                    yield Label("OAuth Client ID (required)", classes="auth-label")
+                    yield Input(
+                        id="auth-oauth-client-id",
+                        classes="auth-input",
+                    )
+                    yield Label(
+                        "OAuth client id used for browser login.",
+                        classes="auth-help",
+                    )
+                    yield Label("OAuth Client Secret (Optional)", classes="auth-label")
+                    yield Input(
+                        id="auth-oauth-client-secret",
+                        classes="auth-input",
+                    )
+                    yield Label(
+                        "Optional secret required for token refresh with some providers.",
+                        classes="auth-help",
+                    )
+                    yield Label("OAuth Scope Hint", classes="auth-label")
+                    yield Input(
+                        id="auth-oauth-scope",
+                        classes="auth-input",
+                    )
+                    yield Label(
+                        "Optional space/comma-separated scope hint metadata.",
+                        classes="auth-help",
+                    )
                 with Collapsible(
                     title="Advanced",
                     id="auth-manager-advanced",
                     collapsed=True,
                 ):
-                    yield Label("Scopes (comma-separated)", classes="auth-label")
-                    yield Input(
-                        id="auth-scopes",
-                        classes="auth-input",
-                    )
-                    yield Label(
-                        "Optional OAuth scopes for this profile.",
-                        classes="auth-help",
-                    )
-                    yield Label("Env pairs (comma-separated KEY=VALUE)", classes="auth-label")
-                    yield Input(
-                        id="auth-env",
-                        classes="auth-input",
-                    )
-                    yield Label(
-                        "Extra env vars injected when this profile is applied.",
-                        classes="auth-help",
-                    )
-                    yield Label("Command (cli_passthrough)", classes="auth-label")
-                    yield Input(
-                        id="auth-command",
-                        classes="auth-input",
-                    )
-                    yield Label(
-                        "Command name used for cli_passthrough auth mode.",
-                        classes="auth-help",
-                    )
+                    with Vertical(id="auth-token-ref-section"):
+                        yield Label("Token Ref", classes="auth-label")
+                        yield Input(
+                            id="auth-token-ref",
+                            classes="auth-input",
+                        )
+                        yield Label(
+                            "OAuth token storage reference. Must be keychain://... "
+                            "and should stay separate from MCP alias token stores. "
+                            "Default: keychain://loom/<provider>/<profile>/tokens.",
+                            classes="auth-help",
+                        )
+                    with Vertical(id="auth-scopes-section"):
+                        yield Label("Scopes (comma-separated)", classes="auth-label")
+                        yield Input(
+                            id="auth-scopes",
+                            classes="auth-input",
+                        )
+                        yield Label(
+                            "Optional OAuth scopes for this profile.",
+                            classes="auth-help",
+                        )
+                    with Vertical(id="auth-env-section"):
+                        yield Label("Env pairs (comma-separated KEY=VALUE)", classes="auth-label")
+                        yield Input(
+                            id="auth-env",
+                            classes="auth-input",
+                        )
+                        yield Label(
+                            "Required for env_passthrough; optional for api_key fallback.",
+                            classes="auth-help",
+                        )
+                    with Vertical(id="auth-command-section"):
+                        yield Label("Command (cli_passthrough)", classes="auth-label")
+                        yield Input(
+                            id="auth-command",
+                            classes="auth-input",
+                        )
+                        yield Label(
+                            "Required for cli_passthrough mode.",
+                            classes="auth-help",
+                        )
                     yield Label("Auth check args (comma-separated)", classes="auth-label")
                     yield Input(
                         id="auth-auth-check",
@@ -592,6 +696,8 @@ class AuthManagerScreen(Vertical):
     def _on_form_input_changed(self, event: Input.Changed) -> None:
         if event.input.id not in self._FORM_FIELD_IDS:
             return
+        if event.input.id == "auth-profile-id" and not self._suppress_dirty_tracking:
+            self._maybe_set_default_oauth_token_ref()
         self._update_form_dirty()
 
     @on(Select.Changed)
@@ -603,6 +709,11 @@ class AuthManagerScreen(Vertical):
         if event.select.id == "auth-resource-target":
             self._sync_provider_display()
             self._refresh_mode_select()
+            self._refresh_oauth_settings_visibility()
+            self._maybe_set_default_oauth_token_ref()
+        elif event.select.id == "auth-mode":
+            self._refresh_oauth_settings_visibility()
+            self._maybe_set_default_oauth_token_ref()
         self._update_form_dirty()
 
     @on(Checkbox.Changed, "#auth-default-provider")
@@ -744,6 +855,95 @@ class AuthManagerScreen(Vertical):
         select = self.query_one("#auth-mode", Select)
         return self._decode_mode_value(select.value)
 
+    @classmethod
+    def _sanitize_ref_fragment(cls, raw: object, *, fallback: str) -> str:
+        cleaned = cls._SAFE_REF_FRAGMENT_RE.sub(
+            "_",
+            str(raw or "").strip().lower(),
+        ).strip("_")
+        return cleaned or fallback
+
+    def _default_oauth_token_ref(
+        self,
+        *,
+        provider: str = "",
+        key_name: str = "",
+    ) -> str:
+        provider_hint = str(provider or "").strip()
+        if not provider_hint:
+            provider_hint = self._provider_for_selected_resource()
+        if not provider_hint:
+            provider_hint = self._active_provider
+
+        key_hint = str(key_name or "").strip()
+        if not key_hint:
+            key_hint = self._profile_id()
+        if not key_hint:
+            selected_resource = self._resources_by_id.get(self._selected_resource_id())
+            if selected_resource is not None:
+                key_hint = str(getattr(selected_resource, "resource_key", "")).strip()
+                if not key_hint:
+                    key_hint = str(getattr(selected_resource, "resource_id", "")).strip()
+        if not key_hint:
+            key_hint = provider_hint or "default"
+
+        provider_part = self._sanitize_ref_fragment(
+            provider_hint or key_hint,
+            fallback="oauth",
+        )
+        key_part = self._sanitize_ref_fragment(
+            key_hint,
+            fallback="default",
+        )
+        return f"keychain://loom/{provider_part}/{key_part}/tokens"
+
+    def _maybe_set_default_oauth_token_ref(
+        self,
+        *,
+        provider: str = "",
+        key_name: str = "",
+    ) -> None:
+        if self._selected_mode() not in self._OAUTH_MODES:
+            return
+        token_input = self.query_one("#auth-token-ref", Input)
+        if str(token_input.value or "").strip():
+            return
+        token_input.value = self._default_oauth_token_ref(
+            provider=provider,
+            key_name=key_name,
+        )
+
+    def _refresh_oauth_settings_visibility(self) -> None:
+        mode = self._selected_mode()
+        oauth_mode = mode in self._OAUTH_MODES
+        api_key_mode = mode == "api_key"
+        env_passthrough_mode = mode == "env_passthrough"
+        cli_passthrough_mode = mode == "cli_passthrough"
+        self.query_one("#auth-oauth-settings", Vertical).display = oauth_mode
+        self.query_one("#auth-secret-ref-section", Vertical).display = api_key_mode
+        self.query_one("#auth-token-ref-section", Vertical).display = oauth_mode
+        self.query_one("#auth-scopes-section", Vertical).display = oauth_mode
+        self.query_one("#auth-env-section", Vertical).display = (
+            api_key_mode or env_passthrough_mode
+        )
+        self.query_one("#auth-command-section", Vertical).display = cli_passthrough_mode
+
+    def _oauth_metadata_from_form(self) -> dict[str, str]:
+        metadata: dict[str, str] = {}
+        for key, field_id in self._OAUTH_METADATA_FIELDS:
+            value = self.query_one(f"#{field_id}", Input).value.strip()
+            if value:
+                metadata[key] = value
+        return metadata
+
+    @classmethod
+    def _missing_required_oauth_metadata(cls, metadata: dict[str, str]) -> tuple[str, ...]:
+        missing: list[str] = []
+        for key, label in cls._OAUTH_REQUIRED_METADATA_FIELDS:
+            if not str(metadata.get(key, "") or "").strip():
+                missing.append(label)
+        return tuple(missing)
+
     def _default_provider_selected(self) -> bool:
         return bool(self.query_one("#auth-default-provider", Checkbox).value)
 
@@ -843,6 +1043,7 @@ class AuthManagerScreen(Vertical):
         command: str,
         auth_check: str,
         metadata: str,
+        oauth_metadata: dict[str, str] | None = None,
     ) -> None:
         self._suppress_dirty_tracking = True
         try:
@@ -858,8 +1059,14 @@ class AuthManagerScreen(Vertical):
             self.query_one("#auth-env", Input).value = env
             self.query_one("#auth-command", Input).value = command
             self.query_one("#auth-auth-check", Input).value = auth_check
+            oauth_values = dict(oauth_metadata or {})
+            for key, field_id in self._OAUTH_METADATA_FIELDS:
+                self.query_one(f"#{field_id}", Input).value = str(
+                    oauth_values.get(key, "") or ""
+                ).strip()
             self.query_one("#auth-meta", Input).value = metadata
             self._sync_provider_display()
+            self._refresh_oauth_settings_visibility()
         finally:
             self._suppress_dirty_tracking = False
 
@@ -878,6 +1085,7 @@ class AuthManagerScreen(Vertical):
             command="",
             auth_check="",
             metadata="",
+            oauth_metadata={},
         )
         self._mark_form_clean(active_profile_id="")
 
@@ -1154,6 +1362,11 @@ class AuthManagerScreen(Vertical):
             return False
 
         resource_id = self._resource_id_for_profile(profile)
+        profile_metadata = dict(profile.metadata)
+        oauth_metadata = {
+            key: str(profile_metadata.pop(key, "") or "").strip()
+            for key in self._OAUTH_METADATA_KEYS
+        }
         self._set_form_values(
             profile_id=profile.profile_id,
             provider=profile.provider,
@@ -1172,8 +1385,9 @@ class AuthManagerScreen(Vertical):
             command=profile.command,
             auth_check=", ".join(profile.auth_check),
             metadata=", ".join(
-                f"{key}={value}" for key, value in sorted(profile.metadata.items())
+                f"{key}={value}" for key, value in sorted(profile_metadata.items())
             ),
+            oauth_metadata=oauth_metadata,
         )
         self._mark_form_clean(active_profile_id=profile.profile_id)
         self._select_summary_profile(profile.profile_id)
@@ -1218,6 +1432,31 @@ class AuthManagerScreen(Vertical):
         try:
             env = self._parse_kv_pairs(env_values, env_keys=True)
             metadata = self._parse_kv_pairs(meta_values, env_keys=False)
+            for key in self._OAUTH_METADATA_KEYS:
+                metadata.pop(key, None)
+            metadata.update(self._oauth_metadata_from_form())
+            if mode in self._OAUTH_MODES:
+                missing_oauth_fields = self._missing_required_oauth_metadata(metadata)
+                if missing_oauth_fields:
+                    self.notify(
+                        "OAuth mode requires: "
+                        + ", ".join(missing_oauth_fields)
+                        + ".",
+                        severity="error",
+                    )
+                    return False
+            if mode in self._OAUTH_MODES and not token_ref:
+                token_ref = self._default_oauth_token_ref(
+                    provider=provider,
+                    key_name=profile_id,
+                )
+                self.query_one("#auth-token-ref", Input).value = token_ref
+            if mode in self._OAUTH_MODES and not token_ref.lower().startswith("keychain://"):
+                self.notify(
+                    "OAuth token_ref must use keychain://... storage.",
+                    severity="error",
+                )
+                return False
             status = "ready"
             if existing is not None and str(existing.status or "").strip().lower() == "archived":
                 status = "archived"
@@ -1621,6 +1860,15 @@ class AuthManagerScreen(Vertical):
         self.notify(f"Removed profile: {profile_id}")
 
     async def _oauth_target_profile(self) -> AuthProfile | None:
+        if self._form_dirty:
+            saved = await self._save_profile(notify_success=False)
+            if not saved:
+                self.notify(
+                    "OAuth action canceled because profile changes could not be saved.",
+                    severity="warning",
+                )
+                return None
+
         profile_id = self._profile_id() or self._active_profile_id
         if not profile_id:
             self.notify("Load an OAuth profile first.", severity="warning")
@@ -1632,29 +1880,88 @@ class AuthManagerScreen(Vertical):
         if profile is None:
             self.notify(f"Profile not found: {profile_id}", severity="error")
             return None
+        if str(profile.mode or "").strip().lower() not in self._OAUTH_MODES:
+            self.notify(
+                f"Profile {profile.profile_id!r} is not an OAuth mode profile.",
+                severity="warning",
+            )
+            return None
         return profile
+
+    def _oauth_callback_prompt(self, prompt_text: str) -> str:
+        entered = {"value": ""}
+        done = threading.Event()
+
+        def _on_done(raw: str | None) -> None:
+            entered["value"] = str(raw or "").strip()
+            done.set()
+
+        def _show_prompt() -> None:
+            self.app.push_screen(
+                OAuthCodeEntryScreen(
+                    title_text="Enter OAuth Callback",
+                    prompt_text=str(
+                        prompt_text or "Paste callback URL or authorization code."
+                    ).strip()
+                    or "Paste callback URL or authorization code.",
+                ),
+                callback=_on_done,
+            )
+
+        try:
+            self.app.call_from_thread(_show_prompt)
+        except Exception:
+            return ""
+        done.wait()
+        return entered["value"]
 
     async def _oauth_login(self) -> None:
         profile = await self._oauth_target_profile()
         if profile is None:
             return
+        start_payload: dict[str, str] = {}
+
+        def _on_start(started) -> None:
+            start_payload["authorization_url"] = str(
+                getattr(started, "authorization_url", "") or ""
+            ).strip()
+            start_payload["callback_mode"] = str(
+                getattr(started, "callback_mode", "") or ""
+            ).strip()
+            start_payload["browser_warning"] = str(
+                getattr(started, "browser_error", "") or ""
+            ).strip()
+
         try:
             result = await asyncio.to_thread(
                 login_oauth_profile,
                 profile,
+                on_start=_on_start,
+                callback_prompt=self._oauth_callback_prompt,
             )
         except OAuthProfileError as e:
+            auth_url = start_payload.get("authorization_url", "")
+            if auth_url:
+                self.notify(f"OAuth login URL: {auth_url}")
             self.notify(
                 f"OAuth login failed ({e.reason_code}): {e}",
                 severity="error",
             )
             if e.reason_code == "callback_missing":
                 self.notify(
-                    "Manual OAuth callback input is not available in TUI; use CLI login.",
+                    "OAuth callback input was not provided; login canceled.",
                     severity="warning",
                 )
             return
-        self.notify(f"OAuth login URL: {result.authorization_url}")
+        auth_url = start_payload.get("authorization_url", "") or result.authorization_url
+        if auth_url:
+            self.notify(f"OAuth login URL: {auth_url}")
+        browser_warning = (
+            start_payload.get("browser_warning", "")
+            or str(getattr(result, "browser_warning", "") or "").strip()
+        )
+        if browser_warning:
+            self.notify(f"Browser open warning: {browser_warning}", severity="warning")
         if result.callback_mode == "manual":
             self.notify(
                 "OAuth login fell back to manual callback mode; use CLI for manual callback.",

@@ -145,9 +145,36 @@ class AuthAuditReport:
     orphaned_bindings: tuple[str, ...] = ()
     historical_deleted_bindings: tuple[str, ...] = ()
     deleted_resource_bindings: tuple[str, ...] = ()
+    duplicate_generated_draft_groups: tuple[str, ...] = ()
+    stale_generated_profiles: tuple[str, ...] = ()
     legacy_provider_defaults: tuple[str, ...] = ()
     dangling_workspace_resource_defaults: tuple[str, ...] = ()
     dangling_user_resource_defaults: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AuthRepairResult:
+    """Plan/apply summary for auth repair flows."""
+
+    applied: bool = False
+    snapshot_path: Path | None = None
+    duplicate_generated_draft_groups: tuple[str, ...] = ()
+    deduped_profiles: tuple[str, ...] = ()
+    rebound_bindings: int = 0
+    updated_workspace_defaults: int = 0
+    updated_user_resource_defaults: int = 0
+    pruned_deleted_bindings: int = 0
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def changed(self) -> bool:
+        return (
+            len(self.deduped_profiles) > 0
+            or self.rebound_bindings > 0
+            or self.updated_workspace_defaults > 0
+            or self.updated_user_resource_defaults > 0
+            or self.pruned_deleted_bindings > 0
+        )
 
 
 @dataclass(frozen=True)
@@ -163,6 +190,7 @@ class ResourceDeleteImpact:
 
 _TOML_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_ID_RE = re.compile(r"[^a-z0-9_]+")
+_TRAILING_NUMERIC_SUFFIX_RE = re.compile(r"_\d+$")
 _SUPPORTED_MODES = (
     "api_key",
     "oauth2_pkce",
@@ -170,6 +198,14 @@ _SUPPORTED_MODES = (
     "env_passthrough",
     "cli_passthrough",
 )
+_OAUTH_PROVIDER_TEMPLATE_BY_PROVIDER: dict[str, dict[str, str]] = {
+    "youtube_data_api": {
+        "oauth_authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+        "oauth_token_endpoint": "https://oauth2.googleapis.com/token",
+        "oauth_client_id": "TODO_YOUTUBE_OAUTH_CLIENT_ID",
+        "oauth_scope": "https://www.googleapis.com/auth/youtube.readonly",
+    },
+}
 
 
 def _toml_escape(value: str) -> str:
@@ -1120,6 +1156,75 @@ def _draft_identity_from_profile(profile: AuthProfile) -> tuple[str, str, str, s
     return (kind, key, provider, mcp_server, mode)
 
 
+def _profile_is_generated_draft(profile: AuthProfile) -> bool:
+    if str(getattr(profile, "status", "ready") or "ready").strip().lower() != "draft":
+        return False
+    metadata = dict(getattr(profile, "metadata", {}) or {})
+    generated_flag = str(metadata.get("generated", "")).strip().lower()
+    if generated_flag in {"1", "true", "yes", "on"}:
+        return True
+    if str(metadata.get("generated_from", "")).strip():
+        return True
+    return _draft_identity_from_profile(profile) is not None
+
+
+def _generated_draft_groups(
+    profiles: dict[str, AuthProfile],
+) -> dict[tuple[str, str, str, str, str], list[str]]:
+    grouped: dict[tuple[str, str, str, str, str], list[str]] = {}
+    for profile_id, profile in profiles.items():
+        if not _profile_is_generated_draft(profile):
+            continue
+        identity = _draft_identity_from_profile(profile)
+        if identity is None:
+            continue
+        grouped.setdefault(identity, []).append(profile_id)
+    return grouped
+
+
+def _select_canonical_profile_id(
+    *,
+    profile_ids: list[str],
+    profiles: dict[str, AuthProfile],
+    store: AuthResourcesStore,
+    user_resource_defaults: dict[str, str],
+) -> str:
+    active_binding_count: dict[str, int] = {}
+    for binding in store.bindings.values():
+        if str(binding.status or "").strip().lower() != "active":
+            continue
+        profile_id = str(binding.profile_id or "").strip()
+        if not profile_id:
+            continue
+        active_binding_count[profile_id] = active_binding_count.get(profile_id, 0) + 1
+
+    resource_default_count: dict[str, int] = {}
+    for profile_id in store.workspace_defaults.values():
+        clean = str(profile_id or "").strip()
+        if clean:
+            resource_default_count[clean] = resource_default_count.get(clean, 0) + 1
+    for profile_id in user_resource_defaults.values():
+        clean = str(profile_id or "").strip()
+        if clean:
+            resource_default_count[clean] = resource_default_count.get(clean, 0) + 1
+
+    ranked = sorted(
+        profile_ids,
+        key=lambda item: (
+            1 if _TRAILING_NUMERIC_SUFFIX_RE.search(item) else 0,
+            -active_binding_count.get(item, 0),
+            -resource_default_count.get(item, 0),
+            len(item),
+            item,
+        ),
+    )
+    for profile_id in ranked:
+        profile = profiles.get(profile_id)
+        if profile is not None and _profile_is_usable(profile):
+            return profile_id
+    return ranked[0] if ranked else ""
+
+
 def _find_compatible_generated_draft_profile_id(
     *,
     resource: AuthResource,
@@ -1131,17 +1236,13 @@ def _find_compatible_generated_draft_profile_id(
     candidates: list[str] = []
 
     for profile_id, profile in profiles.items():
-        if str(getattr(profile, "status", "ready") or "ready").strip().lower() != "draft":
+        if not _profile_is_generated_draft(profile):
             continue
         if not _profile_is_usable(profile):
             continue
         metadata = dict(getattr(profile, "metadata", {}) or {})
         generated_from = str(metadata.get("generated_from", "")).strip()
         profile_identity = _draft_identity_from_profile(profile)
-        generated_flag = str(metadata.get("generated", "")).strip().lower()
-        has_generated_markers = bool(generated_from or profile_identity is not None)
-        if generated_flag not in {"1", "true", "yes", "on"} and not has_generated_markers:
-            continue
         if generated_from and generated_from == target_generated_from:
             candidates.append(profile_id)
             continue
@@ -1153,6 +1254,12 @@ def _find_compatible_generated_draft_profile_id(
     if not candidates:
         return ""
     return sorted(candidates)[0]
+
+
+def _oauth_template_metadata_for_provider(provider: str) -> dict[str, str]:
+    clean_provider = str(provider or "").strip().lower()
+    template = _OAUTH_PROVIDER_TEMPLATE_BY_PROVIDER.get(clean_provider, {})
+    return {str(key): str(value) for key, value in template.items() if str(key).strip()}
 
 
 def _build_draft_profile(
@@ -1178,10 +1285,11 @@ def _build_draft_profile(
     secret_ref = ""
     token_ref = ""
     command = ""
+    provider_part = _sanitize_profile_fragment(resource.provider or resource.resource_key)
     if mode == "api_key":
-        secret_ref = f"env://TODO_{_sanitize_profile_fragment(resource.provider).upper()}_API_KEY"
+        secret_ref = f"env://TODO_{provider_part.upper()}_API_KEY"
     elif mode in {"oauth2_pkce", "oauth2_device"}:
-        token_ref = f"env://TODO_{_sanitize_profile_fragment(resource.provider).upper()}_TOKEN"
+        token_ref = f"keychain://loom/{provider_part}/{profile_id}/tokens"
     elif mode == "env_passthrough" and not env:
         env["API_KEY"] = "${API_KEY}"
     elif mode == "cli_passthrough":
@@ -1198,6 +1306,10 @@ def _build_draft_profile(
         "generated_mcp_server": mcp_server,
         "generated_mode": mode,
     }
+    if mode in {"oauth2_pkce", "oauth2_device"}:
+        metadata.update(
+            _oauth_template_metadata_for_provider(resource.provider or resource.resource_key)
+        )
 
     return AuthProfile(
         profile_id=profile_id,
@@ -2169,6 +2281,26 @@ def audit_auth_state(
         if not has_binding:
             orphaned_profiles.append(profile_id)
 
+    duplicate_generated_draft_groups: list[str] = []
+    generated_groups = _generated_draft_groups(merged.config.profiles)
+    for profile_ids in generated_groups.values():
+        unique_ids = sorted({profile_id for profile_id in profile_ids if profile_id})
+        if len(unique_ids) <= 1:
+            continue
+        duplicate_generated_draft_groups.append(",".join(unique_ids))
+
+    stale_generated_profiles: list[str] = []
+    for profile_id, profile in merged.config.profiles.items():
+        if not _profile_is_generated_draft(profile):
+            continue
+        metadata = dict(getattr(profile, "metadata", {}) or {})
+        resource_id = str(metadata.get("resource_id", "")).strip()
+        if not resource_id:
+            continue
+        resource = store.resources.get(resource_id)
+        if resource is None or str(resource.status or "").strip().lower() != "active":
+            stale_generated_profiles.append(profile_id)
+
     orphaned_bindings: list[str] = []
     historical_deleted_bindings: list[str] = []
     deleted_resource_bindings: list[str] = []
@@ -2225,7 +2357,201 @@ def audit_auth_state(
         orphaned_bindings=tuple(sorted(orphaned_bindings)),
         historical_deleted_bindings=tuple(sorted(historical_deleted_bindings)),
         deleted_resource_bindings=tuple(sorted(deleted_resource_bindings)),
+        duplicate_generated_draft_groups=tuple(sorted(duplicate_generated_draft_groups)),
+        stale_generated_profiles=tuple(sorted(stale_generated_profiles)),
         legacy_provider_defaults=tuple(sorted(set(legacy_provider_defaults))),
         dangling_workspace_resource_defaults=tuple(dangling_workspace_resource_defaults),
         dangling_user_resource_defaults=tuple(dangling_user_resource_defaults),
+    )
+
+
+def repair_auth_state(
+    *,
+    workspace: Path,
+    explicit_auth_path: Path | None,
+    apply: bool = False,
+    prune_deleted_history: bool = False,
+) -> AuthRepairResult:
+    """Plan/apply deterministic auth dedupe and binding repair."""
+    ws = workspace.resolve()
+    resources_path = default_workspace_auth_resources_path(ws)
+    auth_write_path = resolve_auth_write_path(explicit_path=explicit_auth_path)
+
+    store = load_workspace_auth_resources(resources_path)
+    auth_cfg = load_auth_file(auth_write_path)
+    profiles = dict(auth_cfg.profiles)
+
+    duplicate_groups: list[str] = []
+    duplicate_to_canonical: dict[str, str] = {}
+    generated_groups = _generated_draft_groups(profiles)
+    for profile_ids in generated_groups.values():
+        unique_ids = sorted({profile_id for profile_id in profile_ids if profile_id})
+        if len(unique_ids) <= 1:
+            continue
+        canonical = _select_canonical_profile_id(
+            profile_ids=unique_ids,
+            profiles=profiles,
+            store=store,
+            user_resource_defaults=dict(auth_cfg.resource_defaults),
+        )
+        if not canonical:
+            continue
+        duplicates = [profile_id for profile_id in unique_ids if profile_id != canonical]
+        if not duplicates:
+            continue
+        duplicate_groups.append(",".join([canonical, *duplicates]))
+        for profile_id in duplicates:
+            duplicate_to_canonical[profile_id] = canonical
+
+    now = _iso_now()
+    bindings = dict(store.bindings)
+    workspace_defaults = dict(store.workspace_defaults)
+    deduped_profiles = sorted(duplicate_to_canonical)
+    rebound_bindings = 0
+    updated_workspace_defaults = 0
+    updated_user_resource_defaults = 0
+    pruned_deleted_bindings = 0
+
+    def _has_active_binding(resource_id: str, profile_id: str) -> bool:
+        for candidate in bindings.values():
+            if str(candidate.status or "").strip().lower() != "active":
+                continue
+            if candidate.resource_id == resource_id and candidate.profile_id == profile_id:
+                return True
+        return False
+
+    for binding_id, binding in list(bindings.items()):
+        binding_status = str(binding.status or "").strip().lower() or "active"
+        if binding_status != "active":
+            if prune_deleted_history:
+                resource = store.resources.get(binding.resource_id)
+                resource_deleted = (
+                    resource is None
+                    or str(resource.status or "").strip().lower() == "deleted"
+                )
+                profile_missing = binding.profile_id not in profiles
+                if resource_deleted or profile_missing:
+                    bindings.pop(binding_id, None)
+                    pruned_deleted_bindings += 1
+            continue
+
+        canonical_profile_id = duplicate_to_canonical.get(binding.profile_id)
+        if not canonical_profile_id:
+            continue
+        if _has_active_binding(binding.resource_id, canonical_profile_id):
+            bindings[binding_id] = replace(
+                binding,
+                status="deleted",
+                deleted_at=now,
+                updated_at=now,
+            )
+            rebound_bindings += 1
+            continue
+
+        new_binding_id = str(uuid.uuid4())
+        bindings[new_binding_id] = AuthBinding(
+            binding_id=new_binding_id,
+            resource_id=binding.resource_id,
+            profile_id=canonical_profile_id,
+            priority=_parse_int(binding.priority, default=0),
+            generated_from=f"repair:{binding.binding_id}",
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        bindings[binding_id] = replace(
+            binding,
+            status="deleted",
+            deleted_at=now,
+            updated_at=now,
+        )
+        rebound_bindings += 1
+
+    for resource_id, profile_id in list(workspace_defaults.items()):
+        canonical = duplicate_to_canonical.get(profile_id)
+        if canonical and canonical != profile_id:
+            workspace_defaults[resource_id] = canonical
+            updated_workspace_defaults += 1
+
+    user_resource_defaults = dict(auth_cfg.resource_defaults)
+    for resource_id, profile_id in list(user_resource_defaults.items()):
+        canonical = duplicate_to_canonical.get(profile_id)
+        if canonical and canonical != profile_id:
+            user_resource_defaults[resource_id] = canonical
+            updated_user_resource_defaults += 1
+
+    user_provider_defaults = dict(auth_cfg.defaults)
+    for selector, profile_id in list(user_provider_defaults.items()):
+        canonical = duplicate_to_canonical.get(profile_id)
+        if canonical and canonical != profile_id:
+            user_provider_defaults[selector] = canonical
+
+    next_profiles = {
+        profile_id: profile
+        for profile_id, profile in profiles.items()
+        if profile_id not in duplicate_to_canonical
+    }
+    next_store = replace(
+        store,
+        bindings=bindings,
+        workspace_defaults=workspace_defaults,
+    )
+    next_auth_cfg = replace(
+        auth_cfg,
+        profiles=next_profiles,
+        defaults=user_provider_defaults,
+        resource_defaults=user_resource_defaults,
+    )
+
+    planned = AuthRepairResult(
+        applied=False,
+        snapshot_path=None,
+        duplicate_generated_draft_groups=tuple(sorted(duplicate_groups)),
+        deduped_profiles=tuple(deduped_profiles),
+        rebound_bindings=rebound_bindings,
+        updated_workspace_defaults=updated_workspace_defaults,
+        updated_user_resource_defaults=updated_user_resource_defaults,
+        pruned_deleted_bindings=pruned_deleted_bindings,
+        warnings=(),
+    )
+    if not apply or not planned.changed:
+        return planned
+
+    snapshot = create_auth_snapshot(
+        workspace=ws,
+        explicit_auth_path=explicit_auth_path,
+        label="repair-preflight",
+    )
+    try:
+        if next_store != store:
+            write_workspace_auth_resources(resources_path, next_store)
+        if next_auth_cfg != auth_cfg:
+            write_auth_file(auth_write_path, next_auth_cfg)
+    except Exception as e:
+        try:
+            restore_auth_snapshot(
+                workspace=ws,
+                explicit_auth_path=explicit_auth_path,
+                snapshot_path=snapshot,
+            )
+        except Exception as rollback_error:
+            raise AuthResourceError(
+                "Auth repair apply failed and rollback failed. "
+                f"snapshot={snapshot}; "
+                f"repair_error={e}; rollback_error={rollback_error}"
+            ) from rollback_error
+        raise AuthResourceError(
+            f"Auth repair apply failed and rolled back from {snapshot}: {e}"
+        ) from e
+
+    return AuthRepairResult(
+        applied=True,
+        snapshot_path=snapshot,
+        duplicate_generated_draft_groups=planned.duplicate_generated_draft_groups,
+        deduped_profiles=planned.deduped_profiles,
+        rebound_bindings=planned.rebound_bindings,
+        updated_workspace_defaults=planned.updated_workspace_defaults,
+        updated_user_resource_defaults=planned.updated_user_resource_defaults,
+        pruned_deleted_bindings=planned.pruned_deleted_bindings,
+        warnings=(),
     )

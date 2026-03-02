@@ -40,6 +40,7 @@ from loom.auth.resources import (
     has_active_binding,
     load_workspace_auth_resources,
     migrate_legacy_auth,
+    repair_auth_state,
     resolve_resource,
     resource_delete_impact,
     restore_auth_snapshot,
@@ -1316,6 +1317,10 @@ def auth_audit(ctx: click.Context, as_json: bool) -> None:
         "orphaned_bindings": list(report.orphaned_bindings),
         "historical_deleted_bindings": list(report.historical_deleted_bindings),
         "deleted_resource_bindings": list(report.deleted_resource_bindings),
+        "duplicate_generated_draft_groups": list(
+            report.duplicate_generated_draft_groups
+        ),
+        "stale_generated_profiles": list(report.stale_generated_profiles),
         "legacy_provider_defaults": list(report.legacy_provider_defaults),
         "dangling_workspace_resource_defaults": list(
             report.dangling_workspace_resource_defaults
@@ -1328,6 +1333,8 @@ def auth_audit(ctx: click.Context, as_json: bool) -> None:
         "orphaned_profiles",
         "orphaned_bindings",
         "deleted_resource_bindings",
+        "duplicate_generated_draft_groups",
+        "stale_generated_profiles",
         "legacy_provider_defaults",
         "dangling_workspace_resource_defaults",
         "dangling_user_resource_defaults",
@@ -1350,6 +1357,80 @@ def auth_audit(ctx: click.Context, as_json: bool) -> None:
 
     if finding_count > 0:
         sys.exit(1)
+
+
+@auth.command(name="repair")
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    default=False,
+    help="Apply the repair plan (default is dry-run plan only).",
+)
+@click.option(
+    "--prune-deleted-history",
+    is_flag=True,
+    default=False,
+    help="Prune deleted binding history noise when applying/planning.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def auth_repair(
+    ctx: click.Context,
+    apply_changes: bool,
+    prune_deleted_history: bool,
+    as_json: bool,
+) -> None:
+    """Plan/apply deterministic auth dedupe and rebind repairs."""
+    workspace = ctx.obj.get("workspace")
+    try:
+        result = repair_auth_state(
+            workspace=workspace,
+            explicit_auth_path=ctx.obj.get("explicit_auth_path"),
+            apply=apply_changes,
+            prune_deleted_history=prune_deleted_history,
+        )
+    except Exception as e:
+        click.echo(f"Auth repair failed: {e}", err=True)
+        sys.exit(1)
+
+    payload = {
+        "applied": result.applied,
+        "changed": result.changed,
+        "snapshot_path": str(result.snapshot_path) if result.snapshot_path else None,
+        "duplicate_generated_draft_groups": list(result.duplicate_generated_draft_groups),
+        "deduped_profiles": list(result.deduped_profiles),
+        "rebound_bindings": result.rebound_bindings,
+        "updated_workspace_defaults": result.updated_workspace_defaults,
+        "updated_user_resource_defaults": result.updated_user_resource_defaults,
+        "pruned_deleted_bindings": result.pruned_deleted_bindings,
+        "warnings": list(result.warnings),
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(
+        "Auth repair "
+        f"{'apply' if apply_changes else 'plan'}:"
+    )
+    click.echo(
+        "  duplicate generated groups: "
+        f"{len(result.duplicate_generated_draft_groups)}"
+    )
+    click.echo(f"  deduped profiles: {len(result.deduped_profiles)}")
+    click.echo(f"  rebound bindings: {result.rebound_bindings}")
+    click.echo(f"  updated workspace defaults: {result.updated_workspace_defaults}")
+    click.echo(f"  updated user defaults: {result.updated_user_resource_defaults}")
+    click.echo(f"  pruned deleted bindings: {result.pruned_deleted_bindings}")
+    if result.snapshot_path is not None:
+        click.echo(f"  snapshot: {result.snapshot_path}")
+    for warning in result.warnings:
+        click.echo(f"  warning: {warning}")
+    if not result.changed:
+        click.echo("No repair changes required.")
+    elif not apply_changes:
+        click.echo("Dry-run only. Re-run with --apply to write changes.")
 
 
 @auth.command(name="migrate")
@@ -1972,6 +2053,18 @@ def auth_profile_login(
         click.echo(f"Auth profile not found: {clean_profile_id}", err=True)
         sys.exit(1)
 
+    def _emit_login_start(started) -> None:
+        click.echo("Auth profile OAuth login URL:")
+        click.echo(started.authorization_url)
+        if str(getattr(started, "callback_mode", "")).strip() == "manual":
+            click.echo(
+                "Loopback callback unavailable; using manual callback mode.",
+                err=True,
+            )
+        browser_warning = str(getattr(started, "browser_error", "") or "").strip()
+        if browser_warning:
+            click.echo(f"Browser open warning: {browser_warning}", err=True)
+
     try:
         result = login_oauth_profile(
             profile,
@@ -1986,6 +2079,7 @@ def auth_profile_login(
             callback_prompt=(
                 lambda prompt: click.prompt(prompt, hide_input=False).strip()
             ),
+            on_start=_emit_login_start,
         )
     except OAuthProfileError as e:
         click.echo(
@@ -1998,15 +2092,6 @@ def auth_profile_login(
                 err=True,
             )
         sys.exit(1)
-    click.echo("Auth profile OAuth login URL:")
-    click.echo(result.authorization_url)
-    if result.callback_mode == "manual":
-        click.echo(
-            "Loopback callback unavailable; using manual callback mode.",
-            err=True,
-        )
-    if result.browser_warning:
-        click.echo(f"Browser open warning: {result.browser_warning}", err=True)
     click.echo(
         f"Stored OAuth token for auth profile '{clean_profile_id}' in {result.token_ref}"
     )

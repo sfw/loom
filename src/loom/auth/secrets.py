@@ -149,6 +149,7 @@ class SecretResolver:
         except Exception as e:  # pragma: no cover - import path dependent
             raise SecretResolutionError(
                 "Keychain secret resolution requires the `keyring` package. "
-                "Install it or switch to env:// references."
+                "Install it to use keychain:// references. "
+                "OAuth token persistence currently requires keychain:// storage."
             ) from e
         return keyring

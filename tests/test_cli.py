@@ -785,6 +785,135 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         payload = json.loads(result.output)
         assert payload["orphaned_bindings"] == []
         assert payload["historical_deleted_bindings"] == ["bind-history"]
+        assert payload["duplicate_generated_draft_groups"] == []
+        assert payload["stale_generated_profiles"] == []
+
+    def test_auth_repair_dry_run_and_apply(self, tmp_path):
+        from loom.auth.config import load_auth_file
+        from loom.auth.resources import (
+            AuthBinding,
+            AuthResource,
+            AuthResourcesStore,
+            default_workspace_auth_resources_path,
+            load_workspace_auth_resources,
+            write_workspace_auth_resources,
+        )
+
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.resource_defaults]
+res-youtube = "draft_api_integration_youtube_data_api_2"
+
+[auth.profiles.draft_api_integration_youtube_data_api]
+provider = "youtube_data_api"
+mode = "oauth2_pkce"
+status = "draft"
+generated = "true"
+generated_from = "api_integration:youtube_data_api"
+
+[auth.profiles.draft_api_integration_youtube_data_api_2]
+provider = "youtube_data_api"
+mode = "oauth2_pkce"
+status = "draft"
+generated = "true"
+generated_from = "api_integration:youtube_data_api"
+"""
+        )
+        write_workspace_auth_resources(
+            default_workspace_auth_resources_path(workspace),
+            AuthResourcesStore(
+                resources={
+                    "res-youtube": AuthResource(
+                        resource_id="res-youtube",
+                        resource_kind="api_integration",
+                        resource_key="youtube_data_api",
+                        display_name="API: youtube_data_api",
+                        provider="youtube_data_api",
+                        source="api",
+                        status="active",
+                    ),
+                },
+                bindings={
+                    "bind-youtube": AuthBinding(
+                        binding_id="bind-youtube",
+                        resource_id="res-youtube",
+                        profile_id="draft_api_integration_youtube_data_api_2",
+                        status="active",
+                    ),
+                },
+                workspace_defaults={"res-youtube": "draft_api_integration_youtube_data_api_2"},
+            ),
+        )
+
+        runner = CliRunner()
+        plan = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "repair",
+                "--json",
+            ],
+        )
+        assert plan.exit_code == 0
+        plan_payload = json.loads(plan.output)
+        assert plan_payload["applied"] is False
+        assert plan_payload["changed"] is True
+        assert plan_payload["deduped_profiles"] == [
+            "draft_api_integration_youtube_data_api_2"
+        ]
+
+        applied = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "repair",
+                "--apply",
+                "--json",
+            ],
+        )
+        assert applied.exit_code == 0
+        applied_payload = json.loads(applied.output)
+        assert applied_payload["applied"] is True
+        assert applied_payload["snapshot_path"]
+
+        post_cfg = load_auth_file(auth_cfg)
+        assert "draft_api_integration_youtube_data_api_2" not in post_cfg.profiles
+        assert post_cfg.resource_defaults["res-youtube"] == "draft_api_integration_youtube_data_api"
+
+        post_store = load_workspace_auth_resources(
+            default_workspace_auth_resources_path(workspace),
+        )
+        assert (
+            post_store.workspace_defaults["res-youtube"]
+            == "draft_api_integration_youtube_data_api"
+        )
+        active_bindings = [
+            binding
+            for binding in post_store.bindings.values()
+            if binding.status == "active" and binding.resource_id == "res-youtube"
+        ]
+        assert len(active_bindings) == 1
+        assert (
+            active_bindings[0].profile_id
+            == "draft_api_integration_youtube_data_api"
+        )
 
     def test_auth_migrate_and_rollback(self, tmp_path):
         cfg = tmp_path / "loom.toml"

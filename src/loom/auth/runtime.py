@@ -467,6 +467,11 @@ def oauth_provider_config_for_profile(profile: AuthProfile) -> OAuthProviderConf
         "oauth_client_id",
         "client_id",
     )
+    client_secret = _metadata_value(
+        profile,
+        "oauth_client_secret",
+        "client_secret",
+    )
     if not authorization_endpoint or not token_endpoint or not client_id:
         return None
 
@@ -485,6 +490,7 @@ def oauth_provider_config_for_profile(profile: AuthProfile) -> OAuthProviderConf
         token_endpoint=token_endpoint,
         client_id=client_id,
         scopes=tuple(dict.fromkeys(scopes)),
+        token_params={"client_secret": client_secret} if client_secret else {},
     )
 
 

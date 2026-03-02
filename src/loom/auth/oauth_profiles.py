@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -13,7 +14,12 @@ import httpx
 from loom.auth.config import AuthProfile
 from loom.auth.runtime import oauth_provider_config_for_profile
 from loom.auth.secrets import SecretResolutionError, SecretResolver
-from loom.oauth.engine import OAuthEngine, OAuthEngineError, OAuthProviderConfig
+from loom.oauth.engine import (
+    OAuthEngine,
+    OAuthEngineError,
+    OAuthProviderConfig,
+    OAuthStartResult,
+)
 
 
 class OAuthProfileError(Exception):
@@ -474,6 +480,7 @@ def login_oauth_profile(
     no_browser: bool = False,
     callback_code: str | None = None,
     callback_prompt: Any = None,
+    on_start: Callable[[OAuthStartResult], None] | None = None,
     resolver: SecretResolver | None = None,
 ) -> OAuthProfileLoginResult:
     """Run browser OAuth login for one `/auth` OAuth profile."""
@@ -518,6 +525,8 @@ def login_oauth_profile(
             open_browser=not no_browser,
             allow_manual_fallback=True,
         )
+        if callable(on_start):
+            on_start(started)
 
         manual_input = str(callback_code or "").strip()
         if not manual_input and (no_browser or started.callback_mode == "manual"):

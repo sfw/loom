@@ -409,6 +409,19 @@ class TestAuthAndMCPManagerScreens:
         block = css.split("#auth-manager-summary {", 1)[1].split("}", 1)[0]
         assert "border: round $surface-lighten-1;" in block
 
+    def test_auth_manager_oauth_settings_css_uses_auto_height(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        css = AuthManagerScreen.DEFAULT_CSS
+        block = css.split("#auth-oauth-settings {", 1)[1].split("}", 1)[0]
+        assert "height: auto;" in block
+        assert "layout: vertical;" in block
+        shared_block = css.split("#auth-secret-ref-section,", 1)[1].split("}", 1)[0]
+        assert "#auth-token-ref-section" in shared_block
+        assert "#auth-scopes-section" in shared_block
+        assert "#auth-env-section" in shared_block
+        assert "#auth-command-section" in shared_block
+
     @pytest.mark.asyncio
     async def test_auth_manager_refresh_summary_context_is_single_line(self, monkeypatch):
         from loom.tui.screens.auth_manager import AuthManagerScreen
@@ -606,7 +619,13 @@ class TestAuthAndMCPManagerScreens:
         env_input = SimpleNamespace(value="")
         command_input = SimpleNamespace(value="")
         auth_check_input = SimpleNamespace(value="")
+        oauth_authorize_input = SimpleNamespace(value="")
+        oauth_token_input = SimpleNamespace(value="")
+        oauth_client_id_input = SimpleNamespace(value="")
+        oauth_client_secret_input = SimpleNamespace(value="")
+        oauth_scope_input = SimpleNamespace(value="")
         meta_input = SimpleNamespace(value="")
+        oauth_settings = SimpleNamespace(display=False)
         provider_static = SimpleNamespace(update=lambda _value: None)
 
         def _query_one(selector, _cls=None):
@@ -620,7 +639,13 @@ class TestAuthAndMCPManagerScreens:
                 "#auth-env": env_input,
                 "#auth-command": command_input,
                 "#auth-auth-check": auth_check_input,
+                "#auth-oauth-authorize-url": oauth_authorize_input,
+                "#auth-oauth-token-url": oauth_token_input,
+                "#auth-oauth-client-id": oauth_client_id_input,
+                "#auth-oauth-client-secret": oauth_client_secret_input,
+                "#auth-oauth-scope": oauth_scope_input,
                 "#auth-meta": meta_input,
+                "#auth-oauth-settings": oauth_settings,
                 "#auth-provider-derived": provider_static,
             }
             return mapping[selector]
@@ -628,6 +653,7 @@ class TestAuthAndMCPManagerScreens:
         screen.query_one = _query_one
         screen._set_mcp_server_select_value = lambda _alias: order.append("resource")
         screen._set_mode_select_value = lambda _mode: order.append("mode")
+        screen._refresh_oauth_settings_visibility = MagicMock()
 
         screen._set_form_values(
             profile_id="draft_api_integration_youtube_data_api",
@@ -646,6 +672,214 @@ class TestAuthAndMCPManagerScreens:
         )
 
         assert order == ["resource", "mode"]
+
+    def test_auth_manager_default_oauth_token_ref_uses_keychain_template(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+
+        token_ref = screen._default_oauth_token_ref(
+            provider="YouTube Data API",
+            key_name="Primary Account",
+        )
+
+        assert token_ref == "keychain://loom/youtube_data_api/primary_account/tokens"
+
+    def test_auth_manager_oauth_settings_visibility_tracks_mode(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        oauth_settings = SimpleNamespace(display=False)
+        secret_section = SimpleNamespace(display=True)
+        token_section = SimpleNamespace(display=False)
+        scopes_section = SimpleNamespace(display=False)
+        env_section = SimpleNamespace(display=False)
+        command_section = SimpleNamespace(display=False)
+
+        def _query_one(selector, _cls=None):
+            mapping = {
+                "#auth-oauth-settings": oauth_settings,
+                "#auth-secret-ref-section": secret_section,
+                "#auth-token-ref-section": token_section,
+                "#auth-scopes-section": scopes_section,
+                "#auth-env-section": env_section,
+                "#auth-command-section": command_section,
+            }
+            return mapping[selector]
+
+        screen.query_one = _query_one
+
+        screen._selected_mode = lambda: "oauth2_pkce"
+        screen._refresh_oauth_settings_visibility()
+        assert oauth_settings.display is True
+        assert secret_section.display is False
+        assert token_section.display is True
+        assert scopes_section.display is True
+        assert env_section.display is False
+        assert command_section.display is False
+
+        screen._selected_mode = lambda: "api_key"
+        screen._refresh_oauth_settings_visibility()
+        assert oauth_settings.display is False
+        assert secret_section.display is True
+        assert token_section.display is False
+        assert scopes_section.display is False
+        assert env_section.display is True
+        assert command_section.display is False
+
+        screen._selected_mode = lambda: "env_passthrough"
+        screen._refresh_oauth_settings_visibility()
+        assert oauth_settings.display is False
+        assert secret_section.display is False
+        assert token_section.display is False
+        assert scopes_section.display is False
+        assert env_section.display is True
+        assert command_section.display is False
+
+        screen._selected_mode = lambda: "cli_passthrough"
+        screen._refresh_oauth_settings_visibility()
+        assert oauth_settings.display is False
+        assert secret_section.display is False
+        assert token_section.display is False
+        assert scopes_section.display is False
+        assert env_section.display is False
+        assert command_section.display is True
+
+    def test_auth_manager_maybe_set_default_oauth_token_ref_only_when_empty(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        token_input = SimpleNamespace(value="")
+
+        def _query_one(selector, _cls=None):
+            assert selector == "#auth-token-ref"
+            return token_input
+
+        screen.query_one = _query_one
+        screen._selected_mode = lambda: "oauth2_pkce"
+        screen._default_oauth_token_ref = lambda provider="", key_name="": (
+            f"keychain://loom/{provider}/{key_name}/tokens"
+        )
+
+        screen._maybe_set_default_oauth_token_ref(
+            provider="youtube_data_api",
+            key_name="api_integration_youtube_data_api",
+        )
+        assert (
+            token_input.value
+            == "keychain://loom/youtube_data_api/api_integration_youtube_data_api/tokens"
+        )
+
+        token_input.value = "keychain://loom/custom/path/tokens"
+        screen._maybe_set_default_oauth_token_ref(
+            provider="youtube_data_api",
+            key_name="new_profile",
+        )
+        assert token_input.value == "keychain://loom/custom/path/tokens"
+
+    def test_auth_manager_missing_required_oauth_metadata(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        missing = AuthManagerScreen._missing_required_oauth_metadata(
+            {
+                "oauth_client_id": "client-123",
+            }
+        )
+
+        assert missing == ("OAuth Authorization URL", "OAuth Token URL")
+
+    @pytest.mark.asyncio
+    async def test_auth_manager_save_profile_requires_oauth_metadata(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._profiles = {}
+        screen._workspace_defaults = {}
+        screen._workspace_resource_defaults = {}
+        screen._resources_by_id = {
+            "res-youtube": SimpleNamespace(
+                provider="youtube_data_api",
+                resource_kind="api_integration",
+                resource_key="youtube_data_api",
+            ),
+        }
+        screen._selected_resource_id = lambda: "res-youtube"
+        screen._selected_mode = lambda: "oauth2_pkce"
+        screen._profile_id = lambda: "youtube_profile"
+        screen._default_provider_selected = lambda: False
+        screen.notify = MagicMock()
+
+        fields = {
+            "#auth-label": SimpleNamespace(value="API: youtube_data_api"),
+            "#auth-secret-ref": SimpleNamespace(value=""),
+            "#auth-token-ref": SimpleNamespace(value=""),
+            "#auth-scopes": SimpleNamespace(value=""),
+            "#auth-env": SimpleNamespace(value=""),
+            "#auth-command": SimpleNamespace(value=""),
+            "#auth-auth-check": SimpleNamespace(value=""),
+            "#auth-meta": SimpleNamespace(value=""),
+            "#auth-oauth-authorize-url": SimpleNamespace(value=""),
+            "#auth-oauth-token-url": SimpleNamespace(value=""),
+            "#auth-oauth-client-id": SimpleNamespace(value=""),
+            "#auth-oauth-client-secret": SimpleNamespace(value=""),
+            "#auth-oauth-scope": SimpleNamespace(value=""),
+        }
+        screen.query_one = lambda selector, _cls=None: fields[selector]
+
+        saved = await screen._save_profile()
+
+        assert saved is False
+        assert any(
+            "OAuth mode requires:" in str(call.args[0]) for call in screen.notify.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_auth_manager_save_profile_requires_keychain_token_ref_for_oauth(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._profiles = {}
+        screen._workspace_defaults = {}
+        screen._workspace_resource_defaults = {}
+        screen._resources_by_id = {
+            "res-youtube": SimpleNamespace(
+                provider="youtube_data_api",
+                resource_kind="api_integration",
+                resource_key="youtube_data_api",
+            ),
+        }
+        screen._selected_resource_id = lambda: "res-youtube"
+        screen._selected_mode = lambda: "oauth2_pkce"
+        screen._profile_id = lambda: "youtube_profile"
+        screen._default_provider_selected = lambda: False
+        screen.notify = MagicMock()
+
+        fields = {
+            "#auth-label": SimpleNamespace(value="API: youtube_data_api"),
+            "#auth-secret-ref": SimpleNamespace(value=""),
+            "#auth-token-ref": SimpleNamespace(value="env://YOUTUBE_TOKEN"),
+            "#auth-scopes": SimpleNamespace(value=""),
+            "#auth-env": SimpleNamespace(value=""),
+            "#auth-command": SimpleNamespace(value=""),
+            "#auth-auth-check": SimpleNamespace(value=""),
+            "#auth-meta": SimpleNamespace(value=""),
+            "#auth-oauth-authorize-url": SimpleNamespace(
+                value="https://accounts.google.com/o/oauth2/v2/auth"
+            ),
+            "#auth-oauth-token-url": SimpleNamespace(value="https://oauth2.googleapis.com/token"),
+            "#auth-oauth-client-id": SimpleNamespace(value="client-123"),
+            "#auth-oauth-client-secret": SimpleNamespace(value=""),
+            "#auth-oauth-scope": SimpleNamespace(value=""),
+        }
+        screen.query_one = lambda selector, _cls=None: fields[selector]
+
+        saved = await screen._save_profile()
+
+        assert saved is False
+        assert any(
+            "OAuth token_ref must use keychain://... storage." in str(call.args[0])
+            for call in screen.notify.call_args_list
+        )
 
     def test_auth_manager_ignores_programmatic_select_changes_when_suppressed(self):
         from loom.tui.screens.auth_manager import AuthManagerScreen
@@ -692,9 +926,60 @@ class TestAuthAndMCPManagerScreens:
         screen._oauth_refresh.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_auth_manager_oauth_login_passes_callback_prompt(self, monkeypatch):
+        from loom.auth.oauth_profiles import OAuthProfileError
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._oauth_target_profile = AsyncMock(return_value=SimpleNamespace(profile_id="youtube"))
+        screen.notify = MagicMock()
+
+        observed: dict[str, object] = {}
+
+        def _fake_login(profile, **kwargs):
+            observed["profile"] = profile
+            observed["callback_prompt"] = kwargs.get("callback_prompt")
+            raise OAuthProfileError(
+                "callback_missing",
+                "Callback URL/code required for manual OAuth completion.",
+            )
+
+        monkeypatch.setattr("loom.tui.screens.auth_manager.login_oauth_profile", _fake_login)
+
+        await screen._oauth_login()
+
+        assert observed["profile"].profile_id == "youtube"
+        assert callable(observed["callback_prompt"])
+        assert any(
+            "OAuth callback input was not provided; login canceled." in str(call.args[0])
+            for call in screen.notify.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_auth_manager_oauth_target_profile_autosaves_dirty_form(self):
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        screen = AuthManagerScreen(workspace=Path("/tmp"))
+        screen._form_dirty = True
+        screen._save_profile = AsyncMock(return_value=True)
+        screen._profiles = {
+            "youtube": SimpleNamespace(profile_id="youtube", mode="oauth2_pkce")
+        }
+        screen._active_profile_id = "youtube"
+        screen._profile_id = lambda: "youtube"
+        screen.notify = MagicMock()
+
+        profile = await screen._oauth_target_profile()
+
+        assert profile is not None
+        assert profile.profile_id == "youtube"
+        screen._save_profile.assert_awaited_once_with(notify_success=False)
+
+    @pytest.mark.asyncio
     async def test_auth_manager_load_profile_keeps_mode_selected_after_events(self):
         from textual.app import App
-        from textual.widgets import Select
+        from textual.containers import Vertical
+        from textual.widgets import Input, Select
 
         from loom.tui.screens.auth_manager import AuthManagerScreen
 
@@ -735,7 +1020,13 @@ class TestAuthAndMCPManagerScreens:
             env={},
             command="",
             auth_check=[],
-            metadata={"generated": "true"},
+            metadata={
+                "generated": "true",
+                "oauth_authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+                "oauth_token_endpoint": "https://oauth2.googleapis.com/token",
+                "oauth_client_id": "client-123",
+                "oauth_scope": "https://www.googleapis.com/auth/youtube.readonly",
+            },
         )
         screen._profiles = {profile_id: profile}
         screen._resources_by_id = {
@@ -757,9 +1048,19 @@ class TestAuthAndMCPManagerScreens:
             await pilot.pause()
 
             mode_select = screen.query_one("#auth-mode", Select)
+            oauth_authorize = screen.query_one("#auth-oauth-authorize-url", Input)
+            oauth_token = screen.query_one("#auth-oauth-token-url", Input)
+            oauth_client_id = screen.query_one("#auth-oauth-client-id", Input)
+            meta_input = screen.query_one("#auth-meta", Input)
+            oauth_settings = screen.query_one("#auth-oauth-settings", Vertical)
             assert loaded is True
             assert mode_select.value == "oauth2_pkce"
             assert screen._selected_mode() == "oauth2_pkce"
+            assert oauth_authorize.value == "https://accounts.google.com/o/oauth2/v2/auth"
+            assert oauth_token.value == "https://oauth2.googleapis.com/token"
+            assert oauth_client_id.value == "client-123"
+            assert meta_input.value == "generated=true"
+            assert oauth_settings.display is True
 
     @pytest.mark.asyncio
     async def test_auth_manager_on_mount_does_not_sync_implicitly(self):
