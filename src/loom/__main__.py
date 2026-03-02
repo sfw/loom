@@ -1309,6 +1309,7 @@ def auth_audit(ctx: click.Context, as_json: bool) -> None:
     payload = {
         "orphaned_profiles": list(report.orphaned_profiles),
         "orphaned_bindings": list(report.orphaned_bindings),
+        "historical_deleted_bindings": list(report.historical_deleted_bindings),
         "deleted_resource_bindings": list(report.deleted_resource_bindings),
         "legacy_provider_defaults": list(report.legacy_provider_defaults),
         "dangling_workspace_resource_defaults": list(
@@ -1318,7 +1319,15 @@ def auth_audit(ctx: click.Context, as_json: bool) -> None:
             report.dangling_user_resource_defaults
         ),
     }
-    finding_count = sum(len(items) for items in payload.values())
+    actionable_keys = (
+        "orphaned_profiles",
+        "orphaned_bindings",
+        "deleted_resource_bindings",
+        "legacy_provider_defaults",
+        "dangling_workspace_resource_defaults",
+        "dangling_user_resource_defaults",
+    )
+    finding_count = sum(len(payload[key]) for key in actionable_keys)
 
     if as_json:
         click.echo(json.dumps(payload, indent=2, sort_keys=True))

@@ -143,6 +143,7 @@ class AuthAuditReport:
 
     orphaned_profiles: tuple[str, ...] = ()
     orphaned_bindings: tuple[str, ...] = ()
+    historical_deleted_bindings: tuple[str, ...] = ()
     deleted_resource_bindings: tuple[str, ...] = ()
     legacy_provider_defaults: tuple[str, ...] = ()
     dangling_workspace_resource_defaults: tuple[str, ...] = ()
@@ -2169,14 +2170,25 @@ def audit_auth_state(
             orphaned_profiles.append(profile_id)
 
     orphaned_bindings: list[str] = []
+    historical_deleted_bindings: list[str] = []
     deleted_resource_bindings: list[str] = []
     for binding_id, binding in store.bindings.items():
+        status = str(getattr(binding, "status", "active") or "active").strip().lower()
         resource = store.resources.get(binding.resource_id)
+        if status != "active":
+            if (
+                resource is None
+                or str(getattr(resource, "status", "")).strip().lower() == "deleted"
+                or binding.profile_id not in merged.config.profiles
+            ):
+                historical_deleted_bindings.append(binding_id)
+            continue
         if resource is None:
             orphaned_bindings.append(binding_id)
             continue
         if resource.status == "deleted" and binding.status == "active":
             deleted_resource_bindings.append(binding_id)
+            continue
         if binding.profile_id not in merged.config.profiles:
             orphaned_bindings.append(binding_id)
 
@@ -2211,6 +2223,7 @@ def audit_auth_state(
     return AuthAuditReport(
         orphaned_profiles=tuple(sorted(orphaned_profiles)),
         orphaned_bindings=tuple(sorted(orphaned_bindings)),
+        historical_deleted_bindings=tuple(sorted(historical_deleted_bindings)),
         deleted_resource_bindings=tuple(sorted(deleted_resource_bindings)),
         legacy_provider_defaults=tuple(sorted(set(legacy_provider_defaults))),
         dangling_workspace_resource_defaults=tuple(dangling_workspace_resource_defaults),

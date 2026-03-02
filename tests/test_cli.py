@@ -280,6 +280,8 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
 """
         )
 
+        home = tmp_path / "home"
+        home.mkdir()
         runner = CliRunner()
         result = runner.invoke(
             cli,
@@ -697,6 +699,91 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         )
         assert result.exit_code == 1
         assert "legacy_provider_defaults" in result.output
+
+    def test_auth_audit_reports_deleted_history_without_failing(self, tmp_path):
+        from loom.auth.resources import (
+            AuthBinding,
+            AuthResource,
+            AuthResourcesStore,
+            default_workspace_auth_resources_path,
+            write_workspace_auth_resources,
+        )
+
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+"""
+        )
+        write_workspace_auth_resources(
+            default_workspace_auth_resources_path(workspace),
+            AuthResourcesStore(
+                resources={
+                    "res-notion-active": AuthResource(
+                        resource_id="res-notion-active",
+                        resource_kind="api_integration",
+                        resource_key="notion-active",
+                        display_name="API: notion-active",
+                        provider="notion",
+                        source="api",
+                        status="active",
+                    ),
+                    "res-notion-deleted": AuthResource(
+                        resource_id="res-notion-deleted",
+                        resource_kind="api_integration",
+                        resource_key="notion",
+                        display_name="API: notion",
+                        provider="notion",
+                        source="api",
+                        status="deleted",
+                    ),
+                },
+                bindings={
+                    "bind-active": AuthBinding(
+                        binding_id="bind-active",
+                        resource_id="res-notion-active",
+                        profile_id="notion_marketing",
+                        status="active",
+                    ),
+                    "bind-history": AuthBinding(
+                        binding_id="bind-history",
+                        resource_id="res-notion-deleted",
+                        profile_id="missing-profile",
+                        status="deleted",
+                    ),
+                },
+            ),
+        )
+
+        home = tmp_path / "home"
+        home.mkdir()
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "audit",
+                "--json",
+            ],
+            env={"HOME": str(home)},
+        )
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["orphaned_bindings"] == []
+        assert payload["historical_deleted_bindings"] == ["bind-history"]
 
     def test_auth_migrate_and_rollback(self, tmp_path):
         cfg = tmp_path / "loom.toml"
