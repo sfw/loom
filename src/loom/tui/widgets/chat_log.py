@@ -5,10 +5,51 @@ from __future__ import annotations
 import asyncio
 
 from rich.markdown import Markdown as RichMarkdown
+from rich.style import Style
+from textual import events
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from loom.tui.widgets.tool_call import DelegateProgressWidget, ToolCallWidget
+
+
+class LinkAwareStatic(Static):
+    """Static widget that treats Rich-rendered links as clickable URLs."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._hovered_link = ""
+
+    @staticmethod
+    def _extract_link(style: Style | None) -> str | None:
+        href = (style.link if style is not None else "") or ""
+        href = href.strip()
+        if not href or href.startswith("#"):
+            return None
+        return href
+
+    def _sync_link_tooltip(self, href: str | None) -> None:
+        normalized = href or ""
+        if normalized == self._hovered_link:
+            return
+        self._hovered_link = normalized
+        self.tooltip = normalized or None
+
+    def _open_link(self, href: str) -> None:
+        self.app.open_url(href)
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        self._sync_link_tooltip(self._extract_link(event.style))
+
+    def on_leave(self, _event: events.Leave) -> None:
+        self._sync_link_tooltip(None)
+
+    def on_click(self, event: events.Click) -> None:
+        href = self._extract_link(event.style)
+        if not href:
+            return
+        event.stop()
+        self._open_link(href)
 
 
 class ChatLog(VerticalScroll):
@@ -80,7 +121,7 @@ class ChatLog(VerticalScroll):
         if markup:
             widget = Static(text, classes="model-text", expand=True, markup=True)
         else:
-            widget = Static(
+            widget = LinkAwareStatic(
                 RichMarkdown(text or ""),
                 classes="model-text",
                 expand=True,
@@ -98,7 +139,7 @@ class ChatLog(VerticalScroll):
 
         if self._stream_widget is None:
             self._stream_text = ""
-            self._stream_widget = Static("", classes="model-text", expand=True)
+            self._stream_widget = LinkAwareStatic("", classes="model-text", expand=True)
             self.mount(self._stream_widget)
 
         # Flush every 5 chunks or when text is large

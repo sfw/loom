@@ -1908,6 +1908,42 @@ class TestChatLogStreaming:
         assert log._stream_widget.expand is True
         assert mounted == [log._stream_widget]
 
+    def test_link_aware_widget_opens_url_on_click(self):
+        from types import SimpleNamespace
+
+        from rich.style import Style
+
+        from loom.tui.widgets.chat_log import LinkAwareStatic
+
+        opened: list[str] = []
+        stopped: list[bool] = []
+        widget = LinkAwareStatic("")
+        widget._open_link = lambda href: opened.append(href)  # type: ignore[method-assign]
+
+        widget.on_click(
+            SimpleNamespace(
+                style=Style(link="https://example.com"),
+                stop=lambda: stopped.append(True),
+            )
+        )
+
+        assert opened == ["https://example.com"]
+        assert stopped == [True]
+
+    def test_link_aware_widget_sets_tooltip_from_hovered_link(self):
+        from types import SimpleNamespace
+
+        from rich.style import Style
+
+        from loom.tui.widgets.chat_log import LinkAwareStatic
+
+        widget = LinkAwareStatic("")
+        widget.on_mouse_move(SimpleNamespace(style=Style(link="https://example.com")))
+        assert widget.tooltip == "https://example.com"
+
+        widget.on_mouse_move(SimpleNamespace(style=Style(link="#heading")))
+        assert widget.tooltip is None
+
     def test_delegate_progress_section_lifecycle(self):
         from loom.tui.widgets.chat_log import ChatLog
 
