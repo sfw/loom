@@ -14,6 +14,15 @@ class ActivityIndicator(Static):
     _GLYPH_IDLE = "[#4f6787]■[/]"
     _GLYPH_TRAIL = "[#7dcfff]■[/]"
     _GLYPH_HEAD = "[bold #00f0ff]■[/]"
+    _GLYPH_IDLE_TOP = "[#4f6787]▄[/]"
+    _GLYPH_TRAIL_TOP = "[#7dcfff]▄[/]"
+    _GLYPH_HEAD_TOP = "[bold #00f0ff]▄[/]"
+    _GLYPH_IDLE_MID = "[#4f6787]█[/]"
+    _GLYPH_TRAIL_MID = "[#7dcfff]█[/]"
+    _GLYPH_HEAD_MID = "[bold #00f0ff]█[/]"
+    _GLYPH_IDLE_BOT = "[#4f6787]▀[/]"
+    _GLYPH_TRAIL_BOT = "[#7dcfff]▀[/]"
+    _GLYPH_HEAD_BOT = "[bold #00f0ff]▀[/]"
 
     DEFAULT_CSS = """
     ActivityIndicator {
@@ -138,15 +147,59 @@ class ActivityIndicator(Static):
         self._advance_frame()
         self.refresh()
 
-    def render(self) -> str:
-        dots = [self._GLYPH_IDLE for _ in range(self._dot_count)]
+    def _render_line(
+        self,
+        *,
+        idle_glyph: str,
+        trail_glyph: str,
+        head_glyph: str,
+    ) -> str:
+        dots = [idle_glyph for _ in range(self._dot_count)]
         if self._is_visually_active():
             index = max(0, min(self._frame_index, self._dot_count - 1))
             left = index - 1
             right = index + 1
             if left >= 0:
-                dots[left] = self._GLYPH_TRAIL
+                dots[left] = trail_glyph
             if right < self._dot_count:
-                dots[right] = self._GLYPH_TRAIL
-            dots[index] = self._GLYPH_HEAD
+                dots[right] = trail_glyph
+            dots[index] = head_glyph
         return "".join(dots)
+
+    def render(self) -> str:
+        line = self._render_line(
+            idle_glyph=self._GLYPH_IDLE,
+            trail_glyph=self._GLYPH_TRAIL,
+            head_glyph=self._GLYPH_HEAD,
+        )
+        height = max(1, int(getattr(self.size, "height", 1) or 1))
+        if height <= 1:
+            return line
+        rows: list[str] = []
+        for row_idx in range(height):
+            if row_idx == 0:
+                rows.append(
+                    self._render_line(
+                        idle_glyph=self._GLYPH_IDLE_TOP,
+                        trail_glyph=self._GLYPH_TRAIL_TOP,
+                        head_glyph=self._GLYPH_HEAD_TOP,
+                    )
+                )
+                continue
+            if row_idx == (height - 1):
+                rows.append(
+                    self._render_line(
+                        idle_glyph=self._GLYPH_IDLE_BOT,
+                        trail_glyph=self._GLYPH_TRAIL_BOT,
+                        head_glyph=self._GLYPH_HEAD_BOT,
+                    )
+                )
+                continue
+            rows.append(
+                self._render_line(
+                    idle_glyph=self._GLYPH_IDLE_MID,
+                    trail_glyph=self._GLYPH_TRAIL_MID,
+                    head_glyph=self._GLYPH_HEAD_MID,
+                )
+            )
+        return "\n".join(rows)

@@ -9155,6 +9155,8 @@ class TestCommandPaletteProcessActions:
             await pilot.pause()
             assert indicator.region.height == clock.region.height
             assert indicator.region.y == clock.region.y
+            rendered = indicator.render()
+            assert rendered.count("\n") == max(0, indicator.region.height - 1)
 
     def test_background_work_active_predicate(self):
         from loom.tui.app import LoomApp
