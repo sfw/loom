@@ -343,7 +343,7 @@ Remote MCP aliases additionally support:
 | `url` | `string` | `""` | Remote MCP endpoint URL (HTTPS required unless `allow_insecure_http=true`). |
 | `fallback_sse_url` | `string` | `""` | Optional SSE fallback endpoint. |
 | `headers` | `table` | `{}` | Additional request headers (sensitive values redacted in displays). |
-| `oauth.enabled` | `bool` | `false` | Require MCP alias OAuth token readiness before requests. |
+| `oauth.enabled` | `bool` | `true` (remote) / `false` (local) | Require MCP alias OAuth token readiness before requests. |
 | `oauth.scopes` | `list[string]` | `[]` | Scope hints used for browser OAuth login. |
 | `allow_insecure_http` | `bool` | `false` | Allow `http://` remote URLs for trusted local/dev usage. |
 | `allow_private_network` | `bool` | `false` | Allow loopback/private-network remote URLs for trusted usage. |

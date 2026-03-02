@@ -330,6 +330,7 @@ class AuthManagerScreen(Vertical):
             )
             with Horizontal(classes="auth-actions-row", id="auth-actions-primary"):
                 yield Button("Refresh", id="auth-btn-refresh")
+                yield Button("Sync", id="auth-btn-sync")
                 yield Button("Load", id="auth-btn-load")
                 yield Button("Save", id="auth-btn-save", variant="primary")
                 yield Button("Duplicate", id="auth-btn-duplicate")
@@ -481,7 +482,7 @@ class AuthManagerScreen(Vertical):
                         classes="auth-help",
                     )
             yield Label(
-                "[dim]Load a row to edit, then Save to upsert profile and bindings.[/dim]",
+                "[dim]Refresh is read-only. Use Sync to discover drafts, then Save to upsert profile and bindings.[/dim]",  # noqa: E501
                 id="auth-manager-footer",
             )
 
@@ -502,7 +503,6 @@ class AuthManagerScreen(Vertical):
             metadata="",
         )
         self._mark_form_clean(active_profile_id="")
-        await self._sync_missing_drafts()
         await self._refresh_summary()
         self.query_one("#auth-profile-id", Input).focus()
 
@@ -526,6 +526,9 @@ class AuthManagerScreen(Vertical):
         await self._request_close()
 
     async def action_refresh(self) -> None:
+        await self._refresh_summary()
+
+    async def action_sync(self) -> None:
         await self._sync_missing_drafts()
         await self._refresh_summary()
 
@@ -536,7 +539,10 @@ class AuthManagerScreen(Vertical):
             await self.action_request_close()
             return
         if button_id == "auth-btn-refresh":
-            await self._refresh_summary()
+            await self.action_refresh()
+            return
+        if button_id == "auth-btn-sync":
+            await self.action_sync()
             return
         if button_id == "auth-btn-load":
             selected = self._selected_summary_profile_id()

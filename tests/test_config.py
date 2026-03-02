@@ -515,6 +515,19 @@ scopes = ["read:content", "write:content"]
         assert server.oauth.enabled is True
         assert server.oauth.scopes == ["read:content", "write:content"]
 
+    def test_load_remote_mcp_server_defaults_oauth_enabled(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+""")
+        config = load_config(toml_file)
+        server = config.mcp.servers["remote_demo"]
+        assert server.type == "remote"
+        assert server.oauth.enabled is True
+        assert server.oauth.scopes == []
+
     def test_load_remote_mcp_server_rejects_insecure_http_by_default(
         self,
         tmp_path: Path,

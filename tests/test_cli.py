@@ -426,6 +426,49 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         assert check_result.exit_code == 0
         assert "Auth config is valid." in check_result.output
 
+    def test_auth_check_with_explicit_config_ignores_user_overlay_profiles(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+"""
+        )
+
+        home = tmp_path / "home"
+        user_auth = home / ".loom" / "auth.toml"
+        user_auth.parent.mkdir(parents=True)
+        user_auth.write_text(
+            """
+[auth.profiles.draft_mcp_notion_2]
+provider = "notion"
+mode = "api_key"
+mcp_server = "notion"
+status = "draft"
+token_ref = "keychain://loom/notion/draft/tokens"
+"""
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "check",
+            ],
+            env={"HOME": str(home)},
+        )
+        assert result.exit_code == 0
+        assert "Auth config is valid." in result.output
+
     def test_auth_select_sets_and_unsets_workspace_default(self, tmp_path):
         cfg = tmp_path / "loom.toml"
         cfg.write_text("[server]\nport = 9000\n")

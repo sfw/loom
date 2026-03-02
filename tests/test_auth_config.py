@@ -562,6 +562,177 @@ def test_sync_missing_drafts_creates_resource_binding_and_default(tmp_path: Path
     )
 
 
+def test_sync_missing_drafts_is_idempotent_for_unchanged_requirements(
+    tmp_path: Path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    auth_path = tmp_path / "auth.toml"
+    process_defs = [
+        types.SimpleNamespace(
+            name="youtube-draft-descriptions",
+            auth=types.SimpleNamespace(
+                required=[
+                    {
+                        "provider": "youtube_data_api",
+                        "source": "api",
+                        "resource_ref": "api_integration:youtube_data_api",
+                        "modes": ["oauth2_pkce", "oauth2_device"],
+                    }
+                ]
+            ),
+            tools=types.SimpleNamespace(excluded=[]),
+        )
+    ]
+
+    first = sync_missing_drafts(
+        workspace=workspace,
+        explicit_auth_path=auth_path,
+        process_defs=process_defs,
+    )
+    second = sync_missing_drafts(
+        workspace=workspace,
+        explicit_auth_path=auth_path,
+        process_defs=process_defs,
+    )
+
+    assert first.created_drafts == 1
+    assert second.created_drafts == 0
+    assert second.created_bindings == 0
+
+    auth_cfg = load_auth_file(auth_path)
+    draft_ids = sorted(
+        profile_id
+        for profile_id, profile in auth_cfg.profiles.items()
+        if profile.status == "draft"
+    )
+    assert draft_ids == ["draft_api_integration_youtube_data_api"]
+
+
+def test_sync_missing_drafts_reuses_compatible_orphan_draft_profile(
+    tmp_path: Path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    auth_path = tmp_path / "auth.toml"
+    auth_path.write_text(
+        """
+[auth.profiles.draft_api_integration_youtube_data_api_2]
+provider = "youtube_data_api"
+mode = "oauth2_pkce"
+status = "draft"
+generated = "true"
+generated_from = "api_integration:youtube_data_api"
+"""
+    )
+    process_defs = [
+        types.SimpleNamespace(
+            name="youtube-draft-descriptions",
+            auth=types.SimpleNamespace(
+                required=[
+                    {
+                        "provider": "youtube_data_api",
+                        "source": "api",
+                        "resource_ref": "api_integration:youtube_data_api",
+                        "modes": ["oauth2_pkce"],
+                    }
+                ]
+            ),
+            tools=types.SimpleNamespace(excluded=[]),
+        )
+    ]
+
+    result = sync_missing_drafts(
+        workspace=workspace,
+        explicit_auth_path=auth_path,
+        process_defs=process_defs,
+    )
+    assert result.created_drafts == 0
+    assert result.created_bindings == 1
+
+    auth_cfg = load_auth_file(auth_path)
+    assert sorted(auth_cfg.profiles.keys()) == ["draft_api_integration_youtube_data_api_2"]
+
+    store = load_workspace_auth_resources(
+        default_workspace_auth_resources_path(workspace),
+    )
+    active_bindings = [
+        binding for binding in store.bindings.values() if binding.status == "active"
+    ]
+    assert len(active_bindings) == 1
+    assert active_bindings[0].profile_id == "draft_api_integration_youtube_data_api_2"
+
+
+def test_sync_missing_drafts_prefers_stable_draft_id_when_duplicates_exist(
+    tmp_path: Path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    auth_path = tmp_path / "auth.toml"
+    auth_path.write_text(
+        """
+[auth.profiles.draft_api_integration_youtube_data_api]
+provider = "youtube_data_api"
+mode = "oauth2_pkce"
+status = "draft"
+generated = "true"
+generated_from = "api_integration:youtube_data_api"
+
+[auth.profiles.draft_api_integration_youtube_data_api_2]
+provider = "youtube_data_api"
+mode = "oauth2_pkce"
+status = "draft"
+generated = "true"
+generated_from = "api_integration:youtube_data_api"
+"""
+    )
+    process_defs = [
+        types.SimpleNamespace(
+            name="youtube-draft-descriptions",
+            auth=types.SimpleNamespace(
+                required=[
+                    {
+                        "provider": "youtube_data_api",
+                        "source": "api",
+                        "resource_ref": "api_integration:youtube_data_api",
+                        "modes": ["oauth2_pkce"],
+                    }
+                ]
+            ),
+            tools=types.SimpleNamespace(excluded=[]),
+        )
+    ]
+
+    result = sync_missing_drafts(
+        workspace=workspace,
+        explicit_auth_path=auth_path,
+        process_defs=process_defs,
+    )
+    assert result.created_drafts == 0
+    assert result.created_bindings == 1
+
+    store = load_workspace_auth_resources(
+        default_workspace_auth_resources_path(workspace),
+    )
+    active_bindings = [
+        binding for binding in store.bindings.values() if binding.status == "active"
+    ]
+    assert len(active_bindings) == 1
+    assert active_bindings[0].profile_id == "draft_api_integration_youtube_data_api"
+
+
 def test_discover_auth_resources_skips_mcp_remote_alias_without_explicit_requirement():
     class _FakeMCPManager:
         def list_views(self):
@@ -569,8 +740,9 @@ def test_discover_auth_resources_skips_mcp_remote_alias_without_explicit_require
                 types.SimpleNamespace(
                     alias="notion",
                     server=types.SimpleNamespace(
-                        command="npx",
-                        args=["-y", "mcp-remote", "https://mcp.notion.com/mcp"],
+                        type="remote",
+                        oauth=types.SimpleNamespace(enabled=True, scopes=["read:content"]),
+                        url="https://mcp.notion.com/mcp",
                     ),
                 )
             ]
@@ -582,6 +754,33 @@ def test_discover_auth_resources_skips_mcp_remote_alias_without_explicit_require
         scope="active",
     )
     assert discovered == []
+
+
+def test_discover_auth_resources_keeps_local_mcp_alias_without_external_oauth():
+    class _FakeMCPManager:
+        def list_views(self):
+            return [
+                types.SimpleNamespace(
+                    alias="notion",
+                    server=types.SimpleNamespace(
+                        type="local",
+                        oauth=types.SimpleNamespace(enabled=False, scopes=[]),
+                        command="npx",
+                        args=["-y", "@notion/mcp"],
+                    ),
+                )
+            ]
+
+    discovered = discover_auth_resources(
+        process_def=None,
+        tool_registry=None,
+        mcp_manager=_FakeMCPManager(),
+        scope="active",
+    )
+    assert len(discovered) == 1
+    item = discovered[0]
+    assert item.resource_kind == "mcp"
+    assert item.resource_key == "notion"
 
 
 def test_discover_auth_resources_supports_process_defs_collection():
@@ -635,8 +834,9 @@ def test_discover_auth_resources_keeps_explicit_mcp_requirement_even_for_mcp_rem
                 types.SimpleNamespace(
                     alias="notion",
                     server=types.SimpleNamespace(
-                        command="npx",
-                        args=["-y", "mcp-remote", "https://mcp.notion.com/mcp"],
+                        type="remote",
+                        oauth=types.SimpleNamespace(enabled=True, scopes=["read:content"]),
+                        url="https://mcp.notion.com/mcp",
                     ),
                 )
             ]

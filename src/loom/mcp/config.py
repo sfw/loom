@@ -84,9 +84,10 @@ def _parse_str_map(raw: object) -> dict[str, str]:
     return parsed
 
 
-def _parse_oauth(raw: object) -> MCPOAuthConfig:
+def _parse_oauth(raw: object, *, server_type: str) -> MCPOAuthConfig:
+    enabled_default = str(server_type or "").strip().lower() == MCP_SERVER_TYPE_REMOTE
     if not isinstance(raw, dict):
-        return MCPOAuthConfig()
+        return MCPOAuthConfig(enabled=enabled_default)
     raw_scopes = raw.get("scopes", [])
     scopes: list[str] = []
     if isinstance(raw_scopes, list):
@@ -96,7 +97,7 @@ def _parse_oauth(raw: object) -> MCPOAuthConfig:
             if str(scope).strip()
         ]
     return MCPOAuthConfig(
-        enabled=bool(raw.get("enabled", False)),
+        enabled=bool(raw.get("enabled", enabled_default)),
         scopes=scopes,
     )
 
@@ -126,7 +127,10 @@ def _parse_servers(raw: object) -> dict[str, MCPServerConfig]:
 
         env = _parse_str_map(server_raw.get("env", {}))
         headers = _parse_str_map(server_raw.get("headers", {}))
-        oauth = _parse_oauth(server_raw.get("oauth", {}))
+        oauth = _parse_oauth(
+            server_raw.get("oauth", {}),
+            server_type=server_type,
+        )
         allow_insecure_http = bool(server_raw.get("allow_insecure_http", False))
         allow_private_network = bool(server_raw.get("allow_private_network", False))
 
@@ -173,7 +177,10 @@ def _parse_mcp_section(raw: object) -> MCPConfig:
     if not isinstance(raw, dict):
         return MCPConfig()
     servers_raw = raw.get("servers", {})
-    return MCPConfig(servers=_parse_servers(servers_raw))
+    return MCPConfig(
+        servers=_parse_servers(servers_raw),
+        oauth_browser_login=bool(raw.get("oauth_browser_login", True)),
+    )
 
 
 def load_mcp_file(path: Path) -> MCPConfig:
@@ -254,7 +261,13 @@ def load_merged_mcp_config(
     workspace_cfg_path = default_workspace_mcp_path(ws)
     explicit_cfg_path = explicit_path.expanduser().resolve() if explicit_path else None
 
-    legacy = config.mcp if config is not None else MCPConfig()
+    legacy_path: Path | None = None
+    legacy = MCPConfig()
+    if legacy_config_path is not None:
+        candidate_legacy = legacy_config_path.expanduser().resolve()
+        if candidate_legacy.exists():
+            legacy_path = candidate_legacy
+            legacy = load_mcp_file(legacy_path)
     user_cfg = load_mcp_file(user_cfg_path)
     workspace_cfg = load_mcp_file(workspace_cfg_path)
     explicit_cfg = (
@@ -272,7 +285,6 @@ def load_merged_mcp_config(
         workspace_path=workspace_cfg_path,
         explicit_path=explicit_cfg_path,
     )
-    legacy_path = _detect_legacy_path(legacy_config_path, workspace=ws)
     return MergedMCPConfig(
         config=merged,
         sources=sources,
@@ -406,7 +418,11 @@ def _render_mcp_toml(servers: dict[str, MCPServerConfig]) -> str:
                 lines.append(
                     f"{header_key} = {_toml_escape(server.headers[header_key])}"
                 )
-        if server.oauth.enabled or server.oauth.scopes:
+        if (
+            server.type == MCP_SERVER_TYPE_REMOTE
+            or server.oauth.enabled
+            or server.oauth.scopes
+        ):
             lines.append("")
             lines.append(f"[mcp.servers.{alias}.oauth]")
             lines.append(f"enabled = {'true' if server.oauth.enabled else 'false'}")

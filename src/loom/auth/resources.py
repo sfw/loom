@@ -761,8 +761,24 @@ def _make_discovered_resource(
 
 
 def _mcp_view_uses_external_auth(view: object) -> bool:
-    """Best-effort heuristic for MCP aliases that manage auth outside Loom."""
+    """Detect MCP aliases whose auth lifecycle is owned outside `/auth`."""
     server = getattr(view, "server", None)
+    if server is None:
+        return False
+
+    server_type = str(getattr(server, "type", "") or "").strip().lower()
+    oauth = getattr(server, "oauth", None)
+    oauth_enabled = False
+    if isinstance(oauth, dict):
+        oauth_enabled = _parse_bool(oauth.get("enabled"), default=False)
+    elif oauth is not None:
+        oauth_enabled = _parse_bool(getattr(oauth, "enabled", False), default=False)
+
+    # Remote aliases with OAuth enabled are MCP-owned by default.
+    if server_type == "remote" and oauth_enabled:
+        return True
+
+    # Backward-compatible fallback for legacy mcp-remote command specs.
     command = str(getattr(server, "command", "") or "").strip().lower()
     raw_args = getattr(server, "args", ())
     args: list[str] = []
@@ -1059,6 +1075,85 @@ def _sanitize_profile_fragment(value: str) -> str:
     return text or "resource"
 
 
+def _default_mode_for_resource(resource: AuthResource) -> str:
+    for candidate in resource.modes:
+        if candidate in _SUPPORTED_MODES:
+            return candidate
+    return "api_key"
+
+
+def _draft_identity_for_resource(
+    *,
+    resource: AuthResource,
+    mode: str,
+) -> tuple[str, str, str, str, str]:
+    kind = str(resource.resource_kind or "").strip().lower()
+    key = str(resource.resource_key or "").strip()
+    provider = str(resource.provider or "").strip()
+    mcp_server = key if kind == "mcp" else ""
+    return (kind, key, provider, mcp_server, str(mode or "").strip().lower())
+
+
+def _draft_identity_from_profile(profile: AuthProfile) -> tuple[str, str, str, str, str] | None:
+    metadata = dict(getattr(profile, "metadata", {}) or {})
+    kind = str(metadata.get("generated_resource_kind", "")).strip().lower()
+    key = str(metadata.get("generated_resource_key", "")).strip()
+    provider = str(metadata.get("generated_provider", "")).strip()
+    mcp_server = str(metadata.get("generated_mcp_server", "")).strip()
+    mode = str(getattr(profile, "mode", "") or "").strip().lower()
+
+    if not kind or not key:
+        generated_from = str(metadata.get("generated_from", "")).strip()
+        parsed_kind, parsed_key = _parse_resource_ref(generated_from)
+        kind, key = parsed_kind, parsed_key
+    if not kind or not key:
+        return None
+
+    if not provider:
+        provider = str(getattr(profile, "provider", "") or "").strip()
+    if kind == "mcp" and not mcp_server:
+        mcp_server = (
+            str(getattr(profile, "mcp_server", "") or "").strip()
+            or key
+        )
+    return (kind, key, provider, mcp_server, mode)
+
+
+def _find_compatible_generated_draft_profile_id(
+    *,
+    resource: AuthResource,
+    profiles: dict[str, AuthProfile],
+) -> str:
+    mode = _default_mode_for_resource(resource)
+    target_identity = _draft_identity_for_resource(resource=resource, mode=mode)
+    target_generated_from = resource.resource_ref
+    candidates: list[str] = []
+
+    for profile_id, profile in profiles.items():
+        if str(getattr(profile, "status", "ready") or "ready").strip().lower() != "draft":
+            continue
+        if not _profile_is_usable(profile):
+            continue
+        metadata = dict(getattr(profile, "metadata", {}) or {})
+        generated_from = str(metadata.get("generated_from", "")).strip()
+        profile_identity = _draft_identity_from_profile(profile)
+        generated_flag = str(metadata.get("generated", "")).strip().lower()
+        has_generated_markers = bool(generated_from or profile_identity is not None)
+        if generated_flag not in {"1", "true", "yes", "on"} and not has_generated_markers:
+            continue
+        if generated_from and generated_from == target_generated_from:
+            candidates.append(profile_id)
+            continue
+        if profile_identity is None:
+            continue
+        if profile_identity == target_identity:
+            candidates.append(profile_id)
+
+    if not candidates:
+        return ""
+    return sorted(candidates)[0]
+
+
 def _build_draft_profile(
     *,
     resource: AuthResource,
@@ -1073,13 +1168,7 @@ def _build_draft_profile(
         profile_id = f"{base}_{counter}"
         counter += 1
 
-    mode = ""
-    for candidate in resource.modes:
-        if candidate in _SUPPORTED_MODES:
-            mode = candidate
-            break
-    if not mode:
-        mode = "api_key"
+    mode = _default_mode_for_resource(resource)
 
     env: dict[str, str] = {}
     for key in resource.required_env_keys:
@@ -1097,13 +1186,18 @@ def _build_draft_profile(
     elif mode == "cli_passthrough":
         command = "TODO_AUTH_COMMAND"
 
+    mcp_server = resource.resource_key if resource.resource_kind == "mcp" else ""
     metadata = {
         "generated": "true",
         "generated_from": resource.resource_ref,
         "resource_id": resource.resource_id,
+        "generated_resource_kind": resource.resource_kind,
+        "generated_resource_key": resource.resource_key,
+        "generated_provider": resource.provider or resource.resource_key,
+        "generated_mcp_server": mcp_server,
+        "generated_mode": mode,
     }
 
-    mcp_server = resource.resource_key if resource.resource_kind == "mcp" else ""
     return AuthProfile(
         profile_id=profile_id,
         provider=resource.provider or resource.resource_key,
@@ -1322,68 +1416,89 @@ def sync_missing_drafts(
             if _profile_is_usable(profiles.get(binding.profile_id))
         ]
         if not active_bindings:
-            pending_id = str(uuid.uuid4())
-            pending_payload = {
-                "op": "draft_sync_bind",
-                "resource_id": resource.resource_id,
-                "profile_id": "",
-                "created_at": now,
-            }
-            store = mutate_workspace_auth_resources(
-                resources_path,
-                lambda current: replace(
-                    current,
-                    pending_operations={
-                        **current.pending_operations,
-                        pending_id: dict(pending_payload),
-                    },
-                ),
-            )
-            draft_profile = _build_draft_profile(
+            reusable_profile_id = _find_compatible_generated_draft_profile_id(
                 resource=resource,
-                existing_profile_ids=existing_profile_ids,
+                profiles=profiles,
             )
-            pending_payload["profile_id"] = draft_profile.profile_id
-            store = mutate_workspace_auth_resources(
-                resources_path,
-                lambda current: replace(
-                    current,
-                    pending_operations={
-                        **{
-                            key: value
-                            for key, value in current.pending_operations.items()
-                            if key != pending_id
-                        },
-                        pending_id: dict(pending_payload),
-                    },
-                ),
-            )
-            try:
-                upsert_auth_profile(auth_write_path, draft_profile, must_exist=False)
-            except Exception as e:
-                warnings.append(
-                    f"Failed to create draft profile for {resource.resource_ref}: {e}"
+            if reusable_profile_id:
+                binding_id = str(uuid.uuid4())
+                binding = AuthBinding(
+                    binding_id=binding_id,
+                    resource_id=resource.resource_id,
+                    profile_id=reusable_profile_id,
+                    priority=0,
+                    generated_from=f"reuse:{resource.resource_ref}",
+                    status="active",
+                    created_at=now,
+                    updated_at=now,
                 )
-                continue
-            profiles[draft_profile.profile_id] = draft_profile
-            existing_profile_ids.add(draft_profile.profile_id)
-            created_drafts += 1
+                bindings[binding.binding_id] = binding
+                created_bindings += 1
+                active_bindings = [binding]
 
-            binding_id = str(uuid.uuid4())
-            binding = AuthBinding(
-                binding_id=binding_id,
-                resource_id=resource.resource_id,
-                profile_id=draft_profile.profile_id,
-                priority=0,
-                generated_from=f"auto:{resource.resource_ref}",
-                status="active",
-                created_at=now,
-                updated_at=now,
-            )
-            bindings[binding.binding_id] = binding
-            created_bindings += 1
-            active_bindings = [binding]
-            completed_pending_ids.add(pending_id)
+            if not active_bindings:
+                pending_id = str(uuid.uuid4())
+                pending_payload = {
+                    "op": "draft_sync_bind",
+                    "resource_id": resource.resource_id,
+                    "profile_id": "",
+                    "created_at": now,
+                }
+                store = mutate_workspace_auth_resources(
+                    resources_path,
+                    lambda current: replace(
+                        current,
+                        pending_operations={
+                            **current.pending_operations,
+                            pending_id: dict(pending_payload),
+                        },
+                    ),
+                )
+                draft_profile = _build_draft_profile(
+                    resource=resource,
+                    existing_profile_ids=existing_profile_ids,
+                )
+                pending_payload["profile_id"] = draft_profile.profile_id
+                store = mutate_workspace_auth_resources(
+                    resources_path,
+                    lambda current: replace(
+                        current,
+                        pending_operations={
+                            **{
+                                key: value
+                                for key, value in current.pending_operations.items()
+                                if key != pending_id
+                            },
+                            pending_id: dict(pending_payload),
+                        },
+                    ),
+                )
+                try:
+                    upsert_auth_profile(auth_write_path, draft_profile, must_exist=False)
+                except Exception as e:
+                    warnings.append(
+                        f"Failed to create draft profile for {resource.resource_ref}: {e}"
+                    )
+                    continue
+                profiles[draft_profile.profile_id] = draft_profile
+                existing_profile_ids.add(draft_profile.profile_id)
+                created_drafts += 1
+
+                binding_id = str(uuid.uuid4())
+                binding = AuthBinding(
+                    binding_id=binding_id,
+                    resource_id=resource.resource_id,
+                    profile_id=draft_profile.profile_id,
+                    priority=0,
+                    generated_from=f"auto:{resource.resource_ref}",
+                    status="active",
+                    created_at=now,
+                    updated_at=now,
+                )
+                bindings[binding.binding_id] = binding
+                created_bindings += 1
+                active_bindings = [binding]
+                completed_pending_ids.add(pending_id)
 
         if len(active_bindings) == 1:
             only_profile_id = active_bindings[0].profile_id

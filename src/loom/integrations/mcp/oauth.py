@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -32,6 +32,8 @@ class MCPOAuthProviderConfig:
     token_endpoint: str
     client_id: str
     scopes: tuple[str, ...]
+    authorize_params: dict[str, str] = field(default_factory=dict)
+    token_params: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -370,6 +372,8 @@ def bearer_auth_header_for_alias(
         return None
     access_token = str(token_payload.get("access_token", "")).strip()
     token_type = str(token_payload.get("token_type", "Bearer")).strip() or "Bearer"
+    if token_type.lower() == "bearer":
+        token_type = "Bearer"
     if not access_token:
         return None
     return f"{token_type} {access_token}"
@@ -643,43 +647,209 @@ def ensure_mcp_oauth_ready(
     )
 
 
+def _append_unique(values: list[str], raw: object) -> None:
+    text = str(raw or "").strip()
+    if text and text not in values:
+        values.append(text)
+
+
+def _origin_for_url(raw_url: str) -> str:
+    parsed = urlparse(str(raw_url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _base_url_for_metadata(raw_url: str) -> str:
+    parsed = urlparse(str(raw_url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def _oauth_metadata_candidates(base_url: str) -> list[str]:
+    base = _base_url_for_metadata(base_url)
+    if not base:
+        return []
+    origin = _origin_for_url(base)
+    candidates: list[str] = []
+    _append_unique(candidates, f"{base}/.well-known/oauth-authorization-server")
+    _append_unique(candidates, f"{base}/.well-known/openid-configuration")
+    if origin and origin != base:
+        _append_unique(candidates, f"{origin}/.well-known/oauth-authorization-server")
+        _append_unique(candidates, f"{origin}/.well-known/openid-configuration")
+    return candidates
+
+
+def _oauth_protected_resource_candidates(server_url: str) -> list[str]:
+    clean_url = str(server_url or "").strip().rstrip("/")
+    origin = _origin_for_url(clean_url)
+    candidates: list[str] = []
+    if origin:
+        _append_unique(candidates, f"{origin}/.well-known/oauth-protected-resource")
+    if clean_url:
+        _append_unique(candidates, f"{clean_url}/.well-known/oauth-protected-resource")
+    return candidates
+
+
+def _fetch_oauth_metadata_json(
+    url: str,
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    try:
+        response = httpx.get(
+            url,
+            headers={"Accept": "application/json"},
+            timeout=max(1, int(timeout_seconds)),
+        )
+        if response.status_code >= 400:
+            return {}
+        payload = response.json()
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def register_remote_oauth_client(
+    *,
+    registration_endpoint: str,
+    redirect_uris: list[str] | tuple[str, ...],
+    scopes: list[str] | tuple[str, ...] | None = None,
+    timeout_seconds: int = 10,
+    client_name: str = "Loom MCP Client",
+) -> dict[str, str]:
+    """Register a public OAuth client and return client credentials."""
+    endpoint = str(registration_endpoint or "").strip()
+    if not endpoint:
+        raise MCPOAuthFlowError("OAuth client registration endpoint is required.")
+
+    clean_redirect_uris: list[str] = []
+    for raw in redirect_uris:
+        _append_unique(clean_redirect_uris, raw)
+    if not clean_redirect_uris:
+        raise MCPOAuthFlowError("OAuth client registration requires redirect URI values.")
+
+    payload: dict[str, Any] = {
+        "client_name": str(client_name or "Loom MCP Client").strip() or "Loom MCP Client",
+        "redirect_uris": clean_redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+    scope_values = [
+        str(scope).strip()
+        for scope in (scopes or ())
+        if str(scope).strip()
+    ]
+    if scope_values:
+        payload["scope"] = " ".join(scope_values)
+
+    try:
+        response = httpx.post(
+            endpoint,
+            json=payload,
+            headers={"Accept": "application/json"},
+            timeout=max(1, int(timeout_seconds)),
+        )
+    except Exception as e:
+        raise MCPOAuthFlowError(
+            "OAuth client registration request failed: "
+            f"{redact_oauth_error_text(e)}"
+        ) from e
+
+    body: dict[str, Any] = {}
+    if response.content:
+        try:
+            parsed = response.json()
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            body = dict(parsed)
+
+    if response.status_code >= 400:
+        detail = str(
+            body.get("error_description")
+            or body.get("error")
+            or response.text
+            or "OAuth client registration failed."
+        ).strip()
+        raise MCPOAuthFlowError(
+            "OAuth client registration failed: "
+            f"{redact_oauth_error_text(detail)}"
+        )
+
+    resolved_client_id = str(body.get("client_id", "") or "").strip()
+    if not resolved_client_id:
+        raise MCPOAuthFlowError(
+            "OAuth client registration response missing client_id."
+        )
+    return {
+        "client_id": resolved_client_id,
+        "client_secret": str(body.get("client_secret", "") or "").strip(),
+    }
+
+
 def discover_remote_oauth_provider(
     server_url: str,
     *,
     timeout_seconds: int = 5,
 ) -> dict[str, str]:
-    """Probe common OAuth metadata endpoints for remote MCP providers."""
+    """Probe MCP OAuth metadata endpoints and resolve auth-server endpoints."""
     clean_url = str(server_url or "").strip()
     parsed = urlparse(clean_url)
     if not parsed.scheme or not parsed.netloc:
         return {}
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    candidates = [
-        f"{origin}/.well-known/oauth-authorization-server",
-        f"{origin}/.well-known/openid-configuration",
-    ]
-    for url in candidates:
-        try:
-            response = httpx.get(
-                url,
-                headers={"Accept": "application/json"},
-                timeout=max(1, int(timeout_seconds)),
+
+    auth_server_candidates: list[str] = []
+    resource_candidates: list[str] = []
+    _append_unique(auth_server_candidates, clean_url)
+    _append_unique(auth_server_candidates, f"{parsed.scheme}://{parsed.netloc}")
+
+    for metadata_url in _oauth_protected_resource_candidates(clean_url):
+        metadata = _fetch_oauth_metadata_json(
+            metadata_url,
+            timeout_seconds=timeout_seconds,
+        )
+        if not metadata:
+            continue
+        _append_unique(resource_candidates, metadata.get("resource"))
+        _append_unique(resource_candidates, clean_url)
+        _append_unique(resource_candidates, f"{parsed.scheme}://{parsed.netloc}")
+        _append_unique(auth_server_candidates, metadata.get("authorization_server"))
+        raw_servers = metadata.get("authorization_servers", [])
+        if isinstance(raw_servers, list):
+            for item in raw_servers:
+                _append_unique(auth_server_candidates, item)
+
+    for auth_base in auth_server_candidates:
+        for metadata_url in _oauth_metadata_candidates(auth_base):
+            metadata = _fetch_oauth_metadata_json(
+                metadata_url,
+                timeout_seconds=timeout_seconds,
             )
-            if response.status_code >= 400:
+            if not metadata:
                 continue
-            payload = response.json()
-        except Exception:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        authorization_endpoint = str(payload.get("authorization_endpoint", "") or "").strip()
-        token_endpoint = str(payload.get("token_endpoint", "") or "").strip()
-        if authorization_endpoint and token_endpoint:
-            return {
-                "authorization_endpoint": authorization_endpoint,
-                "token_endpoint": token_endpoint,
-                "issuer": str(payload.get("issuer", "") or "").strip(),
-            }
+            authorization_endpoint = str(
+                metadata.get("authorization_endpoint", "") or ""
+            ).strip()
+            token_endpoint = str(metadata.get("token_endpoint", "") or "").strip()
+            if authorization_endpoint and token_endpoint:
+                return {
+                    "authorization_endpoint": authorization_endpoint,
+                    "token_endpoint": token_endpoint,
+                    "registration_endpoint": str(
+                        metadata.get("registration_endpoint", "") or ""
+                    ).strip(),
+                    "issuer": str(metadata.get("issuer", "") or "").strip(),
+                    "resource": (
+                        str(metadata.get("resource", "") or "").strip()
+                        or (resource_candidates[0] if resource_candidates else "")
+                    ),
+                }
     return {}
 
 
@@ -690,6 +860,8 @@ def resolve_mcp_oauth_provider(
     authorization_endpoint: str | None = None,
     token_endpoint: str | None = None,
     client_id: str | None = None,
+    redirect_uris: list[str] | tuple[str, ...] | None = None,
+    client_name: str = "Loom MCP Client",
     timeout_seconds: int = 5,
 ) -> MCPOAuthProviderConfig:
     """Resolve provider endpoints with discovery + explicit override precedence."""
@@ -705,11 +877,13 @@ def resolve_mcp_oauth_provider(
         str(token_endpoint or "").strip()
         or str(discovered.get("token_endpoint", "") or "").strip()
     )
-    resolved_client_id = (
-        str(client_id or "").strip()
-        or str(os.environ.get("LOOM_MCP_OAUTH_CLIENT_ID", "") or "").strip()
-        or "loom-cli"
-    )
+    resolved_registration_endpoint = str(
+        discovered.get("registration_endpoint", "") or ""
+    ).strip()
+    resolved_resource = str(discovered.get("resource", "") or "").strip()
+    resolved_client_id = str(client_id or "").strip() or str(
+        os.environ.get("LOOM_MCP_OAUTH_CLIENT_ID", "") or ""
+    ).strip()
 
     if not resolved_authorization_endpoint or not resolved_token_endpoint:
         raise MCPOAuthFlowError(
@@ -723,9 +897,43 @@ def resolve_mcp_oauth_provider(
         for scope in (scopes or ())
         if str(scope).strip()
     )
+    authorize_params: dict[str, str] = {}
+    token_params: dict[str, str] = {}
+    if resolved_resource:
+        authorize_params["resource"] = resolved_resource
+        token_params["resource"] = resolved_resource
+    if not resolved_client_id and resolved_registration_endpoint:
+        candidate_redirect_uris = tuple(
+            str(uri).strip()
+            for uri in (
+                redirect_uris
+                or (
+                    "http://127.0.0.1:8765/oauth/callback",
+                    "http://localhost:8765/oauth/callback",
+                    "urn:ietf:wg:oauth:2.0:oob",
+                )
+            )
+            if str(uri).strip()
+        )
+        registration = register_remote_oauth_client(
+            registration_endpoint=resolved_registration_endpoint,
+            redirect_uris=candidate_redirect_uris,
+            scopes=normalized_scopes,
+            timeout_seconds=timeout_seconds,
+            client_name=client_name,
+        )
+        resolved_client_id = registration["client_id"]
+        client_secret = registration.get("client_secret", "")
+        if client_secret:
+            token_params["client_secret"] = client_secret
+    if not resolved_client_id:
+        resolved_client_id = "loom-cli"
+
     return MCPOAuthProviderConfig(
         authorization_endpoint=resolved_authorization_endpoint,
         token_endpoint=resolved_token_endpoint,
         client_id=resolved_client_id,
         scopes=normalized_scopes,
+        authorize_params=authorize_params,
+        token_params=token_params,
     )

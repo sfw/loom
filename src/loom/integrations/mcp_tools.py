@@ -692,6 +692,13 @@ class _MCPRemoteHTTPClient:
 
     alias: str
     server: MCPServerConfig
+    _state_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        init=False,
+        repr=False,
+    )
+    _initialized: bool = field(default=False, init=False, repr=False)
+    _session_id: str = field(default="", init=False, repr=False)
 
     def _timeout_seconds(self) -> int:
         try:
@@ -704,16 +711,215 @@ class _MCPRemoteHTTPClient:
         self,
         *,
         env_overrides: dict[str, str] | None = None,
+        include_session: bool = True,
     ) -> dict[str, str]:
         base_env = os.environ.copy()
         if env_overrides:
             base_env.update(env_overrides)
         headers = _resolve_env_map(self.server.headers, base_env=base_env)
         auth_header = bearer_auth_header_for_alias(self.alias)
-        if auth_header and "Authorization" not in headers:
-            headers["Authorization"] = auth_header
+        had_authorization = any(str(key).lower() == "authorization" for key in headers)
+        if auth_header:
+            if self.server.oauth.enabled:
+                for key in list(headers.keys()):
+                    if str(key).lower() == "authorization":
+                        headers.pop(key, None)
+                headers["Authorization"] = auth_header
+            elif not had_authorization:
+                headers["Authorization"] = auth_header
         headers.setdefault("Content-Type", "application/json")
+        headers.setdefault("Accept", "application/json, text/event-stream")
+        if include_session and self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
         return headers
+
+    @staticmethod
+    def _decode_response_body(response: Any) -> dict[str, Any]:
+        if not response.content:
+            return {}
+        try:
+            parsed = response.json()
+        except Exception:
+            return {}
+        if isinstance(parsed, dict):
+            return dict(parsed)
+        return {}
+
+    @staticmethod
+    def _decode_sse_response_body(
+        response: Any,
+        *,
+        request_id: int | None,
+    ) -> dict[str, Any]:
+        """Decode one JSON-RPC object from an SSE stream response."""
+        pending_data_lines: list[str] = []
+        fallback: dict[str, Any] = {}
+
+        def _consume_event() -> dict[str, Any] | None:
+            nonlocal pending_data_lines
+            if not pending_data_lines:
+                return None
+            payload_text = "\n".join(pending_data_lines).strip()
+            pending_data_lines = []
+            if not payload_text:
+                return None
+            try:
+                parsed = json.loads(payload_text)
+            except Exception:
+                return None
+            if not isinstance(parsed, dict):
+                return None
+            return parsed
+
+        for raw_line in response.iter_lines():
+            line = str(raw_line or "").rstrip("\r")
+            if not line:
+                parsed = _consume_event()
+                if not parsed:
+                    continue
+                payload_id = parsed.get("id")
+                has_result_or_error = ("result" in parsed) or ("error" in parsed)
+                if request_id is None:
+                    if has_result_or_error:
+                        return parsed
+                    fallback = parsed
+                    continue
+                if payload_id == request_id or str(payload_id) == str(request_id):
+                    return parsed
+                # Some servers omit id in error payloads; keep first as fallback.
+                if has_result_or_error and payload_id in (None, "") and not fallback:
+                    fallback = parsed
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                pending_data_lines.append(line.split(":", 1)[1].lstrip())
+
+        trailing = _consume_event()
+        if trailing:
+            payload_id = trailing.get("id")
+            has_result_or_error = ("result" in trailing) or ("error" in trailing)
+            if request_id is None and has_result_or_error:
+                return trailing
+            if request_id is not None and (
+                payload_id == request_id or str(payload_id) == str(request_id)
+            ):
+                return trailing
+            if has_result_or_error and not fallback:
+                fallback = trailing
+        return fallback
+
+    def _rpc_request(
+        self,
+        *,
+        method: str,
+        params: dict[str, Any] | None,
+        env_overrides: dict[str, str] | None,
+        timeout: int,
+        include_session: bool,
+        request_id: int | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if request_id is not None:
+            payload["id"] = int(request_id)
+            payload["params"] = params or {}
+        elif params:
+            payload["params"] = params
+        body: dict[str, Any] = {}
+        status_code = 0
+        try:
+            import httpx
+
+            with httpx.stream(
+                "POST",
+                self.server.url,
+                headers=self._headers(
+                    env_overrides=env_overrides,
+                    include_session=include_session,
+                ),
+                json=payload,
+                timeout=timeout,
+            ) as response:
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                fresh_session = str(
+                    response.headers.get("Mcp-Session-Id")
+                    or response.headers.get("mcp-session-id")
+                    or ""
+                ).strip()
+                if fresh_session:
+                    self._session_id = fresh_session
+
+                content_type = str(
+                    response.headers.get("content-type", "") or ""
+                ).lower()
+                if "text/event-stream" in content_type:
+                    if request_id is not None or status_code >= 400:
+                        body = self._decode_sse_response_body(
+                            response,
+                            request_id=request_id,
+                        )
+                else:
+                    response.read()
+                    body = self._decode_response_body(response)
+        except Exception as e:
+            raise RuntimeError(
+                f"Remote MCP request failed for {self.alias!r}: {e}"
+            ) from e
+        if status_code >= 400:
+            detail = str(
+                body.get("error_description")
+                or _error_to_text(body.get("error"))
+                or f"HTTP {status_code}"
+            ).strip()
+            raise RuntimeError(
+                f"Remote MCP request failed for {self.alias!r}: "
+                f"HTTP {status_code}: {detail}"
+            )
+
+        if request_id is None:
+            return {}
+        if not isinstance(body, dict) or not body:
+            raise RuntimeError(
+                f"Remote MCP request failed for {self.alias!r}: "
+                f"missing JSON-RPC response payload"
+            )
+        return body
+
+    def _ensure_initialized(
+        self,
+        *,
+        env_overrides: dict[str, str] | None,
+        timeout: int,
+    ) -> None:
+        if self._initialized:
+            return
+        init_body = self._rpc_request(
+            method="initialize",
+            params={
+                "protocolVersion": "2025-11-05",
+                "capabilities": {"tools": {"listChanged": True}},
+                "clientInfo": {"name": "loom", "version": "0.1.0"},
+            },
+            env_overrides=env_overrides,
+            timeout=timeout,
+            include_session=False,
+            request_id=1,
+        )
+        if "error" in init_body and init_body["error"] is not None:
+            raise RuntimeError(_error_to_text(init_body["error"]))
+        # Notification is best-effort; some endpoints may omit this method.
+        try:
+            self._rpc_request(
+                method="notifications/initialized",
+                params={},
+                env_overrides=env_overrides,
+                timeout=timeout,
+                include_session=True,
+                request_id=None,
+            )
+        except Exception:
+            pass
+        self._initialized = True
 
     def request(
         self,
@@ -732,36 +938,46 @@ class _MCPRemoteHTTPClient:
             if timeout_seconds is not None
             else self._timeout_seconds()
         )
-        payload: dict[str, Any] = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params or {},
-        }
-        try:
-            import httpx
-
-            response = httpx.post(
-                self.server.url,
-                headers=self._headers(env_overrides=env_overrides),
-                json=payload,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            body = response.json()
-        except Exception as e:
-            raise RuntimeError(
-                f"Remote MCP request failed for {self.alias!r}: {e}"
-            ) from e
-        if not isinstance(body, dict):
-            raise RuntimeError(
-                f"Remote MCP response for {self.alias!r} is not an object"
-            )
-        if "error" in body and body["error"] is not None:
-            raise RuntimeError(_error_to_text(body["error"]))
-        result = body.get("result", {})
-        parsed = result if isinstance(result, dict) else {"result": result}
-        return parsed, False
+        with self._state_lock:
+            for attempt in range(2):
+                try:
+                    if method != "initialize":
+                        self._ensure_initialized(
+                            env_overrides=env_overrides,
+                            timeout=timeout,
+                        )
+                    body = self._rpc_request(
+                        method=method,
+                        params=params or {},
+                        env_overrides=env_overrides,
+                        timeout=timeout,
+                        include_session=(method != "initialize"),
+                        request_id=1,
+                    )
+                    if not isinstance(body, dict):
+                        raise RuntimeError(
+                            f"Remote MCP response for {self.alias!r} is not an object"
+                        )
+                    if "error" in body and body["error"] is not None:
+                        raise RuntimeError(_error_to_text(body["error"]))
+                    result = body.get("result", {})
+                    parsed = result if isinstance(result, dict) else {"result": result}
+                    return parsed, False
+                except Exception as e:
+                    text = str(e or "").lower()
+                    if (
+                        attempt == 0
+                        and method != "initialize"
+                        and (
+                            "mcp-session-id" in text
+                            or "invalid session" in text
+                            or "missing session" in text
+                        )
+                    ):
+                        self._initialized = False
+                        self._session_id = ""
+                        continue
+                    raise
 
     def list_tools(
         self,

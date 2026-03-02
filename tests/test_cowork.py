@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import pytest
 
 from loom.cowork.session import (
     CoworkSession,
+    CoworkStopRequestedError,
     CoworkTurn,
     ToolCallEvent,
     build_cowork_system_prompt,
@@ -74,6 +76,143 @@ def tools():
 
 
 class TestCoworkSession:
+    def test_stop_request_lifecycle(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(text="ok", usage=TokenUsage(total_tokens=1)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        assert session.stop_requested is False
+        session.request_stop("user_requested")
+        assert session.stop_requested is True
+        session.clear_stop_request()
+        assert session.stop_requested is False
+
+    def test_pause_request_lifecycle(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(text="ok", usage=TokenUsage(total_tokens=1)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        assert session.pause_requested is False
+        session.request_pause()
+        assert session.pause_requested is True
+        session.request_resume()
+        assert session.pause_requested is False
+
+    async def test_send_raises_when_stop_requested_mid_turn(self, workspace, tools):
+        gate = asyncio.Event()
+
+        class _BlockingProvider(MockProvider):
+            async def complete(self, messages, tools=None, **kwargs):
+                await gate.wait()
+                return ModelResponse(text="Should not complete", usage=TokenUsage(total_tokens=2))
+
+        session = CoworkSession(
+            model=_BlockingProvider([]),
+            tools=tools,
+            workspace=workspace,
+        )
+
+        async def _consume() -> None:
+            async for _event in session.send("Please stop this turn"):
+                pass
+
+        task = asyncio.create_task(_consume())
+        await asyncio.sleep(0)
+        session.request_stop("user_requested")
+        gate.set()
+
+        with pytest.raises(CoworkStopRequestedError):
+            await task
+
+    async def test_send_waits_while_paused_then_resumes(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(text="resumed", usage=TokenUsage(total_tokens=2)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+        session.request_pause()
+        events: list[object] = []
+
+        async def _consume() -> None:
+            async for event in session.send("wait for resume"):
+                events.append(event)
+
+        task = asyncio.create_task(_consume())
+        await asyncio.sleep(0.05)
+        assert task.done() is False
+
+        session.request_resume()
+        await asyncio.wait_for(task, timeout=1.0)
+
+        turns = [event for event in events if isinstance(event, CoworkTurn)]
+        assert len(turns) == 1
+        assert turns[0].text == "resumed"
+
+    async def test_send_applies_pending_inject_before_model_request(self, workspace, tools):
+        captured_messages: list[list[dict]] = []
+
+        class _CaptureProvider(MockProvider):
+            async def complete(self, messages, tools=None, **kwargs):
+                captured_messages.append([dict(item) for item in messages])
+                return ModelResponse(
+                    text="done",
+                    usage=TokenUsage(total_tokens=2),
+                )
+
+        session = CoworkSession(
+            model=_CaptureProvider([]),
+            tools=tools,
+            workspace=workspace,
+        )
+        session.queue_inject_instruction("Prioritize test coverage.")
+
+        async for _event in session.send("continue"):
+            pass
+
+        assert session.has_pending_inject_instruction is False
+        assert captured_messages
+        first_context = captured_messages[0]
+        assert any(
+            str(item.get("role")) == "system"
+            and "Steering instruction from user: Prioritize test coverage."
+            in str(item.get("content", ""))
+            for item in first_context
+        )
+
+    async def test_send_applies_stacked_inject_instructions_fifo(self, workspace, tools):
+        captured_messages: list[list[dict]] = []
+
+        class _CaptureProvider(MockProvider):
+            async def complete(self, messages, tools=None, **kwargs):
+                captured_messages.append([dict(item) for item in messages])
+                return ModelResponse(
+                    text="done",
+                    usage=TokenUsage(total_tokens=2),
+                )
+
+        session = CoworkSession(
+            model=_CaptureProvider([]),
+            tools=tools,
+            workspace=workspace,
+        )
+        session.queue_inject_instruction("First directive.")
+        session.queue_inject_instruction("Second directive.")
+
+        assert session.pending_inject_instruction_count == 2
+        async for _event in session.send("continue"):
+            pass
+
+        assert session.pending_inject_instruction_count == 1
+        assert captured_messages
+        first_context = captured_messages[0]
+        assert any(
+            str(item.get("role")) == "system"
+            and "Steering instruction from user: First directive."
+            in str(item.get("content", ""))
+            for item in first_context
+        )
+
     async def test_simple_text_response(self, workspace, tools):
         """Model returns text only — one turn, no tool calls."""
         provider = MockProvider([

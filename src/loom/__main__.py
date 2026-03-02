@@ -1080,8 +1080,17 @@ def auth_show(ctx: click.Context, profile_id: str, as_json: bool) -> None:
 def auth_check(ctx: click.Context) -> None:
     """Validate auth profile references and defaults."""
     merged = _merged_auth_config(ctx)
-    profiles = merged.config.profiles
-    effective_defaults = {
+    profiles = dict(merged.config.profiles)
+    explicit_profile_ids = set(getattr(merged, "explicit_profile_ids", ()))
+    explicit_only = merged.explicit_path is not None
+    if explicit_only:
+        profiles = {
+            profile_id: profile
+            for profile_id, profile in profiles.items()
+            if profile_id in explicit_profile_ids
+        }
+
+    merged_defaults = {
         selector: profile_id
         for selector, profile_id in {
             **merged.config.defaults,
@@ -1089,6 +1098,14 @@ def auth_check(ctx: click.Context) -> None:
         }.items()
         if not selector.startswith("mcp.")
     }
+    if explicit_only:
+        effective_defaults = {
+            selector: profile_id
+            for selector, profile_id in merged_defaults.items()
+            if profile_id in profiles
+        }
+    else:
+        effective_defaults = merged_defaults
 
     errors: list[str] = []
     mcp_aliases = set(_effective_config(ctx).mcp.servers.keys())
@@ -1122,6 +1139,8 @@ def auth_check(ctx: click.Context) -> None:
 
     if resource_store is not None:
         for resource_id, profile_id in sorted(resource_store.workspace_defaults.items()):
+            if explicit_only and profile_id not in profiles:
+                continue
             resource = resource_store.resources.get(resource_id)
             if resource is None or str(resource.status).strip().lower() != "active":
                 errors.append(
@@ -1146,6 +1165,8 @@ def auth_check(ctx: click.Context) -> None:
                 )
 
         for resource_id, profile_id in sorted(merged.config.resource_defaults.items()):
+            if explicit_only and profile_id not in profiles:
+                continue
             resource = resource_store.resources.get(resource_id)
             if resource is None or str(resource.status).strip().lower() != "active":
                 errors.append(
@@ -2895,6 +2916,7 @@ def _resolve_mcp_oauth_provider_config(
     authorize_url: str | None,
     token_url: str | None,
     client_id: str | None,
+    redirect_port: int,
 ) -> OAuthProviderConfig:
     if view.server.type != "remote":
         raise MCPOAuthFlowError(
@@ -2906,12 +2928,20 @@ def _resolve_mcp_oauth_provider_config(
         authorization_endpoint=authorize_url,
         token_endpoint=token_url,
         client_id=client_id,
+        redirect_uris=(
+            f"http://127.0.0.1:{max(1, int(redirect_port))}/oauth/callback",
+            f"http://localhost:{max(1, int(redirect_port))}/oauth/callback",
+            "urn:ietf:wg:oauth:2.0:oob",
+        ),
+        client_name=f"Loom MCP ({view.alias})",
     )
     return OAuthProviderConfig(
         authorization_endpoint=provider.authorization_endpoint,
         token_endpoint=provider.token_endpoint,
         client_id=provider.client_id,
         scopes=provider.scopes,
+        authorize_params=dict(provider.authorize_params),
+        token_params=dict(provider.token_params),
     )
 
 
@@ -2946,7 +2976,10 @@ def _resolve_mcp_oauth_provider_config(
 @click.option(
     "--client-id",
     default=None,
-    help="OAuth client id override (defaults to LOOM_MCP_OAUTH_CLIENT_ID or loom-cli).",
+    help=(
+        "OAuth client id override (defaults to LOOM_MCP_OAUTH_CLIENT_ID, "
+        "dynamic registration when available, or loom-cli)."
+    ),
 )
 @click.option(
     "--redirect-port",
@@ -3070,6 +3103,7 @@ def mcp_auth_login(
             authorize_url=authorize_url,
             token_url=token_url,
             client_id=client_id,
+            redirect_port=redirect_port,
         )
     except MCPOAuthFlowError as e:
         click.echo(f"MCP auth login failed: {e}", err=True)
@@ -3147,6 +3181,7 @@ def mcp_auth_login(
     expires_at_unix = _parse_expiry_epoch_from_token_payload(token_payload)
     refresh_token_value = str(token_payload.get("refresh_token", "")).strip() or refresh_token
     token_type_value = str(token_payload.get("token_type", "")).strip() or token_type
+    client_secret = str(dict(provider.token_params).get("client_secret", "")).strip()
 
     try:
         path = upsert_mcp_oauth_token(
@@ -3160,6 +3195,7 @@ def mcp_auth_login(
             authorization_endpoint=provider.authorization_endpoint,
             client_id=provider.client_id,
             obtained_via="browser_pkce",
+            extra_fields={"client_secret": client_secret} if client_secret else None,
             store_path=oauth_store_path,
         )
     except MCPOAuthStoreError as e:

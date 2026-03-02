@@ -67,11 +67,21 @@ command = "explicit-only"
 """
     )
 
+    legacy_toml = tmp_path / "loom.toml"
+    legacy_toml.write_text(
+        """
+[mcp.servers.shared]
+command = "legacy"
+
+[mcp.servers.legacy_only]
+command = "legacy-only"
+"""
+    )
     legacy = Config(
         mcp=MCPConfig(
             servers={
-                "shared": _server("legacy"),
-                "legacy_only": _server("legacy-only"),
+                "shared": _server("stale-memory"),
+                "stale_only": _server("stale-memory-only"),
             }
         )
     )
@@ -81,7 +91,7 @@ command = "explicit-only"
         workspace=workspace,
         explicit_path=explicit_mcp,
         user_path=user_mcp,
-        legacy_config_path=tmp_path / "loom.toml",
+        legacy_config_path=legacy_toml,
     )
 
     servers = merged.config.servers
@@ -90,8 +100,51 @@ command = "explicit-only"
     assert servers["user_only"].command == "user-only"
     assert servers["workspace_only"].command == "workspace-only"
     assert servers["explicit_only"].command == "explicit-only"
+    assert "stale_only" not in servers
     assert merged.get("shared").source == "explicit"
     assert merged.get("legacy_only").source == "legacy"
+
+
+def test_merged_mcp_legacy_file_used_when_config_missing(tmp_path: Path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    legacy_toml = tmp_path / "loom.toml"
+    legacy_toml.write_text(
+        """
+[mcp]
+oauth_browser_login = false
+
+[mcp.servers.legacy_demo]
+command = "legacy"
+"""
+    )
+
+    merged = load_merged_mcp_config(
+        config=None,
+        workspace=workspace,
+        legacy_config_path=legacy_toml,
+        user_path=tmp_path / "user.toml",
+    )
+
+    assert "legacy_demo" in merged.config.servers
+    assert merged.config.oauth_browser_login is False
+    assert merged.get("legacy_demo") is not None
+    assert merged.get("legacy_demo").source == "legacy"
+
+
+def test_merged_mcp_ignores_in_memory_config_without_legacy_path(tmp_path: Path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    merged = load_merged_mcp_config(
+        config=Config(mcp=MCPConfig(servers={"stale_demo": _server("stale")})),
+        workspace=workspace,
+        user_path=tmp_path / "user.toml",
+        legacy_config_path=None,
+    )
+
+    assert "stale_demo" not in merged.config.servers
+    assert merged.get("stale_demo") is None
 
 
 def test_apply_mcp_overrides_preserves_oauth_browser_login_flag(tmp_path: Path):
@@ -156,6 +209,35 @@ url = "http://example.com/mcp"
     )
     with pytest.raises(MCPConfigManagerError):
         load_mcp_file(cfg)
+
+
+def test_load_mcp_file_remote_defaults_oauth_enabled(tmp_path: Path):
+    cfg = tmp_path / "mcp.toml"
+    cfg.write_text(
+        """
+[mcp.servers.remote]
+type = "remote"
+url = "https://example.com/mcp"
+"""
+    )
+    loaded = load_mcp_file(cfg)
+    assert loaded.servers["remote"].oauth.enabled is True
+
+
+def test_load_mcp_file_remote_oauth_false_override(tmp_path: Path):
+    cfg = tmp_path / "mcp.toml"
+    cfg.write_text(
+        """
+[mcp.servers.remote]
+type = "remote"
+url = "https://example.com/mcp"
+
+[mcp.servers.remote.oauth]
+enabled = false
+"""
+    )
+    loaded = load_mcp_file(cfg)
+    assert loaded.servers["remote"].oauth.enabled is False
 
 
 def test_manager_preserves_remote_fields_round_trip(tmp_path: Path):
@@ -266,11 +348,19 @@ def test_edit_legacy_alias_writes_override_to_target(tmp_path: Path):
     workspace = tmp_path / "ws"
     workspace.mkdir()
     target = tmp_path / "mcp.toml"
+    legacy_toml = tmp_path / "loom.toml"
+    legacy_toml.write_text(
+        """
+[mcp.servers.legacy_demo]
+command = "legacy"
+"""
+    )
     manager = MCPConfigManager(
-        config=Config(mcp=MCPConfig(servers={"legacy_demo": _server("legacy")})),
+        config=Config(),
         workspace=workspace,
         explicit_path=target,
         user_path=tmp_path / "user.toml",
+        legacy_config_path=legacy_toml,
     )
 
     manager.edit_server(
