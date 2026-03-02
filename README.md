@@ -14,7 +14,7 @@ It handles coding, research, document analysis (PDF, Word docs, PowerPoint decks
 
 **Claude-class cowork UX, local-ready.** Tools like Claude Code and Claude cowork deliver strong agentic experiences, and Claude Code can be paired with local model stacks depending on your setup. Loom's focus is different: a model-agnostic harness designed to keep local and mixed local/cloud execution reliable with structured planning, tool safety, independent verification, and persistent memory. Loom is also cross-platform, while Claude cowork is currently macOS + Claude-model oriented. The result is an agentic workflow that stays robust on your own hardware without locking you to one provider.
 
-Loom also exposes a REST API and an MCP server built for agentic systems. Orchestrators like OpenClaw can call Loom's 19 REST endpoints -- or connect via the Model Context Protocol -- to offload complex multi-step tasks: decomposition, tool calling, verification, and memory. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive. The MCP integration also means any MCP-compatible agent or IDE can use Loom as a tool provider out of the box.
+Loom also exposes a REST API and an MCP server built for agentic systems. Orchestrators like OpenClaw can call Loom's 20 REST endpoints -- or connect via the Model Context Protocol -- to offload complex multi-step tasks: decomposition, tool calling, verification, and memory. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive. The MCP integration also means any MCP-compatible agent or IDE can use Loom as a tool provider out of the box.
 
 ## Why Loom Exists
 
@@ -294,7 +294,7 @@ In the TUI, use `/learned` to open an interactive review screen for learned beha
 ## Interfaces
 
 - **Interactive TUI** (`uv run loom`) -- rich terminal interface with chat panel, sidebar, diff viewer, tool approval modals, event log, and setup wizard. Includes session persistence/recall, task delegation, process discovery (`/processes`), in-process orchestration (`/run <goal|@goal-file [goal]|close [run-id-prefix]>`), direct process commands (`/<process-name> <goal>`), learned-pattern review (`/learned`), MCP config controls (`/mcp ...`), auth profile controls (`/auth ...`), and click-to-open workspace previews for Markdown/code/JSON/CSV/HTML/diff/Office/PDF/images. `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `uv run loom serve`; `/run problem.md` and `/run @problem.md optional-goal` load file content into planning context.
-- **REST API** -- 19 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
+- **REST API** -- 20 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
 
 ## CLI Commands
@@ -332,7 +332,7 @@ Role routing note:
 
 ## Architecture
 
-Large Python codebase in `src/` with an extensive automated test suite (roughly ~68k LOC and ~1.8k tests as of February 2026). No frameworks (no LangChain, no CrewAI).
+Large Python codebase in `src/` with an extensive automated test suite (roughly ~93k LOC and ~2.2k tests as of March 2026). No frameworks (no LangChain, no CrewAI).
 
 ```
 src/loom/
