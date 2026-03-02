@@ -8829,6 +8829,7 @@ class TestMCPSlashCommands:
         manager = app._mcp_manager()
 
         assert isinstance(manager, DummyManager)
+        assert captured["config"] is None
         assert captured["explicit_path"] == Path("/tmp/override-mcp.toml")
         assert captured["legacy_config_path"] == Path("/tmp/loom.toml")
 

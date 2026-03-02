@@ -1153,7 +1153,8 @@ class LoomApp(App):
         from loom.mcp.config import MCPConfigManager
 
         return MCPConfigManager(
-            config=self._config,
+            # Use file-backed MCP layers to avoid stale in-memory alias snapshots.
+            config=None,
             workspace=self._workspace,
             explicit_path=self._explicit_mcp_path,
             legacy_config_path=self._legacy_config_path,

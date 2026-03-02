@@ -173,7 +173,10 @@ def _parse_mcp_section(raw: object) -> MCPConfig:
     if not isinstance(raw, dict):
         return MCPConfig()
     servers_raw = raw.get("servers", {})
-    return MCPConfig(servers=_parse_servers(servers_raw))
+    return MCPConfig(
+        servers=_parse_servers(servers_raw),
+        oauth_browser_login=bool(raw.get("oauth_browser_login", True)),
+    )
 
 
 def load_mcp_file(path: Path) -> MCPConfig:
@@ -254,7 +257,13 @@ def load_merged_mcp_config(
     workspace_cfg_path = default_workspace_mcp_path(ws)
     explicit_cfg_path = explicit_path.expanduser().resolve() if explicit_path else None
 
-    legacy = config.mcp if config is not None else MCPConfig()
+    legacy_path: Path | None = None
+    legacy = MCPConfig()
+    if legacy_config_path is not None:
+        candidate_legacy = legacy_config_path.expanduser().resolve()
+        if candidate_legacy.exists():
+            legacy_path = candidate_legacy
+            legacy = load_mcp_file(legacy_path)
     user_cfg = load_mcp_file(user_cfg_path)
     workspace_cfg = load_mcp_file(workspace_cfg_path)
     explicit_cfg = (
@@ -272,7 +281,6 @@ def load_merged_mcp_config(
         workspace_path=workspace_cfg_path,
         explicit_path=explicit_cfg_path,
     )
-    legacy_path = _detect_legacy_path(legacy_config_path, workspace=ws)
     return MergedMCPConfig(
         config=merged,
         sources=sources,

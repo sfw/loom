@@ -1080,8 +1080,17 @@ def auth_show(ctx: click.Context, profile_id: str, as_json: bool) -> None:
 def auth_check(ctx: click.Context) -> None:
     """Validate auth profile references and defaults."""
     merged = _merged_auth_config(ctx)
-    profiles = merged.config.profiles
-    effective_defaults = {
+    profiles = dict(merged.config.profiles)
+    explicit_profile_ids = set(getattr(merged, "explicit_profile_ids", ()))
+    explicit_only = merged.explicit_path is not None
+    if explicit_only:
+        profiles = {
+            profile_id: profile
+            for profile_id, profile in profiles.items()
+            if profile_id in explicit_profile_ids
+        }
+
+    merged_defaults = {
         selector: profile_id
         for selector, profile_id in {
             **merged.config.defaults,
@@ -1089,6 +1098,14 @@ def auth_check(ctx: click.Context) -> None:
         }.items()
         if not selector.startswith("mcp.")
     }
+    if explicit_only:
+        effective_defaults = {
+            selector: profile_id
+            for selector, profile_id in merged_defaults.items()
+            if profile_id in profiles
+        }
+    else:
+        effective_defaults = merged_defaults
 
     errors: list[str] = []
     mcp_aliases = set(_effective_config(ctx).mcp.servers.keys())
@@ -1122,6 +1139,8 @@ def auth_check(ctx: click.Context) -> None:
 
     if resource_store is not None:
         for resource_id, profile_id in sorted(resource_store.workspace_defaults.items()):
+            if explicit_only and profile_id not in profiles:
+                continue
             resource = resource_store.resources.get(resource_id)
             if resource is None or str(resource.status).strip().lower() != "active":
                 errors.append(
@@ -1146,6 +1165,8 @@ def auth_check(ctx: click.Context) -> None:
                 )
 
         for resource_id, profile_id in sorted(merged.config.resource_defaults.items()):
+            if explicit_only and profile_id not in profiles:
+                continue
             resource = resource_store.resources.get(resource_id)
             if resource is None or str(resource.status).strip().lower() != "active":
                 errors.append(
