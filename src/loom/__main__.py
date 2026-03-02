@@ -18,7 +18,6 @@ from loom.auth.config import (
     AuthConfigError,
     AuthProfile,
     default_workspace_auth_defaults_path,
-    load_auth_file,
     load_merged_auth_config,
     remove_auth_profile,
     resolve_auth_write_path,
@@ -918,14 +917,13 @@ def auth_list(ctx: click.Context, as_json: bool, verbose: bool) -> None:
     """List merged auth profiles and defaults."""
     merged = _merged_auth_config(ctx)
     profiles = merged.config.profiles
-    explicit_profile_ids: set[str] = set()
+    explicit_profile_ids = set(getattr(merged, "explicit_profile_ids", ()))
     if merged.explicit_path is not None:
-        try:
-            explicit_profiles = load_auth_file(merged.explicit_path).profiles
-            explicit_profile_ids = set(explicit_profiles)
-            profiles = explicit_profiles
-        except Exception:
-            explicit_profile_ids = set()
+        profiles = {
+            profile_id: profile
+            for profile_id, profile in profiles.items()
+            if profile_id in explicit_profile_ids
+        }
 
     def _profile_sort_key(profile: AuthProfile) -> tuple[int, int, str]:
         source_rank = 0 if profile.profile_id in explicit_profile_ids else 1

@@ -366,9 +366,6 @@ class TestAuthCli:
 [auth.defaults]
 notion = "notion_marketing"
 
-[auth.mcp_alias_profiles]
-notion_local = "notion_marketing"
-
 [auth.profiles.notion_marketing]
 provider = "notion"
 mode = "oauth2_pkce"

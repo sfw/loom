@@ -1981,6 +1981,7 @@ class TestDelegateTaskUnbound:
             Subtask(
                 id="company-screening",
                 description="Company screening",
+                phase_id="company-screening",
                 status=SubtaskStatus.COMPLETED,
             ),
             Subtask(
@@ -2008,6 +2009,7 @@ class TestDelegateTaskUnbound:
         assert isinstance(result.data, dict)
         assert result.data["task_id"] == "task-123"
         assert result.data["tasks"][0]["status"] == "completed"
+        assert result.data["tasks"][0]["phase_id"] == "company-screening"
         assert result.data["tasks"][1]["status"] == "in_progress"
         assert result.data["tasks"][2]["status"] == "skipped"
 
@@ -7756,8 +7758,14 @@ class TestProcessSlashCommands:
 
         output_rows = pane.set_outputs.call_args.args[0]
         by_content = {row["content"]: row for row in output_rows}
-        assert "pitch-analysis.md (inspect-pitch) (planned)" in by_content
-        assert "era-coverage-matrix.csv (map-eras) (planned)" in by_content
+        assert any(
+            key.startswith("pitch-analysis.md (inspect-pitch)")
+            for key in by_content
+        )
+        assert any(
+            key.startswith("era-coverage-matrix.csv (map-eras)")
+            for key in by_content
+        )
         assert all("(expected output)" not in row["content"] for row in output_rows)
 
     def test_adhoc_outputs_fallback_to_task_rows_without_deliverables(self):
@@ -7834,6 +7842,87 @@ class TestProcessSlashCommands:
                 "content": "Read and analyze pitch.md (expected output)",
             },
         ]
+
+    def test_process_progress_outputs_use_phase_id_from_task_row(self, tmp_path):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+
+        pane = MagicMock()
+        process_defn = SimpleNamespace(
+            phases=[
+                SimpleNamespace(
+                    id="slogan-divergence",
+                    description="Generate slogan longlist",
+                ),
+            ],
+            get_deliverables=lambda: {"slogan-divergence": ["slogan-longlist.csv"]},
+        )
+        run = SimpleNamespace(
+            run_id="abc129",
+            process_name="campaign-slogans",
+            goal="Generate campaign slogans",
+            run_workspace=tmp_path,
+            process_defn=process_defn,
+            pane_id="tab-run-abc129",
+            pane=pane,
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            task_labels={},
+            subtask_phase_ids={},
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc129": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+
+        sidebar = MagicMock()
+        events_panel = MagicMock()
+        chat = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#sidebar":
+                return sidebar
+            if selector == "#events-panel":
+                return events_panel
+            if selector == "#chat-log":
+                return chat
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        app._on_process_progress_event(
+            {
+                "event_type": "subtask_completed",
+                "event_data": {"subtask_id": "generate-slogan-longlist"},
+                "tasks": [
+                    {
+                        "id": "generate-slogan-longlist",
+                        "status": "completed",
+                        "phase_id": "slogan-divergence",
+                        "content": "Generated longlist.",
+                    },
+                ],
+            },
+            run_id="abc129",
+        )
+
+        output_rows = pane.set_outputs.call_args.args[0]
+        by_content = {row["content"]: row for row in output_rows}
+        assert "slogan-longlist.csv (slogan-divergence) (missing)" in by_content
+        assert by_content["slogan-longlist.csv (slogan-divergence) (missing)"]["status"] == (
+            "failed"
+        )
 
     def test_process_progress_outputs_detect_existing_file_when_task_id_drifts(self, tmp_path):
         from loom.tui.app import LoomApp

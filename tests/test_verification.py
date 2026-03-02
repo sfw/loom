@@ -1703,6 +1703,42 @@ class TestDeterministicVerifierDeliverables:
         assert not any(c.name.startswith("deliverable_") for c in result.checks)
 
     @pytest.mark.asyncio
+    async def test_phase_hint_enforces_matching_phase_deliverables(self, tmp_path):
+        process = _make_process(deliverables={
+            "phase_a": ["file_a.md"],
+            "phase_b": ["file_b.md"],
+        })
+        v = DeterministicVerifier(process=process)
+        subtask = _make_subtask(subtask_id="planner-generated-id")
+        subtask.phase_id = "phase_a"
+        result = await v.verify(subtask, "output", [], tmp_path)
+        assert not result.passed
+        check_names = {c.name: c.passed for c in result.checks}
+        assert check_names.get("deliverable_file_a.md") is False
+        assert "deliverable_file_b.md" not in check_names
+
+    @pytest.mark.asyncio
+    async def test_unmatched_id_infers_phase_from_description(self, tmp_path):
+        process = _make_process(deliverables={
+            "market_sizing": ["market-sizing.md"],
+            "risk_map": ["risk-map.md"],
+        })
+        v = DeterministicVerifier(process=process)
+        result = await v.verify(
+            _make_subtask(
+                subtask_id="step-42",
+                description="Estimate market sizing assumptions and TAM ranges.",
+            ),
+            "output",
+            [],
+            tmp_path,
+        )
+        assert not result.passed
+        check_names = {c.name: c.passed for c in result.checks}
+        assert check_names.get("deliverable_market-sizing.md") is False
+        assert "deliverable_risk-map.md" not in check_names
+
+    @pytest.mark.asyncio
     async def test_terminal_synthesis_fails_when_upstream_deliverables_missing(
         self,
         tmp_path,

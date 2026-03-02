@@ -67,6 +67,7 @@ from loom.cowork.session import (
 )
 from loom.models.base import ModelProvider
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.processes.phase_alignment import infer_phase_id_for_subtask
 from loom.tools.registry import ToolRegistry
 from loom.tui.commands import LoomCommands
 from loom.tui.screens import (
@@ -638,6 +639,7 @@ class ProcessRunState:
     ended_at: float | None = None
     tasks: list[dict] = field(default_factory=list)
     task_labels: dict[str, str] = field(default_factory=dict)
+    subtask_phase_ids: dict[str, str] = field(default_factory=dict)
     last_progress_message: str = ""
     last_progress_at: float = 0.0
     activity_log: list[str] = field(default_factory=list)
@@ -5369,6 +5371,9 @@ class LoomApp(App):
         labels = getattr(run, "task_labels", {})
         if not isinstance(labels, dict):
             labels = {}
+        phase_map = getattr(run, "subtask_phase_ids", {})
+        if not isinstance(phase_map, dict):
+            phase_map = {}
         activity = [
             self._one_line(line, 1200)
             for line in getattr(run, "activity_log", [])
@@ -5399,6 +5404,11 @@ class LoomApp(App):
             "launch_tab_created_at": float(getattr(run, "launch_tab_created_at", 0.0) or 0.0),
             "tasks": tasks,
             "task_labels": {str(k): str(v) for k, v in labels.items()},
+            "subtask_phase_ids": {
+                str(k): str(v)
+                for k, v in phase_map.items()
+                if str(k).strip() and str(v).strip()
+            },
             "activity_log": activity,
             "result_log": result_log,
             "auth_profile_overrides": {
@@ -5627,6 +5637,12 @@ class LoomApp(App):
                 if isinstance(labels_raw, dict)
                 else {}
             )
+            phase_map_raw = raw.get("subtask_phase_ids", {})
+            subtask_phase_ids = (
+                {str(k): str(v) for k, v in phase_map_raw.items()}
+                if isinstance(phase_map_raw, dict)
+                else {}
+            )
             activity_log = [
                 self._one_line(line, 1200)
                 for line in raw.get("activity_log", [])
@@ -5688,6 +5704,7 @@ class LoomApp(App):
                 ended_at=ended_at,
                 tasks=tasks,
                 task_labels=task_labels,
+                subtask_phase_ids=subtask_phase_ids,
                 activity_log=activity_log,
                 result_log=result_log,
                 auth_profile_overrides=auth_profile_overrides,
@@ -6512,6 +6529,22 @@ class LoomApp(App):
         run.progress_ui_last_refresh_at = 0.0
         self._clear_process_run_cancel_handler(run.run_id)
         run.tasks, run.task_labels = self._resume_seed_task_rows(run)
+        row_ids = {
+            str(row.get("id", "")).strip()
+            for row in run.tasks
+            if isinstance(row, dict) and str(row.get("id", "")).strip()
+        }
+        phase_map = getattr(run, "subtask_phase_ids", {})
+        if isinstance(phase_map, dict):
+            run.subtask_phase_ids = {
+                str(subtask_id): str(phase_id)
+                for subtask_id, phase_id in phase_map.items()
+                if str(subtask_id).strip()
+                and str(phase_id).strip()
+                and (not row_ids or str(subtask_id) in row_ids)
+            }
+        else:
+            run.subtask_phase_ids = {}
         run.last_progress_message = ""
         run.last_progress_at = 0.0
         self._update_process_run_visuals(run)
@@ -10108,6 +10141,13 @@ class LoomApp(App):
                 run.task_labels = task_labels
             except Exception:
                 pass
+        phase_map = getattr(run, "subtask_phase_ids", None)
+        if not isinstance(phase_map, dict):
+            phase_map = {}
+            try:
+                run.subtask_phase_ids = phase_map
+            except Exception:
+                pass
 
         normalized: list[dict] = []
         for row in tasks:
@@ -10125,6 +10165,7 @@ class LoomApp(App):
             if subtask_id in phase_labels:
                 label = phase_labels[subtask_id]
                 task_labels[subtask_id] = label
+                phase_map[subtask_id] = subtask_id
             else:
                 if subtask_id:
                     existing = str(task_labels.get(subtask_id, "")).strip()
@@ -10140,11 +10181,20 @@ class LoomApp(App):
                 else:
                     label = candidate
 
-            normalized.append({
+            row_payload = {
                 "id": subtask_id or candidate,
                 "status": status,
                 "content": label,
-            })
+            }
+            row_phase_id = str(row.get("phase_id", "")).strip()
+            if not row_phase_id and subtask_id:
+                row_phase_id = str(phase_map.get(subtask_id, "")).strip()
+            if row_phase_id:
+                row_payload["phase_id"] = row_phase_id
+                if subtask_id:
+                    phase_map[subtask_id] = row_phase_id
+
+            normalized.append(row_payload)
         return normalized
 
     def _process_run_output_rows(self, run: ProcessRunState) -> list[dict]:
@@ -10186,19 +10236,6 @@ class LoomApp(App):
         if not has_deliverables:
             return []
 
-        subtask_status: dict[str, str] = {}
-        content_status: dict[str, str] = {}
-        for row in getattr(run, "tasks", []):
-            if not isinstance(row, dict):
-                continue
-            subtask_id = str(row.get("id", "")).strip()
-            status = str(row.get("status", "pending")).strip()
-            if subtask_id:
-                subtask_status[subtask_id] = status
-            content_text = self._one_line(row.get("content", ""), max_len=None)
-            if content_text:
-                content_status[content_text] = status
-
         ordered_phase_ids: list[str] = []
         phase_labels: dict[str, str] = {}
         for phase in getattr(process, "phases", []):
@@ -10218,18 +10255,31 @@ class LoomApp(App):
         run_workspace = getattr(run, "run_workspace", None)
         workspace_root = Path(run_workspace) if run_workspace else self._workspace
 
+        phase_statuses: dict[str, list[str]] = {phase_id: [] for phase_id in ordered_phase_ids}
+        phase_map = self._process_run_phase_map(run)
+        for row in getattr(run, "tasks", []):
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status", "pending")).strip()
+            if status not in {"pending", "in_progress", "completed", "failed", "skipped"}:
+                status = "pending"
+            phase_id = self._infer_process_run_task_phase_id(
+                run,
+                row=row,
+                phase_ids=ordered_phase_ids,
+                phase_labels=phase_labels,
+                deliverables_by_phase=deliverables_by_phase,
+                phase_map=phase_map,
+            )
+            if phase_id and phase_id in phase_statuses:
+                phase_statuses[phase_id].append(status)
+
         rows: list[dict] = []
         for phase_id in ordered_phase_ids:
             phase_deliverables = deliverables_by_phase.get(phase_id) or []
             if not isinstance(phase_deliverables, list):
                 continue
-            phase_state = subtask_status.get(phase_id, "").strip()
-            if not phase_state:
-                phase_label = phase_labels.get(phase_id, "")
-                if phase_label:
-                    phase_state = content_status.get(phase_label, "").strip()
-            if phase_state not in {"pending", "in_progress", "completed", "failed", "skipped"}:
-                phase_state = "pending"
+            phase_state = self._aggregate_phase_state(phase_statuses.get(phase_id, []))
             for path in phase_deliverables:
                 rel_path = str(path).strip()
                 if not rel_path:
@@ -10259,6 +10309,85 @@ class LoomApp(App):
                     "content": f"{rel_path} ({phase_id}){suffix}",
                 })
         return rows
+
+    def _process_run_phase_map(self, run: ProcessRunState) -> dict[str, str]:
+        """Return mutable subtask->phase map for the run, creating if missing."""
+        phase_map = getattr(run, "subtask_phase_ids", None)
+        if isinstance(phase_map, dict):
+            return phase_map
+        phase_map = {}
+        try:
+            run.subtask_phase_ids = phase_map
+        except Exception:
+            pass
+        return phase_map
+
+    @staticmethod
+    def _aggregate_phase_state(statuses: list[str]) -> str:
+        """Aggregate multiple subtask states into one phase-level state."""
+        normalized = [
+            str(item).strip()
+            for item in statuses
+            if str(item).strip() in {"pending", "in_progress", "completed", "failed", "skipped"}
+        ]
+        if not normalized:
+            return "pending"
+        if "failed" in normalized:
+            return "failed"
+        if "in_progress" in normalized:
+            return "in_progress"
+        if "pending" in normalized:
+            if any(item in {"completed", "skipped"} for item in normalized):
+                return "in_progress"
+            return "pending"
+        if all(item == "skipped" for item in normalized):
+            return "skipped"
+        return "completed"
+
+    def _infer_process_run_task_phase_id(
+        self,
+        run: ProcessRunState,
+        *,
+        row: dict,
+        phase_ids: list[str],
+        phase_labels: dict[str, str],
+        deliverables_by_phase: dict[str, list[str]],
+        phase_map: dict[str, str],
+    ) -> str:
+        """Infer phase ID for one task row, preserving stable mappings."""
+        phase_set = set(phase_ids)
+        subtask_id = str(row.get("id", "")).strip()
+        explicit_phase_id = str(row.get("phase_id", "")).strip()
+        if explicit_phase_id in phase_set:
+            if subtask_id:
+                phase_map[subtask_id] = explicit_phase_id
+            return explicit_phase_id
+
+        if subtask_id in phase_set:
+            phase_map[subtask_id] = subtask_id
+            return subtask_id
+
+        if subtask_id:
+            existing = str(phase_map.get(subtask_id, "")).strip()
+            if existing in phase_set:
+                return existing
+
+        content = self._one_line(row.get("content", ""), max_len=None)
+        label = ""
+        task_labels = getattr(run, "task_labels", {})
+        if subtask_id and isinstance(task_labels, dict):
+            label = self._one_line(task_labels.get(subtask_id, ""), max_len=None)
+        text = " ".join(part for part in [label, content] if part).strip()
+        inferred = infer_phase_id_for_subtask(
+            subtask_id=subtask_id,
+            text=text,
+            phase_ids=phase_ids,
+            phase_descriptions=phase_labels,
+            phase_deliverables=deliverables_by_phase,
+        )
+        if inferred in phase_set and subtask_id:
+            phase_map[subtask_id] = inferred
+        return inferred if inferred in phase_set else ""
 
     def _refresh_process_run_outputs(self, run: ProcessRunState) -> None:
         """Refresh per-run output rows in the process pane."""

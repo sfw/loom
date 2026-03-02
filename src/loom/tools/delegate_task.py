@@ -889,11 +889,15 @@ def _progress_payload(task: Task) -> dict:
         else:
             status = "pending"
         content = (subtask.summary or subtask.description or subtask.id).strip()
-        progress_rows.append({
+        row = {
             "id": subtask.id,
             "status": status,
             "content": content,
-        })
+        }
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
+        if phase_id:
+            row["phase_id"] = phase_id
+        progress_rows.append(row)
     return {
         "task_id": task.id,
         "status": task_status,
