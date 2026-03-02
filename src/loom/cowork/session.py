@@ -549,6 +549,8 @@ class CoworkSession:
         self._counter_lock = asyncio.Lock()
         self._stop_requested = asyncio.Event()
         self._stop_reason = ""
+        self._pause_requested = asyncio.Event()
+        self._pending_inject_instructions: list[str] = []
 
         self._messages: list[dict] = []
         if system_prompt:
@@ -593,6 +595,46 @@ class CoworkSession:
         self._stop_requested.clear()
         self._stop_reason = ""
 
+    @property
+    def pause_requested(self) -> bool:
+        """Return True when cooperative pause has been requested."""
+        return self._pause_requested.is_set()
+
+    def request_pause(self) -> None:
+        """Request cooperative pause at the next safe execution boundary."""
+        self._pause_requested.set()
+
+    def request_resume(self) -> None:
+        """Resume cowork execution after a cooperative pause."""
+        self._pause_requested.clear()
+
+    @property
+    def has_pending_inject_instruction(self) -> bool:
+        """Return True when an inject instruction is queued for next boundary."""
+        return bool(self._pending_inject_instructions)
+
+    @property
+    def pending_inject_instruction_count(self) -> int:
+        """Return count of queued inject instructions."""
+        return len(self._pending_inject_instructions)
+
+    def queue_inject_instruction(self, text: str) -> None:
+        """Append an inject instruction for the next safe boundary."""
+        clean = str(text or "").strip()
+        if not clean:
+            return
+        self._pending_inject_instructions.append(clean)
+
+    def dequeue_pending_inject_instruction(self) -> str:
+        """Pop the next queued inject instruction (FIFO)."""
+        if not self._pending_inject_instructions:
+            return ""
+        return str(self._pending_inject_instructions.pop(0) or "").strip()
+
+    def clear_pending_inject_instruction(self) -> None:
+        """Drop any pending inject instruction."""
+        self._pending_inject_instructions = []
+
     def _raise_if_stop_requested(self, *, stage: str = "") -> None:
         """Raise CoworkStopRequestedError when a cooperative stop is pending."""
         if not self._stop_requested.is_set():
@@ -602,6 +644,26 @@ class CoworkSession:
             stage=str(stage or "").strip(),
             path="cooperative",
         )
+
+    async def _await_if_paused(self, *, stage: str = "") -> None:
+        """Cooperatively pause execution until resumed or stopped."""
+        while self._pause_requested.is_set():
+            self._raise_if_stop_requested(stage=stage or "paused")
+            await asyncio.sleep(0.05)
+
+    async def _apply_pending_inject_instruction_if_any(self) -> bool:
+        """Inject one queued steering instruction into conversation context."""
+        instruction = self.dequeue_pending_inject_instruction()
+        if not instruction:
+            return False
+        content = (
+            "Steering instruction from user: "
+            f"{instruction}\n"
+            "Apply this instruction while preserving existing evidence."
+        )
+        self._messages.append({"role": "system", "content": content})
+        await self._persist_turn("system", content=content)
+        return True
 
     @property
     def compactor(self) -> SemanticCompactor:
@@ -652,6 +714,8 @@ class CoworkSession:
         repeated_tool_batch_recovery_hints_used = 0
 
         for _ in range(MAX_TOOL_ITERATIONS):
+            await self._await_if_paused(stage="model_request")
+            await self._apply_pending_inject_instruction_if_any()
             self._raise_if_stop_requested(stage="model_request")
             # Call the model
             async def _invoke_complete():
@@ -742,6 +806,7 @@ class CoworkSession:
 
                 ask_user_pending = False
                 for tc in response.tool_calls:
+                    await self._await_if_paused(stage=f"tool_start:{tc.name}")
                     self._raise_if_stop_requested(stage=f"tool_start:{tc.name}")
                     event = ToolCallEvent(
                         name=tc.name,
@@ -871,6 +936,8 @@ class CoworkSession:
         repeated_tool_batch_recovery_hints_used = 0
 
         for _ in range(MAX_TOOL_ITERATIONS):
+            await self._await_if_paused(stage="stream_model_request")
+            await self._apply_pending_inject_instruction_if_any()
             self._raise_if_stop_requested(stage="stream_model_request")
             iter_text_parts: list[str] = []
             final_tool_calls: list[ToolCall] | None = None
@@ -890,6 +957,7 @@ class CoworkSession:
                 _invoke_stream,
                 policy=self._model_retry_policy,
             ):
+                await self._await_if_paused(stage="stream_chunk")
                 self._raise_if_stop_requested(stage="stream_chunk")
                 if first_model_latency_ms is None and (
                     chunk.text or chunk.tool_calls is not None or chunk.usage is not None
@@ -983,6 +1051,7 @@ class CoworkSession:
 
                 ask_user_pending = False
                 for tc in final_tool_calls:
+                    await self._await_if_paused(stage=f"tool_start:{tc.name}")
                     self._raise_if_stop_requested(stage=f"tool_start:{tc.name}")
                     event = ToolCallEvent(
                         name=tc.name,

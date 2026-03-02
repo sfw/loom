@@ -46,7 +46,7 @@ from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
     Button,
     DirectoryTree,
@@ -184,6 +184,25 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         description="run goal via process orchestrator (ad hoc by default)",
     ),
     SlashCommandSpec(
+        canonical="/pause",
+        description="pause active cowork chat execution",
+    ),
+    SlashCommandSpec(
+        canonical="/inject",
+        usage="<text>",
+        description="queue cowork steering instruction for next safe boundary",
+    ),
+    SlashCommandSpec(
+        canonical="/redirect",
+        usage="<text>",
+        description="immediately redirect cowork objective",
+    ),
+    SlashCommandSpec(
+        canonical="/steer",
+        usage="pause|resume|queue|clear",
+        description="cowork steering controls",
+    ),
+    SlashCommandSpec(
         canonical="/stop",
         description="stop active cowork chat execution",
     ),
@@ -195,8 +214,12 @@ _SLASH_COMMAND_PRIORITY: dict[str, int] = {
     "/history": 13,
     "/session": 14,
     "/run": 20,
+    "/pause": 21,
+    "/inject": 22,
+    "/redirect": 23,
+    "/steer": 24,
     "/stop": 22,
-    "/processes": 21,
+    "/processes": 25,
     "/mcp": 30,
     "/auth": 31,
     "/tools": 32,
@@ -704,6 +727,18 @@ class AdhocProcessCacheEntry:
     generated_at: float = field(default_factory=time.monotonic)
 
 
+@dataclass
+class SteeringDirective:
+    """Ephemeral cowork steering directive."""
+
+    id: str
+    kind: str
+    text: str
+    source: str = "slash"
+    created_at: float = field(default_factory=time.monotonic)
+    status: str = "queued"
+
+
 class LoomApp(App):
     """Loom TUI — the unified interactive cowork interface."""
 
@@ -748,12 +783,18 @@ class LoomApp(App):
         border-bottom: solid $primary-darken-1;
         color: $text;
     }
+    #user-input.no-chat-controls {
+        border-right: solid $primary-darken-2;
+    }
     #user-input:focus {
         border: none;
         border-left: solid $primary-darken-1;
         border-right: none;
         border-bottom: solid $primary;
         background: $surface;
+    }
+    #user-input.no-chat-controls:focus {
+        border-right: solid $primary-darken-1;
     }
     #chat-stop-btn {
         display: none;
@@ -770,6 +811,54 @@ class LoomApp(App):
         border-bottom: solid $primary-darken-1;
         background: $panel;
         color: $text-muted;
+    }
+    #chat-inject-btn,
+    #chat-redirect-btn {
+        display: none;
+        width: 5;
+        min-width: 5;
+        max-width: 5;
+        height: 2;
+        margin: 0;
+        padding: 0;
+        content-align: center middle;
+        border: none;
+        border-left: solid $primary-darken-2;
+        border-right: none;
+        border-bottom: solid $primary-darken-1;
+        background: $panel;
+        color: $text-muted;
+    }
+    #chat-inject-btn:hover,
+    #chat-redirect-btn:hover {
+        color: $text;
+        background: $surface-lighten-1;
+    }
+    #chat-inject-btn:focus,
+    #chat-redirect-btn:focus {
+        color: $text;
+        border-left: solid $primary-darken-1;
+        border-bottom: solid $primary;
+        background: $surface-lighten-1;
+    }
+    #chat-inject-btn:disabled,
+    #chat-redirect-btn:disabled {
+        color: $text-muted;
+        background: $panel;
+    }
+    #chat-redirect-btn {
+        background: #2d2b32;
+        border-right: solid $primary-darken-2;
+    }
+    #chat-redirect-btn:hover {
+        background: #37323a;
+    }
+    #chat-redirect-btn:focus {
+        border-bottom: solid $warning;
+        background: #37323a;
+    }
+    #chat-redirect-btn:disabled {
+        background: #2d2b32;
     }
     #chat-stop-btn:hover {
         color: $text;
@@ -846,10 +935,85 @@ class LoomApp(App):
         scrollbar-size: 1 1;
     }
     #slash-hint-body {
-        width: 100%;
+        width: 1fr;
         min-height: 1;
-        padding: 0 1;
+        padding: 0;
         color: $text-muted;
+    }
+    #steer-queue-grid {
+        display: none;
+        width: 100%;
+        height: auto;
+        grid-size: 1 1;
+        grid-columns: 1fr;
+        grid-rows: auto;
+        grid-gutter: 0 0;
+        padding: 0;
+        border: none;
+    }
+    #steer-queue-grid.queue-mode {
+        border-top: solid #5f729d;
+        border-left: solid #5f729d;
+        border-right: solid #5f729d;
+        border-bottom: solid #5f729d;
+        background: #3a4465;
+    }
+    #steer-queue-list {
+        display: none;
+        width: 100%;
+        height: auto;
+    }
+    .steer-queue-item-row {
+        width: 100%;
+        height: 1;
+        padding: 0 1;
+        background: #3a4465;
+    }
+    .steer-queue-item-text {
+        width: 1fr;
+        height: 1;
+        content-align: left middle;
+    }
+    .steer-queue-item-btn {
+        width: 7;
+        min-width: 7;
+        max-width: 7;
+        height: 1;
+        margin: 0 0 0 1;
+        padding: 0;
+        content-align: center middle;
+        border: none;
+        background: #2f3a58;
+        color: #c7d5f0;
+    }
+    .steer-queue-item-btn.edit {
+        background: #304661;
+        color: #9dd2ff;
+    }
+    .steer-queue-item-btn.redirect {
+        background: #524634;
+        color: #f5cc9b;
+    }
+    .steer-queue-item-btn.dismiss {
+        background: #4f373d;
+        color: #f0b1bb;
+    }
+    .steer-queue-item-btn.edit:hover {
+        background: #3a5a7f;
+    }
+    .steer-queue-item-btn.redirect:hover {
+        background: #66563f;
+    }
+    .steer-queue-item-btn.dismiss:hover {
+        background: #64464e;
+    }
+    .steer-queue-item-btn:hover {
+        color: #ffffff;
+    }
+    .steer-queue-item-btn:focus {
+        color: #ffffff;
+        border: none;
+        text-style: bold;
     }
     """
 
@@ -901,6 +1065,13 @@ class LoomApp(App):
         self._chat_stop_requested_at = 0.0
         self._chat_stop_last_path = ""
         self._chat_stop_last_error = ""
+        self._chat_redirect_inflight = False
+        self._cowork_inflight_tool_counts: dict[str, int] = {}
+        self._pending_inject_directives: list[SteeringDirective] = []
+        self._last_rendered_steer_queue_signature: tuple[tuple[str, str, str], ...] = ()
+        self._active_redirect_directive: SteeringDirective | None = None
+        self._last_applied_directive_id = ""
+        self._steer_last_error = ""
         self._total_tokens = 0
 
         # Approval state — resolved via Textual modal
@@ -1004,16 +1175,148 @@ class LoomApp(App):
             return True
         return self._has_unfinalized_delegate_streams()
 
-    def _sync_chat_stop_control(self) -> None:
-        """Keep input-row Stop button visibility and state in sync."""
+    def _has_input_text(self) -> bool:
+        """Return True when main input contains non-whitespace text."""
         try:
-            stop_btn = self.query_one("#chat-stop-btn", Button)
+            value = self.query_one("#user-input", Input).value
+        except Exception:
+            return False
+        return bool(str(value or "").strip())
+
+    def _has_pending_inject(self) -> bool:
+        return bool(self._pending_inject_directives)
+
+    def _pending_inject_age_seconds(self) -> float:
+        if not self._pending_inject_directives:
+            return 0.0
+        directive = self._pending_inject_directives[0]
+        return max(0.0, time.monotonic() - float(directive.created_at))
+
+    def _pending_inject_count(self) -> int:
+        return len(self._pending_inject_directives)
+
+    def _steer_queue_signature(self) -> tuple[tuple[str, str, str], ...]:
+        """Stable signature for queued steering rows to avoid remount flicker."""
+        signature: list[tuple[str, str, str]] = []
+        for directive in self._pending_inject_directives:
+            signature.append(
+                (
+                    str(getattr(directive, "id", "") or ""),
+                    str(getattr(directive, "text", "") or ""),
+                    str(getattr(directive, "status", "") or ""),
+                ),
+            )
+        return tuple(signature)
+
+    def _current_steering_hint_text(self) -> str:
+        current = ""
+        try:
+            current = self.query_one("#user-input", Input).value
+        except Exception:
+            current = ""
+        return self._render_slash_hint(current)
+
+    def _should_show_steer_queue_popup(self) -> bool:
+        return self._is_cowork_stop_visible() and self._has_pending_inject()
+
+    def _render_steer_queue_popup(self) -> str:
+        if not self._pending_inject_directives:
+            return ""
+        count = self._pending_inject_count()
+        age_seconds = int(self._pending_inject_age_seconds())
+        return f"[bold #7dcfff]Inject Queue ({count})[/] [dim]{age_seconds}s[/]"
+
+    def _render_steer_queue_rows(self) -> None:
+        """Render queued inject rows with per-item action buttons."""
+        try:
+            queue_list = self.query_one("#steer-queue-list", Vertical)
         except Exception:
             return
+        signature = self._steer_queue_signature()
+        for child in list(queue_list.children):
+            child.remove()
+        for idx, directive in enumerate(self._pending_inject_directives, start=1):
+            preview = textwrap.shorten(
+                " ".join(str(directive.text or "").split()),
+                width=104,
+                placeholder="…",
+            )
+            edit_btn = Button(
+                "✎",
+                id=f"steer-queue-edit-{directive.id}",
+                classes="steer-queue-item-btn edit",
+            )
+            edit_btn.tooltip = "Edit queued instruction"
+            redirect_btn = Button(
+                "↪",
+                id=f"steer-queue-redirect-{directive.id}",
+                classes="steer-queue-item-btn redirect",
+            )
+            redirect_btn.tooltip = "Redirect now with this queued instruction"
+            dismiss_btn = Button(
+                "✕",
+                id=f"steer-queue-dismiss-{directive.id}",
+                classes="steer-queue-item-btn dismiss",
+            )
+            dismiss_btn.tooltip = "Dismiss this queued instruction"
+            queue_list.mount(
+                Horizontal(
+                    Static(
+                        f"[#73daca]{idx}. {self._escape_markup(preview)}[/]",
+                        classes="steer-queue-item-text",
+                    ),
+                    edit_btn,
+                    redirect_btn,
+                    dismiss_btn,
+                    classes="steer-queue-item-row",
+                ),
+            )
+        self._last_rendered_steer_queue_signature = signature
+
+    def _refresh_hint_panel(self) -> None:
+        """Refresh slash/steering hint UI based on latest input and queue state."""
+        try:
+            self._set_slash_hint(self._current_steering_hint_text())
+        except Exception:
+            pass
+
+    def _sync_chat_stop_control(self) -> None:
+        """Keep input-row steering controls visibility/state in sync."""
         visible = self._is_cowork_stop_visible()
-        stop_btn.display = visible
-        stop_btn.disabled = bool(self._chat_stop_requested and visible)
-        stop_btn.label = "■"
+        show_steer_buttons = visible and self._has_input_text()
+        try:
+            stop_btn = self.query_one("#chat-stop-btn", Button)
+            stop_btn.display = visible
+            stop_btn.disabled = bool(
+                visible
+                and (self._chat_stop_requested or self._chat_redirect_inflight),
+            )
+            stop_btn.label = "■"
+        except Exception:
+            pass
+        try:
+            inject_btn = self.query_one("#chat-inject-btn", Button)
+            inject_btn.display = show_steer_buttons
+            inject_btn.disabled = bool(self._chat_redirect_inflight)
+        except Exception:
+            pass
+        try:
+            redirect_btn = self.query_one("#chat-redirect-btn", Button)
+            redirect_btn.display = show_steer_buttons
+            redirect_btn.disabled = bool(self._chat_redirect_inflight)
+        except Exception:
+            pass
+        try:
+            input_widget = self.query_one("#user-input", Input)
+            add_class = getattr(input_widget, "add_class", None)
+            remove_class = getattr(input_widget, "remove_class", None)
+            if visible:
+                if callable(remove_class):
+                    remove_class("no-chat-controls")
+            elif callable(add_class):
+                add_class("no-chat-controls")
+        except Exception:
+            pass
 
     def _sync_activity_indicator(self) -> None:
         """Sync header activity indicator animation state."""
@@ -1026,6 +1329,7 @@ class LoomApp(App):
         except Exception:
             pass
         self._sync_chat_stop_control()
+        self._refresh_hint_panel()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, id="app-header")
@@ -1044,7 +1348,9 @@ class LoomApp(App):
                     with TabPane("Events", id="tab-events"):
                         yield EventPanel(id="events-panel")
         with VerticalScroll(id="slash-hint"):
-            yield Static("", id="slash-hint-body")
+            with Grid(id="steer-queue-grid"):
+                yield Static("", id="slash-hint-body")
+                yield Vertical(id="steer-queue-list")
         yield StatusBar(id="status-bar")
         with Vertical(id="bottom-stack"):
             yield Static("", id="input-top-rule")
@@ -1052,7 +1358,10 @@ class LoomApp(App):
                 yield Input(
                     placeholder="Type a message... (Enter to send)",
                     id="user-input",
+                    classes="no-chat-controls",
                 )
+                yield Button("⤓", id="chat-inject-btn")
+                yield Button("⤴", id="chat-redirect-btn")
                 yield Button("■", id="chat-stop-btn")
             with Horizontal(id="footer-row"):
                 yield Footer(id="app-footer")
@@ -1076,6 +1385,15 @@ class LoomApp(App):
         self.theme = "loom-dark"
         try:
             self.query_one("#chat-stop-btn", Button).tooltip = "Stop active chat turn"
+        except Exception:
+            pass
+        try:
+            self.query_one("#chat-inject-btn", Button).tooltip = (
+                "Queue steering for next safe boundary"
+            )
+            self.query_one("#chat-redirect-btn", Button).tooltip = (
+                "Interrupt and redirect cowork objective now"
+            )
         except Exception:
             pass
         self._mount_header_activity_indicator()
@@ -1106,6 +1424,8 @@ class LoomApp(App):
             self.query_one("#user-input", Input).focus()
         except Exception:
             pass
+        self._sync_chat_stop_control()
+        self._refresh_hint_panel()
 
     async def _monitor_event_loop_lag(self) -> None:
         """Emit periodic event-loop lag diagnostics when enabled."""
@@ -4890,6 +5210,7 @@ class LoomApp(App):
                 delegate_progress_callback=self._on_cowork_delegate_progress_event,
             )
 
+        self._reset_cowork_steering_state(clear_session=True)
         self._hydrate_input_history_from_session()
 
         # Bind session-dependent tools
@@ -7823,6 +8144,7 @@ class LoomApp(App):
         finally:
             if from_history_navigation:
                 self._applying_input_history_navigation = False
+        self._sync_chat_stop_control()
 
     def _apply_input_history_navigation(self, *, older: bool) -> bool:
         """Move through recorded input history like a shell."""
@@ -7950,14 +8272,710 @@ class LoomApp(App):
         """Show or hide the slash-command hint panel."""
         hint = self.query_one("#slash-hint", VerticalScroll)
         hint_body = self.query_one("#slash-hint-body", Static)
+        queue_grid: Grid | None = None
+        queue_list: Vertical | None = None
+        try:
+            queue_grid = self.query_one("#steer-queue-grid", Grid)
+        except Exception:
+            queue_grid = None
+        try:
+            queue_list = self.query_one("#steer-queue-list", Vertical)
+        except Exception:
+            queue_list = None
+        styles = getattr(hint, "styles", None)
+        queue_grid_styles = getattr(queue_grid, "styles", None) if queue_grid is not None else None
+        if self._should_show_steer_queue_popup():
+            rows = max(1, self._pending_inject_count()) + 2
+            signature = self._steer_queue_signature()
+            if styles is not None:
+                styles.height = rows
+                styles.max_height = rows
+                styles.overflow_y = "hidden"
+            if queue_grid_styles is not None:
+                queue_grid_styles.background = "#3a4465"
+            hint_body.update("")
+            hint_body.display = False
+            hint.display = True
+            if queue_grid is not None:
+                add_class = getattr(queue_grid, "add_class", None)
+                if callable(add_class):
+                    add_class("queue-mode")
+                queue_grid.display = True
+            if queue_list is not None:
+                should_render_rows = (
+                    not bool(getattr(queue_list, "display", False))
+                    or self._last_rendered_steer_queue_signature != signature
+                )
+                queue_list.display = True
+                if should_render_rows:
+                    self._render_steer_queue_rows()
+            hint.scroll_home(animate=False)
+            return
+        if styles is not None:
+            styles.height = "auto"
+            styles.max_height = 14
+            styles.overflow_y = "scroll"
+        if queue_grid_styles is not None:
+            queue_grid_styles.background = "transparent"
+        hint_body.display = bool(hint_text)
+        if queue_grid is not None:
+            remove_class = getattr(queue_grid, "remove_class", None)
+            if callable(remove_class):
+                remove_class("queue-mode")
+            queue_grid.display = bool(hint_text)
+        if queue_list is not None:
+            queue_list.display = False
+        self._last_rendered_steer_queue_signature = ()
         if hint_text:
             hint_body.update(hint_text)
             hint.display = True
             hint.scroll_home(animate=False)
         else:
+            if queue_grid is not None:
+                queue_grid.display = False
             hint.display = False
             hint_body.update("")
             hint.scroll_home(animate=False)
+
+    def _new_steering_directive(
+        self,
+        *,
+        kind: str,
+        text: str,
+        source: str,
+    ) -> SteeringDirective:
+        return SteeringDirective(
+            id=uuid.uuid4().hex[:12],
+            kind=str(kind or "").strip().lower() or "inject",
+            text=str(text or "").strip(),
+            source=str(source or "").strip().lower() or "slash",
+        )
+
+    def _pop_pending_inject_directive(
+        self,
+        *,
+        clear_session: bool = True,
+    ) -> SteeringDirective | None:
+        return self._remove_pending_inject_directive_at(
+            0,
+            clear_session=clear_session,
+        )
+
+    def _clear_pending_inject_directives(
+        self,
+        *,
+        clear_session: bool = True,
+    ) -> list[SteeringDirective]:
+        previous = list(self._pending_inject_directives)
+        self._pending_inject_directives = []
+        if clear_session and self._session is not None:
+            clear_pending = getattr(
+                self._session,
+                "clear_pending_inject_instruction",
+                None,
+            )
+            if callable(clear_pending):
+                clear_pending()
+        self._refresh_hint_panel()
+        self._sync_chat_stop_control()
+        return previous
+
+    def _pending_inject_directive_index(self, directive_id: str) -> int:
+        clean = str(directive_id or "").strip()
+        if not clean:
+            return -1
+        for idx, directive in enumerate(self._pending_inject_directives):
+            if str(directive.id or "").strip() == clean:
+                return idx
+        return -1
+
+    def _sync_session_pending_inject_queue(self) -> None:
+        if self._session is None:
+            return
+        clear_pending = getattr(
+            self._session,
+            "clear_pending_inject_instruction",
+            None,
+        )
+        if callable(clear_pending):
+            clear_pending()
+        queue_inject = getattr(self._session, "queue_inject_instruction", None)
+        if not callable(queue_inject):
+            return
+        for directive in self._pending_inject_directives:
+            text = str(getattr(directive, "text", "") or "").strip()
+            if text:
+                queue_inject(text)
+
+    def _remove_pending_inject_directive_at(
+        self,
+        index: int,
+        *,
+        clear_session: bool = True,
+    ) -> SteeringDirective | None:
+        if index < 0 or index >= len(self._pending_inject_directives):
+            return None
+        directive = self._pending_inject_directives.pop(index)
+        if clear_session:
+            self._sync_session_pending_inject_queue()
+        self._refresh_hint_panel()
+        self._sync_chat_stop_control()
+        return directive
+
+    def _pop_next_queued_followup_directive(self) -> SteeringDirective | None:
+        """Pop the next queued directive eligible for auto follow-up dispatch."""
+        if not self._pending_inject_directives:
+            return None
+        directive = self._pending_inject_directives[0]
+        source = str(getattr(directive, "source", "") or "").strip().lower()
+        if source not in {"enter", "button"}:
+            return None
+        return self._remove_pending_inject_directive_at(
+            0,
+            clear_session=True,
+        )
+
+    def _start_queued_followup_turn(self, message: str) -> None:
+        """Launch a queued follow-up prompt once chat is idle."""
+        clean = str(message or "").strip()
+        if not clean or self._session is None:
+            return
+        if self._chat_busy or self._chat_redirect_inflight or self._chat_stop_requested:
+            return
+        self._chat_turn_worker = self._run_turn(clean)
+
+    def _take_input_text_for_steering(self) -> str:
+        """Consume current input text and clear the input box."""
+        input_widget = self.query_one("#user-input", Input)
+        text = str(input_widget.value or "").strip()
+        input_widget.value = ""
+        self._reset_slash_tab_cycle()
+        self._reset_input_history_navigation()
+        self._sync_chat_stop_control()
+        self._set_slash_hint("")
+        return text
+
+    def _render_steer_queue_status(self) -> str:
+        """Render `/steer queue` summary for cowork steering state."""
+        lines = ["[bold #7dcfff]Steering Queue[/]"]
+        paused = bool(self._session and self._session.pause_requested)
+        lines.append(f"  [bold]Pause:[/] {'requested' if paused else 'not requested'}")
+        if not self._pending_inject_directives:
+            lines.append("  [bold]Inject:[/] empty")
+            return "\n".join(lines)
+        age_seconds = int(self._pending_inject_age_seconds())
+        lines.append(f"  [bold]Inject:[/] {self._pending_inject_count()} queued")
+        lines.append(f"  [bold]Oldest:[/] {age_seconds}s ago")
+        for idx, directive in enumerate(self._pending_inject_directives, start=1):
+            preview = textwrap.shorten(
+                " ".join(str(directive.text or "").split()),
+                width=140,
+                placeholder="…",
+            )
+            lines.append(f"  [bold]{idx}.[/] {self._escape_markup(preview)}")
+        return "\n".join(lines)
+
+    def _mark_cowork_tool_inflight(self, tool_name: str) -> None:
+        clean = str(tool_name or "").strip()
+        if not clean:
+            return
+        current = int(self._cowork_inflight_tool_counts.get(clean, 0) or 0)
+        self._cowork_inflight_tool_counts[clean] = max(1, current + 1)
+
+    def _clear_cowork_tool_inflight(self, tool_name: str) -> None:
+        clean = str(tool_name or "").strip()
+        if not clean:
+            return
+        current = int(self._cowork_inflight_tool_counts.get(clean, 0) or 0)
+        if current <= 1:
+            self._cowork_inflight_tool_counts.pop(clean, None)
+            return
+        self._cowork_inflight_tool_counts[clean] = current - 1
+
+    def _cowork_inflight_mutating_tool_name(self) -> str:
+        for tool_name, count in self._cowork_inflight_tool_counts.items():
+            if int(count or 0) <= 0:
+                continue
+            if self._is_mutating_tool(tool_name):
+                return tool_name
+        return ""
+
+    async def _record_steering_event(
+        self,
+        event_type: str,
+        *,
+        message: str = "",
+        directive: SteeringDirective | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {}
+        if message:
+            payload["text"] = message
+            payload["markup"] = True
+            try:
+                chat = self.query_one("#chat-log", ChatLog)
+                chat.add_info(message)
+            except Exception:
+                pass
+        if directive is not None:
+            payload.update({
+                "directive_id": directive.id,
+                "directive_kind": directive.kind,
+                "directive_text": directive.text,
+                "source": directive.source,
+                "status": directive.status,
+                "created_at_monotonic": float(directive.created_at),
+            })
+        if extra:
+            payload.update(extra)
+        await self._append_chat_replay_event(
+            str(event_type or "steer_failed").strip(),
+            payload,
+            render=False,
+        )
+        try:
+            events_panel = self.query_one("#events-panel", EventPanel)
+            label = str(event_type or "steer").replace("steer_", "steer:")
+            detail = textwrap.shorten(
+                " ".join(str(payload.get("text", "")).split()) or label,
+                width=120,
+                placeholder="…",
+            )
+            events_panel.add_event(_now_str(), "steer", f"{label} {detail}".strip())
+        except Exception:
+            pass
+
+    async def _queue_chat_inject_instruction(
+        self,
+        text: str,
+        *,
+        source: str,
+    ) -> bool:
+        clean = str(text or "").strip()
+        if not clean:
+            return False
+        if self._session is None:
+            await self._record_steering_event(
+                "steer_failed",
+                message="No active cowork chat session for inject.",
+                extra={"result": "failed", "reason": "no_session", "source": source},
+            )
+            return False
+        if not self._is_cowork_stop_visible():
+            await self._record_steering_event(
+                "steer_failed",
+                message="No active cowork chat execution to inject into.",
+                extra={"result": "failed", "reason": "not_busy", "source": source},
+            )
+            return False
+
+        directive = self._new_steering_directive(
+            kind="inject",
+            text=clean,
+            source=source,
+        )
+        self._pending_inject_directives.append(directive)
+        self._session.queue_inject_instruction(clean)
+        await self._record_steering_event(
+            "steer_inject_queued",
+            message=(
+                "Queued inject instruction for next safe boundary. "
+                f"Queue size: {self._pending_inject_count()}."
+            ),
+            directive=directive,
+            extra={
+                "result": "queued",
+                "apply_mode": "safe_boundary",
+                "queue_size": self._pending_inject_count(),
+            },
+        )
+        log_latency_event(
+            logger,
+            event="steer_inject_queued",
+            duration_seconds=0.0,
+            fields={
+                "session_id": self._active_session_id(),
+                "turn_number": int(getattr(self._session, "_turn_counter", 0) or 0),
+                "directive_id": directive.id,
+                "directive_kind": directive.kind,
+                "source": directive.source,
+                "result": "queued",
+                "queue_size": self._pending_inject_count(),
+            },
+        )
+        self._sync_chat_stop_control()
+        self._refresh_hint_panel()
+        return True
+
+    async def _sync_pending_inject_apply_state(self) -> None:
+        if not self._pending_inject_directives or self._session is None:
+            return
+        local_count = self._pending_inject_count()
+        count_value = getattr(self._session, "pending_inject_instruction_count", None)
+        if count_value is not None:
+            try:
+                pending_count = int(count_value)
+            except Exception:
+                pending_count = (
+                    local_count
+                    if bool(getattr(self._session, "has_pending_inject_instruction", False))
+                    else 0
+                )
+        else:
+            pending_count = (
+                local_count
+                if bool(getattr(self._session, "has_pending_inject_instruction", False))
+                else 0
+            )
+        if pending_count >= local_count:
+            return
+        apply_count = max(0, local_count - pending_count)
+        if apply_count <= 0:
+            return
+        applied: list[SteeringDirective] = []
+        for _ in range(apply_count):
+            if not self._pending_inject_directives:
+                break
+            directive = self._pending_inject_directives.pop(0)
+            directive.status = "applied"
+            applied.append(directive)
+        for directive in applied:
+            self._last_applied_directive_id = directive.id
+            queued_ms = int(max(0.0, time.monotonic() - directive.created_at) * 1000)
+            await self._record_steering_event(
+                "steer_inject_applied",
+                message="Applied queued inject instruction.",
+                directive=directive,
+                extra={
+                    "result": "applied",
+                    "queued_ms": queued_ms,
+                    "apply_mode": "safe_boundary",
+                    "queue_size": self._pending_inject_count(),
+                },
+            )
+            log_latency_event(
+                logger,
+                event="steer_inject_applied",
+                duration_seconds=max(0.0, float(queued_ms) / 1000.0),
+                fields={
+                    "session_id": self._active_session_id(),
+                    "turn_number": int(getattr(self._session, "_turn_counter", 0) or 0),
+                    "directive_id": directive.id,
+                    "directive_kind": directive.kind,
+                    "source": directive.source,
+                    "queued_ms": queued_ms,
+                    "result": "applied",
+                    "queue_size": self._pending_inject_count(),
+                },
+            )
+        self._sync_chat_stop_control()
+        self._refresh_hint_panel()
+
+    async def _request_chat_pause(self, *, source: str) -> bool:
+        if self._session is None:
+            await self._record_steering_event(
+                "steer_failed",
+                message="No active cowork chat session.",
+                extra={"result": "failed", "reason": "no_session", "source": source},
+            )
+            return False
+        if not self._is_cowork_stop_visible():
+            await self._record_steering_event(
+                "steer_failed",
+                message="No active cowork chat execution to pause.",
+                extra={"result": "failed", "reason": "not_busy", "source": source},
+            )
+            return False
+        if self._session.pause_requested:
+            chat = self.query_one("#chat-log", ChatLog)
+            chat.add_info("Cowork chat is already paused.")
+            return True
+        self._session.request_pause()
+        await self._record_steering_event(
+            "steer_pause_requested",
+            message="Pause requested. Cowork chat will pause at the next safe boundary.",
+            extra={"result": "queued", "source": source},
+        )
+        log_latency_event(
+            logger,
+            event="steer_pause_requested",
+            duration_seconds=0.0,
+            fields={
+                "session_id": self._active_session_id(),
+                "turn_number": int(getattr(self._session, "_turn_counter", 0) or 0),
+                "source": source,
+                "result": "queued",
+            },
+        )
+        self._sync_chat_stop_control()
+        return True
+
+    async def _request_chat_resume(self, *, source: str) -> bool:
+        if self._session is None:
+            await self._record_steering_event(
+                "steer_failed",
+                message="No active cowork chat session.",
+                extra={"result": "failed", "reason": "no_session", "source": source},
+            )
+            return False
+        if not self._session.pause_requested:
+            chat = self.query_one("#chat-log", ChatLog)
+            chat.add_info("Cowork chat is not paused.")
+            return True
+        self._session.request_resume()
+        await self._record_steering_event(
+            "steer_resumed",
+            message="Cowork chat resumed.",
+            extra={"result": "applied", "source": source},
+        )
+        log_latency_event(
+            logger,
+            event="steer_resumed",
+            duration_seconds=0.0,
+            fields={
+                "session_id": self._active_session_id(),
+                "turn_number": int(getattr(self._session, "_turn_counter", 0) or 0),
+                "source": source,
+                "result": "applied",
+            },
+        )
+        self._sync_chat_stop_control()
+        return True
+
+    async def _clear_chat_steering(self, *, source: str) -> bool:
+        had_pending = self._has_pending_inject()
+        had_paused = bool(self._session and self._session.pause_requested)
+        if had_pending:
+            cleared = self._clear_pending_inject_directives(clear_session=True)
+            for directive in cleared:
+                directive.status = "dismissed"
+            await self._record_steering_event(
+                "steer_inject_dismissed",
+                message=f"Cleared {len(cleared)} queued inject instruction(s).",
+                extra={
+                    "result": "dismissed",
+                    "source": source,
+                    "queue_cleared_count": len(cleared),
+                },
+            )
+            log_latency_event(
+                logger,
+                event="steer_inject_dismissed",
+                duration_seconds=0.0,
+                fields={
+                    "session_id": self._active_session_id(),
+                    "source": source,
+                    "result": "dismissed",
+                    "queue_cleared_count": len(cleared),
+                },
+            )
+        if had_paused and self._session is not None:
+            self._session.request_resume()
+            await self._record_steering_event(
+                "steer_resumed",
+                message="Cowork chat resumed.",
+                extra={"result": "applied", "source": source, "resume_reason": "clear"},
+            )
+        if not had_pending and not had_paused:
+            chat = self.query_one("#chat-log", ChatLog)
+            chat.add_info("No steering state to clear.")
+        self._sync_chat_stop_control()
+        self._refresh_hint_panel()
+        return True
+
+    async def _confirm_redirect_with_mutating_tool(self, tool_name: str) -> bool:
+        clean_tool = str(tool_name or "").strip() or "mutating tool"
+        waiter: asyncio.Future[bool] = asyncio.Future()
+        screen = ProcessRunCloseScreen(
+            run_label="cowork chat",
+            running=True,
+            prompt_override=(
+                "[bold #e0af68]Redirect while mutating tool is in flight?[/]"
+            ),
+            detail_override=(
+                f"Tool [bold]{self._escape_markup(clean_tool)}[/bold] is mutating files. "
+                "Redirect will interrupt the current turn before rebasing the objective."
+            ),
+            confirm_label="Redirect",
+            cancel_label="Keep Running",
+            confirm_variant="warning",
+        )
+
+        def handle_result(confirmed: bool) -> None:
+            if not waiter.done():
+                waiter.set_result(bool(confirmed))
+
+        self.push_screen(screen, callback=handle_result)
+        try:
+            timeout = self._tui_run_close_modal_timeout_seconds()
+            return await asyncio.wait_for(waiter, timeout=timeout)
+        except TimeoutError:
+            try:
+                screen.dismiss(False)
+            except Exception:
+                pass
+            return False
+        except asyncio.CancelledError:
+            try:
+                screen.dismiss(False)
+            except Exception:
+                pass
+            raise
+
+    async def _request_chat_redirect(
+        self,
+        text: str,
+        *,
+        source: str,
+    ) -> bool:
+        clean = str(text or "").strip()
+        if not clean:
+            return False
+        if self._session is None:
+            await self._record_steering_event(
+                "steer_failed",
+                message="No active cowork chat session for redirect.",
+                extra={"result": "failed", "reason": "no_session", "source": source},
+            )
+            return False
+
+        directive = self._new_steering_directive(
+            kind="redirect",
+            text=clean,
+            source=source,
+        )
+        pending = self._clear_pending_inject_directives(clear_session=True)
+        if pending:
+            for item in pending:
+                item.status = "dismissed"
+            await self._record_steering_event(
+                "steer_inject_dismissed",
+                message=(
+                    f"Cleared {len(pending)} queued inject instruction(s) "
+                    "before redirect."
+                ),
+                extra={
+                    "result": "dismissed",
+                    "source": source,
+                    "dismiss_reason": "redirect",
+                    "queue_cleared_count": len(pending),
+                },
+            )
+        self._active_redirect_directive = directive
+        await self._record_steering_event(
+            "steer_redirect_requested",
+            message="Redirect requested. Interrupting current cowork execution.",
+            directive=directive,
+            extra={"result": "requested", "apply_mode": "immediate"},
+        )
+        log_latency_event(
+            logger,
+            event="steer_redirect_requested",
+            duration_seconds=0.0,
+            fields={
+                "session_id": self._active_session_id(),
+                "turn_number": int(getattr(self._session, "_turn_counter", 0) or 0),
+                "directive_id": directive.id,
+                "directive_kind": directive.kind,
+                "source": directive.source,
+                "result": "requested",
+            },
+        )
+
+        mutating_tool = self._cowork_inflight_mutating_tool_name()
+        if mutating_tool:
+            await self._record_steering_event(
+                "steer_redirect_confirm_required",
+                message=(
+                    "Redirect requires confirmation because a mutating tool "
+                    "is currently in flight."
+                ),
+                directive=directive,
+                extra={"tool_name": mutating_tool, "result": "confirm_required"},
+            )
+            confirmed = await self._confirm_redirect_with_mutating_tool(mutating_tool)
+            if not confirmed:
+                self._active_redirect_directive = None
+                await self._record_steering_event(
+                    "steer_failed",
+                    message="Redirect canceled. Continuing current cowork execution.",
+                    directive=directive,
+                    extra={
+                        "result": "cancelled",
+                        "reason": "redirect_confirm_denied",
+                        "tool_name": mutating_tool,
+                    },
+                )
+                return False
+            await self._record_steering_event(
+                "steer_redirect_confirmed",
+                message="Redirect confirmed.",
+                directive=directive,
+                extra={"tool_name": mutating_tool, "result": "confirmed"},
+            )
+
+        if self._is_cowork_stop_visible():
+            await self._request_chat_stop()
+            if self._is_cowork_stop_visible():
+                self._active_redirect_directive = None
+                self._steer_last_error = "redirect_stop_timeout"
+                await self._record_steering_event(
+                    "steer_failed",
+                    message="Redirect failed because cowork execution did not stop.",
+                    directive=directive,
+                    extra={"result": "failed", "reason": "stop_timeout"},
+                )
+                return False
+
+        # Redirect should release any pause gate and immediately drive a new turn.
+        self._session.request_resume()
+        directive.status = "applied"
+        self._last_applied_directive_id = directive.id
+        await self._record_steering_event(
+            "steer_redirect_applied",
+            message="Redirect applied. Rebasing cowork objective now.",
+            directive=directive,
+            extra={"result": "applied", "apply_mode": "immediate"},
+        )
+        log_latency_event(
+            logger,
+            event="steer_redirect_applied",
+            duration_seconds=0.0,
+            fields={
+                "session_id": self._active_session_id(),
+                "turn_number": int(getattr(self._session, "_turn_counter", 0) or 0),
+                "directive_id": directive.id,
+                "directive_kind": directive.kind,
+                "source": directive.source,
+                "result": "applied",
+                "interrupt_path": self._chat_stop_last_path or "cooperative",
+            },
+        )
+        self._active_redirect_directive = None
+        self._chat_turn_worker = self._run_turn(clean)
+        self._sync_activity_indicator()
+        return True
+
+    def _reset_cowork_steering_state(self, *, clear_session: bool = True) -> None:
+        """Reset ephemeral cowork steering state."""
+        self._cowork_inflight_tool_counts = {}
+        self._active_redirect_directive = None
+        self._pending_inject_directives = []
+        self._last_applied_directive_id = ""
+        self._steer_last_error = ""
+        if clear_session and self._session is not None:
+            request_resume = getattr(self._session, "request_resume", None)
+            if callable(request_resume):
+                request_resume()
+            clear_pending = getattr(
+                self._session,
+                "clear_pending_inject_instruction",
+                None,
+            )
+            if callable(clear_pending):
+                clear_pending()
+        self._sync_chat_stop_control()
+        self._refresh_hint_panel()
 
     def _bind_session_tools(self) -> None:
         """Bind tools that hold a reference to the active session."""
@@ -8255,6 +9273,20 @@ class LoomApp(App):
                     str(payload.get("message", "") or ""),
                     markup=self._coerce_bool(payload.get("markup", True), default=True),
                 )
+                return True
+            if event_type.startswith("steer_"):
+                text = str(
+                    payload.get(
+                        "text",
+                        payload.get("message", event_type.replace("_", " ")),
+                    )
+                    or "",
+                )
+                if text:
+                    chat.add_info(
+                        text,
+                        markup=self._coerce_bool(payload.get("markup", True), default=True),
+                    )
                 return True
             if event_type == "info":
                 chat.add_info(
@@ -8572,6 +9604,7 @@ class LoomApp(App):
             ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
             delegate_progress_callback=self._on_cowork_delegate_progress_event,
         )
+        self._reset_cowork_steering_state(clear_session=True)
         self._total_tokens = 0
         self._bind_session_tools()
         self._hydrate_input_history_from_session()
@@ -8622,6 +9655,7 @@ class LoomApp(App):
         await new_session.resume(session_id)
 
         self._session = new_session
+        self._reset_cowork_steering_state(clear_session=True)
         self._total_tokens = new_session.total_tokens
         self._bind_session_tools()
         self._hydrate_input_history_from_session()
@@ -8742,8 +9776,16 @@ class LoomApp(App):
                 await self._persist_process_run_ui_state()
                 return
 
-        if self._chat_busy:
-            return
+        if self._is_cowork_stop_visible():
+            queued = await self._queue_chat_inject_instruction(text, source="enter")
+            if queued:
+                self._append_input_history(text)
+                await self._persist_process_run_ui_state()
+                return
+            # Preserve user text if steering is still active but queueing failed.
+            if self._is_cowork_stop_visible():
+                self._set_user_input_text(text)
+                return
 
         self._append_input_history(text)
         self._chat_turn_worker = self._run_turn(text)
@@ -8762,6 +9804,7 @@ class LoomApp(App):
         # Use the widget's current value rather than event payload to avoid
         # stale-value edge cases that can appear one keypress behind.
         current = self.query_one("#user-input", Input).value
+        self._sync_chat_stop_control()
         self._set_slash_hint(self._render_slash_hint(current))
 
     @on(Button.Pressed, ".process-run-restart-btn")
@@ -8788,6 +9831,48 @@ class LoomApp(App):
         event.stop()
         event.prevent_default()
         self.action_stop_chat()
+
+    @on(Button.Pressed, "#chat-inject-btn")
+    def _on_chat_inject_pressed(self, event: Button.Pressed) -> None:
+        """Queue inject steering from input-row button."""
+        event.stop()
+        event.prevent_default()
+        self.action_inject_chat()
+
+    @on(Button.Pressed, "#chat-redirect-btn")
+    def _on_chat_redirect_pressed(self, event: Button.Pressed) -> None:
+        """Apply redirect steering from input-row button."""
+        event.stop()
+        event.prevent_default()
+        self.action_redirect_chat()
+
+    @on(Button.Pressed)
+    def _on_dynamic_steer_queue_button_pressed(self, event: Button.Pressed) -> None:
+        """Dispatch per-item steering queue actions from dynamic row buttons."""
+        button_id = str(getattr(event.button, "id", "") or "").strip()
+        if button_id.startswith("steer-queue-edit-"):
+            directive_id = button_id.removeprefix("steer-queue-edit-").strip()
+            if not directive_id:
+                return
+            event.stop()
+            event.prevent_default()
+            self.action_steer_queue_edit(directive_id)
+            return
+        if button_id.startswith("steer-queue-dismiss-"):
+            directive_id = button_id.removeprefix("steer-queue-dismiss-").strip()
+            if not directive_id:
+                return
+            event.stop()
+            event.prevent_default()
+            self.action_steer_queue_dismiss(directive_id)
+            return
+        if button_id.startswith("steer-queue-redirect-"):
+            directive_id = button_id.removeprefix("steer-queue-redirect-").strip()
+            if not directive_id:
+                return
+            event.stop()
+            event.prevent_default()
+            self.action_steer_queue_redirect(directive_id)
 
     @on(Button.Pressed, "#footer-auth-shortcut, #footer-mcp-shortcut")
     def _on_footer_manager_shortcut_pressed(self, event: Button.Pressed) -> None:
@@ -9463,6 +10548,78 @@ class LoomApp(App):
             await self._start_process_run(execution_goal, **start_kwargs)
             return True
 
+        if token == "/pause":
+            if arg:
+                chat.add_info(self._render_slash_command_usage("/pause", "(no arguments)"))
+                return True
+            await self._request_chat_pause(source="slash")
+            return True
+
+        if token == "/inject":
+            inject_text = self._strip_wrapping_quotes(arg)
+            if not inject_text:
+                chat.add_info(self._render_slash_command_usage("/inject", "<text>"))
+                return True
+            await self._queue_chat_inject_instruction(inject_text, source="slash")
+            return True
+
+        if token == "/redirect":
+            redirect_text = self._strip_wrapping_quotes(arg)
+            if not redirect_text:
+                chat.add_info(self._render_slash_command_usage("/redirect", "<text>"))
+                return True
+            if self._chat_redirect_inflight:
+                chat.add_info("Redirect already in progress.")
+                return True
+            self._chat_redirect_inflight = True
+            self._sync_chat_stop_control()
+            try:
+                await self._request_chat_redirect(redirect_text, source="slash")
+            finally:
+                self._chat_redirect_inflight = False
+                self._sync_chat_stop_control()
+            return True
+
+        if token == "/steer":
+            if not arg:
+                chat.add_info(
+                    self._render_slash_command_usage(
+                        "/steer",
+                        "pause|resume|queue|clear",
+                    )
+                )
+                return True
+            subparts = arg.split(None, 1)
+            subcmd = str(subparts[0] or "").strip().lower()
+            rest = subparts[1].strip() if len(subparts) > 1 else ""
+            if rest:
+                chat.add_info(
+                    self._render_slash_command_usage(
+                        "/steer",
+                        "pause|resume|queue|clear",
+                    )
+                )
+                return True
+            if subcmd == "pause":
+                await self._request_chat_pause(source="slash")
+                return True
+            if subcmd == "resume":
+                await self._request_chat_resume(source="slash")
+                return True
+            if subcmd == "queue":
+                chat.add_info(self._render_steer_queue_status())
+                return True
+            if subcmd == "clear":
+                await self._clear_chat_steering(source="slash")
+                return True
+            chat.add_info(
+                self._render_slash_command_usage(
+                    "/steer",
+                    "pause|resume|queue|clear",
+                )
+            )
+            return True
+
         if token == "/stop":
             if arg:
                 chat.add_info(self._render_slash_command_usage("/stop", "(no arguments)"))
@@ -9825,14 +10982,196 @@ class LoomApp(App):
             exclusive=False,
         )
 
+    def action_inject_chat(self) -> None:
+        """Queue an inject steering instruction from the input row."""
+        text = self._take_input_text_for_steering()
+        if not text:
+            return
+
+        async def _run_inject() -> None:
+            try:
+                await self._queue_chat_inject_instruction(text, source="button")
+            except Exception as e:
+                logger.exception("chat_inject_failed session=%s", self._active_session_id())
+                await self._record_steering_event(
+                    "steer_failed",
+                    message=f"[bold #f7768e]Inject failed:[/] {self._escape_markup(str(e))}",
+                    extra={"result": "failed", "reason": "exception", "source": "button"},
+                )
+
+        self.run_worker(
+            _run_inject(),
+            group="chat-steer",
+            exclusive=False,
+        )
+
+    def action_redirect_chat(self) -> None:
+        """Request immediate redirect steering from the input row."""
+        text = self._take_input_text_for_steering()
+        if not text:
+            return
+        if self._chat_redirect_inflight:
+            return
+        self._chat_redirect_inflight = True
+        self._sync_chat_stop_control()
+
+        async def _run_redirect() -> None:
+            try:
+                await self._request_chat_redirect(text, source="button")
+            except Exception as e:
+                logger.exception("chat_redirect_failed session=%s", self._active_session_id())
+                await self._record_steering_event(
+                    "steer_failed",
+                    message=f"[bold #f7768e]Redirect failed:[/] {self._escape_markup(str(e))}",
+                    extra={"result": "failed", "reason": "exception", "source": "button"},
+                )
+            finally:
+                self._chat_redirect_inflight = False
+                self._sync_chat_stop_control()
+
+        self.run_worker(
+            _run_redirect(),
+            group="chat-steer",
+            exclusive=False,
+        )
+
+    def action_steer_queue_edit(self, directive_id: str = "") -> None:
+        """Bring queued inject text back to input for editing."""
+        index = (
+            self._pending_inject_directive_index(directive_id)
+            if directive_id
+            else 0
+        )
+        directive = self._remove_pending_inject_directive_at(
+            index,
+            clear_session=True,
+        )
+        if directive is None:
+            return
+        directive.status = "dismissed"
+        self._set_user_input_text(directive.text)
+        try:
+            self.query_one("#user-input", Input).focus()
+        except Exception:
+            pass
+
+        async def _run_edit() -> None:
+            await self._record_steering_event(
+                "steer_inject_dismissed",
+                message="Moved queued inject instruction back to input for editing.",
+                directive=directive,
+                extra={"result": "dismissed", "source": "queue_popup", "dismiss_reason": "edit"},
+            )
+
+        self.run_worker(
+            _run_edit(),
+            group="chat-steer",
+            exclusive=False,
+        )
+
+    def action_steer_queue_dismiss(self, directive_id: str = "") -> None:
+        """Dismiss queued inject directive from queue popup."""
+        index = (
+            self._pending_inject_directive_index(directive_id)
+            if directive_id
+            else 0
+        )
+        directive = self._remove_pending_inject_directive_at(
+            index,
+            clear_session=True,
+        )
+        if directive is None:
+            return
+        directive.status = "dismissed"
+
+        async def _run_dismiss() -> None:
+            await self._record_steering_event(
+                "steer_inject_dismissed",
+                message="Dismissed queued inject instruction.",
+                directive=directive,
+                extra={
+                    "result": "dismissed",
+                    "source": "queue_popup",
+                    "dismiss_reason": "dismiss",
+                },
+            )
+
+        self.run_worker(
+            _run_dismiss(),
+            group="chat-steer",
+            exclusive=False,
+        )
+
+    def action_steer_queue_redirect(self, directive_id: str = "") -> None:
+        """Use queued inject text as immediate redirect objective."""
+        index = (
+            self._pending_inject_directive_index(directive_id)
+            if directive_id
+            else 0
+        )
+        directive = self._remove_pending_inject_directive_at(
+            index,
+            clear_session=True,
+        )
+        if directive is None:
+            return
+        text = str(directive.text or "").strip()
+        if not text:
+            return
+        if self._chat_redirect_inflight:
+            return
+        self._chat_redirect_inflight = True
+        self._sync_chat_stop_control()
+
+        async def _run_redirect() -> None:
+            try:
+                directive.status = "dismissed"
+                await self._record_steering_event(
+                    "steer_inject_dismissed",
+                    message="Converted queued inject instruction to immediate redirect.",
+                    directive=directive,
+                    extra={
+                        "result": "dismissed",
+                        "source": "queue_popup",
+                        "dismiss_reason": "redirect_now",
+                    },
+                )
+                await self._request_chat_redirect(text, source="queue_popup")
+            except Exception as e:
+                logger.exception(
+                    "queue_redirect_failed session=%s",
+                    self._active_session_id(),
+                )
+                await self._record_steering_event(
+                    "steer_failed",
+                    message=f"[bold #f7768e]Redirect failed:[/] {self._escape_markup(str(e))}",
+                    extra={
+                        "result": "failed",
+                        "reason": "exception",
+                        "source": "queue_popup",
+                    },
+                )
+            finally:
+                self._chat_redirect_inflight = False
+                self._sync_chat_stop_control()
+
+        self.run_worker(
+            _run_redirect(),
+            group="chat-steer",
+            exclusive=False,
+        )
+
     @work(exclusive=True)
     async def _run_turn(self, user_message: str) -> None:
         if self._session is None:
             return
 
+        followup_directive: SteeringDirective | None = None
+        followup_message = ""
         self._chat_stop_last_path = ""
         self._chat_stop_last_error = ""
         self._chat_stop_requested = False
+        self._cowork_inflight_tool_counts = {}
         self._session.clear_stop_request()
         self._chat_busy = True
         self._sync_activity_indicator()
@@ -9866,12 +11205,35 @@ class LoomApp(App):
             chat.add_model_text(f"[bold #f7768e]Error:[/] {e}", markup=True)
             self.notify(str(e), severity="error", timeout=5)
         finally:
+            await self._sync_pending_inject_apply_state()
+            self._cowork_inflight_tool_counts = {}
             self._chat_busy = False
             self._chat_stop_requested = False
             self._chat_turn_worker = None
             self._session.clear_stop_request()
             status.state = "Ready"
             self._sync_activity_indicator()
+            if not self._chat_stop_last_path and not self._chat_redirect_inflight:
+                followup_directive = self._pop_next_queued_followup_directive()
+                if followup_directive is not None:
+                    followup_message = str(followup_directive.text or "").strip()
+        if followup_directive is not None and followup_message:
+            followup_directive.status = "applied"
+            queued_ms = int(max(0.0, time.monotonic() - followup_directive.created_at) * 1000)
+            await self._record_steering_event(
+                "steer_inject_applied",
+                message="Dispatched queued prompt as follow-up turn.",
+                directive=followup_directive,
+                extra={
+                    "result": "applied",
+                    "queued_ms": queued_ms,
+                    "apply_mode": "queued_turn",
+                    "queue_size": self._pending_inject_count(),
+                },
+            )
+            self.call_after_refresh(
+                lambda message=followup_message: self._start_queued_followup_turn(message),
+            )
 
     async def _run_followup(self, message: str) -> None:
         """Run a follow-up turn (e.g. after ask_user answer)."""
@@ -10096,8 +11458,14 @@ class LoomApp(App):
         event_data = payload.get("event_data", {})
         if not isinstance(event_data, dict):
             event_data = {}
+        if event_type == "tool_call_started":
+            nested_tool = str(event_data.get("tool", "") or "").strip()
+            if nested_tool:
+                self._mark_cowork_tool_inflight(nested_tool)
         if event_type == "tool_call_completed":
             nested_tool = str(event_data.get("tool", "") or "").strip()
+            if nested_tool:
+                self._clear_cowork_tool_inflight(nested_tool)
             if nested_tool and self._is_mutating_tool(nested_tool):
                 self._request_workspace_refresh(f"delegate:{nested_tool}")
             self._ingest_files_panel_from_paths(
@@ -10142,7 +11510,9 @@ class LoomApp(App):
 
         streamed_text = False
 
+        await self._sync_pending_inject_apply_state()
         async for event in self._session.send_streaming(message):
+            await self._sync_pending_inject_apply_state()
             if isinstance(event, str):
                 if not streamed_text:
                     streamed_text = True
@@ -10151,6 +11521,7 @@ class LoomApp(App):
             elif isinstance(event, ToolCallEvent):
                 if event.result is None:
                     # Tool starting
+                    self._mark_cowork_tool_inflight(event.name)
                     chat.add_tool_call(
                         event.name,
                         event.args,
@@ -10184,6 +11555,7 @@ class LoomApp(App):
                     )
                 else:
                     # Tool completed
+                    self._clear_cowork_tool_inflight(event.name)
                     output = ""
                     if event.result.success:
                         output = event.result.output
@@ -10320,6 +11692,7 @@ class LoomApp(App):
 
                 # Update files panel
                 self._update_files_panel(event)
+        await self._sync_pending_inject_apply_state()
 
     async def _run_process_goal(self, goal: str) -> None:
         """Compatibility wrapper for callers that still use the old method."""
@@ -11793,6 +13166,24 @@ class LoomApp(App):
             return
         if command == "run_prompt":
             self._prefill_user_input("/run ")
+            return
+        if command == "pause_chat":
+            await self._handle_slash_command("/pause")
+            return
+        if command == "resume_chat":
+            await self._handle_slash_command("/steer resume")
+            return
+        if command == "inject_prompt":
+            self._prefill_user_input("/inject ")
+            return
+        if command == "redirect_prompt":
+            self._prefill_user_input("/redirect ")
+            return
+        if command == "steer_queue":
+            await self._handle_slash_command("/steer queue")
+            return
+        if command == "steer_clear":
+            await self._handle_slash_command("/steer clear")
             return
         if command == "stop_chat":
             self.action_stop_chat()

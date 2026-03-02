@@ -4009,12 +4009,18 @@ class TestSlashCommandHints:
         fake_hint_body = SimpleNamespace(update=MagicMock())
         fake_footer = SimpleNamespace(display=True)
         fake_status = SimpleNamespace(display=True)
+        fake_list = SimpleNamespace(display=True)
+        fake_grid = SimpleNamespace(display=False)
 
         def _query_one(selector, *_args, **_kwargs):
             if selector == "#slash-hint":
                 return fake_hint
             if selector == "#slash-hint-body":
                 return fake_hint_body
+            if selector == "#steer-queue-grid":
+                return fake_grid
+            if selector == "#steer-queue-list":
+                return fake_list
             if selector == "#status-bar":
                 return fake_status
             return fake_footer
@@ -4029,6 +4035,8 @@ class TestSlashCommandHints:
         # Slash hints no longer toggle footer/status visibility.
         assert fake_footer.display is True
         assert fake_status.display is True
+        assert fake_list.display is False
+        assert fake_grid.display is True
 
     def test_set_slash_hint_empty_hides_container_and_clears_body(self):
         from loom.tui.app import LoomApp
@@ -4045,12 +4053,18 @@ class TestSlashCommandHints:
         fake_hint_body = SimpleNamespace(update=MagicMock())
         fake_footer = SimpleNamespace(display=False)
         fake_status = SimpleNamespace(display=False)
+        fake_list = SimpleNamespace(display=True)
+        fake_grid = SimpleNamespace(display=True)
 
         def _query_one(selector, *_args, **_kwargs):
             if selector == "#slash-hint":
                 return fake_hint
             if selector == "#slash-hint-body":
                 return fake_hint_body
+            if selector == "#steer-queue-grid":
+                return fake_grid
+            if selector == "#steer-queue-list":
+                return fake_list
             if selector == "#status-bar":
                 return fake_status
             return fake_footer
@@ -4065,6 +4079,8 @@ class TestSlashCommandHints:
         # Slash hints no longer toggle footer/status visibility.
         assert fake_footer.display is False
         assert fake_status.display is False
+        assert fake_list.display is False
+        assert fake_grid.display is False
 
     def test_slash_completion_candidates_prefix(self):
         from loom.tui.app import LoomApp
@@ -4081,13 +4097,14 @@ class TestSlashCommandHints:
             "/sessions",
             "/session",
             "/stop",
+            "/steer",
             "/setup",
         ]
         assert app._slash_completion_candidates("/h") == ["/history", "/help"]
         assert app._slash_completion_candidates("/m") == ["/mcp", "/model", "/models"]
         assert app._slash_completion_candidates("/t") == ["/tools", "/tokens"]
-        assert app._slash_completion_candidates("/p") == ["/processes"]
-        assert app._slash_completion_candidates("/r") == ["/resume", "/run"]
+        assert app._slash_completion_candidates("/p") == ["/pause", "/processes"]
+        assert app._slash_completion_candidates("/r") == ["/resume", "/run", "/redirect"]
 
     def test_slash_completion_candidates_include_dynamic_process_commands(self):
         from loom.tui.app import LoomApp
@@ -4104,7 +4121,7 @@ class TestSlashCommandHints:
             ])
         ))
 
-        assert app._slash_completion_candidates("/i") == ["/investment-analysis"]
+        assert app._slash_completion_candidates("/i") == ["/inject", "/investment-analysis"]
         assert app._slash_completion_candidates("/m") == [
             "/mcp",
             "/model",
@@ -4221,6 +4238,110 @@ class TestProcessSlashCommands:
         message = chat.add_info.call_args.args[0]
         assert "Usage" in message
         assert "/stop" in message
+
+    @pytest.mark.asyncio
+    async def test_pause_requests_active_chat_pause(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app._request_chat_pause = AsyncMock(return_value=True)
+
+        handled = await app._handle_slash_command("/pause")
+
+        assert handled is True
+        app._request_chat_pause.assert_awaited_once_with(source="slash")
+
+    @pytest.mark.asyncio
+    async def test_inject_requires_text(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app._queue_chat_inject_instruction = AsyncMock(return_value=True)
+
+        handled = await app._handle_slash_command("/inject")
+
+        assert handled is True
+        app._queue_chat_inject_instruction.assert_not_awaited()
+        chat.add_info.assert_called_once()
+        assert "/inject" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_redirect_requires_text(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app._request_chat_redirect = AsyncMock(return_value=True)
+
+        handled = await app._handle_slash_command("/redirect")
+
+        assert handled is True
+        app._request_chat_redirect.assert_not_awaited()
+        chat.add_info.assert_called_once()
+        assert "/redirect" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_steer_subcommands_dispatch(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app._request_chat_pause = AsyncMock(return_value=True)
+        app._request_chat_resume = AsyncMock(return_value=True)
+        app._clear_chat_steering = AsyncMock(return_value=True)
+        app._render_steer_queue_status = MagicMock(return_value="queue")
+
+        assert await app._handle_slash_command("/steer pause") is True
+        app._request_chat_pause.assert_awaited_once_with(source="slash")
+
+        assert await app._handle_slash_command("/steer resume") is True
+        app._request_chat_resume.assert_awaited_once_with(source="slash")
+
+        assert await app._handle_slash_command("/steer queue") is True
+        chat.add_info.assert_called_with("queue")
+
+        assert await app._handle_slash_command("/steer clear") is True
+        app._clear_chat_steering.assert_awaited_once_with(source="slash")
+
+    @pytest.mark.asyncio
+    async def test_steer_rejects_unknown_subcommand(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/steer nope")
+
+        assert handled is True
+        chat.add_info.assert_called_once()
+        assert "/steer" in chat.add_info.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_run_requires_goal(self):
@@ -9558,6 +9679,35 @@ class TestCommandPaletteProcessActions:
         assert calls == ["/run ", "/resume "]
 
     @pytest.mark.asyncio
+    async def test_palette_steering_actions_dispatch(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._handle_slash_command = AsyncMock(return_value=True)
+        app._prefill_user_input = MagicMock()
+
+        await app.action_loom_command("pause_chat")
+        await app.action_loom_command("resume_chat")
+        await app.action_loom_command("inject_prompt")
+        await app.action_loom_command("redirect_prompt")
+        await app.action_loom_command("steer_queue")
+        await app.action_loom_command("steer_clear")
+
+        slash_calls = [c.args[0] for c in app._handle_slash_command.await_args_list]
+        assert slash_calls == [
+            "/pause",
+            "/steer resume",
+            "/steer queue",
+            "/steer clear",
+        ]
+        prefill_calls = [c.args[0] for c in app._prefill_user_input.call_args_list]
+        assert prefill_calls == ["/inject ", "/redirect "]
+
+    @pytest.mark.asyncio
     async def test_palette_dynamic_process_prompt_action_prefills_input(self):
         from loom.tui.app import LoomApp
 
@@ -9750,6 +9900,95 @@ class TestCommandPaletteProcessActions:
         assert app._chat_turn_worker is worker
 
     @pytest.mark.asyncio
+    async def test_user_submit_busy_enter_defaults_to_inject(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app.query_one = MagicMock(return_value=SimpleNamespace(value=""))
+        app._handle_slash_command = AsyncMock(return_value=False)
+        app._is_cowork_stop_visible = MagicMock(return_value=True)
+        app._queue_chat_inject_instruction = AsyncMock(return_value=True)
+        app._persist_process_run_ui_state = AsyncMock()
+        app._set_slash_hint = MagicMock()
+        app._run_turn = MagicMock()
+
+        event = SimpleNamespace(value="inject this")
+        await app.on_user_submit(event)
+
+        app._queue_chat_inject_instruction.assert_awaited_once_with(
+            "inject this",
+            source="enter",
+        )
+        app._run_turn.assert_not_called()
+        assert app._input_history == ["inject this"]
+        app._persist_process_run_ui_state.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_user_submit_busy_queue_failure_restores_input(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app.query_one = MagicMock(return_value=SimpleNamespace(value=""))
+        app._handle_slash_command = AsyncMock(return_value=False)
+        app._is_cowork_stop_visible = MagicMock(side_effect=[True, True])
+        app._queue_chat_inject_instruction = AsyncMock(return_value=False)
+        app._persist_process_run_ui_state = AsyncMock()
+        app._set_slash_hint = MagicMock()
+        app._set_user_input_text = MagicMock()
+        app._run_turn = MagicMock()
+
+        event = SimpleNamespace(value="keep me")
+        await app.on_user_submit(event)
+
+        app._queue_chat_inject_instruction.assert_awaited_once_with(
+            "keep me",
+            source="enter",
+        )
+        app._set_user_input_text.assert_called_once_with("keep me")
+        app._run_turn.assert_not_called()
+        app._persist_process_run_ui_state.assert_not_awaited()
+        assert app._input_history == []
+
+    @pytest.mark.asyncio
+    async def test_user_submit_busy_queue_failure_falls_back_to_turn_if_idle(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app.query_one = MagicMock(return_value=SimpleNamespace(value=""))
+        app._handle_slash_command = AsyncMock(return_value=False)
+        app._is_cowork_stop_visible = MagicMock(side_effect=[True, False])
+        app._queue_chat_inject_instruction = AsyncMock(return_value=False)
+        app._persist_process_run_ui_state = AsyncMock()
+        app._set_slash_hint = MagicMock()
+        app._set_user_input_text = MagicMock()
+        worker = object()
+        app._run_turn = MagicMock(return_value=worker)
+
+        event = SimpleNamespace(value="fallback send")
+        await app.on_user_submit(event)
+
+        app._queue_chat_inject_instruction.assert_awaited_once_with(
+            "fallback send",
+            source="enter",
+        )
+        app._set_user_input_text.assert_not_called()
+        app._run_turn.assert_called_once_with("fallback send")
+        assert app._chat_turn_worker is worker
+        assert app._input_history == ["fallback send"]
+
+    @pytest.mark.asyncio
     async def test_request_chat_stop_clears_state_when_only_delegate_streams_active(self):
         from loom.tui.app import LoomApp
 
@@ -9801,7 +10040,22 @@ class TestCommandPaletteProcessActions:
             workspace=Path("/tmp"),
         )
         stop_btn = SimpleNamespace(display=False, disabled=False, label="Stop")
-        app.query_one = MagicMock(return_value=stop_btn)
+        inject_btn = SimpleNamespace(display=False, disabled=False)
+        redirect_btn = SimpleNamespace(display=False, disabled=False)
+        input_widget = SimpleNamespace(value="queued steer")
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-stop-btn":
+                return stop_btn
+            if selector == "#chat-inject-btn":
+                return inject_btn
+            if selector == "#chat-redirect-btn":
+                return redirect_btn
+            if selector == "#user-input":
+                return input_widget
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
 
         app._chat_busy = True
         app._chat_stop_requested = False
@@ -9809,8 +10063,17 @@ class TestCommandPaletteProcessActions:
         assert stop_btn.display is True
         assert stop_btn.disabled is False
         assert stop_btn.label == "■"
+        assert inject_btn.display is True
+        assert redirect_btn.display is True
+
+        input_widget.value = "   "
+        app._sync_chat_stop_control()
+        assert stop_btn.display is True
+        assert inject_btn.display is False
+        assert redirect_btn.display is False
 
         app._chat_stop_requested = True
+        input_widget.value = "queued steer"
         app._sync_chat_stop_control()
         assert stop_btn.display is True
         assert stop_btn.disabled is True
@@ -9820,6 +10083,289 @@ class TestCommandPaletteProcessActions:
         app._chat_stop_requested = False
         app._sync_chat_stop_control()
         assert stop_btn.display is False
+        assert inject_btn.display is False
+        assert redirect_btn.display is False
+
+    def test_set_slash_hint_prefers_steering_queue_popup_when_pending(self):
+        from loom.tui.app import LoomApp, SteeringDirective
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._chat_busy = True
+        app._pending_inject_directives = [
+            SteeringDirective(
+                id="d1",
+                kind="inject",
+                text="focus on tests first",
+                source="slash",
+            ),
+        ]
+        fake_hint = SimpleNamespace(
+            display=False,
+            scroll_home=MagicMock(),
+            styles=SimpleNamespace(height=None, max_height=None, overflow_y=None),
+        )
+        fake_hint_body = SimpleNamespace(update=MagicMock(), display=True)
+        fake_list = SimpleNamespace(display=False)
+        fake_grid = SimpleNamespace(
+            display=False,
+            styles=SimpleNamespace(background=None),
+        )
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#slash-hint":
+                return fake_hint
+            if selector == "#slash-hint-body":
+                return fake_hint_body
+            if selector == "#steer-queue-grid":
+                return fake_grid
+            if selector == "#steer-queue-list":
+                return fake_list
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        app._render_steer_queue_rows = MagicMock()
+
+        app._set_slash_hint("slash hint")
+
+        assert fake_hint.display is True
+        assert fake_list.display is True
+        assert fake_grid.display is True
+        assert fake_hint.styles.height == 3
+        assert fake_hint.styles.max_height == 3
+        assert fake_hint.styles.overflow_y == "hidden"
+        assert fake_grid.styles.background == "#3a4465"
+        app._render_steer_queue_rows.assert_called_once()
+        fake_hint_body.update.assert_called_once_with("")
+        assert fake_hint_body.display is False
+
+    def test_set_slash_hint_queue_popup_skips_rerender_when_unchanged(self):
+        from loom.tui.app import LoomApp, SteeringDirective
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._chat_busy = True
+        app._pending_inject_directives = [
+            SteeringDirective(
+                id="d1",
+                kind="inject",
+                text="focus on tests first",
+                source="slash",
+            ),
+        ]
+        fake_hint = SimpleNamespace(
+            display=False,
+            scroll_home=MagicMock(),
+            styles=SimpleNamespace(height=None, max_height=None, overflow_y=None),
+        )
+        fake_hint_body = SimpleNamespace(update=MagicMock(), display=True)
+        fake_list = SimpleNamespace(display=False)
+        fake_grid = SimpleNamespace(
+            display=False,
+            styles=SimpleNamespace(background=None),
+        )
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#slash-hint":
+                return fake_hint
+            if selector == "#slash-hint-body":
+                return fake_hint_body
+            if selector == "#steer-queue-grid":
+                return fake_grid
+            if selector == "#steer-queue-list":
+                return fake_list
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        def _mark_rows_rendered() -> None:
+            app._last_rendered_steer_queue_signature = app._steer_queue_signature()
+
+        app._render_steer_queue_rows = MagicMock(side_effect=_mark_rows_rendered)
+
+        app._set_slash_hint("slash hint")
+        app._set_slash_hint("slash hint")
+
+        app._render_steer_queue_rows.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_steer_queue_popup_renders_three_buttons_per_item(self):
+        from loom.tui.app import LoomApp, SteeringDirective
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+        app._chat_busy = True
+        app._pending_inject_directives = [
+            SteeringDirective(id="d1", kind="inject", text="first", source="slash"),
+            SteeringDirective(id="d2", kind="inject", text="second", source="slash"),
+        ]
+
+        async with app.run_test() as pilot:
+            app._set_slash_hint("")
+            await pilot.pause()
+
+            button_ids = {
+                str(widget.id)
+                for widget in app.query(".steer-queue-item-btn")
+            }
+
+        assert button_ids == {
+            "steer-queue-edit-d1",
+            "steer-queue-redirect-d1",
+            "steer-queue-dismiss-d1",
+            "steer-queue-edit-d2",
+            "steer-queue-redirect-d2",
+            "steer-queue-dismiss-d2",
+        }
+
+    @pytest.mark.asyncio
+    async def test_request_chat_redirect_requires_confirm_only_for_mutating_tool(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(
+            pause_requested=False,
+            request_resume=MagicMock(),
+            clear_pending_inject_instruction=MagicMock(),
+            _turn_counter=2,
+        )
+        app._record_steering_event = AsyncMock()
+        app._request_chat_stop = AsyncMock()
+        app._is_cowork_stop_visible = MagicMock(return_value=False)
+        app._run_turn = MagicMock(return_value=object())
+        app._sync_activity_indicator = MagicMock()
+        app._confirm_redirect_with_mutating_tool = AsyncMock(return_value=True)
+
+        app._cowork_inflight_tool_counts = {"read_file": 1}
+        app._is_mutating_tool = MagicMock(side_effect=lambda name: name == "write_file")
+
+        ok = await app._request_chat_redirect("new objective", source="slash")
+
+        assert ok is True
+        app._confirm_redirect_with_mutating_tool.assert_not_awaited()
+
+        app._cowork_inflight_tool_counts = {"write_file": 1}
+        app._confirm_redirect_with_mutating_tool = AsyncMock(return_value=False)
+        app._run_turn.reset_mock()
+        app._chat_turn_worker = None
+
+        ok = await app._request_chat_redirect("another objective", source="slash")
+
+        assert ok is False
+        app._confirm_redirect_with_mutating_tool.assert_awaited_once_with("write_file")
+        app._run_turn.assert_not_called()
+
+    def test_action_steer_queue_edit_restores_input(self):
+        from loom.tui.app import LoomApp, SteeringDirective
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._pending_inject_directives = [SteeringDirective(
+            id="d1",
+            kind="inject",
+            text="restore me",
+            source="slash",
+        )]
+        app._session = SimpleNamespace(clear_pending_inject_instruction=MagicMock())
+        app._set_user_input_text = MagicMock()
+        app._sync_chat_stop_control = MagicMock()
+        app._refresh_hint_panel = MagicMock()
+        app.query_one = MagicMock(return_value=SimpleNamespace(focus=MagicMock()))
+        captured: dict[str, object] = {}
+        app.run_worker = MagicMock(
+            side_effect=lambda coro, **kwargs: captured.update(coro=coro, kwargs=kwargs)
+        )
+
+        app.action_steer_queue_edit()
+
+        app._set_user_input_text.assert_called_once_with("restore me")
+        assert app._pending_inject_directives == []
+        app._session.clear_pending_inject_instruction.assert_called_once()
+        coro = captured.get("coro")
+        if coro is not None:
+            coro.close()
+
+    def test_action_steer_queue_dismiss_clears_pending(self):
+        from loom.tui.app import LoomApp, SteeringDirective
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._pending_inject_directives = [SteeringDirective(
+            id="d1",
+            kind="inject",
+            text="dismiss me",
+            source="slash",
+        )]
+        app._session = SimpleNamespace(clear_pending_inject_instruction=MagicMock())
+        app._sync_chat_stop_control = MagicMock()
+        app._refresh_hint_panel = MagicMock()
+        captured: dict[str, object] = {}
+        app.run_worker = MagicMock(
+            side_effect=lambda coro, **kwargs: captured.update(coro=coro, kwargs=kwargs)
+        )
+
+        app.action_steer_queue_dismiss()
+
+        assert app._pending_inject_directives == []
+        app._session.clear_pending_inject_instruction.assert_called_once()
+        coro = captured.get("coro")
+        if coro is not None:
+            coro.close()
+
+    @pytest.mark.asyncio
+    async def test_action_steer_queue_redirect_uses_queued_text(self):
+        from loom.tui.app import LoomApp, SteeringDirective
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._pending_inject_directives = [SteeringDirective(
+            id="d1",
+            kind="inject",
+            text="switch objective",
+            source="slash",
+        )]
+        app._session = SimpleNamespace(clear_pending_inject_instruction=MagicMock())
+        app._sync_chat_stop_control = MagicMock()
+        app._refresh_hint_panel = MagicMock()
+        app._request_chat_redirect = AsyncMock(return_value=True)
+        app._record_steering_event = AsyncMock()
+        captured: dict[str, object] = {}
+        app.run_worker = MagicMock(
+            side_effect=lambda coro, **kwargs: captured.update(coro=coro, kwargs=kwargs)
+        )
+
+        app.action_steer_queue_redirect()
+        await captured["coro"]
+
+        app._request_chat_redirect.assert_awaited_once_with(
+            "switch objective",
+            source="queue_popup",
+        )
+        assert app._pending_inject_directives == []
+        app._session.clear_pending_inject_instruction.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_request_chat_stop_when_idle_is_safe_noop(self):
@@ -9960,6 +10506,58 @@ class TestCommandPaletteProcessActions:
         assert app._session.clear_stop_request.call_count >= 1
 
     @pytest.mark.asyncio
+    async def test_run_turn_dispatches_enter_queued_followup_after_completion(self):
+        from loom.tui.app import LoomApp, SteeringDirective
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        status = SimpleNamespace(state="Idle", total_tokens=0)
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#status-bar":
+                return status
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        app._session = SimpleNamespace(
+            clear_stop_request=MagicMock(),
+            stop_requested=False,
+            pending_inject_instruction_count=1,
+            has_pending_inject_instruction=True,
+            clear_pending_inject_instruction=MagicMock(),
+            queue_inject_instruction=MagicMock(),
+            _turn_counter=1,
+        )
+        app._pending_inject_directives = [
+            SteeringDirective(
+                id="d1",
+                kind="inject",
+                text="Write me another.",
+                source="enter",
+            ),
+        ]
+        app._append_chat_replay_event = AsyncMock()
+        app._record_steering_event = AsyncMock()
+        app._run_interaction = AsyncMock()
+        app._sync_activity_indicator = MagicMock()
+        app._start_queued_followup_turn = MagicMock()
+        app.call_after_refresh = MagicMock(side_effect=lambda callback: callback())
+
+        await LoomApp._run_turn.__wrapped__(app, "write me a story")
+
+        assert app._pending_inject_directives == []
+        app._session.clear_pending_inject_instruction.assert_called_once()
+        app._start_queued_followup_turn.assert_called_once_with("Write me another.")
+        assert app._record_steering_event.await_count >= 1
+        assert app._record_steering_event.await_args_list[-1].args[0] == "steer_inject_applied"
+
+    @pytest.mark.asyncio
     async def test_chat_stop_button_renders_when_visible(self):
         from textual.widgets import Button
 
@@ -10001,6 +10599,9 @@ class TestCommandPaletteProcessActions:
 
         assert app._apply_slash_tab_completion(reverse=False) is True
         assert input_widget.value == "/stop"
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/steer"
 
         assert app._apply_slash_tab_completion(reverse=False) is True
         assert input_widget.value == "/setup"
