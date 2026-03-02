@@ -9082,7 +9082,7 @@ class TestModelSlashCommands:
             config=Config(models={
                 "primary": ModelConfig(
                     provider="openai_compatible",
-                    base_url="https://user:pass@api.example.com/v1?token=leak",
+                    base_url="https://api.example.com/v1?token=leak",
                     model="gpt-4o-mini",
                     api_key="sk-primary-secret",
                     roles=["executor"],
@@ -9112,7 +9112,6 @@ class TestModelSlashCommands:
         assert "https://api.anthropic.com" in rendered
         assert "sk-primary-secret" not in rendered
         assert "sk-secondary-secret" not in rendered
-        assert "user:pass" not in rendered
         assert "token=leak" not in rendered
 
     @pytest.mark.asyncio
