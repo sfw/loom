@@ -40,6 +40,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 from rich.text import Text
 from textual import events, on, work
@@ -134,7 +135,8 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec(canonical="/clear", description="clear chat log"),
     SlashCommandSpec(canonical="/help", description="show command help"),
     SlashCommandSpec(canonical="/setup", description="run setup wizard"),
-    SlashCommandSpec(canonical="/model", description="show active model"),
+    SlashCommandSpec(canonical="/model", description="show active model details"),
+    SlashCommandSpec(canonical="/models", description="show configured models details"),
     SlashCommandSpec(
         canonical="/mcp",
         usage=(
@@ -192,12 +194,13 @@ _SLASH_COMMAND_PRIORITY: dict[str, int] = {
     "/auth": 31,
     "/tools": 32,
     "/model": 40,
-    "/tokens": 41,
-    "/setup": 42,
-    "/learned": 43,
-    "/help": 44,
-    "/clear": 45,
-    "/quit": 46,
+    "/models": 41,
+    "/tokens": 42,
+    "/setup": 43,
+    "/learned": 44,
+    "/help": 45,
+    "/clear": 46,
+    "/quit": 47,
 }
 _MUTATING_TOOL_FALLBACK = frozenset({"document_write", "humanize_writing"})
 _WORKSPACE_SCAN_EXCLUDE_DIRS = frozenset({
@@ -3695,6 +3698,467 @@ class LoomApp(App):
                 subsequent_indent="  ",
             )
         )
+        return "\n".join(lines)
+
+    def _configured_models(self) -> dict[str, Any]:
+        """Return configured model aliases from loaded config."""
+        models = getattr(getattr(self, "_config", None), "models", None)
+        if not isinstance(models, dict):
+            return {}
+        return {
+            str(alias): cfg
+            for alias, cfg in models.items()
+        }
+
+    @staticmethod
+    def _normalize_provider_name(provider: object | None) -> str:
+        """Normalize provider naming aliases for consistent display/matching."""
+        value = str(provider or "").strip().lower()
+        if value == "openai":
+            return "openai_compatible"
+        return value
+
+    @staticmethod
+    def _protocol_for_provider(provider: object | None) -> str:
+        """Map provider type to user-facing protocol label."""
+        normalized = LoomApp._normalize_provider_name(provider)
+        if normalized == "anthropic":
+            return "anthropic-messages"
+        if normalized == "ollama":
+            return "ollama-chat"
+        if normalized == "openai_compatible":
+            return "openai-chat-completions"
+        if normalized:
+            return "unknown"
+        return "-"
+
+    @staticmethod
+    def _sanitize_endpoint_url(raw_url: object | None) -> str:
+        """Render an endpoint URL with credentials/query/fragment stripped."""
+        value = str(raw_url or "").strip()
+        if not value:
+            return "-"
+        try:
+            parsed = urlsplit(value)
+        except Exception:
+            return "(invalid-configured-url)"
+        scheme = str(parsed.scheme or "").strip().lower()
+        host = str(parsed.hostname or "").strip()
+        if not scheme or not host:
+            return "(invalid-configured-url)"
+        try:
+            port = parsed.port
+        except ValueError:
+            return "(invalid-configured-url)"
+        safe_host = host
+        if ":" in host and not host.startswith("["):
+            safe_host = f"[{host}]"
+        netloc = f"{safe_host}:{port}" if port is not None else safe_host
+        safe = urlunsplit((scheme, netloc, parsed.path or "", "", ""))
+        return safe or "(invalid-configured-url)"
+
+    def _endpoint_for_config(self, provider: object | None, base_url: object | None) -> str:
+        """Resolve and sanitize displayed endpoint from config values."""
+        normalized = self._normalize_provider_name(provider)
+        value = str(base_url or "").strip()
+        if not value and normalized == "anthropic":
+            value = "https://api.anthropic.com"
+        if not value:
+            return "-"
+        return self._sanitize_endpoint_url(value)
+
+    def _runtime_model_provider(self, model: ModelProvider | None) -> str:
+        """Best-effort provider key for a runtime model instance."""
+        if model is None:
+            return ""
+        cfg = getattr(model, "_config", None)
+        normalized = self._normalize_provider_name(getattr(cfg, "provider", ""))
+        if normalized:
+            return normalized
+        cls_name = type(model).__name__.lower()
+        if "anthropic" in cls_name:
+            return "anthropic"
+        if "ollama" in cls_name:
+            return "ollama"
+        if "openai" in cls_name:
+            return "openai_compatible"
+        return ""
+
+    def _runtime_model_id(self, model: ModelProvider | None) -> str:
+        """Best-effort model identifier for a runtime model instance."""
+        if model is None:
+            return ""
+        for attr in ("model", "_model"):
+            value = getattr(model, attr, "")
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _runtime_model_roles(self, model: ModelProvider | None) -> list[str]:
+        """Best-effort roles for a runtime model instance."""
+        if model is None:
+            return []
+        value = getattr(model, "roles", [])
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    def _runtime_model_endpoint(self, model: ModelProvider | None) -> str:
+        """Best-effort endpoint for a runtime model instance."""
+        if model is None:
+            return "-"
+        cfg = getattr(model, "_config", None)
+        base_url = getattr(cfg, "base_url", "")
+        if not str(base_url or "").strip():
+            base_url = getattr(model, "_base_url", "")
+        return self._endpoint_for_config(self._runtime_model_provider(model), base_url)
+
+    @staticmethod
+    def _runtime_model_tier(model: ModelProvider | None) -> int | None:
+        """Best-effort runtime tier for active model."""
+        if model is None:
+            return None
+        value = getattr(model, "tier", None)
+        if isinstance(value, int):
+            return value if value > 0 else None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _infer_tier_from_config(
+        self,
+        provider: object | None,
+        model_id: object | None,
+    ) -> int | None:
+        """Infer a tier label from provider + model name when not explicit."""
+        normalized = self._normalize_provider_name(provider)
+        value = str(model_id or "").strip().lower()
+        if not value:
+            return None
+        if normalized == "openai_compatible":
+            if any(token in value for token in ("70b", "72b", "m2.1", "large")):
+                return 3
+            if any(token in value for token in ("14b", "32b", "medium")):
+                return 2
+            return 1
+        if normalized == "ollama":
+            if any(token in value for token in ("70b", "72b", "large")):
+                return 3
+            if any(token in value for token in ("14b", "32b", "medium")):
+                return 2
+            return 1
+        if normalized == "anthropic":
+            if "opus" in value:
+                return 3
+            if "sonnet" in value:
+                return 2
+            if "haiku" in value:
+                return 1
+            return 2
+        return None
+
+    @staticmethod
+    def _format_tier_label(explicit_tier: object | None, inferred_tier: int | None) -> str:
+        """Render tier label, preferring explicit value then inferred."""
+        if isinstance(explicit_tier, int) and explicit_tier > 0:
+            return str(explicit_tier)
+        try:
+            parsed = int(explicit_tier)
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed > 0:
+            return str(parsed)
+        if isinstance(inferred_tier, int) and inferred_tier > 0:
+            return f"{inferred_tier} (inferred)"
+        return "auto"
+
+    @staticmethod
+    def _format_temperature(value: object | None) -> str:
+        """Render temperature with compact formatting."""
+        if isinstance(value, (int, float)):
+            return f"{float(value):g}"
+        return "-"
+
+    @staticmethod
+    def _format_max_tokens(value: object | None) -> str:
+        """Render max token limit when set."""
+        if isinstance(value, int) and value > 0:
+            return str(value)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return "-"
+        return str(parsed) if parsed > 0 else "-"
+
+    @staticmethod
+    def _format_model_roles(roles: object | None) -> str:
+        """Render roles in deterministic order."""
+        if isinstance(roles, (list, tuple, set)):
+            cleaned = {
+                str(item).strip()
+                for item in roles
+                if str(item).strip()
+            }
+            if cleaned:
+                return ", ".join(sorted(cleaned, key=str.casefold))
+        return "-"
+
+    @staticmethod
+    def _format_capabilities(capabilities: object | None) -> str:
+        """Render capabilities as compact yes/no flags."""
+        if capabilities is None:
+            return "-"
+        fields = (
+            "vision",
+            "native_pdf",
+            "thinking",
+            "citations",
+            "audio_input",
+            "audio_output",
+        )
+        rendered: list[str] = []
+        for field_name in fields:
+            rendered.append(
+                f"{field_name}={'yes' if bool(getattr(capabilities, field_name, False)) else 'no'}",
+            )
+        return ", ".join(rendered)
+
+    def _resolve_active_model_alias(self) -> tuple[str | None, list[str]]:
+        """Resolve active model alias from config with ambiguity awareness."""
+        configured = self._configured_models()
+        if self._model is None or not configured:
+            return None, []
+
+        runtime_name = str(getattr(self._model, "name", "") or "").strip()
+        if runtime_name and runtime_name in configured:
+            return runtime_name, []
+
+        runtime_provider = self._runtime_model_provider(self._model)
+        runtime_model_id = self._runtime_model_id(self._model).lower()
+        runtime_endpoint = self._runtime_model_endpoint(self._model)
+        candidates: list[tuple[str, int]] = []
+
+        for alias, cfg in configured.items():
+            cfg_provider = self._normalize_provider_name(getattr(cfg, "provider", ""))
+            if runtime_provider and cfg_provider and cfg_provider != runtime_provider:
+                continue
+
+            score = 0
+            cfg_model_id = str(getattr(cfg, "model", "") or "").strip().lower()
+            if runtime_model_id and cfg_model_id and runtime_model_id == cfg_model_id:
+                score += 2
+
+            cfg_endpoint = self._endpoint_for_config(
+                cfg_provider,
+                getattr(cfg, "base_url", ""),
+            )
+            if (
+                runtime_endpoint not in {"-", "(invalid-configured-url)"}
+                and cfg_endpoint not in {"-", "(invalid-configured-url)"}
+                and runtime_endpoint == cfg_endpoint
+            ):
+                score += 1
+
+            if score > 0:
+                candidates.append((alias, score))
+
+        if not candidates:
+            return None, []
+
+        candidates.sort(key=lambda item: (-item[1], item[0].casefold()))
+        top_score = candidates[0][1]
+        top_aliases = [alias for alias, score in candidates if score == top_score]
+        if len(top_aliases) == 1:
+            return top_aliases[0], []
+        return None, sorted(top_aliases, key=str.casefold)
+
+    def _render_model_block(
+        self,
+        *,
+        alias: str,
+        active: bool,
+        provider: str,
+        endpoint: str,
+        model_id: str,
+        roles: object | None,
+        tier_label: str,
+        temperature: object | None,
+        max_tokens: object | None,
+        reasoning_effort: object | None,
+        capabilities: object | None,
+    ) -> str:
+        """Render one model detail block."""
+        provider_label = provider or "-"
+        reasoning = str(reasoning_effort or "").strip() or "-"
+        lines = [
+            f"[bold]{self._escape_markup(alias)}[/bold]",
+            f"  [bold]active:[/] {'yes' if active else 'no'}",
+            f"  [bold]provider:[/] {self._escape_markup(provider_label)}",
+            "  [bold]protocol:[/] "
+            f"{self._escape_markup(self._protocol_for_provider(provider_label))}",
+            f"  [bold]endpoint:[/] {self._escape_markup(endpoint)}",
+            f"  [bold]model_id:[/] {self._escape_markup(model_id or '-')}",
+            f"  [bold]roles:[/] {self._escape_markup(self._format_model_roles(roles))}",
+            f"  [bold]tier:[/] {self._escape_markup(tier_label)}",
+            f"  [bold]temperature:[/] {self._escape_markup(self._format_temperature(temperature))}",
+            f"  [bold]max_tokens:[/] {self._escape_markup(self._format_max_tokens(max_tokens))}",
+            f"  [bold]reasoning_effort:[/] {self._escape_markup(reasoning)}",
+            "  [bold]capabilities:[/] "
+            f"{self._escape_markup(self._format_capabilities(capabilities))}",
+        ]
+        return "\n".join(lines)
+
+    def _render_configured_model_block(
+        self,
+        alias: str,
+        cfg: Any,
+        *,
+        active: bool,
+        runtime_model: ModelProvider | None = None,
+    ) -> str:
+        """Render a detail block for one configured model alias."""
+        provider = self._normalize_provider_name(getattr(cfg, "provider", ""))
+        model_id = str(getattr(cfg, "model", "") or "").strip()
+        inferred_tier = (
+            self._runtime_model_tier(runtime_model)
+            if active and runtime_model is not None
+            else self._infer_tier_from_config(provider, model_id)
+        )
+        return self._render_model_block(
+            alias=alias,
+            active=active,
+            provider=provider or "-",
+            endpoint=self._endpoint_for_config(provider, getattr(cfg, "base_url", "")),
+            model_id=model_id or "-",
+            roles=getattr(cfg, "roles", []),
+            tier_label=self._format_tier_label(getattr(cfg, "tier", 0), inferred_tier),
+            temperature=getattr(cfg, "temperature", None),
+            max_tokens=getattr(cfg, "max_tokens", None),
+            reasoning_effort=getattr(cfg, "reasoning_effort", ""),
+            capabilities=getattr(cfg, "resolved_capabilities", None),
+        )
+
+    def _render_runtime_model_block(
+        self,
+        model: ModelProvider,
+        *,
+        alias_override: str,
+        active: bool,
+    ) -> str:
+        """Render a detail block for a runtime model with no config alias."""
+        provider = self._runtime_model_provider(model) or "-"
+        tier = self._runtime_model_tier(model)
+        return self._render_model_block(
+            alias=alias_override,
+            active=active,
+            provider=provider,
+            endpoint=self._runtime_model_endpoint(model),
+            model_id=self._runtime_model_id(model) or "-",
+            roles=self._runtime_model_roles(model),
+            tier_label=str(tier) if isinstance(tier, int) and tier > 0 else "auto",
+            temperature=getattr(model, "configured_temperature", None),
+            max_tokens=getattr(model, "configured_max_tokens", None),
+            reasoning_effort=getattr(getattr(model, "_config", None), "reasoning_effort", ""),
+            capabilities=getattr(model, "_capabilities", None),
+        )
+
+    def _render_active_model_info(self) -> str:
+        """Render rich `/model` output for the active runtime model."""
+        configured = self._configured_models()
+        active_alias, ambiguous_aliases = self._resolve_active_model_alias()
+        lines = ["[bold #7dcfff]Active Model[/bold #7dcfff]"]
+
+        if self._model is None:
+            lines.append("  [dim]No active model configured.[/dim]")
+            if configured:
+                lines.append("  [dim]Use /models to inspect configured aliases.[/dim]")
+            return "\n".join(lines)
+
+        if active_alias is not None:
+            lines.append(
+                self._render_configured_model_block(
+                    active_alias,
+                    configured[active_alias],
+                    active=True,
+                    runtime_model=self._model,
+                )
+            )
+        else:
+            lines.append(
+                self._render_runtime_model_block(
+                    self._model,
+                    alias_override="(runtime-only)",
+                    active=True,
+                )
+            )
+
+        if ambiguous_aliases:
+            lines.append("  [bold]active_alias:[/] ambiguous")
+            lines.append(
+                "  [bold]candidates:[/] "
+                + ", ".join(self._escape_markup(alias) for alias in ambiguous_aliases),
+            )
+        return "\n".join(lines)
+
+    def _render_models_catalog(self) -> str:
+        """Render rich `/models` output for all configured aliases."""
+        configured = self._configured_models()
+        active_alias, ambiguous_aliases = self._resolve_active_model_alias()
+        lines = ["[bold #7dcfff]Configured Models[/bold #7dcfff]"]
+
+        if not configured:
+            lines.append("  [dim]No configured models.[/dim]")
+            if self._model is not None:
+                lines.append("")
+                lines.append("[bold #7dcfff]Active Runtime Model[/bold #7dcfff]")
+                lines.append(
+                    self._render_runtime_model_block(
+                        self._model,
+                        alias_override="(runtime-only)",
+                        active=True,
+                    )
+                )
+            return "\n".join(lines)
+
+        aliases = sorted(configured.keys(), key=str.casefold)
+        if active_alias and active_alias in configured:
+            aliases = [active_alias, *[alias for alias in aliases if alias != active_alias]]
+
+        for idx, alias in enumerate(aliases):
+            if idx > 0:
+                lines.append("")
+            lines.append(
+                self._render_configured_model_block(
+                    alias,
+                    configured[alias],
+                    active=alias == active_alias,
+                    runtime_model=self._model if alias == active_alias else None,
+                )
+            )
+
+        if ambiguous_aliases:
+            lines.append("")
+            lines.append("[bold #e0af68]Active alias is ambiguous.[/bold #e0af68]")
+            lines.append(
+                "  [bold]candidates:[/] "
+                + ", ".join(self._escape_markup(alias) for alias in ambiguous_aliases),
+            )
+        elif self._model is not None and active_alias is None:
+            lines.append("")
+            lines.append(
+                "[bold #e0af68]Active runtime model is not part of configured "
+                "aliases.[/bold #e0af68]"
+            )
+            lines.append(
+                self._render_runtime_model_block(
+                    self._model,
+                    alias_override="(runtime-only)",
+                    active=True,
+                )
+            )
         return "\n".join(lines)
 
     def _render_session_info(self, state) -> str:
@@ -8288,8 +8752,21 @@ class LoomApp(App):
             self._show_help()
             return True
         if token == "/model":
-            name = self._model.name if self._model else "(not configured)"
-            chat.add_info(f"Model: {name}")
+            if arg:
+                chat.add_info(
+                    self._render_slash_command_usage("/model", "(no arguments)")
+                    + "\n[dim]Runtime model switching is not supported yet.[/dim]"
+                )
+                return True
+            chat.add_info(self._render_active_model_info())
+            return True
+        if token == "/models":
+            if arg:
+                chat.add_info(
+                    self._render_slash_command_usage("/models", "(no arguments)")
+                )
+                return True
+            chat.add_info(self._render_models_catalog())
             return True
         if token == "/mcp":
             from loom.mcp.config import (
@@ -10835,6 +11312,7 @@ class LoomApp(App):
             "open_mcp_tab": self.action_open_mcp_tab,
             "list_tools": self._show_tools,
             "model_info": self._show_model_info,
+            "models_info": self._show_models_info,
             "process_info": self._show_process_info,
             "process_list": self._show_process_list,
             "token_info": self._show_token_info,
@@ -10858,8 +11336,11 @@ class LoomApp(App):
 
     def _show_model_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)
-        name = self._model.name if self._model else "(not configured)"
-        chat.add_info(f"Model: {name}")
+        chat.add_info(self._render_active_model_info())
+
+    def _show_models_info(self) -> None:
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(self._render_models_catalog())
 
     def _show_process_info(self) -> None:
         chat = self.query_one("#chat-log", ChatLog)

@@ -20,6 +20,7 @@ _COMMANDS = [
     ("Switch to Events tab", "tab_events", "Focus the Events tab"),
     ("List tools", "list_tools", "Show all available tools"),
     ("Show model info", "model_info", "Display model details"),
+    ("Show models catalog", "models_info", "Display configured model details"),
     ("Show session info", "session_info", "Display current session details"),
     ("Start new session", "new_session", "Create a fresh session"),
     ("List recent sessions", "sessions_list", "Show recent sessions"),
