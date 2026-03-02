@@ -1378,6 +1378,14 @@ class TestTheme:
         assert LOOM_DARK.dark is True
         assert LOOM_DARK.primary == "#7dcfff"
 
+    def test_markdown_rich_theme_overrides_magenta_defaults(self):
+        from loom.tui.theme import LOOM_MARKDOWN_RICH_THEME
+
+        styles = LOOM_MARKDOWN_RICH_THEME.styles
+        assert "markdown.h2" in styles
+        assert str(styles["markdown.h2"]) == "underline #7dcfff"
+        assert str(styles["markdown.block_quote"]) == "#9aa5ce"
+
     def test_color_constants(self):
         from loom.tui.theme import (
             ACCENT_CYAN,

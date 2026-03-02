@@ -83,7 +83,7 @@ from loom.tui.screens import (
     SetupScreen,
     ToolApprovalScreen,
 )
-from loom.tui.theme import LOOM_DARK
+from loom.tui.theme import LOOM_DARK, LOOM_MARKDOWN_RICH_THEME
 from loom.tui.widgets import (
     ActivityIndicator,
     ChatLog,
@@ -1383,6 +1383,8 @@ class LoomApp(App):
         # Register and activate theme
         self.register_theme(LOOM_DARK)
         self.theme = "loom-dark"
+        self.console.push_theme(LOOM_MARKDOWN_RICH_THEME, inherit=True)
+        self.error_console.push_theme(LOOM_MARKDOWN_RICH_THEME, inherit=True)
         try:
             self.query_one("#chat-stop-btn", Button).tooltip = "Stop active chat turn"
         except Exception:
