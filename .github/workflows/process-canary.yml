@@ -29,7 +29,7 @@ jobs:
         run: |
           mkdir -p artifacts/process-live/results
           if [ -n "${{ secrets.LOOM_PROCESS_LIVE_CONFIG_TOML }}" ]; then
-            printf '%s\n' "${{ secrets.LOOM_PROCESS_LIVE_CONFIG_TOML }}" > artifacts/process-live/loom-live.toml
+            printf '%s\n' "${{ secrets.LOOM_PROCESS_LIVE_CONFIG_TOML }}" > "${RUNNER_TEMP}/loom-live.toml"
           fi
 
       - name: Run live process canary suite
@@ -37,7 +37,7 @@ jobs:
         continue-on-error: true
         env:
           LOOM_PROCESS_LIVE: "1"
-          LOOM_PROCESS_LIVE_CONFIG: artifacts/process-live/loom-live.toml
+          LOOM_PROCESS_LIVE_CONFIG: ${{ runner.temp }}/loom-live.toml
           LOOM_PROCESS_LIVE_TIMEOUT: "1200"
           LOOM_PROCESS_LIVE_ARTIFACT_DIR: artifacts/process-live/results
           UV_CACHE_DIR: .uv-cache
@@ -111,4 +111,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: process-live-canary
-          path: artifacts/process-live
+          path: |
+            artifacts/process-live/junit.xml
+            artifacts/process-live/pytest.log
+            artifacts/process-live/summary.md
+            artifacts/process-live/results
