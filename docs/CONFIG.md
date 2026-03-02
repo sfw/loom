@@ -335,6 +335,45 @@ definitions inside `loom.toml`:
 | `timeout_seconds` | `int` | `30` | MCP call timeout budget. |
 | `enabled` | `bool` | `true` | Enables/disables that MCP server. |
 
+Remote MCP aliases additionally support:
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `type` | `string` | `"local"` | Use `"remote"` for HTTP MCP endpoints. |
+| `url` | `string` | `""` | Remote MCP endpoint URL (HTTPS required unless `allow_insecure_http=true`). |
+| `fallback_sse_url` | `string` | `""` | Optional SSE fallback endpoint. |
+| `headers` | `table` | `{}` | Additional request headers (sensitive values redacted in displays). |
+| `oauth.enabled` | `bool` | `false` | Require MCP alias OAuth token readiness before requests. |
+| `oauth.scopes` | `list[string]` | `[]` | Scope hints used for browser OAuth login. |
+| `allow_insecure_http` | `bool` | `false` | Allow `http://` remote URLs for trusted local/dev usage. |
+| `allow_private_network` | `bool` | `false` | Allow loopback/private-network remote URLs for trusted usage. |
+
+Operational OAuth notes:
+- Browser-first login: `uv run loom mcp auth login <alias>`.
+- Manual fallback: `--manual-token --access-token ...` or `--access-token-env ...`.
+- MCP alias OAuth tokens are stored in `~/.loom/mcp_oauth_tokens.json`.
+- `/auth` profile token refs remain separate (`~/.loom/auth.toml` + secret refs).
+
+#### MCP OAuth Failure Runbook
+1. Check alias auth state: `uv run loom mcp auth status <alias>`.
+2. If state is `missing` or `expired`, run browser login:
+   `uv run loom mcp auth login <alias>`.
+3. For headless/SSH sessions, use fallback:
+   `uv run loom mcp auth login <alias> --manual-token --access-token-env <ENV_VAR>`.
+4. If refresh fails repeatedly, clear alias token and re-authenticate:
+   `uv run loom mcp auth logout <alias>` then login again.
+5. Confirm runtime remediation clears:
+   `uv run loom mcp status` and verify alias no longer reports `needs_auth`.
+
+#### Manual Token -> Browser Flow Migration
+1. Keep existing token as rollback path (do not delete immediately).
+2. Run browser login once per alias:
+   `uv run loom mcp auth login <alias>`.
+3. Verify additive metadata now exists in token store (`token_endpoint`, `client_id`).
+4. Validate refresh path:
+   `uv run loom mcp auth refresh <alias> --force`.
+5. If browser flow is unavailable in your environment, continue using manual-token import as a documented fallback.
+
 ## Environment Overrides
 
 | Env var | Overrides | Notes |

@@ -32,7 +32,7 @@ _COMMANDS = [
     ("Show process modes", "process_info", "Show ad hoc vs explicit process modes"),
     ("List processes", "process_list", "Show available process definitions"),
     ("Run ad hoc goal…", "run_prompt", "Prefill /run for ad hoc process execution"),
-    ("Close process run tab", "close_process_tab", "Close current process run tab"),
+    ("Close tab", "close_process_tab", "Close current tab"),
     ("Show token usage", "token_info", "Display session token count"),
     ("Show help", "help", "List commands and keyboard shortcuts"),
     ("Quit", "quit", "Save session and exit"),

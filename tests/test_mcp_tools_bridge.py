@@ -12,7 +12,8 @@ from pathlib import Path
 import pytest
 
 import loom.integrations.mcp_tools as mcp_tools_module
-from loom.config import Config, MCPConfig, MCPServerConfig
+from loom.config import Config, MCPConfig, MCPOAuthConfig, MCPServerConfig
+from loom.integrations.mcp.oauth import MCPOAuthReadiness
 from loom.integrations.mcp_tools import (
     MCPConnectionManager,
     _MCPStdioClient,
@@ -857,6 +858,35 @@ def test_connection_manager_backpressure_guard(monkeypatch):
     assert first.is_alive() is False
     assert second.is_alive() is False
     assert worker_errors == []
+
+
+def test_connection_manager_redacts_oauth_failure_reason(monkeypatch):
+    server = MCPServerConfig(
+        type="remote",
+        url="https://api.example.com/mcp",
+        oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+    )
+    manager = MCPConnectionManager(
+        mcp_config=MCPConfig(servers={"demo": server})
+    )
+
+    monkeypatch.setattr(
+        mcp_tools_module,
+        "ensure_mcp_oauth_ready",
+        lambda _alias: MCPOAuthReadiness(
+            ready=False,
+            state="needs_auth",
+            reason="refresh_token=secret Authorization=Bearer abc123",
+        ),
+    )
+
+    ready = manager._remote_oauth_ready("demo", server)  # noqa: SLF001
+    assert ready is False
+    state = manager.state_for(alias="demo", server=server)
+    assert state.status == "needs_auth"
+    assert "secret" not in state.last_error
+    assert "abc123" not in state.last_error
+    assert "<redacted>" in state.last_error
 
 
 @pytest.mark.asyncio

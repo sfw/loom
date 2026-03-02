@@ -453,6 +453,7 @@ class MCPConfig:
     """Configuration for MCP-backed tool discovery."""
 
     servers: dict[str, MCPServerConfig] = field(default_factory=dict)
+    oauth_browser_login: bool = True
 
 
 @dataclass(frozen=True)
@@ -1654,5 +1655,10 @@ def load_config(path: Path | None = None) -> Config:
         process=process,
         tui=tui,
         limits=limits,
-        mcp=MCPConfig(servers=mcp_servers),
+        mcp=MCPConfig(
+            servers=mcp_servers,
+            oauth_browser_login=bool(
+                mcp_data.get("oauth_browser_login", True)
+            ) if isinstance(mcp_data, dict) else True,
+        ),
     )

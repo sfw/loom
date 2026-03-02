@@ -42,14 +42,19 @@ from loom.auth.resources import (
 )
 from loom.auth.runtime import (
     AuthResolutionError,
+    oauth_provider_config_for_profile,
     parse_auth_profile_overrides,
 )
+from loom.auth.secrets import SecretResolutionError, SecretResolver
 from loom.config import Config, ConfigError, load_config
 from loom.integrations.mcp.oauth import (
+    MCPOAuthFlowError,
     MCPOAuthStoreError,
     default_mcp_oauth_store_path,
     oauth_state_for_alias,
+    refresh_mcp_oauth_token,
     remove_mcp_oauth_token,
+    resolve_mcp_oauth_provider,
     upsert_mcp_oauth_token,
 )
 from loom.integrations.mcp_tools import (
@@ -71,6 +76,7 @@ from loom.mcp.config import (
     redact_server_env,
     redact_server_headers,
 )
+from loom.oauth.engine import OAuthEngine, OAuthEngineError, OAuthProviderConfig
 from loom.tools import create_default_registry
 
 
@@ -1865,6 +1871,222 @@ def auth_profile_remove(ctx: click.Context, profile_id: str) -> None:
     click.echo(f"Profiles remaining: {len(updated.profiles)}")
 
 
+@auth_profile.command(name="login")
+@click.argument("profile_id")
+@click.option("--scope", "scopes", multiple=True, help="OAuth scope. Repeatable.")
+@click.option(
+    "--authorize-url",
+    default=None,
+    help="OAuth authorization endpoint override.",
+)
+@click.option(
+    "--token-url",
+    default=None,
+    help="OAuth token endpoint override.",
+)
+@click.option(
+    "--client-id",
+    default=None,
+    help="OAuth client id override.",
+)
+@click.option(
+    "--redirect-port",
+    type=int,
+    default=8765,
+    show_default=True,
+    help="Loopback callback port for browser auth.",
+)
+@click.option(
+    "--timeout-seconds",
+    type=int,
+    default=180,
+    show_default=True,
+    help="Max seconds to wait for OAuth callback completion.",
+)
+@click.option(
+    "--no-browser",
+    is_flag=True,
+    default=False,
+    help="Do not auto-open browser; print URL and accept manual callback input.",
+)
+@click.option(
+    "--callback-code",
+    default=None,
+    help="Callback URL or authorization code for manual completion.",
+)
+@click.pass_context
+def auth_profile_login(
+    ctx: click.Context,
+    profile_id: str,
+    scopes: tuple[str, ...],
+    authorize_url: str | None,
+    token_url: str | None,
+    client_id: str | None,
+    redirect_port: int,
+    timeout_seconds: int,
+    no_browser: bool,
+    callback_code: str | None,
+) -> None:
+    """Run browser OAuth login for one `/auth` OAuth profile."""
+    clean_profile_id = str(profile_id or "").strip()
+    if not clean_profile_id:
+        click.echo("Profile id cannot be empty.", err=True)
+        sys.exit(1)
+
+    merged = _merged_auth_config(ctx)
+    profile = merged.config.profiles.get(clean_profile_id)
+    if profile is None:
+        click.echo(f"Auth profile not found: {clean_profile_id}", err=True)
+        sys.exit(1)
+
+    mode = str(profile.mode or "").strip().lower()
+    if mode not in {"oauth2_pkce", "oauth2_device"}:
+        click.echo(
+            f"Auth profile login failed: profile {clean_profile_id!r} mode "
+            f"{profile.mode!r} is not browser OAuth.",
+            err=True,
+        )
+        sys.exit(1)
+
+    token_ref = str(profile.token_ref or "").strip()
+    if not token_ref:
+        click.echo(
+            f"Auth profile login failed: profile {clean_profile_id!r} has no token_ref.",
+            err=True,
+        )
+        sys.exit(1)
+
+    resolver = SecretResolver()
+    try:
+        resolver.validate_writable(token_ref)
+    except SecretResolutionError as e:
+        click.echo(f"Auth profile login failed: {e}", err=True)
+        click.echo(
+            "Set token_ref to keychain://... to store OAuth tokens securely.",
+            err=True,
+        )
+        sys.exit(1)
+
+    base_provider = oauth_provider_config_for_profile(profile)
+    if base_provider is None:
+        click.echo(
+            f"Auth profile login failed: profile {clean_profile_id!r} is missing OAuth metadata.",
+            err=True,
+        )
+        click.echo(
+            "Required metadata: oauth_authorization_endpoint, "
+            "oauth_token_endpoint, oauth_client_id.",
+            err=True,
+        )
+        sys.exit(1)
+
+    provider = OAuthProviderConfig(
+        authorization_endpoint=str(
+            authorize_url or base_provider.authorization_endpoint
+        ).strip(),
+        token_endpoint=str(token_url or base_provider.token_endpoint).strip(),
+        client_id=str(client_id or base_provider.client_id).strip(),
+        scopes=tuple(
+            _merge_oauth_scopes(
+                base_provider.scopes,
+                profile.scopes,
+                scopes,
+            )
+        ),
+        authorize_params=dict(base_provider.authorize_params),
+        token_params=dict(base_provider.token_params),
+    )
+
+    engine = OAuthEngine()
+    try:
+        started = engine.start_auth(
+            provider=provider,
+            preferred_port=max(1, int(redirect_port)),
+            open_browser=not no_browser,
+            allow_manual_fallback=True,
+        )
+        click.echo("Auth profile OAuth login URL:")
+        click.echo(started.authorization_url)
+        if started.callback_mode == "manual":
+            click.echo(
+                "Loopback callback unavailable; using manual callback mode.",
+                err=True,
+            )
+        if started.browser_error:
+            click.echo(
+                f"Browser open warning: {started.browser_error}",
+                err=True,
+            )
+
+        manual_input = str(callback_code or "").strip()
+        if not manual_input and (no_browser or started.callback_mode == "manual"):
+            manual_input = click.prompt(
+                "Paste callback URL or authorization code",
+                hide_input=False,
+            ).strip()
+        if manual_input:
+            engine.submit_callback_input(
+                state=started.state,
+                raw_input=manual_input,
+            )
+
+        callback = engine.await_callback(
+            state=started.state,
+            timeout_seconds=max(1, int(timeout_seconds)),
+        )
+        token_payload = engine.finish_auth(
+            provider=provider,
+            state=started.state,
+            callback=callback,
+            timeout_seconds=max(1, int(timeout_seconds)),
+        )
+    except OAuthEngineError as e:
+        click.echo(
+            f"Auth profile login failed ({e.reason_code}): {e}",
+            err=True,
+        )
+        sys.exit(1)
+    finally:
+        engine.shutdown()
+
+    access_token_value = str(token_payload.get("access_token", "")).strip()
+    if not access_token_value:
+        click.echo(
+            "Auth profile login failed: token response missing access_token.",
+            err=True,
+        )
+        sys.exit(1)
+
+    stored_payload = dict(token_payload)
+    stored_payload["access_token"] = access_token_value
+    stored_payload.setdefault("token_type", "Bearer")
+    merged_scopes = _merge_oauth_scopes(
+        provider.scopes,
+        profile.scopes,
+        scopes,
+        token_payload.get("scope"),
+    )
+    if merged_scopes:
+        stored_payload["scope"] = " ".join(merged_scopes)
+        stored_payload["scopes"] = merged_scopes
+    expires_at_unix = _parse_expiry_epoch_from_token_payload(stored_payload)
+    if expires_at_unix is not None:
+        stored_payload["expires_at"] = expires_at_unix
+    stored_payload["obtained_via"] = "browser_pkce"
+    stored_payload["obtained_at"] = int(time.time())
+    stored_token = json.dumps(stored_payload, sort_keys=True, separators=(",", ":"))
+
+    try:
+        resolver.store(token_ref, stored_token)
+    except SecretResolutionError as e:
+        click.echo(f"Auth profile login failed: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(
+        f"Stored OAuth token for auth profile '{clean_profile_id}' in {token_ref}"
+    )
+
+
 # -- MCP configuration management commands --------------------------------
 
 @cli.group()
@@ -2631,8 +2853,78 @@ def _resolve_access_token(
     return ""
 
 
+def _merge_oauth_scopes(*scope_groups: object) -> list[str]:
+    merged: list[str] = []
+    for group in scope_groups:
+        if isinstance(group, str):
+            candidates = [item for item in group.split(" ") if item.strip()]
+        elif isinstance(group, (list, tuple, set)):
+            candidates = [str(item).strip() for item in group]
+        else:
+            continue
+        for candidate in candidates:
+            scope = str(candidate or "").strip()
+            if not scope:
+                continue
+            merged.append(scope)
+    return list(dict.fromkeys(merged))
+
+
+def _parse_expiry_epoch_from_token_payload(token_payload: dict[str, object]) -> int | None:
+    expires_in = token_payload.get("expires_in")
+    if expires_in not in (None, ""):
+        try:
+            return int(time.time()) + max(1, int(expires_in))
+        except (TypeError, ValueError):
+            pass
+    for key in ("expires_at", "expires_on"):
+        raw = token_payload.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _resolve_mcp_oauth_provider_config(
+    *,
+    view: MCPServerView,
+    scopes: tuple[str, ...],
+    authorize_url: str | None,
+    token_url: str | None,
+    client_id: str | None,
+) -> OAuthProviderConfig:
+    if view.server.type != "remote":
+        raise MCPOAuthFlowError(
+            "Browser OAuth login currently supports only remote MCP aliases."
+        )
+    provider = resolve_mcp_oauth_provider(
+        server_url=view.server.url,
+        scopes=_merge_oauth_scopes(view.server.oauth.scopes, scopes),
+        authorization_endpoint=authorize_url,
+        token_endpoint=token_url,
+        client_id=client_id,
+    )
+    return OAuthProviderConfig(
+        authorization_endpoint=provider.authorization_endpoint,
+        token_endpoint=provider.token_endpoint,
+        client_id=provider.client_id,
+        scopes=provider.scopes,
+    )
+
+
 @mcp_auth.command(name="login")
 @click.argument("alias")
+@click.option(
+    "--manual-token",
+    is_flag=True,
+    default=False,
+    help="Use manual token import path instead of browser PKCE flow.",
+)
 @click.option("--access-token", default=None, help="OAuth access token.")
 @click.option(
     "--access-token-env",
@@ -2644,6 +2936,46 @@ def _resolve_access_token(
 @click.option("--scope", "scopes", multiple=True, help="OAuth scope. Repeatable.")
 @click.option("--expires-in", type=int, default=None, help="Token lifetime in seconds.")
 @click.option(
+    "--authorize-url",
+    default=None,
+    help="OAuth authorization endpoint override.",
+)
+@click.option(
+    "--token-url",
+    default=None,
+    help="OAuth token endpoint override.",
+)
+@click.option(
+    "--client-id",
+    default=None,
+    help="OAuth client id override (defaults to LOOM_MCP_OAUTH_CLIENT_ID or loom-cli).",
+)
+@click.option(
+    "--redirect-port",
+    type=int,
+    default=8765,
+    show_default=True,
+    help="Loopback callback port for browser auth.",
+)
+@click.option(
+    "--timeout-seconds",
+    type=int,
+    default=180,
+    show_default=True,
+    help="Max seconds to wait for OAuth callback completion.",
+)
+@click.option(
+    "--no-browser",
+    is_flag=True,
+    default=False,
+    help="Do not auto-open browser; print URL and accept manual callback input.",
+)
+@click.option(
+    "--callback-code",
+    default=None,
+    help="Callback URL or authorization code for manual completion.",
+)
+@click.option(
     "--oauth-store",
     "oauth_store_path",
     type=click.Path(path_type=Path),
@@ -2654,15 +2986,23 @@ def _resolve_access_token(
 def mcp_auth_login(
     ctx: click.Context,
     alias: str,
+    manual_token: bool,
     access_token: str | None,
     access_token_env: str | None,
     refresh_token: str,
     token_type: str,
     scopes: tuple[str, ...],
     expires_in: int | None,
+    authorize_url: str | None,
+    token_url: str | None,
+    client_id: str | None,
+    redirect_port: int,
+    timeout_seconds: int,
+    no_browser: bool,
+    callback_code: str | None,
     oauth_store_path: Path | None,
 ) -> None:
-    """Store OAuth token material for one MCP alias."""
+    """Authenticate one MCP alias (browser PKCE by default)."""
     manager = _mcp_manager(ctx)
     try:
         clean_alias = ensure_valid_alias(alias)
@@ -2680,34 +3020,148 @@ def mcp_auth_login(
         )
         sys.exit(1)
 
-    token = _resolve_access_token(
+    manual_access_token = _resolve_access_token(
         access_token=access_token,
         access_token_env=access_token_env,
     )
-    if not token:
-        token = click.prompt("Access token", hide_input=True).strip()
-    if not token:
-        click.echo("Access token cannot be empty.", err=True)
+    use_manual_token_path = bool(manual_token or manual_access_token)
+    if use_manual_token_path:
+        token = manual_access_token
+        if not token:
+            token = click.prompt("Access token", hide_input=True).strip()
+        if not token:
+            click.echo("Access token cannot be empty.", err=True)
+            sys.exit(1)
+        expires_at_unix: int | None = None
+        if expires_in is not None:
+            expires_at_unix = int(time.time()) + max(1, int(expires_in))
+        merged_scopes = _merge_oauth_scopes(view.server.oauth.scopes, scopes)
+        try:
+            path = upsert_mcp_oauth_token(
+                alias=clean_alias,
+                access_token=token,
+                refresh_token=refresh_token,
+                token_type=token_type,
+                scopes=merged_scopes,
+                expires_at_unix=expires_at_unix,
+                store_path=oauth_store_path,
+                obtained_via="manual_token",
+            )
+        except MCPOAuthStoreError as e:
+            click.echo(f"MCP auth login failed: {e}", err=True)
+            sys.exit(1)
+        click.echo(f"Stored MCP OAuth token for '{clean_alias}' in {path}")
+        return
+
+    if not bool(_effective_config(ctx).mcp.oauth_browser_login):
+        click.echo(
+            "MCP browser OAuth login is disabled by config "
+            "(mcp.oauth_browser_login=false).",
+            err=True,
+        )
+        click.echo(
+            "Fallback: use `loom mcp auth login <alias> --manual-token --access-token ...`.",
+            err=True,
+        )
         sys.exit(1)
 
-    expires_at_unix: int | None = None
-    if expires_in is not None:
-        expires_at_unix = int(time.time()) + max(1, int(expires_in))
-    merged_scopes = [
-        str(scope).strip()
-        for scope in ([*view.server.oauth.scopes, *list(scopes)])
-        if str(scope).strip()
-    ]
-    merged_scopes = list(dict.fromkeys(merged_scopes))
+    try:
+        provider = _resolve_mcp_oauth_provider_config(
+            view=view,
+            scopes=scopes,
+            authorize_url=authorize_url,
+            token_url=token_url,
+            client_id=client_id,
+        )
+    except MCPOAuthFlowError as e:
+        click.echo(f"MCP auth login failed: {e}", err=True)
+        click.echo(
+            "Fallback: use `loom mcp auth login <alias> --manual-token --access-token ...`.",
+            err=True,
+        )
+        sys.exit(1)
+
+    engine = OAuthEngine()
+    try:
+        started = engine.start_auth(
+            provider=provider,
+            preferred_port=max(1, int(redirect_port)),
+            open_browser=not no_browser,
+            allow_manual_fallback=True,
+        )
+        click.echo("MCP OAuth login URL:")
+        click.echo(started.authorization_url)
+        if started.callback_mode == "manual":
+            click.echo(
+                "Loopback callback unavailable; using manual callback mode.",
+                err=True,
+            )
+        if started.browser_error:
+            click.echo(
+                f"Browser open warning: {started.browser_error}",
+                err=True,
+            )
+
+        manual_input = str(callback_code or "").strip()
+        if not manual_input and (no_browser or started.callback_mode == "manual"):
+            manual_input = click.prompt(
+                "Paste callback URL or authorization code",
+                hide_input=False,
+            ).strip()
+        if manual_input:
+            engine.submit_callback_input(
+                state=started.state,
+                raw_input=manual_input,
+            )
+
+        callback = engine.await_callback(
+            state=started.state,
+            timeout_seconds=max(1, int(timeout_seconds)),
+        )
+        token_payload = engine.finish_auth(
+            provider=provider,
+            state=started.state,
+            callback=callback,
+            timeout_seconds=max(1, int(timeout_seconds)),
+        )
+    except OAuthEngineError as e:
+        click.echo(
+            f"MCP auth login failed ({e.reason_code}): {e}",
+            err=True,
+        )
+        click.echo(
+            "Fallback: use `loom mcp auth login <alias> --manual-token --access-token ...`.",
+            err=True,
+        )
+        sys.exit(1)
+    finally:
+        engine.shutdown()
+
+    access_token_value = str(token_payload.get("access_token", "")).strip()
+    if not access_token_value:
+        click.echo("MCP auth login failed: token response missing access_token.", err=True)
+        sys.exit(1)
+    store_scopes = _merge_oauth_scopes(
+        provider.scopes,
+        scopes,
+        token_payload.get("scope"),
+    )
+    expires_at_unix = _parse_expiry_epoch_from_token_payload(token_payload)
+    refresh_token_value = str(token_payload.get("refresh_token", "")).strip() or refresh_token
+    token_type_value = str(token_payload.get("token_type", "")).strip() or token_type
 
     try:
         path = upsert_mcp_oauth_token(
             alias=clean_alias,
-            access_token=token,
-            refresh_token=refresh_token,
-            token_type=token_type,
-            scopes=merged_scopes,
+            access_token=access_token_value,
+            refresh_token=refresh_token_value,
+            token_type=token_type_value,
+            scopes=store_scopes,
             expires_at_unix=expires_at_unix,
+            token_endpoint=provider.token_endpoint,
+            authorization_endpoint=provider.authorization_endpoint,
+            client_id=provider.client_id,
+            obtained_via="browser_pkce",
             store_path=oauth_store_path,
         )
     except MCPOAuthStoreError as e:
@@ -2768,6 +3222,8 @@ def mcp_auth_status(
                 "has_token": bool(state.get("has_token", False)),
                 "expires_at": state.get("expires_at"),
                 "scopes": list(state.get("scopes", []) or []),
+                "last_failure_reason": str(state.get("last_failure_reason", "") or ""),
+                "last_failure_at": state.get("last_failure_at"),
             }
         )
 
@@ -2785,6 +3241,8 @@ def mcp_auth_status(
         )
         if item["expires_at"]:
             click.echo(f"    expires_at: {item['expires_at']}")
+        if item.get("last_failure_reason"):
+            click.echo(f"    last_failure: {item['last_failure_reason']}")
 
 
 @mcp_auth.command(name="logout")
@@ -2819,6 +3277,21 @@ def mcp_auth_logout(alias: str, oauth_store_path: Path | None) -> None:
 @click.option("--token-type", default="Bearer", show_default=True)
 @click.option("--scope", "scopes", multiple=True, help="OAuth scope. Repeatable.")
 @click.option("--expires-in", type=int, default=None, help="Token lifetime in seconds.")
+@click.option("--token-url", default=None, help="OAuth token endpoint override for refresh.")
+@click.option("--client-id", default=None, help="OAuth client id override for refresh.")
+@click.option(
+    "--timeout-seconds",
+    type=int,
+    default=15,
+    show_default=True,
+    help="HTTP timeout for refresh grant requests.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Attempt refresh even when token is not yet expired.",
+)
 @click.option(
     "--oauth-store",
     "oauth_store_path",
@@ -2836,9 +3309,13 @@ def mcp_auth_refresh(
     token_type: str,
     scopes: tuple[str, ...],
     expires_in: int | None,
+    token_url: str | None,
+    client_id: str | None,
+    timeout_seconds: int,
+    force: bool,
     oauth_store_path: Path | None,
 ) -> None:
-    """Manually refresh/update OAuth token payload for one MCP alias."""
+    """Refresh/update OAuth token payload for one MCP alias."""
     manager = _mcp_manager(ctx)
     try:
         clean_alias = ensure_valid_alias(alias)
@@ -2854,35 +3331,47 @@ def mcp_auth_refresh(
         access_token=access_token,
         access_token_env=access_token_env,
     )
-    if not token:
+    if token:
+        expires_at_unix: int | None = None
+        if expires_in is not None:
+            expires_at_unix = int(time.time()) + max(1, int(expires_in))
+        merged_scopes = _merge_oauth_scopes(view.server.oauth.scopes, scopes)
+        try:
+            path = upsert_mcp_oauth_token(
+                alias=clean_alias,
+                access_token=token,
+                refresh_token=refresh_token,
+                token_type=token_type,
+                scopes=merged_scopes,
+                expires_at_unix=expires_at_unix,
+                store_path=oauth_store_path,
+                obtained_via="manual_refresh",
+            )
+        except MCPOAuthStoreError as e:
+            click.echo(f"MCP auth refresh failed: {e}", err=True)
+            sys.exit(1)
+        click.echo(f"Refreshed MCP OAuth token for '{clean_alias}' in {path}")
+        return
+
+    refreshed = refresh_mcp_oauth_token(
+        clean_alias,
+        store_path=oauth_store_path,
+        token_endpoint=token_url,
+        client_id=client_id,
+        timeout_seconds=max(1, int(timeout_seconds)),
+        force=force,
+    )
+    if not refreshed.refreshed:
         click.echo(
-            "Manual refresh requires --access-token or --access-token-env.",
+            f"MCP auth refresh failed: {refreshed.reason or 'refresh not completed.'}",
+            err=True,
+        )
+        click.echo(
+            "Manual fallback: pass --access-token or --access-token-env.",
             err=True,
         )
         sys.exit(1)
-    expires_at_unix: int | None = None
-    if expires_in is not None:
-        expires_at_unix = int(time.time()) + max(1, int(expires_in))
-    merged_scopes = [
-        str(scope).strip()
-        for scope in ([*view.server.oauth.scopes, *list(scopes)])
-        if str(scope).strip()
-    ]
-    merged_scopes = list(dict.fromkeys(merged_scopes))
-    try:
-        path = upsert_mcp_oauth_token(
-            alias=clean_alias,
-            access_token=token,
-            refresh_token=refresh_token,
-            token_type=token_type,
-            scopes=merged_scopes,
-            expires_at_unix=expires_at_unix,
-            store_path=oauth_store_path,
-        )
-    except MCPOAuthStoreError as e:
-        click.echo(f"MCP auth refresh failed: {e}", err=True)
-        sys.exit(1)
-    click.echo(f"Refreshed MCP OAuth token for '{clean_alias}' in {path}")
+    click.echo(f"Refreshed MCP OAuth token for '{clean_alias}'.")
 
 
 # -- Process management commands -------------------------------------------

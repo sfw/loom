@@ -528,6 +528,15 @@ url = "http://example.com/mcp"
         with pytest.raises(ConfigError):
             load_config(toml_file)
 
+    def test_load_mcp_oauth_browser_login_flag(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[mcp]
+oauth_browser_login = false
+""")
+        config = load_config(toml_file)
+        assert config.mcp.oauth_browser_login is False
+
     def test_load_limits_sections(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
         toml_file.write_text("""\

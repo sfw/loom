@@ -671,6 +671,13 @@
     Configured MCP servers are auto-discovered and exposed as namespaced tools in Loom (for example <code>mcp.notion.search</code>). Merge precedence is <code>--mcp-config</code> &gt; workspace <code>./.loom/mcp.toml</code> &gt; user <code>~/.loom/mcp.toml</code> &gt; legacy <code>[mcp]</code> in <code>loom.toml</code>.
   </div>
 
+  <div class="callout callout-info">
+    <strong>MCP OAuth</strong>
+    Use browser-first alias login with <code>loom mcp auth login &lt;alias&gt;</code>.
+    MCP alias OAuth tokens are stored in <code>~/.loom/mcp_oauth_tokens.json</code> and are intentionally separate from <code>/auth</code> profile token refs.
+    For headless flows, use manual fallback flags (<code>--manual-token</code> or callback-code entry).
+  </div>
+
   <pre><code><span class="cmt"># ~/.loom/auth.toml (profile metadata + secret refs; no plaintext secrets)</span>
 <span class="key">[auth.defaults]</span>
 <span class="key">notion</span> = <span class="str">"notion_marketing"</span>
@@ -898,11 +905,11 @@
   <pre><code><span class="cmt"># Launch the interactive TUI (default command)</span>
 <span class="cmd">loom</span> <span class="flag">-w</span> /path/to/project
 
-<span class="cmt"># With a process definition</span>
-<span class="cmd">loom</span> <span class="flag">-w</span> /path/to/project <span class="flag">--process</span> consulting-engagement
+<span class="cmt"># Discover process definitions, then run explicitly</span>
+<span class="cmd">/processes</span>
+<span class="cmd">/investment-analysis</span> Analyze Tesla for investment
 
-<span class="cmt"># Activate/switch process at runtime, then force orchestration</span>
-<span class="cmd">/process use</span> investment-analysis
+<span class="cmt"># Ad-hoc run orchestration</span>
 <span class="cmd">/run</span> Analyze Tesla for investment
 <span class="cmd">/run</span> problem.md
 <span class="cmd">/run</span> @problem.md focus on parser regressions
@@ -946,15 +953,14 @@
     <tr><td><code>/mcp show &lt;alias&gt;</code></td><td>Show one MCP config entry (redacted env values)</td></tr>
     <tr><td><code>/mcp test &lt;alias&gt;</code></td><td>Run a <code>tools/list</code> probe against one MCP server</td></tr>
     <tr><td><code>/mcp enable|disable|remove &lt;alias&gt;</code></td><td>Mutate MCP config and refresh runtime MCP tools</td></tr>
+    <tr><td><code>/mcp manage</code></td><td>Open MCP manager UI (includes browser OAuth login/logout and callback fallbacks)</td></tr>
     <tr><td><code>/auth</code> / <code>/auth manage</code></td><td>Open the auth profile manager</td></tr>
     <tr><td><code>/auth use selector=profile_id</code></td><td>Set run-local auth override for the next <code>/run</code> (selector can be provider, <code>resource_ref</code>, or <code>resource_id</code>)</td></tr>
     <tr><td><code>/auth select &lt;selector&gt;=&lt;profile_id&gt;</code></td><td>Persist workspace default mapping (selector can be provider, <code>resource_ref</code>, or <code>resource_id</code>)</td></tr>
     <tr><td><code>loom auth sync [--scope active|full]</code></td><td>Auto-discover auth resources and create missing draft profiles</td></tr>
     <tr><td><code>loom auth audit</code></td><td>Report orphaned/dangling auth state (non-zero exit when findings exist)</td></tr>
     <tr><td><code>loom auth migrate [--rollback &lt;snapshot&gt;]</code></td><td>Migrate legacy provider defaults to resource bindings/defaults (auto-rollback on failure), or restore from snapshot</td></tr>
-    <tr><td><code>/process list</code></td><td>List discovered process definitions</td></tr>
-    <tr><td><code>/process use &lt;name-or-path&gt;</code></td><td>Activate a process in the current session</td></tr>
-    <tr><td><code>/process off</code></td><td>Disable the active process</td></tr>
+    <tr><td><code>/processes</code></td><td>List discovered process definitions</td></tr>
     <tr><td><code>/run &lt;goal&gt;</code></td><td>Force orchestration through the active process (single-token workspace files are treated as goal files)</td></tr>
     <tr><td><code>/run @&lt;goal-file&gt; [goal]</code></td><td>Explicitly load a workspace goal file, optionally with an inline goal override</td></tr>
     <tr><td><code>/run close [run-id-prefix]</code></td><td>Close/cancel a process-run tab with confirmation</td></tr>
@@ -1015,10 +1021,11 @@
 <span class="cmt"># Run a task with a specific process</span>
 <span class="cmd">loom run</span> <span class="str">"Analyze Tesla for investment"</span> <span class="flag">--workspace</span> /tmp/tesla <span class="flag">--process</span> investment-analysis
 
-<span class="cmt"># Interactive session with a process</span>
-<span class="cmd">loom</span> <span class="flag">-w</span> /tmp/project <span class="flag">--process</span> consulting-engagement
+<span class="cmt"># Interactive session with explicit process command</span>
+<span class="cmd">loom</span> <span class="flag">-w</span> /tmp/project
+<span class="cmd">/consulting-engagement</span> Draft onboarding playbook
 
-<span class="cmt"># Inside the TUI: force the active process</span>
+<span class="cmt"># Inside the TUI: ad-hoc /run flow</span>
 <span class="cmd">/run</span> Analyze Tesla for investment
 <span class="cmd">/run</span> problem.md
 <span class="cmd">/run</span> @problem.md focus on parser regressions</code></pre>

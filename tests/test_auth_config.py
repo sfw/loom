@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from loom.auth.config import (
+    AuthConfigError,
     AuthProfile,
     load_auth_file,
     load_merged_auth_config,
@@ -37,6 +38,7 @@ from loom.auth.runtime import (
     AuthResolutionError,
     UnresolvedAuthResourcesError,
     build_run_auth_context,
+    oauth_provider_config_for_profile,
     parse_auth_profile_overrides,
 )
 from loom.auth.secrets import SecretResolutionError, SecretResolver
@@ -93,6 +95,44 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         cfg = load_auth_file(auth_path)
     assert cfg.defaults == {"notion": "notion_marketing"}
     assert cfg.profiles["notion_marketing"].provider == "notion"
+
+
+def test_load_auth_file_rejects_token_ref_pointing_to_mcp_store(tmp_path: Path):
+    auth_path = tmp_path / "auth.toml"
+    auth_path.write_text(
+        """
+[auth.profiles.bad_profile]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "file://~/.loom/mcp_oauth_tokens.json"
+"""
+    )
+
+    with pytest.raises(AuthConfigError, match="must not point to MCP alias token store"):
+        load_auth_file(auth_path)
+
+
+def test_oauth_provider_config_for_profile_parses_metadata():
+    profile = AuthProfile(
+        profile_id="notion_marketing",
+        provider="notion",
+        mode="oauth2_pkce",
+        token_ref="keychain://loom/notion/notion_marketing/tokens",
+        scopes=["read:content"],
+        metadata={
+            "oauth_authorization_endpoint": "https://auth.example.com/authorize",
+            "oauth_token_endpoint": "https://auth.example.com/token",
+            "oauth_client_id": "loom-client",
+            "oauth_scope": "read:content write:content",
+        },
+    )
+
+    cfg = oauth_provider_config_for_profile(profile)
+    assert cfg is not None
+    assert cfg.authorization_endpoint == "https://auth.example.com/authorize"
+    assert cfg.token_endpoint == "https://auth.example.com/token"
+    assert cfg.client_id == "loom-client"
+    assert cfg.scopes == ("read:content", "write:content")
 
 
 def test_load_merged_auth_config_applies_workspace_defaults(tmp_path: Path):

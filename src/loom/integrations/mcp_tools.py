@@ -33,7 +33,7 @@ from loom.config import (
 )
 from loom.integrations.mcp.oauth import (
     bearer_auth_header_for_alias,
-    oauth_state_for_alias,
+    ensure_mcp_oauth_ready,
 )
 from loom.tools.registry import Tool, ToolContext, ToolRegistry, ToolResult
 from loom.utils.latency import log_latency_event
@@ -45,7 +45,8 @@ _ENV_REF_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 _REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
-            r"(?i)\b(authorization|proxy-authorization)\b\s*[:=]\s*([^\s,;]+)"
+            r"(?i)\b(authorization|proxy-authorization)\b\s*[:=]\s*"
+            r"([^\s,;]+(?:\s+[^\s,;]+)?)"
         ),
         r"\1=<redacted>",
     ),
@@ -1173,13 +1174,13 @@ class MCPConnectionManager:
     def _remote_oauth_ready(self, alias: str, server: MCPServerConfig) -> bool:
         if not server.oauth.enabled:
             return True
-        oauth_state = oauth_state_for_alias(alias)
-        if oauth_state["state"] != "ready":
+        readiness = ensure_mcp_oauth_ready(alias)
+        if not readiness.ready:
             self._set_state(
                 alias=alias,
                 server=server,
                 status="needs_auth",
-                last_error="OAuth token missing or expired",
+                last_error=readiness.reason or "OAuth token missing or expired",
             )
             return False
         return True

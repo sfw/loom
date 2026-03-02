@@ -11,6 +11,7 @@ from loom.config import Config, MCPConfig, MCPServerConfig, load_config
 from loom.mcp.config import (
     MCPConfigManager,
     MCPConfigManagerError,
+    apply_mcp_overrides,
     load_mcp_file,
     load_merged_mcp_config,
     redact_server_env,
@@ -91,6 +92,35 @@ command = "explicit-only"
     assert servers["explicit_only"].command == "explicit-only"
     assert merged.get("shared").source == "explicit"
     assert merged.get("legacy_only").source == "legacy"
+
+
+def test_apply_mcp_overrides_preserves_oauth_browser_login_flag(tmp_path: Path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    workspace_mcp = workspace / ".loom" / "mcp.toml"
+    workspace_mcp.parent.mkdir(parents=True)
+    workspace_mcp.write_text(
+        """
+[mcp.servers.workspace_demo]
+command = "workspace"
+"""
+    )
+    base = Config(
+        mcp=MCPConfig(
+            servers={"legacy_demo": _server("legacy")},
+            oauth_browser_login=False,
+        )
+    )
+
+    merged = apply_mcp_overrides(
+        base,
+        workspace=workspace,
+        explicit_path=None,
+        user_path=tmp_path / "user.toml",
+    )
+
+    assert merged.mcp.oauth_browser_login is False
+    assert "workspace_demo" in merged.mcp.servers
 
 
 def test_redaction_preserves_env_references():

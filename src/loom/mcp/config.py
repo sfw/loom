@@ -217,7 +217,10 @@ def _merge_layers(
                 source=source_name,
                 source_path=source_path,
             )
-    return MCPConfig(servers=merged), sources
+    return MCPConfig(
+        servers=merged,
+        oauth_browser_login=bool(getattr(legacy, "oauth_browser_login", True)),
+    ), sources
 
 
 def _detect_legacy_path(
@@ -299,7 +302,15 @@ def apply_mcp_overrides(
         )
     except MCPConfigManagerError as e:
         raise ConfigError(str(e)) from e
-    return replace(config, mcp=merged.config)
+    return replace(
+        config,
+        mcp=replace(
+            merged.config,
+            oauth_browser_login=bool(
+                getattr(config.mcp, "oauth_browser_login", True)
+            ),
+        ),
+    )
 
 
 def is_env_reference(value: str) -> bool:

@@ -4,14 +4,54 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock
+from urllib.parse import parse_qs
 
 from click.testing import CliRunner
 
 from loom.__main__ import cli
 from loom.config import Config, ProcessConfig
 from loom.processes.testing import ProcessCaseResult
+
+
+@contextmanager
+def _oauth_token_server(*, status_code: int = 200, payload: dict | None = None):
+    response_payload = dict(payload or {"access_token": "token-123", "token_type": "Bearer"})
+    captured: list[dict[str, str]] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8", errors="replace")
+            parsed = {
+                key: values[0]
+                for key, values in parse_qs(body, keep_blank_values=True).items()
+                if values
+            }
+            captured.append(parsed)
+            encoded = json.dumps(response_payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def log_message(self, _format: str, *_args):  # noqa: A003
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/token", captured
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)
 
 
 class TestCLI:
@@ -892,6 +932,111 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         listed_after_remove = json.loads(list_after_remove.output)
         assert listed_after_remove["profiles"] == []
 
+    def test_auth_profile_login_browser_flow_stores_token_payload(self, tmp_path, monkeypatch):
+        import loom.__main__ as main_mod
+
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+scopes = ["read:content"]
+oauth_authorization_endpoint = "https://auth.example.com/authorize"
+oauth_token_endpoint = "https://auth.example.com/token"
+oauth_client_id = "loom-profile-client"
+"""
+        )
+        stored: dict[str, str] = {}
+
+        class _FakeSecretResolver:
+            def validate_writable(self, secret_ref: str) -> None:
+                stored["validated_ref"] = secret_ref
+
+            def store(self, secret_ref: str, secret_value: str) -> None:
+                stored["stored_ref"] = secret_ref
+                stored["stored_value"] = secret_value
+
+        monkeypatch.setattr(main_mod, "SecretResolver", _FakeSecretResolver)
+
+        runner = CliRunner()
+        with _oauth_token_server(payload={
+            "access_token": "profile-token",
+            "refresh_token": "profile-refresh",
+            "token_type": "Bearer",
+            "expires_in": 300,
+            "scope": "read:content write:content",
+        }) as (token_url, captured):
+            result = runner.invoke(
+                cli,
+                [
+                    "--config",
+                    str(cfg),
+                    "--auth-config",
+                    str(auth_cfg),
+                    "auth",
+                    "profile",
+                    "login",
+                    "notion_marketing",
+                    "--token-url",
+                    token_url,
+                    "--no-browser",
+                    "--callback-code",
+                    "manual-profile-code",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert stored["validated_ref"] == "keychain://loom/notion/notion_marketing/tokens"
+        assert stored["stored_ref"] == "keychain://loom/notion/notion_marketing/tokens"
+        payload = json.loads(stored["stored_value"])
+        assert payload["access_token"] == "profile-token"
+        assert payload["refresh_token"] == "profile-refresh"
+        assert payload["obtained_via"] == "browser_pkce"
+        assert "expires_at" in payload
+        assert captured[0]["grant_type"] == "authorization_code"
+        assert captured[0]["code"] == "manual-profile-code"
+
+    def test_auth_profile_login_rejects_non_writable_token_ref(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+token_ref = "env://NOTION_TOKEN_PAYLOAD"
+oauth_authorization_endpoint = "https://auth.example.com/authorize"
+oauth_token_endpoint = "https://auth.example.com/token"
+oauth_client_id = "loom-profile-client"
+"""
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "auth",
+                "profile",
+                "login",
+                "notion_marketing",
+                "--no-browser",
+                "--callback-code",
+                "manual-profile-code",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "keychain://..." in result.output
+
 class TestMCPCli:
     def test_mcp_help(self):
         runner = CliRunner()
@@ -1271,6 +1416,287 @@ scopes = ["read:content"]
         assert status_after_logout.exit_code == 0
         after_payload = json.loads(status_after_logout.output)
         assert after_payload["aliases"][0]["state"] == "missing"
+
+    def test_mcp_auth_login_browser_flow_with_manual_callback_code(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        mcp_cfg = tmp_path / "mcp.toml"
+        mcp_cfg.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+scopes = ["read:content"]
+"""
+        )
+        oauth_store = tmp_path / "mcp-oauth.json"
+        runner = CliRunner()
+
+        with _oauth_token_server(payload={
+            "access_token": "browser-token",
+            "refresh_token": "refresh-browser",
+            "token_type": "Bearer",
+            "expires_in": 180,
+            "scope": "read:content write:content",
+        }) as (token_url, captured):
+            result = runner.invoke(
+                cli,
+                [
+                    "--config",
+                    str(cfg),
+                    "--mcp-config",
+                    str(mcp_cfg),
+                    "mcp",
+                    "auth",
+                    "login",
+                    "remote_demo",
+                    "--authorize-url",
+                    "https://auth.example.com/authorize",
+                    "--token-url",
+                    token_url,
+                    "--client-id",
+                    "loom-test-client",
+                    "--no-browser",
+                    "--callback-code",
+                    "manual-code-123",
+                    "--oauth-store",
+                    str(oauth_store),
+                ],
+            )
+        assert result.exit_code == 0
+        assert oauth_store.exists()
+        raw = json.loads(oauth_store.read_text(encoding="utf-8"))
+        alias_payload = raw["aliases"]["remote_demo"]
+        assert alias_payload["access_token"] == "browser-token"
+        assert alias_payload["refresh_token"] == "refresh-browser"
+        assert alias_payload["token_endpoint"] == token_url
+        assert alias_payload["authorization_endpoint"] == "https://auth.example.com/authorize"
+        assert alias_payload["client_id"] == "loom-test-client"
+        assert alias_payload["obtained_via"] == "browser_pkce"
+        assert captured[0]["code"] == "manual-code-123"
+        assert captured[0]["grant_type"] == "authorization_code"
+
+    def test_mcp_auth_login_browser_flow_respects_disabled_feature_flag(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text(
+            """
+[server]
+port = 9000
+
+[mcp]
+oauth_browser_login = false
+"""
+        )
+        mcp_cfg = tmp_path / "mcp.toml"
+        mcp_cfg.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+"""
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "auth",
+                "login",
+                "remote_demo",
+                "--no-browser",
+                "--callback-code",
+                "manual-code-123",
+                "--authorize-url",
+                "https://auth.example.com/authorize",
+                "--token-url",
+                "https://auth.example.com/token",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "mcp.oauth_browser_login=false" in result.output
+        assert "--manual-token" in result.output
+
+    def test_mcp_auth_login_manual_token_still_works_when_browser_flag_disabled(
+        self,
+        tmp_path,
+    ):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text(
+            """
+[server]
+port = 9000
+
+[mcp]
+oauth_browser_login = false
+"""
+        )
+        mcp_cfg = tmp_path / "mcp.toml"
+        mcp_cfg.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+"""
+        )
+        oauth_store = tmp_path / "mcp-oauth.json"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "auth",
+                "login",
+                "remote_demo",
+                "--manual-token",
+                "--access-token",
+                "manual-token-123",
+                "--oauth-store",
+                str(oauth_store),
+            ],
+        )
+        assert result.exit_code == 0
+        payload = json.loads(oauth_store.read_text(encoding="utf-8"))
+        assert payload["aliases"]["remote_demo"]["access_token"] == "manual-token-123"
+
+    def test_mcp_auth_status_redacts_stored_failure_reason(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        mcp_cfg = tmp_path / "mcp.toml"
+        mcp_cfg.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+"""
+        )
+        oauth_store = tmp_path / "mcp-oauth.json"
+        oauth_store.write_text(
+            json.dumps(
+                {
+                    "aliases": {
+                        "remote_demo": {
+                            "access_token": "token-123",
+                            "last_failure_reason": "Authorization=Bearer super-secret",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--mcp-config",
+                str(mcp_cfg),
+                "mcp",
+                "auth",
+                "status",
+                "remote_demo",
+                "--oauth-store",
+                str(oauth_store),
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "super-secret" not in result.output
+        assert "<redacted>" in result.output
+
+    def test_mcp_auth_refresh_uses_refresh_token_grant_when_no_access_token(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        mcp_cfg = tmp_path / "mcp.toml"
+        mcp_cfg.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+"""
+        )
+        oauth_store = tmp_path / "mcp-oauth.json"
+        oauth_store.write_text(
+            json.dumps(
+                {
+                    "aliases": {
+                        "remote_demo": {
+                            "access_token": "expired-token",
+                            "refresh_token": "refresh-1",
+                            "token_type": "Bearer",
+                            "expires_at": 1,
+                            "token_endpoint": "https://placeholder.invalid/token",
+                            "client_id": "loom-test-client",
+                            "scopes": ["read:content"],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        with _oauth_token_server(payload={
+            "access_token": "refreshed-token",
+            "refresh_token": "refresh-2",
+            "token_type": "Bearer",
+            "expires_in": 300,
+        }) as (token_url, captured):
+            result = runner.invoke(
+                cli,
+                [
+                    "--config",
+                    str(cfg),
+                    "--mcp-config",
+                    str(mcp_cfg),
+                    "mcp",
+                    "auth",
+                    "refresh",
+                    "remote_demo",
+                    "--token-url",
+                    token_url,
+                    "--client-id",
+                    "loom-test-client",
+                    "--oauth-store",
+                    str(oauth_store),
+                ],
+            )
+        assert result.exit_code == 0
+        saved = json.loads(oauth_store.read_text(encoding="utf-8"))
+        payload = saved["aliases"]["remote_demo"]
+        assert payload["access_token"] == "refreshed-token"
+        assert payload["refresh_token"] == "refresh-2"
+        assert payload["obtained_via"] == "refresh_token"
+        assert captured[0]["grant_type"] == "refresh_token"
+        assert captured[0]["refresh_token"] == "refresh-1"
 
     def test_mcp_status_command_reports_runtime(self, tmp_path):
         cfg = tmp_path / "loom.toml"

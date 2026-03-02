@@ -70,6 +70,7 @@ from loom.tools.registry import ToolRegistry
 from loom.tui.commands import LoomCommands
 from loom.tui.screens import (
     AskUserScreen,
+    AuthManagerModalScreen,
     AuthManagerScreen,
     ExitConfirmScreen,
     FileViewerScreen,
@@ -518,7 +519,7 @@ class ProcessRunPane(Vertical):
             meta += f"\n[dim]Task:[/] {task_id}"
         meta += (
             "\n[dim]Close: Ctrl+W | /run close [run-id-prefix] | "
-            "Ctrl+P: Close process run tab[/dim]"
+            "Ctrl+P: Close tab[/dim]"
         )
         self._meta.update(meta)
         can_restart = status == "failed" and bool(task_id.strip())
@@ -694,6 +695,8 @@ class LoomApp(App):
 
     TITLE = "Loom"
     COMMANDS = {LoomCommands}
+    _MCP_MANAGER_TAB_ID = "tab-mcp-manager"
+    _AUTH_MANAGER_TAB_ID = "tab-auth-manager"
 
     CSS = """
     #main-layout {
@@ -736,10 +739,44 @@ class LoomApp(App):
     #status-bar {
         display: none;
     }
+    #footer-row {
+        width: 100%;
+        height: 1;
+    }
     #app-footer {
+        width: 1fr;
         dock: none;
         height: 1;
         border: none;
+    }
+    #footer-shortcuts {
+        width: auto;
+        height: 1;
+    }
+    #footer-shortcuts .footer-shortcut-divider {
+        width: auto;
+        height: 1;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    #footer-shortcuts .footer-shortcut-btn {
+        width: auto;
+        min-width: 0;
+        height: 1;
+        margin: 0;
+        padding: 0 1;
+        border: none;
+        background: transparent;
+        color: $text-muted;
+    }
+    #footer-shortcuts .footer-shortcut-btn:hover {
+        color: $text;
+        background: $surface-lighten-1;
+    }
+    #footer-shortcuts .footer-shortcut-btn:focus {
+        color: $text;
+        background: $surface-lighten-1;
+        text-style: bold;
     }
     #slash-hint {
         dock: bottom;
@@ -765,10 +802,12 @@ class LoomApp(App):
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True),
         Binding("ctrl+l", "clear_chat", "Clear", show=True),
         Binding("ctrl+r", "reload_workspace", "Reload", show=True),
-        Binding("ctrl+w", "close_process_tab", "Close Run", show=True),
+        Binding("ctrl+w", "close_process_tab", "Close Tab", show=True),
         Binding("ctrl+1", "tab_chat", "Chat"),
         Binding("ctrl+2", "tab_files", "Files"),
         Binding("ctrl+3", "tab_events", "Events"),
+        Binding("ctrl+a", "open_auth_tab", "Auth", show=False, priority=True),
+        Binding("ctrl+m", "open_mcp_tab", "MCP", show=False, priority=True),
     ]
 
     def __init__(
@@ -879,7 +918,21 @@ class LoomApp(App):
                 placeholder="Type a message... (Enter to send)",
                 id="user-input",
             )
-            yield Footer(id="app-footer")
+            with Horizontal(id="footer-row"):
+                yield Footer(id="app-footer")
+                with Horizontal(id="footer-shortcuts"):
+                    yield Static("|", classes="footer-shortcut-divider")
+                    yield Button(
+                        "[#ff9e64]^a[/] auth",
+                        id="footer-auth-shortcut",
+                        classes="footer-shortcut-btn",
+                    )
+                    yield Static("|", classes="footer-shortcut-divider")
+                    yield Button(
+                        "[#ff9e64]^m[/] mcp",
+                        id="footer-mcp-shortcut",
+                        classes="footer-shortcut-btn",
+                    )
 
     async def on_mount(self) -> None:
         # Register and activate theme
@@ -1038,15 +1091,40 @@ class LoomApp(App):
             legacy_config_path=self._legacy_config_path,
         )
 
-    def _open_mcp_manager_screen(self) -> None:
-        """Open modal MCP manager and reload runtime when changed."""
-        manager = self._mcp_manager()
+    def _tab_exists(self, tabs: TabbedContent, pane_id: str) -> bool:
+        """Return True when TabbedContent already has pane_id registered."""
+        try:
+            tabs.get_tab(pane_id)
+        except Exception:
+            return False
+        return True
 
-        def _handle_result(result: dict[str, object] | None) -> None:
-            if not isinstance(result, dict):
-                return
-            if not result.get("changed"):
-                return
+    async def _remove_tab_if_present(
+        self,
+        pane_id: str,
+        *,
+        fallback_active: str = "tab-chat",
+    ) -> None:
+        """Remove pane if present and restore fallback active tab when needed."""
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            return
+        if not self._tab_exists(tabs, pane_id):
+            if not str(getattr(tabs, "active", "") or ""):
+                tabs.active = fallback_active
+            return
+        was_active = str(getattr(tabs, "active", "") or "") == pane_id
+        try:
+            await tabs.remove_pane(pane_id)
+        except Exception:
+            return
+        if was_active or not str(getattr(tabs, "active", "") or ""):
+            tabs.active = fallback_active
+
+    def _handle_mcp_manager_tab_close(self, result: dict[str, object]) -> None:
+        """Handle embedded MCP manager close callback."""
+        if bool(result.get("changed")):
             self.run_worker(
                 self._reload_mcp_runtime(),
                 group="mcp-manager-refresh",
@@ -1057,43 +1135,94 @@ class LoomApp(App):
                 chat.add_info("MCP configuration updated.")
             except Exception:
                 pass
-
-        self.push_screen(
-            MCPManagerScreen(
-                manager,
-                explicit_auth_path=self._explicit_auth_path,
-            ),
-            callback=_handle_result,
+        self.run_worker(
+            self._remove_tab_if_present(self._MCP_MANAGER_TAB_ID),
+            group="mcp-manager-tab-close",
+            exclusive=True,
         )
 
-    def _open_auth_manager_screen(self) -> None:
-        """Open modal auth manager."""
+    async def _open_mcp_manager_tab(self) -> None:
+        """Open MCP manager as a first-class tab."""
+        tabs = self.query_one("#tabs", TabbedContent)
+        if not self._tab_exists(tabs, self._MCP_MANAGER_TAB_ID):
+            manager = self._mcp_manager()
+            await tabs.add_pane(
+                TabPane(
+                    "MCP",
+                    MCPManagerScreen(
+                        manager,
+                        explicit_auth_path=self._explicit_auth_path,
+                        oauth_browser_login_enabled=bool(
+                            getattr(
+                                getattr(self._config, "mcp", None),
+                                "oauth_browser_login",
+                                True,
+                            )
+                        ),
+                        embedded=True,
+                        on_close=self._handle_mcp_manager_tab_close,
+                    ),
+                    id=self._MCP_MANAGER_TAB_ID,
+                ),
+                after="tab-events",
+            )
+        tabs.active = self._MCP_MANAGER_TAB_ID
 
-        def _handle_result(result: dict[str, object] | None) -> None:
-            if not isinstance(result, dict):
-                return
-            if not result.get("changed"):
-                return
+    def _open_mcp_manager_screen(self) -> None:
+        """Open MCP manager tab."""
+        self.run_worker(
+            self._open_mcp_manager_tab(),
+            group="mcp-manager-tab-open",
+            exclusive=True,
+        )
+
+    def _handle_auth_manager_tab_close(self, result: dict[str, object]) -> None:
+        """Handle embedded auth manager close callback."""
+        if bool(result.get("changed")):
             try:
                 chat = self.query_one("#chat-log", ChatLog)
                 chat.add_info("Auth configuration updated.")
             except Exception:
                 pass
+        self.run_worker(
+            self._remove_tab_if_present(self._AUTH_MANAGER_TAB_ID),
+            group="auth-manager-tab-close",
+            exclusive=True,
+        )
 
-        process_defs = self._auth_discovery_process_defs()
-        if process_defs:
-            # Ensure registry sees bundled tools loaded by process contracts.
-            self._refresh_tool_registry()
-        self.push_screen(
-            AuthManagerScreen(
-                workspace=self._workspace,
-                explicit_auth_path=self._explicit_auth_path,
-                mcp_manager=self._mcp_manager(),
-                process_def=self._process_defn,
-                process_defs=process_defs,
-                tool_registry=self._tools,
-            ),
-            callback=_handle_result,
+    async def _open_auth_manager_tab(self) -> None:
+        """Open auth manager as a first-class tab."""
+        tabs = self.query_one("#tabs", TabbedContent)
+        if not self._tab_exists(tabs, self._AUTH_MANAGER_TAB_ID):
+            process_defs = self._auth_discovery_process_defs()
+            if process_defs:
+                # Ensure registry sees bundled tools loaded by process contracts.
+                self._refresh_tool_registry()
+            await tabs.add_pane(
+                TabPane(
+                    "Auth",
+                    AuthManagerScreen(
+                        workspace=self._workspace,
+                        explicit_auth_path=self._explicit_auth_path,
+                        mcp_manager=self._mcp_manager(),
+                        process_def=self._process_defn,
+                        process_defs=process_defs,
+                        tool_registry=self._tools,
+                        embedded=True,
+                        on_close=self._handle_auth_manager_tab_close,
+                    ),
+                    id=self._AUTH_MANAGER_TAB_ID,
+                ),
+                after="tab-events",
+            )
+        tabs.active = self._AUTH_MANAGER_TAB_ID
+
+    def _open_auth_manager_screen(self) -> None:
+        """Open auth manager tab."""
+        self.run_worker(
+            self._open_auth_manager_tab(),
+            group="auth-manager-tab-open",
+            exclusive=True,
         )
 
     def _auth_discovery_process_defs(self) -> list[ProcessDefinition]:
@@ -5930,7 +6059,7 @@ class LoomApp(App):
         if process_defs:
             self._refresh_tool_registry()
         self.push_screen(
-            AuthManagerScreen(
+            AuthManagerModalScreen(
                 workspace=self._workspace,
                 explicit_auth_path=self._explicit_auth_path,
                 mcp_manager=self._mcp_manager(),
@@ -6306,8 +6435,8 @@ class LoomApp(App):
         self._append_process_run_activity(run, "Queued process run.")
         if not self._process_close_hint_shown:
             chat.add_info(
-                "[dim]Tip: close process tabs with Ctrl+W, /run close "
-                "[run-id-prefix], or Ctrl+P -> Close process run tab.[/]"
+                "[dim]Tip: close tabs with Ctrl+W, /run close "
+                "[run-id-prefix], or Ctrl+P -> Close tab.[/]"
             )
             self._process_close_hint_shown = True
         events_panel.add_event(
@@ -6913,7 +7042,8 @@ class LoomApp(App):
             "[bold #7dcfff]Keys[/bold #7dcfff]",
             self._wrap_info_text(
                 "Ctrl+B sidebar, Ctrl+L clear, Ctrl+R reload workspace, "
-                "Ctrl+W close run tab, Ctrl+P palette, Ctrl+1/2/3 tabs",
+                "Ctrl+W close tab, Ctrl+A auth, Ctrl+M mcp, "
+                "Ctrl+P palette, Ctrl+1/2/3 tabs",
                 initial_indent="  ",
                 subsequent_indent="  ",
             ),
@@ -8006,15 +8136,31 @@ class LoomApp(App):
             exclusive=False,
         )
 
+    @on(Button.Pressed, "#footer-auth-shortcut, #footer-mcp-shortcut")
+    def _on_footer_manager_shortcut_pressed(self, event: Button.Pressed) -> None:
+        button_id = str(getattr(event.button, "id", "") or "").strip()
+        event.stop()
+        event.prevent_default()
+        if button_id == "footer-auth-shortcut":
+            self.action_open_auth_tab()
+            return
+        if button_id == "footer-mcp-shortcut":
+            self.action_open_mcp_tab()
+
     def on_key(self, event: events.Key) -> None:
         """Handle user-input key captures (autocomplete + close-run shortcut)."""
-        if event.key == "ctrl+w":
+        if event.key in {"ctrl+w", "ctrl+a", "ctrl+m"}:
             focused = self.focused
             if isinstance(focused, Input) and focused.id == "user-input":
                 event.stop()
                 event.prevent_default()
-                self.action_close_process_tab()
-            return
+                if event.key == "ctrl+w":
+                    self.action_close_process_tab()
+                elif event.key == "ctrl+a":
+                    self.action_open_auth_tab()
+                elif event.key == "ctrl+m":
+                    self.action_open_mcp_tab()
+                return
 
         if event.key in ("up", "down"):
             focused = self.focused
@@ -10431,10 +10577,37 @@ class LoomApp(App):
         self._request_workspace_refresh("manual", immediate=True)
         self.notify("Workspace reloaded", timeout=2)
 
+    async def _request_manager_tab_close(self, pane_id: str) -> bool:
+        """Ask active manager widget to run its guarded close flow when available."""
+        selector = ""
+        if pane_id == self._MCP_MANAGER_TAB_ID:
+            selector = f"#{pane_id} MCPManagerScreen"
+        elif pane_id == self._AUTH_MANAGER_TAB_ID:
+            selector = f"#{pane_id} AuthManagerScreen"
+        if not selector:
+            return False
+        try:
+            manager_widget = self.query_one(selector)
+        except Exception:
+            return False
+        close_action = getattr(manager_widget, "action_request_close", None)
+        if not callable(close_action):
+            return False
+        result = close_action()
+        if asyncio.iscoroutine(result):
+            await result
+        return True
+
     def action_close_process_tab(self) -> None:
-        """Close current process run tab with confirmation."""
+        """Close current tab (process run tab or manager tab)."""
         current = self._current_process_run()
-        close_key = current.run_id if current is not None else "current"
+        active_tab = ""
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+            active_tab = str(getattr(tabs, "active", "") or "")
+        except Exception:
+            active_tab = ""
+        close_key = current.run_id if current is not None else (active_tab or "current")
         if close_key in self._close_process_tab_inflight:
             return
         self._close_process_tab_inflight.add(close_key)
@@ -10443,6 +10616,18 @@ class LoomApp(App):
             try:
                 if current is not None:
                     await self._close_process_run(current)
+                elif active_tab in {self._MCP_MANAGER_TAB_ID, self._AUTH_MANAGER_TAB_ID}:
+                    requested = await self._request_manager_tab_close(active_tab)
+                    if not requested:
+                        await self._remove_tab_if_present(active_tab)
+                elif not self._process_runs:
+                    try:
+                        chat = self.query_one("#chat-log", ChatLog)
+                        chat.add_info(
+                            "No closable tabs are open. Ctrl+W closes run, MCP, or Auth tabs."
+                        )
+                    except Exception:
+                        pass
                 else:
                     await self._close_process_run_from_target("current")
             finally:
@@ -10469,6 +10654,12 @@ class LoomApp(App):
     def action_tab_events(self) -> None:
         tabs = self.query_one("#tabs", TabbedContent)
         tabs.active = "tab-events"
+
+    def action_open_auth_tab(self) -> None:
+        self._open_auth_manager_screen()
+
+    def action_open_mcp_tab(self) -> None:
+        self._open_mcp_manager_screen()
 
     async def action_quit(self) -> None:
         """Compatibility action that runs the exit flow inline."""
@@ -10568,6 +10759,8 @@ class LoomApp(App):
             "tab_chat": self.action_tab_chat,
             "tab_files": self.action_tab_files,
             "tab_events": self.action_tab_events,
+            "open_auth_tab": self.action_open_auth_tab,
+            "open_mcp_tab": self.action_open_mcp_tab,
             "list_tools": self._show_tools,
             "model_info": self._show_model_info,
             "process_info": self._show_process_info,
