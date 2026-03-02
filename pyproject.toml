@@ -15,6 +15,7 @@ dependencies = [
     # Data handling
     "pyyaml>=6.0.2",
     "pydantic>=2.10.0",
+    "keyring>=25.0.0",
 
     # Terminal UI
     "textual>=1.0.0",

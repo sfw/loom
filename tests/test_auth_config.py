@@ -25,10 +25,12 @@ from loom.auth.resources import (
     AuthBinding,
     AuthResource,
     AuthResourcesStore,
+    audit_auth_state,
     cleanup_deleted_resource,
     default_workspace_auth_resources_path,
     discover_auth_resources,
     load_workspace_auth_resources,
+    repair_auth_state,
     resource_delete_impact,
     restore_deleted_resource,
     sync_missing_drafts,
@@ -123,6 +125,7 @@ def test_oauth_provider_config_for_profile_parses_metadata():
             "oauth_authorization_endpoint": "https://auth.example.com/authorize",
             "oauth_token_endpoint": "https://auth.example.com/token",
             "oauth_client_id": "loom-client",
+            "oauth_client_secret": "secret-xyz",
             "oauth_scope": "read:content write:content",
         },
     )
@@ -133,6 +136,7 @@ def test_oauth_provider_config_for_profile_parses_metadata():
     assert cfg.token_endpoint == "https://auth.example.com/token"
     assert cfg.client_id == "loom-client"
     assert cfg.scopes == ("read:content", "write:content")
+    assert cfg.token_params == {"client_secret": "secret-xyz"}
 
 
 def test_load_merged_auth_config_applies_workspace_defaults(tmp_path: Path):
@@ -731,6 +735,242 @@ generated_from = "api_integration:youtube_data_api"
     ]
     assert len(active_bindings) == 1
     assert active_bindings[0].profile_id == "draft_api_integration_youtube_data_api"
+
+
+def test_sync_missing_drafts_oauth_draft_uses_keychain_and_template_metadata(
+    tmp_path: Path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    auth_path = tmp_path / "auth.toml"
+    process_defs = [
+        types.SimpleNamespace(
+            name="youtube-draft-descriptions",
+            auth=types.SimpleNamespace(
+                required=[
+                    {
+                        "provider": "youtube_data_api",
+                        "source": "api",
+                        "resource_ref": "api_integration:youtube_data_api",
+                        "modes": ["oauth2_pkce"],
+                    }
+                ]
+            ),
+            tools=types.SimpleNamespace(excluded=[]),
+        )
+    ]
+
+    result = sync_missing_drafts(
+        workspace=workspace,
+        explicit_auth_path=auth_path,
+        process_defs=process_defs,
+    )
+    assert result.created_drafts == 1
+
+    auth_cfg = load_auth_file(auth_path)
+    draft = auth_cfg.profiles["draft_api_integration_youtube_data_api"]
+    assert draft.token_ref == (
+        "keychain://loom/youtube_data_api/"
+        "draft_api_integration_youtube_data_api/tokens"
+    )
+    assert draft.metadata["oauth_authorization_endpoint"] == (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+    )
+    assert draft.metadata["oauth_token_endpoint"] == "https://oauth2.googleapis.com/token"
+    assert draft.metadata["oauth_client_id"] == "TODO_YOUTUBE_OAUTH_CLIENT_ID"
+
+
+def test_audit_auth_state_classifies_deleted_binding_history_separately(
+    tmp_path: Path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    auth_path = tmp_path / "auth.toml"
+    auth_path.write_text(
+        """
+[auth.profiles.notion_live]
+provider = "notion"
+mode = "env_passthrough"
+
+[auth.profiles.notion_live.env]
+NOTION_TOKEN = "dev-token"
+"""
+    )
+    write_workspace_auth_resources(
+        default_workspace_auth_resources_path(workspace),
+        AuthResourcesStore(
+            resources={
+                "res-notion": AuthResource(
+                    resource_id="res-notion",
+                    resource_kind="api_integration",
+                    resource_key="notion",
+                    display_name="API: notion",
+                    provider="notion",
+                    source="api",
+                    status="active",
+                ),
+                "res-deleted": AuthResource(
+                    resource_id="res-deleted",
+                    resource_kind="api_integration",
+                    resource_key="legacy",
+                    display_name="API: legacy",
+                    provider="legacy",
+                    source="api",
+                    status="deleted",
+                ),
+            },
+            bindings={
+                "bind-active-orphan": AuthBinding(
+                    binding_id="bind-active-orphan",
+                    resource_id="missing-resource",
+                    profile_id="notion_live",
+                    status="active",
+                ),
+                "bind-deleted-history": AuthBinding(
+                    binding_id="bind-deleted-history",
+                    resource_id="res-deleted",
+                    profile_id="missing-profile",
+                    status="deleted",
+                ),
+            },
+        ),
+    )
+
+    report = audit_auth_state(
+        workspace=workspace,
+        explicit_auth_path=auth_path,
+    )
+    assert report.orphaned_bindings == ("bind-active-orphan",)
+    assert report.historical_deleted_bindings == ("bind-deleted-history",)
+    assert report.duplicate_generated_draft_groups == ()
+    assert report.stale_generated_profiles == ()
+
+
+def test_audit_auth_state_reports_generated_duplicate_and_stale_links(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    auth_path = tmp_path / "auth.toml"
+    auth_path.write_text(
+        """
+[auth.profiles.draft_api_integration_youtube_data_api]
+provider = "youtube_data_api"
+mode = "oauth2_pkce"
+status = "draft"
+generated = "true"
+generated_from = "api_integration:youtube_data_api"
+resource_id = "missing-resource"
+
+[auth.profiles.draft_api_integration_youtube_data_api_2]
+provider = "youtube_data_api"
+mode = "oauth2_pkce"
+status = "draft"
+generated = "true"
+generated_from = "api_integration:youtube_data_api"
+resource_id = "missing-resource"
+"""
+    )
+    report = audit_auth_state(
+        workspace=workspace,
+        explicit_auth_path=auth_path,
+    )
+    assert report.duplicate_generated_draft_groups == (
+        "draft_api_integration_youtube_data_api,draft_api_integration_youtube_data_api_2",
+    )
+    assert report.stale_generated_profiles == (
+        "draft_api_integration_youtube_data_api",
+        "draft_api_integration_youtube_data_api_2",
+    )
+
+
+def test_repair_auth_state_dedupes_generated_drafts_and_rebinds(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    auth_path = tmp_path / "auth.toml"
+    auth_path.write_text(
+        """
+[auth.resource_defaults]
+res-youtube = "draft_api_integration_youtube_data_api_2"
+
+[auth.profiles.draft_api_integration_youtube_data_api]
+provider = "youtube_data_api"
+mode = "oauth2_pkce"
+status = "draft"
+generated = "true"
+generated_from = "api_integration:youtube_data_api"
+
+[auth.profiles.draft_api_integration_youtube_data_api_2]
+provider = "youtube_data_api"
+mode = "oauth2_pkce"
+status = "draft"
+generated = "true"
+generated_from = "api_integration:youtube_data_api"
+"""
+    )
+    write_workspace_auth_resources(
+        default_workspace_auth_resources_path(workspace),
+        AuthResourcesStore(
+            resources={
+                "res-youtube": AuthResource(
+                    resource_id="res-youtube",
+                    resource_kind="api_integration",
+                    resource_key="youtube_data_api",
+                    display_name="API: youtube_data_api",
+                    provider="youtube_data_api",
+                    source="api",
+                    status="active",
+                ),
+            },
+            bindings={
+                "bind-dup": AuthBinding(
+                    binding_id="bind-dup",
+                    resource_id="res-youtube",
+                    profile_id="draft_api_integration_youtube_data_api_2",
+                    status="active",
+                ),
+            },
+            workspace_defaults={"res-youtube": "draft_api_integration_youtube_data_api_2"},
+        ),
+    )
+
+    plan = repair_auth_state(
+        workspace=workspace,
+        explicit_auth_path=auth_path,
+        apply=False,
+    )
+    assert plan.changed is True
+    assert plan.deduped_profiles == ("draft_api_integration_youtube_data_api_2",)
+    assert plan.rebound_bindings == 1
+
+    applied = repair_auth_state(
+        workspace=workspace,
+        explicit_auth_path=auth_path,
+        apply=True,
+    )
+    assert applied.applied is True
+    assert applied.snapshot_path is not None
+
+    auth_cfg = load_auth_file(auth_path)
+    assert "draft_api_integration_youtube_data_api" in auth_cfg.profiles
+    assert "draft_api_integration_youtube_data_api_2" not in auth_cfg.profiles
+    assert auth_cfg.resource_defaults["res-youtube"] == "draft_api_integration_youtube_data_api"
+
+    store = load_workspace_auth_resources(default_workspace_auth_resources_path(workspace))
+    active_bindings = [
+        binding
+        for binding in store.bindings.values()
+        if binding.status == "active" and binding.resource_id == "res-youtube"
+    ]
+    assert len(active_bindings) == 1
+    assert active_bindings[0].profile_id == "draft_api_integration_youtube_data_api"
+    assert store.workspace_defaults["res-youtube"] == "draft_api_integration_youtube_data_api"
 
 
 def test_discover_auth_resources_skips_mcp_remote_alias_without_explicit_requirement():

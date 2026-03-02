@@ -56,6 +56,7 @@ from loom.mcp.config import (
     parse_mcp_server_from_flags,
 )
 from loom.oauth.engine import OAuthEngine, OAuthEngineError, OAuthProviderConfig
+from loom.tui.screens.oauth_code_entry import OAuthCodeEntryScreen
 
 _ENV_REF_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
@@ -223,67 +224,6 @@ class ConfirmAliasSwitchScreen(ModalScreen[str]):
     @on(Button.Pressed, "#mcp-switch-confirm-cancel")
     def _on_cancel_button(self) -> None:
         self.dismiss("cancel")
-
-
-class OAuthCodeEntryScreen(ModalScreen[str | None]):
-    """Prompt for callback URL/code when auto-callback is unavailable."""
-
-    _inherit_bindings = False
-
-    BINDINGS = [
-        Binding("enter", "submit", "Submit"),
-        Binding("escape", "cancel", "Cancel"),
-    ]
-
-    CSS = """
-    OAuthCodeEntryScreen {
-        align: center middle;
-    }
-    #mcp-oauth-code-dialog {
-        width: 84;
-        height: auto;
-        border: solid $primary;
-        padding: 1 2;
-        background: $surface;
-    }
-    #mcp-oauth-code-input {
-        margin-top: 1;
-    }
-    #mcp-oauth-code-actions {
-        margin-top: 1;
-        height: auto;
-    }
-    #mcp-oauth-code-actions Button {
-        margin-right: 1;
-    }
-    """
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="mcp-oauth-code-dialog"):
-            yield Label("[bold #7dcfff]Enter OAuth Callback[/bold #7dcfff]")
-            yield Label("Paste full callback URL or raw authorization code.")
-            yield Input(id="mcp-oauth-code-input")
-            with Horizontal(id="mcp-oauth-code-actions"):
-                yield Button("Submit", id="mcp-oauth-code-submit", variant="primary")
-                yield Button("Cancel", id="mcp-oauth-code-cancel")
-
-    def on_mount(self) -> None:
-        self.query_one("#mcp-oauth-code-input", Input).focus()
-
-    def action_submit(self) -> None:
-        raw = self.query_one("#mcp-oauth-code-input", Input).value.strip()
-        self.dismiss(raw or None)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-    @on(Button.Pressed, "#mcp-oauth-code-submit")
-    def _on_submit(self) -> None:
-        self.action_submit()
-
-    @on(Button.Pressed, "#mcp-oauth-code-cancel")
-    def _on_cancel(self) -> None:
-        self.action_cancel()
 
 
 class MCPManagerScreen(Vertical):

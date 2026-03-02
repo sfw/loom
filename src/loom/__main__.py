@@ -24,6 +24,13 @@ from loom.auth.config import (
     set_workspace_auth_default,
     upsert_auth_profile,
 )
+from loom.auth.oauth_profiles import (
+    OAuthProfileError,
+    login_oauth_profile,
+    logout_oauth_profile,
+    oauth_state_for_profile,
+    refresh_oauth_profile,
+)
 from loom.auth.resources import (
     audit_auth_state,
     bind_resource_to_profile,
@@ -33,6 +40,7 @@ from loom.auth.resources import (
     has_active_binding,
     load_workspace_auth_resources,
     migrate_legacy_auth,
+    repair_auth_state,
     resolve_resource,
     resource_delete_impact,
     restore_auth_snapshot,
@@ -41,10 +49,8 @@ from loom.auth.resources import (
 )
 from loom.auth.runtime import (
     AuthResolutionError,
-    oauth_provider_config_for_profile,
     parse_auth_profile_overrides,
 )
-from loom.auth.secrets import SecretResolutionError, SecretResolver
 from loom.config import Config, ConfigError, load_config
 from loom.integrations.mcp.oauth import (
     MCPOAuthFlowError,
@@ -1309,7 +1315,12 @@ def auth_audit(ctx: click.Context, as_json: bool) -> None:
     payload = {
         "orphaned_profiles": list(report.orphaned_profiles),
         "orphaned_bindings": list(report.orphaned_bindings),
+        "historical_deleted_bindings": list(report.historical_deleted_bindings),
         "deleted_resource_bindings": list(report.deleted_resource_bindings),
+        "duplicate_generated_draft_groups": list(
+            report.duplicate_generated_draft_groups
+        ),
+        "stale_generated_profiles": list(report.stale_generated_profiles),
         "legacy_provider_defaults": list(report.legacy_provider_defaults),
         "dangling_workspace_resource_defaults": list(
             report.dangling_workspace_resource_defaults
@@ -1318,7 +1329,17 @@ def auth_audit(ctx: click.Context, as_json: bool) -> None:
             report.dangling_user_resource_defaults
         ),
     }
-    finding_count = sum(len(items) for items in payload.values())
+    actionable_keys = (
+        "orphaned_profiles",
+        "orphaned_bindings",
+        "deleted_resource_bindings",
+        "duplicate_generated_draft_groups",
+        "stale_generated_profiles",
+        "legacy_provider_defaults",
+        "dangling_workspace_resource_defaults",
+        "dangling_user_resource_defaults",
+    )
+    finding_count = sum(len(payload[key]) for key in actionable_keys)
 
     if as_json:
         click.echo(json.dumps(payload, indent=2, sort_keys=True))
@@ -1336,6 +1357,80 @@ def auth_audit(ctx: click.Context, as_json: bool) -> None:
 
     if finding_count > 0:
         sys.exit(1)
+
+
+@auth.command(name="repair")
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    default=False,
+    help="Apply the repair plan (default is dry-run plan only).",
+)
+@click.option(
+    "--prune-deleted-history",
+    is_flag=True,
+    default=False,
+    help="Prune deleted binding history noise when applying/planning.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def auth_repair(
+    ctx: click.Context,
+    apply_changes: bool,
+    prune_deleted_history: bool,
+    as_json: bool,
+) -> None:
+    """Plan/apply deterministic auth dedupe and rebind repairs."""
+    workspace = ctx.obj.get("workspace")
+    try:
+        result = repair_auth_state(
+            workspace=workspace,
+            explicit_auth_path=ctx.obj.get("explicit_auth_path"),
+            apply=apply_changes,
+            prune_deleted_history=prune_deleted_history,
+        )
+    except Exception as e:
+        click.echo(f"Auth repair failed: {e}", err=True)
+        sys.exit(1)
+
+    payload = {
+        "applied": result.applied,
+        "changed": result.changed,
+        "snapshot_path": str(result.snapshot_path) if result.snapshot_path else None,
+        "duplicate_generated_draft_groups": list(result.duplicate_generated_draft_groups),
+        "deduped_profiles": list(result.deduped_profiles),
+        "rebound_bindings": result.rebound_bindings,
+        "updated_workspace_defaults": result.updated_workspace_defaults,
+        "updated_user_resource_defaults": result.updated_user_resource_defaults,
+        "pruned_deleted_bindings": result.pruned_deleted_bindings,
+        "warnings": list(result.warnings),
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(
+        "Auth repair "
+        f"{'apply' if apply_changes else 'plan'}:"
+    )
+    click.echo(
+        "  duplicate generated groups: "
+        f"{len(result.duplicate_generated_draft_groups)}"
+    )
+    click.echo(f"  deduped profiles: {len(result.deduped_profiles)}")
+    click.echo(f"  rebound bindings: {result.rebound_bindings}")
+    click.echo(f"  updated workspace defaults: {result.updated_workspace_defaults}")
+    click.echo(f"  updated user defaults: {result.updated_user_resource_defaults}")
+    click.echo(f"  pruned deleted bindings: {result.pruned_deleted_bindings}")
+    if result.snapshot_path is not None:
+        click.echo(f"  snapshot: {result.snapshot_path}")
+    for warning in result.warnings:
+        click.echo(f"  warning: {warning}")
+    if not result.changed:
+        click.echo("No repair changes required.")
+    elif not apply_changes:
+        click.echo("Dry-run only. Re-run with --apply to write changes.")
 
 
 @auth.command(name="migrate")
@@ -1958,152 +2053,210 @@ def auth_profile_login(
         click.echo(f"Auth profile not found: {clean_profile_id}", err=True)
         sys.exit(1)
 
-    mode = str(profile.mode or "").strip().lower()
-    if mode not in {"oauth2_pkce", "oauth2_device"}:
-        click.echo(
-            f"Auth profile login failed: profile {clean_profile_id!r} mode "
-            f"{profile.mode!r} is not browser OAuth.",
-            err=True,
-        )
-        sys.exit(1)
-
-    token_ref = str(profile.token_ref or "").strip()
-    if not token_ref:
-        click.echo(
-            f"Auth profile login failed: profile {clean_profile_id!r} has no token_ref.",
-            err=True,
-        )
-        sys.exit(1)
-
-    resolver = SecretResolver()
-    try:
-        resolver.validate_writable(token_ref)
-    except SecretResolutionError as e:
-        click.echo(f"Auth profile login failed: {e}", err=True)
-        click.echo(
-            "Set token_ref to keychain://... to store OAuth tokens securely.",
-            err=True,
-        )
-        sys.exit(1)
-
-    base_provider = oauth_provider_config_for_profile(profile)
-    if base_provider is None:
-        click.echo(
-            f"Auth profile login failed: profile {clean_profile_id!r} is missing OAuth metadata.",
-            err=True,
-        )
-        click.echo(
-            "Required metadata: oauth_authorization_endpoint, "
-            "oauth_token_endpoint, oauth_client_id.",
-            err=True,
-        )
-        sys.exit(1)
-
-    provider = OAuthProviderConfig(
-        authorization_endpoint=str(
-            authorize_url or base_provider.authorization_endpoint
-        ).strip(),
-        token_endpoint=str(token_url or base_provider.token_endpoint).strip(),
-        client_id=str(client_id or base_provider.client_id).strip(),
-        scopes=tuple(
-            _merge_oauth_scopes(
-                base_provider.scopes,
-                profile.scopes,
-                scopes,
-            )
-        ),
-        authorize_params=dict(base_provider.authorize_params),
-        token_params=dict(base_provider.token_params),
-    )
-
-    engine = OAuthEngine()
-    try:
-        started = engine.start_auth(
-            provider=provider,
-            preferred_port=max(1, int(redirect_port)),
-            open_browser=not no_browser,
-            allow_manual_fallback=True,
-        )
+    def _emit_login_start(started) -> None:
         click.echo("Auth profile OAuth login URL:")
         click.echo(started.authorization_url)
-        if started.callback_mode == "manual":
+        if str(getattr(started, "callback_mode", "")).strip() == "manual":
             click.echo(
                 "Loopback callback unavailable; using manual callback mode.",
                 err=True,
             )
-        if started.browser_error:
-            click.echo(
-                f"Browser open warning: {started.browser_error}",
-                err=True,
-            )
+        browser_warning = str(getattr(started, "browser_error", "") or "").strip()
+        if browser_warning:
+            click.echo(f"Browser open warning: {browser_warning}", err=True)
 
-        manual_input = str(callback_code or "").strip()
-        if not manual_input and (no_browser or started.callback_mode == "manual"):
-            manual_input = click.prompt(
-                "Paste callback URL or authorization code",
-                hide_input=False,
-            ).strip()
-        if manual_input:
-            engine.submit_callback_input(
-                state=started.state,
-                raw_input=manual_input,
-            )
-
-        callback = engine.await_callback(
-            state=started.state,
-            timeout_seconds=max(1, int(timeout_seconds)),
+    try:
+        result = login_oauth_profile(
+            profile,
+            scopes=scopes,
+            authorize_url=authorize_url,
+            token_url=token_url,
+            client_id=client_id,
+            redirect_port=redirect_port,
+            timeout_seconds=timeout_seconds,
+            no_browser=no_browser,
+            callback_code=callback_code,
+            callback_prompt=(
+                lambda prompt: click.prompt(prompt, hide_input=False).strip()
+            ),
+            on_start=_emit_login_start,
         )
-        token_payload = engine.finish_auth(
-            provider=provider,
-            state=started.state,
-            callback=callback,
-            timeout_seconds=max(1, int(timeout_seconds)),
-        )
-    except OAuthEngineError as e:
+    except OAuthProfileError as e:
         click.echo(
             f"Auth profile login failed ({e.reason_code}): {e}",
             err=True,
         )
+        if e.reason_code in {"token_ref_not_writable", "oauth_metadata_missing"}:
+            click.echo(
+                "Set token_ref to keychain://... and ensure OAuth metadata is present.",
+                err=True,
+            )
         sys.exit(1)
-    finally:
-        engine.shutdown()
-
-    access_token_value = str(token_payload.get("access_token", "")).strip()
-    if not access_token_value:
-        click.echo(
-            "Auth profile login failed: token response missing access_token.",
-            err=True,
-        )
-        sys.exit(1)
-
-    stored_payload = dict(token_payload)
-    stored_payload["access_token"] = access_token_value
-    stored_payload.setdefault("token_type", "Bearer")
-    merged_scopes = _merge_oauth_scopes(
-        provider.scopes,
-        profile.scopes,
-        scopes,
-        token_payload.get("scope"),
+    click.echo(
+        f"Stored OAuth token for auth profile '{clean_profile_id}' in {result.token_ref}"
     )
-    if merged_scopes:
-        stored_payload["scope"] = " ".join(merged_scopes)
-        stored_payload["scopes"] = merged_scopes
-    expires_at_unix = _parse_expiry_epoch_from_token_payload(stored_payload)
-    if expires_at_unix is not None:
-        stored_payload["expires_at"] = expires_at_unix
-    stored_payload["obtained_via"] = "browser_pkce"
-    stored_payload["obtained_at"] = int(time.time())
-    stored_token = json.dumps(stored_payload, sort_keys=True, separators=(",", ":"))
+    if result.expires_at is not None:
+        click.echo(f"Expires at (unix): {result.expires_at}")
+    if result.scopes:
+        click.echo(f"Scopes: {', '.join(result.scopes)}")
+
+
+@auth_profile.command(name="status")
+@click.argument("profile_id")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def auth_profile_status(ctx: click.Context, profile_id: str, as_json: bool) -> None:
+    """Show OAuth token state for one `/auth` OAuth profile."""
+    clean_profile_id = str(profile_id or "").strip()
+    if not clean_profile_id:
+        click.echo("Profile id cannot be empty.", err=True)
+        sys.exit(1)
+
+    merged = _merged_auth_config(ctx)
+    profile = merged.config.profiles.get(clean_profile_id)
+    if profile is None:
+        click.echo(f"Auth profile not found: {clean_profile_id}", err=True)
+        sys.exit(1)
+
+    state = oauth_state_for_profile(profile)
+    payload = {
+        "profile_id": clean_profile_id,
+        "provider": profile.provider,
+        "mode": profile.mode,
+        "token_ref": profile.token_ref,
+        "state": state.state,
+        "has_token": state.has_token,
+        "expired": state.expired,
+        "expires_at": state.expires_at,
+        "token_type": state.token_type,
+        "scopes": list(state.scopes),
+        "reason": state.reason,
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(f"Profile: {clean_profile_id}")
+    click.echo(f"Provider: {profile.provider}")
+    click.echo(f"Mode: {profile.mode}")
+    click.echo(f"Token ref: {profile.token_ref or '-'}")
+    click.echo(f"OAuth state: {state.state}")
+    click.echo(f"Has token: {'yes' if state.has_token else 'no'}")
+    click.echo(f"Expired: {'yes' if state.expired else 'no'}")
+    click.echo(f"Expires at: {state.expires_at if state.expires_at is not None else '-'}")
+    click.echo(f"Token type: {state.token_type or '-'}")
+    click.echo(f"Scopes: {', '.join(state.scopes) if state.scopes else '-'}")
+    if state.reason:
+        click.echo(f"Reason: {state.reason}")
+
+
+@auth_profile.command(name="logout")
+@click.argument("profile_id")
+@click.pass_context
+def auth_profile_logout(ctx: click.Context, profile_id: str) -> None:
+    """Clear stored OAuth token for one `/auth` OAuth profile."""
+    clean_profile_id = str(profile_id or "").strip()
+    if not clean_profile_id:
+        click.echo("Profile id cannot be empty.", err=True)
+        sys.exit(1)
+
+    merged = _merged_auth_config(ctx)
+    profile = merged.config.profiles.get(clean_profile_id)
+    if profile is None:
+        click.echo(f"Auth profile not found: {clean_profile_id}", err=True)
+        sys.exit(1)
 
     try:
-        resolver.store(token_ref, stored_token)
-    except SecretResolutionError as e:
-        click.echo(f"Auth profile login failed: {e}", err=True)
+        token_ref = logout_oauth_profile(profile)
+    except OAuthProfileError as e:
+        click.echo(f"Auth profile logout failed ({e.reason_code}): {e}", err=True)
         sys.exit(1)
 
     click.echo(
-        f"Stored OAuth token for auth profile '{clean_profile_id}' in {token_ref}"
+        f"Cleared OAuth token for auth profile '{clean_profile_id}' in {token_ref}"
     )
+
+
+@auth_profile.command(name="refresh")
+@click.argument("profile_id")
+@click.option("--scope", "scopes", multiple=True, help="OAuth scope hint. Repeatable.")
+@click.option(
+    "--token-url",
+    default=None,
+    help="OAuth token endpoint override.",
+)
+@click.option(
+    "--client-id",
+    default=None,
+    help="OAuth client id override.",
+)
+@click.option(
+    "--client-secret",
+    default=None,
+    help="OAuth client secret override.",
+)
+@click.option(
+    "--timeout-seconds",
+    type=int,
+    default=15,
+    show_default=True,
+    help="HTTP timeout for refresh request.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def auth_profile_refresh(
+    ctx: click.Context,
+    profile_id: str,
+    scopes: tuple[str, ...],
+    token_url: str | None,
+    client_id: str | None,
+    client_secret: str | None,
+    timeout_seconds: int,
+    as_json: bool,
+) -> None:
+    """Refresh OAuth token for one `/auth` OAuth profile."""
+    clean_profile_id = str(profile_id or "").strip()
+    if not clean_profile_id:
+        click.echo("Profile id cannot be empty.", err=True)
+        sys.exit(1)
+
+    merged = _merged_auth_config(ctx)
+    profile = merged.config.profiles.get(clean_profile_id)
+    if profile is None:
+        click.echo(f"Auth profile not found: {clean_profile_id}", err=True)
+        sys.exit(1)
+
+    try:
+        result = refresh_oauth_profile(
+            profile,
+            token_endpoint=token_url,
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=scopes,
+            timeout_seconds=timeout_seconds,
+        )
+    except OAuthProfileError as e:
+        click.echo(f"Auth profile refresh failed ({e.reason_code}): {e}", err=True)
+        sys.exit(1)
+
+    payload = {
+        "profile_id": clean_profile_id,
+        "token_ref": result.token_ref,
+        "expires_at": result.expires_at,
+        "scopes": list(result.scopes),
+        "refreshed": True,
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(
+        f"Refreshed OAuth token for auth profile '{clean_profile_id}' in {result.token_ref}"
+    )
+    if result.expires_at is not None:
+        click.echo(f"Expires at (unix): {result.expires_at}")
+    if result.scopes:
+        click.echo(f"Scopes: {', '.join(result.scopes)}")
 
 
 # -- MCP configuration management commands --------------------------------
