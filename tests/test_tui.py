@@ -2958,6 +2958,26 @@ class TestWorkspaceRefresh:
         assert isinstance(stream, dict)
         assert stream.get("status") == "completed"
 
+    def test_render_chat_event_turn_interrupted_rehydrates(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        assert app._render_chat_event({
+            "event_type": "turn_interrupted",
+            "payload": {
+                "message": "Stopped current chat execution.",
+                "markup": True,
+            },
+        })
+        chat.add_info.assert_called_once_with("Stopped current chat execution.", markup=True)
+
     @pytest.mark.asyncio
     async def test_switch_session_clears_files_panel(self, monkeypatch):
         """Switching sessions should clear stale file history."""
@@ -4060,6 +4080,7 @@ class TestSlashCommandHints:
         assert app._slash_completion_candidates("/s") == [
             "/sessions",
             "/session",
+            "/stop",
             "/setup",
         ]
         assert app._slash_completion_candidates("/h") == ["/history", "/help"]
@@ -4159,6 +4180,47 @@ class TestProcessSlashCommands:
         assert handled is True
         app._render_process_catalog.assert_called_once()
         chat.add_info.assert_called_once_with("catalog")
+
+    @pytest.mark.asyncio
+    async def test_stop_requests_active_chat_turn(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app.action_stop_chat = MagicMock()
+
+        handled = await app._handle_slash_command("/stop")
+
+        assert handled is True
+        app.action_stop_chat.assert_called_once()
+        chat.add_info.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stop_rejects_arguments(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app.action_stop_chat = MagicMock()
+
+        handled = await app._handle_slash_command("/stop now")
+
+        assert handled is True
+        app.action_stop_chat.assert_not_called()
+        chat.add_info.assert_called_once()
+        message = chat.add_info.call_args.args[0]
+        assert "Usage" in message
+        assert "/stop" in message
 
     @pytest.mark.asyncio
     async def test_run_requires_goal(self):
@@ -9464,6 +9526,21 @@ class TestCommandPaletteProcessActions:
         ]
 
     @pytest.mark.asyncio
+    async def test_palette_stop_chat_action_triggers_stop(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app.action_stop_chat = MagicMock()
+
+        await app.action_loom_command("stop_chat")
+
+        app.action_stop_chat.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_palette_prompt_actions_prefill_input(self):
         from loom.tui.app import LoomApp
 
@@ -9662,13 +9739,248 @@ class TestCommandPaletteProcessActions:
         app.query_one = MagicMock(return_value=SimpleNamespace(value=""))
         app._handle_slash_command = AsyncMock(return_value=False)
         app._set_slash_hint = MagicMock()
-        app._run_turn = MagicMock()
+        worker = object()
+        app._run_turn = MagicMock(return_value=worker)
 
         event = SimpleNamespace(value="hello loom")
         await app.on_user_submit(event)
 
         assert app._input_history == ["hello loom"]
         app._run_turn.assert_called_once_with("hello loom")
+        assert app._chat_turn_worker is worker
+
+    @pytest.mark.asyncio
+    async def test_request_chat_stop_clears_state_when_only_delegate_streams_active(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        status = SimpleNamespace(state="Ready")
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#status-bar":
+                return status
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        app._chat_busy = False
+        app._active_delegate_streams["call_1"] = {"finalized": False}
+        app._session = SimpleNamespace(
+            request_stop=MagicMock(),
+            clear_stop_request=MagicMock(),
+            session_id="session-1",
+            _turn_counter=1,
+        )
+        app._sync_activity_indicator = MagicMock()
+        app._handle_interrupted_chat_turn = AsyncMock()
+
+        await app._request_chat_stop()
+
+        app._handle_interrupted_chat_turn.assert_awaited_once_with(
+            path="cooperative",
+            reason="user_requested",
+            stage="delegate_stream_cleanup",
+        )
+        assert app._chat_stop_requested is False
+        assert status.state == "Ready"
+        app._session.request_stop.assert_called_once_with("user_requested")
+        assert app._session.clear_stop_request.call_count >= 1
+
+    def test_sync_chat_stop_control_visibility_and_disabled_state(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        stop_btn = SimpleNamespace(display=False, disabled=False, label="Stop")
+        app.query_one = MagicMock(return_value=stop_btn)
+
+        app._chat_busy = True
+        app._chat_stop_requested = False
+        app._sync_chat_stop_control()
+        assert stop_btn.display is True
+        assert stop_btn.disabled is False
+        assert stop_btn.label == "■"
+
+        app._chat_stop_requested = True
+        app._sync_chat_stop_control()
+        assert stop_btn.display is True
+        assert stop_btn.disabled is True
+        assert stop_btn.label == "■"
+
+        app._chat_busy = False
+        app._chat_stop_requested = False
+        app._sync_chat_stop_control()
+        assert stop_btn.display is False
+
+    @pytest.mark.asyncio
+    async def test_request_chat_stop_when_idle_is_safe_noop(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        status = SimpleNamespace(state="Ready")
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#status-bar":
+                return status
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        app._chat_busy = False
+        app._session = None
+
+        await app._request_chat_stop()
+
+        chat.add_info.assert_called_once_with("No active cowork chat execution to stop.")
+
+    def test_chat_stop_button_invokes_stop_action(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app.action_stop_chat = MagicMock()
+        event = MagicMock()
+
+        app._on_chat_stop_pressed(event)
+
+        event.stop.assert_called_once()
+        event.prevent_default.assert_called_once()
+        app.action_stop_chat.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_action_stop_chat_reports_failure_and_resets_state(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        status = SimpleNamespace(state="Stopping...")
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#status-bar":
+                return status
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        app._request_chat_stop = AsyncMock(side_effect=RuntimeError("boom"))
+        app._session = SimpleNamespace(
+            clear_stop_request=MagicMock(),
+            session_id="session-1",
+        )
+        app._chat_stop_requested = True
+        app._chat_stop_requested_at = time.monotonic()
+        app._sync_activity_indicator = MagicMock()
+        captured: dict[str, object] = {}
+        app.run_worker = MagicMock(
+            side_effect=lambda coro, **kwargs: captured.update(coro=coro, kwargs=kwargs)
+        )
+
+        app.action_stop_chat()
+        assert app._chat_stop_inflight is True
+
+        await captured["coro"]
+
+        assert app._chat_stop_inflight is False
+        assert app._chat_stop_requested is False
+        app._session.clear_stop_request.assert_called_once()
+        assert status.state == "Ready"
+        chat.add_info.assert_called_once()
+        assert "Stop failed" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_run_turn_resets_state_after_cooperative_stop(self):
+        from loom.cowork.session import CoworkStopRequestedError
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        status = SimpleNamespace(state="Idle")
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#status-bar":
+                return status
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        app._session = SimpleNamespace(
+            clear_stop_request=MagicMock(),
+            stop_requested=False,
+        )
+        app._append_chat_replay_event = AsyncMock()
+        app._run_interaction = AsyncMock(side_effect=CoworkStopRequestedError(
+            reason="user_requested",
+            stage="model_response",
+            path="cooperative",
+        ))
+        app._handle_interrupted_chat_turn = AsyncMock()
+        app._sync_activity_indicator = MagicMock()
+        app._chat_busy = False
+        app._chat_turn_worker = object()
+
+        await LoomApp._run_turn.__wrapped__(app, "hello")
+
+        app._handle_interrupted_chat_turn.assert_awaited_once_with(
+            path="cooperative",
+            reason="user_requested",
+            stage="model_response",
+        )
+        assert app._chat_busy is False
+        assert app._chat_stop_requested is False
+        assert app._chat_turn_worker is None
+        assert status.state == "Ready"
+        assert app._session.clear_stop_request.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_chat_stop_button_renders_when_visible(self):
+        from textual.widgets import Button
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            app._chat_busy = True
+            app._chat_stop_requested = False
+            app._sync_chat_stop_control()
+            await pilot.pause()
+
+            stop_btn = app.query_one("#chat-stop-btn", Button)
+            assert stop_btn.display is True
+            assert str(stop_btn.label) == "■"
 
     def test_slash_tab_completion_cycles_forward(self):
         from loom.tui.app import LoomApp
@@ -9686,6 +9998,9 @@ class TestCommandPaletteProcessActions:
 
         assert app._apply_slash_tab_completion(reverse=False) is True
         assert input_widget.value == "/session"
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/stop"
 
         assert app._apply_slash_tab_completion(reverse=False) is True
         assert input_widget.value == "/setup"

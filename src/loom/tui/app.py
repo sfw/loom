@@ -61,6 +61,7 @@ from textual.widgets import (
 from loom.cowork.approval import ApprovalDecision, ToolApprover
 from loom.cowork.session import (
     CoworkSession,
+    CoworkStopRequestedError,
     CoworkTurn,
     ToolCallEvent,
     build_cowork_system_prompt,
@@ -182,6 +183,10 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         ),
         description="run goal via process orchestrator (ad hoc by default)",
     ),
+    SlashCommandSpec(
+        canonical="/stop",
+        description="stop active cowork chat execution",
+    ),
 )
 _SLASH_COMMAND_PRIORITY: dict[str, int] = {
     "/new": 10,
@@ -190,6 +195,7 @@ _SLASH_COMMAND_PRIORITY: dict[str, int] = {
     "/history": 13,
     "/session": 14,
     "/run": 20,
+    "/stop": 22,
     "/processes": 21,
     "/mcp": 30,
     "/auth": 31,
@@ -260,6 +266,8 @@ _DEFAULT_TUI_RUN_CLOSE_MODAL_TIMEOUT_SECONDS = 45
 _DEFAULT_TUI_RUN_CANCEL_WAIT_TIMEOUT_SECONDS = 10
 _DEFAULT_TUI_RUN_PROGRESS_REFRESH_INTERVAL_MS = 200
 _DEFAULT_TUI_RUN_PREFLIGHT_ASYNC_ENABLED = True
+_DEFAULT_TUI_CHAT_STOP_COOPERATIVE_WAIT_SECONDS = 0.35
+_DEFAULT_TUI_CHAT_STOP_SETTLE_TIMEOUT_SECONDS = 2.0
 _PROCESS_COMMAND_INDEX_REFRESH_INTERVAL_SECONDS = 2.0
 _EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS = 0.5
 _EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS = 0.05
@@ -724,23 +732,59 @@ class LoomApp(App):
         border-right: solid $primary-darken-2;
         background: $panel;
     }
+    #input-row {
+        width: 100%;
+        height: 2;
+    }
     #user-input {
+        width: 1fr;
         margin: 0;
         height: 2;
         padding: 0 1;
         background: $panel;
         border: none;
         border-left: solid $primary-darken-2;
-        border-right: solid $primary-darken-2;
+        border-right: none;
         border-bottom: solid $primary-darken-1;
         color: $text;
     }
     #user-input:focus {
         border: none;
         border-left: solid $primary-darken-1;
-        border-right: solid $primary-darken-1;
+        border-right: none;
         border-bottom: solid $primary;
         background: $surface;
+    }
+    #chat-stop-btn {
+        display: none;
+        width: 5;
+        min-width: 5;
+        max-width: 5;
+        height: 2;
+        margin: 0;
+        padding: 0;
+        content-align: center middle;
+        border: none;
+        border-left: solid $primary-darken-2;
+        border-right: solid $primary-darken-2;
+        border-bottom: solid $primary-darken-1;
+        background: $panel;
+        color: $text-muted;
+    }
+    #chat-stop-btn:hover {
+        color: $text;
+        background: $surface-lighten-1;
+    }
+    #chat-stop-btn:focus {
+        color: $text;
+        border-left: solid $primary-darken-1;
+        border-right: solid $primary-darken-1;
+        border-bottom: solid $primary;
+        background: $surface-lighten-1;
+    }
+    #chat-stop-btn:disabled {
+        color: $text-muted;
+        background: $panel;
     }
     #status-bar {
         display: none;
@@ -851,6 +895,12 @@ class LoomApp(App):
         self._process_defn: ProcessDefinition | None = None
         self._session: CoworkSession | None = None
         self._chat_busy = False
+        self._chat_turn_worker: Any | None = None
+        self._chat_stop_requested = False
+        self._chat_stop_inflight = False
+        self._chat_stop_requested_at = 0.0
+        self._chat_stop_last_path = ""
+        self._chat_stop_last_error = ""
         self._total_tokens = 0
 
         # Approval state — resolved via Textual modal
@@ -948,6 +998,23 @@ class LoomApp(App):
             return True
         return self._has_unfinalized_delegate_streams()
 
+    def _is_cowork_stop_visible(self) -> bool:
+        """Return True when cowork chat stop affordance should be visible."""
+        if self._chat_busy:
+            return True
+        return self._has_unfinalized_delegate_streams()
+
+    def _sync_chat_stop_control(self) -> None:
+        """Keep input-row Stop button visibility and state in sync."""
+        try:
+            stop_btn = self.query_one("#chat-stop-btn", Button)
+        except Exception:
+            return
+        visible = self._is_cowork_stop_visible()
+        stop_btn.display = visible
+        stop_btn.disabled = bool(self._chat_stop_requested and visible)
+        stop_btn.label = "■"
+
     def _sync_activity_indicator(self) -> None:
         """Sync header activity indicator animation state."""
         try:
@@ -957,7 +1024,8 @@ class LoomApp(App):
             )
             indicator.set_active(self._is_background_work_active())
         except Exception:
-            return
+            pass
+        self._sync_chat_stop_control()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, id="app-header")
@@ -980,10 +1048,12 @@ class LoomApp(App):
         yield StatusBar(id="status-bar")
         with Vertical(id="bottom-stack"):
             yield Static("", id="input-top-rule")
-            yield Input(
-                placeholder="Type a message... (Enter to send)",
-                id="user-input",
-            )
+            with Horizontal(id="input-row"):
+                yield Input(
+                    placeholder="Type a message... (Enter to send)",
+                    id="user-input",
+                )
+                yield Button("■", id="chat-stop-btn")
             with Horizontal(id="footer-row"):
                 yield Footer(id="app-footer")
                 with Horizontal(id="footer-shortcuts"):
@@ -1004,6 +1074,10 @@ class LoomApp(App):
         # Register and activate theme
         self.register_theme(LOOM_DARK)
         self.theme = "loom-dark"
+        try:
+            self.query_one("#chat-stop-btn", Button).tooltip = "Stop active chat turn"
+        except Exception:
+            pass
         self._mount_header_activity_indicator()
         self._sync_activity_indicator()
         if diagnostics_enabled():
@@ -8176,6 +8250,12 @@ class LoomApp(App):
                     ),
                 )
                 return True
+            if event_type == "turn_interrupted":
+                chat.add_info(
+                    str(payload.get("message", "") or ""),
+                    markup=self._coerce_bool(payload.get("markup", True), default=True),
+                )
+                return True
             if event_type == "info":
                 chat.add_info(
                     str(payload.get("text", "") or ""),
@@ -8666,7 +8746,7 @@ class LoomApp(App):
             return
 
         self._append_input_history(text)
-        self._run_turn(text)
+        self._chat_turn_worker = self._run_turn(text)
 
     @on(Input.Changed, "#user-input")
     def on_user_input_changed(self, _event: Input.Changed) -> None:
@@ -8701,6 +8781,13 @@ class LoomApp(App):
             group=f"process-run-restart-{run_id}",
             exclusive=False,
         )
+
+    @on(Button.Pressed, "#chat-stop-btn")
+    def _on_chat_stop_pressed(self, event: Button.Pressed) -> None:
+        """Stop the active cowork chat turn from input-row button."""
+        event.stop()
+        event.prevent_default()
+        self.action_stop_chat()
 
     @on(Button.Pressed, "#footer-auth-shortcut, #footer-mcp-shortcut")
     def _on_footer_manager_shortcut_pressed(self, event: Button.Pressed) -> None:
@@ -9376,6 +9463,13 @@ class LoomApp(App):
             await self._start_process_run(execution_goal, **start_kwargs)
             return True
 
+        if token == "/stop":
+            if arg:
+                chat.add_info(self._render_slash_command_usage("/stop", "(no arguments)"))
+                return True
+            self.action_stop_chat()
+            return True
+
         process_name = self._process_command_map.get(token)
         if process_name:
             goal = self._strip_wrapping_quotes(arg)
@@ -9477,11 +9571,269 @@ class LoomApp(App):
     # Turn execution
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _chat_stop_cooperative_wait_seconds() -> float:
+        return _DEFAULT_TUI_CHAT_STOP_COOPERATIVE_WAIT_SECONDS
+
+    @staticmethod
+    def _chat_stop_settle_timeout_seconds() -> float:
+        return _DEFAULT_TUI_CHAT_STOP_SETTLE_TIMEOUT_SECONDS
+
+    async def _wait_for_chat_turn_settle(self, *, timeout_seconds: float) -> bool:
+        """Wait for current cowork turn to leave busy state."""
+        timeout = max(0.05, float(timeout_seconds))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._chat_busy:
+                return True
+            await asyncio.sleep(0.05)
+        return not self._chat_busy
+
+    async def _finalize_unsettled_delegate_streams_for_stop(self) -> None:
+        """Mark any in-progress cowork delegate streams as failed on interruption."""
+        pending_ids: list[str] = []
+        for key, stream in self._active_delegate_streams.items():
+            if not isinstance(stream, dict):
+                continue
+            if bool(stream.get("finalized", False)):
+                continue
+            pending_ids.append(str(key))
+        for tool_call_id in pending_ids:
+            stream = self._active_delegate_streams.get(tool_call_id, {})
+            elapsed_ms = 0
+            if isinstance(stream, dict):
+                started_at = float(stream.get("started_at", 0.0) or 0.0)
+                if started_at > 0:
+                    elapsed_ms = max(1, int((time.monotonic() - started_at) * 1000))
+            await self._finalize_delegate_progress_stream(
+                tool_call_id=tool_call_id,
+                success=False,
+                elapsed_ms=elapsed_ms,
+                persist=True,
+            )
+
+    async def _handle_interrupted_chat_turn(
+        self,
+        *,
+        path: str,
+        reason: str = "",
+        stage: str = "",
+    ) -> None:
+        """Record and render one interrupted cowork turn."""
+        await self._finalize_unsettled_delegate_streams_for_stop()
+        clean_path = str(path or "").strip() or "unknown"
+        clean_reason = str(reason or "").strip()
+        clean_stage = str(stage or "").strip()
+        self._chat_stop_last_path = clean_path
+        self._chat_stop_last_error = clean_reason
+        detail: list[str] = [f"path={clean_path}"]
+        if clean_reason:
+            detail.append(f"reason={clean_reason}")
+        if clean_stage:
+            detail.append(f"stage={clean_stage}")
+        detail_text = ", ".join(detail)
+        message = f"Stopped current chat execution. [dim]({self._escape_markup(detail_text)})[/dim]"
+        chat = self.query_one("#chat-log", ChatLog)
+        chat.add_info(message)
+        await self._append_chat_replay_event(
+            "turn_interrupted",
+            {
+                "message": message,
+                "markup": True,
+                "path": clean_path,
+                "reason": clean_reason,
+                "stage": clean_stage,
+            },
+            render=False,
+        )
+        try:
+            events_panel = self.query_one("#events-panel", EventPanel)
+            events_panel.add_event(_now_str(), "chat_stop", f"Interrupted ({clean_path})")
+        except Exception:
+            pass
+
+    async def _request_chat_stop(self) -> None:
+        """Request stop for active cowork chat turn using hybrid cancellation."""
+        chat = self.query_one("#chat-log", ChatLog)
+        status = self.query_one("#status-bar", StatusBar)
+
+        def _clear_stop_request_state() -> None:
+            self._chat_stop_requested = False
+            if self._session is not None:
+                self._session.clear_stop_request()
+            status.state = "Thinking..." if self._chat_busy else "Ready"
+            self._sync_activity_indicator()
+
+        if not self._is_cowork_stop_visible():
+            chat.add_info("No active cowork chat execution to stop.")
+            return
+        if self._chat_stop_requested:
+            chat.add_info("Stop already requested. Waiting for chat turn to settle.")
+            return
+        self._chat_stop_requested = True
+        self._chat_stop_requested_at = time.monotonic()
+        self._chat_stop_last_path = ""
+        self._chat_stop_last_error = ""
+        status.state = "Stopping..."
+        if self._session is not None:
+            self._session.request_stop("user_requested")
+        self._sync_activity_indicator()
+        chat.add_info("Stop requested for active cowork chat turn.")
+        log_latency_event(
+            logger,
+            event="chat_stop_requested",
+            duration_seconds=0.0,
+            fields={
+                "session_id": self._active_session_id(),
+                "turn_number": int(getattr(self._session, "_turn_counter", 0) or 0),
+                "stop_path": "cooperative",
+            },
+        )
+
+        if not self._chat_busy and self._has_unfinalized_delegate_streams():
+            await self._handle_interrupted_chat_turn(
+                path="cooperative",
+                reason="user_requested",
+                stage="delegate_stream_cleanup",
+            )
+
+        cooperative_wait = self._chat_stop_cooperative_wait_seconds()
+        settled = await self._wait_for_chat_turn_settle(timeout_seconds=cooperative_wait)
+        if settled:
+            settled_path = self._chat_stop_last_path or "cooperative"
+            log_latency_event(
+                logger,
+                event="chat_stop_settled",
+                duration_seconds=max(0.0, time.monotonic() - self._chat_stop_requested_at),
+                fields={
+                    "session_id": self._active_session_id(),
+                    "stop_path": settled_path,
+                    "result": "stopped",
+                },
+            )
+            _clear_stop_request_state()
+            return
+
+        fallback_error = ""
+        cancel_requested = False
+        worker = self._chat_turn_worker
+        if worker is not None and hasattr(worker, "cancel"):
+            try:
+                worker.cancel()
+                cancel_requested = True
+            except Exception as e:
+                fallback_error = str(e)
+        else:
+            fallback_error = "No active chat worker cancellation path."
+
+        log_latency_event(
+            logger,
+            event="chat_stop_ack",
+            duration_seconds=max(0.0, time.monotonic() - self._chat_stop_requested_at),
+            fields={
+                "session_id": self._active_session_id(),
+                "stop_path": "worker_fallback",
+                "cancel_requested": bool(cancel_requested),
+                "error": fallback_error,
+            },
+        )
+        if fallback_error:
+            chat.add_info(
+                "[bold #e0af68]Stop fallback warning:[/] "
+                f"{self._escape_markup(fallback_error)}"
+            )
+
+        settled = await self._wait_for_chat_turn_settle(
+            timeout_seconds=self._chat_stop_settle_timeout_seconds(),
+        )
+        if settled:
+            settled_path = self._chat_stop_last_path or "hybrid"
+            log_latency_event(
+                logger,
+                event="chat_stop_settled",
+                duration_seconds=max(0.0, time.monotonic() - self._chat_stop_requested_at),
+                fields={
+                    "session_id": self._active_session_id(),
+                    "stop_path": settled_path,
+                    "result": "stopped",
+                },
+            )
+            _clear_stop_request_state()
+            return
+
+        log_latency_event(
+            logger,
+            event="chat_stop_timeout",
+            duration_seconds=max(0.0, time.monotonic() - self._chat_stop_requested_at),
+            fields={
+                "session_id": self._active_session_id(),
+                "stop_path": "hybrid",
+                "result": "timeout",
+            },
+        )
+        chat.add_info(
+            "[bold #e0af68]Stop timed out.[/] "
+            "Chat is still running; try /stop again."
+        )
+        _clear_stop_request_state()
+
+    def action_stop_chat(self) -> None:
+        """Start non-blocking stop flow for current cowork turn."""
+        if self._chat_stop_inflight:
+            return
+        self._chat_stop_inflight = True
+
+        async def _run_stop() -> None:
+            try:
+                await self._request_chat_stop()
+            except Exception as e:
+                log_latency_event(
+                    logger,
+                    event="chat_stop_failed",
+                    duration_seconds=max(0.0, time.monotonic() - self._chat_stop_requested_at),
+                    fields={
+                        "session_id": self._active_session_id(),
+                        "stop_path": self._chat_stop_last_path or "hybrid",
+                        "result": "failed",
+                        "error": str(e),
+                    },
+                )
+                logger.exception("chat_stop_failed session=%s", self._active_session_id())
+                try:
+                    chat = self.query_one("#chat-log", ChatLog)
+                    chat.add_info(
+                        "[bold #f7768e]Stop failed:[/] "
+                        f"{self._escape_markup(str(e))}"
+                    )
+                except Exception:
+                    pass
+                self._chat_stop_requested = False
+                if self._session is not None:
+                    self._session.clear_stop_request()
+                try:
+                    status = self.query_one("#status-bar", StatusBar)
+                    status.state = "Thinking..." if self._chat_busy else "Ready"
+                except Exception:
+                    pass
+                self._sync_activity_indicator()
+            finally:
+                self._chat_stop_inflight = False
+
+        self.run_worker(
+            _run_stop(),
+            group="chat-stop",
+            exclusive=False,
+        )
+
     @work(exclusive=True)
     async def _run_turn(self, user_message: str) -> None:
         if self._session is None:
             return
 
+        self._chat_stop_last_path = ""
+        self._chat_stop_last_error = ""
+        self._chat_stop_requested = False
+        self._session.clear_stop_request()
         self._chat_busy = True
         self._sync_activity_indicator()
         chat = self.query_one("#chat-log", ChatLog)
@@ -9496,11 +9848,28 @@ class LoomApp(App):
 
         try:
             await self._run_interaction(user_message)
+        except CoworkStopRequestedError as stop_exc:
+            await self._handle_interrupted_chat_turn(
+                path=stop_exc.path,
+                reason=stop_exc.reason,
+                stage=stop_exc.stage,
+            )
+        except asyncio.CancelledError:
+            if self._chat_stop_requested or self._session.stop_requested:
+                await self._handle_interrupted_chat_turn(
+                    path="worker_fallback",
+                    reason="user_requested",
+                )
+                return
+            raise
         except Exception as e:
             chat.add_model_text(f"[bold #f7768e]Error:[/] {e}", markup=True)
             self.notify(str(e), severity="error", timeout=5)
         finally:
             self._chat_busy = False
+            self._chat_stop_requested = False
+            self._chat_turn_worker = None
+            self._session.clear_stop_request()
             status.state = "Ready"
             self._sync_activity_indicator()
 
@@ -11424,6 +11793,9 @@ class LoomApp(App):
             return
         if command == "run_prompt":
             self._prefill_user_input("/run ")
+            return
+        if command == "stop_chat":
+            self.action_stop_chat()
             return
         if command == "resume_prompt":
             self._prefill_user_input("/resume ")

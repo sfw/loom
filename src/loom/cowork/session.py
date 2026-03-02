@@ -77,6 +77,25 @@ class CoworkTurn:
 
 
 @dataclass(frozen=True)
+class CoworkStopRequestedError(Exception):
+    """Raised when an in-flight cowork turn is asked to stop cooperatively."""
+
+    reason: str = "user_requested"
+    stage: str = ""
+    path: str = "cooperative"
+
+    def __str__(self) -> str:
+        base = "Cowork turn stop requested"
+        reason = str(self.reason or "").strip()
+        stage = str(self.stage or "").strip()
+        if reason:
+            base += f" ({reason})"
+        if stage:
+            base += f" at {stage}"
+        return base
+
+
+@dataclass(frozen=True)
 class _ContextWindowStats:
     """Per-request context metadata for lightweight turn telemetry."""
 
@@ -528,6 +547,8 @@ class CoworkSession:
 
         self._messages_lock = asyncio.Lock()
         self._counter_lock = asyncio.Lock()
+        self._stop_requested = asyncio.Event()
+        self._stop_reason = ""
 
         self._messages: list[dict] = []
         if system_prompt:
@@ -558,6 +579,31 @@ class CoworkSession:
         return self._session_state
 
     @property
+    def stop_requested(self) -> bool:
+        """Return True when a cooperative stop has been requested."""
+        return self._stop_requested.is_set()
+
+    def request_stop(self, reason: str = "user_requested") -> None:
+        """Request cooperative interruption of the active cowork turn."""
+        self._stop_reason = str(reason or "user_requested").strip() or "user_requested"
+        self._stop_requested.set()
+
+    def clear_stop_request(self) -> None:
+        """Clear any prior cooperative stop request."""
+        self._stop_requested.clear()
+        self._stop_reason = ""
+
+    def _raise_if_stop_requested(self, *, stage: str = "") -> None:
+        """Raise CoworkStopRequestedError when a cooperative stop is pending."""
+        if not self._stop_requested.is_set():
+            return
+        raise CoworkStopRequestedError(
+            reason=self._stop_reason or "user_requested",
+            stage=str(stage or "").strip(),
+            path="cooperative",
+        )
+
+    @property
     def compactor(self) -> SemanticCompactor:
         return self._compactor
 
@@ -578,6 +624,7 @@ class CoworkSession:
         The caller should display streamed text inline, show tool calls
         as they happen, and use the final CoworkTurn for bookkeeping.
         """
+        self.clear_stop_request()
         async with self._counter_lock:
             self._turn_counter += 1
         self._session_state.set_focus(user_message.split("\n")[0])
@@ -605,6 +652,7 @@ class CoworkSession:
         repeated_tool_batch_recovery_hints_used = 0
 
         for _ in range(MAX_TOOL_ITERATIONS):
+            self._raise_if_stop_requested(stage="model_request")
             # Call the model
             async def _invoke_complete():
                 nonlocal context_stats
@@ -620,6 +668,7 @@ class CoworkSession:
                 _invoke_complete,
                 policy=self._model_retry_policy,
             )
+            self._raise_if_stop_requested(stage="model_response")
             if first_model_latency_ms is None:
                 first_model_latency_ms = max(
                     1,
@@ -693,6 +742,7 @@ class CoworkSession:
 
                 ask_user_pending = False
                 for tc in response.tool_calls:
+                    self._raise_if_stop_requested(stage=f"tool_start:{tc.name}")
                     event = ToolCallEvent(
                         name=tc.name,
                         args=tc.arguments,
@@ -710,6 +760,7 @@ class CoworkSession:
                     event.elapsed_ms = elapsed_ms
                     all_tool_events.append(event)
                     yield event
+                    self._raise_if_stop_requested(stage=f"tool_complete:{tc.name}")
 
                     await self._append_tool_result(tc.id, tc.name, result)
 
@@ -793,6 +844,7 @@ class CoworkSession:
         Yields str chunks for incremental display, ToolCallEvents for
         tool calls, and a final CoworkTurn.
         """
+        self.clear_stop_request()
         async with self._counter_lock:
             self._turn_counter += 1
         self._session_state.set_focus(user_message.split("\n")[0])
@@ -819,6 +871,7 @@ class CoworkSession:
         repeated_tool_batch_recovery_hints_used = 0
 
         for _ in range(MAX_TOOL_ITERATIONS):
+            self._raise_if_stop_requested(stage="stream_model_request")
             iter_text_parts: list[str] = []
             final_tool_calls: list[ToolCall] | None = None
             final_usage = None
@@ -837,6 +890,7 @@ class CoworkSession:
                 _invoke_stream,
                 policy=self._model_retry_policy,
             ):
+                self._raise_if_stop_requested(stage="stream_chunk")
                 if first_model_latency_ms is None and (
                     chunk.text or chunk.tool_calls is not None or chunk.usage is not None
                 ):
@@ -851,8 +905,10 @@ class CoworkSession:
                     final_tool_calls = chunk.tool_calls
                 if chunk.usage is not None:
                     final_usage = chunk.usage
+                self._raise_if_stop_requested(stage="stream_chunk_processed")
 
             response_text = "".join(iter_text_parts)
+            self._raise_if_stop_requested(stage="stream_iteration_complete")
             if first_model_latency_ms is None and (
                 response_text or final_tool_calls is not None or final_usage is not None
             ):
@@ -927,6 +983,7 @@ class CoworkSession:
 
                 ask_user_pending = False
                 for tc in final_tool_calls:
+                    self._raise_if_stop_requested(stage=f"tool_start:{tc.name}")
                     event = ToolCallEvent(
                         name=tc.name,
                         args=tc.arguments,
@@ -944,6 +1001,7 @@ class CoworkSession:
                     event.elapsed_ms = elapsed_ms
                     all_tool_events.append(event)
                     yield event
+                    self._raise_if_stop_requested(stage=f"tool_complete:{tc.name}")
 
                     await self._append_tool_result(tc.id, tc.name, result)
 

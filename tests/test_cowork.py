@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import pytest
 
 from loom.cowork.session import (
     CoworkSession,
+    CoworkStopRequestedError,
     CoworkTurn,
     ToolCallEvent,
     build_cowork_system_prompt,
@@ -74,6 +76,44 @@ def tools():
 
 
 class TestCoworkSession:
+    def test_stop_request_lifecycle(self, workspace, tools):
+        provider = MockProvider([
+            ModelResponse(text="ok", usage=TokenUsage(total_tokens=1)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        assert session.stop_requested is False
+        session.request_stop("user_requested")
+        assert session.stop_requested is True
+        session.clear_stop_request()
+        assert session.stop_requested is False
+
+    async def test_send_raises_when_stop_requested_mid_turn(self, workspace, tools):
+        gate = asyncio.Event()
+
+        class _BlockingProvider(MockProvider):
+            async def complete(self, messages, tools=None, **kwargs):
+                await gate.wait()
+                return ModelResponse(text="Should not complete", usage=TokenUsage(total_tokens=2))
+
+        session = CoworkSession(
+            model=_BlockingProvider([]),
+            tools=tools,
+            workspace=workspace,
+        )
+
+        async def _consume() -> None:
+            async for _event in session.send("Please stop this turn"):
+                pass
+
+        task = asyncio.create_task(_consume())
+        await asyncio.sleep(0)
+        session.request_stop("user_requested")
+        gate.set()
+
+        with pytest.raises(CoworkStopRequestedError):
+            await task
+
     async def test_simple_text_response(self, workspace, tools):
         """Model returns text only — one turn, no tool calls."""
         provider = MockProvider([
