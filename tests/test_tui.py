@@ -733,6 +733,100 @@ class TestAuthAndMCPManagerScreens:
             assert mode_select.value == "oauth2_pkce"
             assert screen._selected_mode() == "oauth2_pkce"
 
+    @pytest.mark.asyncio
+    async def test_auth_manager_on_mount_does_not_sync_implicitly(self):
+        from textual.app import App
+
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        class _DummyMCPManager:
+            def list_views(self):
+                return []
+
+        class _AuthManagerHarnessApp(App):
+            CSS_PATH = None
+
+            def __init__(self):
+                super().__init__()
+                self.screen_under_test = AuthManagerScreen(
+                    workspace=Path("/tmp"),
+                    mcp_manager=_DummyMCPManager(),
+                    process_defs=[],
+                )
+
+            def compose(self):
+                yield self.screen_under_test
+
+        app = _AuthManagerHarnessApp()
+        screen = app.screen_under_test
+        screen._sync_missing_drafts = AsyncMock()
+        screen._refresh_summary = AsyncMock()
+
+        async with app.run_test(size=(140, 44)) as pilot:
+            await pilot.pause()
+
+        screen._sync_missing_drafts.assert_not_awaited()
+        screen._refresh_summary.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_auth_manager_refresh_and_sync_controls_have_distinct_behavior(self):
+        from textual.app import App
+
+        from loom.tui.screens.auth_manager import AuthManagerScreen
+
+        class _DummyMCPManager:
+            def list_views(self):
+                return []
+
+        class _AuthManagerHarnessApp(App):
+            CSS_PATH = None
+
+            def __init__(self):
+                super().__init__()
+                self.screen_under_test = AuthManagerScreen(
+                    workspace=Path("/tmp"),
+                    mcp_manager=_DummyMCPManager(),
+                    process_defs=[],
+                )
+
+            def compose(self):
+                yield self.screen_under_test
+
+        app = _AuthManagerHarnessApp()
+        screen = app.screen_under_test
+        screen._sync_missing_drafts = AsyncMock()
+        screen._refresh_summary = AsyncMock()
+
+        async with app.run_test(size=(140, 44)) as pilot:
+            await pilot.pause()
+            screen._sync_missing_drafts.reset_mock()
+            screen._refresh_summary.reset_mock()
+
+            await screen.action_refresh()
+            assert screen._sync_missing_drafts.await_count == 0
+            assert screen._refresh_summary.await_count == 1
+
+            screen._sync_missing_drafts.reset_mock()
+            screen._refresh_summary.reset_mock()
+            await pilot.click("#auth-btn-refresh")
+            await pilot.pause()
+            assert screen._sync_missing_drafts.await_count == 0
+            assert screen._refresh_summary.await_count == 1
+
+            screen._sync_missing_drafts.reset_mock()
+            screen._refresh_summary.reset_mock()
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            assert screen._sync_missing_drafts.await_count == 0
+            assert screen._refresh_summary.await_count == 1
+
+            screen._sync_missing_drafts.reset_mock()
+            screen._refresh_summary.reset_mock()
+            await pilot.click("#auth-btn-sync")
+            await pilot.pause()
+            assert screen._sync_missing_drafts.await_count == 1
+            assert screen._refresh_summary.await_count == 1
+
     def test_auth_manager_next_duplicate_profile_id(self):
         from loom.tui.screens.auth_manager import AuthManagerScreen
 
