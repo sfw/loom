@@ -45,6 +45,22 @@ max_task_tool_calls = 0
 max_task_mutating_tool_calls = 0
 max_task_replans = 0
 max_task_remediation_attempts = 0
+enable_process_iteration_loops = false
+enable_iteration_command_exit_gate = false
+max_iteration_replans_after_exhaustion = 2
+iteration_command_exit_allowlisted_prefixes = [
+  "pytest",
+  "uv run pytest",
+  "python -m pytest",
+  "python3 -m pytest",
+  "ruff check",
+  "npm test",
+  "pnpm test",
+  "bun test",
+  "go test",
+  "cargo test",
+  "make test",
+]
 executor_completion_contract_mode = "off" # off | warn | enforce
 planner_degraded_mode = "allow" # allow | require_approval | deny
 enable_sqlite_remediation_queue = false

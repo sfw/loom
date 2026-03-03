@@ -14,6 +14,7 @@ import importlib
 import importlib.util
 import logging
 import re
+import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +58,49 @@ class ProcessValidationError(Exception):
 # ---------------------------------------------------------------------------
 
 @dataclass
+class IterationBudget:
+    """Bounded per-phase budget for gate-driven iteration loops."""
+
+    max_wall_clock_seconds: int = 0
+    max_tokens: int = 0
+    max_tool_calls: int = 0
+
+
+@dataclass
+class IterationGate:
+    """One gate evaluation rule used by phase iteration policies."""
+
+    id: str
+    type: str
+    blocking: bool = False
+    operator: str = ""
+    value: Any = None
+    tool: str = ""
+    metric_path: str = ""
+    target: str = ""
+    pattern: str = ""
+    expect_match: bool = True
+    verifier_field: str = ""
+    command: list[str] = field(default_factory=list)
+    timeout_seconds: int = 60
+
+
+@dataclass
+class IterationPolicy:
+    """Phase-level iteration contract."""
+
+    enabled: bool = False
+    max_attempts: int = 4
+    strategy: str = "targeted_remediation"
+    stop_on_no_improvement_attempts: int = 0
+    max_total_runner_invocations: int = 0
+    max_replans_after_exhaustion: int = 2
+    replan_on_exhaustion: bool = True
+    budget: IterationBudget = field(default_factory=IterationBudget)
+    gates: list[IterationGate] = field(default_factory=list)
+
+
+@dataclass
 class PhaseTemplate:
     """A blueprint phase in the process definition."""
 
@@ -69,6 +113,7 @@ class PhaseTemplate:
     is_synthesis: bool = False
     acceptance_criteria: str = ""
     deliverables: list[str] = field(default_factory=list)
+    iteration: IterationPolicy | None = None
 
 
 @dataclass
@@ -512,6 +557,28 @@ class ProcessLoader:
     """
 
     BUILTIN_DIR = Path(__file__).parent / "builtin"
+    _ITERATION_STRATEGIES = frozenset({"targeted_remediation", "full_rerun"})
+    _ARTIFACT_REGEX_TARGETS = frozenset({
+        "",
+        "auto",
+        "deliverables",
+        "changed_files",
+        "summary",
+        "output",
+    })
+    _COMMAND_EXIT_ALLOWLIST_PREFIXES = (
+        ("pytest",),
+        ("uv", "run", "pytest"),
+        ("python", "-m", "pytest"),
+        ("python3", "-m", "pytest"),
+        ("ruff", "check"),
+        ("npm", "test"),
+        ("pnpm", "test"),
+        ("bun", "test"),
+        ("go", "test"),
+        ("cargo", "test"),
+        ("make", "test"),
+    )
 
     def __init__(
         self,
@@ -679,6 +746,7 @@ class ProcessLoader:
                 is_synthesis=p.get("is_synthesis", False),
                 acceptance_criteria=p.get("acceptance_criteria", ""),
                 deliverables=p.get("deliverables", []),
+                iteration=self._parse_iteration_policy(p.get("iteration")),
             ))
 
         # Verification rules + contract v2 verification blocks
@@ -1017,6 +1085,129 @@ class ProcessLoader:
             dependencies=deps_raw,
         )
 
+    @staticmethod
+    def _int_or_default(value: object, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _bool_or_default(value: object, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "yes", "1", "on"}:
+                return True
+            if lowered in {"false", "no", "0", "off"}:
+                return False
+        return default
+
+    @staticmethod
+    def _command_tokens(value: object) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                return [token for token in shlex.split(text) if token]
+            except ValueError:
+                return []
+        return []
+
+    @classmethod
+    def _command_exit_prefix_allowlisted(cls, command: list[str]) -> bool:
+        tokens = [str(token).strip() for token in command if str(token).strip()]
+        if not tokens:
+            return False
+        first = Path(tokens[0]).name.lower()
+        normalized = [first] + [str(token).strip() for token in tokens[1:]]
+        command_tuple = tuple(normalized)
+        for prefix in cls._COMMAND_EXIT_ALLOWLIST_PREFIXES:
+            if len(command_tuple) < len(prefix):
+                continue
+            if command_tuple[: len(prefix)] == prefix:
+                return True
+        return False
+
+    def _parse_iteration_policy(self, raw: object) -> IterationPolicy | None:
+        if not isinstance(raw, dict):
+            return None
+
+        budget_raw = raw.get("iteration_budget", {})
+        if not isinstance(budget_raw, dict):
+            budget_raw = {}
+        budget = IterationBudget(
+            max_wall_clock_seconds=self._int_or_default(
+                budget_raw.get("max_wall_clock_seconds", 0),
+                0,
+            ),
+            max_tokens=self._int_or_default(
+                budget_raw.get("max_tokens", 0),
+                0,
+            ),
+            max_tool_calls=self._int_or_default(
+                budget_raw.get("max_tool_calls", 0),
+                0,
+            ),
+        )
+
+        gates: list[IterationGate] = []
+        gates_raw = raw.get("gates", [])
+        if isinstance(gates_raw, list):
+            for index, gate_raw in enumerate(gates_raw):
+                if not isinstance(gate_raw, dict):
+                    continue
+                gate_id = str(gate_raw.get("id", "")).strip() or f"gate-{index + 1}"
+                gates.append(IterationGate(
+                    id=gate_id,
+                    type=str(gate_raw.get("type", "")).strip().lower(),
+                    blocking=bool(gate_raw.get("blocking", False)),
+                    operator=str(gate_raw.get("operator", "")).strip().lower(),
+                    value=gate_raw.get("value"),
+                    tool=str(gate_raw.get("tool", "")).strip(),
+                    metric_path=str(gate_raw.get("metric_path", "")).strip(),
+                    target=str(gate_raw.get("target", "")).strip().lower(),
+                    pattern=str(gate_raw.get("pattern", "")),
+                    expect_match=self._bool_or_default(
+                        gate_raw.get("expect_match", True),
+                        True,
+                    ),
+                    verifier_field=str(gate_raw.get("field", "")).strip(),
+                    command=self._command_tokens(gate_raw.get("command")),
+                    timeout_seconds=self._int_or_default(
+                        gate_raw.get("timeout_seconds", 60),
+                        60,
+                    ),
+                ))
+
+        return IterationPolicy(
+            enabled=bool(raw.get("enabled", False)),
+            max_attempts=self._int_or_default(raw.get("max_attempts", 4), 4),
+            strategy=str(raw.get("strategy", "targeted_remediation")).strip().lower(),
+            stop_on_no_improvement_attempts=self._int_or_default(
+                raw.get("stop_on_no_improvement_attempts", 0),
+                0,
+            ),
+            max_total_runner_invocations=self._int_or_default(
+                raw.get("max_total_runner_invocations", 0),
+                0,
+            ),
+            max_replans_after_exhaustion=self._int_or_default(
+                raw.get("max_replans_after_exhaustion", 2),
+                2,
+            ),
+            replan_on_exhaustion=self._bool_or_default(
+                raw.get("replan_on_exhaustion", True),
+                True,
+            ),
+            budget=budget,
+            gates=gates,
+        )
+
     def _validate(self, defn: ProcessDefinition) -> list[str]:
         """Validate a ProcessDefinition beyond schema structure."""
         errors: list[str] = []
@@ -1103,6 +1294,7 @@ class ProcessLoader:
             phase_ids.add(phase.id)
             if not phase.description:
                 errors.append(f"Phase {phase.id!r} has empty description")
+            self._validate_iteration_policy(phase, errors)
 
         # Dependency graph validation
         for phase in defn.phases:
@@ -1284,6 +1476,202 @@ class ProcessLoader:
                     )
 
         return errors
+
+    def _validate_iteration_policy(
+        self,
+        phase: PhaseTemplate,
+        errors: list[str],
+    ) -> None:
+        policy = phase.iteration
+        if policy is None or not bool(policy.enabled):
+            return
+
+        phase_id = phase.id or "<unknown>"
+        gate_types = {"tool_metric", "command_exit", "artifact_regex", "verifier_field"}
+        deterministic_types = {"tool_metric", "command_exit", "artifact_regex"}
+        operators = {"gte", "lte", "eq", "contains", "not_contains"}
+
+        if policy.max_attempts < 1 or policy.max_attempts > 6:
+            errors.append(
+                f"Phase {phase_id!r}: iteration.max_attempts must be between 1 and 6",
+            )
+        if policy.strategy not in self._ITERATION_STRATEGIES:
+            errors.append(
+                f"Phase {phase_id!r}: iteration.strategy must be one of "
+                "{targeted_remediation,full_rerun}",
+            )
+        if policy.stop_on_no_improvement_attempts < 0:
+            errors.append(
+                f"Phase {phase_id!r}: iteration.stop_on_no_improvement_attempts "
+                "must be >= 0",
+            )
+        if policy.max_replans_after_exhaustion < 0:
+            errors.append(
+                f"Phase {phase_id!r}: iteration.max_replans_after_exhaustion "
+                "must be >= 0",
+            )
+        if policy.max_total_runner_invocations <= 0:
+            errors.append(
+                f"Phase {phase_id!r}: iteration.max_total_runner_invocations "
+                "must be > 0",
+            )
+        elif policy.max_total_runner_invocations < policy.max_attempts:
+            errors.append(
+                f"Phase {phase_id!r}: iteration.max_total_runner_invocations must be "
+                ">= iteration.max_attempts",
+            )
+        if policy.budget.max_wall_clock_seconds <= 0:
+            errors.append(
+                f"Phase {phase_id!r}: iteration.iteration_budget.max_wall_clock_seconds "
+                "must be > 0",
+            )
+        if policy.budget.max_tokens <= 0:
+            errors.append(
+                f"Phase {phase_id!r}: iteration.iteration_budget.max_tokens must be > 0",
+            )
+        if policy.budget.max_tool_calls <= 0:
+            errors.append(
+                f"Phase {phase_id!r}: iteration.iteration_budget.max_tool_calls "
+                "must be > 0",
+            )
+        if not policy.gates:
+            errors.append(
+                f"Phase {phase_id!r}: iteration.gates must declare at least one gate",
+            )
+            return
+
+        seen_gate_ids: set[str] = set()
+        deterministic_blockers = 0
+        score_like_gate = False
+        shell_meta_pattern = re.compile(r"[;&|><`]")
+        for gate in policy.gates:
+            gate_id = str(gate.id or "").strip()
+            if not gate_id:
+                errors.append(
+                    f"Phase {phase_id!r}: iteration gate missing id",
+                )
+                continue
+            if gate_id in seen_gate_ids:
+                errors.append(
+                    f"Phase {phase_id!r}: duplicate iteration gate id {gate_id!r}",
+                )
+            seen_gate_ids.add(gate_id)
+
+            gate_type = str(gate.type or "").strip().lower()
+            if gate_type not in gate_types:
+                errors.append(
+                    f"Phase {phase_id!r}: gate {gate_id!r} has invalid type "
+                    f"{gate.type!r}",
+                )
+                continue
+
+            if gate.blocking and gate_type in deterministic_types:
+                deterministic_blockers += 1
+            if gate_type == "verifier_field" and gate.blocking:
+                errors.append(
+                    f"Phase {phase_id!r}: gate {gate_id!r} of type verifier_field "
+                    "is advisory-only in MVP and cannot be blocking",
+                )
+
+            operator = str(gate.operator or "").strip().lower()
+            if gate_type in {"tool_metric", "verifier_field"} and operator not in operators:
+                errors.append(
+                    f"Phase {phase_id!r}: gate {gate_id!r} requires operator in "
+                    "{gte,lte,eq,contains,not_contains}",
+                )
+
+            if gate_type == "tool_metric":
+                if not str(gate.tool or "").strip():
+                    errors.append(
+                        f"Phase {phase_id!r}: gate {gate_id!r} missing tool",
+                    )
+                if not str(gate.metric_path or "").strip():
+                    errors.append(
+                        f"Phase {phase_id!r}: gate {gate_id!r} missing metric_path",
+                    )
+                path_hint = " ".join([
+                    str(gate.metric_path or "").strip().lower(),
+                    gate_id.lower(),
+                ])
+                if "score" in path_hint and isinstance(gate.value, (int, float)):
+                    score_like_gate = True
+
+            if gate_type == "artifact_regex":
+                if not str(gate.pattern or "").strip():
+                    errors.append(
+                        f"Phase {phase_id!r}: gate {gate_id!r} missing pattern",
+                    )
+                else:
+                    try:
+                        re.compile(str(gate.pattern))
+                    except re.error as e:
+                        errors.append(
+                            f"Phase {phase_id!r}: gate {gate_id!r} has invalid regex: {e}",
+                        )
+                target = str(gate.target or "").strip().lower()
+                if target not in self._ARTIFACT_REGEX_TARGETS:
+                    errors.append(
+                        f"Phase {phase_id!r}: gate {gate_id!r} target must be one of "
+                        "{auto,deliverables,changed_files,summary,output}",
+                    )
+                if target == "deliverables" and not phase.deliverables:
+                    errors.append(
+                        f"Phase {phase_id!r}: gate {gate_id!r} targets deliverables "
+                        "but phase has no deliverables declared",
+                    )
+
+            if gate_type == "command_exit":
+                if not gate.command:
+                    errors.append(
+                        f"Phase {phase_id!r}: gate {gate_id!r} missing command",
+                    )
+                if gate.timeout_seconds <= 0:
+                    errors.append(
+                        f"Phase {phase_id!r}: gate {gate_id!r} timeout_seconds "
+                        "must be > 0",
+                    )
+                for token in gate.command:
+                    text = str(token or "")
+                    if (
+                        shell_meta_pattern.search(text)
+                        or "$(" in text
+                        or "||" in text
+                        or "&&" in text
+                    ):
+                        errors.append(
+                            f"Phase {phase_id!r}: gate {gate_id!r} command contains "
+                            "shell metacharacters; provide argv tokens only",
+                        )
+                        break
+                if gate.command and not self._command_exit_prefix_allowlisted(gate.command):
+                    errors.append(
+                        f"Phase {phase_id!r}: gate {gate_id!r} command is not allowlisted "
+                        "for MVP command_exit gates",
+                    )
+
+            if gate_type == "verifier_field" and not str(gate.verifier_field or "").strip():
+                errors.append(
+                    f"Phase {phase_id!r}: gate {gate_id!r} missing field for verifier_field",
+                )
+
+        if deterministic_blockers == 0:
+            errors.append(
+                f"Phase {phase_id!r}: iteration requires at least one deterministic "
+                "blocking gate",
+            )
+        if score_like_gate and policy.stop_on_no_improvement_attempts <= 0:
+            errors.append(
+                f"Phase {phase_id!r}: score-like iteration gates require "
+                "stop_on_no_improvement_attempts > 0",
+            )
+        if (
+            policy.stop_on_no_improvement_attempts > 0
+            and policy.stop_on_no_improvement_attempts >= policy.max_attempts
+        ):
+            errors.append(
+                f"Phase {phase_id!r}: stop_on_no_improvement_attempts must be < "
+                "max_attempts",
+            )
 
     def _detect_cycles(
         self, phases: list[PhaseTemplate],

@@ -55,6 +55,15 @@ class Subtask:
     acceptance_criteria: str = ""
     retry_count: int = 0
     max_retries: int = 3
+    iteration_attempt: int = 0
+    iteration_runner_invocations: int = 0
+    iteration_max_attempts: int = 0
+    iteration_no_improvement_count: int = 0
+    iteration_best_score: float | None = None
+    iteration_terminal_reason: str = ""
+    iteration_loop_run_id: str = ""
+    iteration_replan_count: int = 0
+    iteration_last_gate_summary: str = ""
 
 
 @dataclass
@@ -264,6 +273,32 @@ class TaskStateManager:
                 entry["is_critical_path"] = True
             if s.is_synthesis:
                 entry["is_synthesis"] = True
+            if s.retry_count:
+                entry["retry_count"] = int(s.retry_count)
+            if s.max_retries != 3:
+                entry["max_retries"] = int(s.max_retries)
+            if s.iteration_attempt:
+                entry["iteration_attempt"] = int(s.iteration_attempt)
+            if s.iteration_runner_invocations:
+                entry["iteration_runner_invocations"] = int(
+                    s.iteration_runner_invocations,
+                )
+            if s.iteration_max_attempts:
+                entry["iteration_max_attempts"] = int(s.iteration_max_attempts)
+            if s.iteration_no_improvement_count:
+                entry["iteration_no_improvement_count"] = int(
+                    s.iteration_no_improvement_count,
+                )
+            if s.iteration_best_score is not None:
+                entry["iteration_best_score"] = float(s.iteration_best_score)
+            if s.iteration_terminal_reason:
+                entry["iteration_terminal_reason"] = s.iteration_terminal_reason
+            if s.iteration_loop_run_id:
+                entry["iteration_loop_run_id"] = s.iteration_loop_run_id
+            if s.iteration_replan_count:
+                entry["iteration_replan_count"] = int(s.iteration_replan_count)
+            if s.iteration_last_gate_summary:
+                entry["iteration_last_gate_summary"] = s.iteration_last_gate_summary
             subtasks_data.append(entry)
 
         errors_data = []
@@ -326,6 +361,13 @@ class TaskStateManager:
         for s in data.get("subtasks", []):
             if "_completed_count" in s:
                 continue
+            best_score_raw = s.get("iteration_best_score")
+            try:
+                best_score = (
+                    float(best_score_raw) if best_score_raw is not None else None
+                )
+            except (TypeError, ValueError):
+                best_score = None
             subtasks.append(Subtask(
                 id=s["id"],
                 description=s.get("description", ""),
@@ -336,6 +378,27 @@ class TaskStateManager:
                 phase_id=s.get("phase_id", ""),
                 is_critical_path=bool(s.get("is_critical_path", False)),
                 is_synthesis=bool(s.get("is_synthesis", False)),
+                retry_count=int(s.get("retry_count", 0) or 0),
+                max_retries=int(s.get("max_retries", 3) or 3),
+                iteration_attempt=int(s.get("iteration_attempt", 0) or 0),
+                iteration_runner_invocations=int(
+                    s.get("iteration_runner_invocations", 0) or 0,
+                ),
+                iteration_max_attempts=int(s.get("iteration_max_attempts", 0) or 0),
+                iteration_no_improvement_count=int(
+                    s.get("iteration_no_improvement_count", 0) or 0,
+                ),
+                iteration_best_score=best_score,
+                iteration_terminal_reason=str(
+                    s.get("iteration_terminal_reason", "") or "",
+                ),
+                iteration_loop_run_id=str(
+                    s.get("iteration_loop_run_id", "") or "",
+                ),
+                iteration_replan_count=int(s.get("iteration_replan_count", 0) or 0),
+                iteration_last_gate_summary=str(
+                    s.get("iteration_last_gate_summary", "") or "",
+                ),
             ))
 
         errors = []

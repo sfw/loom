@@ -221,6 +221,24 @@ class ExecutionConfig:
     max_task_mutating_tool_calls: int = 0
     max_task_replans: int = 0
     max_task_remediation_attempts: int = 0
+    enable_process_iteration_loops: bool = False
+    enable_iteration_command_exit_gate: bool = False
+    max_iteration_replans_after_exhaustion: int = 2
+    iteration_command_exit_allowlisted_prefixes: list[str] = field(
+        default_factory=lambda: [
+            "pytest",
+            "uv run pytest",
+            "python -m pytest",
+            "python3 -m pytest",
+            "ruff check",
+            "npm test",
+            "pnpm test",
+            "bun test",
+            "go test",
+            "cargo test",
+            "make test",
+        ],
+    )
     executor_completion_contract_mode: str = "off"  # off | warn | enforce
     planner_degraded_mode: str = "allow"  # allow | require_approval | deny
     enable_sqlite_remediation_queue: bool = False
@@ -785,6 +803,28 @@ def load_config(path: Path | None = None) -> Config:
             minimum=0,
             maximum=100_000,
         ),
+        enable_process_iteration_loops=_bool_from(
+            exec_data,
+            "enable_process_iteration_loops",
+            ExecutionConfig.enable_process_iteration_loops,
+        ),
+        enable_iteration_command_exit_gate=_bool_from(
+            exec_data,
+            "enable_iteration_command_exit_gate",
+            ExecutionConfig.enable_iteration_command_exit_gate,
+        ),
+        max_iteration_replans_after_exhaustion=_int_from(
+            exec_data,
+            "max_iteration_replans_after_exhaustion",
+            ExecutionConfig.max_iteration_replans_after_exhaustion,
+            minimum=0,
+            maximum=10,
+        ),
+        iteration_command_exit_allowlisted_prefixes=_string_list_from(
+            exec_data,
+            "iteration_command_exit_allowlisted_prefixes",
+            ExecutionConfig().iteration_command_exit_allowlisted_prefixes,
+        ),
         executor_completion_contract_mode=(
             str(
                 exec_data.get(
@@ -885,6 +925,13 @@ def load_config(path: Path | None = None) -> Config:
     agent_tools_default_network_mode = execution.agent_tools_default_network_mode
     if agent_tools_default_network_mode not in {"on", "off"}:
         agent_tools_default_network_mode = ExecutionConfig.agent_tools_default_network_mode
+    loop_prefixes = [
+        str(item).strip()
+        for item in execution.iteration_command_exit_allowlisted_prefixes
+        if str(item).strip()
+    ]
+    if not loop_prefixes:
+        loop_prefixes = ExecutionConfig().iteration_command_exit_allowlisted_prefixes
     execution = ExecutionConfig(
         **{
             **execution.__dict__,
@@ -892,6 +939,7 @@ def load_config(path: Path | None = None) -> Config:
             "planner_degraded_mode": planner_mode,
             "cowork_tool_exposure_mode": cowork_tool_exposure_mode,
             "agent_tools_default_network_mode": agent_tools_default_network_mode,
+            "iteration_command_exit_allowlisted_prefixes": loop_prefixes,
         },
     )
 

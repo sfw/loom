@@ -460,7 +460,7 @@ async def steer_task(request: Request, task_id: str, body: TaskSteerRequest):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
     task = engine.state_manager.load(task_id)
-    if task.status not in (TaskStatus.EXECUTING, TaskStatus.PLANNING):
+    if task.status not in (TaskStatus.EXECUTING, TaskStatus.PLANNING, TaskStatus.PAUSED):
         raise HTTPException(
             status_code=409,
             detail=f"Cannot steer task in status: {task.status.value}",
@@ -490,6 +490,52 @@ async def cancel_task(request: Request, task_id: str):
     engine.orchestrator.cancel_task(task)
 
     return {"status": "ok", "message": f"Task {task_id} cancelled."}
+
+
+@router.post("/tasks/{task_id}/pause")
+async def pause_task(request: Request, task_id: str):
+    """Pause an active task run."""
+    engine = _get_engine(request)
+
+    if not engine.state_manager.exists(task_id):
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+
+    task = engine.state_manager.load(task_id)
+    if task.status not in (TaskStatus.EXECUTING, TaskStatus.PLANNING, TaskStatus.PAUSED):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot pause task in status: {task.status.value}",
+        )
+
+    engine.orchestrator.pause_task(task)
+    return {
+        "status": "ok",
+        "message": f"Task {task_id} paused.",
+        "task_status": task.status.value,
+    }
+
+
+@router.post("/tasks/{task_id}/resume")
+async def resume_task(request: Request, task_id: str):
+    """Resume a paused task run."""
+    engine = _get_engine(request)
+
+    if not engine.state_manager.exists(task_id):
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+
+    task = engine.state_manager.load(task_id)
+    if task.status not in (TaskStatus.PAUSED, TaskStatus.EXECUTING, TaskStatus.PLANNING):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot resume task in status: {task.status.value}",
+        )
+
+    engine.orchestrator.resume_task(task)
+    return {
+        "status": "ok",
+        "message": f"Task {task_id} resumed.",
+        "task_status": task.status.value,
+    }
 
 
 @router.post("/tasks/{task_id}/approve")

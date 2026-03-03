@@ -17,6 +17,7 @@ import logging
 import time
 import uuid
 from copy import deepcopy
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,12 +26,19 @@ from loom.auth.runtime import AuthResolutionError, build_run_auth_context
 from loom.config import Config
 
 if TYPE_CHECKING:
-    from loom.processes.schema import ProcessDefinition
+    from loom.processes.schema import IterationPolicy, ProcessDefinition
+from loom.engine.iteration_gates import IterationEvaluation, IterationGateEvaluator
 from loom.engine.runner import SubtaskResult, SubtaskResultStatus, SubtaskRunner, ToolCallRecord
 from loom.engine.scheduler import Scheduler
 from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
+    ITERATION_COMPLETED,
+    ITERATION_GATE_FAILED,
+    ITERATION_RETRYING,
+    ITERATION_STARTED,
+    ITERATION_STATE_RECONCILED,
+    ITERATION_TERMINAL,
     MODEL_INVOCATION,
     REMEDIATION_ATTEMPT,
     REMEDIATION_EXPIRED,
@@ -287,6 +295,25 @@ class Orchestrator:
         self._telemetry_rollup: dict[str, int] = self._new_telemetry_rollup()
         self._run_budget = _RunBudget(config)
         self._active_run_id = ""
+        self._iteration_enabled = bool(
+            getattr(self._config.execution, "enable_process_iteration_loops", False),
+        )
+        self._iteration_gates = IterationGateEvaluator(
+            command_allowlisted_prefixes=list(
+                getattr(
+                    self._config.execution,
+                    "iteration_command_exit_allowlisted_prefixes",
+                    [],
+                ) or [],
+            ),
+            enable_command_exit=bool(
+                getattr(
+                    self._config.execution,
+                    "enable_iteration_command_exit_gate",
+                    False,
+                ),
+            ),
+        )
 
         # Inject process into prompt assembler
         if process is not None:
@@ -340,6 +367,8 @@ class Orchestrator:
             })
             if bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
                 await self._hydrate_remediation_queue_from_db(task)
+            if self._iteration_enabled:
+                await self._reconcile_iteration_state(task)
             plan: Plan
             if reuse_existing_plan and task.plan and task.plan.subtasks:
                 plan = task.plan
@@ -386,8 +415,12 @@ class Orchestrator:
             max_stall_recovery_attempts = 2
 
             while self._scheduler.has_pending(task.plan) and iteration < max_iterations:
+                await self._sync_external_control_state(task)
                 if await self._enforce_global_budget(task):
                     break
+                if task.status == TaskStatus.PAUSED:
+                    await asyncio.sleep(0.25)
+                    continue
                 if task.status == TaskStatus.CANCELLED:
                     break
 
@@ -478,6 +511,12 @@ class Orchestrator:
                             outcome_plan_version=batch_plan_version,
                         )
                         continue
+                    self._observe_iteration_runner_invocation(subtask)
+                    self._observe_iteration_runtime_usage(
+                        task=task,
+                        subtask=subtask,
+                        result=result,
+                    )
                     if result.status == "failed":
                         replan_request = await self._handle_failure(
                             task, subtask, result, verification,
@@ -486,9 +525,14 @@ class Orchestrator:
                         if replan_request is not None and pending_replan is None:
                             pending_replan = replan_request
                     else:
-                        await self._handle_success(
-                            task, subtask, result, verification,
+                        replan_request = await self._handle_iteration_after_success(
+                            task=task,
+                            subtask=subtask,
+                            result=result,
+                            verification=verification,
                         )
+                        if replan_request is not None and pending_replan is None:
+                            pending_replan = replan_request
 
                 if pending_replan is not None and task.status == TaskStatus.EXECUTING:
                     self._run_budget.observe_replan()
@@ -619,6 +663,10 @@ class Orchestrator:
             original_tier=subtask.model_tier,
         )
         expected_deliverables = self._expected_deliverables_for_subtask(subtask)
+        is_iteration_retry, iteration_strategy = self._iteration_retry_mode(subtask)
+        targeted_iteration_retry = (
+            is_iteration_retry and iteration_strategy == "targeted_remediation"
+        )
         retry_context = self._retry.build_retry_context(attempts)
         retry_context = self._augment_retry_context_for_outputs(
             subtask=subtask,
@@ -627,6 +675,24 @@ class Orchestrator:
             expected_deliverables=expected_deliverables,
             base_context=retry_context,
         )
+        prior_iteration_feedback = str(
+            getattr(subtask, "iteration_last_gate_summary", "") or "",
+        ).strip()
+        if prior_iteration_feedback:
+            if is_iteration_retry and iteration_strategy == "full_rerun":
+                retry_context = (
+                    f"{retry_context}\n\n"
+                    "FAILED ITERATION GATES FROM PRIOR ATTEMPT:\n"
+                    f"{prior_iteration_feedback}\n"
+                    "You may rerun the full phase output to resolve these gates."
+                ).strip()
+            else:
+                retry_context = (
+                    f"{retry_context}\n\n"
+                    "FAILED ITERATION GATES FROM PRIOR ATTEMPT:\n"
+                    f"{prior_iteration_feedback}\n"
+                    "Preserve already-correct content and fix only the listed gaps."
+                ).strip()
         changelog = self._get_changelog(task)
 
         result, verification = await self._runner.run(
@@ -637,8 +703,12 @@ class Orchestrator:
             prior_successful_tool_calls=prior_successful_tool_calls,
             prior_evidence_records=prior_evidence_records,
             expected_deliverables=expected_deliverables,
-            enforce_deliverable_paths=bool(attempts and expected_deliverables),
-            edit_existing_only=bool(attempts and expected_deliverables),
+            enforce_deliverable_paths=bool(expected_deliverables) and bool(
+                attempts or targeted_iteration_retry
+            ),
+            edit_existing_only=bool(expected_deliverables) and bool(
+                attempts or targeted_iteration_retry
+            ),
             retry_strategy=retry_strategy.value,
         )
 
@@ -647,6 +717,747 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Outcome handlers
     # ------------------------------------------------------------------
+
+    def _phase_iteration_policy(self, subtask: Subtask) -> IterationPolicy | None:
+        if not self._iteration_enabled or self._process is None:
+            return None
+        phases = list(getattr(self._process, "phases", []) or [])
+        if not phases:
+            return None
+
+        subtask_id = str(getattr(subtask, "id", "") or "").strip()
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
+        for phase in phases:
+            phase_key = str(getattr(phase, "id", "") or "").strip()
+            if not phase_key:
+                continue
+            if phase_key not in {subtask_id, phase_id}:
+                continue
+            policy = getattr(phase, "iteration", None)
+            if policy is not None and bool(getattr(policy, "enabled", False)):
+                return policy
+
+        if len(phases) == 1:
+            policy = getattr(phases[0], "iteration", None)
+            if policy is not None and bool(getattr(policy, "enabled", False)):
+                return policy
+        return None
+
+    def _iteration_retry_mode(self, subtask: Subtask) -> tuple[bool, str]:
+        policy = self._phase_iteration_policy(subtask)
+        if policy is None:
+            return False, ""
+        strategy = str(getattr(policy, "strategy", "") or "").strip().lower()
+        if strategy not in {"targeted_remediation", "full_rerun"}:
+            strategy = "targeted_remediation"
+        prior_gate_feedback = str(
+            getattr(subtask, "iteration_last_gate_summary", "") or "",
+        ).strip()
+        is_iteration_retry = bool(
+            int(getattr(subtask, "iteration_attempt", 0) or 0) > 0
+            and prior_gate_feedback,
+        )
+        return is_iteration_retry, strategy
+
+    def _observe_iteration_runner_invocation(self, subtask: Subtask) -> None:
+        policy = self._phase_iteration_policy(subtask)
+        if policy is None:
+            return
+        subtask.iteration_runner_invocations = int(
+            max(0, subtask.iteration_runner_invocations) + 1,
+        )
+        if subtask.iteration_max_attempts <= 0:
+            subtask.iteration_max_attempts = int(max(1, policy.max_attempts))
+
+    def _observe_iteration_runtime_usage(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        result: SubtaskResult,
+    ) -> None:
+        if self._phase_iteration_policy(subtask) is None:
+            return
+        self._update_iteration_runtime(task=task, subtask=subtask, result=result)
+
+    def _iteration_runtime_entry(self, task: Task, subtask_id: str) -> dict[str, object]:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        runtime = metadata.get("iteration_runtime")
+        if not isinstance(runtime, dict):
+            runtime = {}
+            metadata["iteration_runtime"] = runtime
+        entry = runtime.get(subtask_id)
+        if not isinstance(entry, dict):
+            entry = {}
+            runtime[subtask_id] = entry
+        task.metadata = metadata
+        return entry
+
+    def _update_iteration_runtime(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        result: SubtaskResult,
+    ) -> dict[str, object]:
+        entry = self._iteration_runtime_entry(task, subtask.id)
+        if "started_monotonic" not in entry:
+            entry["started_monotonic"] = float(time.monotonic())
+            entry["started_at"] = datetime.now().isoformat()
+        entry["tokens_used"] = int(entry.get("tokens_used", 0) or 0) + int(
+            max(0, getattr(result, "tokens_used", 0) or 0),
+        )
+        counters = getattr(result, "telemetry_counters", None)
+        tool_calls_used = 0
+        if isinstance(counters, dict):
+            tool_calls_used = int(counters.get("tool_calls", 0) or 0)
+        if tool_calls_used <= 0:
+            tool_calls_used = len(getattr(result, "tool_calls", []) or [])
+        entry["tool_calls"] = int(entry.get("tool_calls", 0) or 0) + max(
+            0,
+            int(tool_calls_used),
+        )
+        entry["updated_at"] = datetime.now().isoformat()
+        return entry
+
+    async def _sync_external_control_state(self, task: Task) -> None:
+        """Apply pause/cancel/resume state changes persisted by control APIs."""
+        try:
+            loaded = self._state.load(task.id)
+        except Exception:
+            return
+        if loaded.status == task.status:
+            return
+        if loaded.status in {
+            TaskStatus.PAUSED,
+            TaskStatus.CANCELLED,
+            TaskStatus.EXECUTING,
+            TaskStatus.PLANNING,
+        }:
+            task.status = loaded.status
+
+    @staticmethod
+    def _iteration_budget_snapshot(
+        *,
+        policy: IterationPolicy,
+        runtime: dict[str, object],
+    ) -> dict[str, object]:
+        started = runtime.get("started_monotonic")
+        elapsed = 0.0
+        if isinstance(started, (int, float)) and started > 0:
+            elapsed = max(0.0, float(time.monotonic()) - float(started))
+        return {
+            "used": {
+                "elapsed_seconds": round(elapsed, 3),
+                "tokens": int(runtime.get("tokens_used", 0) or 0),
+                "tool_calls": int(runtime.get("tool_calls", 0) or 0),
+            },
+            "limits": {
+                "max_wall_clock_seconds": int(policy.budget.max_wall_clock_seconds),
+                "max_tokens": int(policy.budget.max_tokens),
+                "max_tool_calls": int(policy.budget.max_tool_calls),
+            },
+        }
+
+    @staticmethod
+    def _iteration_budget_exhausted_reason(
+        *,
+        policy: IterationPolicy,
+        runtime: dict[str, object],
+    ) -> str:
+        started = runtime.get("started_monotonic")
+        elapsed = 0.0
+        if isinstance(started, (int, float)) and started > 0:
+            elapsed = max(0.0, float(time.monotonic()) - float(started))
+        if (
+            int(policy.budget.max_wall_clock_seconds) > 0
+            and elapsed > float(policy.budget.max_wall_clock_seconds)
+        ):
+            return "iteration_budget_exhausted:wall_clock"
+        tokens_used = int(runtime.get("tokens_used", 0) or 0)
+        if int(policy.budget.max_tokens) > 0 and tokens_used > int(policy.budget.max_tokens):
+            return "iteration_budget_exhausted:tokens"
+        tool_calls = int(runtime.get("tool_calls", 0) or 0)
+        if int(policy.budget.max_tool_calls) > 0 and tool_calls > int(policy.budget.max_tool_calls):
+            return "iteration_budget_exhausted:tool_calls"
+        return ""
+
+    @staticmethod
+    def _format_iteration_gate_failures(
+        failures: list[object],
+    ) -> str:
+        lines = []
+        for item in failures:
+            gate_id = str(getattr(item, "gate_id", "") or "").strip() or "gate"
+            reason = str(getattr(item, "reason_code", "") or "").strip() or "failed"
+            detail = str(getattr(item, "detail", "") or "").strip()
+            if detail:
+                lines.append(f"- {gate_id}: {reason} ({detail})")
+            else:
+                lines.append(f"- {gate_id}: {reason}")
+        return "\n".join(lines).strip()
+
+    def _iteration_replan_cap(self, policy: IterationPolicy) -> int:
+        process_cap = int(getattr(policy, "max_replans_after_exhaustion", 0) or 0)
+        if process_cap > 0:
+            return process_cap
+        return int(
+            max(
+                0,
+                getattr(
+                    self._config.execution,
+                    "max_iteration_replans_after_exhaustion",
+                    2,
+                ) or 0,
+            ),
+        )
+
+    @staticmethod
+    def _iteration_exhaustion_fingerprint(
+        *,
+        subtask: Subtask,
+        terminal_reason: str,
+        gate_summary: str,
+    ) -> str:
+        return "|".join([
+            str(subtask.id or "").strip(),
+            str(terminal_reason or "").strip().lower(),
+            str(gate_summary or "").strip().lower(),
+        ])
+
+    async def _request_iteration_replan(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        policy: IterationPolicy,
+        terminal_reason: str,
+        gate_summary: str,
+    ) -> dict[str, str | None] | None:
+        if not bool(getattr(policy, "replan_on_exhaustion", True)):
+            return None
+
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        replan_counts = metadata.get("iteration_replan_counts")
+        if not isinstance(replan_counts, dict):
+            replan_counts = {}
+            metadata["iteration_replan_counts"] = replan_counts
+        seen_fingerprints = metadata.get("iteration_exhaustion_fingerprints")
+        if not isinstance(seen_fingerprints, dict):
+            seen_fingerprints = {}
+            metadata["iteration_exhaustion_fingerprints"] = seen_fingerprints
+
+        subtask_key = str(subtask.id or "").strip()
+        fingerprint = self._iteration_exhaustion_fingerprint(
+            subtask=subtask,
+            terminal_reason=terminal_reason,
+            gate_summary=gate_summary,
+        )
+        prior_fingerprints = seen_fingerprints.get(subtask_key)
+        if not isinstance(prior_fingerprints, list):
+            prior_fingerprints = []
+        if fingerprint in prior_fingerprints:
+            return None
+
+        cap = self._iteration_replan_cap(policy)
+        prior_count = int(replan_counts.get(subtask_key, 0) or 0)
+        if cap > 0 and prior_count >= cap:
+            return None
+
+        replan_counts[subtask_key] = prior_count + 1
+        subtask.iteration_replan_count = int(replan_counts[subtask_key])
+        prior_fingerprints.append(fingerprint)
+        if len(prior_fingerprints) > 8:
+            prior_fingerprints = prior_fingerprints[-8:]
+        seen_fingerprints[subtask_key] = prior_fingerprints
+        task.metadata = metadata
+        self._state.save(task)
+
+        return {
+            "reason": f"iteration_loop_exhausted:{terminal_reason}",
+            "failed_subtask_id": subtask.id,
+            "verification_feedback": gate_summary,
+        }
+
+    async def _persist_iteration_evaluation(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        policy: IterationPolicy,
+        evaluation: IterationEvaluation | None,
+        attempt_index: int,
+        status: str,
+        gate_summary: str,
+        budget_snapshot: dict[str, object],
+        terminal_reason: str = "",
+        exhaustion_fingerprint: str = "",
+    ) -> None:
+        if not self._iteration_enabled:
+            return
+        loop_run_id = str(subtask.iteration_loop_run_id or "").strip()
+        if not loop_run_id:
+            return
+        try:
+            await self._memory.upsert_iteration_run(
+                loop_run_id=loop_run_id,
+                task_id=task.id,
+                run_id=self._task_run_id(task),
+                subtask_id=subtask.id,
+                phase_id=str(getattr(subtask, "phase_id", "") or ""),
+                policy_snapshot=asdict(policy),
+                terminal_reason=terminal_reason,
+                attempt_count=int(subtask.iteration_attempt),
+                replan_count=int(subtask.iteration_replan_count),
+                exhaustion_fingerprint=exhaustion_fingerprint,
+                metadata={
+                    "iteration_runner_invocations": int(
+                        subtask.iteration_runner_invocations,
+                    ),
+                    "iteration_no_improvement_count": int(
+                        subtask.iteration_no_improvement_count,
+                    ),
+                    "iteration_best_score": subtask.iteration_best_score,
+                    "iteration_last_gate_summary": gate_summary,
+                },
+            )
+            attempt_id = await self._memory.insert_iteration_attempt(
+                loop_run_id=loop_run_id,
+                task_id=task.id,
+                run_id=self._task_run_id(task),
+                subtask_id=subtask.id,
+                phase_id=str(getattr(subtask, "phase_id", "") or ""),
+                attempt_index=attempt_index,
+                status=status,
+                summary=gate_summary,
+                gate_summary={
+                    "blocking_failures": [
+                        getattr(item, "gate_id", "")
+                        for item in (evaluation.blocking_failures if evaluation else [])
+                    ],
+                    "advisory_failures": [
+                        getattr(item, "gate_id", "")
+                        for item in (evaluation.advisory_failures if evaluation else [])
+                    ],
+                },
+                budget_snapshot=budget_snapshot,
+            )
+            if evaluation is None:
+                return
+            for gate in evaluation.results:
+                await self._memory.insert_iteration_gate_result(
+                    loop_run_id=loop_run_id,
+                    attempt_id=attempt_id,
+                    task_id=task.id,
+                    run_id=self._task_run_id(task),
+                    subtask_id=subtask.id,
+                    phase_id=str(getattr(subtask, "phase_id", "") or ""),
+                    attempt_index=attempt_index,
+                    gate_id=str(getattr(gate, "gate_id", "") or ""),
+                    gate_type=str(getattr(gate, "gate_type", "") or ""),
+                    status=str(getattr(gate, "status", "") or ""),
+                    blocking=bool(getattr(gate, "blocking", False)),
+                    reason_code=str(getattr(gate, "reason_code", "") or ""),
+                    measured_value=getattr(gate, "measured_value", None),
+                    threshold_value=getattr(gate, "threshold_value", None),
+                    detail=str(getattr(gate, "detail", "") or ""),
+                )
+        except Exception:
+            logger.debug(
+                "Failed persisting iteration evaluation for %s/%s",
+                task.id,
+                subtask.id,
+                exc_info=True,
+            )
+
+    async def _handle_iteration_after_success(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        result: SubtaskResult,
+        verification: VerificationResult,
+    ) -> dict[str, str | None] | None:
+        policy = self._phase_iteration_policy(subtask)
+        if policy is None:
+            await self._handle_success(task, subtask, result, verification)
+            return None
+
+        if not subtask.iteration_loop_run_id:
+            subtask.iteration_loop_run_id = f"iter-{uuid.uuid4().hex[:10]}"
+            self._emit(ITERATION_STARTED, task.id, {
+                "subtask_id": subtask.id,
+                "phase_id": subtask.phase_id,
+                "loop_run_id": subtask.iteration_loop_run_id,
+                "max_attempts": int(policy.max_attempts),
+                "max_runner_invocations": int(policy.max_total_runner_invocations),
+            })
+
+        runtime = self._iteration_runtime_entry(task, subtask.id)
+        if "started_monotonic" not in runtime:
+            runtime["started_monotonic"] = float(time.monotonic())
+            runtime["started_at"] = datetime.now().isoformat()
+        runtime["updated_at"] = datetime.now().isoformat()
+        budget_snapshot = self._iteration_budget_snapshot(policy=policy, runtime=runtime)
+        budget_reason = self._iteration_budget_exhausted_reason(policy=policy, runtime=runtime)
+
+        evaluation: IterationEvaluation | None = None
+        if not budget_reason:
+            evaluation = await self._iteration_gates.evaluate(
+                policy=policy,
+                result=result,
+                verification=verification,
+                workspace=Path(task.workspace) if task.workspace else None,
+                expected_deliverables=self._expected_deliverables_for_subtask(subtask),
+            )
+
+        attempt_index = int(max(0, subtask.iteration_attempt) + 1)
+        subtask.iteration_attempt = attempt_index
+        if subtask.iteration_max_attempts <= 0:
+            subtask.iteration_max_attempts = int(max(1, policy.max_attempts))
+
+        if evaluation and evaluation.score_hint is not None:
+            score = float(evaluation.score_hint)
+            best = subtask.iteration_best_score
+            if best is None or score > best:
+                subtask.iteration_best_score = score
+                subtask.iteration_no_improvement_count = 0
+            else:
+                subtask.iteration_no_improvement_count = int(
+                    max(0, subtask.iteration_no_improvement_count) + 1,
+                )
+
+        blocking_failures = list(evaluation.blocking_failures if evaluation else [])
+        has_blocking_failures = bool(blocking_failures) or bool(budget_reason)
+        if not has_blocking_failures:
+            subtask.iteration_terminal_reason = "passed"
+            subtask.iteration_last_gate_summary = ""
+            await self._persist_iteration_evaluation(
+                task=task,
+                subtask=subtask,
+                policy=policy,
+                evaluation=evaluation,
+                attempt_index=attempt_index,
+                status="completed",
+                gate_summary="all blocking iteration gates passed",
+                budget_snapshot=budget_snapshot,
+                terminal_reason="passed",
+            )
+            self._emit(ITERATION_COMPLETED, task.id, {
+                "subtask_id": subtask.id,
+                "phase_id": subtask.phase_id,
+                "loop_run_id": subtask.iteration_loop_run_id,
+                "attempt": attempt_index,
+                "max_attempts": int(policy.max_attempts),
+            })
+            await self._handle_success(task, subtask, result, verification)
+            return None
+
+        gate_summary = (
+            budget_reason
+            if budget_reason
+            else self._format_iteration_gate_failures(blocking_failures)
+        )
+        subtask.iteration_last_gate_summary = gate_summary
+
+        attempts_exhausted = attempt_index >= int(max(1, policy.max_attempts))
+        invocations_exhausted = (
+            int(policy.max_total_runner_invocations) > 0
+            and subtask.iteration_runner_invocations >= int(policy.max_total_runner_invocations)
+        )
+        no_improvement_exhausted = (
+            int(policy.stop_on_no_improvement_attempts) > 0
+            and subtask.iteration_no_improvement_count
+            >= int(policy.stop_on_no_improvement_attempts)
+        )
+
+        terminal_reason = ""
+        if budget_reason:
+            terminal_reason = "iteration_budget_exhausted"
+        elif no_improvement_exhausted:
+            terminal_reason = "no_improvement"
+        elif invocations_exhausted:
+            terminal_reason = "max_runner_invocations_exhausted"
+        elif attempts_exhausted:
+            terminal_reason = "max_attempts_exhausted"
+
+        self._emit(ITERATION_GATE_FAILED, task.id, {
+            "subtask_id": subtask.id,
+            "phase_id": subtask.phase_id,
+            "loop_run_id": subtask.iteration_loop_run_id,
+            "attempt": attempt_index,
+            "max_attempts": int(policy.max_attempts),
+            "terminal_reason": terminal_reason,
+            "gate_summary": gate_summary,
+        })
+
+        if not terminal_reason:
+            async with self._state_lock:
+                subtask.status = SubtaskStatus.PENDING
+                subtask.summary = gate_summary or "Iteration gate failed"
+                subtask.active_issue = gate_summary
+                task.update_subtask(
+                    subtask.id,
+                    status=SubtaskStatus.PENDING,
+                    summary=subtask.summary,
+                    active_issue=subtask.active_issue,
+                    iteration_attempt=subtask.iteration_attempt,
+                    iteration_best_score=subtask.iteration_best_score,
+                    iteration_no_improvement_count=subtask.iteration_no_improvement_count,
+                    iteration_last_gate_summary=subtask.iteration_last_gate_summary,
+                )
+                self._state.save(task)
+            await self._persist_iteration_evaluation(
+                task=task,
+                subtask=subtask,
+                policy=policy,
+                evaluation=evaluation,
+                attempt_index=attempt_index,
+                status="retrying",
+                gate_summary=gate_summary,
+                budget_snapshot=budget_snapshot,
+            )
+            self._emit(ITERATION_RETRYING, task.id, {
+                "subtask_id": subtask.id,
+                "phase_id": subtask.phase_id,
+                "loop_run_id": subtask.iteration_loop_run_id,
+                "attempt": attempt_index,
+                "next_attempt": attempt_index + 1,
+                "max_attempts": int(policy.max_attempts),
+                "gate_summary": gate_summary,
+            })
+            return None
+
+        subtask.iteration_terminal_reason = terminal_reason
+        exhaustion_fingerprint = self._iteration_exhaustion_fingerprint(
+            subtask=subtask,
+            terminal_reason=terminal_reason,
+            gate_summary=gate_summary,
+        )
+        await self._persist_iteration_evaluation(
+            task=task,
+            subtask=subtask,
+            policy=policy,
+            evaluation=evaluation,
+            attempt_index=attempt_index,
+            status="terminal",
+            gate_summary=gate_summary,
+            budget_snapshot=budget_snapshot,
+            terminal_reason=terminal_reason,
+            exhaustion_fingerprint=exhaustion_fingerprint,
+        )
+        self._emit(ITERATION_TERMINAL, task.id, {
+            "subtask_id": subtask.id,
+            "phase_id": subtask.phase_id,
+            "loop_run_id": subtask.iteration_loop_run_id,
+            "attempt": attempt_index,
+            "terminal_reason": terminal_reason,
+            "gate_summary": gate_summary,
+        })
+
+        replan_request = await self._request_iteration_replan(
+            task=task,
+            subtask=subtask,
+            policy=policy,
+            terminal_reason=terminal_reason,
+            gate_summary=gate_summary,
+        )
+        if replan_request is not None:
+            async with self._state_lock:
+                subtask.status = SubtaskStatus.FAILED
+                subtask.summary = f"Iteration exhausted: {terminal_reason}"
+                subtask.active_issue = gate_summary
+                task.update_subtask(
+                    subtask.id,
+                    status=SubtaskStatus.FAILED,
+                    summary=subtask.summary,
+                    active_issue=subtask.active_issue,
+                    iteration_terminal_reason=subtask.iteration_terminal_reason,
+                    iteration_replan_count=subtask.iteration_replan_count,
+                )
+                self._state.save(task)
+            return replan_request
+
+        if subtask.is_critical_path:
+            await self._abort_on_critical_path_failure(
+                task,
+                subtask,
+                VerificationResult(
+                    tier=max(1, int(subtask.verification_tier or 1)),
+                    passed=False,
+                    feedback=gate_summary,
+                    outcome="fail",
+                    reason_code="iteration_exhausted",
+                    severity_class="semantic",
+                ),
+            )
+            return None
+
+        async with self._state_lock:
+            subtask.status = SubtaskStatus.FAILED
+            subtask.summary = f"Iteration exhausted: {terminal_reason}"
+            subtask.active_issue = gate_summary
+            task.update_subtask(
+                subtask.id,
+                status=SubtaskStatus.FAILED,
+                summary=subtask.summary,
+                active_issue=subtask.active_issue,
+                iteration_terminal_reason=subtask.iteration_terminal_reason,
+            )
+            task.add_error(
+                subtask.id,
+                f"Iteration exhausted ({terminal_reason}): {gate_summary}",
+            )
+            self._state.save(task)
+        return None
+
+    async def _reconcile_iteration_state(self, task: Task) -> None:
+        if not self._iteration_enabled:
+            return
+        try:
+            runs = await self._memory.list_iteration_runs(task_id=task.id)
+        except Exception:
+            return
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        mirror = metadata.get("iteration_sqlite_mirror")
+        if not isinstance(mirror, dict):
+            mirror = {}
+        prior_count = int(mirror.get("run_count", 0) or 0)
+        current_count = len(runs)
+        latest_by_subtask: dict[str, dict] = {}
+        for row in runs:
+            if not isinstance(row, dict):
+                continue
+            subtask_id = str(row.get("subtask_id", "") or "").strip()
+            if not subtask_id:
+                continue
+            prior = latest_by_subtask.get(subtask_id)
+            row_sort_key = str(row.get("updated_at", "") or row.get("created_at", ""))
+            prior_sort_key = ""
+            if isinstance(prior, dict):
+                prior_sort_key = str(
+                    prior.get("updated_at", "") or prior.get("created_at", ""),
+                )
+            if prior is None or row_sort_key >= prior_sort_key:
+                latest_by_subtask[subtask_id] = row
+
+        hydrated_subtask_ids: list[str] = []
+        for subtask in task.plan.subtasks:
+            row = latest_by_subtask.get(subtask.id)
+            if not isinstance(row, dict):
+                continue
+            row_metadata = row.get("metadata")
+            if not isinstance(row_metadata, dict):
+                row_metadata = {}
+            policy_snapshot = row.get("policy_snapshot")
+            if not isinstance(policy_snapshot, dict):
+                policy_snapshot = {}
+
+            updates: dict[str, object] = {}
+            loop_run_id = str(row.get("loop_run_id", "") or "").strip()
+            if loop_run_id and subtask.iteration_loop_run_id != loop_run_id:
+                updates["iteration_loop_run_id"] = loop_run_id
+
+            try:
+                attempt_count = max(0, int(row.get("attempt_count", 0) or 0))
+            except (TypeError, ValueError):
+                attempt_count = 0
+            if subtask.iteration_attempt != attempt_count:
+                updates["iteration_attempt"] = attempt_count
+
+            try:
+                replan_count = max(0, int(row.get("replan_count", 0) or 0))
+            except (TypeError, ValueError):
+                replan_count = 0
+            if subtask.iteration_replan_count != replan_count:
+                updates["iteration_replan_count"] = replan_count
+
+            terminal_reason = str(row.get("terminal_reason", "") or "")
+            if subtask.iteration_terminal_reason != terminal_reason:
+                updates["iteration_terminal_reason"] = terminal_reason
+
+            try:
+                runner_invocations = max(
+                    0,
+                    int(row_metadata.get("iteration_runner_invocations", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                runner_invocations = 0
+            if subtask.iteration_runner_invocations != runner_invocations:
+                updates["iteration_runner_invocations"] = runner_invocations
+
+            try:
+                no_improvement_count = max(
+                    0,
+                    int(row_metadata.get("iteration_no_improvement_count", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                no_improvement_count = 0
+            if subtask.iteration_no_improvement_count != no_improvement_count:
+                updates["iteration_no_improvement_count"] = no_improvement_count
+
+            best_score_raw = row_metadata.get("iteration_best_score", None)
+            best_score: float | None
+            if best_score_raw in (None, ""):
+                best_score = None
+            else:
+                try:
+                    best_score = float(best_score_raw)
+                except (TypeError, ValueError):
+                    best_score = subtask.iteration_best_score
+            if subtask.iteration_best_score != best_score:
+                updates["iteration_best_score"] = best_score
+
+            gate_summary = str(
+                row_metadata.get("iteration_last_gate_summary", "") or "",
+            )
+            if subtask.iteration_last_gate_summary != gate_summary:
+                updates["iteration_last_gate_summary"] = gate_summary
+
+            try:
+                max_attempts = max(0, int(policy_snapshot.get("max_attempts", 0) or 0))
+            except (TypeError, ValueError):
+                max_attempts = 0
+            if max_attempts > 0 and subtask.iteration_max_attempts != max_attempts:
+                updates["iteration_max_attempts"] = max_attempts
+
+            if updates:
+                for field_name, field_value in updates.items():
+                    setattr(subtask, field_name, field_value)
+                hydrated_subtask_ids.append(subtask.id)
+
+        mirror["run_count"] = current_count
+        mirror["updated_at"] = datetime.now().isoformat()
+        mirror["subtasks"] = {
+            subtask_id: {
+                "loop_run_id": str(row.get("loop_run_id", "") or ""),
+                "attempt_count": int(row.get("attempt_count", 0) or 0),
+                "replan_count": int(row.get("replan_count", 0) or 0),
+                "terminal_reason": str(row.get("terminal_reason", "") or ""),
+            }
+            for subtask_id, row in latest_by_subtask.items()
+            if isinstance(row, dict)
+        }
+        metadata["iteration_sqlite_mirror"] = mirror
+        task.metadata = metadata
+
+        if prior_count == current_count and not hydrated_subtask_ids:
+            return
+
+        self._state.save(task)
+        self._emit(ITERATION_STATE_RECONCILED, task.id, {
+            "run_id": self._task_run_id(task),
+            "task_id": task.id,
+            "previous_count": prior_count,
+            "sqlite_count": current_count,
+            "hydrated_subtask_ids": hydrated_subtask_ids,
+        })
 
     async def _handle_failure(
         self,
@@ -782,7 +1593,28 @@ class Orchestrator:
             "reason_code": verification.reason_code,
         })
 
-        if subtask.retry_count < subtask.max_retries:
+        runner_cap_exhausted = False
+        iteration_policy = self._phase_iteration_policy(subtask)
+        iteration_budget_reason = ""
+        if (
+            iteration_policy is not None
+            and int(iteration_policy.max_total_runner_invocations) > 0
+            and int(subtask.iteration_runner_invocations)
+            >= int(iteration_policy.max_total_runner_invocations)
+        ):
+            runner_cap_exhausted = True
+        if iteration_policy is not None:
+            runtime = self._iteration_runtime_entry(task, subtask.id)
+            iteration_budget_reason = self._iteration_budget_exhausted_reason(
+                policy=iteration_policy,
+                runtime=runtime,
+            )
+
+        if (
+            not runner_cap_exhausted
+            and not iteration_budget_reason
+            and subtask.retry_count < subtask.max_retries
+        ):
             subtask.retry_count += 1
             async with self._state_lock:
                 subtask.status = SubtaskStatus.PENDING
@@ -804,6 +1636,92 @@ class Orchestrator:
                 "resolution_plan_generated": bool(resolution_plan),
             })
         else:
+            if runner_cap_exhausted:
+                extra = (
+                    "Retry budget cut off by iteration.max_total_runner_invocations "
+                    f"({subtask.iteration_runner_invocations}/"
+                    f"{iteration_policy.max_total_runner_invocations})."
+                )
+                verification.feedback = (
+                    f"{verification.feedback}\n{extra}".strip()
+                    if verification.feedback
+                    else extra
+                )
+            if iteration_budget_reason:
+                verification.feedback = (
+                    f"{verification.feedback}\n{iteration_budget_reason}".strip()
+                    if verification.feedback
+                    else iteration_budget_reason
+                )
+            if iteration_policy is not None and (runner_cap_exhausted or iteration_budget_reason):
+                terminal_reason = (
+                    "iteration_budget_exhausted"
+                    if iteration_budget_reason
+                    else "max_runner_invocations_exhausted"
+                )
+                gate_summary = (
+                    iteration_budget_reason
+                    if iteration_budget_reason
+                    else str(verification.feedback or "").strip()
+                )
+                if not gate_summary:
+                    gate_summary = "iteration_exhausted"
+                subtask.iteration_terminal_reason = terminal_reason
+                replan_request = await self._request_iteration_replan(
+                    task=task,
+                    subtask=subtask,
+                    policy=iteration_policy,
+                    terminal_reason=terminal_reason,
+                    gate_summary=gate_summary,
+                )
+                if replan_request is not None:
+                    async with self._state_lock:
+                        subtask.status = SubtaskStatus.FAILED
+                        subtask.summary = f"Iteration exhausted: {terminal_reason}"
+                        subtask.active_issue = gate_summary
+                        task.update_subtask(
+                            subtask.id,
+                            status=SubtaskStatus.FAILED,
+                            summary=subtask.summary,
+                            active_issue=subtask.active_issue,
+                            iteration_terminal_reason=subtask.iteration_terminal_reason,
+                            iteration_replan_count=subtask.iteration_replan_count,
+                        )
+                        self._state.save(task)
+                    return replan_request
+
+                if subtask.is_critical_path:
+                    await self._abort_on_critical_path_failure(
+                        task,
+                        subtask,
+                        VerificationResult(
+                            tier=max(1, int(subtask.verification_tier or 1)),
+                            passed=False,
+                            feedback=gate_summary,
+                            outcome="fail",
+                            reason_code="iteration_exhausted",
+                            severity_class="semantic",
+                        ),
+                    )
+                    return None
+
+                async with self._state_lock:
+                    subtask.status = SubtaskStatus.FAILED
+                    subtask.summary = f"Iteration exhausted: {terminal_reason}"
+                    subtask.active_issue = gate_summary
+                    task.update_subtask(
+                        subtask.id,
+                        status=SubtaskStatus.FAILED,
+                        summary=subtask.summary,
+                        active_issue=subtask.active_issue,
+                        iteration_terminal_reason=subtask.iteration_terminal_reason,
+                    )
+                    task.add_error(
+                        subtask.id,
+                        f"Iteration exhausted ({terminal_reason}): {gate_summary}",
+                    )
+                    self._state.save(task)
+                return None
             # All retries exhausted.
             # Critical-path failures abort the remaining plan.
             if subtask.is_critical_path:
@@ -1073,6 +1991,7 @@ class Orchestrator:
 
         phase_ids: list[str] = []
         phase_descriptions: dict[str, str] = {}
+        phase_by_id: dict[str, object] = {}
         for phase in process.phases:
             phase_id = str(getattr(phase, "id", "")).strip()
             if not phase_id or phase_id in phase_descriptions:
@@ -1081,6 +2000,7 @@ class Orchestrator:
             phase_descriptions[phase_id] = str(
                 getattr(phase, "description", ""),
             ).strip()
+            phase_by_id[phase_id] = phase
 
         if not phase_ids:
             return
@@ -1128,6 +2048,13 @@ class Orchestrator:
                     assigned = phase_ids[0]
 
             subtask.phase_id = assigned
+            phase_obj = phase_by_id.get(assigned)
+            if phase_obj is not None:
+                policy = getattr(phase_obj, "iteration", None)
+                if policy is not None and bool(getattr(policy, "enabled", False)):
+                    subtask.iteration_max_attempts = int(
+                        max(1, getattr(policy, "max_attempts", 1)),
+                    )
 
     @staticmethod
     def _normalize_non_terminal_synthesis(
@@ -2991,7 +3918,16 @@ class Orchestrator:
         async with self._state_lock:
             subtask.status = SubtaskStatus.COMPLETED
             subtask.summary = summary
-            task.update_subtask(subtask.id, status=SubtaskStatus.COMPLETED, summary=summary)
+            subtask.active_issue = ""
+            subtask.iteration_last_gate_summary = ""
+            task.update_subtask(
+                subtask.id,
+                status=SubtaskStatus.COMPLETED,
+                summary=summary,
+                active_issue="",
+                iteration_last_gate_summary="",
+                iteration_terminal_reason=subtask.iteration_terminal_reason,
+            )
 
             # Update workspace_changes from changelog
             changelog = self._get_changelog(task)
@@ -3760,6 +4696,14 @@ class Orchestrator:
         for phase in self._process.phases:
             existing = planner_subtasks.get(phase.id)
             if existing is None:
+                iteration_max_attempts = 0
+                if (
+                    getattr(phase, "iteration", None) is not None
+                    and bool(getattr(phase.iteration, "enabled", False))
+                ):
+                    iteration_max_attempts = int(
+                        max(1, getattr(phase.iteration, "max_attempts", 1)),
+                    )
                 strict_subtasks.append(
                     Subtask(
                         id=phase.id,
@@ -3772,6 +4716,7 @@ class Orchestrator:
                         is_synthesis=phase.is_synthesis,
                         acceptance_criteria=phase.acceptance_criteria,
                         max_retries=self._config.execution.max_subtask_retries,
+                        iteration_max_attempts=iteration_max_attempts,
                     )
                 )
                 continue
@@ -3785,6 +4730,13 @@ class Orchestrator:
             existing.is_synthesis = phase.is_synthesis
             if phase.acceptance_criteria:
                 existing.acceptance_criteria = phase.acceptance_criteria
+            if (
+                getattr(phase, "iteration", None) is not None
+                and bool(getattr(phase.iteration, "enabled", False))
+            ):
+                existing.iteration_max_attempts = int(
+                    max(1, getattr(phase.iteration, "max_attempts", 1)),
+                )
             strict_subtasks.append(existing)
 
         return Plan(
@@ -4203,6 +5155,29 @@ class Orchestrator:
     def cancel_task(self, task: Task) -> None:
         """Mark a task for cancellation."""
         task.status = TaskStatus.CANCELLED
+        self._state.save(task)
+
+    def pause_task(self, task: Task) -> None:
+        """Pause a running task at the next orchestration boundary."""
+        if task.status not in {TaskStatus.EXECUTING, TaskStatus.PLANNING}:
+            return
+        if not isinstance(task.metadata, dict):
+            task.metadata = {}
+        task.metadata["paused_from_status"] = task.status.value
+        task.status = TaskStatus.PAUSED
+        self._state.save(task)
+
+    def resume_task(self, task: Task) -> None:
+        """Resume a paused task."""
+        if task.status != TaskStatus.PAUSED:
+            return
+        paused_from = ""
+        if isinstance(task.metadata, dict):
+            paused_from = str(task.metadata.pop("paused_from_status", "") or "").strip().lower()
+        if paused_from == TaskStatus.PLANNING.value:
+            task.status = TaskStatus.PLANNING
+        else:
+            task.status = TaskStatus.EXECUTING
         self._state.save(task)
 
 

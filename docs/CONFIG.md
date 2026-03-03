@@ -79,6 +79,10 @@ Recommended two-model split:
 | `max_task_mutating_tool_calls` | `int` | `0` | Task-level mutating tool call cap (`0` disables). |
 | `max_task_replans` | `int` | `0` | Task-level replan cap (`0` disables). |
 | `max_task_remediation_attempts` | `int` | `0` | Task-level remediation-attempt cap (`0` disables). |
+| `enable_process_iteration_loops` | `bool` | `false` | Enables phase-level process iteration loops (`phase.iteration`). |
+| `enable_iteration_command_exit_gate` | `bool` | `false` | Enables runtime execution for `command_exit` iteration gates. |
+| `max_iteration_replans_after_exhaustion` | `int` | `2` | Global cap for loop-triggered replans after gate exhaustion. |
+| `iteration_command_exit_allowlisted_prefixes` | `list[string]` | test/lint allowlist | Runtime allowlisted command prefixes for `command_exit` gates. |
 | `executor_completion_contract_mode` | `string` | `"off"` | Executor completion protocol (`off`, `warn`, `enforce`). |
 | `planner_degraded_mode` | `string` | `"allow"` | Planner fallback policy (`allow`, `require_approval`, `deny`). |
 | `enable_sqlite_remediation_queue` | `bool` | `false` | Dual-write remediation queue and retry lineage to SQLite tables. |
@@ -97,6 +101,19 @@ Recommended two-model split:
 | `agent_tools_allowed_providers` | `list[string]` | `["codex","claude_code","opencode"]` | Restrict which external agent providers are exposed. |
 | `agent_tools_max_timeout_seconds` | `int` | `1800` | Max allowed timeout for coding-agent tool calls. |
 | `agent_tools_default_network_mode` | `string` | `"on"` | Default network mode for coding-agent tool calls (`on` or `off`). |
+
+Default `iteration_command_exit_allowlisted_prefixes`:
+- `pytest`
+- `uv run pytest`
+- `python -m pytest`
+- `python3 -m pytest`
+- `ruff check`
+- `npm test`
+- `pnpm test`
+- `bun test`
+- `go test`
+- `cargo test`
+- `make test`
 
 ### `[verification]`
 

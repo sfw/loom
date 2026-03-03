@@ -69,6 +69,14 @@ REMEDIATION_EXPIRED = "remediation_expired"
 REMEDIATION_TERMINAL = "remediation_terminal"
 UNCONFIRMED_DATA_QUEUED = "unconfirmed_data_queued"
 
+# Iteration loop events
+ITERATION_STARTED = "iteration_started"
+ITERATION_GATE_FAILED = "iteration_gate_failed"
+ITERATION_RETRYING = "iteration_retrying"
+ITERATION_COMPLETED = "iteration_completed"
+ITERATION_TERMINAL = "iteration_terminal"
+ITERATION_STATE_RECONCILED = "iteration_state_reconciled"
+
 # Durable run lifecycle
 TASK_RUN_ACQUIRED = "task_run_acquired"
 TASK_RUN_HEARTBEAT = "task_run_heartbeat"

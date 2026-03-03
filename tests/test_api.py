@@ -63,6 +63,8 @@ def mock_orchestrator():
     orch = MagicMock(spec=Orchestrator)
     orch.execute_task = AsyncMock()
     orch.cancel_task = MagicMock()
+    orch.pause_task = MagicMock()
+    orch.resume_task = MagicMock()
     return orch
 
 
@@ -348,6 +350,14 @@ class TestTaskSteer:
         assert response.status_code == 409
 
     @pytest.mark.asyncio
+    async def test_steer_paused_task(self, client, state_manager):
+        _make_task(state_manager, status=TaskStatus.PAUSED)
+        response = await client.patch("/tasks/test-1", json={
+            "instruction": "Apply this once resumed",
+        })
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
     async def test_steer_not_found(self, client):
         response = await client.patch("/tasks/nonexistent", json={
             "instruction": "test",
@@ -497,6 +507,36 @@ class TestCancelUsesDelete:
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
         mock_orchestrator.cancel_task.assert_called_once()
+
+
+class TestTaskPauseResume:
+    @pytest.mark.asyncio
+    async def test_pause_task(self, client, state_manager, mock_orchestrator):
+        _make_task(state_manager, status=TaskStatus.EXECUTING)
+        response = await client.post("/tasks/test-1/pause")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        mock_orchestrator.pause_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_task(self, client, state_manager, mock_orchestrator):
+        _make_task(state_manager, status=TaskStatus.PAUSED)
+        response = await client.post("/tasks/test-1/resume")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        mock_orchestrator.resume_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pause_invalid_status(self, client, state_manager):
+        _make_task(state_manager, status=TaskStatus.COMPLETED)
+        response = await client.post("/tasks/test-1/pause")
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_resume_invalid_status(self, client, state_manager):
+        _make_task(state_manager, status=TaskStatus.FAILED)
+        response = await client.post("/tasks/test-1/resume")
+        assert response.status_code == 409
 
 
 # --- Process field in task creation ---
