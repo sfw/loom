@@ -35,7 +35,17 @@ from loom.models.retry import (
     call_with_model_retry,
     stream_with_model_retry,
 )
-from loom.tools.registry import ToolRegistry, ToolResult
+from loom.tools.registry import (
+    ToolRegistry,
+    ToolResult,
+    normalize_tool_auth_mode,
+    tool_auth_required,
+)
+from loom.tools.shell import high_risk_command_metadata
+from loom.tools.tooling_common.wp_policy import (
+    assess_wp_cli_risk,
+    format_wp_risk_info,
+)
 from loom.utils.tokens import estimate_tokens as _estimate_tokens
 
 if TYPE_CHECKING:
@@ -112,6 +122,11 @@ class _ContextWindowStats:
 # Tools that signal "ask the user" — the tool loop should pause and
 # return to the user instead of continuing.
 _USER_INTERACTION_TOOLS = frozenset({"ask_user"})
+_RUNTIME_INTERNAL_PREFIX = "_loom_"
+_RUN_TOOL_PARENT_KEYS = frozenset({
+    "_loom_parent_tool_call_id",
+    "_loom_parent_tool_name",
+})
 
 MAX_TOOL_ITERATIONS = 40
 MAX_IDENTICAL_TOOL_BATCH_STREAK = 3
@@ -1550,6 +1565,14 @@ class CoworkSession:
             caller_tool_name=caller_tool_name or tool_name,
             include_delegate_callback=True,
         )
+        if (
+            self._approver is not None
+            and bool(execute_args.get("_loom_require_explicit_approval", False))
+        ):
+            if tool_name == "shell_execute":
+                execute_args["_loom_high_risk_confirmed"] = True
+            if tool_name == "wp_cli":
+                execute_args["confirm_high_risk"] = True
         start = time.monotonic()
         result = await self._tools.execute(
             tool_name,
@@ -1557,6 +1580,7 @@ class CoworkSession:
             workspace=self._workspace,
             scratch_dir=self._scratch_dir,
             auth_context=self._auth_context,
+            allow_internal_args=True,
         )
         if (
             not result.success
@@ -1589,16 +1613,21 @@ class CoworkSession:
         include_delegate_callback: bool = True,
     ) -> dict:
         """Inject runtime-only knobs used by selected tools."""
-        execute_args = dict(arguments or {})
+        execute_args = self._sanitize_runtime_arguments(tool_name, dict(arguments or {}))
         normalized_call_id = str(tool_call_id or "").strip()
         caller_name = str(caller_tool_name or tool_name or "").strip()
 
-        if tool_name == "run_tool" and normalized_call_id:
+        if tool_name == "run_tool":
             delegated_args = execute_args.get("arguments")
             if isinstance(delegated_args, dict):
-                delegated_copy = dict(delegated_args)
-                delegated_copy.setdefault("_loom_parent_tool_call_id", normalized_call_id)
-                delegated_copy.setdefault("_loom_parent_tool_name", caller_name or "run_tool")
+                delegated_tool_name = str(execute_args.get("name", "") or "").strip()
+                delegated_copy = self._sanitize_runtime_arguments(
+                    delegated_tool_name,
+                    delegated_args,
+                )
+                if normalized_call_id:
+                    delegated_copy["_loom_parent_tool_call_id"] = normalized_call_id
+                    delegated_copy["_loom_parent_tool_name"] = caller_name or "run_tool"
                 execute_args["arguments"] = delegated_copy
 
         if (
@@ -1649,7 +1678,54 @@ class CoworkSession:
             execute_args["_artifact_retention_max_bytes_per_scope"] = int(
                 self._ingest_artifact_retention_max_bytes_per_scope,
             )
+
+        if tool_name == "shell_execute":
+            command = str(execute_args.get("command", "") or "")
+            risk_info = high_risk_command_metadata(command)
+            if isinstance(risk_info, dict):
+                execute_args["_loom_require_explicit_approval"] = True
+                execute_args["_loom_risk_info"] = risk_info
+
+        if tool_name == "wp_cli":
+            group = str(execute_args.get("group", "") or "").strip().lower()
+            action = str(execute_args.get("action", "") or "").strip().lower()
+            wp_args = execute_args.get("args")
+            assessment = assess_wp_cli_risk(
+                group=group,
+                action=action,
+                args=wp_args if isinstance(wp_args, dict) else {},
+            )
+            if assessment is not None and self._wp_high_risk_confirmation_enabled():
+                execute_args["_loom_require_explicit_approval"] = True
+                execute_args["_loom_risk_info"] = format_wp_risk_info(assessment)
         return execute_args
+
+    @staticmethod
+    def _sanitize_runtime_arguments(tool_name: str, raw_args: dict) -> dict:
+        """Remove internal runtime controls from model/tool-provided arguments."""
+        cleaned: dict = {}
+        for key, value in raw_args.items():
+            key_text = str(key or "")
+            if key_text.startswith(_RUNTIME_INTERNAL_PREFIX):
+                if (
+                    str(tool_name or "").strip() == "run_tool"
+                    and key_text in _RUN_TOOL_PARENT_KEYS
+                ):
+                    cleaned[key_text] = value
+                continue
+            cleaned[key] = value
+
+        # High-risk confirmation for wp_cli is set internally only after approval.
+        if str(tool_name or "").strip() == "wp_cli":
+            cleaned.pop("confirm_high_risk", None)
+        return cleaned
+
+    def _wp_high_risk_confirmation_enabled(self) -> bool:
+        """Check wp_cli runtime policy toggle from configured tool instance."""
+        tool = self._tools.get("wp_cli")
+        if tool is None:
+            return True
+        return bool(getattr(tool, "high_risk_requires_confirmation", True))
 
     def _maybe_trim(self) -> None:
         """Trim in-memory message cache if very large.
@@ -1983,13 +2059,20 @@ class CoworkSession:
             tool = self._tools.get(name)
             description = str(schema.get("description", "") or "").strip()
             parameters = schema.get("parameters", {})
+            auth_requirements = getattr(tool, "auth_requirements", [])
+            if not isinstance(auth_requirements, list):
+                auth_requirements = []
             rows.append({
                 "name": name,
                 "summary": " ".join(description.split()),
                 "description": description,
                 "parameters": parameters if isinstance(parameters, dict) else {},
                 "mutates": bool(getattr(tool, "is_mutating", False)),
-                "auth_required": bool(getattr(tool, "auth_requirements", [])),
+                "auth_mode": normalize_tool_auth_mode(
+                    getattr(tool, "auth_mode", "no_auth"),
+                ),
+                "auth_required": tool_auth_required(tool),
+                "auth_requirements": list(auth_requirements),
                 "category": self._tool_category(name),
             })
         rows.sort(key=lambda item: str(item.get("name", "")))
@@ -2044,12 +2127,21 @@ class CoworkSession:
             caller_tool_name=parent_tool_name or "run_tool",
             include_delegate_callback=True,
         )
+        if (
+            self._approver is not None
+            and bool(execute_args.get("_loom_require_explicit_approval", False))
+        ):
+            if target == "shell_execute":
+                execute_args["_loom_high_risk_confirmed"] = True
+            if target == "wp_cli":
+                execute_args["confirm_high_risk"] = True
         return await self._tools.execute(
             target,
             execute_args,
             workspace=self._workspace,
             scratch_dir=self._scratch_dir,
             auth_context=auth_context,
+            allow_internal_args=True,
         )
 
     # ------------------------------------------------------------------

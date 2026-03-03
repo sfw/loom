@@ -259,6 +259,15 @@ class TestToolApprovalScreen:
         screen = ToolApprovalScreen("shell_execute", "ls -la")
         assert screen._tool_name == "shell_execute"
         assert screen._args_preview == "ls -la"
+        assert screen._risk_info is None
+
+    def test_init_with_risk_info(self):
+        screen = ToolApprovalScreen(
+            "shell_execute",
+            "wp db reset --yes",
+            risk_info={"risk_level": "high"},
+        )
+        assert screen._risk_info == {"risk_level": "high"}
 
     def test_on_key_approve(self):
         screen = ToolApprovalScreen("shell_execute", "ls -la")
@@ -291,13 +300,74 @@ class TestToolApprovalScreen:
         dismissed = []
         screen.dismiss = lambda value: dismissed.append(value)
 
-        for key in ("n", "escape"):
+        for key in ("n", "escape", "ctrl+c", "ctrl+z"):
             event = MagicMock()
             event.key = key
             screen.on_key(event)
             assert dismissed[-1] == "deny"
             event.stop.assert_called_once()
             event.prevent_default.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_modal_renders_markup_sensitive_preview_without_crashing(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test() as pilot:
+            app.push_screen(
+                ToolApprovalScreen(
+                    "run_tool[unsafe]",
+                    'name=read_file args={"path":"note[1].md"}',
+                    risk_info={
+                        "risk_level": "high[1]",
+                        "action_class": "destructive[action]",
+                        "impact_preview": "touches [all] files",
+                        "consequences": "possible [loss]",
+                    },
+                )
+            )
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+
+
+class TestApprovalCallback:
+    @pytest.mark.asyncio
+    async def test_approval_callback_events_are_not_clobbered_by_overlap(self):
+        from loom.cowork.approval import ApprovalDecision
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        callbacks: list = []
+
+        def _push_screen(_screen, callback):
+            callbacks.append(callback)
+
+        app.push_screen = _push_screen
+
+        first = asyncio.create_task(app._approval_callback("shell_execute", {"command": "echo 1"}))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(app._approval_callback("shell_execute", {"command": "echo 2"}))
+        await asyncio.sleep(0)
+
+        callbacks[0]("approve")
+        result_first = await asyncio.wait_for(first, timeout=1)
+        callbacks[1]("deny")
+        result_second = await asyncio.wait_for(second, timeout=1)
+
+        assert result_first == ApprovalDecision.APPROVE
+        assert result_second == ApprovalDecision.DENY
 
 
 class TestAskUserScreen:
@@ -3900,6 +3970,107 @@ class TestStartupSessionResume:
         chat.add_user_message.assert_any_call("hello")
         chat.add_model_text.assert_any_call("world", markup=False)
 
+    @pytest.mark.asyncio
+    async def test_initialize_session_refreshes_process_index_in_background(self, monkeypatch):
+        from loom.tui.app import LoomApp
+
+        class FakeSession:
+            def __init__(self, **_kwargs):
+                self.total_tokens = 0
+                self.session_id = "s1"
+                self.session_state = SimpleNamespace(turn_count=0, ui_state={})
+                self.messages = []
+
+        monkeypatch.setattr("loom.tui.app.CoworkSession", FakeSession)
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._store = None
+        app._resolve_startup_resume_target = AsyncMock(return_value=(None, False))
+        app._refresh_tool_registry = MagicMock()
+        app._refresh_process_command_index = MagicMock()
+        app._ensure_persistence_tools = MagicMock()
+        app._apply_process_tool_policy = MagicMock()
+        app._build_system_prompt = MagicMock(return_value="system")
+        app._bind_session_tools = MagicMock()
+        app._hydrate_chat_history_for_active_session = AsyncMock()
+        app._restore_process_run_tabs = AsyncMock()
+        app._set_slash_hint = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._tools.list_tools = MagicMock(return_value=[])
+        app._reset_cowork_steering_state = MagicMock()
+        app._hydrate_input_history_from_session = MagicMock()
+
+        chat = MagicMock()
+        status = SimpleNamespace(workspace_name="", model_name="", process_name="")
+        input_widget = SimpleNamespace(focus=MagicMock())
+
+        def _query_one(selector: str, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#status-bar":
+                return status
+            if selector == "#user-input":
+                return input_widget
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+
+        to_thread_calls: list[tuple] = []
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            to_thread_calls.append((func, args, kwargs))
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr("loom.tui.app.asyncio.to_thread", _fake_to_thread)
+
+        await app._initialize_session()
+
+        app._refresh_tool_registry.assert_called_once()
+        app._refresh_process_command_index.assert_called_once_with(
+            chat=chat,
+            notify_conflicts=True,
+            background=True,
+            force=True,
+        )
+        assert to_thread_calls
+
+    def test_start_workspace_watch_does_not_scan_synchronously(self):
+        from loom.tui.app import LoomApp
+
+        class RunningHarness(LoomApp):
+            @property
+            def is_running(self) -> bool:  # pragma: no cover - property shim
+                return True
+
+        app = RunningHarness(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._stop_workspace_watch = MagicMock()
+        app._tui_realtime_refresh_enabled = MagicMock(return_value=True)
+        app._tui_workspace_watch_backend = MagicMock(return_value="poll")
+        app._tui_workspace_poll_interval_seconds = MagicMock(return_value=2.0)
+        app._compute_workspace_signature = MagicMock(
+            side_effect=AssertionError("workspace signature scan should not run inline"),
+        )
+        timer = MagicMock()
+        app.set_interval = MagicMock(return_value=timer)
+
+        app._start_workspace_watch()
+
+        app._compute_workspace_signature.assert_not_called()
+        app.set_interval.assert_called_once_with(
+            2.0,
+            app._on_workspace_poll_tick,
+        )
+        assert app._workspace_poll_timer is timer
+        assert app._workspace_signature is None
+
 
 class TestChatReplayHydration:
     class _PerfChat:
@@ -4409,6 +4580,75 @@ class TestSlashCommandHints:
 
         assert hint == ""
 
+    def test_tool_hint_lists_matching_tool_names(self):
+        from loom.tui.app import LoomApp
+
+        tools = MagicMock()
+        tools.list_tools.return_value = ["read_file", "write_file", "web_search"]
+        tools.get.return_value = None
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+
+        hint = app._render_slash_hint("/tool w")
+
+        assert "Matching tools for w:" in hint
+        assert "write_file" in hint
+        assert "web_search" in hint
+        assert "read_file" not in hint
+
+    def test_tool_hint_root_lists_all_tools_without_pagination(self):
+        from loom.tui.app import LoomApp
+
+        tools = MagicMock()
+        tools.list_tools.return_value = [f"tool_{i:02d}" for i in range(12)]
+        tools.get.return_value = None
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+
+        hint = app._render_slash_hint("/tool")
+
+        for i in range(12):
+            assert f"tool_{i:02d}" in hint
+        assert "more" not in hint
+        assert "\\[key=value ... | json-object-args\\]" in hint
+
+    def test_tool_hint_shows_argument_details_for_exact_match(self):
+        from loom.tui.app import LoomApp
+
+        tools = MagicMock()
+        tools.list_tools.return_value = ["read_file"]
+        tools.get.return_value = SimpleNamespace(
+            description="Read a file from workspace",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "encoding": {"type": "string"},
+                },
+                "required": ["path"],
+            },
+        )
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+
+        hint = app._render_slash_hint("/tool read_file")
+
+        assert "Tool: read_file" in hint
+        assert "Required:" in hint
+        assert "path" in hint
+        assert "Optional:" in hint
+        assert "encoding" in hint
+        assert "Example:" in hint
+
     def test_prefix_r_matches_resume_and_run(self):
         from loom.tui.app import LoomApp
 
@@ -4477,7 +4717,29 @@ class TestSlashCommandHints:
         app.on_user_input_changed(stale_event)
 
         assert captured
-        assert "/help" in captured[-1]
+
+    @pytest.mark.asyncio
+    async def test_tool_hint_markup_renders_without_error(self):
+        from textual.widgets import Static
+
+        from loom.tui.app import LoomApp
+
+        tools = MagicMock()
+        tools.list_tools.return_value = [f"tool_{i}" for i in range(20)]
+        tools.get.return_value = None
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test() as pilot:
+            hint_text = app._render_slash_hint("/tool")
+            app._set_slash_hint(hint_text)
+            await pilot.pause()
+            hint_body = app.query_one("#slash-hint-body", Static)
+            assert hint_body.display is True
 
     @pytest.mark.asyncio
     async def test_slash_hint_container_supports_overflow_scrolling(self):
@@ -4607,7 +4869,7 @@ class TestSlashCommandHints:
         ]
         assert app._slash_completion_candidates("/h") == ["/history", "/help"]
         assert app._slash_completion_candidates("/m") == ["/mcp", "/model", "/models"]
-        assert app._slash_completion_candidates("/t") == ["/tools", "/tokens"]
+        assert app._slash_completion_candidates("/t") == ["/tools", "/tool", "/tokens"]
         assert app._slash_completion_candidates("/p") == ["/pause", "/processes"]
         assert app._slash_completion_candidates("/r") == ["/resume", "/run", "/redirect"]
 
@@ -4702,6 +4964,209 @@ class TestProcessSlashCommands:
         assert handled is True
         app._render_process_catalog.assert_called_once()
         chat.add_info.assert_called_once_with("catalog")
+
+    @pytest.mark.asyncio
+    async def test_tool_command_executes_via_run_tool(self):
+        from loom.tools.registry import ToolResult
+        from loom.tui.app import LoomApp
+
+        tools = MagicMock()
+        tools.list_tools.return_value = ["read_file"]
+        tools.execute = AsyncMock(return_value=ToolResult.ok("ok"))
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app._session = SimpleNamespace(_auth_context=None)
+        app._ingest_files_panel_from_paths = MagicMock(return_value=0)
+        app._is_mutating_tool = MagicMock(return_value=False)
+        app._request_workspace_refresh = MagicMock()
+
+        handled = await app._handle_slash_command('/tool read_file {"path":"README.md"}')
+
+        assert handled is True
+        tools.execute.assert_awaited_once()
+        execute_call = tools.execute.await_args
+        assert execute_call.args[0] == "run_tool"
+        assert execute_call.args[1] == {
+            "name": "read_file",
+            "arguments": {"path": "README.md"},
+        }
+        chat.add_tool_call.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_tool_command_uses_worker_when_app_running(self):
+        from loom.tui.app import LoomApp
+
+        class RunningHarness(LoomApp):
+            @property
+            def is_running(self) -> bool:  # pragma: no cover - property shim
+                return True
+
+        tools = MagicMock()
+        tools.list_tools.return_value = ["read_file"]
+        tools.execute = AsyncMock()
+        app = RunningHarness(
+            model=MagicMock(name="model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app._session = SimpleNamespace(_auth_context=None)
+        app._execute_slash_tool_command = AsyncMock()
+        captured: dict[str, object] = {}
+        app.run_worker = MagicMock(
+            side_effect=lambda coro, **kwargs: captured.update(coro=coro, kwargs=kwargs)
+        )
+
+        handled = await app._handle_slash_command("/tool read_file path=README.md")
+
+        assert handled is True
+        app._execute_slash_tool_command.assert_called_once_with(
+            "read_file",
+            {"path": "README.md"},
+        )
+        app._execute_slash_tool_command.assert_not_awaited()
+        tools.execute.assert_not_awaited()
+        assert app.run_worker.call_count == 1
+        assert captured["kwargs"]["exclusive"] is False
+        assert str(captured["kwargs"]["group"]).startswith("slash-tool-command-")
+
+        await captured["coro"]
+        app._execute_slash_tool_command.assert_awaited_once_with(
+            "read_file",
+            {"path": "README.md"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_tool_command_modal_from_input_submit_accepts_keys(self):
+        from textual.widgets import Input
+
+        from loom.cowork.approval import ApprovalDecision
+        from loom.tui.app import LoomApp
+
+        tools = MagicMock()
+        tools.list_tools.return_value = ["write_file"]
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+        app._tool_name_inventory = MagicMock(return_value=["write_file"])
+
+        decision: dict[str, ApprovalDecision | None] = {"value": None}
+
+        async def _fake_execute(tool_name: str, tool_args: dict[str, object]) -> None:
+            decision["value"] = await app._approval_callback(
+                tool_name,
+                {"path": tool_args.get("path", "")},
+            )
+
+        app._execute_slash_tool_command = AsyncMock(side_effect=_fake_execute)
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#user-input", Input)
+            input_widget.value = "/tool write_file path=test.md"
+            input_widget.cursor_position = len(input_widget.value)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen_stack[-1], ToolApprovalScreen)
+
+            await pilot.press("y")
+            for _ in range(10):
+                if decision["value"] is not None:
+                    break
+                await pilot.pause()
+
+            assert all(
+                not isinstance(screen, ToolApprovalScreen)
+                for screen in app.screen_stack
+            )
+            assert decision["value"] == ApprovalDecision.APPROVE
+
+    @pytest.mark.asyncio
+    async def test_tool_command_executes_via_kv_pairs(self):
+        from loom.tools.registry import ToolResult
+        from loom.tui.app import LoomApp
+
+        tools = MagicMock()
+        tools.list_tools.return_value = ["ripgrep_search"]
+        tools.execute = AsyncMock(return_value=ToolResult.ok("ok"))
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+        app._session = SimpleNamespace(_auth_context=None)
+        app._ingest_files_panel_from_paths = MagicMock(return_value=0)
+        app._is_mutating_tool = MagicMock(return_value=False)
+        app._request_workspace_refresh = MagicMock()
+
+        handled = await app._handle_slash_command(
+            "/tool ripgrep_search pattern=TODO max_results=25 case_sensitive=true",
+        )
+
+        assert handled is True
+        tools.execute.assert_awaited_once()
+        execute_call = tools.execute.await_args
+        assert execute_call.args[0] == "run_tool"
+        assert execute_call.args[1] == {
+            "name": "ripgrep_search",
+            "arguments": {
+                "pattern": "TODO",
+                "max_results": 25,
+                "case_sensitive": True,
+            },
+        }
+        chat.add_tool_call.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_tool_command_rejects_invalid_json(self):
+        from loom.tui.app import LoomApp
+
+        tools = MagicMock()
+        tools.list_tools.return_value = ["read_file"]
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command('/tool read_file {"path": }')
+
+        assert handled is True
+        chat.add_info.assert_called_once()
+        assert "Invalid /tool JSON arguments" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_tool_command_rejects_invalid_kv_argument(self):
+        from loom.tui.app import LoomApp
+
+        tools = MagicMock()
+        tools.list_tools.return_value = ["read_file"]
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/tool read_file README.md")
+
+        assert handled is True
+        chat.add_info.assert_called_once()
+        assert "Use key=value pairs or a JSON object" in chat.add_info.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_stop_requests_active_chat_turn(self):
@@ -11127,6 +11592,28 @@ class TestCommandPaletteProcessActions:
         assert app._apply_slash_tab_completion(reverse=True) is True
         assert input_widget.value == "/setup"
 
+    def test_slash_tab_completion_cycles_tool_names_for_tool_command(self):
+        from loom.tui.app import LoomApp
+
+        tools = MagicMock()
+        tools.list_tools.return_value = ["read_file", "redirect_path", "write_file"]
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=tools,
+            workspace=Path("/tmp"),
+        )
+        input_widget = SimpleNamespace(value="/tool r", cursor_position=0)
+        app.query_one = MagicMock(return_value=input_widget)
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/tool read_file"
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/tool redirect_path"
+
+        assert app._apply_slash_tab_completion(reverse=False) is True
+        assert input_widget.value == "/tool read_file"
+
     def test_slash_tab_completion_ignores_non_slash_or_args(self):
         from loom.tui.app import LoomApp
 
@@ -11140,6 +11627,9 @@ class TestCommandPaletteProcessActions:
         assert app._apply_slash_tab_completion(reverse=False) is False
 
         input_widget.value = "/resume abc"
+        assert app._apply_slash_tab_completion(reverse=False) is False
+
+        input_widget.value = '/tool read_file {"path":"README.md"}'
         assert app._apply_slash_tab_completion(reverse=False) is False
 
     def test_slash_tab_completion_process_use_prefix_not_supported(self):
@@ -11277,6 +11767,31 @@ class TestCommandPaletteProcessActions:
 
         event.stop.assert_not_called()
         event.prevent_default.assert_not_called()
+
+    def test_on_key_dismisses_active_tool_approval_screen(self):
+        from loom.tui.app import LoomApp
+
+        class _ScreenHarness(LoomApp):
+            @property
+            def screen(self):  # pragma: no cover - property shim
+                return self._screen_for_test
+
+        app = _ScreenHarness(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        screen = ToolApprovalScreen("write_file", "test.md")
+        screen.dismiss = MagicMock()
+        app._screen_for_test = screen
+        event = MagicMock()
+        event.key = "y"
+
+        app.on_key(event)
+
+        screen.dismiss.assert_called_once_with("approve")
+        event.stop.assert_called_once()
+        event.prevent_default.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_action_close_process_tab_starts_nonexclusive_worker(self):

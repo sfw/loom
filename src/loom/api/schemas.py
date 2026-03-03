@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 # --- Request Schemas ---
@@ -121,6 +123,9 @@ class ModelInfo(BaseModel):
 class ToolInfo(BaseModel):
     name: str
     description: str
+    auth_mode: str = "no_auth"
+    auth_required: bool = False
+    auth_requirements: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ContentBlockResponse(BaseModel):

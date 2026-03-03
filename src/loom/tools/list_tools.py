@@ -213,7 +213,13 @@ class ListToolsTool(Tool):
             description = str(raw.get("description", "") or "").strip()
             row_category = str(raw.get("category", "") or "").strip().lower()
             mutates = bool(raw.get("mutates", False))
-            auth_required = bool(raw.get("auth_required", False))
+            auth_mode = str(raw.get("auth_mode", "") or "").strip().lower()
+            if auth_mode not in {"no_auth", "optional_auth", "required_auth"}:
+                auth_mode = "required_auth" if bool(raw.get("auth_required", False)) else "no_auth"
+            auth_required = auth_mode != "no_auth"
+            auth_requirements = raw.get("auth_requirements", [])
+            if not isinstance(auth_requirements, list):
+                auth_requirements = []
             parameters = raw.get("parameters", {})
             if not isinstance(parameters, dict):
                 parameters = {}
@@ -235,7 +241,9 @@ class ListToolsTool(Tool):
                 "description": description,
                 "category": row_category,
                 "mutates": mutates,
+                "auth_mode": auth_mode,
                 "auth_required": auth_required,
+                "auth_requirements": auth_requirements,
                 "parameters": parameters,
             })
 
@@ -261,10 +269,12 @@ class ListToolsTool(Tool):
                 "summary": row["summary"],
                 "category": row["category"],
                 "mutates": row["mutates"],
+                "auth_mode": row["auth_mode"],
                 "auth_required": row["auth_required"],
             }
             if detail == "schema":
                 item["parameters"] = row["parameters"]
+                item["auth_requirements"] = row["auth_requirements"]
             else:
                 item["required_args"] = _required_args(row["parameters"])
 

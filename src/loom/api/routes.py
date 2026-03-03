@@ -40,6 +40,7 @@ from loom.engine.orchestrator import create_task
 from loom.events.bus import Event
 from loom.state.memory import MemoryEntry
 from loom.state.task_state import SubtaskStatus, TaskStatus
+from loom.tools.registry import normalize_tool_auth_mode, tool_auth_required
 from loom.tools.workspace import validate_workspace
 from loom.utils.latency import log_latency_event
 
@@ -750,10 +751,25 @@ async def list_tools(request: Request):
     """List available tools and schemas."""
     engine = _get_engine(request)
     schemas = engine.tool_registry.all_schemas()
-    return [
-        ToolInfo(name=s["name"], description=s.get("description", ""))
-        for s in schemas
-    ]
+    rows: list[ToolInfo] = []
+    for schema in schemas:
+        name = str(schema.get("name", "") or "").strip()
+        tool = engine.tool_registry.get(name) if name else None
+        auth_requirements = getattr(tool, "auth_requirements", [])
+        if not isinstance(auth_requirements, list):
+            auth_requirements = []
+        rows.append(
+            ToolInfo(
+                name=schema["name"],
+                description=schema.get("description", ""),
+                auth_mode=normalize_tool_auth_mode(
+                    getattr(tool, "auth_mode", "no_auth"),
+                ),
+                auth_required=tool_auth_required(tool),
+                auth_requirements=list(auth_requirements),
+            ),
+        )
+    return rows
 
 
 @router.get("/health", response_model=HealthResponse)

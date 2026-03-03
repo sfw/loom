@@ -60,7 +60,7 @@ Goal -> Planner ->  | [Subtask A]  [Subtask B]   |  parallel batch
 
 **Full undo.** Every file write is preceded by a snapshot. You can revert any individual change, all changes from a subtask, or the entire task. The changelog tracks creates, modifies, deletes, and renames with before-state snapshots.
 
-**Dozens of built-in tools.** Loom includes file operations (read/write/edit/delete/move with fuzzy matching), shell + git safety, ripgrep + glob search, web fetch/search, code analysis (tree-sitter when installed; regex fallback), calculator + spreadsheet operations, document generation, task tracking, and conversation recall.
+**Dozens of built-in tools.** Loom includes file operations (read/write/edit/delete/move with fuzzy matching), shell + git safety, ripgrep + glob search, web fetch/search, code analysis (tree-sitter when installed; regex fallback), calculator + spreadsheet operations, document generation, task tracking, and conversation recall. Optional software-development integrations add external coding-agent tools (`openai_codex`, `claude_code`, `opencode`) and WordPress workflow tools (`wp_cli`, `wp_env`, block scaffolding, quality gates) behind execution feature flags.
 
 It also ships research helpers (academic search, archives, citations, fact checking, OCR, timeline/inflation analysis, correspondence/social mapping) plus a keyless investment suite for market data, SEC fundamentals, macro regime scoring, factor exposure, valuation, ranking, and portfolio analysis/recommendation. Tools are auto-discovered via `__init_subclass__`.
 

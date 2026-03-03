@@ -82,12 +82,15 @@ class ToolApprover:
         approved-all. Otherwise prompts the user via the callback.
         If no callback is set, auto-approves everything.
         """
-        # Auto-approved tools never need permission
-        if tool_name in self._auto_approved:
+        explicit_required = _requires_explicit_approval(args)
+        # Auto-approved tools never need permission unless explicit high-risk
+        # policy requires per-call confirmation.
+        if not explicit_required and tool_name in self._auto_approved:
             return ApprovalDecision.APPROVE
 
-        # User already said "always approve" for this tool
-        if tool_name in self._always_approved:
+        # User already said "always approve" for this tool, unless explicit
+        # policy requires a new confirmation for this exact call.
+        if not explicit_required and tool_name in self._always_approved:
             return ApprovalDecision.APPROVE
 
         # No callback = deny by default (safe fallback for headless/API deployments)
@@ -96,8 +99,11 @@ class ToolApprover:
 
         decision = await self._prompt_callback(tool_name, args)
 
-        if decision == ApprovalDecision.APPROVE_ALL:
+        if decision == ApprovalDecision.APPROVE_ALL and not explicit_required:
             self._always_approved.add(tool_name)
+            return ApprovalDecision.APPROVE
+        if decision == ApprovalDecision.APPROVE_ALL and explicit_required:
+            # Explicit-risk calls are never persisted as globally always-approved.
             return ApprovalDecision.APPROVE
 
         return decision
@@ -151,6 +157,12 @@ async def async_terminal_approval_prompt(tool_name: str, args: dict) -> Approval
 
 def _format_args_preview(tool_name: str, args: dict) -> str:
     """Create a short preview of args for the approval prompt."""
+    risk_info = args.get("_loom_risk_info")
+    if isinstance(risk_info, dict):
+        impact = str(risk_info.get("impact_preview", "") or "").strip()
+        if impact:
+            return impact
+
     if tool_name in ("write_file", "edit_file", "delete_file", "move_file"):
         path = args.get("path", args.get("file_path", ""))
         return path if path else ""
@@ -165,9 +177,22 @@ def _format_args_preview(tool_name: str, args: dict) -> str:
         git_args = args.get("args", [])
         return " ".join(git_args) if git_args else ""
 
+    if tool_name == "wp_cli":
+        group = str(args.get("group", "") or "").strip()
+        action = str(args.get("action", "") or "").strip()
+        return f"{group} {action}".strip()
+
     # Generic: show first string value
     for v in args.values():
         if isinstance(v, str) and v:
             preview = v if len(v) <= 60 else v[:57] + "..."
             return preview
     return ""
+
+
+def _requires_explicit_approval(args: dict) -> bool:
+    """Whether this invocation must always be user-approved."""
+    try:
+        return bool(args.get("_loom_require_explicit_approval", False))
+    except Exception:
+        return False

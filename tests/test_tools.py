@@ -28,7 +28,11 @@ from loom.tools.registry import (
     ToolSafetyError,
 )
 from loom.tools.search import ListDirectoryTool, SearchFilesTool
-from loom.tools.shell import ShellExecuteTool, check_command_safety
+from loom.tools.shell import (
+    ShellExecuteTool,
+    check_command_safety,
+    high_risk_command_metadata,
+)
 
 
 @pytest.fixture
@@ -139,6 +143,90 @@ class TestRegistry:
         assert delegate is not None
         assert delegate.timeout_seconds == 7200
 
+    def test_feature_flag_disables_software_dev_tools(self):
+        config = Config(
+            execution=ExecutionConfig(
+                enable_agent_tools=False,
+                enable_wp_tools=False,
+            ),
+        )
+        registry = create_default_registry(config)
+        names = set(registry.list_tools())
+        assert "openai_codex" not in names
+        assert "claude_code" not in names
+        assert "opencode" not in names
+        assert "wp_cli" not in names
+        assert "wp_env" not in names
+        assert "wp_scaffold_block" not in names
+        assert "wp_quality_gate" not in names
+
+    def test_feature_flag_enables_software_dev_tools(self):
+        config = Config(
+            execution=ExecutionConfig(
+                enable_agent_tools=True,
+                enable_wp_tools=True,
+            ),
+        )
+        registry = create_default_registry(config)
+        names = set(registry.list_tools())
+        assert "openai_codex" in names
+        assert "claude_code" in names
+        assert "opencode" in names
+        assert "wp_cli" in names
+        assert "wp_env" in names
+        assert "wp_scaffold_block" in names
+        assert "wp_quality_gate" in names
+
+    def test_umbrella_feature_flag_enables_software_dev_tools(self):
+        config = Config(
+            execution=ExecutionConfig(
+                enable_software_dev_tools=True,
+            ),
+        )
+        registry = create_default_registry(config)
+        names = set(registry.list_tools())
+        assert "openai_codex" in names
+        assert "claude_code" in names
+        assert "opencode" in names
+        assert "wp_cli" in names
+        assert "wp_env" in names
+        assert "wp_scaffold_block" in names
+        assert "wp_quality_gate" in names
+
+    def test_feature_flag_enables_agent_tools_without_wordpress_tools(self):
+        config = Config(
+            execution=ExecutionConfig(
+                enable_agent_tools=True,
+                enable_wp_tools=False,
+            ),
+        )
+        registry = create_default_registry(config)
+        names = set(registry.list_tools())
+        assert "openai_codex" in names
+        assert "claude_code" in names
+        assert "opencode" in names
+        assert "wp_cli" not in names
+        assert "wp_env" not in names
+        assert "wp_scaffold_block" not in names
+        assert "wp_quality_gate" not in names
+
+    def test_feature_flag_enables_wordpress_tools_without_agent_tools(self):
+        config = Config(
+            execution=ExecutionConfig(
+                enable_agent_tools=False,
+                enable_wp_tools=True,
+            ),
+        )
+        registry = create_default_registry(config)
+        names = set(registry.list_tools())
+        assert "openai_codex" not in names
+        assert "claude_code" not in names
+        assert "opencode" not in names
+        assert "wp_cli" in names
+        assert "wp_env" in names
+        assert "wp_scaffold_block" in names
+        assert "wp_quality_gate" in names
+
     async def test_create_default_registry_binds_hybrid_fallback_tools(
         self,
         tmp_path: Path,
@@ -166,6 +254,67 @@ class TestRegistry:
         result = await registry.execute("nonexistent", {})
         assert not result.success
         assert "Unknown tool" in result.error
+
+    async def test_execute_strips_internal_args_by_default(self):
+        class _EchoTool(Tool):
+            __loom_register__ = False
+
+            @property
+            def name(self) -> str:
+                return "echo_args"
+
+            @property
+            def description(self) -> str:
+                return "Echo args"
+
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+
+            async def execute(self, args: dict, _ctx: ToolContext) -> ToolResult:
+                return ToolResult.ok("ok", data={"args": dict(args)})
+
+        registry = ToolRegistry()
+        registry.register(_EchoTool())
+        result = await registry.execute(
+            "echo_args",
+            {"safe": "ok", "_loom_runtime": "secret"},
+        )
+        assert result.success
+        payload = result.data or {}
+        echoed = payload.get("args") or {}
+        assert echoed == {"safe": "ok"}
+
+    async def test_execute_allows_internal_args_when_opted_in(self):
+        class _EchoTool(Tool):
+            __loom_register__ = False
+
+            @property
+            def name(self) -> str:
+                return "echo_args"
+
+            @property
+            def description(self) -> str:
+                return "Echo args"
+
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+
+            async def execute(self, args: dict, _ctx: ToolContext) -> ToolResult:
+                return ToolResult.ok("ok", data={"args": dict(args)})
+
+        registry = ToolRegistry()
+        registry.register(_EchoTool())
+        result = await registry.execute(
+            "echo_args",
+            {"safe": "ok", "_loom_runtime": "secret"},
+            allow_internal_args=True,
+        )
+        assert result.success
+        payload = result.data or {}
+        echoed = payload.get("args") or {}
+        assert echoed.get("_loom_runtime") == "secret"
 
     async def test_execute_with_timeout(self, registry: ToolRegistry, workspace: Path):
         result = await registry.execute("read_file", {"path": "README.md"}, workspace=workspace)
@@ -527,6 +676,12 @@ class TestShellSafety:
     def test_blocks_chmod_root(self):
         assert check_command_safety("chmod -R 777 /") is not None
 
+    def test_detects_high_risk_wp_shell_command(self):
+        risk = high_risk_command_metadata("wp db reset --yes")
+        assert isinstance(risk, dict)
+        assert risk.get("risk_level") == "high"
+        assert "database" in str(risk.get("consequences", "")).lower()
+
     async def test_blocked_command_via_registry(self, ctx: ToolContext):
         registry = create_default_registry()
         result = await registry.execute(
@@ -534,6 +689,45 @@ class TestShellSafety:
         )
         assert not result.success
         assert "Safety violation" in result.error
+
+    async def test_high_risk_wp_command_requires_confirmation(self, ctx: ToolContext):
+        registry = create_default_registry()
+        result = await registry.execute(
+            "shell_execute",
+            {"command": "wp db reset --yes"},
+            workspace=ctx.workspace,
+        )
+        assert not result.success
+        assert "Safety violation" in result.error
+        assert "requires explicit confirmation" in result.error
+
+    async def test_high_risk_wp_command_ignores_public_runtime_flag(self, ctx: ToolContext):
+        registry = create_default_registry()
+        result = await registry.execute(
+            "shell_execute",
+            {
+                "command": "wp db reset --yes",
+                "_loom_high_risk_confirmed": True,
+            },
+            workspace=ctx.workspace,
+        )
+        assert not result.success
+        assert "Safety violation" in (result.error or "")
+
+    async def test_high_risk_wp_command_allows_internal_confirmation_flag(self, ctx: ToolContext):
+        registry = create_default_registry()
+        result = await registry.execute(
+            "shell_execute",
+            {
+                "command": "wp db reset --yes",
+                "_loom_high_risk_confirmed": True,
+            },
+            workspace=ctx.workspace,
+            allow_internal_args=True,
+        )
+        # Command may still fail if wp isn't installed; this asserts safety-gate bypass
+        # only for trusted internal invocations.
+        assert "Safety violation" not in (result.error or "")
 
 
 # --- SearchFilesTool ---

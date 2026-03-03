@@ -6,6 +6,10 @@ import asyncio
 import re
 
 from loom.tools.registry import Tool, ToolContext, ToolResult, ToolSafetyError
+from loom.tools.tooling_common.wp_policy import (
+    assess_wp_shell_command_risk,
+    format_wp_risk_info,
+)
 
 # Max bytes to buffer from process stdout/stderr before killing it.
 # Prevents OOM from commands like `yes` or `cat /dev/urandom`.
@@ -58,6 +62,14 @@ def check_command_safety(command: str) -> str | None:
     return None
 
 
+def high_risk_command_metadata(command: str) -> dict | None:
+    """Return high-risk metadata for commands that need explicit approval."""
+    assessment = assess_wp_shell_command_risk(command)
+    if assessment is None:
+        return None
+    return format_wp_risk_info(assessment)
+
+
 async def _read_limited(stream: asyncio.StreamReader | None, limit: int) -> bytes:
     """Read from stream up to *limit* bytes, then discard the rest."""
     if stream is None:
@@ -103,6 +115,12 @@ class ShellExecuteTool(Tool):
         command = args.get("command", "")
         if not command.strip():
             return ToolResult.fail("Empty command")
+
+        high_risk = high_risk_command_metadata(command)
+        if high_risk and not bool(args.get("_loom_high_risk_confirmed", False)):
+            raise ToolSafetyError(
+                "High-risk shell command requires explicit confirmation.",
+            )
 
         # Safety check
         violation = check_command_safety(command)

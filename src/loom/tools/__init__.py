@@ -17,7 +17,7 @@ import loom.tools as _pkg
 from loom.config import Config
 from loom.tools.registry import Tool as Tool
 from loom.tools.registry import ToolContext as ToolContext
-from loom.tools.registry import ToolRegistry
+from loom.tools.registry import ToolRegistry, normalize_tool_auth_mode, tool_auth_required
 from loom.tools.registry import ToolResult as ToolResult
 from loom.tools.registry import ToolSafetyError as ToolSafetyError
 
@@ -28,6 +28,29 @@ _RUN_TOOL_BLOCKED_TARGETS = frozenset({"ask_user"})
 _DISCOVER_TOOLS_LOCK = threading.Lock()
 _DISCOVER_TOOLS_IMPORTED = False
 _DISCOVER_TOOLS_CACHE: list[type[Tool]] = []
+_AGENT_TOOL_NAMES = frozenset({
+    "openai_codex",
+    "claude_code",
+    "opencode",
+})
+_WORDPRESS_TOOL_NAMES = frozenset({
+    "wp_cli",
+    "wp_env",
+    "wp_scaffold_block",
+    "wp_quality_gate",
+})
+
+
+def _software_dev_family_enabled(config: Config, *, family: str) -> bool:
+    """Return whether a software-dev tool family is enabled."""
+    execution = config.execution
+    if bool(getattr(execution, "enable_software_dev_tools", False)):
+        return True
+    if family == "agent":
+        return bool(getattr(execution, "enable_agent_tools", False))
+    if family == "wordpress":
+        return bool(getattr(execution, "enable_wp_tools", False))
+    return False
 
 
 def _tool_catalog_category(name: str) -> str:
@@ -75,13 +98,20 @@ def _bind_hybrid_fallback_tools(registry: ToolRegistry) -> None:
                 if not isinstance(parameters, dict):
                     parameters = {}
                 tool = registry.get(name)
+                auth_requirements = getattr(tool, "auth_requirements", [])
+                if not isinstance(auth_requirements, list):
+                    auth_requirements = []
                 rows.append({
                     "name": name,
                     "summary": " ".join(description.split()),
                     "description": description,
                     "parameters": parameters,
                     "mutates": bool(getattr(tool, "is_mutating", False)),
-                    "auth_required": bool(getattr(tool, "auth_requirements", [])),
+                    "auth_mode": normalize_tool_auth_mode(
+                        getattr(tool, "auth_mode", "no_auth"),
+                    ),
+                    "auth_required": tool_auth_required(tool),
+                    "auth_requirements": list(auth_requirements),
                     "category": _tool_catalog_category(name),
                 })
             rows.sort(key=lambda item: str(item.get("name", "")))
@@ -172,21 +202,12 @@ def create_default_registry(
     """
     registry = ToolRegistry()
     for tool_cls in discover_tools():
-        if (
-            config is not None
-            and getattr(tool_cls, "name", "") == "delegate_task"
-        ):
-            timeout_seconds = int(
-                getattr(
-                    config.execution,
-                    "delegate_task_timeout_seconds",
-                    3600,
-                ) or 3600
-            )
-            timeout_seconds = max(1, timeout_seconds)
-            registry.register(tool_cls(timeout_seconds=timeout_seconds))
+        instance = _instantiate_tool(tool_cls, config)
+        if instance is None:
             continue
-        registry.register(tool_cls())
+        if config is not None and not _tool_enabled_for_config(instance.name, config):
+            continue
+        registry.register(instance)
 
     if config and config.mcp.servers:
         try:
@@ -205,3 +226,75 @@ def create_default_registry(
 
     _bind_hybrid_fallback_tools(registry)
     return registry
+
+
+def _tool_enabled_for_config(name: str, config: Config) -> bool:
+    """Gate optional tool families behind explicit execution flags."""
+    if name in _AGENT_TOOL_NAMES:
+        return _software_dev_family_enabled(config, family="agent")
+    if name in _WORDPRESS_TOOL_NAMES:
+        return _software_dev_family_enabled(config, family="wordpress")
+    return True
+
+
+def _instantiate_tool(tool_cls: type[Tool], config: Config | None) -> Tool | None:
+    """Instantiate tool classes with config-aware constructor overrides."""
+    class_name = str(getattr(tool_cls, "__name__", "") or "")
+    if config is None:
+        return tool_cls()
+
+    if class_name == "DelegateTaskTool":
+        timeout_seconds = int(
+            getattr(
+                config.execution,
+                "delegate_task_timeout_seconds",
+                3600,
+            ) or 3600
+        )
+        timeout_seconds = max(1, timeout_seconds)
+        return tool_cls(timeout_seconds=timeout_seconds)
+
+    if class_name in {"OpenAICodexTool", "ClaudeCodeTool", "OpenCodeTool"}:
+        return tool_cls(
+            enabled=_software_dev_family_enabled(config, family="agent"),
+            allowed_providers=list(
+                getattr(
+                    config.execution,
+                    "agent_tools_allowed_providers",
+                    ["codex", "claude_code", "opencode"],
+                ) or ["codex", "claude_code", "opencode"],
+            ),
+            max_timeout_seconds=int(
+                getattr(
+                    config.execution,
+                    "agent_tools_max_timeout_seconds",
+                    1800,
+                ) or 1800,
+            ),
+            default_network_mode=str(
+                getattr(
+                    config.execution,
+                    "agent_tools_default_network_mode",
+                    "on",
+                ) or "on",
+            ),
+        )
+
+    if class_name == "WpCliTool":
+        return tool_cls(
+            enabled=_software_dev_family_enabled(config, family="wordpress"),
+            high_risk_requires_confirmation=bool(
+                getattr(
+                    config.execution,
+                    "wp_high_risk_requires_confirmation",
+                    True,
+                ),
+            ),
+        )
+
+    if class_name in {"WpEnvTool", "WpScaffoldBlockTool", "WpQualityGateTool"}:
+        return tool_cls(
+            enabled=_software_dev_family_enabled(config, family="wordpress"),
+        )
+
+    return tool_cls()

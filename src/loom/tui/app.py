@@ -151,6 +151,11 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         canonical="/auth",
         description="open auth manager (use CLI for scriptable auth operations)",
     ),
+    SlashCommandSpec(
+        canonical="/tool",
+        usage="<tool-name> [key=value ... | json-object-args]",
+        description="run a tool directly with key=value or JSON arguments",
+    ),
     SlashCommandSpec(canonical="/tools", description="list available tools"),
     SlashCommandSpec(canonical="/tokens", description="show session token usage"),
     SlashCommandSpec(canonical="/session", description="show current session info"),
@@ -223,6 +228,7 @@ _SLASH_COMMAND_PRIORITY: dict[str, int] = {
     "/mcp": 30,
     "/auth": 31,
     "/tools": 32,
+    "/tool": 33,
     "/model": 40,
     "/models": 41,
     "/tokens": 42,
@@ -1732,6 +1738,252 @@ class LoomApp(App):
             return shlex.split(raw)
         except ValueError as e:
             raise ValueError(f"Invalid quoted argument syntax: {e}") from e
+
+    @staticmethod
+    def _split_tool_slash_args(raw: str) -> tuple[str, str]:
+        """Split `/tool` args into (tool_name, raw_json_args)."""
+        text = str(raw or "").strip()
+        if not text:
+            return "", ""
+        parts = text.split(None, 1)
+        tool_name = str(parts[0] or "").strip()
+        json_args = str(parts[1] or "").strip() if len(parts) > 1 else ""
+        return tool_name, json_args
+
+    @staticmethod
+    def _parse_tool_kv_value(raw_value: str) -> Any:
+        """Parse one `/tool` key=value literal into a typed JSON-compatible value."""
+        text = str(raw_value or "")
+        lowered = text.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        if lowered == "null":
+            return None
+
+        if re.fullmatch(r"[+-]?\d+", text):
+            try:
+                return int(text)
+            except ValueError:
+                pass
+        if re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", text):
+            try:
+                return float(text)
+            except ValueError:
+                pass
+
+        if text.startswith(("{", "[", '"')) or text in {"{}", "[]"}:
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
+        return text
+
+    def _parse_tool_slash_arguments(self, raw: str) -> tuple[dict[str, Any] | None, str]:
+        """Parse `/tool` arguments from either JSON object or key=value pairs."""
+        text = str(raw or "").strip()
+        if not text:
+            return {}, ""
+
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as e:
+                return None, f"Invalid /tool JSON arguments: {e}"
+            if parsed is None:
+                return {}, ""
+            if not isinstance(parsed, dict):
+                return None, "/tool arguments must be a JSON object."
+            return parsed, ""
+
+        try:
+            tokens = self._split_slash_args(text)
+        except ValueError as e:
+            return None, str(e)
+
+        parsed_pairs: dict[str, Any] = {}
+        for token in tokens:
+            if "=" not in token:
+                return (
+                    None,
+                    (
+                        f"Invalid /tool argument '{token}'. "
+                        "Use key=value pairs or a JSON object."
+                    ),
+                )
+            key, raw_value = token.split("=", 1)
+            key = str(key or "").strip()
+            if not key:
+                return None, "Invalid /tool argument key in key=value pair."
+            parsed_pairs[key] = self._parse_tool_kv_value(raw_value)
+        return parsed_pairs, ""
+
+    def _tool_name_inventory(self) -> list[str]:
+        """Return sorted available tool names for slash helper/completion."""
+        try:
+            names = self._tools.list_tools()
+        except Exception:
+            names = []
+        normalized = {
+            str(name or "").strip()
+            for name in names
+            if str(name or "").strip()
+        }
+        return sorted(normalized)
+
+    def _tool_description(self, tool_name: str) -> str:
+        """Return compact tool description text."""
+        tool = self._tools.get(str(tool_name or "").strip())
+        if tool is None:
+            return ""
+        return " ".join(str(getattr(tool, "description", "") or "").split())
+
+    def _tool_parameters_schema(self, tool_name: str) -> dict[str, Any]:
+        """Return JSON-schema-like parameters object for a tool when available."""
+        tool = self._tools.get(str(tool_name or "").strip())
+        if tool is None:
+            return {}
+        raw = getattr(tool, "parameters", {})
+        if isinstance(raw, dict):
+            return raw
+        try:
+            schema = tool.schema()
+        except Exception:
+            return {}
+        payload = schema.get("parameters", {}) if isinstance(schema, dict) else {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _tool_argument_lists(parameters: dict[str, Any]) -> tuple[list[str], list[str]]:
+        """Return (required, optional) argument names from tool parameters schema."""
+        required_raw = parameters.get("required", []) if isinstance(parameters, dict) else []
+        required: list[str] = []
+        for item in required_raw if isinstance(required_raw, list) else []:
+            name = str(item or "").strip()
+            if name:
+                required.append(name)
+
+        properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+        optional: list[str] = []
+        if isinstance(properties, dict):
+            for key in properties.keys():
+                name = str(key or "").strip()
+                if name and name not in required:
+                    optional.append(name)
+        return required, optional
+
+    @staticmethod
+    def _tool_argument_placeholder(schema: dict[str, Any]) -> str:
+        """Return a JSON literal placeholder for a schema property."""
+        if not isinstance(schema, dict):
+            return '"value"'
+        enum_values = schema.get("enum")
+        if isinstance(enum_values, list) and enum_values:
+            try:
+                return json.dumps(enum_values[0], ensure_ascii=False)
+            except (TypeError, ValueError):
+                return '"value"'
+        schema_type = schema.get("type", "")
+        if isinstance(schema_type, list):
+            schema_type = next(
+                (str(item or "").strip() for item in schema_type if str(item or "").strip()),
+                "",
+            )
+        schema_type = str(schema_type or "").strip().lower()
+        if schema_type in {"integer", "number"}:
+            return "0"
+        if schema_type == "boolean":
+            return "false"
+        if schema_type == "array":
+            return "[]"
+        if schema_type == "object":
+            return "{}"
+        if schema_type == "null":
+            return "null"
+        return '"value"'
+
+    def _tool_argument_example(self, tool_name: str, *, max_fields: int = 4) -> str:
+        """Build a compact JSON example payload for `/tool` hints."""
+        parameters = self._tool_parameters_schema(tool_name)
+        properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+        if not isinstance(properties, dict) or not properties:
+            return "{}"
+        required, optional = self._tool_argument_lists(parameters)
+        ordered = [*required, *[name for name in optional if name not in required]]
+        if not ordered:
+            ordered = [
+                str(key or "").strip()
+                for key in properties.keys()
+                if str(key or "").strip()
+            ]
+        if not ordered:
+            return "{}"
+        pairs: list[str] = []
+        truncated = False
+        for index, key in enumerate(ordered):
+            if index >= max_fields:
+                truncated = True
+                break
+            schema = properties.get(key, {})
+            placeholder = self._tool_argument_placeholder(
+                schema if isinstance(schema, dict) else {},
+            )
+            pairs.append(f"{json.dumps(key)}: {placeholder}")
+        if truncated:
+            pairs.append('"...": "..."')
+        return "{ " + ", ".join(pairs) + " }"
+
+    def _tool_argument_summary(self, tool_name: str) -> tuple[str, str]:
+        """Return required/optional argument summary strings for UI hints."""
+        parameters = self._tool_parameters_schema(tool_name)
+        required, optional = self._tool_argument_lists(parameters)
+        required_text = ", ".join(required) if required else "(none)"
+        optional_text = ", ".join(optional[:8]) if optional else "(none)"
+        if optional and len(optional) > 8:
+            optional_text += ", ..."
+        return required_text, optional_text
+
+    async def _execute_slash_tool_command(
+        self,
+        resolved_tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> None:
+        """Execute `/tool` via run_tool and render output in chat."""
+        chat = self.query_one("#chat-log", ChatLog)
+        auth_context = (
+            getattr(self._session, "_auth_context", None)
+            if self._session is not None
+            else None
+        )
+        start = time.monotonic()
+        result = await self._tools.execute(
+            "run_tool",
+            {"name": resolved_tool_name, "arguments": tool_args},
+            workspace=self._workspace,
+            scratch_dir=self._cowork_scratch_dir(),
+            auth_context=auth_context,
+        )
+        elapsed_ms = max(0, int((time.monotonic() - start) * 1000))
+        chat.add_tool_call(
+            "run_tool",
+            {"name": resolved_tool_name, "arguments": tool_args},
+            tool_call_id=f"slash-tool-{uuid.uuid4().hex[:12]}",
+            success=bool(getattr(result, "success", False)),
+            elapsed_ms=elapsed_ms,
+            output=str(getattr(result, "output", "") or ""),
+            error=str(getattr(result, "error", "") or ""),
+        )
+        if bool(getattr(result, "success", False)):
+            changed = self._ingest_files_panel_from_paths(
+                getattr(result, "files_changed", []),
+                operation_hint=self._operation_hint_for_tool(resolved_tool_name),
+            )
+            if changed > 0:
+                s = "s" if changed != 1 else ""
+                self.notify(f"{changed} file{s} changed", timeout=3)
+            if self._is_mutating_tool(resolved_tool_name):
+                self._request_workspace_refresh("slash-tool")
 
     @staticmethod
     def _truncate_run_goal_file_content(content: str) -> tuple[str, bool]:
@@ -5109,8 +5361,15 @@ class LoomApp(App):
         chat.set_stream_flush_interval_ms(self._tui_chat_stream_flush_interval_ms())
 
         # Build a clean registry once at session initialization.
-        self._refresh_tool_registry()
-        self._refresh_process_command_index(chat=chat, notify_conflicts=True)
+        # Keep startup responsive by moving registry construction off the UI loop.
+        await asyncio.to_thread(self._refresh_tool_registry)
+        # Process command discovery can hit disk; refresh in background.
+        self._refresh_process_command_index(
+            chat=chat,
+            notify_conflicts=True,
+            background=True,
+            force=True,
+        )
 
         # Ensure persistence-dependent tools are present and tracked.
         self._ensure_persistence_tools()
@@ -8019,6 +8278,115 @@ class LoomApp(App):
             f"  [bold]{self._escape_markup(command)}[/bold] {self._escape_markup(usage)}"
         )
 
+    def _render_tool_slash_hint(self, raw_input: str) -> str | None:
+        """Render helper popup text for `/tool` command composition."""
+        raw = str(raw_input or "")
+        stripped = raw.strip()
+        lowered = stripped.lower()
+        if not (lowered == "/tool" or lowered.startswith("/tool ")):
+            return None
+
+        tool_names = self._tool_name_inventory()
+        if not tool_names:
+            return (
+                "[bold #7dcfff]/tool[/]\n"
+                "  [dim]No tools are currently available.[/dim]"
+            )
+
+        remainder = stripped[len("/tool"):].strip()
+        if not remainder:
+            lines = [
+                "[bold #7dcfff]/tool[/] [dim]<tool-name> "
+                "\\[key=value ... | json-object-args\\][/]",
+                "  [dim]KV example:[/] /tool read_file path=README.md",
+                "  [dim]JSON example:[/] /tool read_file "
+                "{ \"path\": \"README.md\" }",
+                "",
+                "[bold #7dcfff]Tool names:[/]",
+            ]
+            for name in tool_names:
+                desc = self._tool_description(name)
+                safe_name = self._escape_markup(name)
+                safe_desc = self._escape_markup(desc) if desc else "no description"
+                lines.append(f"  [#73daca]{safe_name}[/] {safe_desc}")
+            return "\n".join(lines)
+
+        tool_token, raw_args = self._split_tool_slash_args(remainder)
+        prefix = self._strip_wrapping_quotes(tool_token).lower()
+        matches = [name for name in tool_names if name.lower().startswith(prefix)]
+        if not matches:
+            return (
+                f"[#f7768e]No tool matches '{self._escape_markup(tool_token)}'[/]\n"
+                "  [dim]Use /tools to inspect available tools.[/dim]"
+            )
+
+        exact = next((name for name in matches if name.lower() == prefix), "")
+        if exact:
+            description = self._tool_description(exact)
+            required_text, optional_text = self._tool_argument_summary(exact)
+            example = self._tool_argument_example(exact)
+            lines = [f"[bold #7dcfff]Tool: {self._escape_markup(exact)}[/]"]
+            if description:
+                lines.append(f"  {self._escape_markup(description)}")
+            lines.append(f"  [bold]Required:[/] {self._escape_markup(required_text)}")
+            lines.append(f"  [bold]Optional:[/] {self._escape_markup(optional_text)}")
+            lines.append(
+                "  [bold]Example:[/] "
+                f"/tool {self._escape_markup(exact)} "
+                f"{self._escape_markup(example)}"
+            )
+            if "path" in required_text:
+                lines.append(
+                    "  [bold]KV try:[/] "
+                    f"/tool {self._escape_markup(exact)} path=README.md"
+                )
+            if raw_args:
+                lines.append("  [dim]Press Enter to run with current JSON args.[/dim]")
+            return "\n".join(lines)
+
+        lines = [
+            f"[bold #7dcfff]Matching tools for {self._escape_markup(tool_token)}:[/]"
+        ]
+        for name in matches:
+            required_text, _optional_text = self._tool_argument_summary(name)
+            required_preview = required_text
+            if len(required_preview) > 48:
+                required_preview = required_preview[:45].rstrip() + "..."
+            lines.append(
+                "  "
+                f"[#73daca]{self._escape_markup(name)}[/] "
+                f"[dim](required: {self._escape_markup(required_preview)})[/]"
+            )
+        return "\n".join(lines)
+
+    def _tool_name_completion_candidates(
+        self,
+        raw_input: str,
+    ) -> tuple[str, list[str]] | None:
+        """Return seed/candidates for `/tool <name>` tab completion."""
+        current = str(raw_input or "").lstrip()
+        lowered = current.lower()
+        if not lowered.startswith("/tool"):
+            return None
+        if lowered == "/tool":
+            return None
+        if not lowered.startswith("/tool "):
+            return None
+
+        remainder = current[len("/tool"):].lstrip()
+        if not remainder:
+            prefix = ""
+        else:
+            if " " in remainder:
+                return None
+            prefix = self._strip_wrapping_quotes(remainder)
+
+        names = self._tool_name_inventory()
+        matches = [name for name in names if name.lower().startswith(prefix.lower())]
+        candidates = [f"/tool {name}" for name in matches]
+        seed = f"/tool {prefix}" if prefix else "/tool "
+        return seed, candidates
+
     def _matching_slash_commands(
         self,
         raw_input: str,
@@ -8202,19 +8570,47 @@ class LoomApp(App):
     def _apply_slash_tab_completion(self, *, reverse: bool = False) -> bool:
         """Apply slash tab completion (forward/backward)."""
         input_widget = self.query_one("#user-input", Input)
-        current = input_widget.value.strip()
+        raw_current = str(input_widget.value or "")
+        current = raw_current.lstrip()
         if not current.startswith("/"):
             self._reset_slash_tab_cycle()
             return False
 
-        token = current
-        if " " in current:
+        tool_seed_candidates = self._tool_name_completion_candidates(raw_current)
+        if tool_seed_candidates is not None:
+            token, candidates = tool_seed_candidates
+            if not candidates:
+                self._reset_slash_tab_cycle()
+                return False
+            if current in self._slash_cycle_candidates:
+                cycle = self._slash_cycle_candidates
+                current_index = cycle.index(current)
+                next_index = (
+                    (current_index - 1) if reverse else (current_index + 1)
+                ) % len(cycle)
+            else:
+                self._slash_cycle_seed = token
+                self._slash_cycle_candidates = candidates
+                cycle = candidates
+                next_index = len(cycle) - 1 if reverse else 0
+            completion = cycle[next_index]
+            self._applying_slash_tab_completion = True
+            self._skip_slash_cycle_reset_once = True
+            try:
+                input_widget.value = completion
+                input_widget.cursor_position = len(completion)
+            finally:
+                self._applying_slash_tab_completion = False
+            return True
+
+        token = current.strip()
+        if " " in token:
             self._reset_slash_tab_cycle()
             return False
 
-        if current in self._slash_cycle_candidates:
+        if token in self._slash_cycle_candidates:
             candidates = self._slash_cycle_candidates
-            current_index = candidates.index(current)
+            current_index = candidates.index(token)
             next_index = (
                 (current_index - 1) if reverse else (current_index + 1)
             ) % len(candidates)
@@ -8242,6 +8638,9 @@ class LoomApp(App):
         if raw_input.strip() == "/":
             self._refresh_process_command_index(background=True)
             return self._render_root_slash_hint()
+        tool_hint = self._render_tool_slash_hint(raw_input)
+        if tool_hint is not None:
+            return tool_hint
         if " " in raw_input.strip():
             return ""
         token, matches = self._matching_slash_commands(raw_input)
@@ -9730,8 +10129,12 @@ class LoomApp(App):
     ) -> ApprovalDecision:
         """Show approval modal and wait for result."""
         preview = tool_args_preview(tool_name, args)
+        risk_info = args.get("_loom_risk_info")
+        if not isinstance(risk_info, dict):
+            risk_info = None
 
-        self._approval_event = asyncio.Event()
+        approval_event = asyncio.Event()
+        self._approval_event = approval_event
         self._approval_result = ApprovalDecision.DENY
 
         def handle_result(result: str) -> None:
@@ -9741,16 +10144,16 @@ class LoomApp(App):
                 self._approval_result = ApprovalDecision.APPROVE_ALL
             else:
                 self._approval_result = ApprovalDecision.DENY
-            if self._approval_event:
-                self._approval_event.set()
+            approval_event.set()
 
         self.push_screen(
-            ToolApprovalScreen(tool_name, preview),
+            ToolApprovalScreen(tool_name, preview, risk_info=risk_info),
             callback=handle_result,
         )
 
-        await self._approval_event.wait()
-        self._approval_event = None
+        await approval_event.wait()
+        if self._approval_event is approval_event:
+            self._approval_event = None
         return self._approval_result
 
     # ------------------------------------------------------------------
@@ -9889,6 +10292,25 @@ class LoomApp(App):
 
     def on_key(self, event: events.Key) -> None:
         """Handle user-input key captures (autocomplete + close-run shortcut)."""
+        active_screen = self.screen
+        if isinstance(active_screen, ToolApprovalScreen):
+            key = event.key.lower()
+            if key == "y":
+                active_screen.dismiss("approve")
+                event.stop()
+                event.prevent_default()
+                return
+            if key == "a":
+                active_screen.dismiss("approve_all")
+                event.stop()
+                event.prevent_default()
+                return
+            if key in {"n", "escape", "ctrl+c", "ctrl+z"}:
+                active_screen.dismiss("deny")
+                event.stop()
+                event.prevent_default()
+                return
+
         if event.key in {"ctrl+w", "ctrl+a", "ctrl+m"}:
             focused = self.focused
             if isinstance(focused, Input) and focused.id == "user-input":
@@ -10375,6 +10797,62 @@ class LoomApp(App):
             self.push_screen(
                 SetupScreen(), callback=self._on_setup_complete,
             )
+            return True
+        if token == "/tool":
+            raw_tool_name, raw_json_args = self._split_tool_slash_args(arg)
+            tool_name = self._strip_wrapping_quotes(raw_tool_name)
+            if not tool_name:
+                chat.add_info(
+                    self._render_slash_command_usage(
+                        "/tool",
+                        "<tool-name> [key=value ... | json-object-args]",
+                    )
+                )
+                return True
+
+            tool_args, parse_error = self._parse_tool_slash_arguments(raw_json_args)
+            if tool_args is None:
+                chat.add_info(
+                    "[bold #f7768e]"
+                    f"{self._escape_markup(parse_error)}[/]\n"
+                    + self._render_slash_command_usage(
+                        "/tool",
+                        "<tool-name> [key=value ... | json-object-args]",
+                    )
+                )
+                return True
+
+            available_tools = self._tool_name_inventory()
+            resolved_tool_name = next(
+                (name for name in available_tools if name.lower() == tool_name.lower()),
+                "",
+            )
+            if not resolved_tool_name:
+                suggestions = [
+                    name for name in available_tools
+                    if name.lower().startswith(tool_name.lower())
+                ]
+                message = (
+                    f"[bold #f7768e]Unknown tool:[/] {self._escape_markup(tool_name)}"
+                )
+                if suggestions:
+                    rendered = ", ".join(
+                        self._escape_markup(name)
+                        for name in suggestions
+                    )
+                    message += f"\n[dim]Matches: {rendered}[/dim]"
+                chat.add_info(message)
+                return True
+
+            tool_args = dict(tool_args)
+            if self.is_running:
+                self.run_worker(
+                    self._execute_slash_tool_command(resolved_tool_name, tool_args),
+                    group=f"slash-tool-command-{uuid.uuid4().hex[:8]}",
+                    exclusive=False,
+                )
+            else:
+                await self._execute_slash_tool_command(resolved_tool_name, tool_args)
             return True
         if token == "/tools":
             chat.add_info(self._render_tools_catalog())
@@ -12651,9 +13129,9 @@ class LoomApp(App):
         if not self.is_running:
             return
 
-        signature, overflow = self._compute_workspace_signature()
-        self._workspace_signature = signature
-        self._workspace_scan_overflow_notified = bool(overflow)
+        # Avoid blocking startup on a full workspace walk; first poll seeds this.
+        self._workspace_signature = None
+        self._workspace_scan_overflow_notified = False
 
         backend = self._tui_workspace_watch_backend()
         if backend == "native":

@@ -15,11 +15,30 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from loom.utils.latency import log_latency_event
 
 _MAX_MCP_AUTH_VIEW_CACHE_ENTRIES = 64
+_INTERNAL_TOOL_ARG_PREFIX = "_loom_"
+ToolAuthMode = Literal["no_auth", "optional_auth", "required_auth"]
+_VALID_TOOL_AUTH_MODES = frozenset({"no_auth", "optional_auth", "required_auth"})
+
+
+def normalize_tool_auth_mode(value: object) -> ToolAuthMode:
+    """Normalize auth posture to one of the supported mode literals."""
+    mode = str(value or "").strip().lower()
+    if mode in _VALID_TOOL_AUTH_MODES:
+        return mode  # type: ignore[return-value]
+    return "no_auth"
+
+
+def tool_auth_required(tool: object) -> bool:
+    """Return whether tool requires or can require credentials."""
+    mode = normalize_tool_auth_mode(getattr(tool, "auth_mode", "no_auth"))
+    if mode != "no_auth":
+        return True
+    return bool(getattr(tool, "auth_requirements", []))
 
 
 @dataclass
@@ -152,6 +171,14 @@ class Tool(ABC):
     def auth_requirements(self) -> list[dict[str, Any]]:
         """Optional auth requirements consumed during run preflight."""
         return []
+
+    @property
+    def auth_mode(self) -> ToolAuthMode:
+        """Auth posture declaration for this tool."""
+        declared = self.auth_requirements
+        if declared:
+            return "required_auth"
+        return "no_auth"
 
     @property
     def is_mutating(self) -> bool:
@@ -612,10 +639,41 @@ class ToolRegistry:
 
     def register(self, tool: Tool) -> None:
         """Register a tool. Raises if name conflicts."""
+        self._validate_tool_auth_contract(tool)
         with self._tools_lock:
             if tool.name in self._tools:
                 raise ValueError(f"Tool already registered: {tool.name}")
             self._tools[tool.name] = tool
+
+    @staticmethod
+    def _validate_tool_auth_contract(tool: Tool) -> None:
+        """Validate declared auth posture against requirements payload."""
+        mode_raw = getattr(tool, "auth_mode", "no_auth")
+        mode = str(mode_raw or "").strip().lower()
+        if mode not in _VALID_TOOL_AUTH_MODES:
+            raise ValueError(
+                f"Tool '{tool.name}' has invalid auth_mode={mode_raw!r}. "
+                "Expected one of: no_auth, optional_auth, required_auth.",
+            )
+        declared = getattr(tool, "auth_requirements", [])
+        if declared is None:
+            declared = []
+        if not isinstance(declared, list):
+            raise ValueError(
+                f"Tool '{tool.name}' auth_requirements must be a list, got "
+                f"{type(declared).__name__}.",
+            )
+        has_requirements = bool(declared)
+        if mode == "no_auth" and has_requirements:
+            raise ValueError(
+                f"Tool '{tool.name}' is auth_mode='no_auth' but declares "
+                "auth_requirements.",
+            )
+        if mode in {"optional_auth", "required_auth"} and not has_requirements:
+            raise ValueError(
+                f"Tool '{tool.name}' is auth_mode='{mode}' but does not declare "
+                "auth_requirements.",
+            )
 
     def get(self, name: str) -> Tool | None:
         with self._tools_lock:
@@ -659,6 +717,7 @@ class ToolRegistry:
         changelog: Any = None,
         subtask_id: str = "",
         auth_context: Any = None,
+        allow_internal_args: bool = False,
     ) -> ToolResult:
         """Execute a tool by name with timeout and context."""
         tool: Tool | None = None
@@ -704,6 +763,17 @@ class ToolRegistry:
                 continue
             normalized_read_roots.append(normalized)
 
+        normalized_arguments: dict
+        if isinstance(arguments, dict):
+            normalized_arguments = dict(arguments)
+        else:
+            normalized_arguments = {}
+        if not allow_internal_args:
+            normalized_arguments = self._sanitize_public_arguments(
+                name,
+                normalized_arguments,
+            )
+
         ctx = ToolContext(
             workspace=workspace,
             read_roots=normalized_read_roots,
@@ -715,7 +785,7 @@ class ToolRegistry:
 
         try:
             result = await asyncio.wait_for(
-                tool.execute(arguments, ctx),
+                tool.execute(normalized_arguments, ctx),
                 timeout=tool.timeout_seconds,
             )
             return result
@@ -727,6 +797,21 @@ class ToolRegistry:
             return ToolResult.fail(f"Safety violation: {e}")
         except Exception as e:
             return ToolResult.fail(f"Tool error: {type(e).__name__}: {e}")
+
+    @staticmethod
+    def _sanitize_public_arguments(tool_name: str, args: dict) -> dict:
+        """Strip reserved internal runtime controls from external tool args."""
+        cleaned: dict = {}
+        for key, value in args.items():
+            if str(key or "").startswith(_INTERNAL_TOOL_ARG_PREFIX):
+                continue
+            cleaned[key] = value
+
+        # wp high-risk confirmation is host-owned and not model/public controlled.
+        if str(tool_name or "").strip() == "wp_cli":
+            cleaned.pop("confirm_high_risk", None)
+
+        return cleaned
 
     def all_schemas(self, *, auth_context: Any = None) -> list[dict]:
         """Return all tool schemas for model consumption."""
