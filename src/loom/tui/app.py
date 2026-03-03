@@ -44,7 +44,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from rich.text import Text
 from textual import events, on, work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
@@ -10292,7 +10292,12 @@ class LoomApp(App):
 
     def on_key(self, event: events.Key) -> None:
         """Handle user-input key captures (autocomplete + close-run shortcut)."""
-        active_screen = self.screen
+        active_screen = None
+        try:
+            active_screen = self.screen
+        except ScreenStackError:
+            # Some unit tests invoke on_key() before mounting any screens.
+            active_screen = None
         if isinstance(active_screen, ToolApprovalScreen):
             key = event.key.lower()
             if key == "y":
