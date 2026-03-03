@@ -50,6 +50,17 @@ class TestDefaultConfig:
         assert config.execution.model_call_retry_max_delay_seconds == 8.0
         assert config.execution.model_call_retry_jitter_seconds == 0.25
         assert config.execution.cowork_tool_exposure_mode == "adaptive"
+        assert config.execution.enable_software_dev_tools is False
+        assert config.execution.enable_agent_tools is False
+        assert config.execution.enable_wp_tools is False
+        assert config.execution.wp_high_risk_requires_confirmation is True
+        assert config.execution.agent_tools_allowed_providers == [
+            "codex",
+            "claude_code",
+            "opencode",
+        ]
+        assert config.execution.agent_tools_max_timeout_seconds == 1800
+        assert config.execution.agent_tools_default_network_mode == "on"
 
     def test_default_verification(self):
         config = Config()
@@ -307,6 +318,36 @@ cowork_tool_exposure_mode = "wild-west"
 """)
         config = load_config(toml_file)
         assert config.execution.cowork_tool_exposure_mode == "adaptive"
+
+    def test_execution_software_tools_flags_loaded(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[execution]
+enable_software_dev_tools = true
+enable_agent_tools = true
+enable_wp_tools = true
+wp_high_risk_requires_confirmation = false
+agent_tools_allowed_providers = ["codex", "opencode"]
+agent_tools_max_timeout_seconds = 2400
+agent_tools_default_network_mode = "off"
+""")
+        config = load_config(toml_file)
+        assert config.execution.enable_software_dev_tools is True
+        assert config.execution.enable_agent_tools is True
+        assert config.execution.enable_wp_tools is True
+        assert config.execution.wp_high_risk_requires_confirmation is False
+        assert config.execution.agent_tools_allowed_providers == ["codex", "opencode"]
+        assert config.execution.agent_tools_max_timeout_seconds == 2400
+        assert config.execution.agent_tools_default_network_mode == "off"
+
+    def test_execution_agent_default_network_mode_invalid_falls_back(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[execution]
+agent_tools_default_network_mode = "maybe"
+""")
+        config = load_config(toml_file)
+        assert config.execution.agent_tools_default_network_mode == "on"
 
     def test_verification_policy_flags_loaded(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

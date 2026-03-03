@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from loom.config import Config, ExecutionConfig
 from loom.cowork.approval import (
     AUTO_APPROVED_TOOLS,
     ApprovalDecision,
@@ -140,6 +141,43 @@ class TestToolApprover:
         assert decision == ApprovalDecision.APPROVE
         cb.assert_not_called()
 
+    async def test_explicit_approval_ignores_always_allow(self):
+        cb = AsyncMock(return_value=ApprovalDecision.APPROVE)
+        approver = ToolApprover(prompt_callback=cb)
+        approver.approve_tool_always("shell_execute")
+
+        decision = await approver.check(
+            "shell_execute",
+            {
+                "command": "wp db reset --yes",
+                "_loom_require_explicit_approval": True,
+            },
+        )
+        assert decision == ApprovalDecision.APPROVE
+        cb.assert_called_once()
+
+    async def test_explicit_approval_does_not_persist_approve_all(self):
+        cb = AsyncMock(return_value=ApprovalDecision.APPROVE_ALL)
+        approver = ToolApprover(prompt_callback=cb)
+
+        first = await approver.check(
+            "shell_execute",
+            {
+                "command": "wp db reset --yes",
+                "_loom_require_explicit_approval": True,
+            },
+        )
+        second = await approver.check(
+            "shell_execute",
+            {
+                "command": "wp db reset --yes",
+                "_loom_require_explicit_approval": True,
+            },
+        )
+        assert first == ApprovalDecision.APPROVE
+        assert second == ApprovalDecision.APPROVE
+        assert cb.call_count == 2
+
 
 class TestFormatArgsPreview:
     def test_shell(self):
@@ -158,6 +196,16 @@ class TestFormatArgsPreview:
 
     def test_generic(self):
         assert _format_args_preview("unknown_tool", {"x": "hello"}) == "hello"
+
+    def test_risk_preview_uses_impact(self):
+        preview = _format_args_preview(
+            "shell_execute",
+            {
+                "command": "wp db reset --yes",
+                "_loom_risk_info": {"impact_preview": "wp db reset"},
+            },
+        )
+        assert preview == "wp db reset"
 
 
 # --- Integration: approval in CoworkSession ---
@@ -318,3 +366,138 @@ class TestSessionApproval:
         assert completed[0].result.success is False
         assert "shell_execute" in (completed[0].result.error or "")
         cb.assert_called_once_with("shell_execute", {"command": "echo hi"})
+
+    async def test_shell_runtime_confirmation_flag_is_ignored_from_model(self, workspace, tools):
+        """Model-supplied internal runtime flags must not bypass high-risk checks."""
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="tc1",
+                    name="shell_execute",
+                    arguments={
+                        "command": "wp db reset --yes",
+                        "_loom_high_risk_confirmed": True,
+                    },
+                )],
+                usage=TokenUsage(total_tokens=8),
+            ),
+            ModelResponse(
+                text="Done.",
+                usage=TokenUsage(total_tokens=3),
+            ),
+        ])
+
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            approver=None,
+        )
+
+        events = []
+        async for event in session.send("Run risky shell command"):
+            events.append(event)
+
+        completed = [
+            e for e in events
+            if isinstance(e, ToolCallEvent) and e.result is not None
+        ]
+        assert completed
+        assert completed[0].result is not None
+        assert completed[0].result.success is False
+        assert "requires explicit confirmation" in (completed[0].result.error or "")
+
+    async def test_wp_cli_confirmation_flag_is_ignored_from_model(self, workspace, monkeypatch):
+        """Model cannot self-confirm wp_cli high-risk operations in headless mode."""
+        monkeypatch.setattr("loom.tools.wp_cli.shutil.which", lambda _: "/usr/bin/wp")
+        tools = create_default_registry(
+            Config(execution=ExecutionConfig(enable_wp_tools=True)),
+        )
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="tc1",
+                    name="wp_cli",
+                    arguments={
+                        "group": "db",
+                        "action": "reset",
+                        "args": {},
+                        "confirm_high_risk": True,
+                    },
+                )],
+                usage=TokenUsage(total_tokens=8),
+            ),
+            ModelResponse(
+                text="Done.",
+                usage=TokenUsage(total_tokens=3),
+            ),
+        ])
+
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            approver=None,
+        )
+
+        events = []
+        async for event in session.send("Run risky wp_cli command"):
+            events.append(event)
+
+        completed = [
+            e for e in events
+            if isinstance(e, ToolCallEvent) and e.result is not None
+        ]
+        assert completed
+        assert completed[0].result is not None
+        assert completed[0].result.success is False
+        assert "high_risk_confirmation_required" in (
+            str((completed[0].result.data or {}).get("error_code"))
+        )
+
+    async def test_run_tool_cannot_bypass_shell_confirmation_flag(self, workspace, tools):
+        """run_tool delegated args should strip internal confirmation controls."""
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="tc1",
+                    name="run_tool",
+                    arguments={
+                        "name": "shell_execute",
+                        "arguments": {
+                            "command": "wp db reset --yes",
+                            "_loom_high_risk_confirmed": True,
+                        },
+                    },
+                )],
+                usage=TokenUsage(total_tokens=8),
+            ),
+            ModelResponse(
+                text="Done.",
+                usage=TokenUsage(total_tokens=3),
+            ),
+        ])
+
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            approver=None,
+            tool_exposure_mode="hybrid",
+        )
+
+        events = []
+        async for event in session.send("Run delegated risky shell command"):
+            events.append(event)
+
+        completed = [
+            e for e in events
+            if isinstance(e, ToolCallEvent) and e.result is not None
+        ]
+        assert completed
+        assert completed[0].result is not None
+        assert completed[0].result.success is False
+        assert "requires explicit confirmation" in (completed[0].result.error or "")

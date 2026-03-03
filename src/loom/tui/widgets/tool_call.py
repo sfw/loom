@@ -38,6 +38,24 @@ def tool_args_preview(tool_name: str, args: dict) -> str:
         return _trunc(args.get("question", ""), 60)
     if tool_name == "analyze_code":
         return _trunc(args.get("path", ""), 60)
+    if tool_name in {"openai_codex", "claude_code", "opencode"}:
+        prompt = str(args.get("prompt", "") or "").strip()
+        if not prompt:
+            return ""
+        return _trunc(prompt, 80)
+    if tool_name == "wp_cli":
+        group = str(args.get("group", "") or "").strip()
+        action = str(args.get("action", "") or "").strip()
+        return _trunc(f"{group} {action}".strip(), 60)
+    if tool_name == "wp_env":
+        return _trunc(str(args.get("operation", "") or "").strip(), 60)
+    if tool_name == "wp_scaffold_block":
+        return _trunc(str(args.get("name", "") or "").strip(), 60)
+    if tool_name == "wp_quality_gate":
+        checks = args.get("checks")
+        if isinstance(checks, list) and checks:
+            return _trunc(", ".join(str(c) for c in checks), 60)
+        return "default checks"
     for v in args.values():
         if isinstance(v, str) and v:
             return _trunc(v, 50)

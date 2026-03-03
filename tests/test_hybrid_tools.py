@@ -57,6 +57,8 @@ class TestListToolsTool:
         encoded = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         assert encoded <= 65_536
         assert "required_args" in payload["tools"][0]
+        assert "auth_mode" in payload["tools"][0]
+        assert payload["tools"][0]["auth_mode"] in {"no_auth", "required_auth"}
 
     async def test_compact_mode_fails_when_payload_budget_too_small(self):
         tool = ListToolsTool(catalog_provider=lambda _auth: _fake_rows(100))
@@ -78,6 +80,7 @@ class TestListToolsTool:
         assert payload["detail"] == "schema"
         assert len(payload["tools"]) == 1
         assert "parameters" in payload["tools"][0]
+        assert "auth_requirements" in payload["tools"][0]
 
     async def test_schema_mode_requires_narrow_filter(self):
         tool = ListToolsTool(catalog_provider=lambda _auth: _fake_rows(3))

@@ -90,6 +90,13 @@ Recommended two-model split:
 | `model_call_retry_base_delay_seconds` | `float` | `0.5` | Base exponential backoff delay. |
 | `model_call_retry_max_delay_seconds` | `float` | `8.0` | Max delay cap for retry backoff. |
 | `model_call_retry_jitter_seconds` | `float` | `0.25` | Added random jitter on retries. |
+| `enable_software_dev_tools` | `bool` | `false` | Enable both coding-agent and WordPress tool families with one flag. |
+| `enable_agent_tools` | `bool` | `false` | Enable external coding-agent tools (`openai_codex`, `claude_code`, `opencode`). |
+| `enable_wp_tools` | `bool` | `false` | Enable WordPress development tools (`wp_cli`, `wp_env`, scaffolding, quality gate). |
+| `wp_high_risk_requires_confirmation` | `bool` | `true` | Require explicit confirmation for high-risk WordPress operations. |
+| `agent_tools_allowed_providers` | `list[string]` | `["codex","claude_code","opencode"]` | Restrict which external agent providers are exposed. |
+| `agent_tools_max_timeout_seconds` | `int` | `1800` | Max allowed timeout for coding-agent tool calls. |
+| `agent_tools_default_network_mode` | `string` | `"on"` | Default network mode for coding-agent tool calls (`on` or `off`). |
 
 ### `[verification]`
 

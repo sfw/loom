@@ -177,6 +177,9 @@ class TestSystemEndpoints:
         assert isinstance(tools, list)
         assert len(tools) > 0
         assert "name" in tools[0]
+        assert "auth_mode" in tools[0]
+        assert "auth_required" in tools[0]
+        assert "auth_requirements" in tools[0]
 
     @pytest.mark.asyncio
     async def test_config(self, client):

@@ -10,6 +10,11 @@ from textual.screen import ModalScreen
 from textual.widgets import Label, Static
 
 
+def _escape_markup(value: object | None) -> str:
+    """Escape rich markup brackets in dynamic modal content."""
+    return str(value or "").replace("[", "\\[")
+
+
 class ToolApprovalScreen(ModalScreen[str]):
     """Prompt the user to approve a tool call.
 
@@ -23,6 +28,8 @@ class ToolApprovalScreen(ModalScreen[str]):
         Binding("a", "approve_all", "Always"),
         Binding("n", "deny", "No"),
         Binding("escape", "deny", "Cancel"),
+        Binding("ctrl+c", "deny", show=False),
+        Binding("ctrl+z", "deny", show=False),
     ]
 
     CSS = """
@@ -46,10 +53,16 @@ class ToolApprovalScreen(ModalScreen[str]):
     }
     """
 
-    def __init__(self, tool_name: str, args_preview: str) -> None:
+    def __init__(
+        self,
+        tool_name: str,
+        args_preview: str,
+        risk_info: dict | None = None,
+    ) -> None:
         super().__init__()
         self._tool_name = tool_name
         self._args_preview = args_preview
+        self._risk_info = risk_info if isinstance(risk_info, dict) else None
 
     def compose(self) -> ComposeResult:
         # Determine risk category for visual cue
@@ -62,13 +75,52 @@ class ToolApprovalScreen(ModalScreen[str]):
         elif risk == "delete":
             risk_label = " [#f7768e][delete][/]"
 
+        warning_block: list[Label] = []
+        if self._risk_info:
+            risk_level = _escape_markup(
+                str(self._risk_info.get("risk_level", "high") or "high").upper(),
+            )
+            action_class = _escape_markup(
+                self._risk_info.get("action_class", "destructive action")
+                or "destructive action",
+            )
+            impact_preview = _escape_markup(
+                str(self._risk_info.get("impact_preview", "") or "").strip(),
+            )
+            consequences = _escape_markup(
+                str(self._risk_info.get("consequences", "") or "").strip(),
+            )
+            warning_block = [
+                Label(
+                    f"[bold #f7768e]HIGH RISK: {risk_level}[/] [#f7768e]{action_class}[/]",
+                ),
+                Label(
+                    (
+                        f"[#e0af68]Impact:[/] {impact_preview}"
+                        if impact_preview
+                        else "[#e0af68]Impact:[/] Potential destructive changes"
+                    ),
+                ),
+                Label(
+                    (
+                        f"[#f7768e]Consequence:[/] {consequences}"
+                        if consequences
+                        else (
+                            "[#f7768e]Consequence:[/] "
+                            "Potential irreversible data loss."
+                        )
+                    ),
+                ),
+            ]
+
         yield Vertical(
             Label("[bold #e0af68]Approve tool call?[/]"),
             Label(
-                f"[bold #7dcfff]{self._tool_name}[/]{risk_label}"
+                f"[bold #7dcfff]{_escape_markup(self._tool_name)}[/]{risk_label}"
             ),
+            *warning_block,
             Static(
-                f"[dim]{self._args_preview}[/dim]",
+                f"[dim]{_escape_markup(self._args_preview)}[/dim]",
                 id="approval-args",
             ),
             Label(""),
@@ -103,7 +155,7 @@ class ToolApprovalScreen(ModalScreen[str]):
             event.stop()
             event.prevent_default()
             return
-        if key in {"n", "escape"}:
+        if key in {"n", "escape", "ctrl+c", "ctrl+z"}:
             self.dismiss("deny")
             event.stop()
             event.prevent_default()

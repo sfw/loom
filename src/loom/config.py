@@ -233,6 +233,15 @@ class ExecutionConfig:
     model_call_retry_max_delay_seconds: float = 8.0
     model_call_retry_jitter_seconds: float = 0.25
     cowork_tool_exposure_mode: str = "adaptive"  # full | adaptive | hybrid
+    enable_software_dev_tools: bool = False
+    enable_agent_tools: bool = False
+    enable_wp_tools: bool = False
+    wp_high_risk_requires_confirmation: bool = True
+    agent_tools_allowed_providers: list[str] = field(
+        default_factory=lambda: ["codex", "claude_code", "opencode"],
+    )
+    agent_tools_max_timeout_seconds: int = 1800
+    agent_tools_default_network_mode: str = "on"  # on | off
 
 
 @dataclass(frozen=True)
@@ -612,6 +621,26 @@ def _suffix_list_from(source: dict, key: str, default: list[str]) -> list[str]:
     return normalized or list(default)
 
 
+def _string_list_from(source: dict, key: str, default: list[str]) -> list[str]:
+    """Parse list[string] from config, allowing delimited strings."""
+    raw = source.get(key, default)
+    if isinstance(raw, str):
+        values = re.split(r"[,\n;]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = list(default)
+
+    cleaned: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if text not in cleaned:
+            cleaned.append(text)
+    return cleaned or list(default)
+
+
 def load_config(path: Path | None = None) -> Config:
     """Load configuration from a TOML file.
 
@@ -805,6 +834,44 @@ def load_config(path: Path | None = None) -> Config:
                 ),
             ).strip().lower()
         ),
+        enable_agent_tools=_bool_from(
+            exec_data,
+            "enable_agent_tools",
+            ExecutionConfig.enable_agent_tools,
+        ),
+        enable_software_dev_tools=_bool_from(
+            exec_data,
+            "enable_software_dev_tools",
+            ExecutionConfig.enable_software_dev_tools,
+        ),
+        enable_wp_tools=_bool_from(
+            exec_data,
+            "enable_wp_tools",
+            ExecutionConfig.enable_wp_tools,
+        ),
+        wp_high_risk_requires_confirmation=_bool_from(
+            exec_data,
+            "wp_high_risk_requires_confirmation",
+            ExecutionConfig.wp_high_risk_requires_confirmation,
+        ),
+        agent_tools_allowed_providers=_string_list_from(
+            exec_data,
+            "agent_tools_allowed_providers",
+            ExecutionConfig().agent_tools_allowed_providers,
+        ),
+        agent_tools_max_timeout_seconds=_int_from(
+            exec_data,
+            "agent_tools_max_timeout_seconds",
+            ExecutionConfig.agent_tools_max_timeout_seconds,
+            minimum=30,
+            maximum=3600,
+        ),
+        agent_tools_default_network_mode=str(
+            exec_data.get(
+                "agent_tools_default_network_mode",
+                ExecutionConfig.agent_tools_default_network_mode,
+            ),
+        ).strip().lower(),
     )
     completion_mode = execution.executor_completion_contract_mode
     if completion_mode not in {"off", "warn", "enforce"}:
@@ -815,12 +882,16 @@ def load_config(path: Path | None = None) -> Config:
     cowork_tool_exposure_mode = execution.cowork_tool_exposure_mode
     if cowork_tool_exposure_mode not in {"full", "adaptive", "hybrid"}:
         cowork_tool_exposure_mode = ExecutionConfig.cowork_tool_exposure_mode
+    agent_tools_default_network_mode = execution.agent_tools_default_network_mode
+    if agent_tools_default_network_mode not in {"on", "off"}:
+        agent_tools_default_network_mode = ExecutionConfig.agent_tools_default_network_mode
     execution = ExecutionConfig(
         **{
             **execution.__dict__,
             "executor_completion_contract_mode": completion_mode,
             "planner_degraded_mode": planner_mode,
             "cowork_tool_exposure_mode": cowork_tool_exposure_mode,
+            "agent_tools_default_network_mode": agent_tools_default_network_mode,
         },
     )
 

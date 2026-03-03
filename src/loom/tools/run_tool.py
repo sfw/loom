@@ -12,6 +12,29 @@ from collections.abc import Awaitable, Callable
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
 _DEFAULT_RUN_TOOL_TIMEOUT_SECONDS = 3600
+_INTERNAL_RUNTIME_PREFIX = "_loom_"
+_ALLOWED_PARENT_RUNTIME_KEYS = frozenset({
+    "_loom_parent_tool_call_id",
+    "_loom_parent_tool_name",
+})
+
+
+def _sanitize_delegated_arguments(tool_name: str, args: dict) -> dict:
+    """Drop reserved runtime controls from delegated run_tool payloads."""
+    cleaned: dict = {}
+    for key, value in args.items():
+        key_text = str(key or "")
+        if key_text.startswith(_INTERNAL_RUNTIME_PREFIX):
+            if key_text in _ALLOWED_PARENT_RUNTIME_KEYS:
+                cleaned[key_text] = value
+            continue
+        cleaned[key] = value
+
+    # High-risk confirmation is owned by the host approval path, not model args.
+    if str(tool_name or "").strip() == "wp_cli":
+        cleaned.pop("confirm_high_risk", None)
+
+    return cleaned
 
 
 class RunToolTool(Tool):
@@ -71,9 +94,10 @@ class RunToolTool(Tool):
             raw_arguments = {}
         if not isinstance(raw_arguments, dict):
             return ToolResult.fail("'arguments' must be an object.")
+        delegated_arguments = _sanitize_delegated_arguments(name, raw_arguments)
 
         try:
-            maybe_result = self._dispatcher(name, raw_arguments, ctx)
+            maybe_result = self._dispatcher(name, delegated_arguments, ctx)
             if inspect.isawaitable(maybe_result):
                 result = await maybe_result
             else:

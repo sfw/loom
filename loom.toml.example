@@ -52,6 +52,13 @@ enable_durable_task_runner = false
 enable_mutation_idempotency = false
 enable_slo_metrics = false
 cowork_tool_exposure_mode = "adaptive" # full | adaptive | hybrid
+enable_software_dev_tools = false
+enable_agent_tools = false
+enable_wp_tools = false
+wp_high_risk_requires_confirmation = true
+agent_tools_allowed_providers = ["codex", "claude_code", "opencode"]
+agent_tools_max_timeout_seconds = 1800
+agent_tools_default_network_mode = "on" # on | off
 
 [tui]
 chat_resume_page_size = 250
