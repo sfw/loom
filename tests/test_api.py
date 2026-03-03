@@ -706,7 +706,7 @@ class TestProcessField:
         assert "requires missing tool" in detail
         assert "definitely-missing-tool" in detail
 
-    def test_required_auth_resources_for_process_includes_allowed_tool_requirements(self):
+    def test_required_auth_resources_for_process_uses_required_tool_set_when_declared(self):
         from loom.api.routes import _required_auth_resources_for_process
 
         included_tool = SimpleNamespace(
@@ -715,6 +715,14 @@ class TestProcessField:
                     "provider": "ga_provider",
                     "source": "api",
                     "modes": ["api_key"],
+                }
+            ]
+        )
+        non_required_tool = SimpleNamespace(
+            auth_requirements=[
+                {
+                    "provider": "non_required_provider",
+                    "source": "api",
                 }
             ]
         )
@@ -729,12 +737,13 @@ class TestProcessField:
 
         process_def = SimpleNamespace(
             auth=SimpleNamespace(required=[{"provider": "notion", "source": "mcp"}]),
-            tools=SimpleNamespace(required=[], excluded=["tool_excluded"]),
+            tools=SimpleNamespace(required=["tool_included"], excluded=["tool_excluded"]),
         )
         registry = SimpleNamespace(
-            list_tools=lambda: ["tool_included", "tool_excluded"],
+            list_tools=lambda: ["tool_included", "tool_non_required", "tool_excluded"],
             get=lambda name: {
                 "tool_included": included_tool,
+                "tool_non_required": non_required_tool,
                 "tool_excluded": excluded_tool,
             }.get(name),
         )
@@ -749,6 +758,7 @@ class TestProcessField:
         }
         assert ("notion", "mcp") in selectors
         assert ("ga_provider", "api") in selectors
+        assert ("non_required_provider", "api") not in selectors
         assert ("should_not_appear", "api") not in selectors
 
 

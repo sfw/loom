@@ -54,7 +54,7 @@ from loom.state.evidence import (
     summarize_evidence_records,
 )
 from loom.state.memory import MemoryEntry, MemoryManager
-from loom.state.task_state import Subtask, Task, TaskStateManager
+from loom.state.task_state import Subtask, Task, TaskStateManager, TaskStatus
 from loom.tools.registry import ToolRegistry, ToolResult
 from loom.tools.workspace import ChangeLog
 from loom.utils.tokens import estimate_tokens
@@ -696,6 +696,25 @@ class SubtaskRunner:
                 ),
             )
         return max(0.0, float(deadline) - time.monotonic())
+
+    @staticmethod
+    def _task_status_text(task: Task) -> str:
+        """Normalize current task status to lowercase text."""
+        raw = getattr(task, "status", "")
+        if hasattr(raw, "value"):
+            raw = getattr(raw, "value")
+        return str(raw or "").strip().lower()
+
+    async def _wait_for_task_control_window(self, task: Task) -> bool:
+        """Block while paused; return False when cancellation is observed."""
+        while True:
+            status = self._task_status_text(task)
+            if status == TaskStatus.PAUSED.value:
+                await asyncio.sleep(0.1)
+                continue
+            if status == TaskStatus.CANCELLED.value:
+                return False
+            return True
 
     def _is_timeout_guard_active(self, remaining_seconds: float | None = None) -> bool:
         remaining = (
@@ -1449,6 +1468,9 @@ class SubtaskRunner:
         )
 
         for iteration in range(iteration_budget):
+            if not await self._wait_for_task_control_window(task):
+                interruption_reason = "Execution cancelled before completion."
+                break
             # Wall-clock timeout check
             remaining_seconds = self._remaining_subtask_seconds()
             if remaining_seconds <= 0:
@@ -1603,6 +1625,9 @@ class SubtaskRunner:
                 break
 
             if response.has_tool_calls():
+                if not await self._wait_for_task_control_window(task):
+                    interruption_reason = "Execution cancelled before completion."
+                    break
                 # Validate tool calls before execution
                 validation = self._validator.validate_tool_calls(
                     response,
@@ -1634,6 +1659,9 @@ class SubtaskRunner:
                 })
 
                 for tc in response.tool_calls:
+                    if not await self._wait_for_task_control_window(task):
+                        interruption_reason = "Execution cancelled before completion."
+                        break
                     self._emit_tool_event(
                         TOOL_CALL_STARTED, task.id, subtask.id,
                         tc.name, tc.arguments,
@@ -1795,6 +1823,8 @@ class SubtaskRunner:
                             tc.name, tool_result,
                         ),
                     })
+                if interruption_reason:
+                    break
 
                 # Anti-amnesia reminder
                 messages.append({

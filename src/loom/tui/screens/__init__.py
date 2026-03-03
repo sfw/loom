@@ -8,6 +8,7 @@ from loom.tui.screens.file_viewer import FileViewerScreen
 from loom.tui.screens.learned import LearnedScreen
 from loom.tui.screens.mcp_manager import MCPManagerModalScreen, MCPManagerScreen
 from loom.tui.screens.process_run_close import ProcessRunCloseScreen
+from loom.tui.screens.process_run_workspace import ProcessRunWorkspaceScreen
 from loom.tui.screens.setup import SetupScreen
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "MCPManagerModalScreen",
     "MCPManagerScreen",
     "ProcessRunCloseScreen",
+    "ProcessRunWorkspaceScreen",
     "SetupScreen",
 ]

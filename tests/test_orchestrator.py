@@ -2473,6 +2473,88 @@ class TestOrchestratorFinalize:
         assert task.status == TaskStatus.PLANNING
 
     @pytest.mark.asyncio
+    async def test_pause_blocks_subtask_runner_until_resume(self, tmp_path):
+        executor_model = AsyncMock()
+        executor_model.name = "mock-exec"
+        executor_model.complete = AsyncMock(side_effect=[
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-1",
+                        name="read_file",
+                        arguments={"path": "notes.md"},
+                    ),
+                ],
+                usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
+            ),
+            ModelResponse(
+                text="Done",
+                usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
+            ),
+        ])
+        planner_model = AsyncMock()
+        planner_model.name = "mock-plan"
+        planner_model.complete = AsyncMock(return_value=ModelResponse(
+            text=json.dumps({
+                "subtasks": [{"id": "s1", "description": "Only step"}],
+            }),
+            usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
+        ))
+
+        router = MagicMock(spec=ModelRouter)
+
+        def select_fn(tier=1, role="executor"):
+            if role == "planner":
+                return planner_model
+            return executor_model
+
+        router.select = MagicMock(side_effect=select_fn)
+
+        tools = _make_mock_tools()
+        first_tool_done = asyncio.Event()
+        release_first_tool = asyncio.Event()
+
+        async def _execute_tool(name, args, **kwargs):
+            first_tool_done.set()
+            await release_first_tool.wait()
+            return ToolResult.ok("ok")
+
+        tools.execute = AsyncMock(side_effect=_execute_tool)
+
+        orch = Orchestrator(
+            model_router=router,
+            tool_registry=tools,
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+
+        task = _make_task()
+        task.plan = Plan(subtasks=[Subtask(id="s1", description="Only step")])
+        task.status = TaskStatus.EXECUTING
+
+        run_task = asyncio.create_task(
+            orch.execute_task(task, reuse_existing_plan=True),
+        )
+        await asyncio.wait_for(first_tool_done.wait(), timeout=2.0)
+
+        orch.pause_task(task)
+        assert task.status == TaskStatus.PAUSED
+        release_first_tool.set()
+
+        await asyncio.sleep(0.3)
+        assert executor_model.complete.await_count == 1
+        assert run_task.done() is False
+
+        orch.resume_task(task)
+        result = await asyncio.wait_for(run_task, timeout=2.0)
+        assert result.status == TaskStatus.COMPLETED
+        assert executor_model.complete.await_count >= 2
+
+    @pytest.mark.asyncio
     async def test_failed_on_exception(self, tmp_path):
         """If an exception occurs during execution, task should be FAILED."""
         router = _make_mock_router(plan_response_text="bad")

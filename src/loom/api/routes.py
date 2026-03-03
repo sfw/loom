@@ -70,16 +70,26 @@ def _required_auth_resources_for_process(
             for item in (getattr(tools_cfg, "excluded", []) or [])
             if str(item).strip()
         }
+        required = {
+            str(item).strip()
+            for item in (getattr(tools_cfg, "required", []) or [])
+            if str(item).strip()
+        }
         list_tools = getattr(tool_registry, "list_tools", None)
         get_tool = getattr(tool_registry, "get", None)
         if callable(list_tools) and callable(get_tool):
-            for tool_name in sorted(
-                {
-                    str(name).strip()
-                    for name in list_tools()
-                    if str(name).strip() and str(name).strip() not in excluded
-                }
-            ):
+            if required:
+                candidate_tool_names = sorted(required - excluded)
+            else:
+                candidate_tool_names = sorted(
+                    {
+                        str(name).strip()
+                        for name in list_tools()
+                        if str(name).strip() and str(name).strip() not in excluded
+                    }
+                )
+
+            for tool_name in candidate_tool_names:
                 tool = get_tool(tool_name)
                 if tool is None:
                     continue
