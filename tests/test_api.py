@@ -9,7 +9,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from loom.api.engine import Engine
-from loom.config import Config, ProcessConfig
+from loom.config import Config, ExecutionConfig, ProcessConfig
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import EventBus
 from loom.events.webhook import WebhookDelivery
@@ -17,6 +17,7 @@ from loom.learning.manager import LearningManager
 from loom.models.router import ModelRouter
 from loom.prompts.assembler import PromptAssembler
 from loom.recovery.approval import ApprovalManager
+from loom.recovery.questions import QuestionManager
 from loom.state.memory import Database, MemoryManager
 from loom.state.task_state import (
     Plan,
@@ -78,7 +79,14 @@ def engine(
     mock_orchestrator,
 ):
     return Engine(
-        config=Config(),
+        config=Config(
+            execution=ExecutionConfig(
+                ask_user_v2_enabled=True,
+                ask_user_runtime_blocking_enabled=True,
+                ask_user_durable_state_enabled=True,
+                ask_user_api_enabled=True,
+            ),
+        ),
         orchestrator=mock_orchestrator,
         event_bus=event_bus,
         model_router=ModelRouter(),
@@ -88,6 +96,7 @@ def engine(
         prompt_assembler=PromptAssembler(),
         database=database,
         approval_manager=ApprovalManager(event_bus),
+        question_manager=QuestionManager(event_bus, memory_manager),
         webhook_delivery=WebhookDelivery(),
         learning_manager=LearningManager(database),
     )
@@ -120,7 +129,13 @@ async def client(app):
         yield c
 
 
-def _make_task(state_manager, task_id="test-1", goal="Test goal", status=TaskStatus.PENDING):
+def _make_task(
+    state_manager,
+    task_id="test-1",
+    goal="Test goal",
+    status=TaskStatus.PENDING,
+    metadata: dict | None = None,
+):
     """Create and persist a task for testing."""
     task = Task(
         id=task_id,
@@ -128,6 +143,7 @@ def _make_task(state_manager, task_id="test-1", goal="Test goal", status=TaskSta
         status=status,
         created_at="2025-01-01T00:00:00",
         updated_at="2025-01-01T00:00:00",
+        metadata=metadata or {},
     )
     state_manager.save(task)
     return task
@@ -182,6 +198,10 @@ class TestSystemEndpoints:
         assert "auth_mode" in tools[0]
         assert "auth_required" in tools[0]
         assert "auth_requirements" in tools[0]
+        assert "execution_surfaces" in tools[0]
+        ask_user = next((row for row in tools if row.get("name") == "ask_user"), None)
+        assert isinstance(ask_user, dict)
+        assert ask_user.get("execution_surfaces") == ["tui"]
 
     @pytest.mark.asyncio
     async def test_config(self, client):
@@ -234,6 +254,24 @@ class TestTaskCreate:
     async def test_create_task_missing_goal(self, client):
         response = await client.post("/tasks", json={})
         assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_create_task_forces_api_execution_surface(
+        self,
+        client,
+        state_manager,
+    ):
+        response = await client.post(
+            "/tasks",
+            json={
+                "goal": "Write hello world",
+                "metadata": {"execution_surface": "tui"},
+            },
+        )
+        assert response.status_code == 201
+        task_id = str(response.json()["task_id"])
+        task = state_manager.load(task_id)
+        assert task.metadata["execution_surface"] == "api"
 
     @pytest.mark.asyncio
     async def test_create_task_returns_structured_unresolved_auth_payload(
@@ -384,6 +422,218 @@ class TestTaskApprove:
             "approved": True,
         })
         assert response.status_code == 404
+
+
+class TestTaskQuestions:
+    @pytest.mark.asyncio
+    async def test_list_pending_questions(self, client, state_manager, memory_manager):
+        _make_task(
+            state_manager,
+            status=TaskStatus.EXECUTING,
+            metadata={"execution_surface": "tui"},
+        )
+        await memory_manager.upsert_pending_task_question(
+            question_id="q-1",
+            task_id="test-1",
+            subtask_id="s1",
+            request_payload={
+                "question_id": "q-1",
+                "question": "Choose stack",
+                "question_type": "single_choice",
+                "options": [
+                    {"id": "py", "label": "Python", "description": ""},
+                    {"id": "rs", "label": "Rust", "description": ""},
+                ],
+            },
+        )
+
+        response = await client.get("/tasks/test-1/questions")
+        assert response.status_code == 200
+        rows = response.json()
+        assert len(rows) == 1
+        assert rows[0]["question_id"] == "q-1"
+        assert rows[0]["status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_answer_question(self, client, state_manager, memory_manager):
+        _make_task(
+            state_manager,
+            status=TaskStatus.EXECUTING,
+            metadata={"execution_surface": "tui"},
+        )
+        await memory_manager.upsert_pending_task_question(
+            question_id="q-2",
+            task_id="test-1",
+            subtask_id="s1",
+            request_payload={
+                "question_id": "q-2",
+                "question": "Choose stack",
+                "question_type": "single_choice",
+                "allow_custom_response": False,
+                "options": [
+                    {"id": "py", "label": "Python", "description": ""},
+                    {"id": "rs", "label": "Rust", "description": ""},
+                ],
+            },
+        )
+
+        response = await client.post(
+            "/tasks/test-1/questions/q-2/answer",
+            json={
+                "selected_option_ids": ["py"],
+                "source": "api",
+                "answered_by": "qa",
+                "client_id": "test-client",
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "answered"
+        assert payload["answer_payload"]["selected_option_ids"] == ["py"]
+        assert payload["answer_payload"]["selected_labels"] == ["Python"]
+        assert payload["answer_payload"]["answered_by"] == "qa"
+        assert payload["answer_payload"]["client_id"] == "test-client"
+
+    @pytest.mark.asyncio
+    async def test_answer_question_unknown_returns_404(self, client, state_manager):
+        _make_task(
+            state_manager,
+            status=TaskStatus.EXECUTING,
+            metadata={"execution_surface": "tui"},
+        )
+        response = await client.post(
+            "/tasks/test-1/questions/missing/answer",
+            json={"custom_response": "hello"},
+        )
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_answer_non_pending_timeout_returns_409(
+        self,
+        client,
+        state_manager,
+        memory_manager,
+    ):
+        _make_task(
+            state_manager,
+            status=TaskStatus.EXECUTING,
+            metadata={"execution_surface": "tui"},
+        )
+        await memory_manager.upsert_pending_task_question(
+            question_id="q-3",
+            task_id="test-1",
+            subtask_id="s1",
+            request_payload={
+                "question_id": "q-3",
+                "question": "Provide details",
+                "question_type": "free_text",
+                "allow_custom_response": True,
+            },
+        )
+        await memory_manager.resolve_task_question(
+            task_id="test-1",
+            question_id="q-3",
+            status="timeout",
+            answer_payload={
+                "question_id": "q-3",
+                "response_type": "timeout",
+                "selected_option_ids": [],
+                "selected_labels": [],
+                "custom_response": "",
+                "answered_at": "2026-03-01T00:00:00+00:00",
+                "source": "policy_default",
+            },
+        )
+
+        response = await client.post(
+            "/tasks/test-1/questions/q-3/answer",
+            json={"custom_response": "late answer"},
+        )
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_duplicate_answer_submission_is_idempotent(
+        self,
+        client,
+        state_manager,
+        memory_manager,
+    ):
+        _make_task(
+            state_manager,
+            status=TaskStatus.EXECUTING,
+            metadata={"execution_surface": "tui"},
+        )
+        await memory_manager.upsert_pending_task_question(
+            question_id="q-4",
+            task_id="test-1",
+            subtask_id="s1",
+            request_payload={
+                "question_id": "q-4",
+                "question": "Choose stack",
+                "question_type": "single_choice",
+                "allow_custom_response": False,
+                "options": [
+                    {"id": "py", "label": "Python", "description": ""},
+                    {"id": "rs", "label": "Rust", "description": ""},
+                ],
+            },
+        )
+        await memory_manager.resolve_task_question(
+            task_id="test-1",
+            question_id="q-4",
+            status="answered",
+            answer_payload={
+                "question_id": "q-4",
+                "response_type": "single_choice",
+                "selected_option_ids": ["py"],
+                "selected_labels": ["Python"],
+                "custom_response": "",
+                "answered_at": "2026-03-01T00:00:00+00:00",
+                "source": "api",
+            },
+        )
+
+        response = await client.post(
+            "/tasks/test-1/questions/q-4/answer",
+            json={
+                "selected_option_ids": ["rs"],
+                "source": "api",
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "answered"
+        assert payload["answer_payload"]["selected_option_ids"] == ["py"]
+
+    @pytest.mark.asyncio
+    async def test_question_endpoints_blocked_for_non_tui_surface(
+        self,
+        client,
+        state_manager,
+        memory_manager,
+    ):
+        _make_task(
+            state_manager,
+            status=TaskStatus.EXECUTING,
+            metadata={"execution_surface": "cli"},
+        )
+        await memory_manager.upsert_pending_task_question(
+            question_id="q-cli",
+            task_id="test-1",
+            subtask_id="s1",
+            request_payload={
+                "question_id": "q-cli",
+                "question": "Should not be exposed",
+                "question_type": "free_text",
+            },
+        )
+        list_response = await client.get("/tasks/test-1/questions")
+        assert list_response.status_code == 409
+        answer_response = await client.post(
+            "/tasks/test-1/questions/q-cli/answer",
+            json={"custom_response": "nope"},
+        )
+        assert answer_response.status_code == 409
 
 
 class TestTaskFeedback:

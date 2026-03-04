@@ -40,6 +40,7 @@ from loom.tools.registry import (
     ToolRegistry,
     ToolResult,
     normalize_tool_auth_mode,
+    normalize_tool_execution_surfaces,
     tool_auth_required,
 )
 from loom.tools.shell import high_risk_command_metadata
@@ -1740,6 +1741,7 @@ class CoworkSession:
             scratch_dir=self._scratch_dir,
             auth_context=self._auth_context,
             allow_internal_args=True,
+            execution_surface="tui",
         )
         if (
             not result.success
@@ -1999,7 +2001,12 @@ class CoworkSession:
             return False
 
         tokens = set(re.findall(r"[a-z0-9_./+-]+", message))
-        available = set(self._tools.list_tools(auth_context=self._auth_context))
+        available = set(
+            self._tools.list_tools(
+                auth_context=self._auth_context,
+                execution_surface="tui",
+            ),
+        )
         mcp_aliases = {
             parts[1]
             for name in available
@@ -2024,7 +2031,12 @@ class CoworkSession:
 
     def _tool_names_for_turn(self, user_message: str) -> list[str]:
         """Choose intent-aware typed tool names for this turn (no fallback lane)."""
-        available = set(self._tools.list_tools(auth_context=self._auth_context))
+        available = set(
+            self._tools.list_tools(
+                auth_context=self._auth_context,
+                execution_surface="tui",
+            ),
+        )
         if not available:
             return []
 
@@ -2105,9 +2117,15 @@ class CoworkSession:
     def _tool_schemas_for_turn(self, user_message: str) -> list[dict]:
         """Return tool schemas for this turn according to exposure mode."""
         if self._tool_exposure_mode == "full":
-            return self._tools.all_schemas(auth_context=self._auth_context)
+            return self._tools.all_schemas(
+                auth_context=self._auth_context,
+                execution_surface="tui",
+            )
 
-        all_schemas = self._tools.all_schemas(auth_context=self._auth_context)
+        all_schemas = self._tools.all_schemas(
+            auth_context=self._auth_context,
+            execution_surface="tui",
+        )
         if not all_schemas:
             return []
 
@@ -2207,9 +2225,16 @@ class CoworkSession:
             return "mcp"
         return "other"
 
-    def _tool_catalog_rows(self, auth_context: Any | None = None) -> list[dict]:
+    def _tool_catalog_rows(
+        self,
+        auth_context: Any | None = None,
+        execution_surface: str = "tui",
+    ) -> list[dict]:
         """Build a compact list-tools catalog from currently available schemas."""
-        schemas = self._tools.all_schemas(auth_context=auth_context)
+        schemas = self._tools.all_schemas(
+            auth_context=auth_context,
+            execution_surface=execution_surface,
+        )
         rows: list[dict] = []
         for schema in schemas:
             name = str(schema.get("name", "")).strip()
@@ -2233,6 +2258,9 @@ class CoworkSession:
                 "auth_required": tool_auth_required(tool),
                 "auth_requirements": list(auth_requirements),
                 "category": self._tool_category(name),
+                "execution_surfaces": list(normalize_tool_execution_surfaces(
+                    schema.get("x_supported_execution_surfaces", []),
+                )),
             })
         rows.sort(key=lambda item: str(item.get("name", "")))
         return rows
@@ -2264,7 +2292,11 @@ class CoworkSession:
         ).strip()
 
         auth_context = getattr(ctx, "auth_context", self._auth_context)
-        if not self._tools.has(target, auth_context=auth_context):
+        if not self._tools.has(
+            target,
+            auth_context=auth_context,
+            execution_surface="tui",
+        ):
             return ToolResult.fail(f"Unknown tool: {target}")
 
         approval_args = self._prepare_tool_execute_arguments(
@@ -2301,6 +2333,7 @@ class CoworkSession:
             scratch_dir=self._scratch_dir,
             auth_context=auth_context,
             allow_internal_args=True,
+            execution_surface="tui",
         )
 
     # ------------------------------------------------------------------

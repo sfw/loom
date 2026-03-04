@@ -282,6 +282,29 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_task ON task_runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_task_runs_lease ON task_runs(lease_expires_at);
 
+-- Durable ask-user clarification lifecycle
+CREATE TABLE IF NOT EXISTS task_questions (
+    question_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    subtask_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',      -- pending|answered|timeout|cancelled
+    request_payload TEXT NOT NULL,               -- JSON
+    answer_payload TEXT,                         -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT,
+    timeout_at TEXT,
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_questions_task_status
+    ON task_questions(task_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_questions_task_subtask
+    ON task_questions(task_id, subtask_id, status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_questions_active_scope
+    ON task_questions(task_id, subtask_id)
+    WHERE status = 'pending';
+
 -- Retry lineage and remediation queue state
 CREATE TABLE IF NOT EXISTS subtask_attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

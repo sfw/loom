@@ -59,6 +59,7 @@ class TestListToolsTool:
         assert "required_args" in payload["tools"][0]
         assert "auth_mode" in payload["tools"][0]
         assert payload["tools"][0]["auth_mode"] in {"no_auth", "required_auth"}
+        assert "execution_surfaces" in payload["tools"][0]
 
     async def test_compact_mode_fails_when_payload_budget_too_small(self):
         tool = ListToolsTool(catalog_provider=lambda _auth: _fake_rows(100))

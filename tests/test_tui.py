@@ -381,6 +381,105 @@ class TestAskUserScreen:
         assert screen._question == "Pick one:"
         assert screen._options == ["Python", "Rust"]
 
+    def test_payload_single_choice_maps_numeric_selection(self):
+        screen = AskUserScreen(
+            "Pick one:",
+            question_type="single_choice",
+            option_items=[
+                {"id": "python", "label": "Python", "description": ""},
+                {"id": "rust", "label": "Rust", "description": ""},
+            ],
+            return_payload=True,
+        )
+        payload = screen._payload_answer("2")
+        assert isinstance(payload, dict)
+        assert payload["response_type"] == "single_choice"
+        assert payload["selected_option_ids"] == ["rust"]
+        assert payload["selected_labels"] == ["Rust"]
+
+    def test_payload_multi_choice_enforces_min_max(self):
+        screen = AskUserScreen(
+            "Pick two:",
+            question_type="multi_choice",
+            option_items=[
+                {"id": "a", "label": "A", "description": ""},
+                {"id": "b", "label": "B", "description": ""},
+                {"id": "c", "label": "C", "description": ""},
+            ],
+            min_selections=2,
+            max_selections=2,
+            return_payload=True,
+        )
+        assert screen._payload_answer("1") is None
+        payload = screen._payload_answer("1,2")
+        assert isinstance(payload, dict)
+        assert payload["response_type"] == "multi_choice"
+        assert payload["selected_option_ids"] == ["a", "b"]
+
+    def test_input_hidden_when_options_no_custom_response(self):
+        screen = AskUserScreen(
+            "Pick one:",
+            question_type="single_choice",
+            option_items=[
+                {"id": "python", "label": "Python", "description": ""},
+                {"id": "rust", "label": "Rust", "description": ""},
+            ],
+            allow_custom_response=False,
+            return_payload=True,
+        )
+        assert screen._show_input is False
+
+    def test_input_shown_when_options_allow_custom_response(self):
+        screen = AskUserScreen(
+            "Pick one:",
+            question_type="single_choice",
+            option_items=[
+                {"id": "python", "label": "Python", "description": ""},
+                {"id": "rust", "label": "Rust", "description": ""},
+            ],
+            allow_custom_response=True,
+            return_payload=True,
+        )
+        assert screen._show_input is True
+
+    def test_payload_from_selected_options_single_choice(self):
+        screen = AskUserScreen(
+            "Pick one:",
+            question_type="single_choice",
+            option_items=[
+                {"id": "python", "label": "Python", "description": ""},
+                {"id": "rust", "label": "Rust", "description": ""},
+            ],
+            allow_custom_response=False,
+            return_payload=True,
+        )
+        screen._selected_option_ids = ["rust"]
+        payload = screen._payload_from_selected_options()
+        assert isinstance(payload, dict)
+        assert payload["response_type"] == "single_choice"
+        assert payload["selected_option_ids"] == ["rust"]
+        assert payload["selected_labels"] == ["Rust"]
+
+    def test_payload_from_selected_options_multi_choice(self):
+        screen = AskUserScreen(
+            "Pick two:",
+            question_type="multi_choice",
+            option_items=[
+                {"id": "a", "label": "A", "description": ""},
+                {"id": "b", "label": "B", "description": ""},
+                {"id": "c", "label": "C", "description": ""},
+            ],
+            min_selections=2,
+            max_selections=2,
+            allow_custom_response=False,
+            return_payload=True,
+        )
+        screen._selected_option_ids = ["a", "b"]
+        payload = screen._payload_from_selected_options()
+        assert isinstance(payload, dict)
+        assert payload["response_type"] == "multi_choice"
+        assert payload["selected_option_ids"] == ["a", "b"]
+
 
 class TestExitConfirmScreen:
     def test_init(self):
@@ -2897,6 +2996,54 @@ class TestDelegateTaskUnbound:
         assert payload["event_data"]["subtask_id"] == "company-screening"
 
     @pytest.mark.asyncio
+    async def test_progress_callback_forwards_ask_user_events(self):
+        from loom.events.bus import Event, EventBus
+        from loom.events.types import ASK_USER_REQUESTED
+        from loom.state.task_state import TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        bus = EventBus()
+
+        async def _execute(task):
+            task.status = TaskStatus.EXECUTING
+            bus.emit(Event(
+                event_type=ASK_USER_REQUESTED,
+                task_id=task.id,
+                data={
+                    "subtask_id": "s1",
+                    "question_id": "q-1",
+                    "question": "Pick runtime",
+                    "question_type": "single_choice",
+                    "options": [
+                        {"id": "python", "label": "Python", "description": ""},
+                        {"id": "rust", "label": "Rust", "description": ""},
+                    ],
+                },
+            ))
+            task.status = TaskStatus.COMPLETED
+            return task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator._events = bus
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        progress: list[dict] = []
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+        result = await tool.execute(
+            {"goal": "Analyze Tesla", "_progress_callback": progress.append},
+            ctx,
+        )
+
+        assert result.success is True
+        events = [p for p in progress if p.get("event_type") == ASK_USER_REQUESTED]
+        assert events
+        assert events[0]["event_data"]["question_id"] == "q-1"
+
+    @pytest.mark.asyncio
     async def test_delegate_registers_and_clears_cancel_handler(self):
         from loom.state.task_state import TaskStatus
         from loom.tools.delegate_task import DelegateTaskTool
@@ -2939,6 +3086,7 @@ class TestDelegateTaskUnbound:
         assert callable(captured.get("pause"))
         assert callable(captured.get("resume"))
         assert callable(captured.get("inject"))
+        assert callable(captured.get("answer_question"))
         assert cleared == [True]
 
     @pytest.mark.asyncio
@@ -9454,6 +9602,118 @@ class TestProcessSlashCommands:
         assert "investment-analysis #abc123 Running" in summary_rows[0]["content"]
         chat.add_info.assert_not_called()
         events_panel.add_event.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_prompt_process_run_question_submits_answer(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        run = SimpleNamespace(
+            run_id="abc123",
+            closed=False,
+            status="running",
+        )
+        app._process_runs = {"abc123": run}
+        app._append_process_run_activity = MagicMock()
+        app._request_process_run_question_answer = AsyncMock(return_value={"requested": True})
+
+        def _push_screen(_screen, callback):
+            callback({
+                "response_type": "single_choice",
+                "selected_option_ids": ["python"],
+                "selected_labels": ["Python"],
+                "custom_response": "",
+                "source": "tui",
+            })
+
+        app.push_screen = _push_screen
+
+        await app._prompt_process_run_question(
+            run_id="abc123",
+            question_payload={
+                "question_id": "q1",
+                "subtask_id": "s1",
+                "question": "Pick language",
+                "question_type": "single_choice",
+                "options": [
+                    {"id": "python", "label": "Python", "description": ""},
+                    {"id": "rust", "label": "Rust", "description": ""},
+                ],
+            },
+        )
+
+        app._request_process_run_question_answer.assert_awaited_once()
+        _, kwargs = app._request_process_run_question_answer.await_args
+        assert kwargs["question_id"] == "q1"
+        assert kwargs["answer_payload"]["selected_option_ids"] == ["python"]
+        assert kwargs["answer_payload"]["source"] == "tui"
+
+    def test_process_progress_event_ask_user_requested_spawns_worker(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="investment-analysis",
+            goal="Analyze Tesla",
+            pane_id="tab-run-abc123",
+            pane=MagicMock(),
+            status="running",
+            task_id="",
+            started_at=0.0,
+            ended_at=None,
+            tasks=[],
+            last_progress_message="",
+            last_progress_at=0.0,
+            worker=None,
+            closed=False,
+            launch_last_progress_at=0.0,
+            launch_last_heartbeat_at=0.0,
+            launch_silent_warning_emitted=False,
+            launch_error="",
+            progress_ui_last_refresh_at=0.0,
+        )
+        app._process_runs = {"abc123": run}
+        app._refresh_process_run_progress = MagicMock()
+        app._refresh_process_run_outputs = MagicMock()
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._append_process_run_activity = MagicMock()
+        app._format_process_progress_event = MagicMock(return_value="Clarification requested.")
+        app.run_worker = MagicMock()
+        app.query_one = MagicMock(return_value=MagicMock())
+
+        app._on_process_progress_event(
+            {
+                "event_type": "ask_user_requested",
+                "event_data": {
+                    "question_id": "q-1",
+                    "subtask_id": "s1",
+                    "question": "Pick runtime",
+                    "question_type": "single_choice",
+                    "options": [
+                        {"id": "python", "label": "Python", "description": ""},
+                        {"id": "rust", "label": "Rust", "description": ""},
+                    ],
+                },
+                "status": "executing",
+                "tasks": [],
+            },
+            run_id="abc123",
+        )
+
+        assert app.run_worker.call_count == 1
+        assert "q-1" in app._process_run_seen_questions["abc123"]
+        coro = app.run_worker.call_args.args[0]
+        coro.close()
 
     def test_process_progress_keeps_stable_phase_labels(self):
         from loom.tui.app import LoomApp

@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from loom.cowork.session import CoworkTurn, ToolCallEvent
+from loom.tools.ask_user import normalize_ask_user_args
 
 
 # ANSI color codes
@@ -111,8 +112,9 @@ def _format_duration_ms(duration_ms: int) -> str:
 
 def display_ask_user(event: ToolCallEvent) -> str:
     """Display a question from the model and get user input."""
-    question = event.args.get("question", "")
-    options = event.args.get("options", [])
+    normalized = normalize_ask_user_args(event.args if isinstance(event.args, dict) else {})
+    question = str(normalized.get("question", "") or "")
+    options = list(normalized.get("legacy_options", []) or [])
 
     sys.stdout.write(f"\n{_C.YELLOW}{_C.BOLD}Question:{_C.RESET} {question}\n")
 

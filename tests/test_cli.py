@@ -230,7 +230,7 @@ class TestCLI:
         )
         assert result.exit_code == 0
         assert captured["process_name"] == "marketing-strategy"
-        assert captured["metadata"] is None
+        assert captured["metadata"] == {"execution_surface": "cli"}
 
     def test_run_passes_auth_profile_metadata(self, tmp_path, monkeypatch):
         """`loom run --auth-profile` should send metadata to API payload."""
@@ -302,6 +302,7 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         assert captured["process_name"] == "/tmp/adhoc-runtime.process.yaml"
         metadata = captured["metadata"]
         assert isinstance(metadata, dict)
+        assert metadata["execution_surface"] == "cli"
         assert metadata["auth_profile_overrides"] == {
             "notion": "notion_marketing"
         }

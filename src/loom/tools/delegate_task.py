@@ -21,7 +21,12 @@ from typing import TYPE_CHECKING
 
 from loom.auth.runtime import coerce_auth_requirements, serialize_auth_requirements
 from loom.state.task_state import SubtaskStatus, TaskStatus
-from loom.tools.registry import Tool, ToolContext, ToolResult
+from loom.tools.registry import (
+    Tool,
+    ToolContext,
+    ToolResult,
+    normalize_tool_execution_surface,
+)
 
 if TYPE_CHECKING:
     from loom.engine.orchestrator import Orchestrator
@@ -169,6 +174,10 @@ class DelegateTaskTool(Tool):
         auth_required_resources = serialize_auth_requirements(
             coerce_auth_requirements(args.get("_auth_required_resources")),
         )
+        execution_surface = normalize_tool_execution_surface(
+            args.get("_execution_surface", getattr(ctx, "execution_surface", "")),
+            default="tui",
+        )
         workspace = str(ctx.workspace) if ctx.workspace else ""
 
         # Fresh orchestrator per call to isolate concurrent delegated runs.
@@ -208,7 +217,11 @@ class DelegateTaskTool(Tool):
                 workspace,
                 context,
                 approval_mode=approval_mode,
+                execution_surface=execution_surface,
             )
+        if not isinstance(task.metadata, dict):
+            task.metadata = {}
+        task.metadata["execution_surface"] = execution_surface
         if read_roots:
             task.metadata["read_roots"] = read_roots
         if auth_profile_overrides:
@@ -663,6 +676,63 @@ class DelegateTaskTool(Tool):
                 "status": _task_status_text(task),
             }
 
+        async def _answer_orchestrator_question(
+            *,
+            question_id: str = "",
+            answer_payload: dict | None = None,
+        ) -> dict[str, object]:
+            clean_question_id = str(question_id or "").strip()
+            if not clean_question_id:
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": "Question ID is required.",
+                    "question_id": clean_question_id,
+                }
+            resolve_fn = getattr(orchestrator, "answer_question", None)
+            if not callable(resolve_fn):
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": "Orchestrator does not expose answer_question.",
+                    "question_id": clean_question_id,
+                }
+            payload = answer_payload if isinstance(answer_payload, dict) else {}
+            try:
+                maybe = resolve_fn(task.id, clean_question_id, payload)
+                resolved = await maybe if inspect.isawaitable(maybe) else maybe
+            except Exception as e:
+                error = str(e)
+                _log_event(
+                    "question_answer_failed",
+                    payload={
+                        "question_id": clean_question_id,
+                        "error_type": type(e).__name__,
+                        "error": error,
+                    },
+                )
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": error,
+                    "question_id": clean_question_id,
+                }
+            if not isinstance(resolved, dict):
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": "Question not found.",
+                    "question_id": clean_question_id,
+                }
+            status = str(resolved.get("status", "")).strip().lower()
+            return {
+                "requested": status != "pending",
+                "path": "orchestrator",
+                "error": "",
+                "question_id": clean_question_id,
+                "status": status,
+            }
+
         await _invoke_optional_callback(
             register_cancel_handler,
             {
@@ -671,6 +741,7 @@ class DelegateTaskTool(Tool):
                 "pause": _pause_orchestrator_task,
                 "resume": _resume_orchestrator_task,
                 "inject": _inject_orchestrator_task,
+                "answer_question": _answer_orchestrator_question,
             },
         )
 
@@ -694,6 +765,10 @@ class DelegateTaskTool(Tool):
                 ARTIFACT_INGEST_COMPLETED,
                 ARTIFACT_READ_COMPLETED,
                 ARTIFACT_RETENTION_PRUNED,
+                ASK_USER_ANSWERED,
+                ASK_USER_CANCELLED,
+                ASK_USER_REQUESTED,
+                ASK_USER_TIMEOUT,
                 COMPACTION_POLICY_DECISION,
                 MODEL_INVOCATION,
                 OVERFLOW_FALLBACK_APPLIED,
@@ -733,6 +808,10 @@ class DelegateTaskTool(Tool):
                 SUBTASK_COMPLETED,
                 SUBTASK_FAILED,
                 TASK_REPLANNING,
+                ASK_USER_REQUESTED,
+                ASK_USER_ANSWERED,
+                ASK_USER_TIMEOUT,
+                ASK_USER_CANCELLED,
                 TASK_CANCELLED,
                 TASK_COMPLETED,
                 TASK_FAILED,
@@ -923,6 +1002,7 @@ class DelegateTaskTool(Tool):
 def _create_task(
     goal: str, workspace: str, context: dict,
     approval_mode: str = "confidence_threshold",
+    execution_surface: str = "tui",
 ) -> Task:
     """Create a Task object for the orchestrator."""
     from loom.state.task_state import Task, TaskStatus
@@ -936,6 +1016,12 @@ def _create_task(
         status=TaskStatus.PENDING,
         approval_mode=approval_mode,
         created_at=datetime.now().isoformat(),
+        metadata={
+            "execution_surface": normalize_tool_execution_surface(
+                execution_surface,
+                default="tui",
+            ),
+        },
     )
 
 

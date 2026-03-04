@@ -116,6 +116,12 @@ class TestRegistry:
             assert "description" in s
             assert "parameters" in s
 
+    def test_surface_filtered_tool_lists(self, registry: ToolRegistry):
+        tui_names = set(registry.list_tools(execution_surface="tui"))
+        cli_names = set(registry.list_tools(execution_surface="cli"))
+        assert "ask_user" in tui_names
+        assert "ask_user" not in cli_names
+
     def test_discover_tools_finds_all_builtins(self):
         classes = discover_tools()
         names = {cls.__name__ for cls in classes}
@@ -254,6 +260,15 @@ class TestRegistry:
         result = await registry.execute("nonexistent", {})
         assert not result.success
         assert "Unknown tool" in result.error
+
+    async def test_execute_rejects_tool_on_unsupported_surface(self, registry: ToolRegistry):
+        result = await registry.execute(
+            "ask_user",
+            {"question": "Need input"},
+            execution_surface="cli",
+        )
+        assert result.success is False
+        assert "not available on execution surface" in str(result.error or "")
 
     async def test_execute_strips_internal_args_by_default(self):
         class _EchoTool(Tool):

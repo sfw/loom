@@ -17,7 +17,12 @@ import loom.tools as _pkg
 from loom.config import Config
 from loom.tools.registry import Tool as Tool
 from loom.tools.registry import ToolContext as ToolContext
-from loom.tools.registry import ToolRegistry, normalize_tool_auth_mode, tool_auth_required
+from loom.tools.registry import (
+    ToolRegistry,
+    normalize_tool_auth_mode,
+    normalize_tool_execution_surfaces,
+    tool_auth_required,
+)
 from loom.tools.registry import ToolResult as ToolResult
 from loom.tools.registry import ToolSafetyError as ToolSafetyError
 
@@ -87,9 +92,15 @@ def _bind_hybrid_fallback_tools(registry: ToolRegistry) -> None:
     """
     list_tools_tool = registry.get("list_tools")
     if list_tools_tool is not None and hasattr(list_tools_tool, "bind"):
-        def _catalog_provider(auth_context: Any | None = None) -> list[dict[str, Any]]:
+        def _catalog_provider(
+            auth_context: Any | None = None,
+            execution_surface: str = "tui",
+        ) -> list[dict[str, Any]]:
             rows: list[dict[str, Any]] = []
-            for schema in registry.all_schemas(auth_context=auth_context):
+            for schema in registry.all_schemas(
+                auth_context=auth_context,
+                execution_surface=execution_surface,
+            ):
                 name = str(schema.get("name", "")).strip()
                 if not name:
                     continue
@@ -113,6 +124,9 @@ def _bind_hybrid_fallback_tools(registry: ToolRegistry) -> None:
                     "auth_required": tool_auth_required(tool),
                     "auth_requirements": list(auth_requirements),
                     "category": _tool_catalog_category(name),
+                    "execution_surfaces": list(normalize_tool_execution_surfaces(
+                        schema.get("x_supported_execution_surfaces", []),
+                    )),
                 })
             rows.sort(key=lambda item: str(item.get("name", "")))
             return rows
@@ -139,7 +153,14 @@ def _bind_hybrid_fallback_tools(registry: ToolRegistry) -> None:
                 return ToolResult.fail("run_tool 'arguments' must be an object.")
 
             auth_context = getattr(ctx, "auth_context", None)
-            if not registry.has(target, auth_context=auth_context):
+            execution_surface = str(
+                getattr(ctx, "execution_surface", "") or "tui",
+            ).strip().lower() or "tui"
+            if not registry.has(
+                target,
+                auth_context=auth_context,
+                execution_surface=execution_surface,
+            ):
                 return ToolResult.fail(f"Unknown tool: {target}")
 
             return await registry.execute(
@@ -151,6 +172,7 @@ def _bind_hybrid_fallback_tools(registry: ToolRegistry) -> None:
                 changelog=ctx.changelog,
                 subtask_id=ctx.subtask_id,
                 auth_context=auth_context,
+                execution_surface=execution_surface,
             )
 
         try:

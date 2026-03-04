@@ -187,6 +187,24 @@ class TestExecutorPrompt:
         assert "jq -e . file.json" in prompt
         assert "Default deliverable location is the workspace root" in prompt
 
+    def test_executor_requires_ask_user_for_critical_unknowns(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+        state_manager: TaskStateManager,
+    ):
+        state_manager.create(sample_task)
+        subtask = sample_task.get_subtask("add-tsconfig")
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+        assert "call ask_user before proceeding" in prompt
+        assert "include an explicit options array" in prompt
+        assert "Do NOT encode answer options as bullet points" in prompt
+        assert "Set question_type explicitly" in prompt
+
     def test_executor_includes_memory(
         self,
         assembler: PromptAssembler,
