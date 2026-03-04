@@ -555,7 +555,7 @@ class ProcessRunPane(VerticalScroll):
         height: 1fr;
         min-height: 4;
         border: round $surface-lighten-1;
-        margin: 1 0 0 0;
+        margin: 0;
     }
     """
 

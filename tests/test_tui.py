@@ -2488,6 +2488,63 @@ class TestChatLogStreaming:
         assert log._stream_widget.expand is True
         assert mounted == [log._stream_widget]
 
+    def test_streaming_scrolls_on_mount_and_flush_only(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        log.mount = lambda *_args, **_kwargs: None
+        log._schedule_stream_flush = lambda: None
+        log._scroll_to_end = MagicMock()
+
+        # First chunk mounts stream widget, so one scroll.
+        log.add_streaming_text("a")
+        # Next three chunks are buffered only, no additional scroll.
+        log.add_streaming_text("b")
+        log.add_streaming_text("c")
+        log.add_streaming_text("d")
+        # Fifth buffered chunk flushes, so one more scroll.
+        log.add_streaming_text("e")
+
+        assert log._scroll_to_end.call_count == 2
+
+    def test_scroll_to_end_is_coalesced_per_refresh(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        log._auto_scroll = True
+        log._scroll_end_pending = False
+        scheduled: list = []
+        log.call_after_refresh = lambda callback, *_a, **_k: scheduled.append(callback)
+        log.scroll_end = MagicMock()
+
+        log._scroll_to_end()
+        log._scroll_to_end()
+
+        assert len(scheduled) == 1
+        scheduled[0]()
+        log.scroll_end.assert_called_once_with(animate=False, immediate=True)
+        assert log._scroll_end_pending is False
+
+    def test_watch_scroll_y_toggles_auto_follow_by_position(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        calls: list[tuple[float, float]] = []
+
+        # Ensure parent watch handler is still invoked.
+        log.show_vertical_scrollbar = False
+        log._refresh_scroll = lambda: calls.append((1.0, 2.0))
+
+        log._auto_scroll = True
+        log._is_near_bottom = lambda **_kwargs: False
+        log.watch_scroll_y(1.0, 2.0)
+        assert log._auto_scroll is False
+
+        log._is_near_bottom = lambda **_kwargs: True
+        log.watch_scroll_y(2.0, 3.0)
+        assert log._auto_scroll is True
+        assert calls
+
     def test_link_aware_widget_opens_url_on_click(self):
         from types import SimpleNamespace
 

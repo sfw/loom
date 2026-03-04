@@ -91,6 +91,7 @@ class ChatLog(VerticalScroll):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._auto_scroll = True
+        self._scroll_end_pending = False
         self._stream_buffer: list[str] = []
         self._stream_widget: Static | None = None
         self._stream_text: str = ""
@@ -136,19 +137,23 @@ class ChatLog(VerticalScroll):
         O(n^2) string concatenation on every chunk.
         """
         self._stream_buffer.append(text)
+        mounted_new_widget = False
+        flushed_now = False
 
         if self._stream_widget is None:
             self._stream_text = ""
             self._stream_widget = LinkAwareStatic("", classes="model-text", expand=True)
             self.mount(self._stream_widget)
+            mounted_new_widget = True
 
         # Flush every 5 chunks or when text is large
         if len(self._stream_buffer) >= 5 or len(text) > 100:
-            self._flush_stream_buffer()
+            flushed_now = self._flush_stream_buffer()
         else:
             self._schedule_stream_flush()
 
-        self._scroll_to_end()
+        if mounted_new_widget or flushed_now:
+            self._scroll_to_end()
 
     def set_stream_flush_interval_ms(self, interval_ms: int) -> None:
         """Set sparse streaming flush cadence for buffered chunks."""
@@ -171,19 +176,22 @@ class ChatLog(VerticalScroll):
             self._stream_flush_timer_pending = False
             if self._stream_widget is None or not self._stream_buffer:
                 return
-            self._flush_stream_buffer()
+            flushed = self._flush_stream_buffer()
+            if flushed:
+                self._scroll_to_end()
             if self._stream_buffer:
                 self._schedule_stream_flush()
 
         self.set_timer(self._stream_flush_interval_s, _on_timer)
 
-    def _flush_stream_buffer(self) -> None:
+    def _flush_stream_buffer(self) -> bool:
         """Flush buffered streaming chunks to the widget."""
         if not self._stream_buffer or self._stream_widget is None:
-            return
+            return False
         self._stream_text += "".join(self._stream_buffer)
         self._stream_widget.update(self._stream_text)
         self._stream_buffer.clear()
+        return True
 
     def _flush_and_reset_stream(self) -> None:
         """Flush any buffered stream data and reset stream state."""
@@ -293,8 +301,24 @@ class ChatLog(VerticalScroll):
         self._stream_widget = None
         self._stream_text = ""
         self._stream_flush_timer_pending = False
+        self._scroll_end_pending = False
         self.clear_delegate_progress_sections()
         self._keyed_info_widgets.clear()
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        """Toggle auto-follow based on whether viewport is near the bottom."""
+        super().watch_scroll_y(old_value, new_value)
+        near_bottom = self._is_near_bottom()
+        if self._auto_scroll and not near_bottom:
+            self._auto_scroll = False
+        elif not self._auto_scroll and near_bottom:
+            self._auto_scroll = True
+
+    def _is_near_bottom(self, *, threshold: int = 1) -> bool:
+        """Return whether scroll position is at (or very near) the bottom."""
+        max_y = int(getattr(self, "max_scroll_y", 0) or 0)
+        current_y = int(round(float(getattr(self, "scroll_y", 0.0) or 0.0)))
+        return (max_y - current_y) <= max(0, int(threshold))
 
     def add_turn_separator(
         self,
@@ -409,5 +433,14 @@ class ChatLog(VerticalScroll):
             self._scroll_to_end()
 
     def _scroll_to_end(self) -> None:
-        if self._auto_scroll:
-            self.scroll_end(animate=False)
+        if not self._auto_scroll or self._scroll_end_pending:
+            return
+        self._scroll_end_pending = True
+
+        def _apply_scroll() -> None:
+            self._scroll_end_pending = False
+            if not self._auto_scroll:
+                return
+            self.scroll_end(animate=False, immediate=True)
+
+        self.call_after_refresh(_apply_scroll)
