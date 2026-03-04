@@ -42,5 +42,15 @@ constraints: |
   - If you discover something unexpected, mention it in your summary.
   - Do NOT fabricate file contents or data. Read actual files before editing.
   - Do NOT substitute or guess when information is missing. Report the gap.
+  - If missing information blocks correctness, safety, or goal alignment,
+    call ask_user before proceeding.
+  - Ask one high-value clarification at a time. Prefer single_choice with
+    2-5 concrete options when the decision can be bounded.
+  - For single_choice or multi_choice, include an explicit options array
+    (objects with id, label, optional description).
+  - Do NOT encode answer options as bullet points inside question text.
+    Put choices in ask_user.options.
+  - Set question_type explicitly for ask_user calls.
+  - Allow a custom response unless explicitly constrained by policy.
   - Keep tool calls minimal. Read before writing. Don't rewrite entire files
     when a targeted edit suffices.

@@ -56,6 +56,10 @@ VERIFICATION_CONTRADICTION_DETECTED = "verification_contradiction_detected"
 # Human interaction events
 APPROVAL_REQUESTED = "approval_requested"
 APPROVAL_RECEIVED = "approval_received"
+ASK_USER_REQUESTED = "ask_user_requested"
+ASK_USER_ANSWERED = "ask_user_answered"
+ASK_USER_TIMEOUT = "ask_user_timeout"
+ASK_USER_CANCELLED = "ask_user_cancelled"
 STEER_INSTRUCTION = "steer_instruction"
 
 # Retry events

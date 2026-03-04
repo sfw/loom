@@ -16,12 +16,30 @@ from typing import Any
 from loom.state.memory import Database
 from loom.utils.tokens import estimate_tokens as _estimate_tokens
 
+_COWORK_MEMORY_ENTRY_TYPES = frozenset({
+    "decision",
+    "proposal",
+    "research",
+    "rationale",
+    "constraint",
+    "risk",
+    "open_question",
+    "action_item",
+})
+_COWORK_MEMORY_STATUSES = frozenset({
+    "active",
+    "superseded",
+    "resolved",
+    "rejected",
+})
+
 
 class ConversationStore:
     """Append-only persistence for cowork conversation history."""
 
     MAX_QUERY_LIMIT = 1000
     MAX_CHAT_EVENT_LIMIT = 500
+    MAX_MEMORY_QUERY_LIMIT = 200
 
     def __init__(self, db: Database):
         self._db = db
@@ -230,6 +248,447 @@ class ConversationStore:
                ORDER BY turn_number ASC""",
             (session_id, start, end),
         )
+
+    # ------------------------------------------------------------------
+    # Cowork memory index (typed recall layer)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_memory_entry_type(value: object) -> str:
+        text = str(value or "").strip().lower()
+        return text if text in _COWORK_MEMORY_ENTRY_TYPES else "research"
+
+    @staticmethod
+    def _normalize_memory_status(value: object) -> str:
+        text = str(value or "").strip().lower()
+        return text if text in _COWORK_MEMORY_STATUSES else "active"
+
+    @staticmethod
+    def _coerce_text_list(value: object) -> list[str]:
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                return []
+            return [candidate]
+        if not isinstance(value, list):
+            return []
+        cleaned: list[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if text not in cleaned:
+                cleaned.append(text)
+        return cleaned
+
+    @staticmethod
+    def _safe_int(value: object, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
+
+    @staticmethod
+    def _safe_float(value: object, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
+    def _status_priority_sql(alias: str = "c") -> str:
+        return (
+            f"CASE {alias}.status "
+            "WHEN 'active' THEN 0 "
+            "WHEN 'resolved' THEN 1 "
+            "WHEN 'superseded' THEN 2 "
+            "WHEN 'rejected' THEN 3 "
+            "ELSE 4 END"
+        )
+
+    @staticmethod
+    def _decode_json_column(value: object, *, default: object) -> object:
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return default
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return default
+            return parsed
+        return default
+
+    @classmethod
+    def _normalize_memory_row(cls, row: dict) -> dict:
+        normalized = dict(row)
+        normalized["entry_type"] = cls._normalize_memory_entry_type(
+            normalized.get("entry_type"),
+        )
+        normalized["status"] = cls._normalize_memory_status(normalized.get("status"))
+        normalized["confidence"] = float(normalized.get("confidence", 0.0) or 0.0)
+        normalized["tags"] = cls._decode_json_column(
+            normalized.get("tags_json"),
+            default=[],
+        )
+        normalized["entities"] = cls._decode_json_column(
+            normalized.get("entities_json"),
+            default=[],
+        )
+        normalized["source_roles"] = cls._decode_json_column(
+            normalized.get("source_roles_json"),
+            default=[],
+        )
+        return normalized
+
+    async def get_cowork_memory_index_state(self, session_id: str) -> dict:
+        row = await self._db.query_one(
+            """SELECT * FROM cowork_memory_index_state
+               WHERE session_id = ?""",
+            (session_id,),
+        )
+        if not row:
+            return {
+                "session_id": session_id,
+                "last_indexed_turn": 0,
+                "index_version": 1,
+                "index_degraded": False,
+                "last_indexed_at": "",
+                "last_error": "",
+                "failure_count": 0,
+            }
+        state = dict(row)
+        state["last_indexed_turn"] = int(state.get("last_indexed_turn", 0) or 0)
+        state["index_version"] = int(state.get("index_version", 1) or 1)
+        state["failure_count"] = int(state.get("failure_count", 0) or 0)
+        state["index_degraded"] = bool(state.get("index_degraded", 0))
+        return state
+
+    async def upsert_cowork_memory_index_state(
+        self,
+        session_id: str,
+        *,
+        last_indexed_turn: int,
+        index_degraded: bool = False,
+        last_error: str = "",
+        failure_count: int = 0,
+        index_version: int = 1,
+    ) -> None:
+        now = datetime.now().isoformat()
+        await self._db.execute(
+            """INSERT INTO cowork_memory_index_state
+               (session_id, last_indexed_turn, index_version, index_degraded,
+                last_indexed_at, last_error, failure_count, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                   last_indexed_turn=excluded.last_indexed_turn,
+                   index_version=excluded.index_version,
+                   index_degraded=excluded.index_degraded,
+                   last_indexed_at=excluded.last_indexed_at,
+                   last_error=excluded.last_error,
+                   failure_count=excluded.failure_count,
+                   updated_at=excluded.updated_at""",
+            (
+                str(session_id or "").strip(),
+                max(0, int(last_indexed_turn)),
+                max(1, int(index_version)),
+                1 if bool(index_degraded) else 0,
+                now,
+                str(last_error or "").strip(),
+                max(0, int(failure_count)),
+                now,
+                now,
+            ),
+        )
+
+    async def upsert_cowork_memory_entry(
+        self,
+        session_id: str,
+        entry: dict,
+    ) -> int:
+        clean_session = str(session_id or "").strip()
+        if not clean_session:
+            raise ValueError("session_id is required")
+        if not isinstance(entry, dict):
+            raise ValueError("entry must be a dict")
+
+        now = datetime.now().isoformat()
+        tags = self._coerce_text_list(entry.get("tags", entry.get("tags_json", [])))
+        entities = self._coerce_text_list(
+            entry.get("entities", entry.get("entities_json", []))
+        )
+        source_roles = self._coerce_text_list(
+            entry.get("source_roles", entry.get("source_roles_json", []))
+        )
+        fingerprint = str(entry.get("fingerprint", "") or "").strip()
+        if not fingerprint:
+            raise ValueError("entry fingerprint is required")
+
+        await self._db.execute(
+            """INSERT INTO cowork_memory_entries
+               (session_id, entry_type, status, summary, rationale, topic,
+                tags_json, tags_text, entities_json, entities_text,
+                source_turn_start, source_turn_end, source_roles_json,
+                evidence_excerpt, supersedes_entry_id, confidence, fingerprint,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id, fingerprint) DO UPDATE SET
+                   entry_type=excluded.entry_type,
+                   status=excluded.status,
+                   summary=excluded.summary,
+                   rationale=excluded.rationale,
+                   topic=excluded.topic,
+                   tags_json=excluded.tags_json,
+                   tags_text=excluded.tags_text,
+                   entities_json=excluded.entities_json,
+                   entities_text=excluded.entities_text,
+                   source_turn_start=excluded.source_turn_start,
+                   source_turn_end=excluded.source_turn_end,
+                   source_roles_json=excluded.source_roles_json,
+                   evidence_excerpt=excluded.evidence_excerpt,
+                   supersedes_entry_id=excluded.supersedes_entry_id,
+                   confidence=excluded.confidence,
+                   updated_at=excluded.updated_at""",
+            (
+                clean_session,
+                self._normalize_memory_entry_type(entry.get("entry_type")),
+                self._normalize_memory_status(entry.get("status")),
+                str(entry.get("summary", "") or "").strip(),
+                str(entry.get("rationale", "") or "").strip(),
+                str(entry.get("topic", "") or "").strip(),
+                json.dumps(tags, ensure_ascii=False),
+                ", ".join(tags),
+                json.dumps(entities, ensure_ascii=False),
+                ", ".join(entities),
+                max(0, self._safe_int(entry.get("source_turn_start", 0), 0)),
+                max(
+                    max(0, self._safe_int(entry.get("source_turn_start", 0), 0)),
+                    self._safe_int(entry.get("source_turn_end", 0), 0),
+                ),
+                json.dumps(source_roles, ensure_ascii=False),
+                str(entry.get("evidence_excerpt", "") or "").strip(),
+                (
+                    self._safe_int(entry.get("supersedes_entry_id"), 0)
+                    if entry.get("supersedes_entry_id") not in (None, "", 0, "0")
+                    else None
+                ),
+                self._safe_float(entry.get("confidence", 0.0), 0.0),
+                fingerprint,
+                now,
+                now,
+            ),
+        )
+        row = await self._db.query_one(
+            """SELECT id FROM cowork_memory_entries
+               WHERE session_id = ? AND fingerprint = ?""",
+            (clean_session, fingerprint),
+        )
+        return int(row.get("id", 0) or 0) if row else 0
+
+    async def upsert_cowork_memory_entries(
+        self,
+        session_id: str,
+        entries: list[dict],
+    ) -> int:
+        inserted = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            row_id = await self.upsert_cowork_memory_entry(session_id, entry)
+            if row_id > 0:
+                inserted += 1
+        return inserted
+
+    async def _has_cowork_memory_fts(self) -> bool:
+        row = await self._db.query_one(
+            """SELECT 1 AS present
+               FROM sqlite_master
+               WHERE type='table' AND name='cowork_memory_fts'""",
+        )
+        return bool(row)
+
+    async def rebuild_cowork_memory_fts(self) -> None:
+        if not await self._has_cowork_memory_fts():
+            return
+        await self._db.execute(
+            "INSERT INTO cowork_memory_fts(cowork_memory_fts) VALUES ('rebuild')",
+        )
+
+    async def search_cowork_memory_entries(
+        self,
+        session_id: str,
+        *,
+        query: str = "",
+        entry_type: str = "",
+        status: str = "",
+        topic: str = "",
+        limit: int = 20,
+        force_fts: bool = False,
+    ) -> list[dict]:
+        safe_limit = max(1, min(int(limit), self.MAX_MEMORY_QUERY_LIMIT))
+        clean_session = str(session_id or "").strip()
+        clean_query = str(query or "").strip()
+        clean_topic = str(topic or "").strip()
+        clean_type = self._normalize_memory_entry_type(entry_type) if entry_type else ""
+        clean_status = self._normalize_memory_status(status) if status else ""
+
+        if clean_query and (await self._has_cowork_memory_fts()):
+            where = ["c.session_id = ?", "cowork_memory_fts MATCH ?"]
+            params: list[Any] = [clean_session, clean_query]
+            if clean_type:
+                where.append("c.entry_type = ?")
+                params.append(clean_type)
+            if clean_status:
+                where.append("c.status = ?")
+                params.append(clean_status)
+            if clean_topic:
+                escaped = clean_topic.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                where.append("c.topic LIKE ? ESCAPE '\\'")
+                params.append(f"%{escaped}%")
+            try:
+                rows = await self._db.query(
+                    f"""SELECT c.*, bm25(cowork_memory_fts) AS rank_score
+                        FROM cowork_memory_fts
+                        JOIN cowork_memory_entries c ON c.id = cowork_memory_fts.rowid
+                        WHERE {' AND '.join(where)}
+                        ORDER BY {self._status_priority_sql('c')}, rank_score ASC, c.updated_at DESC
+                        LIMIT ?""",
+                    tuple([*params, safe_limit]),
+                )
+                return [self._normalize_memory_row(row) for row in rows]
+            except Exception:
+                if force_fts:
+                    return []
+
+        if force_fts and clean_query:
+            return []
+
+        where = ["session_id = ?"]
+        params = [clean_session]
+        if clean_type:
+            where.append("entry_type = ?")
+            params.append(clean_type)
+        if clean_status:
+            where.append("status = ?")
+            params.append(clean_status)
+        if clean_topic:
+            escaped_topic = (
+                clean_topic.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            where.append("topic LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped_topic}%")
+        if clean_query:
+            escaped_query = (
+                clean_query.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            like = f"%{escaped_query}%"
+            where.append(
+                "(summary LIKE ? ESCAPE '\\' OR rationale LIKE ? ESCAPE '\\' "
+                "OR evidence_excerpt LIKE ? ESCAPE '\\')",
+            )
+            params.extend([like, like, like])
+
+        rows = await self._db.query(
+            f"""SELECT * FROM cowork_memory_entries
+                WHERE {' AND '.join(where)}
+                ORDER BY {self._status_priority_sql('cowork_memory_entries')}, updated_at DESC
+                LIMIT ?""",
+            tuple([*params, safe_limit]),
+        )
+        return [self._normalize_memory_row(row) for row in rows]
+
+    async def get_cowork_memory_entries_by_ids(
+        self,
+        session_id: str,
+        *,
+        entry_ids: list[int],
+        limit: int = 50,
+    ) -> list[dict]:
+        clean_ids: list[int] = []
+        for item in entry_ids:
+            value = self._safe_int(item, 0)
+            if value > 0:
+                clean_ids.append(value)
+        if not clean_ids:
+            return []
+        safe_limit = max(1, min(int(limit), self.MAX_MEMORY_QUERY_LIMIT))
+        placeholders = ", ".join("?" for _ in clean_ids)
+        rows = await self._db.query(
+            f"""SELECT * FROM cowork_memory_entries
+                WHERE session_id = ? AND id IN ({placeholders})
+                ORDER BY {self._status_priority_sql('cowork_memory_entries')}, updated_at DESC
+                LIMIT ?""",
+            tuple([session_id, *clean_ids, safe_limit]),
+        )
+        return [self._normalize_memory_row(row) for row in rows]
+
+    async def get_cowork_memory_timeline(
+        self,
+        session_id: str,
+        *,
+        topic: str = "",
+        limit: int = 50,
+    ) -> list[dict]:
+        safe_limit = max(1, min(int(limit), self.MAX_MEMORY_QUERY_LIMIT))
+        where = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        clean_topic = str(topic or "").strip()
+        if clean_topic:
+            escaped = clean_topic.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where.append("topic LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        rows = await self._db.query(
+            f"""SELECT * FROM cowork_memory_entries
+                WHERE {' AND '.join(where)}
+                ORDER BY source_turn_start ASC, source_turn_end ASC, id ASC
+                LIMIT ?""",
+            tuple([*params, safe_limit]),
+        )
+        return [self._normalize_memory_row(row) for row in rows]
+
+    async def get_cowork_memory_active_snapshot(
+        self,
+        session_id: str,
+        *,
+        max_decisions: int = 4,
+        max_proposals: int = 4,
+        max_research: int = 4,
+        max_questions: int = 4,
+    ) -> dict[str, list[dict]]:
+        decisions = await self.search_cowork_memory_entries(
+            session_id,
+            entry_type="decision",
+            status="active",
+            limit=max_decisions,
+        )
+        proposals = await self.search_cowork_memory_entries(
+            session_id,
+            entry_type="proposal",
+            status="active",
+            limit=max_proposals,
+        )
+        research = await self.search_cowork_memory_entries(
+            session_id,
+            entry_type="research",
+            status="active",
+            limit=max_research,
+        )
+        open_questions = await self.search_cowork_memory_entries(
+            session_id,
+            entry_type="open_question",
+            status="active",
+            limit=max_questions,
+        )
+        return {
+            "active_decisions": decisions,
+            "active_proposals": proposals,
+            "recent_research": research,
+            "open_questions": open_questions,
+        }
 
     # ------------------------------------------------------------------
     # Helpers for session resume

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loom.cowork.approval import ApprovalDecision, ToolApprover
+from loom.cowork.memory_indexer import CoworkMemoryIndexer
 from loom.cowork.session_state import SessionState, extract_state_from_tool_events
 from loom.engine.semantic_compactor import SemanticCompactor
 from loom.models.base import ModelProvider, TokenUsage, ToolCall
@@ -39,6 +40,7 @@ from loom.tools.registry import (
     ToolRegistry,
     ToolResult,
     normalize_tool_auth_mode,
+    normalize_tool_execution_surfaces,
     tool_auth_required,
 )
 from loom.tools.shell import high_risk_command_metadata
@@ -383,7 +385,9 @@ _CONTEXT_RECENT_MESSAGE_CAP = 48
 _RECALL_INDEX_MAX_USER_TOPICS = 4
 _RECALL_INDEX_MAX_TOOL_NAMES = 6
 _RECALL_INDEX_SNIPPET_CHARS = 96
-_RECALL_INDEX_MAX_CHARS = 1800
+_RECALL_INDEX_MAX_CHARS = 1200
+_RECALL_INDEX_SECTION_LINE_CAP = 4
+_RECALL_INDEX_LINE_CHARS = 220
 _RESUMED_TOOL_OUTPUT_CHARS = 1400
 _RESUMED_TOOL_ERROR_CHARS = 600
 _RESUMED_TOOL_DATA_CHARS = 800
@@ -489,6 +493,7 @@ class CoworkSession:
         self,
         model: ModelProvider,
         tools: ToolRegistry,
+        compactor_model: ModelProvider | None = None,
         workspace: Path | None = None,
         scratch_dir: Path | None = None,
         system_prompt: str = "",
@@ -509,6 +514,14 @@ class CoworkSession:
         delegate_progress_callback: (
             Callable[[dict[str, Any]], Awaitable[None] | None] | None
         ) = None,
+        memory_index_enabled: bool = False,
+        memory_index_llm_extraction_enabled: bool = True,
+        memory_index_model: ModelProvider | None = None,
+        memory_index_model_role: str = "",
+        memory_index_role_strict: bool = False,
+        memory_index_queue_max_batches: int = 32,
+        memory_index_section_limit: int = _RECALL_INDEX_SECTION_LINE_CAP,
+        recall_index_max_chars: int = _RECALL_INDEX_MAX_CHARS,
     ):
         self._model = model
         self._tools = tools
@@ -539,7 +552,7 @@ class CoworkSession:
             session_id=session_id,
         )
         self._static_system_prompt = system_prompt
-        self._compactor = SemanticCompactor(model=model)
+        self._compactor = SemanticCompactor(model=compactor_model or model)
         self._model_retry_policy = model_retry_policy or ModelRetryPolicy()
         self._tool_exposure_mode = _normalize_tool_exposure_mode(tool_exposure_mode)
         self._enable_filetype_ingest_router = bool(enable_filetype_ingest_router)
@@ -556,6 +569,17 @@ class CoworkSession:
             int(ingest_artifact_retention_max_bytes_per_scope),
         )
         self._delegate_progress_callback = delegate_progress_callback
+        self._memory_index_enabled = bool(memory_index_enabled)
+        self._memory_index_llm_extraction_enabled = bool(
+            memory_index_llm_extraction_enabled,
+        )
+        self._memory_index_model = memory_index_model
+        self._memory_index_model_role = str(memory_index_model_role or "").strip().lower()
+        self._memory_index_role_strict = bool(memory_index_role_strict)
+        self._memory_index_queue_max_batches = max(1, int(memory_index_queue_max_batches))
+        self._memory_index_section_limit = max(1, int(memory_index_section_limit))
+        self._recall_index_max_chars = max(500, int(recall_index_max_chars))
+        self._memory_indexer: CoworkMemoryIndexer | None = None
 
         # Learned behaviors section (injected into system prompt)
         self._behaviors_section = ""
@@ -572,6 +596,7 @@ class CoworkSession:
             self._messages.append({"role": "system", "content": self._build_system_content()})
 
         self._bind_hybrid_tools()
+        self._maybe_start_memory_indexer()
 
     @property
     def messages(self) -> list[dict]:
@@ -683,6 +708,61 @@ class CoworkSession:
     @property
     def compactor(self) -> SemanticCompactor:
         return self._compactor
+
+    @property
+    def memory_indexer(self) -> CoworkMemoryIndexer | None:
+        return self._memory_indexer
+
+    def _maybe_start_memory_indexer(self) -> None:
+        if not self._memory_index_enabled:
+            return
+        if self._store is None or not self._session_id:
+            return
+        if self._memory_indexer is not None:
+            return
+        self._memory_indexer = CoworkMemoryIndexer(
+            store=self._store,
+            session_id=self._session_id,
+            session_state=self._session_state,
+            model=self._memory_index_model,
+            model_role=self._memory_index_model_role,
+            llm_extraction_enabled=self._memory_index_llm_extraction_enabled,
+            role_strict=self._memory_index_role_strict,
+            queue_max_batches=self._memory_index_queue_max_batches,
+            section_limit=self._memory_index_section_limit,
+        )
+
+    async def _hydrate_memory_snapshot(self) -> None:
+        if self._store is None or not self._session_id:
+            return
+        try:
+            snapshot = await self._store.get_cowork_memory_active_snapshot(
+                self._session_id,
+                max_decisions=self._memory_index_section_limit,
+                max_proposals=self._memory_index_section_limit,
+                max_research=self._memory_index_section_limit,
+                max_questions=self._memory_index_section_limit,
+            )
+            self._session_state.update_memory_snapshot(snapshot)
+            state = await self._store.get_cowork_memory_index_state(self._session_id)
+            self._session_state.update_memory_index_meta(
+                last_indexed_turn=int(state.get("last_indexed_turn", 0) or 0),
+                degraded=bool(state.get("index_degraded", False)),
+                failure_count=int(state.get("failure_count", 0) or 0),
+                last_error=str(state.get("last_error", "") or ""),
+            )
+        except Exception as e:
+            logger.debug(
+                "Failed hydrating cowork memory snapshot session=%s: %s",
+                self._session_id,
+                e,
+            )
+
+    async def wait_for_memory_index_idle(self, *, timeout_seconds: float = 5.0) -> bool:
+        indexer = self._memory_indexer
+        if indexer is None:
+            return True
+        return await indexer.wait_idle(timeout_seconds=timeout_seconds)
 
     # ------------------------------------------------------------------
     # Public API
@@ -1188,6 +1268,10 @@ class CoworkSession:
             {"role": "system", "content": self._build_system_content()},
             *self._normalize_resumed_messages(recent),
         ]
+        self._maybe_start_memory_indexer()
+        await self._hydrate_memory_snapshot()
+        if self._memory_indexer is not None and self._message_counter > 0:
+            self._memory_indexer.enqueue_up_to_turn(self._message_counter)
 
     # ------------------------------------------------------------------
     # Context management
@@ -1293,16 +1377,27 @@ class CoworkSession:
 
         return json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))
 
-    def _build_recall_index_message(
-        self,
+    @staticmethod
+    def _line_within_budget(
+        lines: list[str],
+        line: str,
         *,
-        omitted_messages: list[dict],
-        selected_messages: list[dict],
-    ) -> dict | None:
-        """Build a compact archive index that steers recall-tool usage."""
-        if not omitted_messages:
-            return None
+        max_chars: int,
+    ) -> bool:
+        candidate = [*lines, line]
+        return len("\n".join(candidate)) <= max_chars
 
+    def _format_recall_marker_line(self, entry: dict, marker: str) -> str:
+        summary, _ = _compact_preview(entry.get("summary", ""), _RECALL_INDEX_LINE_CHARS)
+        status = str(entry.get("status", "active") or "active").strip().lower() or "active"
+        start = max(0, int(entry.get("source_turn_start", 0) or 0))
+        end = max(start, int(entry.get("source_turn_end", start) or start))
+        turns = f"turn {start}" if start == end else f"turns {start}-{end}"
+        line = f"[{marker}][{status}] {summary} ({turns})"
+        compact, _ = _compact_preview(line, _RECALL_INDEX_LINE_CHARS)
+        return compact
+
+    def _build_legacy_recall_lines(self, *, omitted_messages: list[dict]) -> list[str]:
         archived_user_topics: list[str] = []
         for msg in reversed(omitted_messages):
             if msg.get("role") != "user":
@@ -1338,6 +1433,23 @@ class CoworkSession:
             if len(archived_tool_names) >= _RECALL_INDEX_MAX_TOOL_NAMES:
                 break
 
+        legacy: list[str] = []
+        if archived_user_topics:
+            legacy.append("- Archived user topics: " + " | ".join(archived_user_topics))
+        if archived_tool_names:
+            legacy.append("- Archived tool activity: " + ", ".join(archived_tool_names))
+        return legacy
+
+    def _build_recall_index_message(
+        self,
+        *,
+        omitted_messages: list[dict],
+        selected_messages: list[dict],
+    ) -> dict | None:
+        """Build a compact archive index that steers recall-tool usage."""
+        if not omitted_messages:
+            return None
+
         omitted_tool_messages = sum(
             1
             for msg in omitted_messages
@@ -1350,24 +1462,72 @@ class CoworkSession:
             f"- Omitted tool-result messages: {omitted_tool_messages}",
             f"- Recent messages kept live: {len(selected_messages)}",
         ]
-        if archived_user_topics:
-            lines.append("- Archived user topics: " + " | ".join(archived_user_topics))
-        if archived_tool_names:
-            lines.append("- Archived tool activity: " + ", ".join(archived_tool_names))
-        lines.extend([
-            (
-                "- When older details are needed, use conversation_recall "
-                "before asking the user to repeat."
-            ),
+        if self._session_state.memory_index_last_indexed_turn > 0:
+            lines.append(
+                f"- Indexed through turn: {self._session_state.memory_index_last_indexed_turn}",
+            )
+
+        marker_sections = [
+            ("Active DECISION", "DECISION", self._session_state.active_decisions),
+            ("Open QUESTION", "OPEN_QUESTION", self._session_state.open_questions),
+            ("Open PROPOSAL", "PROPOSAL", self._session_state.active_proposals),
+            ("Recent RESEARCH", "RESEARCH", self._session_state.recent_research),
+        ]
+        has_marker_entries = any(bool(section[2]) for section in marker_sections)
+        index_degraded = bool(self._session_state.memory_index_degraded)
+        if index_degraded:
+            lines.append("- Memory index status: degraded; using legacy archive snippets.")
+
+        if has_marker_entries and not index_degraded:
+            for section_title, marker, entries in marker_sections:
+                if not entries:
+                    continue
+                section_header = f"- {section_title}:"
+                if self._line_within_budget(
+                    lines,
+                    section_header,
+                    max_chars=self._recall_index_max_chars,
+                ):
+                    lines.append(section_header)
+                else:
+                    continue
+                for entry in list(entries)[: self._memory_index_section_limit]:
+                    rendered = "  * " + self._format_recall_marker_line(entry, marker)
+                    if not self._line_within_budget(
+                        lines,
+                        rendered,
+                        max_chars=self._recall_index_max_chars,
+                    ):
+                        break
+                    lines.append(rendered)
+        else:
+            for legacy_line in self._build_legacy_recall_lines(
+                omitted_messages=omitted_messages,
+            ):
+                if not self._line_within_budget(
+                    lines,
+                    legacy_line,
+                    max_chars=self._recall_index_max_chars,
+                ):
+                    break
+                lines.append(legacy_line)
+
+        action_lines = [
+            "- When older details are needed, use conversation_recall first.",
             "- Recall actions:",
+            '  * {"action":"decision_context","topic":"<topic>","limit":5}',
+            '  * {"action":"entries","entry_type":"decision","status":"active","limit":5}',
+            '  * {"action":"open_questions","topic":"<topic>","limit":5}',
+            '  * {"action":"source_turns","entry_ids":[<id>],"limit":6}',
             '  * {"action":"search","query":"<keywords>","limit":5}',
-            '  * {"action":"range","start_turn":<int>,"end_turn":<int>}',
-            '  * {"action":"tool_calls","tool_name":"<tool>","limit":5}',
-            '  * {"action":"summary"}',
-        ])
+        ]
+        for line in action_lines:
+            if not self._line_within_budget(lines, line, max_chars=self._recall_index_max_chars):
+                break
+            lines.append(line)
 
         content = "\n".join(lines)
-        compact_content, _ = _compact_preview(content, _RECALL_INDEX_MAX_CHARS)
+        compact_content, _ = _compact_preview(content, self._recall_index_max_chars)
         return {"role": "system", "content": compact_content}
 
     def _context_window(self) -> list[dict]:
@@ -1581,6 +1741,7 @@ class CoworkSession:
             scratch_dir=self._scratch_dir,
             auth_context=self._auth_context,
             allow_internal_args=True,
+            execution_surface="tui",
         )
         if (
             not result.success
@@ -1840,7 +2001,12 @@ class CoworkSession:
             return False
 
         tokens = set(re.findall(r"[a-z0-9_./+-]+", message))
-        available = set(self._tools.list_tools(auth_context=self._auth_context))
+        available = set(
+            self._tools.list_tools(
+                auth_context=self._auth_context,
+                execution_surface="tui",
+            ),
+        )
         mcp_aliases = {
             parts[1]
             for name in available
@@ -1865,7 +2031,12 @@ class CoworkSession:
 
     def _tool_names_for_turn(self, user_message: str) -> list[str]:
         """Choose intent-aware typed tool names for this turn (no fallback lane)."""
-        available = set(self._tools.list_tools(auth_context=self._auth_context))
+        available = set(
+            self._tools.list_tools(
+                auth_context=self._auth_context,
+                execution_surface="tui",
+            ),
+        )
         if not available:
             return []
 
@@ -1946,9 +2117,15 @@ class CoworkSession:
     def _tool_schemas_for_turn(self, user_message: str) -> list[dict]:
         """Return tool schemas for this turn according to exposure mode."""
         if self._tool_exposure_mode == "full":
-            return self._tools.all_schemas(auth_context=self._auth_context)
+            return self._tools.all_schemas(
+                auth_context=self._auth_context,
+                execution_surface="tui",
+            )
 
-        all_schemas = self._tools.all_schemas(auth_context=self._auth_context)
+        all_schemas = self._tools.all_schemas(
+            auth_context=self._auth_context,
+            execution_surface="tui",
+        )
         if not all_schemas:
             return []
 
@@ -2048,9 +2225,16 @@ class CoworkSession:
             return "mcp"
         return "other"
 
-    def _tool_catalog_rows(self, auth_context: Any | None = None) -> list[dict]:
+    def _tool_catalog_rows(
+        self,
+        auth_context: Any | None = None,
+        execution_surface: str = "tui",
+    ) -> list[dict]:
         """Build a compact list-tools catalog from currently available schemas."""
-        schemas = self._tools.all_schemas(auth_context=auth_context)
+        schemas = self._tools.all_schemas(
+            auth_context=auth_context,
+            execution_surface=execution_surface,
+        )
         rows: list[dict] = []
         for schema in schemas:
             name = str(schema.get("name", "")).strip()
@@ -2074,6 +2258,9 @@ class CoworkSession:
                 "auth_required": tool_auth_required(tool),
                 "auth_requirements": list(auth_requirements),
                 "category": self._tool_category(name),
+                "execution_surfaces": list(normalize_tool_execution_surfaces(
+                    schema.get("x_supported_execution_surfaces", []),
+                )),
             })
         rows.sort(key=lambda item: str(item.get("name", "")))
         return rows
@@ -2105,7 +2292,11 @@ class CoworkSession:
         ).strip()
 
         auth_context = getattr(ctx, "auth_context", self._auth_context)
-        if not self._tools.has(target, auth_context=auth_context):
+        if not self._tools.has(
+            target,
+            auth_context=auth_context,
+            execution_surface="tui",
+        ):
             return ToolResult.fail(f"Unknown tool: {target}")
 
         approval_args = self._prepare_tool_execute_arguments(
@@ -2142,6 +2333,7 @@ class CoworkSession:
             scratch_dir=self._scratch_dir,
             auth_context=auth_context,
             allow_internal_args=True,
+            execution_surface="tui",
         )
 
     # ------------------------------------------------------------------
@@ -2431,6 +2623,8 @@ class CoworkSession:
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
             )
+            if self._memory_indexer is not None:
+                self._memory_indexer.enqueue_up_to_turn(counter)
         except Exception as e:
             logger.warning("Persist turn failed: %s", e)
 

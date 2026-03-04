@@ -666,6 +666,67 @@ class TestCoworkSession:
             for msg in context[1:]
         )
 
+    async def test_context_window_prefers_marker_sections_when_memory_snapshot_available(
+        self,
+        workspace,
+        tools,
+    ):
+        provider = MockProvider([
+            ModelResponse(text="ok", usage=TokenUsage(total_tokens=2)),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            system_prompt="test",
+            max_context_messages=6,
+            max_context_tokens=5000,
+        )
+        session.session_state.update_memory_snapshot({
+            "active_decisions": [
+                {
+                    "entry_type": "decision",
+                    "status": "active",
+                    "summary": "Use compactor model for cowork memory extraction",
+                    "source_turn_start": 11,
+                    "source_turn_end": 12,
+                }
+            ],
+            "open_questions": [
+                {
+                    "entry_type": "open_question",
+                    "status": "active",
+                    "summary": "Should we force fts mode for recall queries?",
+                    "source_turn_start": 13,
+                    "source_turn_end": 13,
+                }
+            ],
+        })
+        session.session_state.update_memory_index_meta(
+            last_indexed_turn=20,
+            degraded=False,
+            failure_count=0,
+        )
+
+        session._messages = [{"role": "system", "content": "test"}]
+        for idx in range(14):
+            session._messages.append(
+                {"role": "user", "content": f"Message {idx} with archive detail"},
+            )
+
+        context = session._context_window()
+        recall_messages = [
+            msg
+            for msg in context
+            if msg.get("role") == "system"
+            and "Compact archive index" in str(msg.get("content", ""))
+        ]
+        assert recall_messages
+        recall_content = str(recall_messages[0].get("content", ""))
+        assert "Active DECISION" in recall_content
+        assert "Open QUESTION" in recall_content
+        assert "decision_context" in recall_content
+
     async def test_context_window_repairs_dangling_assistant_tool_calls(
         self,
         workspace,
@@ -843,6 +904,45 @@ class TestCoworkSession:
         assert len(compact_content) < 3500
         assert "output_truncated" in compact_content
         assert "files_changed_count" in compact_content
+
+    async def test_memory_indexer_captures_marker_entries_from_turns(self, tmp_path: Path):
+        database = Database(tmp_path / "cowork-memory.db")
+        await database.initialize()
+        store = ConversationStore(database)
+        sid = await store.create_session(workspace=str(tmp_path), model_name="mock")
+
+        provider = MockProvider([
+            ModelResponse(
+                text="PROPOSAL: Add typed conversation_recall actions for decision context.",
+                usage=TokenUsage(total_tokens=6),
+            ),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=create_default_registry(),
+            workspace=tmp_path,
+            system_prompt="test",
+            store=store,
+            session_id=sid,
+            memory_index_enabled=True,
+            memory_index_llm_extraction_enabled=False,
+        )
+
+        async for _event in session.send(
+            "DECISION: Use compactor role for cowork memory extraction.",
+        ):
+            pass
+
+        assert await session.wait_for_memory_index_idle(timeout_seconds=2.0)
+        assert session.session_state.active_decisions
+        assert session.session_state.active_proposals
+        indexed = await store.search_cowork_memory_entries(
+            sid,
+            entry_type="decision",
+            status="active",
+            limit=10,
+        )
+        assert indexed
 
     async def test_send_retries_transient_model_failure(self, workspace, tools):
         provider = MockProvider([

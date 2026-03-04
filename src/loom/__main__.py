@@ -565,6 +565,7 @@ def run(
     explicit_auth = ctx.obj.get("explicit_auth_path")
 
     metadata: dict[str, object] = {}
+    metadata["execution_surface"] = "cli"
     if overrides:
         metadata["auth_profile_overrides"] = overrides
     if explicit_auth is not None:

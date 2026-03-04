@@ -216,6 +216,160 @@ class Database:
     async def get_task_run(self, run_id: str) -> dict | None:
         return await self.query_one("SELECT * FROM task_runs WHERE run_id=?", (run_id,))
 
+    # --- Task question operations ---
+
+    async def get_task_question(self, task_id: str, question_id: str) -> dict | None:
+        row = await self.query_one(
+            "SELECT * FROM task_questions WHERE task_id=? AND question_id=?",
+            (task_id, question_id),
+        )
+        if row is None:
+            return None
+        return self._decode_task_question_row(row)
+
+    async def upsert_pending_task_question(
+        self,
+        *,
+        question_id: str,
+        task_id: str,
+        subtask_id: str,
+        request_payload: dict | None = None,
+        timeout_at: str = "",
+    ) -> dict:
+        now = datetime.now().isoformat()
+        request_json = json.dumps(
+            request_payload or {},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        clean_question_id = str(question_id or "").strip()
+        clean_task_id = str(task_id or "").strip()
+        clean_subtask_id = str(subtask_id or "").strip()
+        clean_timeout = str(timeout_at or "").strip()
+
+        existing = await self.get_task_question(clean_task_id, clean_question_id)
+        if existing is not None and str(existing.get("status", "")).strip().lower() != "pending":
+            return existing
+
+        if clean_subtask_id:
+            scope_pending = await self.query_one(
+                """SELECT * FROM task_questions
+                   WHERE task_id=? AND subtask_id=? AND status='pending'
+                   ORDER BY created_at DESC
+                   LIMIT 1""",
+                (clean_task_id, clean_subtask_id),
+            )
+            if (
+                scope_pending
+                and str(scope_pending.get("question_id", "")).strip() != clean_question_id
+            ):
+                return self._decode_task_question_row(scope_pending)
+
+        await self.execute(
+            """INSERT INTO task_questions
+               (question_id, task_id, subtask_id, status, request_payload, answer_payload,
+                created_at, updated_at, resolved_at, timeout_at)
+               VALUES (?, ?, ?, 'pending', ?, NULL, ?, ?, NULL, ?)
+               ON CONFLICT(question_id) DO UPDATE SET
+                   status='pending',
+                   request_payload=excluded.request_payload,
+                   updated_at=excluded.updated_at,
+                   timeout_at=excluded.timeout_at""",
+            (
+                clean_question_id,
+                clean_task_id,
+                clean_subtask_id,
+                request_json,
+                now,
+                now,
+                clean_timeout,
+            ),
+        )
+        stored = await self.get_task_question(clean_task_id, clean_question_id)
+        return stored or {
+            "question_id": clean_question_id,
+            "task_id": clean_task_id,
+            "subtask_id": clean_subtask_id,
+            "status": "pending",
+            "request_payload": request_payload or {},
+            "answer_payload": {},
+            "created_at": now,
+            "updated_at": now,
+            "resolved_at": "",
+            "timeout_at": clean_timeout,
+        }
+
+    async def resolve_task_question(
+        self,
+        *,
+        task_id: str,
+        question_id: str,
+        status: str,
+        answer_payload: dict | None = None,
+        resolved_at: str = "",
+    ) -> dict | None:
+        clean_task_id = str(task_id or "").strip()
+        clean_question_id = str(question_id or "").strip()
+        existing = await self.get_task_question(clean_task_id, clean_question_id)
+        if existing is None:
+            return None
+        if str(existing.get("status", "")).strip().lower() != "pending":
+            return existing
+
+        now = datetime.now().isoformat()
+        resolved = str(resolved_at or "").strip() or now
+        await self.execute(
+            """UPDATE task_questions
+               SET status=?, answer_payload=?, updated_at=?, resolved_at=?
+               WHERE task_id=? AND question_id=? AND status='pending'""",
+            (
+                str(status or "").strip().lower() or "answered",
+                json.dumps(answer_payload or {}, ensure_ascii=False, sort_keys=True),
+                now,
+                resolved,
+                clean_task_id,
+                clean_question_id,
+            ),
+        )
+        return await self.get_task_question(clean_task_id, clean_question_id)
+
+    async def list_pending_task_questions(self, task_id: str) -> list[dict]:
+        rows = await self.query(
+            """SELECT * FROM task_questions
+               WHERE task_id=? AND status='pending'
+               ORDER BY created_at ASC""",
+            (task_id,),
+        )
+        return [self._decode_task_question_row(row) for row in rows]
+
+    async def list_task_questions(self, task_id: str) -> list[dict]:
+        rows = await self.query(
+            """SELECT * FROM task_questions
+               WHERE task_id=?
+               ORDER BY created_at ASC""",
+            (task_id,),
+        )
+        return [self._decode_task_question_row(row) for row in rows]
+
+    @staticmethod
+    def _decode_task_question_row(row: dict) -> dict:
+        parsed = dict(row)
+        for key in ("request_payload", "answer_payload"):
+            raw = parsed.get(key)
+            if not isinstance(raw, str):
+                parsed[key] = raw if isinstance(raw, dict) else {}
+                continue
+            text = raw.strip()
+            if not text:
+                parsed[key] = {}
+                continue
+            try:
+                value = json.loads(text)
+            except Exception:
+                value = {}
+            parsed[key] = value if isinstance(value, dict) else {}
+        return parsed
+
     async def list_recoverable_task_runs(
         self,
         *,
@@ -1137,6 +1291,49 @@ class MemoryManager:
 
     async def get_task_run(self, run_id: str) -> dict | None:
         return await self._db.get_task_run(run_id)
+
+    async def get_task_question(self, task_id: str, question_id: str) -> dict | None:
+        return await self._db.get_task_question(task_id, question_id)
+
+    async def upsert_pending_task_question(
+        self,
+        *,
+        question_id: str,
+        task_id: str,
+        subtask_id: str,
+        request_payload: dict | None = None,
+        timeout_at: str = "",
+    ) -> dict:
+        return await self._db.upsert_pending_task_question(
+            question_id=question_id,
+            task_id=task_id,
+            subtask_id=subtask_id,
+            request_payload=request_payload,
+            timeout_at=timeout_at,
+        )
+
+    async def resolve_task_question(
+        self,
+        *,
+        task_id: str,
+        question_id: str,
+        status: str,
+        answer_payload: dict | None = None,
+        resolved_at: str = "",
+    ) -> dict | None:
+        return await self._db.resolve_task_question(
+            task_id=task_id,
+            question_id=question_id,
+            status=status,
+            answer_payload=answer_payload,
+            resolved_at=resolved_at,
+        )
+
+    async def list_pending_task_questions(self, task_id: str) -> list[dict]:
+        return await self._db.list_pending_task_questions(task_id)
+
+    async def list_task_questions(self, task_id: str) -> list[dict]:
+        return await self._db.list_task_questions(task_id)
 
     async def list_recoverable_task_runs(
         self,

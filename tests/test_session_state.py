@@ -111,6 +111,60 @@ class TestSessionState:
         assert len(restored.key_decisions) == 1
         assert restored.ui_state["process_tabs"]["runs"][0]["run_id"] == "abc123"
 
+    def test_memory_snapshot_round_trip(self):
+        state = SessionState(session_id="test", workspace="/tmp", model_name="m")
+        state.update_memory_snapshot({
+            "active_decisions": [
+                {
+                    "id": 5,
+                    "entry_type": "decision",
+                    "status": "active",
+                    "summary": "Use compactor model for index extraction",
+                    "source_turn_start": 12,
+                    "source_turn_end": 13,
+                    "confidence": 0.91,
+                }
+            ],
+            "open_questions": [
+                {
+                    "id": 7,
+                    "entry_type": "open_question",
+                    "status": "active",
+                    "summary": "Should we force FTS mode by default?",
+                    "source_turn_start": 14,
+                    "source_turn_end": 14,
+                }
+            ],
+        })
+        state.update_memory_index_meta(
+            last_indexed_turn=18,
+            degraded=False,
+            failure_count=0,
+        )
+
+        raw = state.to_dict()
+        restored = SessionState.from_dict(raw)
+        assert restored.has_memory_snapshot is True
+        assert restored.active_decisions[0]["id"] == 5
+        assert restored.open_questions[0]["entry_type"] == "open_question"
+        assert restored.memory_index_last_indexed_turn == 18
+
+    def test_to_yaml_includes_active_memory_sections(self):
+        state = SessionState(session_id="x", workspace="/tmp", model_name="m")
+        state.update_memory_snapshot({
+            "active_decisions": [
+                {
+                    "summary": "Adopt typed recall entries",
+                    "status": "active",
+                    "source_turn_start": 9,
+                    "source_turn_end": 10,
+                }
+            ]
+        })
+        rendered = state.to_yaml()
+        assert "active_memory" in rendered
+        assert "DECISION" in rendered
+
     def test_from_json(self):
         state = SessionState(session_id="x", workspace="/tmp", model_name="m")
         import json

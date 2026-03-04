@@ -33,6 +33,8 @@ class TestConversationStore:
         assert "conversation_turns" in table_names
         assert "cowork_sessions" in table_names
         assert "cowork_chat_events" in table_names
+        assert "cowork_memory_entries" in table_names
+        assert "cowork_memory_index_state" in table_names
 
     async def test_create_session(self, store: ConversationStore):
         session_id = await store.create_session(
@@ -69,6 +71,72 @@ class TestConversationStore:
         assert turns[0]["content"] == "Hello"
         assert turns[1]["role"] == "assistant"
         assert turns[2]["turn_number"] == 3
+
+    async def test_upsert_and_search_cowork_memory_entries(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await store.upsert_cowork_memory_entry(
+            sid,
+            {
+                "entry_type": "decision",
+                "status": "active",
+                "summary": "Use compactor for cowork memory extraction",
+                "rationale": "Lower latency and cost",
+                "topic": "cowork-memory",
+                "source_turn_start": 4,
+                "source_turn_end": 5,
+                "source_roles": ["assistant"],
+                "evidence_excerpt": "DECISION: use compactor role",
+                "confidence": 0.93,
+                "fingerprint": "fp-1",
+            },
+        )
+        await store.upsert_cowork_memory_entry(
+            sid,
+            {
+                "entry_type": "open_question",
+                "status": "active",
+                "summary": "Should force_fts be enabled?",
+                "topic": "cowork-memory",
+                "source_turn_start": 6,
+                "source_turn_end": 6,
+                "source_roles": ["user"],
+                "confidence": 0.51,
+                "fingerprint": "fp-2",
+            },
+        )
+
+        rows = await store.search_cowork_memory_entries(
+            sid,
+            query="compactor",
+            limit=10,
+        )
+        assert rows
+        assert rows[0]["entry_type"] in {"decision", "open_question"}
+        assert rows[0]["status"] == "active"
+        assert isinstance(rows[0]["source_roles"], list)
+
+        snapshot = await store.get_cowork_memory_active_snapshot(sid)
+        assert snapshot["active_decisions"]
+        assert snapshot["open_questions"]
+
+    async def test_cowork_memory_index_state_round_trip(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        state = await store.get_cowork_memory_index_state(sid)
+        assert state["last_indexed_turn"] == 0
+        assert state["index_degraded"] is False
+
+        await store.upsert_cowork_memory_index_state(
+            sid,
+            last_indexed_turn=17,
+            index_degraded=True,
+            last_error="parse-failed",
+            failure_count=2,
+            index_version=2,
+        )
+        updated = await store.get_cowork_memory_index_state(sid)
+        assert updated["last_indexed_turn"] == 17
+        assert updated["index_degraded"] is True
+        assert updated["failure_count"] == 2
 
     async def test_get_recent_turns(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")

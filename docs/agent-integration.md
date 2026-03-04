@@ -448,6 +448,12 @@ class RunTestsTool(Tool):
     def timeout_seconds(self) -> int:
         return 120  # tests can take a while
 
+    @property
+    def supported_execution_surfaces(self) -> tuple[str, ...]:
+        # Optional: restrict where this tool can run.
+        # Valid values: "tui", "api", "cli"
+        return ("tui", "api", "cli")
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         import subprocess
 
@@ -475,6 +481,11 @@ class RunTestsTool(Tool):
         except subprocess.TimeoutExpired:
             return ToolResult.fail("Test suite timed out")
 ```
+
+Execution surface notes:
+- If `supported_execution_surfaces` is omitted, Loom defaults to all surfaces (`tui`, `api`, `cli`) for backward compatibility.
+- Use this when a tool is interactive-only (for example, `("tui",)`), API-only, or CLI-only.
+- Runtime context is available on `ctx.execution_surface`.
 
 Register it:
 

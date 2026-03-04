@@ -69,6 +69,7 @@ from loom.cowork.session import (
 from loom.models.base import ModelProvider
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.processes.phase_alignment import infer_phase_id_for_subtask
+from loom.tools.ask_user import normalize_ask_user_args
 from loom.tools.registry import ToolRegistry
 from loom.tui.commands import LoomCommands
 from loom.tui.screens import (
@@ -1244,6 +1245,12 @@ class LoomApp(App):
             str,
             Callable[..., Awaitable[dict | None]],
         ] = {}
+        self._process_run_answer_handlers: dict[
+            str,
+            Callable[..., Awaitable[dict | None]],
+        ] = {}
+        self._process_run_question_locks: dict[str, asyncio.Lock] = {}
+        self._process_run_seen_questions: dict[str, set[str]] = {}
         self._process_run_pending_inject: dict[str, list[str]] = {}
         self._auto_resume_workspace_on_init = True
         self._run_auth_profile_overrides: dict[str, str] = {}
@@ -3557,6 +3564,54 @@ class LoomApp(App):
             )
         return self._model is not None
 
+    def _cowork_compactor_model(self) -> ModelProvider | None:
+        """Best-effort compactor model for cowork context compaction.
+
+        When a compactor role is configured, select it from ModelRouter.
+        Otherwise return None so CoworkSession falls back to the active model.
+        """
+        config = getattr(self, "_config", None)
+        models = getattr(config, "models", None)
+        if not isinstance(models, dict) or not models:
+            return None
+        try:
+            from loom.models.router import ModelRouter
+
+            router = ModelRouter.from_config(config)
+            return router.select(tier=1, role="compactor")
+        except Exception as e:
+            logger.debug("No cowork compactor role model configured: %s", e)
+            return None
+
+    def _cowork_memory_indexer_model(self) -> tuple[ModelProvider | None, str]:
+        """Select memory-index helper model with role preference ordering.
+
+        Preference:
+        1) compactor role
+        2) extractor role
+        3) active cowork model fallback
+        """
+        if self._model is None:
+            return None, ""
+        config = getattr(self, "_config", None)
+        models = getattr(config, "models", None)
+        if not isinstance(models, dict) or not models:
+            return self._model, "active"
+        try:
+            from loom.models.router import ModelRouter
+
+            router = ModelRouter.from_config(config)
+        except Exception as e:
+            logger.debug("Failed building router for cowork memory indexer: %s", e)
+            return self._model, "active"
+
+        for role in ("compactor", "extractor"):
+            try:
+                return router.select(tier=1, role=role), role
+            except Exception:
+                continue
+        return self._model, "active"
+
     def _select_helper_model_for_role(
         self,
         *,
@@ -5195,6 +5250,115 @@ class LoomApp(App):
             return mode
         return "adaptive"
 
+    def _cowork_memory_index_enabled(self) -> bool:
+        if self._config is None:
+            return True
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return True
+        return bool(
+            getattr(execution, "cowork_memory_index_enabled", True),
+        )
+
+    def _cowork_memory_index_v2_actions_enabled(self) -> bool:
+        if self._config is None:
+            return True
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return True
+        return bool(
+            getattr(
+                execution,
+                "cowork_memory_index_v2_actions_enabled",
+                True,
+            ),
+        )
+
+    def _cowork_memory_index_force_fts(self) -> bool:
+        if self._config is None:
+            return False
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return False
+        return bool(
+            getattr(execution, "cowork_memory_index_force_fts", False),
+        )
+
+    def _cowork_indexer_model_role_strict(self) -> bool:
+        if self._config is None:
+            return False
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return False
+        return bool(
+            getattr(execution, "cowork_indexer_model_role_strict", False),
+        )
+
+    def _cowork_memory_index_llm_extraction_enabled(self) -> bool:
+        if self._config is None:
+            return True
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return True
+        return bool(
+            getattr(
+                execution,
+                "cowork_memory_index_llm_extraction_enabled",
+                True,
+            ),
+        )
+
+    def _cowork_memory_index_queue_max_batches(self) -> int:
+        if self._config is None:
+            return 32
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return 32
+        return max(
+            1,
+            int(
+                getattr(
+                    execution,
+                    "cowork_memory_index_queue_max_batches",
+                    32,
+                ),
+            ),
+        )
+
+    def _cowork_memory_index_section_limit(self) -> int:
+        if self._config is None:
+            return 4
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return 4
+        return max(
+            1,
+            int(
+                getattr(
+                    execution,
+                    "cowork_memory_index_section_limit",
+                    4,
+                ),
+            ),
+        )
+
+    def _cowork_recall_index_max_chars(self) -> int:
+        if self._config is None:
+            return 1200
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return 1200
+        return max(
+            600,
+            int(
+                getattr(
+                    execution,
+                    "cowork_recall_index_max_chars",
+                    1200,
+                ),
+            ),
+        )
+
     def _cowork_max_context_tokens(self) -> int:
         runner_limits = getattr(getattr(self._config, "limits", None), "runner", None)
         if runner_limits is None:
@@ -5512,6 +5676,8 @@ class LoomApp(App):
 
         # Build approver
         approver = ToolApprover(prompt_callback=self._approval_callback)
+        compactor_model = self._cowork_compactor_model()
+        memory_index_model, memory_index_role = self._cowork_memory_indexer_model()
 
         resume_target, auto_resume = await self._resolve_startup_resume_target()
         resume_info_message: str | None = None
@@ -5522,6 +5688,7 @@ class LoomApp(App):
             self._session = CoworkSession(
                 model=self._model,
                 tools=self._tools,
+                compactor_model=compactor_model,
                 workspace=self._workspace,
                 scratch_dir=self._cowork_scratch_dir(),
                 system_prompt=system_prompt,
@@ -5535,6 +5702,14 @@ class LoomApp(App):
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
                 ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
                 delegate_progress_callback=self._on_cowork_delegate_progress_event,
+                memory_index_enabled=self._cowork_memory_index_enabled(),
+                memory_index_llm_extraction_enabled=self._cowork_memory_index_llm_extraction_enabled(),
+                memory_index_model=memory_index_model,
+                memory_index_model_role=memory_index_role,
+                memory_index_role_strict=self._cowork_indexer_model_role_strict(),
+                memory_index_queue_max_batches=self._cowork_memory_index_queue_max_batches(),
+                memory_index_section_limit=self._cowork_memory_index_section_limit(),
+                recall_index_max_chars=self._cowork_recall_index_max_chars(),
             )
             try:
                 await self._session.resume(resume_target)
@@ -5569,6 +5744,7 @@ class LoomApp(App):
             self._session = CoworkSession(
                 model=self._model,
                 tools=self._tools,
+                compactor_model=compactor_model,
                 workspace=self._workspace,
                 scratch_dir=self._cowork_scratch_dir(),
                 system_prompt=system_prompt,
@@ -5583,12 +5759,21 @@ class LoomApp(App):
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
                 ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
                 delegate_progress_callback=self._on_cowork_delegate_progress_event,
+                memory_index_enabled=self._cowork_memory_index_enabled(),
+                memory_index_llm_extraction_enabled=self._cowork_memory_index_llm_extraction_enabled(),
+                memory_index_model=memory_index_model,
+                memory_index_model_role=memory_index_role,
+                memory_index_role_strict=self._cowork_indexer_model_role_strict(),
+                memory_index_queue_max_batches=self._cowork_memory_index_queue_max_batches(),
+                memory_index_section_limit=self._cowork_memory_index_section_limit(),
+                recall_index_max_chars=self._cowork_recall_index_max_chars(),
             )
         else:
             # Ephemeral session (no database)
             self._session = CoworkSession(
                 model=self._model,
                 tools=self._tools,
+                compactor_model=compactor_model,
                 workspace=self._workspace,
                 scratch_dir=self._cowork_scratch_dir(),
                 system_prompt=system_prompt,
@@ -5601,6 +5786,14 @@ class LoomApp(App):
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
                 ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
                 delegate_progress_callback=self._on_cowork_delegate_progress_event,
+                memory_index_enabled=self._cowork_memory_index_enabled(),
+                memory_index_llm_extraction_enabled=self._cowork_memory_index_llm_extraction_enabled(),
+                memory_index_model=memory_index_model,
+                memory_index_model_role=memory_index_role,
+                memory_index_role_strict=self._cowork_indexer_model_role_strict(),
+                memory_index_queue_max_batches=self._cowork_memory_index_queue_max_batches(),
+                memory_index_section_limit=self._cowork_memory_index_section_limit(),
+                recall_index_max_chars=self._cowork_recall_index_max_chars(),
             )
 
         self._reset_cowork_steering_state(clear_session=True)
@@ -7191,6 +7384,9 @@ class LoomApp(App):
         inject_cb = payload.get("inject")
         if callable(inject_cb):
             self._process_run_inject_handlers[run_id] = inject_cb
+        answer_cb = payload.get("answer_question")
+        if callable(answer_cb):
+            self._process_run_answer_handlers[run_id] = answer_cb
         task_id = str(payload.get("task_id", "")).strip()
         if task_id:
             run.task_id = task_id
@@ -7211,6 +7407,9 @@ class LoomApp(App):
         self._process_run_pause_handlers.pop(clean_id, None)
         self._process_run_play_handlers.pop(clean_id, None)
         self._process_run_inject_handlers.pop(clean_id, None)
+        self._process_run_answer_handlers.pop(clean_id, None)
+        self._process_run_question_locks.pop(clean_id, None)
+        self._process_run_seen_questions.pop(clean_id, None)
 
     @staticmethod
     def _normalize_process_run_status(raw_status: object | None) -> str:
@@ -7392,6 +7591,60 @@ class LoomApp(App):
             "path": "orchestrator",
             "error": "",
             "status": self._normalize_process_run_status(getattr(run, "status", "")),
+        }
+
+    async def _request_process_run_question_answer(
+        self,
+        run: ProcessRunState,
+        *,
+        question_id: str,
+        answer_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Submit an ask_user answer for a process run via delegate bridge."""
+        run_id = str(getattr(run, "run_id", "")).strip()
+        handler = self._process_run_answer_handlers.get(run_id)
+        if not callable(handler):
+            return {
+                "requested": False,
+                "path": "none",
+                "error": "Question answer bridge is unavailable.",
+                "status": self._normalize_process_run_status(getattr(run, "status", "")),
+                "question_id": str(question_id or "").strip(),
+            }
+        try:
+            response = await handler(
+                question_id=str(question_id or "").strip(),
+                answer_payload=dict(answer_payload or {}),
+            )
+        except Exception as e:
+            logger.warning(
+                "Process run question answer bridge failed for %s: %s",
+                run_id,
+                e,
+            )
+            return {
+                "requested": False,
+                "path": "orchestrator",
+                "error": str(e),
+                "status": self._normalize_process_run_status(getattr(run, "status", "")),
+                "question_id": str(question_id or "").strip(),
+            }
+        if isinstance(response, dict):
+            return {
+                "requested": bool(response.get("requested", False)),
+                "path": str(response.get("path", "orchestrator")).strip() or "orchestrator",
+                "error": str(response.get("error", "")).strip(),
+                "status": self._normalize_process_run_status(response.get("status")),
+                "question_id": str(
+                    response.get("question_id", question_id),
+                ).strip(),
+            }
+        return {
+            "requested": True,
+            "path": "orchestrator",
+            "error": "",
+            "status": self._normalize_process_run_status(getattr(run, "status", "")),
+            "question_id": str(question_id or "").strip(),
         }
 
     async def _flush_pending_process_run_inject(self, run_id: str) -> None:
@@ -8867,6 +9120,7 @@ class LoomApp(App):
                         getattr(run, "auth_required_resources", []),
                     ),
                     "_auth_workspace": str(self._workspace.resolve()),
+                    "_execution_surface": "tui",
                     "_resume_task_id": str(run.task_id or "").strip(),
                     "_progress_callback": (
                         lambda data, rid=run_id: self._on_process_progress_event(
@@ -10276,6 +10530,8 @@ class LoomApp(App):
                 session_id=self._session.session_id,
                 session_state=self._session.session_state,
                 compactor=getattr(self._session, "compactor", None),
+                v2_actions_enabled=self._cowork_memory_index_v2_actions_enabled(),
+                force_fts=self._cowork_memory_index_force_fts(),
             )
         if self._delegate_tool and self._config and self._db:
             try:
@@ -10870,6 +11126,8 @@ class LoomApp(App):
 
         system_prompt = self._build_system_prompt()
         approver = ToolApprover(prompt_callback=self._approval_callback)
+        compactor_model = self._cowork_compactor_model()
+        memory_index_model, memory_index_role = self._cowork_memory_indexer_model()
         session_id = await self._store.create_session(
             workspace=str(self._workspace),
             model_name=self._model.name,
@@ -10878,6 +11136,7 @@ class LoomApp(App):
         self._session = CoworkSession(
             model=self._model,
             tools=self._tools,
+            compactor_model=compactor_model,
             workspace=self._workspace,
             scratch_dir=self._cowork_scratch_dir(),
             system_prompt=system_prompt,
@@ -10892,6 +11151,14 @@ class LoomApp(App):
             ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
             ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
             delegate_progress_callback=self._on_cowork_delegate_progress_event,
+            memory_index_enabled=self._cowork_memory_index_enabled(),
+            memory_index_llm_extraction_enabled=self._cowork_memory_index_llm_extraction_enabled(),
+            memory_index_model=memory_index_model,
+            memory_index_model_role=memory_index_role,
+            memory_index_role_strict=self._cowork_indexer_model_role_strict(),
+            memory_index_queue_max_batches=self._cowork_memory_index_queue_max_batches(),
+            memory_index_section_limit=self._cowork_memory_index_section_limit(),
+            recall_index_max_chars=self._cowork_recall_index_max_chars(),
         )
         self._reset_cowork_steering_state(clear_session=True)
         self._total_tokens = 0
@@ -10920,6 +11187,8 @@ class LoomApp(App):
 
         system_prompt = self._build_system_prompt()
         approver = ToolApprover(prompt_callback=self._approval_callback)
+        compactor_model = self._cowork_compactor_model()
+        memory_index_model, memory_index_role = self._cowork_memory_indexer_model()
 
         # Persist outgoing session UI state before switching.
         await self._persist_process_run_ui_state(is_active=False)
@@ -10927,6 +11196,7 @@ class LoomApp(App):
         new_session = CoworkSession(
             model=self._model,
             tools=self._tools,
+            compactor_model=compactor_model,
             workspace=self._workspace,
             scratch_dir=self._cowork_scratch_dir(),
             system_prompt=system_prompt,
@@ -10940,6 +11210,14 @@ class LoomApp(App):
             ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
             ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
             delegate_progress_callback=self._on_cowork_delegate_progress_event,
+            memory_index_enabled=self._cowork_memory_index_enabled(),
+            memory_index_llm_extraction_enabled=self._cowork_memory_index_llm_extraction_enabled(),
+            memory_index_model=memory_index_model,
+            memory_index_model_role=memory_index_role,
+            memory_index_role_strict=self._cowork_indexer_model_role_strict(),
+            memory_index_queue_max_batches=self._cowork_memory_index_queue_max_batches(),
+            memory_index_section_limit=self._cowork_memory_index_section_limit(),
+            recall_index_max_chars=self._cowork_recall_index_max_chars(),
         )
         await new_session.resume(session_id)
 
@@ -13221,6 +13499,9 @@ class LoomApp(App):
             run.launch_last_heartbeat_at = 0.0
             run.launch_silent_warning_emitted = False
             event_type = str(data.get("event_type") or "")
+            event_data = data.get("event_data", {})
+            if not isinstance(event_data, dict):
+                event_data = {}
             task_status = str(data.get("status", "") or "").strip().lower()
             if task_status == "cancelled":
                 self._set_process_run_status(run, "cancelled")
@@ -13249,14 +13530,30 @@ class LoomApp(App):
             if task_id:
                 run.task_id = task_id
 
+            if event_type == "ask_user_requested":
+                question_id = str(event_data.get("question_id", "")).strip()
+                if question_id:
+                    seen = self._process_run_seen_questions.setdefault(run.run_id, set())
+                    if question_id not in seen:
+                        seen.add(question_id)
+                        self.run_worker(
+                            self._prompt_process_run_question(
+                                run_id=run.run_id,
+                                question_payload=dict(event_data),
+                            ),
+                            name=f"process-run-question-{run.run_id}-{question_id[:8]}",
+                            group=f"process-run-question-{run.run_id}",
+                            exclusive=False,
+                        )
+
             if event_type == "tool_call_completed":
-                tool_name = str(data.get("event_data", {}).get("tool", "")).strip()
+                tool_name = str(event_data.get("tool", "")).strip()
                 if self._is_mutating_tool(tool_name):
                     self._request_workspace_refresh(f"process:{tool_name}")
                 self._ingest_files_panel_from_paths(
-                    data.get("event_data", {}).get(
+                    event_data.get(
                         "files_changed_paths",
-                        data.get("event_data", {}).get("files_changed", []),
+                        event_data.get("files_changed", []),
                     ),
                     operation_hint="modify",
                 )
@@ -13288,6 +13585,10 @@ class LoomApp(App):
                 "subtask_completed",
                 "subtask_failed",
                 "tool_call_completed",
+                "ask_user_requested",
+                "ask_user_answered",
+                "ask_user_timeout",
+                "ask_user_cancelled",
             }
             refresh_due = event_type in force_refresh_types
             if not refresh_due:
@@ -13814,6 +14115,40 @@ class LoomApp(App):
             if error:
                 return f"{tool} failed for {subtask_label}: {error}"
             return f"{tool} failed for {subtask_label}."
+        if event_type == "ask_user_requested":
+            question = self._one_line(event_data.get("question", ""), 140)
+            if question:
+                return f"Clarification requested for {subtask_label}: {question}"
+            return f"Clarification requested for {subtask_label}."
+        if event_type in {"ask_user_answered", "ask_user_timeout", "ask_user_cancelled"}:
+            answer = event_data.get("answer", {})
+            if not isinstance(answer, dict):
+                answer = {}
+            answer_text = self._one_line(answer.get("custom_response", ""), 120)
+            if not answer_text:
+                selected_labels = answer.get("selected_labels", [])
+                if isinstance(selected_labels, list):
+                    answer_text = self._one_line(
+                        ", ".join(
+                            str(item).strip()
+                            for item in selected_labels
+                            if str(item).strip()
+                        ),
+                        120,
+                    )
+            if not answer_text:
+                answer_text = self._one_line(answer.get("response_type", ""), 60)
+            if event_type == "ask_user_answered":
+                if answer_text:
+                    return f"Clarification answered for {subtask_label}: {answer_text}"
+                return f"Clarification answered for {subtask_label}."
+            if event_type == "ask_user_timeout":
+                if answer_text:
+                    return f"Clarification timed out for {subtask_label}: {answer_text}"
+                return f"Clarification timed out for {subtask_label}."
+            if answer_text:
+                return f"Clarification cancelled for {subtask_label}: {answer_text}"
+            return f"Clarification cancelled for {subtask_label}."
         if event_type == "subtask_started":
             return f"Started {subtask_label}."
         if event_type == "subtask_retrying":
@@ -14005,10 +14340,104 @@ class LoomApp(App):
         ]
         self._refresh_sidebar_progress_summary()
 
+    async def _prompt_process_run_question(
+        self,
+        *,
+        run_id: str,
+        question_payload: dict[str, Any],
+    ) -> None:
+        run = self._process_runs.get(run_id)
+        if run is None or run.closed:
+            return
+        lock = self._process_run_question_locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            run = self._process_runs.get(run_id)
+            if run is None or run.closed:
+                return
+            payload = dict(question_payload or {})
+            question_id = str(payload.get("question_id", "") or "").strip()
+            if not question_id:
+                return
+            normalized = normalize_ask_user_args(payload)
+
+            answer_event = asyncio.Event()
+            answer_holder: list[dict[str, Any]] = []
+
+            def handle_answer(answer_payload: object) -> None:
+                if isinstance(answer_payload, dict):
+                    answer_holder.append(dict(answer_payload))
+                answer_event.set()
+
+            self.push_screen(
+                AskUserScreen(
+                    str(normalized.get("question", "") or ""),
+                    options=list(normalized.get("legacy_options", []) or []),
+                    question_type=str(normalized.get("question_type", "free_text") or "free_text"),
+                    option_items=list(normalized.get("options", []) or []),
+                    allow_custom_response=bool(normalized.get("allow_custom_response", True)),
+                    min_selections=int(normalized.get("min_selections", 0) or 0),
+                    max_selections=int(normalized.get("max_selections", 0) or 0),
+                    context_note=str(normalized.get("context_note", "") or ""),
+                    urgency=str(normalized.get("urgency", "normal") or "normal"),
+                    default_option_id=str(normalized.get("default_option_id", "") or ""),
+                    return_payload=True,
+                    allow_cancel=False,
+                ),
+                callback=handle_answer,
+            )
+
+            await answer_event.wait()
+            if not answer_holder:
+                return
+            answer_payload = dict(answer_holder[0])
+            answer_payload["question_id"] = question_id
+            answer_payload.setdefault("source", "tui")
+
+            run = self._process_runs.get(run_id)
+            if run is None or run.closed:
+                return
+
+            preview = str(answer_payload.get("custom_response", "") or "").strip()
+            if not preview:
+                labels = answer_payload.get("selected_labels", [])
+                if isinstance(labels, list):
+                    preview = ", ".join(str(item).strip() for item in labels if str(item).strip())
+            if not preview:
+                option_ids = answer_payload.get("selected_option_ids", [])
+                if isinstance(option_ids, list):
+                    preview = ", ".join(
+                        str(item).strip() for item in option_ids if str(item).strip()
+                    )
+            if not preview:
+                preview = str(answer_payload.get("response_type", "") or "").strip()
+            if preview:
+                self._append_process_run_activity(
+                    run,
+                    f"Clarification answer submitted: {self._one_line(preview, 140)}",
+                )
+
+            response = await self._request_process_run_question_answer(
+                run,
+                question_id=question_id,
+                answer_payload=answer_payload,
+            )
+            if bool(response.get("requested", False)):
+                return
+
+            seen = self._process_run_seen_questions.setdefault(run_id, set())
+            seen.discard(question_id)
+            error = str(response.get("error", "")).strip() or "Failed to submit answer."
+            self._append_process_run_activity(
+                run,
+                f"Clarification answer failed: {self._one_line(error, 140)}",
+            )
+            self.notify(error, severity="error", timeout=4)
+
     async def _handle_ask_user(self, event: ToolCallEvent) -> str:
         """Show an ask_user modal and return the answer."""
-        question = event.args.get("question", "")
-        options = event.args.get("options", [])
+        normalized = normalize_ask_user_args(event.args if isinstance(event.args, dict) else {})
+        question = str(normalized.get("question", "") or "")
+        options = list(normalized.get("legacy_options", []) or [])
 
         answer_event = asyncio.Event()
         answer_holder: list[str] = []
@@ -14018,7 +14447,18 @@ class LoomApp(App):
             answer_event.set()
 
         self.push_screen(
-            AskUserScreen(question, options),
+            AskUserScreen(
+                question,
+                options=options,
+                question_type=str(normalized.get("question_type", "free_text") or "free_text"),
+                option_items=list(normalized.get("options", []) or []),
+                allow_custom_response=bool(normalized.get("allow_custom_response", True)),
+                min_selections=int(normalized.get("min_selections", 0) or 0),
+                max_selections=int(normalized.get("max_selections", 0) or 0),
+                context_note=str(normalized.get("context_note", "") or ""),
+                urgency=str(normalized.get("urgency", "normal") or "normal"),
+                default_option_id=str(normalized.get("default_option_id", "") or ""),
+            ),
             callback=handle_answer,
         )
 

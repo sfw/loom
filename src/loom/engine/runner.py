@@ -48,6 +48,7 @@ from loom.models.request_diagnostics import (
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
+from loom.recovery.questions import QuestionAnswer, QuestionManager, QuestionRequest
 from loom.state.evidence import (
     extract_evidence_records,
     merge_evidence_records,
@@ -55,7 +56,11 @@ from loom.state.evidence import (
 )
 from loom.state.memory import MemoryEntry, MemoryManager
 from loom.state.task_state import Subtask, Task, TaskStateManager, TaskStatus
-from loom.tools.registry import ToolRegistry, ToolResult
+from loom.tools.registry import (
+    ToolRegistry,
+    ToolResult,
+    normalize_tool_execution_surface,
+)
 from loom.tools.workspace import ChangeLog
 from loom.utils.tokens import estimate_tokens
 
@@ -227,6 +232,7 @@ class SubtaskRunner:
         verification: VerificationGates,
         config: Config,
         event_bus: EventBus | None = None,
+        question_manager: QuestionManager | None = None,
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -237,6 +243,7 @@ class SubtaskRunner:
         self._config = config
         self._validator = ResponseValidator()
         self._event_bus = event_bus
+        self._question_manager = question_manager
         runner_limits = getattr(getattr(config, "limits", None), "runner", None)
         self._max_tool_iterations = int(
             getattr(runner_limits, "max_tool_iterations", self.MAX_TOOL_ITERATIONS),
@@ -520,6 +527,36 @@ class SubtaskRunner:
                 self.ENABLE_MUTATION_IDEMPOTENCY,
             ),
         )
+        self._ask_user_v2_enabled = bool(
+            getattr(execution_cfg, "ask_user_v2_enabled", False),
+        )
+        self._ask_user_runtime_blocking_enabled = bool(
+            getattr(execution_cfg, "ask_user_runtime_blocking_enabled", False),
+        )
+        self._ask_user_policy = str(
+            getattr(execution_cfg, "ask_user_policy", "block"),
+        ).strip().lower()
+        if self._ask_user_policy not in {"block", "timeout_default", "fail_closed"}:
+            self._ask_user_policy = "block"
+        self._ask_user_timeout_seconds = max(
+            0,
+            int(getattr(execution_cfg, "ask_user_timeout_seconds", 0) or 0),
+        )
+        self._ask_user_timeout_default_response = str(
+            getattr(execution_cfg, "ask_user_timeout_default_response", "") or "",
+        ).strip()
+        self._ask_user_max_pending_per_task = max(
+            1,
+            int(getattr(execution_cfg, "ask_user_max_pending_per_task", 3) or 3),
+        )
+        self._ask_user_max_questions_per_subtask = max(
+            1,
+            int(getattr(execution_cfg, "ask_user_max_questions_per_subtask", 3) or 3),
+        )
+        self._ask_user_min_seconds_between_questions = max(
+            0.0,
+            float(getattr(execution_cfg, "ask_user_min_seconds_between_questions", 10) or 0),
+        )
         self._evidence_context_text_max_chars = int(
             getattr(
                 getattr(config, "limits", None),
@@ -715,6 +752,159 @@ class SubtaskRunner:
             if status == TaskStatus.CANCELLED.value:
                 return False
             return True
+
+    def _ask_user_runtime_enabled(self) -> bool:
+        return bool(
+            self._ask_user_v2_enabled
+            and self._ask_user_runtime_blocking_enabled
+            and self._question_manager is not None
+        )
+
+    @staticmethod
+    def _execution_surface_for_task(task: Task) -> str:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        raw_surface = (
+            metadata.get("execution_surface", "")
+            or metadata.get("run_surface", "")
+            or metadata.get("client_surface", "")
+        )
+        if not str(raw_surface or "").strip():
+            task_id = str(getattr(task, "id", "") or "").strip().lower()
+            if task_id.startswith("cowork-"):
+                return "tui"
+        return normalize_tool_execution_surface(raw_surface, default="api")
+
+    def _set_waiting_for_user_input(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        request: QuestionRequest,
+    ) -> None:
+        if not isinstance(task.metadata, dict):
+            task.metadata = {}
+        task.metadata["awaiting_user_input"] = {
+            "question_id": str(request.question_id or "").strip(),
+            "subtask_id": str(subtask.id or "").strip(),
+            "question": str(request.question or "").strip(),
+            "question_type": str(request.question_type or "").strip(),
+            "requested_at": datetime.now().isoformat(),
+        }
+        try:
+            self._state.save(task)
+        except Exception:
+            logger.debug(
+                "Failed to persist awaiting_user_input marker for %s/%s",
+                task.id,
+                subtask.id,
+                exc_info=True,
+            )
+
+    def _clear_waiting_for_user_input(
+        self,
+        *,
+        task: Task,
+        question_id: str = "",
+    ) -> None:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            return
+        marker = metadata.get("awaiting_user_input")
+        if question_id:
+            marker_question_id = ""
+            if isinstance(marker, dict):
+                marker_question_id = str(marker.get("question_id", "") or "").strip()
+            if marker_question_id and marker_question_id != question_id:
+                return
+        if "awaiting_user_input" not in metadata:
+            return
+        metadata.pop("awaiting_user_input", None)
+        task.metadata = metadata
+        try:
+            self._state.save(task)
+        except Exception:
+            logger.debug(
+                "Failed clearing awaiting_user_input marker for %s",
+                task.id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _ask_user_limit_error(reason: str) -> ToolResult:
+        guidance = (
+            "Proceed using the best explicit assumption available and include "
+            "a risk note describing the unresolved uncertainty."
+        )
+        return ToolResult.fail(f"{reason} {guidance}")
+
+    async def _persist_ask_user_answer_memory(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        request: QuestionRequest,
+        answer: QuestionAnswer,
+    ) -> None:
+        detail_lines = [f"Question: {request.question}"]
+        answer_text = answer.text_response.strip()
+        if answer_text:
+            detail_lines.append(f"Answer: {answer_text}")
+        elif answer.response_type:
+            detail_lines.append(f"Answer type: {answer.response_type}")
+
+        user_summary = answer_text or answer.response_type or "Clarification received"
+        if len(user_summary) > 140:
+            user_summary = f"{user_summary[:139].rstrip()}…"
+
+        try:
+            await self._memory.store(MemoryEntry(
+                task_id=task.id,
+                subtask_id=subtask.id,
+                entry_type="user_instruction",
+                summary=user_summary,
+                detail="\n".join(detail_lines),
+                tags="ask_user,clarification",
+            ))
+        except Exception:
+            logger.debug(
+                "Failed storing ask_user instruction memory for %s/%s",
+                task.id,
+                subtask.id,
+                exc_info=True,
+            )
+
+        if not answer.selected_option_ids:
+            return
+        selected_labels = ", ".join(answer.selected_labels) or ", ".join(answer.selected_option_ids)
+        decision_summary = f"Clarification decision: {selected_labels}"
+        if len(decision_summary) > 140:
+            decision_summary = f"{decision_summary[:139].rstrip()}…"
+        try:
+            await self._memory.store(MemoryEntry(
+                task_id=task.id,
+                subtask_id=subtask.id,
+                entry_type="decision",
+                summary=decision_summary,
+                detail=json.dumps(
+                    {
+                        "question_id": answer.question_id,
+                        "selected_option_ids": list(answer.selected_option_ids),
+                        "selected_labels": list(answer.selected_labels),
+                        "response_type": answer.response_type,
+                        "source": answer.source,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                tags="ask_user,decision",
+            ))
+        except Exception:
+            logger.debug(
+                "Failed storing ask_user decision memory for %s/%s",
+                task.id,
+                subtask.id,
+                exc_info=True,
+            )
 
     def _is_timeout_guard_active(self, remaining_seconds: float | None = None) -> bool:
         remaining = (
@@ -1425,12 +1615,16 @@ class SubtaskRunner:
             prior_evidence_records or [],
             max_entries=10,
         )
+        execution_surface = self._execution_surface_for_task(task)
         prompt = self._prompts.build_executor_prompt(
             task=task,
             subtask=subtask,
             state_manager=self._state,
             memory_entries=memory_entries,
-            available_tools=self._tools.all_schemas(auth_context=auth_context),
+            available_tools=self._tools.all_schemas(
+                auth_context=auth_context,
+                execution_surface=execution_surface,
+            ),
             evidence_ledger_summary=evidence_summary,
         )
         if retry_context:
@@ -1466,6 +1660,8 @@ class SubtaskRunner:
             has_expected_deliverables=bool(canonical_deliverables),
             base_budget=self._max_tool_iterations,
         )
+        ask_user_questions_asked = 0
+        last_ask_user_requested_at = 0.0
 
         for iteration in range(iteration_budget):
             if not await self._wait_for_task_control_window(task):
@@ -1487,7 +1683,10 @@ class SubtaskRunner:
                 task_id=task.id,
                 subtask_id=subtask.id,
             )
-            tool_schemas = self._tools.all_schemas(auth_context=auth_context)
+            tool_schemas = self._tools.all_schemas(
+                auth_context=auth_context,
+                execution_surface=execution_surface,
+            )
             operation = "stream" if streaming else "complete"
             response = None
             policy = ModelRetryPolicy.from_execution_config(self._config.execution)
@@ -1631,7 +1830,10 @@ class SubtaskRunner:
                 # Validate tool calls before execution
                 validation = self._validator.validate_tool_calls(
                     response,
-                    self._tools.all_schemas(auth_context=auth_context),
+                    self._tools.all_schemas(
+                        auth_context=auth_context,
+                        execution_surface=execution_surface,
+                    ),
                 )
                 if not validation.valid:
                     messages.append({
@@ -1719,7 +1921,161 @@ class SubtaskRunner:
                                     },
                                 )
                         execute_args = dict(tc.arguments)
-                        if not deduped:
+                        if (
+                            tc.name == "ask_user"
+                            and not self._tools.has(
+                                "ask_user",
+                                execution_surface=execution_surface,
+                            )
+                        ):
+                            tool_result = self._ask_user_limit_error(
+                                "ask_user is unavailable for this execution surface.",
+                            )
+                        elif tc.name == "ask_user" and self._ask_user_runtime_enabled():
+                            now = time.monotonic()
+                            if (
+                                ask_user_questions_asked
+                                >= self._ask_user_max_questions_per_subtask
+                            ):
+                                tool_result = self._ask_user_limit_error(
+                                    "ask_user question cap reached for this subtask.",
+                                )
+                            elif (
+                                last_ask_user_requested_at > 0
+                                and self._ask_user_min_seconds_between_questions > 0
+                                and (
+                                    now - last_ask_user_requested_at
+                                ) < self._ask_user_min_seconds_between_questions
+                            ):
+                                wait_seconds = (
+                                    self._ask_user_min_seconds_between_questions
+                                    - (now - last_ask_user_requested_at)
+                                )
+                                tool_result = self._ask_user_limit_error(
+                                    "ask_user called too quickly "
+                                    f"({max(0.0, wait_seconds):.1f}s minimum wait remaining).",
+                                )
+                            else:
+                                question_manager = self._question_manager
+                                if question_manager is None:
+                                    tool_result = ToolResult.fail(
+                                        "ask_user runtime manager is unavailable.",
+                                    )
+                                else:
+                                    request = QuestionRequest.from_ask_user_args(
+                                        tc.arguments,
+                                        timeout_policy=self._ask_user_policy,
+                                        timeout_seconds=self._ask_user_timeout_seconds,
+                                        timeout_default_response=(
+                                            self._ask_user_timeout_default_response or None
+                                        ),
+                                        tool_call_id=str(getattr(tc, "id", "") or ""),
+                                        retry_attempt=max(
+                                            0,
+                                            int(getattr(subtask, "retry_count", 0) or 0),
+                                        ),
+                                    )
+                                    if not request.question_id and request.tool_call_id:
+                                        request.question_id = (
+                                            question_manager.deterministic_question_id(
+                                                task_id=task.id,
+                                                subtask_id=subtask.id,
+                                                tool_call_id=request.tool_call_id,
+                                                retry_attempt=request.retry_attempt,
+                                            )
+                                        )
+                                    if not request.question_id:
+                                        request.question_id = (
+                                            question_manager.deterministic_question_id_for_request(
+                                                task_id=task.id,
+                                                subtask_id=subtask.id,
+                                                request=request,
+                                            )
+                                        )
+                                    pending = await question_manager.list_pending_questions(task.id)
+                                    pending_ids = {
+                                        str(row.get("question_id", "")).strip()
+                                        for row in pending
+                                        if isinstance(row, dict)
+                                    }
+                                    has_same_pending_question = bool(
+                                        request.question_id and request.question_id in pending_ids
+                                    )
+                                    if (
+                                        self._ask_user_max_pending_per_task > 0
+                                        and len(pending) >= self._ask_user_max_pending_per_task
+                                        and not has_same_pending_question
+                                    ):
+                                        tool_result = self._ask_user_limit_error(
+                                            "ask_user pending question limit reached for task.",
+                                        )
+                                    else:
+                                        ask_user_questions_asked += 1
+                                        last_ask_user_requested_at = now
+                                        self._set_waiting_for_user_input(
+                                            task=task,
+                                            subtask=subtask,
+                                            request=request,
+                                        )
+                                        def _check_task_control() -> str:
+                                            return self._task_status_text(task)
+
+                                        try:
+                                            answer = await question_manager.request_question(
+                                                task_id=task.id,
+                                                subtask_id=subtask.id,
+                                                request=request,
+                                                check_task_control=_check_task_control,
+                                            )
+                                        finally:
+                                            self._clear_waiting_for_user_input(
+                                                task=task,
+                                                question_id=request.question_id,
+                                            )
+                                        answer_payload = answer.to_payload()
+                                        answer_status = str(
+                                            getattr(answer.status, "value", answer.status),
+                                        ).strip().lower()
+                                        if (
+                                            answer_status == "timeout"
+                                            and self._ask_user_policy == "fail_closed"
+                                        ):
+                                            tool_result = ToolResult(
+                                                success=False,
+                                                output="",
+                                                error=(
+                                                    "ask_user timed out without a valid "
+                                                    "default response."
+                                                ),
+                                                data=answer_payload,
+                                            )
+                                        elif answer_status == "cancelled":
+                                            tool_result = ToolResult(
+                                                success=False,
+                                                output="",
+                                                error="ask_user request cancelled.",
+                                                data=answer_payload,
+                                            )
+                                        else:
+                                            answer_text = answer.text_response.strip()
+                                            if not answer_text:
+                                                response_type = str(
+                                                    answer_payload.get("response_type", ""),
+                                                ).strip()
+                                                answer_text = (
+                                                    response_type or "Clarification received."
+                                                )
+                                            tool_result = ToolResult.ok(
+                                                answer_text,
+                                                data=answer_payload,
+                                            )
+                                        await self._persist_ask_user_answer_memory(
+                                            task=task,
+                                            subtask=subtask,
+                                            request=request,
+                                            answer=answer,
+                                        )
+                        elif not deduped:
                             if tc.name in {"web_fetch", "web_fetch_html"}:
                                 execute_args["_enable_filetype_ingest_router"] = bool(
                                     self._enable_filetype_ingest_router,
@@ -1741,6 +2097,7 @@ class SubtaskRunner:
                                 changelog=changelog,
                                 subtask_id=subtask.id,
                                 auth_context=auth_context,
+                                execution_surface=execution_surface,
                             )
                         if (
                             self._enable_mutation_idempotency

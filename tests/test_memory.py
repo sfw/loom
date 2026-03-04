@@ -233,6 +233,65 @@ class TestDatabase:
         assert row is not None
         assert row["status"] == "completed"
 
+    async def test_task_question_lifecycle(self, db: Database):
+        await db.insert_task(task_id="t1", goal="Test")
+        pending = await db.upsert_pending_task_question(
+            question_id="q-1",
+            task_id="t1",
+            subtask_id="s1",
+            request_payload={
+                "question_id": "q-1",
+                "question": "Choose stack",
+                "question_type": "single_choice",
+            },
+        )
+        assert pending["status"] == "pending"
+        assert pending["request_payload"]["question"] == "Choose stack"
+
+        listed_pending = await db.list_pending_task_questions("t1")
+        assert len(listed_pending) == 1
+        assert listed_pending[0]["question_id"] == "q-1"
+
+        resolved = await db.resolve_task_question(
+            task_id="t1",
+            question_id="q-1",
+            status="answered",
+            answer_payload={
+                "question_id": "q-1",
+                "response_type": "single_choice",
+                "selected_option_ids": ["py"],
+                "selected_labels": ["Python"],
+                "custom_response": "",
+                "source": "api",
+            },
+        )
+        assert resolved is not None
+        assert resolved["status"] == "answered"
+        assert resolved["answer_payload"]["selected_option_ids"] == ["py"]
+
+        listed_pending = await db.list_pending_task_questions("t1")
+        assert listed_pending == []
+        all_rows = await db.list_task_questions("t1")
+        assert len(all_rows) == 1
+        assert all_rows[0]["status"] == "answered"
+
+    async def test_task_question_scope_reuses_existing_pending_row(self, db: Database):
+        await db.insert_task(task_id="t1", goal="Test")
+        first = await db.upsert_pending_task_question(
+            question_id="q-1",
+            task_id="t1",
+            subtask_id="s1",
+            request_payload={"question_id": "q-1", "question": "First"},
+        )
+        second = await db.upsert_pending_task_question(
+            question_id="q-2",
+            task_id="t1",
+            subtask_id="s1",
+            request_payload={"question_id": "q-2", "question": "Second"},
+        )
+        assert first["question_id"] == "q-1"
+        assert second["question_id"] == "q-1"
+
     async def test_mutation_ledger_roundtrip(self, db: Database):
         await db.insert_task(task_id="t1", goal="Test")
         await db.upsert_mutation_ledger_entry(

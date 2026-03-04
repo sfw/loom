@@ -25,6 +25,8 @@ from loom.api.schemas import (
     TaskCreateRequest,
     TaskCreateResponse,
     TaskListItem,
+    TaskQuestionAnswerRequest,
+    TaskQuestionResponse,
     TaskResponse,
     TaskSteerRequest,
     ToolInfo,
@@ -40,7 +42,12 @@ from loom.engine.orchestrator import create_task
 from loom.events.bus import Event
 from loom.state.memory import MemoryEntry
 from loom.state.task_state import SubtaskStatus, TaskStatus
-from loom.tools.registry import normalize_tool_auth_mode, tool_auth_required
+from loom.tools.registry import (
+    normalize_tool_auth_mode,
+    normalize_tool_execution_surface,
+    normalize_tool_execution_surfaces,
+    tool_auth_required,
+)
 from loom.tools.workspace import validate_workspace
 from loom.utils.latency import log_latency_event
 
@@ -104,6 +111,45 @@ def _required_auth_resources_for_process(
 def _get_engine(request: Request) -> Engine:
     """Get the engine from the app state."""
     return request.app.state.engine
+
+
+def _serialize_task_question(row: dict) -> TaskQuestionResponse:
+    payload = dict(row or {})
+    return TaskQuestionResponse(
+        question_id=str(payload.get("question_id", "") or ""),
+        task_id=str(payload.get("task_id", "") or ""),
+        subtask_id=str(payload.get("subtask_id", "") or ""),
+        status=str(payload.get("status", "") or ""),
+        request_payload=(
+            payload.get("request_payload")
+            if isinstance(payload.get("request_payload"), dict)
+            else {}
+        ),
+        answer_payload=(
+            payload.get("answer_payload")
+            if isinstance(payload.get("answer_payload"), dict)
+            else {}
+        ),
+        created_at=str(payload.get("created_at", "") or ""),
+        updated_at=str(payload.get("updated_at", "") or ""),
+        resolved_at=str(payload.get("resolved_at", "") or ""),
+        timeout_at=str(payload.get("timeout_at", "") or ""),
+    )
+
+
+def _task_execution_surface(task: object) -> str:
+    metadata = getattr(task, "metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    raw = metadata.get("execution_surface", "")
+    if not str(raw or "").strip():
+        task_id = str(getattr(task, "id", "") or "").strip().lower()
+        if task_id.startswith("cowork-"):
+            return "tui"
+    return normalize_tool_execution_surface(
+        raw,
+        default="api",
+    )
 
 
 # --- Task Lifecycle ---
@@ -186,6 +232,9 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
 
     metadata = body.metadata if isinstance(body.metadata, dict) else {}
     metadata = dict(metadata)
+    # API-created tasks always run on the API surface. Do not permit callers
+    # to elevate to interactive-only surfaces (for example, tui).
+    metadata["execution_surface"] = "api"
     metadata["process"] = effective_process or ""
     required_auth_resources = await asyncio.to_thread(
         _required_auth_resources_for_process,
@@ -459,6 +508,92 @@ async def stream_task_tokens(request: Request, task_id: str):
             engine.event_bus.unsubscribe_all(terminal_handler)
 
     return EventSourceResponse(token_generator())
+
+
+@router.get("/tasks/{task_id}/questions", response_model=list[TaskQuestionResponse])
+async def list_task_questions(request: Request, task_id: str):
+    """List pending clarification questions for a task."""
+    engine = _get_engine(request)
+    if not bool(getattr(engine.config.execution, "ask_user_api_enabled", False)):
+        raise HTTPException(status_code=404, detail="Question API is disabled.")
+
+    if not engine.state_manager.exists(task_id):
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    task = engine.state_manager.load(task_id)
+    if _task_execution_surface(task) != "tui":
+        raise HTTPException(
+            status_code=409,
+            detail="Question API is only available for TUI execution surfaces.",
+        )
+
+    manager = getattr(engine, "question_manager", None)
+    if manager is None:
+        raise HTTPException(status_code=404, detail="Question manager is not available.")
+
+    rows = await manager.list_pending_questions(task_id)
+    return [_serialize_task_question(row) for row in rows if isinstance(row, dict)]
+
+
+@router.post(
+    "/tasks/{task_id}/questions/{question_id}/answer",
+    response_model=TaskQuestionResponse,
+)
+async def answer_task_question(
+    request: Request,
+    task_id: str,
+    question_id: str,
+    body: TaskQuestionAnswerRequest,
+):
+    """Submit an answer to a pending clarification question."""
+    engine = _get_engine(request)
+    if not bool(getattr(engine.config.execution, "ask_user_api_enabled", False)):
+        raise HTTPException(status_code=404, detail="Question API is disabled.")
+
+    if not engine.state_manager.exists(task_id):
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    task = engine.state_manager.load(task_id)
+    if _task_execution_surface(task) != "tui":
+        raise HTTPException(
+            status_code=409,
+            detail="Question API is only available for TUI execution surfaces.",
+        )
+
+    manager = getattr(engine, "question_manager", None)
+    if manager is None:
+        raise HTTPException(status_code=404, detail="Question manager is not available.")
+
+    existing = await manager.get_question(task_id, question_id)
+    if existing is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Question not found: {question_id}",
+        )
+
+    status = str(existing.get("status", "") or "").strip().lower()
+    if status != "pending":
+        if status == "answered":
+            return _serialize_task_question(existing)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Question is not pending (status={status or 'unknown'}).",
+        )
+
+    answer_payload = body.model_dump(exclude_none=True)
+    try:
+        resolved = await manager.answer_question(
+            task_id=task_id,
+            question_id=question_id,
+            answer_payload=answer_payload,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    if resolved is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Question not found: {question_id}",
+        )
+    return _serialize_task_question(resolved)
 
 
 @router.patch("/tasks/{task_id}")
@@ -823,6 +958,9 @@ async def list_tools(request: Request):
                 ),
                 auth_required=tool_auth_required(tool),
                 auth_requirements=list(auth_requirements),
+                execution_surfaces=list(normalize_tool_execution_surfaces(
+                    schema.get("x_supported_execution_surfaces", []),
+                )),
             ),
         )
     return rows

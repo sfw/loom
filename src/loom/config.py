@@ -246,11 +246,29 @@ class ExecutionConfig:
     enable_mutation_idempotency: bool = False
     enable_slo_metrics: bool = False
     delegate_task_timeout_seconds: int = 3600
+    ask_user_v2_enabled: bool = False
+    ask_user_runtime_blocking_enabled: bool = False
+    ask_user_durable_state_enabled: bool = False
+    ask_user_api_enabled: bool = False
+    ask_user_policy: str = "block"  # block | timeout_default | fail_closed
+    ask_user_timeout_seconds: int = 0
+    ask_user_timeout_default_response: str = ""
+    ask_user_max_pending_per_task: int = 3
+    ask_user_max_questions_per_subtask: int = 3
+    ask_user_min_seconds_between_questions: int = 10
     model_call_max_attempts: int = 5
     model_call_retry_base_delay_seconds: float = 0.5
     model_call_retry_max_delay_seconds: float = 8.0
     model_call_retry_jitter_seconds: float = 0.25
     cowork_tool_exposure_mode: str = "adaptive"  # full | adaptive | hybrid
+    cowork_memory_index_enabled: bool = True
+    cowork_memory_index_v2_actions_enabled: bool = True
+    cowork_memory_index_force_fts: bool = False
+    cowork_indexer_model_role_strict: bool = False
+    cowork_memory_index_llm_extraction_enabled: bool = True
+    cowork_memory_index_queue_max_batches: int = 32
+    cowork_memory_index_section_limit: int = 4
+    cowork_recall_index_max_chars: int = 1200
     enable_software_dev_tools: bool = False
     enable_agent_tools: bool = False
     enable_wp_tools: bool = False
@@ -711,6 +729,21 @@ def load_config(path: Path | None = None) -> Config:
         delegate_task_timeout_seconds = 3600
     delegate_task_timeout_seconds = max(1, delegate_task_timeout_seconds)
 
+    ask_user_timeout_default_raw = exec_data.get(
+        "ask_user_timeout_default_response",
+        ExecutionConfig.ask_user_timeout_default_response,
+    )
+    if isinstance(ask_user_timeout_default_raw, list):
+        ask_user_timeout_default_response = ",".join(
+            str(item).strip()
+            for item in ask_user_timeout_default_raw
+            if str(item).strip()
+        )
+    else:
+        ask_user_timeout_default_response = str(
+            ask_user_timeout_default_raw or "",
+        ).strip()
+
     max_attempts_raw = exec_data.get("model_call_max_attempts", 5)
     try:
         model_call_max_attempts = int(max_attempts_raw)
@@ -862,6 +895,58 @@ def load_config(path: Path | None = None) -> Config:
             ExecutionConfig.enable_slo_metrics,
         ),
         delegate_task_timeout_seconds=delegate_task_timeout_seconds,
+        ask_user_v2_enabled=_bool_from(
+            exec_data,
+            "ask_user_v2_enabled",
+            ExecutionConfig.ask_user_v2_enabled,
+        ),
+        ask_user_runtime_blocking_enabled=_bool_from(
+            exec_data,
+            "ask_user_runtime_blocking_enabled",
+            ExecutionConfig.ask_user_runtime_blocking_enabled,
+        ),
+        ask_user_durable_state_enabled=_bool_from(
+            exec_data,
+            "ask_user_durable_state_enabled",
+            ExecutionConfig.ask_user_durable_state_enabled,
+        ),
+        ask_user_api_enabled=_bool_from(
+            exec_data,
+            "ask_user_api_enabled",
+            ExecutionConfig.ask_user_api_enabled,
+        ),
+        ask_user_policy=str(
+            exec_data.get("ask_user_policy", ExecutionConfig.ask_user_policy),
+        ).strip().lower(),
+        ask_user_timeout_seconds=_int_from(
+            exec_data,
+            "ask_user_timeout_seconds",
+            ExecutionConfig.ask_user_timeout_seconds,
+            minimum=0,
+            maximum=7 * 24 * 3600,
+        ),
+        ask_user_timeout_default_response=ask_user_timeout_default_response,
+        ask_user_max_pending_per_task=_int_from(
+            exec_data,
+            "ask_user_max_pending_per_task",
+            ExecutionConfig.ask_user_max_pending_per_task,
+            minimum=1,
+            maximum=64,
+        ),
+        ask_user_max_questions_per_subtask=_int_from(
+            exec_data,
+            "ask_user_max_questions_per_subtask",
+            ExecutionConfig.ask_user_max_questions_per_subtask,
+            minimum=1,
+            maximum=20,
+        ),
+        ask_user_min_seconds_between_questions=_int_from(
+            exec_data,
+            "ask_user_min_seconds_between_questions",
+            ExecutionConfig.ask_user_min_seconds_between_questions,
+            minimum=0,
+            maximum=600,
+        ),
         model_call_max_attempts=model_call_max_attempts,
         model_call_retry_base_delay_seconds=model_call_retry_base_delay_seconds,
         model_call_retry_max_delay_seconds=model_call_retry_max_delay_seconds,
@@ -873,6 +958,52 @@ def load_config(path: Path | None = None) -> Config:
                     ExecutionConfig.cowork_tool_exposure_mode,
                 ),
             ).strip().lower()
+        ),
+        cowork_memory_index_enabled=_bool_from(
+            exec_data,
+            "cowork_memory_index_enabled",
+            ExecutionConfig.cowork_memory_index_enabled,
+        ),
+        cowork_memory_index_v2_actions_enabled=_bool_from(
+            exec_data,
+            "cowork_memory_index_v2_actions_enabled",
+            ExecutionConfig.cowork_memory_index_v2_actions_enabled,
+        ),
+        cowork_memory_index_force_fts=_bool_from(
+            exec_data,
+            "cowork_memory_index_force_fts",
+            ExecutionConfig.cowork_memory_index_force_fts,
+        ),
+        cowork_indexer_model_role_strict=_bool_from(
+            exec_data,
+            "cowork_indexer_model_role_strict",
+            ExecutionConfig.cowork_indexer_model_role_strict,
+        ),
+        cowork_memory_index_llm_extraction_enabled=_bool_from(
+            exec_data,
+            "cowork_memory_index_llm_extraction_enabled",
+            ExecutionConfig.cowork_memory_index_llm_extraction_enabled,
+        ),
+        cowork_memory_index_queue_max_batches=_int_from(
+            exec_data,
+            "cowork_memory_index_queue_max_batches",
+            ExecutionConfig.cowork_memory_index_queue_max_batches,
+            minimum=1,
+            maximum=256,
+        ),
+        cowork_memory_index_section_limit=_int_from(
+            exec_data,
+            "cowork_memory_index_section_limit",
+            ExecutionConfig.cowork_memory_index_section_limit,
+            minimum=1,
+            maximum=8,
+        ),
+        cowork_recall_index_max_chars=_int_from(
+            exec_data,
+            "cowork_recall_index_max_chars",
+            ExecutionConfig.cowork_recall_index_max_chars,
+            minimum=600,
+            maximum=4000,
         ),
         enable_agent_tools=_bool_from(
             exec_data,
@@ -922,9 +1053,37 @@ def load_config(path: Path | None = None) -> Config:
     cowork_tool_exposure_mode = execution.cowork_tool_exposure_mode
     if cowork_tool_exposure_mode not in {"full", "adaptive", "hybrid"}:
         cowork_tool_exposure_mode = ExecutionConfig.cowork_tool_exposure_mode
+    cowork_memory_index_queue_max_batches = max(
+        1,
+        min(256, int(execution.cowork_memory_index_queue_max_batches)),
+    )
+    cowork_memory_index_section_limit = max(
+        1,
+        min(8, int(execution.cowork_memory_index_section_limit)),
+    )
+    cowork_recall_index_max_chars = max(
+        600,
+        min(4000, int(execution.cowork_recall_index_max_chars)),
+    )
     agent_tools_default_network_mode = execution.agent_tools_default_network_mode
     if agent_tools_default_network_mode not in {"on", "off"}:
         agent_tools_default_network_mode = ExecutionConfig.agent_tools_default_network_mode
+    ask_user_policy = str(execution.ask_user_policy or "").strip().lower()
+    if ask_user_policy not in {"block", "timeout_default", "fail_closed"}:
+        ask_user_policy = ExecutionConfig.ask_user_policy
+    ask_user_timeout_default_response = str(
+        execution.ask_user_timeout_default_response or "",
+    ).strip()
+    ask_user_timeout_seconds = max(0, int(execution.ask_user_timeout_seconds))
+    ask_user_max_pending_per_task = max(1, int(execution.ask_user_max_pending_per_task))
+    ask_user_max_questions_per_subtask = max(
+        1,
+        int(execution.ask_user_max_questions_per_subtask),
+    )
+    ask_user_min_seconds_between_questions = max(
+        0,
+        int(execution.ask_user_min_seconds_between_questions),
+    )
     loop_prefixes = [
         str(item).strip()
         for item in execution.iteration_command_exit_allowlisted_prefixes
@@ -938,7 +1097,16 @@ def load_config(path: Path | None = None) -> Config:
             "executor_completion_contract_mode": completion_mode,
             "planner_degraded_mode": planner_mode,
             "cowork_tool_exposure_mode": cowork_tool_exposure_mode,
+            "cowork_memory_index_queue_max_batches": cowork_memory_index_queue_max_batches,
+            "cowork_memory_index_section_limit": cowork_memory_index_section_limit,
+            "cowork_recall_index_max_chars": cowork_recall_index_max_chars,
             "agent_tools_default_network_mode": agent_tools_default_network_mode,
+            "ask_user_policy": ask_user_policy,
+            "ask_user_timeout_seconds": ask_user_timeout_seconds,
+            "ask_user_timeout_default_response": ask_user_timeout_default_response,
+            "ask_user_max_pending_per_task": ask_user_max_pending_per_task,
+            "ask_user_max_questions_per_subtask": ask_user_max_questions_per_subtask,
+            "ask_user_min_seconds_between_questions": ask_user_min_seconds_between_questions,
             "iteration_command_exit_allowlisted_prefixes": loop_prefixes,
         },
     )

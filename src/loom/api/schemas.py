@@ -39,6 +39,16 @@ class ConversationMessageRequest(BaseModel):
     role: str = "user"
 
 
+class TaskQuestionAnswerRequest(BaseModel):
+    response_type: str | None = None
+    selected_option_ids: list[str] = Field(default_factory=list)
+    selected_labels: list[str] = Field(default_factory=list)
+    custom_response: str = ""
+    source: str = "api"
+    answered_by: str | None = None
+    client_id: str | None = None
+
+
 # --- Response Schemas ---
 
 
@@ -126,6 +136,7 @@ class ToolInfo(BaseModel):
     auth_mode: str = "no_auth"
     auth_required: bool = False
     auth_requirements: list[dict[str, Any]] = Field(default_factory=list)
+    execution_surfaces: list[str] = Field(default_factory=list)
 
 
 class ContentBlockResponse(BaseModel):
@@ -143,3 +154,16 @@ class ContentBlockResponse(BaseModel):
     extracted_text: str = ""
     thinking: str = ""
     signature: str = ""
+
+
+class TaskQuestionResponse(BaseModel):
+    question_id: str
+    task_id: str
+    subtask_id: str
+    status: str
+    request_payload: dict[str, Any] = Field(default_factory=dict)
+    answer_payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+    resolved_at: str = ""
+    timeout_at: str = ""

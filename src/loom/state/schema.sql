@@ -118,6 +118,147 @@ CREATE INDEX IF NOT EXISTS idx_cce_session_created
 CREATE INDEX IF NOT EXISTS idx_cce_session_id
     ON cowork_chat_events(session_id, id);
 
+-- Typed cowork memory index (marker-oriented conversation memory)
+CREATE TABLE IF NOT EXISTS cowork_memory_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    entry_type TEXT NOT NULL,                   -- decision|proposal|research|...
+    status TEXT NOT NULL DEFAULT 'active',      -- active|superseded|resolved|rejected
+    summary TEXT NOT NULL,
+    rationale TEXT DEFAULT '',
+    topic TEXT DEFAULT '',
+    tags_json TEXT DEFAULT '[]',
+    tags_text TEXT DEFAULT '',
+    entities_json TEXT DEFAULT '[]',
+    entities_text TEXT DEFAULT '',
+    source_turn_start INTEGER NOT NULL DEFAULT 0,
+    source_turn_end INTEGER NOT NULL DEFAULT 0,
+    source_roles_json TEXT DEFAULT '[]',
+    evidence_excerpt TEXT DEFAULT '',
+    supersedes_entry_id INTEGER,
+    confidence REAL DEFAULT 0.0,
+    fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES cowork_sessions(id),
+    FOREIGN KEY (supersedes_entry_id) REFERENCES cowork_memory_entries(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cme_session_fingerprint
+    ON cowork_memory_entries(session_id, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_cme_session_type_status_updated
+    ON cowork_memory_entries(session_id, entry_type, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cme_session_turn_range
+    ON cowork_memory_entries(session_id, source_turn_start, source_turn_end);
+
+CREATE TABLE IF NOT EXISTS cowork_memory_index_state (
+    session_id TEXT PRIMARY KEY,
+    last_indexed_turn INTEGER NOT NULL DEFAULT 0,
+    index_version INTEGER NOT NULL DEFAULT 1,
+    index_degraded INTEGER NOT NULL DEFAULT 0,
+    last_indexed_at TEXT,
+    last_error TEXT DEFAULT '',
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES cowork_sessions(id)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS cowork_memory_fts USING fts5(
+    summary,
+    rationale,
+    topic,
+    tags_text,
+    entities_text,
+    evidence_excerpt,
+    content='cowork_memory_entries',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS cowork_memory_entries_ai
+AFTER INSERT ON cowork_memory_entries BEGIN
+    INSERT INTO cowork_memory_fts(
+        rowid,
+        summary,
+        rationale,
+        topic,
+        tags_text,
+        entities_text,
+        evidence_excerpt
+    ) VALUES (
+        new.id,
+        new.summary,
+        new.rationale,
+        new.topic,
+        new.tags_text,
+        new.entities_text,
+        new.evidence_excerpt
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS cowork_memory_entries_ad
+AFTER DELETE ON cowork_memory_entries BEGIN
+    INSERT INTO cowork_memory_fts(
+        cowork_memory_fts,
+        rowid,
+        summary,
+        rationale,
+        topic,
+        tags_text,
+        entities_text,
+        evidence_excerpt
+    ) VALUES (
+        'delete',
+        old.id,
+        old.summary,
+        old.rationale,
+        old.topic,
+        old.tags_text,
+        old.entities_text,
+        old.evidence_excerpt
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS cowork_memory_entries_au
+AFTER UPDATE ON cowork_memory_entries BEGIN
+    INSERT INTO cowork_memory_fts(
+        cowork_memory_fts,
+        rowid,
+        summary,
+        rationale,
+        topic,
+        tags_text,
+        entities_text,
+        evidence_excerpt
+    ) VALUES (
+        'delete',
+        old.id,
+        old.summary,
+        old.rationale,
+        old.topic,
+        old.tags_text,
+        old.entities_text,
+        old.evidence_excerpt
+    );
+    INSERT INTO cowork_memory_fts(
+        rowid,
+        summary,
+        rationale,
+        topic,
+        tags_text,
+        entities_text,
+        evidence_excerpt
+    ) VALUES (
+        new.id,
+        new.summary,
+        new.rationale,
+        new.topic,
+        new.tags_text,
+        new.entities_text,
+        new.evidence_excerpt
+    );
+END;
+
 -- Durable task run lifecycle (for crash-safe background execution)
 CREATE TABLE IF NOT EXISTS task_runs (
     run_id TEXT PRIMARY KEY,
@@ -140,6 +281,29 @@ CREATE TABLE IF NOT EXISTS task_runs (
 CREATE INDEX IF NOT EXISTS idx_task_runs_task ON task_runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_task_runs_lease ON task_runs(lease_expires_at);
+
+-- Durable ask-user clarification lifecycle
+CREATE TABLE IF NOT EXISTS task_questions (
+    question_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    subtask_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',      -- pending|answered|timeout|cancelled
+    request_payload TEXT NOT NULL,               -- JSON
+    answer_payload TEXT,                         -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT,
+    timeout_at TEXT,
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_questions_task_status
+    ON task_questions(task_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_questions_task_subtask
+    ON task_questions(task_id, subtask_id, status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_questions_active_scope
+    ON task_questions(task_id, subtask_id)
+    WHERE status = 'pending';
 
 -- Retry lineage and remediation queue state
 CREATE TABLE IF NOT EXISTS subtask_attempts (

@@ -6,6 +6,8 @@ import asyncio
 
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
+    ASK_USER_ANSWERED,
+    ASK_USER_REQUESTED,
     SUBTASK_COMPLETED,
     SUBTASK_STARTED,
     TASK_COMPLETED,
@@ -149,6 +151,8 @@ class TestEventBus:
         assert TASK_FAILED == "task_failed"
         assert SUBTASK_STARTED == "subtask_started"
         assert SUBTASK_COMPLETED == "subtask_completed"
+        assert ASK_USER_REQUESTED == "ask_user_requested"
+        assert ASK_USER_ANSWERED == "ask_user_answered"
 
     def test_async_handler_called(self):
         """Test that async handlers are invoked when an event loop is running."""

@@ -23,6 +23,14 @@ _MAX_MCP_AUTH_VIEW_CACHE_ENTRIES = 64
 _INTERNAL_TOOL_ARG_PREFIX = "_loom_"
 ToolAuthMode = Literal["no_auth", "optional_auth", "required_auth"]
 _VALID_TOOL_AUTH_MODES = frozenset({"no_auth", "optional_auth", "required_auth"})
+ToolExecutionSurface = Literal["tui", "api", "cli"]
+_VALID_TOOL_EXECUTION_SURFACES = frozenset({"tui", "api", "cli"})
+_DEFAULT_TOOL_EXECUTION_SURFACE: ToolExecutionSurface = "tui"
+_DEFAULT_TOOL_EXECUTION_SURFACES: tuple[ToolExecutionSurface, ...] = (
+    "tui",
+    "api",
+    "cli",
+)
 
 
 def normalize_tool_auth_mode(value: object) -> ToolAuthMode:
@@ -31,6 +39,55 @@ def normalize_tool_auth_mode(value: object) -> ToolAuthMode:
     if mode in _VALID_TOOL_AUTH_MODES:
         return mode  # type: ignore[return-value]
     return "no_auth"
+
+
+def normalize_tool_execution_surface(
+    value: object,
+    *,
+    default: ToolExecutionSurface = _DEFAULT_TOOL_EXECUTION_SURFACE,
+) -> ToolExecutionSurface:
+    """Normalize runtime execution surface to a supported literal."""
+    surface = str(value or "").strip().lower()
+    if surface in _VALID_TOOL_EXECUTION_SURFACES:
+        return surface  # type: ignore[return-value]
+    return default
+
+
+def normalize_tool_execution_surfaces(value: object) -> tuple[ToolExecutionSurface, ...]:
+    """Normalize declared tool execution surfaces with safe defaults."""
+    if isinstance(value, str):
+        cleaned = normalize_tool_execution_surface(
+            value,
+            default=_DEFAULT_TOOL_EXECUTION_SURFACE,
+        )
+        return (cleaned,)
+    if isinstance(value, (tuple, list, set)):
+        normalized: list[ToolExecutionSurface] = []
+        for item in value:
+            clean = normalize_tool_execution_surface(
+                item,
+                default=_DEFAULT_TOOL_EXECUTION_SURFACE,
+            )
+            if clean not in normalized:
+                normalized.append(clean)
+        if normalized:
+            return tuple(normalized)
+    return _DEFAULT_TOOL_EXECUTION_SURFACES
+
+
+def tool_supports_execution_surface(
+    tool: object,
+    execution_surface: object,
+) -> bool:
+    """Return whether a tool can run on the requested execution surface."""
+    clean_surface = normalize_tool_execution_surface(
+        execution_surface,
+        default=_DEFAULT_TOOL_EXECUTION_SURFACE,
+    )
+    declared = normalize_tool_execution_surfaces(
+        getattr(tool, "supported_execution_surfaces", _DEFAULT_TOOL_EXECUTION_SURFACES),
+    )
+    return clean_surface in declared
 
 
 def tool_auth_required(tool: object) -> bool:
@@ -121,6 +178,7 @@ class ToolContext:
     changelog: Any | None = None  # ChangeLog instance for tracking file modifications
     subtask_id: str = ""
     auth_context: Any | None = None
+    execution_surface: ToolExecutionSurface = _DEFAULT_TOOL_EXECUTION_SURFACE
 
 
 class ToolSafetyError(Exception):
@@ -185,16 +243,25 @@ class Tool(ABC):
         """Whether this tool mutates local/external state."""
         return False
 
+    @property
+    def supported_execution_surfaces(self) -> tuple[ToolExecutionSurface, ...]:
+        """Declared execution surfaces where this tool is valid."""
+        return _DEFAULT_TOOL_EXECUTION_SURFACES
+
     @abstractmethod
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         ...
 
     def schema(self) -> dict:
         """Return OpenAI-format tool definition."""
+        surfaces = normalize_tool_execution_surfaces(
+            getattr(self, "supported_execution_surfaces", _DEFAULT_TOOL_EXECUTION_SURFACES),
+        )
         return {
             "name": self.name,
             "description": self.description,
             "parameters": self.parameters,
+            "x_supported_execution_surfaces": list(surfaces),
         }
 
     def _resolve_path(self, raw_path: str, workspace: Path) -> Path:
@@ -684,28 +751,70 @@ class ToolRegistry:
         with self._tools_lock:
             return self._tools.pop(name, None) is not None
 
-    def has(self, name: str, *, auth_context: Any = None) -> bool:
+    @staticmethod
+    def _requested_execution_surface(value: object) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return normalize_tool_execution_surface(text)
+
+    def has(
+        self,
+        name: str,
+        *,
+        auth_context: Any = None,
+        execution_surface: str | None = None,
+    ) -> bool:
         """Check if tool is registered."""
+        requested_surface = self._requested_execution_surface(execution_surface)
         if name.startswith("mcp."):
             if auth_context is not None and self._mcp_discovery_hook is not None:
                 discovered = self._discover_mcp_view(
                     auth_context=auth_context,
                     background_on_expiry=True,
                 )
+                tool = discovered.get(name)
+                if tool is not None:
+                    return (
+                        not requested_surface
+                        or tool_supports_execution_surface(tool, requested_surface)
+                    )
                 if name in discovered:
                     return True
                 discovered = self._discover_mcp_view(
                     auth_context=auth_context,
                     force=True,
                 )
-                return name in discovered
+                tool = discovered.get(name)
+                if tool is None:
+                    return False
+                if requested_surface and not tool_supports_execution_surface(
+                    tool,
+                    requested_surface,
+                ):
+                    return False
+                return True
             with self._tools_lock:
-                if name in self._tools:
+                tool = self._tools.get(name)
+                if tool is not None:
+                    if requested_surface and not tool_supports_execution_surface(
+                        tool,
+                        requested_surface,
+                    ):
+                        return False
                     return True
             # Only force-refresh when the requested MCP tool is missing.
             self._maybe_refresh_mcp(force=True, wait_if_running=True)
         with self._tools_lock:
-            return name in self._tools
+            tool = self._tools.get(name)
+        if tool is None:
+            return False
+        if requested_surface and not tool_supports_execution_surface(
+            tool,
+            requested_surface,
+        ):
+            return False
+        return True
 
     async def execute(
         self,
@@ -718,9 +827,11 @@ class ToolRegistry:
         subtask_id: str = "",
         auth_context: Any = None,
         allow_internal_args: bool = False,
+        execution_surface: str | None = None,
     ) -> ToolResult:
         """Execute a tool by name with timeout and context."""
         tool: Tool | None = None
+        requested_surface = self._requested_execution_surface(execution_surface)
         if name.startswith("mcp.") and auth_context is not None and self._mcp_discovery_hook:
             discovered = self._discover_mcp_view(
                 auth_context=auth_context,
@@ -754,6 +865,16 @@ class ToolRegistry:
                     tool = self._tools.get(name)
         if tool is None:
             return ToolResult.fail(f"Unknown tool: {name}")
+        if requested_surface and not tool_supports_execution_surface(
+            tool,
+            requested_surface,
+        ):
+            return ToolResult.fail(
+                (
+                    f"Tool '{name}' is not available on execution surface "
+                    f"'{requested_surface}'."
+                ),
+            )
 
         normalized_read_roots: list[Path] = []
         for raw in read_roots or []:
@@ -781,6 +902,11 @@ class ToolRegistry:
             changelog=changelog,
             subtask_id=subtask_id,
             auth_context=auth_context,
+            execution_surface=(
+                normalize_tool_execution_surface(requested_surface)
+                if requested_surface
+                else _DEFAULT_TOOL_EXECUTION_SURFACE
+            ),
         )
 
         try:
@@ -813,14 +939,24 @@ class ToolRegistry:
 
         return cleaned
 
-    def all_schemas(self, *, auth_context: Any = None) -> list[dict]:
+    def all_schemas(
+        self,
+        *,
+        auth_context: Any = None,
+        execution_surface: str | None = None,
+    ) -> list[dict]:
         """Return all tool schemas for model consumption."""
+        requested_surface = self._requested_execution_surface(execution_surface)
         if auth_context is not None and self._mcp_discovery_hook is not None:
             with self._tools_lock:
                 non_mcp_schemas = [
                     tool.schema()
                     for name, tool in self._tools.items()
                     if not name.startswith("mcp.")
+                    and (
+                        not requested_surface
+                        or tool_supports_execution_surface(tool, requested_surface)
+                    )
                 ]
             discovered = self._discover_mcp_view(
                 auth_context=auth_context,
@@ -829,6 +965,13 @@ class ToolRegistry:
             mcp_schemas = [
                 discovered[name].schema()
                 for name in sorted(discovered.keys())
+                if (
+                    not requested_surface
+                    or tool_supports_execution_surface(
+                        discovered[name],
+                        requested_surface,
+                    )
+                )
             ]
             return [*non_mcp_schemas, *mcp_schemas]
         # Keep reads responsive: only trigger MCP refresh when no MCP tools
@@ -837,24 +980,62 @@ class ToolRegistry:
             self._maybe_refresh_mcp(background=True)
         with self._tools_lock:
             tools = list(self._tools.values())
-        return [tool.schema() for tool in tools]
+        return [
+            tool.schema()
+            for tool in tools
+            if (
+                not requested_surface
+                or tool_supports_execution_surface(tool, requested_surface)
+            )
+        ]
 
-    def list_tools(self, *, auth_context: Any = None) -> list[str]:
+    def list_tools(
+        self,
+        *,
+        auth_context: Any = None,
+        execution_surface: str | None = None,
+    ) -> list[str]:
         """Return registered tool names."""
+        requested_surface = self._requested_execution_surface(execution_surface)
         if auth_context is not None and self._mcp_discovery_hook is not None:
             with self._tools_lock:
                 non_mcp_tools = [
-                    name for name in self._tools.keys()
+                    name
+                    for name, tool in self._tools.items()
                     if not name.startswith("mcp.")
+                    and (
+                        not requested_surface
+                        or tool_supports_execution_surface(tool, requested_surface)
+                    )
                 ]
             discovered = self._discover_mcp_view(
                 auth_context=auth_context,
                 background_on_expiry=True,
             )
-            return [*non_mcp_tools, *sorted(discovered.keys())]
+            return [
+                *non_mcp_tools,
+                *[
+                    name
+                    for name in sorted(discovered.keys())
+                    if (
+                        not requested_surface
+                        or tool_supports_execution_surface(
+                            discovered[name],
+                            requested_surface,
+                        )
+                    )
+                ],
+            ]
         # Keep reads responsive: only trigger MCP refresh when no MCP tools
         # have been loaded yet.
         if not self._has_registered_mcp_tools():
             self._maybe_refresh_mcp(background=True)
         with self._tools_lock:
-            return list(self._tools.keys())
+            return [
+                name
+                for name, tool in self._tools.items()
+                if (
+                    not requested_surface
+                    or tool_supports_execution_surface(tool, requested_surface)
+                )
+            ]

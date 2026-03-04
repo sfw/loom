@@ -18,6 +18,7 @@ from loom.learning.manager import LearningManager
 from loom.models.router import ModelRouter
 from loom.prompts.assembler import PromptAssembler
 from loom.recovery.approval import ApprovalManager
+from loom.recovery.questions import QuestionManager
 from loom.state.memory import Database, MemoryManager
 from loom.state.task_state import Task, TaskStateManager, TaskStatus
 from loom.tools import create_default_registry
@@ -47,6 +48,7 @@ class Engine:
         prompt_assembler: PromptAssembler,
         database: Database,
         approval_manager: ApprovalManager,
+        question_manager: QuestionManager | None,
         webhook_delivery: WebhookDelivery,
         learning_manager: LearningManager,
     ):
@@ -60,6 +62,7 @@ class Engine:
         self.prompt_assembler = prompt_assembler
         self.database = database
         self.approval_manager = approval_manager
+        self.question_manager = question_manager
         self.webhook_delivery = webhook_delivery
         self.learning_manager = learning_manager
         self._background_tasks: set[asyncio.Task] = set()
@@ -116,6 +119,7 @@ class Engine:
             event_bus=self.event_bus,
             config=self.config,
             approval_manager=self.approval_manager,
+            question_manager=self.question_manager,
             learning_manager=self.learning_manager,
             process=process,
         )
@@ -430,6 +434,14 @@ async def create_engine(config: Config) -> Engine:
 
     # Approval manager
     approval_manager = ApprovalManager(event_bus)
+    question_manager: QuestionManager | None = None
+    if bool(getattr(config.execution, "ask_user_durable_state_enabled", False)) or bool(
+        getattr(config.execution, "ask_user_runtime_blocking_enabled", False),
+    ) or bool(getattr(config.execution, "ask_user_api_enabled", False)):
+        question_manager = QuestionManager(
+            event_bus=event_bus,
+            memory_manager=memory_manager,
+        )
 
     # Learning manager
     learning_manager = LearningManager(database)
@@ -444,6 +456,7 @@ async def create_engine(config: Config) -> Engine:
         event_bus=event_bus,
         config=config,
         approval_manager=approval_manager,
+        question_manager=question_manager,
         learning_manager=learning_manager,
     )
 
@@ -458,6 +471,7 @@ async def create_engine(config: Config) -> Engine:
         prompt_assembler=prompt_assembler,
         database=database,
         approval_manager=approval_manager,
+        question_manager=question_manager,
         webhook_delivery=webhook_delivery,
         learning_manager=learning_manager,
     )

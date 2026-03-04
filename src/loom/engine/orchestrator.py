@@ -82,6 +82,7 @@ from loom.prompts.assembler import PromptAssembler
 from loom.recovery.approval import ApprovalDecision, ApprovalManager, ApprovalRequest
 from loom.recovery.confidence import ConfidenceScorer
 from loom.recovery.errors import ErrorCategory, categorize_error
+from loom.recovery.questions import QuestionManager
 from loom.recovery.retry import AttemptRecord, RetryManager, RetryStrategy
 from loom.state.evidence import merge_evidence_records
 from loom.state.memory import MemoryManager
@@ -255,6 +256,7 @@ class Orchestrator:
         event_bus: EventBus,
         config: Config,
         approval_manager: ApprovalManager | None = None,
+        question_manager: QuestionManager | None = None,
         learning_manager: LearningManager | None = None,
         process: ProcessDefinition | None = None,
     ):
@@ -287,6 +289,18 @@ class Orchestrator:
         )
         self._confidence = ConfidenceScorer()
         self._approval = approval_manager or ApprovalManager(event_bus)
+        ask_user_runtime_enabled = bool(
+            getattr(config.execution, "ask_user_runtime_blocking_enabled", False),
+        )
+        ask_user_durable_state_enabled = bool(
+            getattr(config.execution, "ask_user_durable_state_enabled", False),
+        )
+        if question_manager is not None:
+            self._question = question_manager
+        elif ask_user_runtime_enabled and ask_user_durable_state_enabled:
+            self._question = QuestionManager(event_bus, memory_manager)
+        else:
+            self._question = None
         self._retry = RetryManager(
             max_retries=config.execution.max_subtask_retries,
         )
@@ -349,6 +363,7 @@ class Orchestrator:
             verification=self._verification,
             config=config,
             event_bus=event_bus,
+            question_manager=self._question,
         )
 
     async def execute_task(
@@ -5179,6 +5194,30 @@ class Orchestrator:
         else:
             task.status = TaskStatus.EXECUTING
         self._state.save(task)
+
+    @property
+    def question_manager(self) -> QuestionManager | None:
+        """Shared ask-user question manager used by this orchestrator."""
+        return self._question
+
+    async def list_pending_questions(self, task_id: str) -> list[dict]:
+        if self._question is None:
+            return []
+        return await self._question.list_pending_questions(task_id)
+
+    async def answer_question(
+        self,
+        task_id: str,
+        question_id: str,
+        answer_payload: dict,
+    ) -> dict | None:
+        if self._question is None:
+            return None
+        return await self._question.answer_question(
+            task_id=task_id,
+            question_id=question_id,
+            answer_payload=answer_payload,
+        )
 
 
 def create_task(

@@ -634,6 +634,20 @@ class MyDomainTool(Tool):
 6. **File names** in `tools/` must not start with `_` (those are skipped)
 7. **One class per file** is conventional but not required — all `Tool` subclasses in the module are registered
 
+### Tool execution surfaces
+
+Tools can declare where they are allowed to run:
+
+```python
+@property
+def supported_execution_surfaces(self) -> tuple[str, ...]:
+    return ("tui",)  # e.g., interactive-only tools
+```
+
+- Valid values are `tui`, `api`, and `cli`
+- If omitted, Loom defaults to all three surfaces for backward compatibility
+- Use this for tools that require interactivity or a specific runtime context
+
 If a tool calls an authenticated API, declare that requirement in the tool:
 
 ```python
@@ -707,6 +721,7 @@ The `ctx` object provides:
 | `scratch_dir` | `Path \| None` | Temp directory for intermediate files |
 | `subtask_id` | `str` | Current subtask identifier |
 | `auth_context` | `RunAuthContext \| None` | Run-scoped selected auth profiles and secret resolver |
+| `execution_surface` | `"tui" \| "api" \| "cli"` | Current run surface for this tool invocation |
 
 Use `workspace` to resolve file paths. Use `_resolve_path(raw, workspace)` for safe path resolution that prevents directory traversal.
 

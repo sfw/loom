@@ -2155,6 +2155,7 @@ class TestOrchestratorExecution:
             changelog=None,
             subtask_id="s1",
             auth_context=ANY,
+            execution_surface="api",
         )
 
     @pytest.mark.asyncio

@@ -45,11 +45,29 @@ class TestDefaultConfig:
         assert config.execution.enable_mutation_idempotency is False
         assert config.execution.enable_slo_metrics is False
         assert config.execution.delegate_task_timeout_seconds == 3600
+        assert config.execution.ask_user_v2_enabled is False
+        assert config.execution.ask_user_runtime_blocking_enabled is False
+        assert config.execution.ask_user_durable_state_enabled is False
+        assert config.execution.ask_user_api_enabled is False
+        assert config.execution.ask_user_policy == "block"
+        assert config.execution.ask_user_timeout_seconds == 0
+        assert config.execution.ask_user_timeout_default_response == ""
+        assert config.execution.ask_user_max_pending_per_task == 3
+        assert config.execution.ask_user_max_questions_per_subtask == 3
+        assert config.execution.ask_user_min_seconds_between_questions == 10
         assert config.execution.model_call_max_attempts == 5
         assert config.execution.model_call_retry_base_delay_seconds == 0.5
         assert config.execution.model_call_retry_max_delay_seconds == 8.0
         assert config.execution.model_call_retry_jitter_seconds == 0.25
         assert config.execution.cowork_tool_exposure_mode == "adaptive"
+        assert config.execution.cowork_memory_index_enabled is True
+        assert config.execution.cowork_memory_index_v2_actions_enabled is True
+        assert config.execution.cowork_memory_index_force_fts is False
+        assert config.execution.cowork_indexer_model_role_strict is False
+        assert config.execution.cowork_memory_index_llm_extraction_enabled is True
+        assert config.execution.cowork_memory_index_queue_max_batches == 32
+        assert config.execution.cowork_memory_index_section_limit == 4
+        assert config.execution.cowork_recall_index_max_chars == 1200
         assert config.execution.enable_software_dev_tools is False
         assert config.execution.enable_agent_tools is False
         assert config.execution.enable_wp_tools is False
@@ -291,7 +309,25 @@ enable_sqlite_remediation_queue = true
 enable_durable_task_runner = true
 enable_mutation_idempotency = true
 enable_slo_metrics = true
+ask_user_v2_enabled = true
+ask_user_runtime_blocking_enabled = true
+ask_user_durable_state_enabled = true
+ask_user_api_enabled = true
+ask_user_policy = "timeout_default"
+ask_user_timeout_seconds = 45
+ask_user_timeout_default_response = "python"
+ask_user_max_pending_per_task = 5
+ask_user_max_questions_per_subtask = 4
+ask_user_min_seconds_between_questions = 6
 cowork_tool_exposure_mode = "hybrid"
+cowork_memory_index_enabled = false
+cowork_memory_index_v2_actions_enabled = false
+cowork_memory_index_force_fts = true
+cowork_indexer_model_role_strict = true
+cowork_memory_index_llm_extraction_enabled = false
+cowork_memory_index_queue_max_batches = 41
+cowork_memory_index_section_limit = 6
+cowork_recall_index_max_chars = 1900
 """)
         config = load_config(toml_file)
         assert config.execution.enable_global_run_budget is True
@@ -308,7 +344,25 @@ cowork_tool_exposure_mode = "hybrid"
         assert config.execution.enable_durable_task_runner is True
         assert config.execution.enable_mutation_idempotency is True
         assert config.execution.enable_slo_metrics is True
+        assert config.execution.ask_user_v2_enabled is True
+        assert config.execution.ask_user_runtime_blocking_enabled is True
+        assert config.execution.ask_user_durable_state_enabled is True
+        assert config.execution.ask_user_api_enabled is True
+        assert config.execution.ask_user_policy == "timeout_default"
+        assert config.execution.ask_user_timeout_seconds == 45
+        assert config.execution.ask_user_timeout_default_response == "python"
+        assert config.execution.ask_user_max_pending_per_task == 5
+        assert config.execution.ask_user_max_questions_per_subtask == 4
+        assert config.execution.ask_user_min_seconds_between_questions == 6
         assert config.execution.cowork_tool_exposure_mode == "hybrid"
+        assert config.execution.cowork_memory_index_enabled is False
+        assert config.execution.cowork_memory_index_v2_actions_enabled is False
+        assert config.execution.cowork_memory_index_force_fts is True
+        assert config.execution.cowork_indexer_model_role_strict is True
+        assert config.execution.cowork_memory_index_llm_extraction_enabled is False
+        assert config.execution.cowork_memory_index_queue_max_batches == 41
+        assert config.execution.cowork_memory_index_section_limit == 6
+        assert config.execution.cowork_recall_index_max_chars == 1900
 
     def test_execution_cowork_tool_exposure_mode_invalid_falls_back(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
@@ -318,6 +372,21 @@ cowork_tool_exposure_mode = "wild-west"
 """)
         config = load_config(toml_file)
         assert config.execution.cowork_tool_exposure_mode == "adaptive"
+
+    def test_execution_ask_user_policy_invalid_falls_back(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[execution]
+ask_user_policy = "mystery"
+ask_user_max_pending_per_task = 0
+ask_user_max_questions_per_subtask = 0
+ask_user_min_seconds_between_questions = -5
+""")
+        config = load_config(toml_file)
+        assert config.execution.ask_user_policy == "block"
+        assert config.execution.ask_user_max_pending_per_task == 1
+        assert config.execution.ask_user_max_questions_per_subtask == 1
+        assert config.execution.ask_user_min_seconds_between_questions == 0
 
     def test_execution_software_tools_flags_loaded(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

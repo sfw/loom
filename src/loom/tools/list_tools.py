@@ -6,6 +6,7 @@ discover long-tail tools without receiving full schemas on every turn.
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Callable
 from typing import Any
@@ -138,13 +139,13 @@ class ListToolsTool(Tool):
 
     def __init__(
         self,
-        catalog_provider: Callable[[Any | None], list[dict[str, Any]]] | None = None,
+        catalog_provider: Callable[..., list[dict[str, Any]]] | None = None,
     ) -> None:
         self._catalog_provider = catalog_provider
 
     def bind(
         self,
-        catalog_provider: Callable[[Any | None], list[dict[str, Any]]],
+        catalog_provider: Callable[..., list[dict[str, Any]]],
     ) -> None:
         self._catalog_provider = catalog_provider
 
@@ -195,7 +196,22 @@ class ListToolsTool(Tool):
             )
 
         try:
-            rows = self._catalog_provider(ctx.auth_context)
+            params = inspect.signature(self._catalog_provider).parameters
+            supports_surface = (
+                len(params) >= 2
+                or any(
+                    param.kind == inspect.Parameter.VAR_POSITIONAL
+                    or param.kind == inspect.Parameter.VAR_KEYWORD
+                    for param in params.values()
+                )
+            )
+            if supports_surface:
+                rows = self._catalog_provider(
+                    ctx.auth_context,
+                    str(getattr(ctx, "execution_surface", "") or "tui"),
+                )
+            else:
+                rows = self._catalog_provider(ctx.auth_context)
         except Exception as e:
             return ToolResult.fail(f"list_tools provider error: {type(e).__name__}: {e}")
 
@@ -220,6 +236,9 @@ class ListToolsTool(Tool):
             auth_requirements = raw.get("auth_requirements", [])
             if not isinstance(auth_requirements, list):
                 auth_requirements = []
+            execution_surfaces = raw.get("execution_surfaces", [])
+            if not isinstance(execution_surfaces, list):
+                execution_surfaces = []
             parameters = raw.get("parameters", {})
             if not isinstance(parameters, dict):
                 parameters = {}
@@ -244,6 +263,11 @@ class ListToolsTool(Tool):
                 "auth_mode": auth_mode,
                 "auth_required": auth_required,
                 "auth_requirements": auth_requirements,
+                "execution_surfaces": [
+                    str(item or "").strip().lower()
+                    for item in execution_surfaces
+                    if str(item or "").strip()
+                ],
                 "parameters": parameters,
             })
 
@@ -271,6 +295,7 @@ class ListToolsTool(Tool):
                 "mutates": row["mutates"],
                 "auth_mode": row["auth_mode"],
                 "auth_required": row["auth_required"],
+                "execution_surfaces": row["execution_surfaces"],
             }
             if detail == "schema":
                 item["parameters"] = row["parameters"]
