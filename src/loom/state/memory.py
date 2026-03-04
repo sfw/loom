@@ -558,6 +558,219 @@ class Database:
             ),
         )
 
+    # --- Iteration loop persistence ---
+
+    async def upsert_iteration_run(
+        self,
+        *,
+        loop_run_id: str,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        policy_snapshot: dict | None = None,
+        terminal_reason: str = "",
+        attempt_count: int = 0,
+        replan_count: int = 0,
+        exhaustion_fingerprint: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        now = datetime.now().isoformat()
+        await self.execute(
+            """INSERT INTO iteration_runs
+               (loop_run_id, task_id, run_id, subtask_id, phase_id, policy_snapshot,
+                terminal_reason, attempt_count, replan_count, exhaustion_fingerprint,
+                metadata, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(loop_run_id) DO UPDATE SET
+                   run_id=excluded.run_id,
+                   phase_id=excluded.phase_id,
+                   policy_snapshot=excluded.policy_snapshot,
+                   terminal_reason=excluded.terminal_reason,
+                   attempt_count=excluded.attempt_count,
+                   replan_count=excluded.replan_count,
+                   exhaustion_fingerprint=excluded.exhaustion_fingerprint,
+                   metadata=excluded.metadata,
+                   updated_at=excluded.updated_at""",
+            (
+                loop_run_id,
+                task_id,
+                run_id,
+                subtask_id,
+                phase_id,
+                json.dumps(policy_snapshot or {}, ensure_ascii=False, sort_keys=True),
+                terminal_reason,
+                max(0, int(attempt_count)),
+                max(0, int(replan_count)),
+                exhaustion_fingerprint,
+                json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+
+    async def insert_iteration_attempt(
+        self,
+        *,
+        loop_run_id: str,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        attempt_index: int,
+        status: str,
+        summary: str = "",
+        gate_summary: dict | None = None,
+        budget_snapshot: dict | None = None,
+        metadata: dict | None = None,
+    ) -> int:
+        return await self.execute_returning_id(
+            """INSERT INTO iteration_attempts
+               (loop_run_id, task_id, run_id, subtask_id, phase_id, attempt_index,
+                status, summary, gate_summary, budget_snapshot, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                loop_run_id,
+                task_id,
+                run_id,
+                subtask_id,
+                phase_id,
+                max(1, int(attempt_index)),
+                status,
+                summary,
+                json.dumps(gate_summary or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(budget_snapshot or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                datetime.now().isoformat(),
+            ),
+        )
+
+    async def insert_iteration_gate_result(
+        self,
+        *,
+        loop_run_id: str,
+        attempt_id: int | None,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        attempt_index: int,
+        gate_id: str,
+        gate_type: str,
+        status: str,
+        blocking: bool,
+        reason_code: str = "",
+        measured_value: object = None,
+        threshold_value: object = None,
+        detail: str = "",
+        metadata: dict | None = None,
+    ) -> int:
+        return await self.execute_returning_id(
+            """INSERT INTO iteration_gate_results
+               (loop_run_id, attempt_id, task_id, run_id, subtask_id, phase_id,
+                attempt_index, gate_id, gate_type, status, blocking, reason_code,
+                measured_value, threshold_value, detail, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                loop_run_id,
+                attempt_id,
+                task_id,
+                run_id,
+                subtask_id,
+                phase_id,
+                max(1, int(attempt_index)),
+                gate_id,
+                gate_type,
+                status,
+                1 if blocking else 0,
+                reason_code,
+                json.dumps(measured_value, ensure_ascii=False, sort_keys=True),
+                json.dumps(threshold_value, ensure_ascii=False, sort_keys=True),
+                detail,
+                json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                datetime.now().isoformat(),
+            ),
+        )
+
+    async def list_iteration_runs(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str | None = None,
+    ) -> list[dict]:
+        if subtask_id:
+            rows = await self.query(
+                """SELECT * FROM iteration_runs
+                   WHERE task_id=? AND subtask_id=?
+                   ORDER BY created_at ASC""",
+                (task_id, subtask_id),
+            )
+        else:
+            rows = await self.query(
+                """SELECT * FROM iteration_runs
+                   WHERE task_id=?
+                   ORDER BY created_at ASC""",
+                (task_id,),
+            )
+        return [self._decode_json_columns(row, ("policy_snapshot", "metadata")) for row in rows]
+
+    async def list_iteration_attempts(
+        self,
+        *,
+        loop_run_id: str,
+    ) -> list[dict]:
+        rows = await self.query(
+            """SELECT * FROM iteration_attempts
+               WHERE loop_run_id=?
+               ORDER BY attempt_index ASC, id ASC""",
+            (loop_run_id,),
+        )
+        return [
+            self._decode_json_columns(
+                row,
+                ("gate_summary", "budget_snapshot", "metadata"),
+            )
+            for row in rows
+        ]
+
+    async def list_iteration_gate_results(
+        self,
+        *,
+        loop_run_id: str,
+    ) -> list[dict]:
+        rows = await self.query(
+            """SELECT * FROM iteration_gate_results
+               WHERE loop_run_id=?
+               ORDER BY attempt_index ASC, id ASC""",
+            (loop_run_id,),
+        )
+        normalized = []
+        for row in rows:
+            parsed = self._decode_json_columns(
+                row,
+                ("measured_value", "threshold_value", "metadata"),
+            )
+            parsed["blocking"] = bool(parsed.get("blocking", 0))
+            normalized.append(parsed)
+        return normalized
+
+    @staticmethod
+    def _decode_json_columns(row: dict, columns: tuple[str, ...]) -> dict:
+        parsed = dict(row)
+        for col in columns:
+            raw = parsed.get(col)
+            if not isinstance(raw, str):
+                continue
+            text = raw.strip()
+            if not text:
+                parsed[col] = {} if col.endswith("metadata") or col.endswith("snapshot") else ""
+                continue
+            try:
+                parsed[col] = json.loads(text)
+            except Exception:
+                continue
+        return parsed
+
     # --- Mutating tool idempotency ledger ---
 
     async def get_mutation_ledger_entry(self, idempotency_key: str) -> dict | None:
@@ -1045,6 +1258,117 @@ class MemoryManager:
             reason_code=reason_code,
             error=error,
         )
+
+    async def upsert_iteration_run(
+        self,
+        *,
+        loop_run_id: str,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        policy_snapshot: dict | None = None,
+        terminal_reason: str = "",
+        attempt_count: int = 0,
+        replan_count: int = 0,
+        exhaustion_fingerprint: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        await self._db.upsert_iteration_run(
+            loop_run_id=loop_run_id,
+            task_id=task_id,
+            run_id=run_id,
+            subtask_id=subtask_id,
+            phase_id=phase_id,
+            policy_snapshot=policy_snapshot,
+            terminal_reason=terminal_reason,
+            attempt_count=attempt_count,
+            replan_count=replan_count,
+            exhaustion_fingerprint=exhaustion_fingerprint,
+            metadata=metadata,
+        )
+
+    async def insert_iteration_attempt(
+        self,
+        *,
+        loop_run_id: str,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        attempt_index: int,
+        status: str,
+        summary: str = "",
+        gate_summary: dict | None = None,
+        budget_snapshot: dict | None = None,
+        metadata: dict | None = None,
+    ) -> int:
+        return await self._db.insert_iteration_attempt(
+            loop_run_id=loop_run_id,
+            task_id=task_id,
+            run_id=run_id,
+            subtask_id=subtask_id,
+            phase_id=phase_id,
+            attempt_index=attempt_index,
+            status=status,
+            summary=summary,
+            gate_summary=gate_summary,
+            budget_snapshot=budget_snapshot,
+            metadata=metadata,
+        )
+
+    async def insert_iteration_gate_result(
+        self,
+        *,
+        loop_run_id: str,
+        attempt_id: int | None,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        attempt_index: int,
+        gate_id: str,
+        gate_type: str,
+        status: str,
+        blocking: bool,
+        reason_code: str = "",
+        measured_value: object = None,
+        threshold_value: object = None,
+        detail: str = "",
+        metadata: dict | None = None,
+    ) -> int:
+        return await self._db.insert_iteration_gate_result(
+            loop_run_id=loop_run_id,
+            attempt_id=attempt_id,
+            task_id=task_id,
+            run_id=run_id,
+            subtask_id=subtask_id,
+            phase_id=phase_id,
+            attempt_index=attempt_index,
+            gate_id=gate_id,
+            gate_type=gate_type,
+            status=status,
+            blocking=blocking,
+            reason_code=reason_code,
+            measured_value=measured_value,
+            threshold_value=threshold_value,
+            detail=detail,
+            metadata=metadata,
+        )
+
+    async def list_iteration_runs(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str | None = None,
+    ) -> list[dict]:
+        return await self._db.list_iteration_runs(task_id=task_id, subtask_id=subtask_id)
+
+    async def list_iteration_attempts(self, *, loop_run_id: str) -> list[dict]:
+        return await self._db.list_iteration_attempts(loop_run_id=loop_run_id)
+
+    async def list_iteration_gate_results(self, *, loop_run_id: str) -> list[dict]:
+        return await self._db.list_iteration_gate_results(loop_run_id=loop_run_id)
 
     async def get_mutation_ledger_entry(self, idempotency_key: str) -> dict | None:
         return await self._db.get_mutation_ledger_entry(idempotency_key)

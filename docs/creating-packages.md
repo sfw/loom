@@ -248,6 +248,24 @@ phases:
     deliverables:                   # Expected output files
       - "filename.md — description"
       - "data.csv — description"
+    iteration:                      # Optional phase-level loop policy
+      enabled: true
+      max_attempts: 4
+      strategy: targeted_remediation
+      stop_on_no_improvement_attempts: 2
+      max_total_runner_invocations: 6
+      iteration_budget:
+        max_wall_clock_seconds: 600
+        max_tokens: 100000
+        max_tool_calls: 20
+      gates:
+        - id: quality-score
+          type: tool_metric
+          blocking: true
+          tool: humanize_writing
+          metric_path: report.humanization_score
+          operator: gte
+          value: 80
 ```
 
 **Phase fields:**
@@ -263,6 +281,7 @@ phases:
 | `is_synthesis` | No | If true, this is a final phase that combines prior work. |
 | `acceptance_criteria` | No | Concrete criteria for phase completion. |
 | `deliverables` | No | List of expected output files with descriptions. |
+| `iteration` | No | Gate-driven loop policy for repeating the phase until gates pass or budgets exhaust. |
 
 Deliverables are enforced by exact filename at execution and verification time.
 If a phase declares `financial-summary.csv`, the model must create/update that
@@ -277,6 +296,106 @@ exact path (not `tesla_financial_summary.csv` or other variants).
 - **Tier 1** — Simple extraction, formatting, data manipulation
 - **Tier 2** — Research, analysis, structured reasoning
 - **Tier 3** — Complex synthesis, creative work, multi-source integration
+
+### Phase iteration loops (optional)
+
+Use `iteration` when one pass is usually not enough and you need explicit
+convergence criteria (for example: score >= 80, tests pass, no placeholders).
+
+Runtime loop shape:
+1. Execute phase.
+2. Evaluate gates.
+3. Retry the phase if blocking gates fail and limits remain.
+4. Exit when all blocking gates pass, or limits/budgets are exhausted.
+
+Example:
+
+```yaml
+phases:
+  - id: rewrite
+    description: Improve draft quality.
+    deliverables:
+      - "draft.md — rewritten draft"
+    iteration:
+      enabled: true
+      max_attempts: 4
+      strategy: targeted_remediation       # targeted_remediation | full_rerun
+      stop_on_no_improvement_attempts: 2
+      max_total_runner_invocations: 6
+      max_replans_after_exhaustion: 2
+      replan_on_exhaustion: true
+      iteration_budget:
+        max_wall_clock_seconds: 600
+        max_tokens: 100000
+        max_tool_calls: 20
+      gates:
+        - id: score
+          type: tool_metric
+          blocking: true
+          tool: humanize_writing
+          metric_path: report.humanization_score
+          operator: gte
+          value: 80
+        - id: no-placeholders
+          type: artifact_regex
+          blocking: true
+          target: deliverables             # auto | deliverables | changed_files | summary | output
+          pattern: "\\[TBD\\]|\\[TODO\\]|\\[PLACEHOLDER\\]"
+          expect_match: false
+```
+
+Iteration policy fields:
+
+| Field | Required when `iteration.enabled=true` | Description |
+|-------|----------------------------------------|-------------|
+| `max_attempts` | Yes | Loop attempt cap. Must be `1..6`. |
+| `strategy` | No | `targeted_remediation` or `full_rerun`. |
+| `stop_on_no_improvement_attempts` | No | Stop when score-like gates do not improve for N attempts. |
+| `max_total_runner_invocations` | Yes | Hard cap across loop + retry churn. Must be `>= max_attempts`. |
+| `max_replans_after_exhaustion` | No | Bounded replans after loop exhaustion. |
+| `replan_on_exhaustion` | No | If false, terminate instead of requesting replan. |
+| `iteration_budget.max_wall_clock_seconds` | Yes | Per-loop wall-clock cap. Must be `> 0`. |
+| `iteration_budget.max_tokens` | Yes | Per-loop token cap. Must be `> 0`. |
+| `iteration_budget.max_tool_calls` | Yes | Per-loop tool call cap. Must be `> 0`. |
+| `gates` | Yes | At least one gate is required. |
+
+Gate types:
+
+| Gate type | Purpose | Key fields |
+|-----------|---------|------------|
+| `tool_metric` | Compare structured tool output metric | `tool`, `metric_path`, `operator`, `value` |
+| `artifact_regex` | Regex check over files or output text | `target`, `pattern`, `expect_match` |
+| `command_exit` | Run allowlisted command and compare exit code | `command`, `operator`, `value`, `timeout_seconds` |
+| `verifier_field` | Compare structured verifier fields | `field`, `operator`, `value` |
+
+Loader-enforced MVP constraints:
+1. At least one deterministic blocking gate is required (`tool_metric`, `artifact_regex`, or `command_exit`).
+2. `verifier_field` gates are advisory-only in MVP and cannot be blocking.
+3. Score-like gates require `stop_on_no_improvement_attempts > 0`.
+4. `artifact_regex.target` must be one of `auto`, `deliverables`, `changed_files`, `summary`, or `output`.
+5. `command_exit` must use argv tokens (no shell metacharacters) and an allowlisted command prefix.
+
+`command_exit` allowlisted prefixes (MVP):
+- `pytest`
+- `uv run pytest`
+- `python -m pytest`
+- `python3 -m pytest`
+- `ruff check`
+- `npm test`
+- `pnpm test`
+- `bun test`
+- `go test`
+- `cargo test`
+- `make test`
+
+Runtime note:
+- `command_exit` gates are disabled by default at runtime.
+- Enable with `execution.enable_iteration_command_exit_gate = true` in `loom.toml`.
+- Process iteration loops are also feature-flagged by `execution.enable_process_iteration_loops = true`.
+- You can override `command_exit` runtime allowlists via
+  `execution.iteration_command_exit_allowlisted_prefixes`.
+- Global loop-replan cap is controlled by
+  `execution.max_iteration_replans_after_exhaustion`.
 
 ### Verification rules
 
@@ -738,6 +857,22 @@ Loom validates `process.yaml` at load time with 22 rules. Common errors:
 | `duplicate deliverable` | Each deliverable filename must be unique across all phases |
 | `required and excluded tools overlap` | A tool can't be in both lists |
 | `invalid regex in verification rule` | Test your regex pattern |
+| `iteration.max_attempts must be between 1 and 6` | Lower attempt cap |
+| `iteration requires at least one deterministic blocking gate` | Add blocking `tool_metric`/`artifact_regex`/`command_exit` gate |
+| `command is not allowlisted for MVP command_exit gates` | Use an allowlisted test/lint command prefix |
+
+### Ad hoc process generation checklist (model input)
+
+If you feed this doc to a model to generate ad hoc processes, require the model
+to satisfy this checklist before returning YAML:
+
+1. Output valid `process.yaml` only (no prose around it).
+2. Use `schema_version: 2`.
+3. Provide at least one phase with unique `id` values and valid `depends_on`.
+4. If `iteration.enabled: true`, include all required iteration fields and at least one deterministic blocking gate.
+5. Never emit blocking `verifier_field` gates.
+6. For `command_exit`, use allowlisted prefixes only and tokenized argv lists.
+7. Keep deliverable filenames canonical and stable across phases.
 
 Test validation without running:
 
@@ -771,6 +906,8 @@ Before publishing a package:
 - [ ] `persona` gives the model a specific expert identity
 - [ ] Phases form a valid DAG (no cycles)
 - [ ] Each phase has `acceptance_criteria` and `deliverables`
+- [ ] If `iteration.enabled`, loop policy includes budgets, gates, and bounded caps
+- [ ] If `command_exit` gate is used, command prefix is allowlisted and runtime flags are documented
 - [ ] `no-placeholders` regex rule is included in verification
 - [ ] At least one domain-specific verification rule (LLM or regex)
 - [ ] 2-3 planner examples with realistic goals

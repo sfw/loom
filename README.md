@@ -136,6 +136,8 @@ max_subtask_retries = 3
 max_loop_iterations = 50
 max_parallel_subtasks = 3
 delegate_task_timeout_seconds = 3600
+enable_process_iteration_loops = false
+enable_iteration_command_exit_gate = false
 
 [limits.runner]
 enable_filetype_ingest_router = true

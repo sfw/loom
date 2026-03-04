@@ -239,3 +239,78 @@ CREATE INDEX IF NOT EXISTS idx_tool_mutation_ledger_task
     ON tool_mutation_ledger(task_id, subtask_id, tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_mutation_ledger_run
     ON tool_mutation_ledger(run_id);
+
+-- Phase iteration loop persistence
+CREATE TABLE IF NOT EXISTS iteration_runs (
+    loop_run_id TEXT PRIMARY KEY,               -- iter-<id>
+    task_id TEXT NOT NULL,
+    run_id TEXT DEFAULT '',
+    subtask_id TEXT NOT NULL,
+    phase_id TEXT DEFAULT '',
+    policy_snapshot TEXT NOT NULL,              -- JSON
+    terminal_reason TEXT DEFAULT '',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    replan_count INTEGER NOT NULL DEFAULT 0,
+    exhaustion_fingerprint TEXT DEFAULT '',
+    metadata TEXT,                              -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_iteration_runs_task
+    ON iteration_runs(task_id, subtask_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_iteration_runs_run
+    ON iteration_runs(run_id);
+
+CREATE TABLE IF NOT EXISTS iteration_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    loop_run_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    run_id TEXT DEFAULT '',
+    subtask_id TEXT NOT NULL,
+    phase_id TEXT DEFAULT '',
+    attempt_index INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'completed',   -- completed|retrying|terminal
+    summary TEXT DEFAULT '',
+    gate_summary TEXT DEFAULT '',               -- JSON
+    budget_snapshot TEXT DEFAULT '',            -- JSON
+    metadata TEXT,                              -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (loop_run_id) REFERENCES iteration_runs(loop_run_id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_iteration_attempts_loop
+    ON iteration_attempts(loop_run_id, attempt_index);
+CREATE INDEX IF NOT EXISTS idx_iteration_attempts_task
+    ON iteration_attempts(task_id, subtask_id);
+
+CREATE TABLE IF NOT EXISTS iteration_gate_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    loop_run_id TEXT NOT NULL,
+    attempt_id INTEGER,
+    task_id TEXT NOT NULL,
+    run_id TEXT DEFAULT '',
+    subtask_id TEXT NOT NULL,
+    phase_id TEXT DEFAULT '',
+    attempt_index INTEGER NOT NULL,
+    gate_id TEXT NOT NULL,
+    gate_type TEXT NOT NULL,
+    status TEXT NOT NULL,                       -- pass|fail|unevaluable
+    blocking INTEGER NOT NULL DEFAULT 0,
+    reason_code TEXT DEFAULT '',
+    measured_value TEXT DEFAULT '',             -- JSON-encoded scalar/object
+    threshold_value TEXT DEFAULT '',            -- JSON-encoded scalar/object
+    detail TEXT DEFAULT '',
+    metadata TEXT,                              -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (loop_run_id) REFERENCES iteration_runs(loop_run_id),
+    FOREIGN KEY (attempt_id) REFERENCES iteration_attempts(id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_iteration_gate_results_loop
+    ON iteration_gate_results(loop_run_id, attempt_index);
+CREATE INDEX IF NOT EXISTS idx_iteration_gate_results_task
+    ON iteration_gate_results(task_id, subtask_id, gate_id);

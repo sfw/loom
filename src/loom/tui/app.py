@@ -80,6 +80,7 @@ from loom.tui.screens import (
     LearnedScreen,
     MCPManagerScreen,
     ProcessRunCloseScreen,
+    ProcessRunWorkspaceScreen,
     SetupScreen,
     ToolApprovalScreen,
 )
@@ -184,6 +185,10 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
         usage=(
             "<goal|close [run-id-prefix]|"
             "resume <run-id-prefix|current>|"
+            "pause [run-id-prefix|current>|"
+            "play [run-id-prefix|current>|"
+            "stop [run-id-prefix|current>|"
+            "inject [run-id-prefix|current] <text>|"
             "save <run-id-prefix|current> <name>>"
         ),
         description="run goal via process orchestrator (ad hoc by default)",
@@ -254,6 +259,7 @@ _WORKSPACE_SCAN_EXCLUDE_DIRS = frozenset({
 _PROCESS_STATUS_ICON = {
     "queued": "\u25cb",
     "running": "\u25c9",
+    "paused": "\u23f8",
     "cancel_requested": "\u25c9",
     "cancel_failed": "!",
     "force_closed": "\u25a1",
@@ -264,6 +270,7 @@ _PROCESS_STATUS_ICON = {
 _PROCESS_STATUS_LABEL = {
     "queued": "Queued",
     "running": "Running",
+    "paused": "Paused",
     "cancel_requested": "Cancel Requested",
     "cancel_failed": "Cancel Failed",
     "force_closed": "Force Closed",
@@ -433,31 +440,92 @@ class ProcessRunList(VerticalScroll):
         return terminal_idx
 
 
-class ProcessRunPane(Vertical):
+class ProcessRunPane(VerticalScroll):
     """A per-run process pane with status, progress rows, and run log."""
 
     DEFAULT_CSS = """
     ProcessRunPane {
         height: 1fr;
         padding: 0 1;
-        overflow: hidden;
+        overflow: auto auto;
     }
     ProcessRunPane .process-run-header {
         color: $text;
         text-style: bold;
+        width: 1fr;
+    }
+    ProcessRunPane .process-run-meta-row {
+        grid-size: 2 1;
+        grid-columns: 1fr auto;
+        grid-rows: auto;
+        width: 100%;
+        height: auto;
         margin: 0 0 1 0;
     }
     ProcessRunPane .process-run-meta {
         color: $text-muted;
-        margin: 0 0 1 0;
+        margin: 0;
     }
     ProcessRunPane .process-run-actions {
-        margin: 0 0 1 0;
+        margin: 0;
         height: auto;
+        width: auto;
     }
     ProcessRunPane .process-run-restart-btn {
         width: auto;
         min-width: 22;
+    }
+    ProcessRunPane .process-run-control-btn {
+        width: 5;
+        min-width: 5;
+        max-width: 5;
+        height: 3;
+        margin: 0;
+        padding: 0;
+        content-align: center middle;
+        border: none;
+        text-style: bold;
+    }
+    ProcessRunPane .process-run-toggle-btn {
+        background: #324c79;
+        color: #e4eeff;
+        border: none;
+    }
+    ProcessRunPane .process-run-toggle-btn:hover {
+        background: #3d5d93;
+        color: #ffffff;
+    }
+    ProcessRunPane .process-run-toggle-btn:focus {
+        background: #496dab;
+        color: #ffffff;
+        text-style: bold;
+        border: none;
+    }
+    ProcessRunPane .process-run-toggle-btn:disabled {
+        background: #253652;
+        color: #8b9ebf;
+        border: none;
+    }
+    ProcessRunPane .process-run-stop-btn {
+        margin-left: 1;
+        background: #c76684;
+        color: #fff2f7;
+        border: none;
+    }
+    ProcessRunPane .process-run-stop-btn:hover {
+        background: #d97895;
+        color: #ffffff;
+    }
+    ProcessRunPane .process-run-stop-btn:focus {
+        background: #e588a4;
+        color: #ffffff;
+        text-style: bold;
+        border: none;
+    }
+    ProcessRunPane .process-run-stop-btn:disabled {
+        background: #4a303a;
+        color: #b8929e;
+        border: none;
     }
     ProcessRunPane .process-run-section {
         color: $text-muted;
@@ -474,19 +542,20 @@ class ProcessRunPane(Vertical):
         width: 100%;
     }
     ProcessRunPane #process-run-progress {
-        height: 11;
+        height: 9;
         min-height: 7;
-        max-height: 16;
+        max-height: 14;
     }
     ProcessRunPane #process-run-outputs {
-        height: 9;
+        height: 7;
         min-height: 5;
-        max-height: 14;
+        max-height: 12;
     }
     ProcessRunPane ChatLog {
         height: 1fr;
+        min-height: 4;
         border: round $surface-lighten-1;
-        margin: 1 0 0 0;
+        margin: 0;
     }
     """
 
@@ -501,15 +570,30 @@ class ProcessRunPane(Vertical):
         self._pending_keyed_activity: dict[str, str] = {}
         self._pending_results: list[tuple[str, bool]] = []
         self._header = Static(classes="process-run-header")
+        self._meta_row = Grid(classes="process-run-meta-row")
         self._meta = Static(classes="process-run-meta")
         self._actions = Horizontal(classes="process-run-actions")
         self._actions.display = False
+        self._toggle_pause_button = Button(
+            "\u23f8",
+            id=f"process-run-toggle-{run_id}",
+            classes="process-run-control-btn process-run-toggle-btn",
+        )
+        self._stop_button = Button(
+            "\u23f9",
+            id=f"process-run-stop-{run_id}",
+            classes="process-run-control-btn process-run-stop-btn",
+        )
         self._restart_button = Button(
             "Restart Failed Run",
             id=f"process-run-restart-{run_id}",
             classes="process-run-restart-btn",
             variant="primary",
         )
+        self._toggle_pause_button.display = False
+        self._toggle_pause_button.disabled = True
+        self._stop_button.display = False
+        self._stop_button.disabled = True
         self._restart_button.display = False
         self._restart_button.disabled = True
         self._progress_label = Static("Progress", classes="process-run-section")
@@ -533,9 +617,12 @@ class ProcessRunPane(Vertical):
 
     def compose(self) -> ComposeResult:
         yield self._header
-        yield self._meta
-        with self._actions:
-            yield self._restart_button
+        with self._meta_row:
+            yield self._meta
+            with self._actions:
+                yield self._toggle_pause_button
+                yield self._stop_button
+                yield self._restart_button
         yield self._progress_label
         yield self._progress
         yield self._outputs_label
@@ -549,6 +636,9 @@ class ProcessRunPane(Vertical):
         status: str,
         elapsed: str,
         task_id: str = "",
+        working_folder: str = "",
+        pending_inject_count: int = 0,
+        pending_inject_preview: str = "",
     ) -> None:
         """Update run header metadata."""
         label = _PROCESS_STATUS_LABEL.get(status, status.title())
@@ -559,13 +649,38 @@ class ProcessRunPane(Vertical):
         meta = f"[dim]Goal:[/] {self._goal}"
         if task_id:
             meta += f"\n[dim]Task:[/] {task_id}"
-        meta += (
-            "\n[dim]Close: Ctrl+W | /run close [run-id-prefix] | "
-            "Ctrl+P: Close tab[/dim]"
-        )
+        if str(working_folder or "").strip():
+            safe_folder = _escape_markup_text(working_folder)
+            meta += f"\n[dim]Working folder:[/] {safe_folder}"
+        if int(pending_inject_count or 0) > 0:
+            preview = " ".join(str(pending_inject_preview or "").split()).strip()
+            if len(preview) > 72:
+                preview = f"{preview[:71]}\u2026"
+            if preview:
+                safe_preview = _escape_markup_text(preview)
+                meta += (
+                    f"\n[dim]Inject queue:[/] {int(pending_inject_count)} pending"
+                    f" \u2022 {safe_preview}"
+                )
+            else:
+                meta += f"\n[dim]Inject queue:[/] {int(pending_inject_count)} pending"
         self._meta.update(meta)
+        terminal = status in {"completed", "failed", "cancelled", "force_closed", "cancel_failed"}
+        can_pause = status == "running"
+        can_play = status == "paused"
+        can_stop = status in {"queued", "running", "paused", "cancel_requested"}
         can_restart = status == "failed" and bool(task_id.strip())
-        self._actions.display = can_restart
+        show_toggle = can_pause or can_play
+        show_stop = not terminal
+        self._actions.display = show_toggle or show_stop or can_restart
+        self._toggle_pause_button.display = show_toggle
+        self._toggle_pause_button.label = "\u25b6" if can_play else "\u23f8"
+        self._toggle_pause_button.tooltip = (
+            "Resume run" if can_play else "Pause run"
+        )
+        self._toggle_pause_button.disabled = not (can_pause or can_play)
+        self._stop_button.display = show_stop
+        self._stop_button.disabled = not can_stop
         self._restart_button.display = can_restart
         self._restart_button.disabled = not can_restart
 
@@ -652,6 +767,8 @@ class ProcessRunPane(Vertical):
             return "#f7768e"
         if status == "cancel_failed":
             return "#f7768e"
+        if status == "paused":
+            return "#e0af68"
         if status in {"running", "cancel_requested"}:
             return "#7dcfff"
         if status == "force_closed":
@@ -701,6 +818,8 @@ class ProcessRunState:
     close_after_cancel: bool = False
     cancel_requested_at: float = 0.0
     progress_ui_last_refresh_at: float = 0.0
+    paused_started_at: float = 0.0
+    paused_accumulated_seconds: float = 0.0
 
 
 @dataclass
@@ -1113,6 +1232,19 @@ class LoomApp(App):
             str,
             Callable[..., Awaitable[dict | None]],
         ] = {}
+        self._process_run_pause_handlers: dict[
+            str,
+            Callable[..., Awaitable[dict | None]],
+        ] = {}
+        self._process_run_play_handlers: dict[
+            str,
+            Callable[..., Awaitable[dict | None]],
+        ] = {}
+        self._process_run_inject_handlers: dict[
+            str,
+            Callable[..., Awaitable[dict | None]],
+        ] = {}
+        self._process_run_pending_inject: dict[str, list[str]] = {}
         self._auto_resume_workspace_on_init = True
         self._run_auth_profile_overrides: dict[str, str] = {}
         self._chat_replay_events: list[dict] = []
@@ -4172,7 +4304,7 @@ class LoomApp(App):
     def _has_active_process_runs(self) -> bool:
         """Return True when at least one run is still active."""
         return any(
-            self._is_process_run_active_status(run.status)
+            self._is_process_run_busy_status(run.status)
             for run in self._process_runs.values()
         )
 
@@ -5542,7 +5674,42 @@ class LoomApp(App):
     def _elapsed_seconds_for_run(self, run: ProcessRunState) -> float:
         """Return elapsed seconds for a run (live or finalized)."""
         end = run.ended_at if run.ended_at is not None else time.monotonic()
-        return max(0.0, end - run.started_at)
+        elapsed = max(0.0, end - run.started_at)
+        paused_total = max(
+            0.0,
+            float(getattr(run, "paused_accumulated_seconds", 0.0) or 0.0),
+        )
+        paused_started = float(getattr(run, "paused_started_at", 0.0) or 0.0)
+        if paused_started > 0.0:
+            paused_total += max(0.0, end - paused_started)
+        return max(0.0, elapsed - paused_total)
+
+    @staticmethod
+    def _is_process_run_busy_status(status: str) -> bool:
+        """Return True while a run is actively consuming execution resources."""
+        state = str(status or "").strip().lower()
+        return state in {"queued", "running", "cancel_requested"}
+
+    def _set_process_run_status(self, run: ProcessRunState, status: str) -> None:
+        """Apply run status transition and keep paused-time bookkeeping consistent."""
+        old_status = str(getattr(run, "status", "") or "").strip().lower()
+        new_status = str(status or "").strip().lower()
+        if not new_status:
+            return
+        now = time.monotonic()
+        paused_started = float(getattr(run, "paused_started_at", 0.0) or 0.0)
+        paused_accum = float(getattr(run, "paused_accumulated_seconds", 0.0) or 0.0)
+
+        if old_status == "paused" and new_status != "paused" and paused_started > 0.0:
+            paused_accum += max(0.0, now - paused_started)
+            paused_started = 0.0
+
+        if new_status == "paused" and old_status != "paused" and paused_started <= 0.0:
+            paused_started = now
+
+        run.status = new_status
+        run.paused_started_at = paused_started
+        run.paused_accumulated_seconds = max(0.0, paused_accum)
 
     def _append_process_run_activity(
         self, run: ProcessRunState, message: str,
@@ -5758,6 +5925,8 @@ class LoomApp(App):
                     row_status = "skipped"
                 elif status == "force_closed":
                     row_status = "skipped"
+                elif status == "paused":
+                    row_status = "in_progress"
                 elif status == "completed":
                     row_status = "completed"
                 else:
@@ -5799,6 +5968,12 @@ class LoomApp(App):
                 "status": "in_progress",
                 "content": "Cancellation requested",
             })
+        elif status == "paused":
+            rows.append({
+                "id": "stage:paused",
+                "status": "in_progress",
+                "content": "Paused",
+            })
         return rows
 
     def _process_run_stage_summary_row(self, run: ProcessRunState) -> dict | None:
@@ -5817,6 +5992,8 @@ class LoomApp(App):
             row_status = "skipped"
         elif status == "force_closed":
             row_status = "skipped"
+        elif status == "paused":
+            row_status = "in_progress"
         elif status == "completed":
             row_status = "completed"
         else:
@@ -5907,7 +6084,7 @@ class LoomApp(App):
         if run.closed:
             return
         detail = self._one_line(message, 1200) or "Process run failed during launch."
-        run.status = "failed"
+        self._set_process_run_status(run, "failed")
         run.ended_at = time.monotonic()
         run.launch_error = detail
         self._log_terminal_stage_duration(run, terminal_state="failed")
@@ -5938,7 +6115,7 @@ class LoomApp(App):
         """Emit a periodic liveness heartbeat while launch/execution is active."""
         if getattr(run, "closed", False):
             return
-        if not self._is_process_run_active_status(str(getattr(run, "status", ""))):
+        if not self._is_process_run_busy_status(str(getattr(run, "status", ""))):
             return
         stage = str(getattr(run, "launch_stage", "")).strip()
         if stage not in _PROCESS_RUN_HEARTBEAT_STAGES:
@@ -6196,6 +6373,7 @@ class LoomApp(App):
     async def _drop_process_run_tabs(self) -> None:
         """Remove all process run panes from the UI and clear in-memory state."""
         if not self._process_runs:
+            self._process_run_pending_inject.clear()
             return
         tabs = None
         try:
@@ -6211,6 +6389,7 @@ class LoomApp(App):
                 except Exception:
                     pass
             self._clear_process_run_cancel_handler(str(getattr(run, "run_id", "")))
+            self._process_run_pending_inject.pop(str(getattr(run, "run_id", "")).strip(), None)
             pane_id = str(getattr(run, "pane_id", "") or "").strip()
             if tabs is not None and pane_id:
                 try:
@@ -6218,6 +6397,7 @@ class LoomApp(App):
                 except Exception:
                     pass
         self._process_runs.clear()
+        self._process_run_pending_inject.clear()
         if tabs is not None:
             try:
                 if not tabs.active:
@@ -6282,6 +6462,7 @@ class LoomApp(App):
                 if self._is_process_run_active_status(status)
                 else time.monotonic()
             )
+            paused_started_at = time.monotonic() if status == "paused" else 0.0
 
             tasks = [
                 dict(row)
@@ -6371,11 +6552,13 @@ class LoomApp(App):
                 ),
                 launch_error=launch_error,
                 launch_tab_created_at=launch_tab_created_at,
+                paused_started_at=paused_started_at,
+                paused_accumulated_seconds=0.0,
             )
 
-            if self._is_process_run_active_status(run.status):
+            if self._is_process_run_busy_status(run.status):
                 interrupted += 1
-                run.status = "failed"
+                self._set_process_run_status(run, "failed")
                 run.ended_at = time.monotonic()
                 note = "Run interrupted before session resume; marked failed."
                 run.activity_log.append(note)
@@ -6434,10 +6617,17 @@ class LoomApp(App):
     def _update_process_run_visuals(self, run: ProcessRunState) -> None:
         """Update pane header and tab title from current run state."""
         elapsed = self._format_elapsed(self._elapsed_seconds_for_run(run))
+        working_folder = self._process_run_working_folder_label(run)
+        pending_queue = self._process_run_pending_inject.get(run.run_id, [])
+        pending_inject = len(pending_queue)
+        pending_preview = str(pending_queue[0]).strip() if pending_queue else ""
         run.pane.set_status_header(
             status=run.status,
             elapsed=elapsed,
             task_id=run.task_id,
+            working_folder=working_folder,
+            pending_inject_count=pending_inject,
+            pending_inject_preview=pending_preview,
         )
         try:
             tabs = self.query_one("#tabs", TabbedContent)
@@ -6447,11 +6637,33 @@ class LoomApp(App):
             pass
         self._sync_activity_indicator()
 
+    def _process_run_working_folder_label(self, run: ProcessRunState) -> str:
+        """Return display label for the run's working folder."""
+        raw_workspace = getattr(run, "run_workspace", None)
+        if raw_workspace is None:
+            return ""
+        try:
+            resolved_workspace = Path(raw_workspace).expanduser().resolve()
+        except Exception:
+            return str(raw_workspace)
+        try:
+            root = self._workspace.resolve()
+        except Exception:
+            return str(resolved_workspace)
+        try:
+            rel = resolved_workspace.relative_to(root)
+        except ValueError:
+            return str(resolved_workspace)
+        rel_text = str(rel).strip()
+        if not rel_text or rel_text in {".", "./"}:
+            return "(workspace root)"
+        return rel_text
+
     def _tick_process_run_elapsed(self) -> None:
         """Periodic timer to refresh elapsed text for active process runs."""
         active = False
         for run in self._process_runs.values():
-            if self._is_process_run_active_status(run.status):
+            if self._is_process_run_busy_status(run.status):
                 active = True
                 self._maybe_emit_process_run_heartbeat(run)
                 self._update_process_run_visuals(run)
@@ -6644,6 +6856,132 @@ class LoomApp(App):
 
         return self._workspace
 
+    def _next_available_process_run_folder_name(self, base_slug: str) -> str:
+        """Return the first non-existing run folder name for a base slug."""
+        root = self._workspace.resolve()
+        slug = self._slugify_process_run_folder(base_slug) or "process-run"
+        for suffix in range(1, 1000):
+            candidate_name = slug if suffix == 1 else f"{slug}-{suffix}"
+            candidate = root / candidate_name
+            if not candidate.exists():
+                return candidate_name
+        return slug
+
+    @staticmethod
+    def _normalize_process_run_workspace_selection(raw_value: str) -> str:
+        """Normalize a user-selected run workspace relative path."""
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return ""
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute():
+            raise ValueError("Folder must be relative to workspace root.")
+        parts: list[str] = []
+        for part in candidate.parts:
+            clean = str(part).strip()
+            if not clean or clean == ".":
+                continue
+            if clean == "..":
+                raise ValueError("Folder cannot traverse outside workspace root.")
+            parts.append(clean)
+        return "/".join(parts)
+
+    def _materialize_process_run_workspace_selection(self, relative_path: str) -> Path:
+        """Create or reuse selected run workspace path under the active workspace root."""
+        root = self._workspace.resolve()
+        clean = str(relative_path or "").strip()
+        if not clean:
+            return root
+
+        candidate = (root / clean).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as e:
+            raise ValueError("Folder must stay inside workspace root.") from e
+
+        if candidate.exists():
+            if candidate.is_dir():
+                return candidate
+            raise ValueError("Selected folder path exists but is not a directory.")
+
+        candidate.mkdir(parents=True, exist_ok=False)
+        return candidate
+
+    async def _prompt_process_run_workspace_choice(
+        self,
+        *,
+        process_name: str,
+        suggested_folder: str,
+    ) -> str | None:
+        """Prompt for run working folder choice.
+
+        Returns:
+        - ``None`` when user cancels
+        - ``""`` when user selects workspace root
+        - ``<relative folder>`` when user selects folder mode
+        """
+        done = asyncio.Event()
+        selected: list[str | None] = []
+
+        def _handle(value: str | None) -> None:
+            if value is None:
+                selected.append(None)
+            else:
+                selected.append(str(value))
+            done.set()
+
+        self.push_screen(
+            ProcessRunWorkspaceScreen(
+                process_name=process_name,
+                workspace_root=str(self._workspace.resolve()),
+                suggested_folder=suggested_folder,
+            ),
+            callback=_handle,
+        )
+        await done.wait()
+        return selected[0] if selected else None
+
+    async def _choose_process_run_workspace(
+        self,
+        process_name: str,
+        goal: str,
+    ) -> Path | None:
+        """Resolve run workspace via provisioning modal selection."""
+        process_cfg = getattr(self._config, "process", None)
+        if not bool(getattr(process_cfg, "tui_run_scoped_workspace_enabled", True)):
+            return self._workspace
+
+        suggested = await self._llm_process_run_folder_name(process_name, goal)
+        if not suggested:
+            suggested = self._fallback_process_run_folder_name(process_name, goal)
+        suggested = self._next_available_process_run_folder_name(suggested)
+
+        chat = self.query_one("#chat-log", ChatLog)
+        while True:
+            selection = await self._prompt_process_run_workspace_choice(
+                process_name=process_name,
+                suggested_folder=suggested,
+            )
+            if selection is None:
+                return None
+
+            try:
+                normalized = self._normalize_process_run_workspace_selection(selection)
+                return self._materialize_process_run_workspace_selection(normalized)
+            except ValueError as e:
+                chat.add_info(
+                    f"[bold #f7768e]Invalid working folder:[/] {self._one_line(str(e), 220)}",
+                )
+                suggested = str(selection or "").strip() or suggested
+                continue
+            except OSError as e:
+                chat.add_info(
+                    "[bold #f7768e]Failed to prepare working folder:[/] "
+                    f"{self._one_line(str(e), 220)}",
+                )
+                suggested = str(selection or "").strip() or suggested
+                continue
+
     def _current_process_run(self) -> ProcessRunState | None:
         """Return run associated with currently active tab, if any."""
         try:
@@ -6661,7 +6999,7 @@ class LoomApp(App):
     @staticmethod
     def _is_process_run_active_status(status: str) -> bool:
         state = str(status or "").strip().lower()
-        return state in {"queued", "running", "cancel_requested"}
+        return state in {"queued", "running", "paused", "cancel_requested"}
 
     def _resolve_process_run_target(
         self, target: str,
@@ -6784,8 +7122,58 @@ class LoomApp(App):
                 pass
             raise
 
+    async def _confirm_stop_process_run(self, run: ProcessRunState) -> bool:
+        """Prompt before issuing a terminal stop for a process run."""
+        waiter: asyncio.Future[bool] = asyncio.Future()
+        screen = ProcessRunCloseScreen(
+            run_label=f"{run.process_name} #{run.run_id}",
+            running=True,
+            prompt_override=f"[bold #e0af68]Stop process {run.process_name} #{run.run_id}?[/]",
+            detail_override=(
+                "This cancels the process and it can't be revived. "
+                "Start a new run if you need to continue."
+            ),
+            confirm_label="Stop Process",
+            cancel_label="Keep Running",
+            confirm_variant="error",
+        )
+
+        def handle_result(confirmed: bool) -> None:
+            if not waiter.done():
+                waiter.set_result(bool(confirmed))
+
+        self.push_screen(screen, callback=handle_result)
+        try:
+            timeout = self._tui_run_close_modal_timeout_seconds()
+            return await asyncio.wait_for(waiter, timeout=timeout)
+        except TimeoutError:
+            try:
+                screen.dismiss(False)
+            except Exception:
+                pass
+            logger.warning(
+                "process_stop_confirm_timeout run_id=%s timeout_seconds=%s",
+                run.run_id,
+                int(timeout),
+            )
+            try:
+                chat = self.query_one("#chat-log", ChatLog)
+                chat.add_info(
+                    f"Stop confirmation timed out for run [dim]{run.run_id}[/dim]. "
+                    "Please try again."
+                )
+            except Exception:
+                pass
+            return False
+        except asyncio.CancelledError:
+            try:
+                screen.dismiss(False)
+            except Exception:
+                pass
+            raise
+
     def _register_process_run_cancel_handler(self, run_id: str, payload: object) -> None:
-        """Store orchestrator-backed cancel callback for one process run."""
+        """Store orchestrator-backed control callbacks for one process run."""
         run = self._process_runs.get(run_id)
         if run is None or run.closed:
             return
@@ -6794,14 +7182,43 @@ class LoomApp(App):
         cancel_cb = payload.get("cancel")
         if callable(cancel_cb):
             self._process_run_cancel_handlers[run_id] = cancel_cb
+        pause_cb = payload.get("pause")
+        if callable(pause_cb):
+            self._process_run_pause_handlers[run_id] = pause_cb
+        play_cb = payload.get("resume")
+        if callable(play_cb):
+            self._process_run_play_handlers[run_id] = play_cb
+        inject_cb = payload.get("inject")
+        if callable(inject_cb):
+            self._process_run_inject_handlers[run_id] = inject_cb
         task_id = str(payload.get("task_id", "")).strip()
         if task_id:
             run.task_id = task_id
             self._update_process_run_visuals(run)
+        # Flush any queued inject directives once inject callback is available.
+        if callable(inject_cb) and self._process_run_pending_inject.get(run_id):
+            self.run_worker(
+                self._flush_pending_process_run_inject(run_id),
+                name=f"process-run-inject-flush-{run_id}",
+                group=f"process-run-inject-flush-{run_id}",
+                exclusive=False,
+            )
 
     def _clear_process_run_cancel_handler(self, run_id: str) -> None:
-        """Drop ephemeral cancel callback state for a run."""
-        self._process_run_cancel_handlers.pop(str(run_id or "").strip(), None)
+        """Drop ephemeral control callback state for a run."""
+        clean_id = str(run_id or "").strip()
+        self._process_run_cancel_handlers.pop(clean_id, None)
+        self._process_run_pause_handlers.pop(clean_id, None)
+        self._process_run_play_handlers.pop(clean_id, None)
+        self._process_run_inject_handlers.pop(clean_id, None)
+
+    @staticmethod
+    def _normalize_process_run_status(raw_status: object | None) -> str:
+        """Map task-engine status strings into process-run pane status values."""
+        status = str(raw_status or "").strip().lower()
+        if status in {"executing", "planning"}:
+            return "running"
+        return status
 
     async def _request_process_run_cancellation(self, run: ProcessRunState) -> dict:
         """Request cancellation, preferring orchestrator cancel over worker fallback."""
@@ -6817,9 +7234,9 @@ class LoomApp(App):
                 )
                 if isinstance(response, dict):
                     path = str(response.get("path", "orchestrator")).strip() or "orchestrator"
-                    status = str(response.get("status", "")).strip().lower()
+                    status = self._normalize_process_run_status(response.get("status"))
                     if status in {"completed", "failed", "cancelled"}:
-                        run.status = status
+                        self._set_process_run_status(run, status)
                         if status != "running":
                             run.ended_at = run.ended_at or time.monotonic()
                     return {
@@ -6868,9 +7285,158 @@ class LoomApp(App):
         return {
             "requested": False,
             "path": "none",
-            "error": "No cancellation path is available.",
-            "timeout": False,
+                "error": "No cancellation path is available.",
+                "timeout": False,
+            }
+
+    async def _request_process_run_pause(self, run: ProcessRunState) -> dict:
+        """Request cooperative pause for a process run."""
+        run_id = str(getattr(run, "run_id", "")).strip()
+        handler = self._process_run_pause_handlers.get(run_id)
+        if not callable(handler):
+            return {
+                "requested": False,
+                "path": "none",
+                "error": "Pause is unavailable until delegate task control is ready.",
+                "status": self._normalize_process_run_status(getattr(run, "status", "")),
+            }
+        try:
+            response = await handler()
+        except Exception as e:
+            logger.warning("Process run pause bridge failed for %s: %s", run_id, e)
+            return {
+                "requested": False,
+                "path": "orchestrator",
+                "error": str(e),
+                "status": self._normalize_process_run_status(getattr(run, "status", "")),
+            }
+        if isinstance(response, dict):
+            return {
+                "requested": bool(response.get("requested", False)),
+                "path": str(response.get("path", "orchestrator")).strip() or "orchestrator",
+                "error": str(response.get("error", "")).strip(),
+                "status": self._normalize_process_run_status(response.get("status")),
+            }
+        return {
+            "requested": True,
+            "path": "orchestrator",
+            "error": "",
+            "status": "paused",
         }
+
+    async def _request_process_run_play(self, run: ProcessRunState) -> dict:
+        """Request resume/play for a paused process run."""
+        run_id = str(getattr(run, "run_id", "")).strip()
+        handler = self._process_run_play_handlers.get(run_id)
+        if not callable(handler):
+            return {
+                "requested": False,
+                "path": "none",
+                "error": "Play is unavailable until delegate task control is ready.",
+                "status": self._normalize_process_run_status(getattr(run, "status", "")),
+            }
+        try:
+            response = await handler()
+        except Exception as e:
+            logger.warning("Process run play bridge failed for %s: %s", run_id, e)
+            return {
+                "requested": False,
+                "path": "orchestrator",
+                "error": str(e),
+                "status": self._normalize_process_run_status(getattr(run, "status", "")),
+            }
+        if isinstance(response, dict):
+            return {
+                "requested": bool(response.get("requested", False)),
+                "path": str(response.get("path", "orchestrator")).strip() or "orchestrator",
+                "error": str(response.get("error", "")).strip(),
+                "status": self._normalize_process_run_status(response.get("status")),
+            }
+        return {
+            "requested": True,
+            "path": "orchestrator",
+            "error": "",
+            "status": "running",
+        }
+
+    async def _request_process_run_inject(self, run: ProcessRunState, text: str) -> dict:
+        """Inject one steering instruction into a running/paused process run."""
+        run_id = str(getattr(run, "run_id", "")).strip()
+        handler = self._process_run_inject_handlers.get(run_id)
+        if not callable(handler):
+            return {
+                "requested": False,
+                "path": "none",
+                "error": "Inject is unavailable until delegate task control is ready.",
+                "status": self._normalize_process_run_status(getattr(run, "status", "")),
+            }
+        try:
+            response = await handler(instruction=text)
+        except Exception as e:
+            logger.warning("Process run inject bridge failed for %s: %s", run_id, e)
+            return {
+                "requested": False,
+                "path": "orchestrator",
+                "error": str(e),
+                "status": self._normalize_process_run_status(getattr(run, "status", "")),
+            }
+        if isinstance(response, dict):
+            return {
+                "requested": bool(response.get("requested", False)),
+                "path": str(response.get("path", "orchestrator")).strip() or "orchestrator",
+                "error": str(response.get("error", "")).strip(),
+                "status": self._normalize_process_run_status(response.get("status")),
+            }
+        return {
+            "requested": True,
+            "path": "orchestrator",
+            "error": "",
+            "status": self._normalize_process_run_status(getattr(run, "status", "")),
+        }
+
+    async def _flush_pending_process_run_inject(self, run_id: str) -> None:
+        """Flush queued inject instructions once the delegate control hook is ready."""
+        pending = self._process_run_pending_inject.get(run_id)
+        if not pending:
+            return
+        run = self._process_runs.get(run_id)
+        if run is None or run.closed:
+            self._process_run_pending_inject.pop(run_id, None)
+            return
+        while pending:
+            text = str(pending[0] or "").strip()
+            if not text:
+                pending.pop(0)
+                continue
+            response = await self._request_process_run_inject(run, text)
+            requested = bool(response.get("requested", False))
+            error = str(response.get("error", "")).strip()
+            if requested:
+                pending.pop(0)
+                self._append_process_run_activity(
+                    run,
+                    f"Applied queued inject: {self._one_line(text, 120)}",
+                )
+                continue
+            if str(response.get("path", "")).strip() == "none":
+                # Control path still unavailable; keep queue and retry later.
+                break
+            pending.pop(0)
+            self._append_process_run_activity(
+                run,
+                (
+                    "Queued inject failed: "
+                    f"{error or 'unknown error'}"
+                ),
+            )
+        if pending:
+            self._process_run_pending_inject[run_id] = pending[-100:]
+        else:
+            self._process_run_pending_inject.pop(run_id, None)
+        self._update_process_run_visuals(run)
+        self._refresh_process_run_progress(run)
+        self._refresh_sidebar_progress_summary()
+        await self._persist_process_run_ui_state()
 
     async def _wait_for_process_run_terminal_state(
         self,
@@ -6914,6 +7480,7 @@ class LoomApp(App):
         except Exception:
             pass
         self._process_runs.pop(run.run_id, None)
+        self._process_run_pending_inject.pop(run.run_id, None)
         self._sync_activity_indicator()
         self._clear_process_run_cancel_handler(run.run_id)
         self._refresh_sidebar_progress_summary()
@@ -6937,7 +7504,7 @@ class LoomApp(App):
         if was_running:
             run.close_after_cancel = True
             run.cancel_requested_at = time.monotonic()
-            run.status = "cancel_requested"
+            self._set_process_run_status(run, "cancel_requested")
             self._append_process_run_activity(run, "Cancellation requested...")
             self._update_process_run_visuals(run)
             self._refresh_process_run_progress(run)
@@ -6989,7 +7556,7 @@ class LoomApp(App):
             wait_timeout = self._tui_run_cancel_wait_timeout_seconds()
             settled = False
             if cancel_path == "worker_fallback" and not str(getattr(run, "task_id", "")).strip():
-                run.status = "cancelled"
+                self._set_process_run_status(run, "cancelled")
                 run.ended_at = time.monotonic()
                 settled = True
             elif not bool(cancel_response.get("timeout", False)):
@@ -7017,7 +7584,7 @@ class LoomApp(App):
                     )
                 return closed
 
-            run.status = "cancel_failed"
+            self._set_process_run_status(run, "cancel_failed")
             self._append_process_run_activity(
                 run,
                 f"Cancellation timed out after {int(wait_timeout)}s.",
@@ -7052,7 +7619,7 @@ class LoomApp(App):
             if not force_close:
                 run.close_after_cancel = False
                 return False
-            run.status = "force_closed"
+            self._set_process_run_status(run, "force_closed")
             run.ended_at = time.monotonic()
             self._append_process_run_activity(
                 run,
@@ -7094,6 +7661,277 @@ class LoomApp(App):
                 chat.add_info(error)
             return False
         return await self._close_process_run(run)
+
+    async def _pause_process_run(self, run: ProcessRunState) -> bool:
+        """Pause an active process run without closing its tab."""
+        chat = self.query_one("#chat-log", ChatLog)
+        events_panel = self.query_one("#events-panel", EventPanel)
+        if run.closed:
+            chat.add_info(f"Run [dim]{run.run_id}[/dim] is already closed.")
+            return False
+        if run.status == "paused":
+            chat.add_info(f"Run [dim]{run.run_id}[/dim] is already paused.")
+            return True
+        if run.status in {"completed", "failed", "cancelled", "force_closed"}:
+            chat.add_info(f"Run [dim]{run.run_id}[/dim] is not active.")
+            return False
+        response = await self._request_process_run_pause(run)
+        requested = bool(response.get("requested", False))
+        path = str(response.get("path", "unknown")).strip() or "unknown"
+        error = str(response.get("error", "")).strip()
+        next_status = self._normalize_process_run_status(response.get("status"))
+        if requested:
+            self._set_process_run_status(run, next_status or "paused")
+            self._append_process_run_activity(run, f"Pause requested via {path}.")
+            chat.add_info(f"Paused process run [dim]{run.run_id}[/dim] via {path}.")
+            events_panel.add_event(
+                _now_str(),
+                "process",
+                f"{run.process_name} #{run.run_id} paused ({path})",
+            )
+        else:
+            detail = error or "Pause request was not accepted."
+            self._append_process_run_activity(run, f"Pause request failed via {path}: {detail}")
+            chat.add_info(
+                f"[bold #f7768e]Pause failed[/] for run "
+                f"[dim]{run.run_id}[/dim] via {path}: {detail}"
+            )
+        self._update_process_run_visuals(run)
+        self._refresh_process_run_progress(run)
+        self._refresh_sidebar_progress_summary()
+        await self._persist_process_run_ui_state()
+        return requested
+
+    async def _play_process_run(self, run: ProcessRunState) -> bool:
+        """Resume/play a paused process run without relaunching it."""
+        chat = self.query_one("#chat-log", ChatLog)
+        events_panel = self.query_one("#events-panel", EventPanel)
+        if run.closed:
+            chat.add_info(f"Run [dim]{run.run_id}[/dim] is already closed.")
+            return False
+        if run.status in {"completed", "failed", "cancelled", "force_closed"}:
+            chat.add_info(f"Run [dim]{run.run_id}[/dim] is not active.")
+            return False
+        response = await self._request_process_run_play(run)
+        requested = bool(response.get("requested", False))
+        path = str(response.get("path", "unknown")).strip() or "unknown"
+        error = str(response.get("error", "")).strip()
+        next_status = self._normalize_process_run_status(response.get("status"))
+        if requested:
+            self._set_process_run_status(run, next_status or "running")
+            self._append_process_run_activity(run, f"Play requested via {path}.")
+            chat.add_info(f"Resumed process run [dim]{run.run_id}[/dim] via {path}.")
+            events_panel.add_event(
+                _now_str(),
+                "process",
+                f"{run.process_name} #{run.run_id} resumed ({path})",
+            )
+        elif (
+            path == "none"
+            and run.status == "paused"
+            and getattr(run, "worker", None) is None
+        ):
+            # Restored paused runs have no live task-control callbacks after app restart.
+            # Fall back to persisted task resume so Play works as expected.
+            chat.add_info(
+                f"No live play hook for run [dim]{run.run_id}[/dim]; "
+                "resuming from persisted task state."
+            )
+            return await self._restart_process_run_in_place(run.run_id, mode="resume")
+        else:
+            detail = error or "Play request was not accepted."
+            self._append_process_run_activity(run, f"Play request failed via {path}: {detail}")
+            chat.add_info(
+                f"[bold #f7768e]Play failed[/] for run "
+                f"[dim]{run.run_id}[/dim] via {path}: {detail}"
+            )
+        self._update_process_run_visuals(run)
+        self._refresh_process_run_progress(run)
+        self._refresh_sidebar_progress_summary()
+        await self._persist_process_run_ui_state()
+        return requested
+
+    async def _inject_process_run(
+        self,
+        run: ProcessRunState,
+        text: str,
+        *,
+        source: str = "slash",
+        queue_if_unavailable: bool = True,
+    ) -> bool:
+        """Inject instruction into a process run, or queue until control hook is ready."""
+        chat = self.query_one("#chat-log", ChatLog)
+        clean = str(text or "").strip()
+        if not clean:
+            chat.add_info(self._render_slash_command_usage("/run inject", "<target> <text>"))
+            return False
+        if run.closed:
+            chat.add_info(f"Run [dim]{run.run_id}[/dim] is already closed.")
+            return False
+        if run.status in {"completed", "failed", "cancelled", "force_closed"}:
+            chat.add_info(f"Run [dim]{run.run_id}[/dim] is not active.")
+            return False
+
+        response = await self._request_process_run_inject(run, clean)
+        requested = bool(response.get("requested", False))
+        path = str(response.get("path", "unknown")).strip() or "unknown"
+        error = str(response.get("error", "")).strip()
+        if requested:
+            self._append_process_run_activity(
+                run,
+                f"Inject ({source}) via {path}: {self._one_line(clean, 140)}",
+            )
+            chat.add_info(
+                f"Injected into run [dim]{run.run_id}[/dim]: "
+                f"{self._escape_markup(self._one_line(clean, 120))}"
+            )
+            self._update_process_run_visuals(run)
+            self._refresh_process_run_progress(run)
+            self._refresh_sidebar_progress_summary()
+            await self._persist_process_run_ui_state()
+            return True
+
+        if queue_if_unavailable and path == "none":
+            queue = self._process_run_pending_inject.setdefault(run.run_id, [])
+            queue.append(clean)
+            if len(queue) > 100:
+                del queue[:-100]
+            self._append_process_run_activity(
+                run,
+                f"Queued inject ({source}) pending task control: {self._one_line(clean, 140)}",
+            )
+            chat.add_info(
+                f"Queued inject for run [dim]{run.run_id}[/dim]. "
+                "It will apply when task control is ready."
+            )
+            self._update_process_run_visuals(run)
+            self._refresh_process_run_progress(run)
+            self._refresh_sidebar_progress_summary()
+            await self._persist_process_run_ui_state()
+            return True
+
+        detail = error or "Inject request was not accepted."
+        self._append_process_run_activity(run, f"Inject failed via {path}: {detail}")
+        chat.add_info(
+            f"[bold #f7768e]Inject failed[/] for run "
+            f"[dim]{run.run_id}[/dim] via {path}: {detail}"
+        )
+        self._update_process_run_visuals(run)
+        self._refresh_process_run_progress(run)
+        self._refresh_sidebar_progress_summary()
+        await self._persist_process_run_ui_state()
+        return False
+
+    async def _stop_process_run(self, run: ProcessRunState, *, confirm: bool = False) -> bool:
+        """Request cancellation for a process run while keeping its tab open."""
+        chat = self.query_one("#chat-log", ChatLog)
+        events_panel = self.query_one("#events-panel", EventPanel)
+        if run.closed:
+            chat.add_info(f"Run [dim]{run.run_id}[/dim] is already closed.")
+            return False
+        if run.status in {"completed", "failed", "cancelled", "force_closed"}:
+            chat.add_info(f"Run [dim]{run.run_id}[/dim] is not active.")
+            return False
+        if run.status == "cancel_requested":
+            chat.add_info(f"Cancellation already requested for run [dim]{run.run_id}[/dim].")
+            return True
+        if confirm and not await self._confirm_stop_process_run(run):
+            return False
+
+        prior_status = run.status
+        self._set_process_run_status(run, "cancel_requested")
+        run.cancel_requested_at = time.monotonic()
+        self._append_process_run_activity(run, "Cancellation requested...")
+        self._update_process_run_visuals(run)
+        self._refresh_process_run_progress(run)
+        self._refresh_sidebar_progress_summary()
+
+        response = await self._request_process_run_cancellation(run)
+        requested = bool(response.get("requested", False))
+        path = str(response.get("path", "unknown")).strip() or "unknown"
+        error = str(response.get("error", "")).strip()
+        if not requested:
+            self._set_process_run_status(run, prior_status)
+            detail = error or "Cancel request was not accepted."
+            self._append_process_run_activity(run, f"Cancel request failed via {path}: {detail}")
+            chat.add_info(
+                f"[bold #f7768e]Stop failed[/] for run "
+                f"[dim]{run.run_id}[/dim] via {path}: {detail}"
+            )
+            self._update_process_run_visuals(run)
+            self._refresh_process_run_progress(run)
+            self._refresh_sidebar_progress_summary()
+            await self._persist_process_run_ui_state()
+            return False
+
+        self._append_process_run_activity(run, f"Cancellation requested via {path}.")
+        chat.add_info(
+            f"Stop requested for process run [dim]{run.run_id}[/dim] via {path}."
+        )
+        events_panel.add_event(
+            _now_str(),
+            "process",
+            f"{run.process_name} #{run.run_id} stop requested ({path})",
+        )
+        self._update_process_run_visuals(run)
+        self._refresh_process_run_progress(run)
+        self._refresh_sidebar_progress_summary()
+        await self._persist_process_run_ui_state()
+        return True
+
+    async def _pause_process_run_from_target(self, target: str) -> bool:
+        """Resolve and pause a process run from /run pause target syntax."""
+        chat = self.query_one("#chat-log", ChatLog)
+        run, error = self._resolve_process_run_target(target)
+        if run is None:
+            if error:
+                if error == "Multiple runs open. Use /run close <run-id-prefix>.":
+                    error = "Multiple runs open. Use /run pause <run-id-prefix>."
+                chat.add_info(error)
+            return False
+        return await self._pause_process_run(run)
+
+    async def _play_process_run_from_target(self, target: str) -> bool:
+        """Resolve and play/resume a process run from /run play target syntax."""
+        chat = self.query_one("#chat-log", ChatLog)
+        run, error = self._resolve_process_run_target(target)
+        if run is None:
+            if error:
+                if error == "Multiple runs open. Use /run close <run-id-prefix>.":
+                    error = "Multiple runs open. Use /run play <run-id-prefix>."
+                chat.add_info(error)
+            return False
+        return await self._play_process_run(run)
+
+    async def _stop_process_run_from_target(self, target: str) -> bool:
+        """Resolve and stop a process run from /run stop target syntax."""
+        chat = self.query_one("#chat-log", ChatLog)
+        run, error = self._resolve_process_run_target(target)
+        if run is None:
+            if error:
+                if error == "Multiple runs open. Use /run close <run-id-prefix>.":
+                    error = "Multiple runs open. Use /run stop <run-id-prefix>."
+                chat.add_info(error)
+            return False
+        return await self._stop_process_run(run)
+
+    async def _inject_process_run_from_target(
+        self,
+        target: str,
+        text: str,
+        *,
+        source: str = "slash",
+    ) -> bool:
+        """Resolve and inject into a process run from /run inject target syntax."""
+        chat = self.query_one("#chat-log", ChatLog)
+        run, error = self._resolve_process_run_target(target)
+        if run is None:
+            if error:
+                if error == "Multiple runs open. Use /run close <run-id-prefix>.":
+                    error = "Multiple runs open. Use /run inject <run-id-prefix> <text>."
+                chat.add_info(error)
+            return False
+        return await self._inject_process_run(run, text, source=source)
 
     async def _resume_process_run_from_target(self, target: str) -> bool:
         """Resolve and resume a failed/cancelled process run from /run resume."""
@@ -7159,7 +7997,24 @@ class LoomApp(App):
 
         chat = self.query_one("#chat-log", ChatLog)
         events_panel = self.query_one("#events-panel", EventPanel)
-        if self._is_process_run_active_status(run.status):
+        run_key = str(getattr(run, "run_id", "")).strip()
+        has_live_controls = any(
+            callable(registry.get(run_key))
+            for registry in (
+                self._process_run_cancel_handlers,
+                self._process_run_pause_handlers,
+                self._process_run_play_handlers,
+                self._process_run_inject_handlers,
+            )
+        )
+        can_resume_persisted_paused = (
+            is_resume
+            and run.status == "paused"
+            and getattr(run, "worker", None) is None
+            and not has_live_controls
+        )
+
+        if self._is_process_run_active_status(run.status) and not can_resume_persisted_paused:
             chat.add_info(
                 f"Run [dim]{run.run_id}[/dim] is already active and cannot be {verb_denied}."
             )
@@ -7170,7 +8025,7 @@ class LoomApp(App):
             )
             return False
 
-        run.status = "queued"
+        self._set_process_run_status(run, "queued")
         run.started_at = time.monotonic()
         run.ended_at = None
         run.launch_error = ""
@@ -7184,7 +8039,10 @@ class LoomApp(App):
         run.close_after_cancel = False
         run.cancel_requested_at = 0.0
         run.progress_ui_last_refresh_at = 0.0
+        run.paused_started_at = 0.0
+        run.paused_accumulated_seconds = 0.0
         self._clear_process_run_cancel_handler(run.run_id)
+        self._process_run_pending_inject.pop(run.run_id, None)
         run.tasks, run.task_labels = self._resume_seed_task_rows(run)
         row_ids = {
             str(row.get("id", "")).strip()
@@ -7318,13 +8176,25 @@ class LoomApp(App):
             for item in (getattr(tools_cfg, "excluded", []) or [])
             if str(item).strip()
         }
-        for tool_name in sorted(
-            {
-                str(name).strip()
-                for name in self._tools.list_tools()
-                if str(name).strip() and str(name).strip() not in excluded
-            }
-        ):
+        required = {
+            str(item).strip()
+            for item in (getattr(tools_cfg, "required", []) or [])
+            if str(item).strip()
+        }
+        if required:
+            # If a process explicitly declares required tools, preflight auth
+            # against that set only to avoid unrelated auth prompts.
+            candidate_tool_names = sorted(required - excluded)
+        else:
+            candidate_tool_names = sorted(
+                {
+                    str(name).strip()
+                    for name in self._tools.list_tools()
+                    if str(name).strip() and str(name).strip() not in excluded
+                }
+            )
+
+        for tool_name in candidate_tool_names:
             tool = self._tools.get(tool_name)
             if tool is None:
                 continue
@@ -7873,7 +8743,13 @@ class LoomApp(App):
         if launch_request.run_workspace_override is not None:
             run_workspace = Path(launch_request.run_workspace_override).expanduser()
         else:
-            run_workspace = await self._prepare_process_run_workspace(process_name, run.goal)
+            run_workspace = await self._choose_process_run_workspace(process_name, run.goal)
+            if run_workspace is None:
+                self._fail_process_run_launch(
+                    run,
+                    "Run cancelled: working folder selection cancelled.",
+                )
+                return False
         if run.closed:
             return False
         run.run_workspace = run_workspace
@@ -7938,13 +8814,15 @@ class LoomApp(App):
         chat = self.query_one("#chat-log", ChatLog)
         events_panel = self.query_one("#events-panel", EventPanel)
 
-        run.status = "running"
+        self._set_process_run_status(run, "running")
         run.started_at = time.monotonic()
         run.ended_at = None
         run.launch_error = ""
         run.close_after_cancel = False
         run.cancel_requested_at = 0.0
         run.progress_ui_last_refresh_at = 0.0
+        run.paused_started_at = 0.0
+        run.paused_accumulated_seconds = 0.0
         self._clear_process_run_cancel_handler(run_id)
         tab_created_at = float(getattr(run, "launch_tab_created_at", 0.0) or 0.0)
         if tab_created_at > 0:
@@ -8038,7 +8916,7 @@ class LoomApp(App):
             if run_succeeded:
                 output = result.output or "Process run completed."
                 self._append_process_run_result(run, output, success=True)
-                run.status = "completed"
+                self._set_process_run_status(run, "completed")
                 run.ended_at = time.monotonic()
                 run.launch_error = ""
                 self._log_terminal_stage_duration(run, terminal_state="completed")
@@ -8052,7 +8930,7 @@ class LoomApp(App):
                 chat.add_info(f"Process run [dim]{run.run_id}[/dim] completed.")
             elif delegated_cancelled:
                 detail = result.output or "Process run cancelled."
-                run.status = "cancelled"
+                self._set_process_run_status(run, "cancelled")
                 run.ended_at = time.monotonic()
                 run.launch_error = "Process run cancelled."
                 self._log_terminal_stage_duration(run, terminal_state="cancelled")
@@ -8073,7 +8951,7 @@ class LoomApp(App):
                 else:
                     error = result.error or result.output or "Process run failed."
                     self._append_process_run_result(run, error, success=False)
-                run.status = "failed"
+                self._set_process_run_status(run, "failed")
                 run.ended_at = time.monotonic()
                 run.launch_error = str(error)
                 self._log_terminal_stage_duration(run, terminal_state="failed")
@@ -8092,7 +8970,15 @@ class LoomApp(App):
         except asyncio.CancelledError:
             if run.closed:
                 return
-            run.status = "cancelled"
+            if run.status == "paused":
+                # Preserve paused state on worker cancellation (for example app
+                # shutdown) so the run can be resumed after restart.
+                run.launch_error = ""
+                self._refresh_process_run_progress(run)
+                self._update_process_run_visuals(run)
+                self._refresh_sidebar_progress_summary()
+                raise
+            self._set_process_run_status(run, "cancelled")
             run.ended_at = time.monotonic()
             run.launch_error = "Process run cancelled."
             self._log_terminal_stage_duration(run, terminal_state="cancelled")
@@ -8107,7 +8993,7 @@ class LoomApp(App):
             raise
         except Exception as e:  # pragma: no cover - defensive guard
             self._append_process_run_result(run, str(e), success=False)
-            run.status = "failed"
+            self._set_process_run_status(run, "failed")
             run.ended_at = time.monotonic()
             run.launch_error = str(e)
             self._log_terminal_stage_duration(run, terminal_state="failed")
@@ -8120,6 +9006,8 @@ class LoomApp(App):
             chat.add_info(f"[bold #f7768e]Process run {run.run_id} failed:[/] {e}")
             self.notify(str(e), severity="error", timeout=5)
         finally:
+            if run.status in {"completed", "failed", "cancelled", "force_closed", "cancel_failed"}:
+                self._process_run_pending_inject.pop(run_id, None)
             run.worker = None
             self._clear_process_run_cancel_handler(run_id)
             await self._persist_process_run_ui_state()
@@ -10181,6 +11069,29 @@ class LoomApp(App):
                 await self._persist_process_run_ui_state()
                 return
 
+        focused_run = self._current_process_run()
+        if (
+            focused_run is not None
+            and self._is_process_run_active_status(focused_run.status)
+        ):
+            injected = await self._inject_process_run(
+                focused_run,
+                text,
+                source="enter",
+                queue_if_unavailable=True,
+            )
+            if injected:
+                self._append_input_history(text)
+                await self._persist_process_run_ui_state()
+                return
+            # Preserve user text if process-run inject remains unavailable.
+            if (
+                focused_run is not None
+                and self._is_process_run_active_status(focused_run.status)
+            ):
+                self._set_user_input_text(text)
+                return
+
         if self._is_cowork_stop_visible():
             queued = await self._queue_chat_inject_instruction(text, source="enter")
             if queued:
@@ -10229,6 +11140,55 @@ class LoomApp(App):
             group=f"process-run-restart-{run_id}",
             exclusive=False,
         )
+
+    @on(Button.Pressed, ".process-run-control-btn")
+    def on_process_run_control_pressed(self, event: Button.Pressed) -> None:
+        """Dispatch pause/play toggle + stop controls from process-run panes."""
+        button_id = str(getattr(event.button, "id", "") or "").strip()
+        control = ""
+        run_id = ""
+        for prefix, control_name in (
+            ("process-run-toggle-", "toggle"),
+            ("process-run-stop-", "stop"),
+        ):
+            if button_id.startswith(prefix):
+                control = control_name
+                run_id = button_id.removeprefix(prefix).strip()
+                break
+        if not control or not run_id:
+            return
+        run = self._process_runs.get(run_id)
+        if run is None or run.closed:
+            return
+        event.stop()
+        event.prevent_default()
+        if control == "toggle":
+            status = str(getattr(run, "status", "")).strip().lower()
+            if status == "paused":
+                self.run_worker(
+                    self._play_process_run(run),
+                    name=f"process-run-play-{run_id}",
+                    group=f"process-run-control-{run_id}",
+                    exclusive=False,
+                )
+                return
+            if status != "running":
+                return
+            self.run_worker(
+                self._pause_process_run(run),
+                name=f"process-run-pause-{run_id}",
+                group=f"process-run-control-{run_id}",
+                exclusive=False,
+            )
+            return
+        if control == "stop":
+            self.run_worker(
+                self._stop_process_run(run, confirm=True),
+                name=f"process-run-stop-{run_id}",
+                group=f"process-run-control-{run_id}",
+                exclusive=False,
+            )
+            return
 
     @on(Button.Pressed, "#chat-stop-btn")
     def _on_chat_stop_pressed(self, event: Button.Pressed) -> None:
@@ -10885,6 +11845,64 @@ class LoomApp(App):
                     if subcmd == "close":
                         target = " ".join(tokens[1:]).strip()
                         await self._close_process_run_from_target(target)
+                        return True
+                    if subcmd == "pause":
+                        target = tokens[1] if len(tokens) >= 2 else "current"
+                        await self._pause_process_run_from_target(target)
+                        return True
+                    if subcmd == "play":
+                        target = tokens[1] if len(tokens) >= 2 else "current"
+                        await self._play_process_run_from_target(target)
+                        return True
+                    if subcmd == "stop":
+                        target = tokens[1] if len(tokens) >= 2 else "current"
+                        await self._stop_process_run_from_target(target)
+                        return True
+                    if subcmd == "inject":
+                        if len(tokens) < 2:
+                            chat.add_info(
+                                self._render_slash_command_usage(
+                                    "/run inject",
+                                    "<run-id-prefix|current> <text>",
+                                )
+                            )
+                            return True
+                        target = "current"
+                        inject_tokens = tokens[1:]
+                        if len(tokens) >= 3:
+                            target_candidate = str(tokens[1] or "").strip()
+                            explicit_target = (
+                                target_candidate.startswith("#")
+                                or target_candidate.lower() in {"current", "this"}
+                            )
+                            if explicit_target:
+                                target = target_candidate
+                                inject_tokens = tokens[2:]
+                            else:
+                                run_candidate, _ = self._resolve_process_run_target(
+                                    target_candidate,
+                                )
+                                if run_candidate is not None:
+                                    target = target_candidate
+                                    inject_tokens = tokens[2:]
+                        inject_text = " ".join(
+                            str(item or "").strip()
+                            for item in inject_tokens
+                            if str(item or "").strip()
+                        ).strip()
+                        if not inject_text:
+                            chat.add_info(
+                                self._render_slash_command_usage(
+                                    "/run inject",
+                                    "<run-id-prefix|current> <text>",
+                                )
+                            )
+                            return True
+                        await self._inject_process_run_from_target(
+                            target,
+                            inject_text,
+                            source="slash",
+                        )
                         return True
                     if subcmd == "resume":
                         if len(tokens) < 2:
@@ -12205,14 +13223,21 @@ class LoomApp(App):
             event_type = str(data.get("event_type") or "")
             task_status = str(data.get("status", "") or "").strip().lower()
             if task_status == "cancelled":
-                run.status = "cancelled"
+                self._set_process_run_status(run, "cancelled")
                 run.ended_at = run.ended_at or now
                 run.launch_error = "Process run cancelled."
+                self._process_run_pending_inject.pop(run.run_id, None)
+            elif task_status == "paused":
+                self._set_process_run_status(run, "paused")
+                run.launch_error = ""
             elif task_status == "failed" and run.status == "cancel_requested":
-                run.status = "cancel_failed"
+                self._set_process_run_status(run, "cancel_failed")
                 run.launch_error = "Cancellation timed out."
+            elif task_status in {"executing", "planning"} and run.status == "paused":
+                self._set_process_run_status(run, "running")
+                run.launch_error = ""
             elif task_status == "running" and run.status == "cancel_failed":
-                run.status = "running"
+                self._set_process_run_status(run, "running")
                 run.launch_error = ""
 
             tasks = data.get("tasks", [])
@@ -12255,6 +13280,9 @@ class LoomApp(App):
                 "task_cancel_requested",
                 "task_cancel_ack",
                 "task_cancel_timeout",
+                "task_paused",
+                "task_resumed",
+                "task_injected",
                 "subtask_started",
                 "subtask_retrying",
                 "subtask_completed",
@@ -12902,6 +13930,34 @@ class LoomApp(App):
                     f"{attempt_suffix}: {reason}"
                 )
             return f"Stall recovery via {mode_label} failed{attempt_suffix}."
+        if event_type == "task_paused":
+            if bool(event_data.get("requested", False)):
+                return "Process run paused."
+            reason = self._one_line(event_data.get("error", ""), 140)
+            if reason:
+                return f"Pause rejected: {reason}"
+            return "Pause request rejected."
+        if event_type == "task_resumed":
+            if bool(event_data.get("requested", False)):
+                return "Process run resumed."
+            reason = self._one_line(event_data.get("error", ""), 140)
+            if reason:
+                return f"Resume rejected: {reason}"
+            return "Resume request rejected."
+        if event_type == "task_injected":
+            if bool(event_data.get("requested", False)):
+                chars = event_data.get("chars")
+                try:
+                    inject_chars = int(chars)
+                except (TypeError, ValueError):
+                    inject_chars = 0
+                if inject_chars > 0:
+                    return f"Injected user instruction ({inject_chars} chars)."
+                return "Injected user instruction."
+            reason = self._one_line(event_data.get("error", ""), 140)
+            if reason:
+                return f"Inject rejected: {reason}"
+            return "Inject request rejected."
         if event_type == "task_cancel_requested":
             return "Cancellation requested."
         if event_type == "task_cancel_ack":
@@ -13060,6 +14116,7 @@ class LoomApp(App):
             row_status = {
                 "queued": "pending",
                 "running": "in_progress",
+                "paused": "in_progress",
                 "cancel_requested": "in_progress",
                 "completed": "completed",
                 "failed": "failed",

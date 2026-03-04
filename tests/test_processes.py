@@ -1860,3 +1860,193 @@ verification:
         assert "unverified_claim_count" in metadata_fields
         assert "verified_claim_count" in metadata_fields
         assert "supporting_ratio" in metadata_fields
+
+
+class TestPhaseIterationPolicyValidation:
+    """Tests for phase-level iteration policy parsing and linting."""
+
+    def _load_yaml_str(self, tmp_path, content):
+        f = tmp_path / "test-iteration.yaml"
+        f.write_text(content)
+        loader = ProcessLoader()
+        return loader.load(str(f))
+
+    def test_iteration_policy_parses_valid_contract(self, tmp_path):
+        yaml_content = """\
+name: iteration-valid
+version: '1.0'
+phases:
+  - id: rewrite
+    description: Rewrite content
+    iteration:
+      enabled: true
+      max_attempts: 4
+      stop_on_no_improvement_attempts: 2
+      max_total_runner_invocations: 6
+      iteration_budget:
+        max_wall_clock_seconds: 300
+        max_tokens: 20000
+        max_tool_calls: 20
+      gates:
+        - id: score
+          type: tool_metric
+          blocking: true
+          tool: humanize_writing
+          metric_path: report.humanization_score
+          operator: gte
+          value: 80
+"""
+        defn = self._load_yaml_str(tmp_path, yaml_content)
+        phase = defn.phases[0]
+        assert phase.iteration is not None
+        assert phase.iteration.enabled is True
+        assert phase.iteration.max_attempts == 4
+        assert phase.iteration.max_total_runner_invocations == 6
+        assert len(phase.iteration.gates) == 1
+        assert phase.iteration.gates[0].type == "tool_metric"
+
+    def test_iteration_policy_rejects_blocking_verifier_gate(self, tmp_path):
+        yaml_content = """\
+name: iteration-invalid-verifier
+version: '1.0'
+phases:
+  - id: rewrite
+    description: Rewrite content
+    iteration:
+      enabled: true
+      max_attempts: 3
+      max_total_runner_invocations: 4
+      iteration_budget:
+        max_wall_clock_seconds: 300
+        max_tokens: 20000
+        max_tool_calls: 20
+      gates:
+        - id: semantic
+          type: verifier_field
+          blocking: true
+          field: outcome
+          operator: eq
+          value: pass
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any(
+            "advisory-only in MVP" in err
+            for err in exc_info.value.errors
+        )
+
+    def test_iteration_policy_rejects_excessive_attempt_cap(self, tmp_path):
+        yaml_content = """\
+name: iteration-invalid-attempts
+version: '1.0'
+phases:
+  - id: rewrite
+    description: Rewrite content
+    iteration:
+      enabled: true
+      max_attempts: 7
+      max_total_runner_invocations: 10
+      iteration_budget:
+        max_wall_clock_seconds: 300
+        max_tokens: 20000
+        max_tool_calls: 20
+      gates:
+        - id: score
+          type: tool_metric
+          blocking: true
+          tool: humanize_writing
+          metric_path: report.humanization_score
+          operator: gte
+          value: 80
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("max_attempts must be between 1 and 6" in err for err in exc_info.value.errors)
+
+    def test_iteration_score_gate_requires_no_improvement_stop(self, tmp_path):
+        yaml_content = """\
+name: iteration-invalid-no-improvement
+version: '1.0'
+phases:
+  - id: rewrite
+    description: Rewrite content
+    iteration:
+      enabled: true
+      max_attempts: 4
+      max_total_runner_invocations: 6
+      iteration_budget:
+        max_wall_clock_seconds: 300
+        max_tokens: 20000
+        max_tool_calls: 20
+      gates:
+        - id: score
+          type: tool_metric
+          blocking: true
+          tool: humanize_writing
+          metric_path: report.humanization_score
+          operator: gte
+          value: 80
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any(
+            "score-like iteration gates require stop_on_no_improvement_attempts > 0" in err
+            for err in exc_info.value.errors
+        )
+
+    def test_iteration_policy_rejects_unallowlisted_command_exit(self, tmp_path):
+        yaml_content = """\
+name: iteration-invalid-command
+version: '1.0'
+phases:
+  - id: coding
+    description: Run tests
+    deliverables: [report.txt]
+    iteration:
+      enabled: true
+      max_attempts: 3
+      max_total_runner_invocations: 4
+      stop_on_no_improvement_attempts: 1
+      iteration_budget:
+        max_wall_clock_seconds: 300
+        max_tokens: 20000
+        max_tool_calls: 20
+      gates:
+        - id: local-script
+          type: command_exit
+          blocking: true
+          command: ["bash", "-lc", "pytest"]
+          operator: eq
+          value: 0
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("command is not allowlisted" in err for err in exc_info.value.errors)
+
+    def test_iteration_policy_rejects_invalid_artifact_target(self, tmp_path):
+        yaml_content = """\
+name: iteration-invalid-artifact-target
+version: '1.0'
+phases:
+  - id: rewrite
+    description: Rewrite content
+    iteration:
+      enabled: true
+      max_attempts: 3
+      max_total_runner_invocations: 4
+      stop_on_no_improvement_attempts: 1
+      iteration_budget:
+        max_wall_clock_seconds: 300
+        max_tokens: 20000
+        max_tool_calls: 20
+      gates:
+        - id: no-placeholders
+          type: artifact_regex
+          blocking: true
+          target: final_doc
+          pattern: "\\\\[TODO\\\\]"
+          expect_match: false
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("target must be one of" in err for err in exc_info.value.errors)

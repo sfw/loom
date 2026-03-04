@@ -268,6 +268,68 @@ class TestDatabase:
         assert rows[0]["blocking"] is True
         assert rows[0]["missing_targets"] == ["a", "b"]
 
+    async def test_iteration_tables_roundtrip(self, db: Database):
+        await db.insert_task(task_id="t1", goal="Test")
+        await db.upsert_iteration_run(
+            loop_run_id="iter-1",
+            task_id="t1",
+            run_id="run-1",
+            subtask_id="s1",
+            phase_id="rewrite",
+            policy_snapshot={"max_attempts": 4},
+            terminal_reason="",
+            attempt_count=1,
+            replan_count=0,
+            exhaustion_fingerprint="",
+            metadata={"foo": "bar"},
+        )
+        attempt_id = await db.insert_iteration_attempt(
+            loop_run_id="iter-1",
+            task_id="t1",
+            run_id="run-1",
+            subtask_id="s1",
+            phase_id="rewrite",
+            attempt_index=1,
+            status="retrying",
+            summary="score below threshold",
+            gate_summary={"blocking_failures": ["score"]},
+            budget_snapshot={"used": {"tokens": 1200}},
+        )
+        assert attempt_id > 0
+        gate_id = await db.insert_iteration_gate_result(
+            loop_run_id="iter-1",
+            attempt_id=attempt_id,
+            task_id="t1",
+            run_id="run-1",
+            subtask_id="s1",
+            phase_id="rewrite",
+            attempt_index=1,
+            gate_id="score",
+            gate_type="tool_metric",
+            status="fail",
+            blocking=True,
+            reason_code="gate_threshold_not_met",
+            measured_value=72,
+            threshold_value=80,
+            detail="score too low",
+        )
+        assert gate_id > 0
+
+        runs = await db.list_iteration_runs(task_id="t1")
+        assert len(runs) == 1
+        assert runs[0]["loop_run_id"] == "iter-1"
+        assert runs[0]["policy_snapshot"]["max_attempts"] == 4
+
+        attempts = await db.list_iteration_attempts(loop_run_id="iter-1")
+        assert len(attempts) == 1
+        assert attempts[0]["gate_summary"]["blocking_failures"] == ["score"]
+
+        gates = await db.list_iteration_gate_results(loop_run_id="iter-1")
+        assert len(gates) == 1
+        assert gates[0]["gate_id"] == "score"
+        assert gates[0]["blocking"] is True
+        assert gates[0]["measured_value"] == 72
+
 
 class TestMemoryManager:
     """Test the high-level memory manager."""

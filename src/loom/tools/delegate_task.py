@@ -433,11 +433,244 @@ class DelegateTaskTool(Tool):
                 "timeout": True,
             }
 
+        async def _pause_orchestrator_task() -> dict[str, object]:
+            _log_event("task_pause_requested", payload={"path": "orchestrator"})
+            pause_fn = getattr(orchestrator, "pause_task", None)
+            if not callable(pause_fn):
+                error = "Orchestrator does not expose pause_task."
+                _log_event(
+                    "task_pause_failed",
+                    payload={"path": "orchestrator", "error": error},
+                )
+                _emit_progress(
+                    "task_paused",
+                    {"path": "orchestrator", "requested": False, "error": error},
+                )
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": error,
+                    "status": _task_status_text(task),
+                }
+            try:
+                maybe = pause_fn(task)
+                if inspect.isawaitable(maybe):
+                    await maybe
+            except Exception as e:
+                error = str(e)
+                _log_event(
+                    "task_pause_failed",
+                    payload={
+                        "path": "orchestrator",
+                        "error_type": type(e).__name__,
+                        "error": error,
+                    },
+                )
+                _emit_progress(
+                    "task_paused",
+                    {"path": "orchestrator", "requested": False, "error": error},
+                )
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": error,
+                    "status": _task_status_text(task),
+                }
+
+            status = _task_status_text(task)
+            requested = status == TaskStatus.PAUSED.value
+            error = "" if requested else f"Pause ignored while task status is '{status}'."
+            _log_event(
+                "task_pause_ack",
+                payload={
+                    "path": "orchestrator",
+                    "requested": requested,
+                    "status": status,
+                    "error": error,
+                },
+            )
+            _emit_progress(
+                "task_paused",
+                {
+                    "path": "orchestrator",
+                    "requested": requested,
+                    "status": status,
+                    "error": error,
+                },
+            )
+            return {
+                "requested": requested,
+                "path": "orchestrator",
+                "error": error,
+                "status": status,
+            }
+
+        async def _resume_orchestrator_task() -> dict[str, object]:
+            _log_event("task_resume_requested", payload={"path": "orchestrator"})
+            resume_fn = getattr(orchestrator, "resume_task", None)
+            if not callable(resume_fn):
+                error = "Orchestrator does not expose resume_task."
+                _log_event(
+                    "task_resume_failed",
+                    payload={"path": "orchestrator", "error": error},
+                )
+                _emit_progress(
+                    "task_resumed",
+                    {"path": "orchestrator", "requested": False, "error": error},
+                )
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": error,
+                    "status": _task_status_text(task),
+                }
+            try:
+                maybe = resume_fn(task)
+                if inspect.isawaitable(maybe):
+                    await maybe
+            except Exception as e:
+                error = str(e)
+                _log_event(
+                    "task_resume_failed",
+                    payload={
+                        "path": "orchestrator",
+                        "error_type": type(e).__name__,
+                        "error": error,
+                    },
+                )
+                _emit_progress(
+                    "task_resumed",
+                    {"path": "orchestrator", "requested": False, "error": error},
+                )
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": error,
+                    "status": _task_status_text(task),
+                }
+
+            status = _task_status_text(task)
+            requested = status in {TaskStatus.EXECUTING.value, TaskStatus.PLANNING.value}
+            error = "" if requested else f"Resume ignored while task status is '{status}'."
+            _log_event(
+                "task_resume_ack",
+                payload={
+                    "path": "orchestrator",
+                    "requested": requested,
+                    "status": status,
+                    "error": error,
+                },
+            )
+            _emit_progress(
+                "task_resumed",
+                {
+                    "path": "orchestrator",
+                    "requested": requested,
+                    "status": status,
+                    "error": error,
+                },
+            )
+            return {
+                "requested": requested,
+                "path": "orchestrator",
+                "error": error,
+                "status": status,
+            }
+
+        async def _inject_orchestrator_task(
+            *,
+            instruction: str = "",
+        ) -> dict[str, object]:
+            clean = str(instruction or "").strip()
+            if not clean:
+                error = "Inject instruction is empty."
+                _emit_progress(
+                    "task_injected",
+                    {"path": "orchestrator", "requested": False, "error": error},
+                )
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": error,
+                    "status": _task_status_text(task),
+                }
+
+            memory_manager = getattr(orchestrator, "_memory", None)
+            store_fn = getattr(memory_manager, "store", None)
+            if not callable(store_fn):
+                error = "Orchestrator memory manager is unavailable for inject."
+                _emit_progress(
+                    "task_injected",
+                    {"path": "orchestrator", "requested": False, "error": error},
+                )
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": error,
+                    "status": _task_status_text(task),
+                }
+
+            try:
+                from loom.state.memory import MemoryEntry
+
+                await store_fn(MemoryEntry(
+                    task_id=task.id,
+                    entry_type="user_instruction",
+                    summary=clean[:150],
+                    detail=clean,
+                    tags="steer",
+                ))
+            except Exception as e:
+                error = str(e)
+                _log_event(
+                    "task_inject_failed",
+                    payload={
+                        "path": "orchestrator",
+                        "error_type": type(e).__name__,
+                        "error": error,
+                    },
+                )
+                _emit_progress(
+                    "task_injected",
+                    {"path": "orchestrator", "requested": False, "error": error},
+                )
+                return {
+                    "requested": False,
+                    "path": "orchestrator",
+                    "error": error,
+                    "status": _task_status_text(task),
+                }
+
+            _log_event(
+                "task_injected",
+                payload={
+                    "path": "orchestrator",
+                    "chars": len(clean),
+                },
+            )
+            _emit_progress(
+                "task_injected",
+                {
+                    "path": "orchestrator",
+                    "requested": True,
+                    "chars": len(clean),
+                },
+            )
+            return {
+                "requested": True,
+                "path": "orchestrator",
+                "error": "",
+                "status": _task_status_text(task),
+            }
+
         await _invoke_optional_callback(
             register_cancel_handler,
             {
                 "task_id": task.id,
                 "cancel": _cancel_orchestrator_task,
+                "pause": _pause_orchestrator_task,
+                "resume": _resume_orchestrator_task,
+                "inject": _inject_orchestrator_task,
             },
         )
 
@@ -612,6 +845,24 @@ class DelegateTaskTool(Tool):
                 data=payload,
             )
         except asyncio.CancelledError:
+            status_on_cancel = _task_status_text(task)
+            if status_on_cancel == TaskStatus.PAUSED.value:
+                _log_event(
+                    "task_cancel_ignored_paused",
+                    payload={
+                        "path": "delegate_task_cancelled",
+                        "status": status_on_cancel,
+                    },
+                )
+                _emit_progress(
+                    "task_paused",
+                    {
+                        "path": "delegate_task_cancelled",
+                        "requested": True,
+                        "status": status_on_cancel,
+                    },
+                )
+                raise
             _log_event(
                 "task_cancel_requested",
                 payload={"path": "delegate_task_cancelled"},

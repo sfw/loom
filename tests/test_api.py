@@ -63,6 +63,8 @@ def mock_orchestrator():
     orch = MagicMock(spec=Orchestrator)
     orch.execute_task = AsyncMock()
     orch.cancel_task = MagicMock()
+    orch.pause_task = MagicMock()
+    orch.resume_task = MagicMock()
     return orch
 
 
@@ -348,6 +350,14 @@ class TestTaskSteer:
         assert response.status_code == 409
 
     @pytest.mark.asyncio
+    async def test_steer_paused_task(self, client, state_manager):
+        _make_task(state_manager, status=TaskStatus.PAUSED)
+        response = await client.patch("/tasks/test-1", json={
+            "instruction": "Apply this once resumed",
+        })
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
     async def test_steer_not_found(self, client):
         response = await client.patch("/tasks/nonexistent", json={
             "instruction": "test",
@@ -497,6 +507,36 @@ class TestCancelUsesDelete:
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
         mock_orchestrator.cancel_task.assert_called_once()
+
+
+class TestTaskPauseResume:
+    @pytest.mark.asyncio
+    async def test_pause_task(self, client, state_manager, mock_orchestrator):
+        _make_task(state_manager, status=TaskStatus.EXECUTING)
+        response = await client.post("/tasks/test-1/pause")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        mock_orchestrator.pause_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_task(self, client, state_manager, mock_orchestrator):
+        _make_task(state_manager, status=TaskStatus.PAUSED)
+        response = await client.post("/tasks/test-1/resume")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        mock_orchestrator.resume_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pause_invalid_status(self, client, state_manager):
+        _make_task(state_manager, status=TaskStatus.COMPLETED)
+        response = await client.post("/tasks/test-1/pause")
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_resume_invalid_status(self, client, state_manager):
+        _make_task(state_manager, status=TaskStatus.FAILED)
+        response = await client.post("/tasks/test-1/resume")
+        assert response.status_code == 409
 
 
 # --- Process field in task creation ---
@@ -666,7 +706,7 @@ class TestProcessField:
         assert "requires missing tool" in detail
         assert "definitely-missing-tool" in detail
 
-    def test_required_auth_resources_for_process_includes_allowed_tool_requirements(self):
+    def test_required_auth_resources_for_process_uses_required_tool_set_when_declared(self):
         from loom.api.routes import _required_auth_resources_for_process
 
         included_tool = SimpleNamespace(
@@ -675,6 +715,14 @@ class TestProcessField:
                     "provider": "ga_provider",
                     "source": "api",
                     "modes": ["api_key"],
+                }
+            ]
+        )
+        non_required_tool = SimpleNamespace(
+            auth_requirements=[
+                {
+                    "provider": "non_required_provider",
+                    "source": "api",
                 }
             ]
         )
@@ -689,12 +737,13 @@ class TestProcessField:
 
         process_def = SimpleNamespace(
             auth=SimpleNamespace(required=[{"provider": "notion", "source": "mcp"}]),
-            tools=SimpleNamespace(required=[], excluded=["tool_excluded"]),
+            tools=SimpleNamespace(required=["tool_included"], excluded=["tool_excluded"]),
         )
         registry = SimpleNamespace(
-            list_tools=lambda: ["tool_included", "tool_excluded"],
+            list_tools=lambda: ["tool_included", "tool_non_required", "tool_excluded"],
             get=lambda name: {
                 "tool_included": included_tool,
+                "tool_non_required": non_required_tool,
                 "tool_excluded": excluded_tool,
             }.get(name),
         )
@@ -709,6 +758,7 @@ class TestProcessField:
         }
         assert ("notion", "mcp") in selectors
         assert ("ga_provider", "api") in selectors
+        assert ("non_required_provider", "api") not in selectors
         assert ("should_not_appear", "api") not in selectors
 
 
