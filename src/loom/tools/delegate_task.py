@@ -54,6 +54,20 @@ def _delegate_timeout_seconds(default_timeout: int) -> int:
     return _normalize_timeout_seconds(raw, default=default_timeout)
 
 
+def _resolve_approval_mode(raw_mode: object, *, execution_surface: str) -> str:
+    """Resolve orchestrator approval mode with execution-surface defaults.
+
+    /run executes delegate_task in TUI with approval disabled. Mirror that
+    behavior for cowork/TUI delegate calls when no explicit override is passed.
+    """
+    explicit = str(raw_mode or "").strip()
+    if explicit:
+        return explicit
+    if str(execution_surface or "").strip().lower() == "tui":
+        return "disabled"
+    return "confidence_threshold"
+
+
 class DelegateTaskTool(Tool):
     """Delegate complex work to Loom's task orchestration engine.
 
@@ -149,9 +163,6 @@ class DelegateTaskTool(Tool):
         register_cancel_handler = args.get("_register_cancel_handler")
         clear_cancel_handler = args.get("_clear_cancel_handler")
         process_override = args.get("_process_override")
-        approval_mode = str(
-            args.get("_approval_mode", "confidence_threshold"),
-        ).strip() or "confidence_threshold"
         read_roots_raw = args.get("_read_roots", [])
         if isinstance(read_roots_raw, str):
             read_roots_raw = [read_roots_raw]
@@ -177,6 +188,10 @@ class DelegateTaskTool(Tool):
         execution_surface = normalize_tool_execution_surface(
             args.get("_execution_surface", getattr(ctx, "execution_surface", "")),
             default="tui",
+        )
+        approval_mode = _resolve_approval_mode(
+            args.get("_approval_mode"),
+            execution_surface=execution_surface,
         )
         workspace = str(ctx.workspace) if ctx.workspace else ""
 

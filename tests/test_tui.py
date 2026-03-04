@@ -3233,6 +3233,58 @@ class TestDelegateTaskUnbound:
         assert observed_modes == ["disabled"]
 
     @pytest.mark.asyncio
+    async def test_delegate_defaults_to_disabled_approval_in_tui_surface(self):
+        from loom.state.task_state import TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        observed_modes: list[str] = []
+
+        async def _execute(task):
+            observed_modes.append(task.approval_mode)
+            task.status = TaskStatus.COMPLETED
+            return task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"))
+
+        result = await tool.execute({"goal": "Analyze Tesla"}, ctx)
+
+        assert result.success is True
+        assert observed_modes == ["disabled"]
+
+    @pytest.mark.asyncio
+    async def test_delegate_keeps_confidence_threshold_default_for_api_surface(self):
+        from loom.state.task_state import TaskStatus
+        from loom.tools.delegate_task import DelegateTaskTool
+        from loom.tools.registry import ToolContext
+
+        observed_modes: list[str] = []
+
+        async def _execute(task):
+            observed_modes.append(task.approval_mode)
+            task.status = TaskStatus.COMPLETED
+            return task
+
+        async def _factory():
+            orchestrator = MagicMock()
+            orchestrator.execute_task = AsyncMock(side_effect=_execute)
+            return orchestrator
+
+        tool = DelegateTaskTool(orchestrator_factory=_factory)
+        ctx = ToolContext(workspace=Path("/tmp"), execution_surface="api")
+
+        result = await tool.execute({"goal": "Analyze Tesla"}, ctx)
+
+        assert result.success is True
+        assert observed_modes == ["confidence_threshold"]
+
+    @pytest.mark.asyncio
     async def test_delegate_resume_reuses_plan_and_resets_incomplete_subtasks(self):
         from loom.state.task_state import Plan, Subtask, SubtaskStatus, Task, TaskStatus
         from loom.tools.delegate_task import DelegateTaskTool
