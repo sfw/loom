@@ -8185,6 +8185,157 @@ class TestProcessSlashCommands:
         assert fake_router.select.call_count == 1
         fake_router.close.assert_awaited_once()
 
+    def test_cowork_compactor_model_prefers_compactor_role_model(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.config import Config, ModelConfig
+        from loom.tui.app import LoomApp
+
+        compactor_model = MagicMock(name="compactor-model")
+        compactor_model.name = "compactor-model"
+
+        active_model = MagicMock(name="active-executor-model")
+
+        fake_router = MagicMock()
+
+        def _select(*, tier=1, role="executor"):
+            assert role == "compactor"
+            assert tier == 1
+            return compactor_model
+
+        fake_router.select = MagicMock(side_effect=_select)
+        monkeypatch.setattr(
+            "loom.models.router.ModelRouter.from_config",
+            lambda cfg: fake_router,
+        )
+
+        app = LoomApp(
+            model=active_model,
+            tools=MagicMock(),
+            workspace=tmp_path,
+            config=Config(models={
+                "primary": ModelConfig(
+                    provider="ollama",
+                    base_url="http://localhost:11434",
+                    model="executor-model",
+                    roles=["executor"],
+                ),
+                "compactor": ModelConfig(
+                    provider="ollama",
+                    base_url="http://localhost:11434",
+                    model="compactor-model",
+                    roles=["compactor"],
+                ),
+            }),
+        )
+
+        selected = app._cowork_compactor_model()
+
+        assert selected is compactor_model
+        assert fake_router.select.call_count == 1
+
+    def test_cowork_memory_indexer_model_prefers_compactor_role(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.config import Config, ModelConfig
+        from loom.tui.app import LoomApp
+
+        compactor_model = MagicMock(name="compactor-memory-model")
+        compactor_model.name = "compactor-memory-model"
+        active_model = MagicMock(name="active-model")
+
+        fake_router = MagicMock()
+
+        def _select(*, tier=1, role="executor"):
+            if role == "compactor":
+                return compactor_model
+            raise RuntimeError("unexpected role")
+
+        fake_router.select = MagicMock(side_effect=_select)
+        monkeypatch.setattr(
+            "loom.models.router.ModelRouter.from_config",
+            lambda cfg: fake_router,
+        )
+
+        app = LoomApp(
+            model=active_model,
+            tools=MagicMock(),
+            workspace=tmp_path,
+            config=Config(models={
+                "primary": ModelConfig(
+                    provider="ollama",
+                    base_url="http://localhost:11434",
+                    model="executor-model",
+                    roles=["executor"],
+                ),
+                "compactor": ModelConfig(
+                    provider="ollama",
+                    base_url="http://localhost:11434",
+                    model="compactor-model",
+                    roles=["compactor"],
+                ),
+            }),
+        )
+
+        model, role = app._cowork_memory_indexer_model()
+        assert model is compactor_model
+        assert role == "compactor"
+
+    def test_cowork_memory_indexer_model_falls_back_to_extractor(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.config import Config, ModelConfig
+        from loom.tui.app import LoomApp
+
+        extractor_model = MagicMock(name="extractor-memory-model")
+        extractor_model.name = "extractor-memory-model"
+        active_model = MagicMock(name="active-model")
+
+        fake_router = MagicMock()
+
+        def _select(*, tier=1, role="executor"):
+            if role == "compactor":
+                raise RuntimeError("missing compactor")
+            if role == "extractor":
+                return extractor_model
+            raise RuntimeError("unexpected role")
+
+        fake_router.select = MagicMock(side_effect=_select)
+        monkeypatch.setattr(
+            "loom.models.router.ModelRouter.from_config",
+            lambda cfg: fake_router,
+        )
+
+        app = LoomApp(
+            model=active_model,
+            tools=MagicMock(),
+            workspace=tmp_path,
+            config=Config(models={
+                "primary": ModelConfig(
+                    provider="ollama",
+                    base_url="http://localhost:11434",
+                    model="executor-model",
+                    roles=["executor"],
+                ),
+                "extractor": ModelConfig(
+                    provider="ollama",
+                    base_url="http://localhost:11434",
+                    model="extractor-model",
+                    roles=["extractor"],
+                ),
+            }),
+        )
+
+        model, role = app._cowork_memory_indexer_model()
+        assert model is extractor_model
+        assert role == "extractor"
+
     @pytest.mark.asyncio
     async def test_prepare_process_run_workspace_falls_back_when_llm_name_invalid(self, tmp_path):
         from loom.tui.app import LoomApp

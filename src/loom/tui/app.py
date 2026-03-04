@@ -3557,6 +3557,54 @@ class LoomApp(App):
             )
         return self._model is not None
 
+    def _cowork_compactor_model(self) -> ModelProvider | None:
+        """Best-effort compactor model for cowork context compaction.
+
+        When a compactor role is configured, select it from ModelRouter.
+        Otherwise return None so CoworkSession falls back to the active model.
+        """
+        config = getattr(self, "_config", None)
+        models = getattr(config, "models", None)
+        if not isinstance(models, dict) or not models:
+            return None
+        try:
+            from loom.models.router import ModelRouter
+
+            router = ModelRouter.from_config(config)
+            return router.select(tier=1, role="compactor")
+        except Exception as e:
+            logger.debug("No cowork compactor role model configured: %s", e)
+            return None
+
+    def _cowork_memory_indexer_model(self) -> tuple[ModelProvider | None, str]:
+        """Select memory-index helper model with role preference ordering.
+
+        Preference:
+        1) compactor role
+        2) extractor role
+        3) active cowork model fallback
+        """
+        if self._model is None:
+            return None, ""
+        config = getattr(self, "_config", None)
+        models = getattr(config, "models", None)
+        if not isinstance(models, dict) or not models:
+            return self._model, "active"
+        try:
+            from loom.models.router import ModelRouter
+
+            router = ModelRouter.from_config(config)
+        except Exception as e:
+            logger.debug("Failed building router for cowork memory indexer: %s", e)
+            return self._model, "active"
+
+        for role in ("compactor", "extractor"):
+            try:
+                return router.select(tier=1, role=role), role
+            except Exception:
+                continue
+        return self._model, "active"
+
     def _select_helper_model_for_role(
         self,
         *,
@@ -5195,6 +5243,115 @@ class LoomApp(App):
             return mode
         return "adaptive"
 
+    def _cowork_memory_index_enabled(self) -> bool:
+        if self._config is None:
+            return True
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return True
+        return bool(
+            getattr(execution, "cowork_memory_index_enabled", True),
+        )
+
+    def _cowork_memory_index_v2_actions_enabled(self) -> bool:
+        if self._config is None:
+            return True
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return True
+        return bool(
+            getattr(
+                execution,
+                "cowork_memory_index_v2_actions_enabled",
+                True,
+            ),
+        )
+
+    def _cowork_memory_index_force_fts(self) -> bool:
+        if self._config is None:
+            return False
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return False
+        return bool(
+            getattr(execution, "cowork_memory_index_force_fts", False),
+        )
+
+    def _cowork_indexer_model_role_strict(self) -> bool:
+        if self._config is None:
+            return False
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return False
+        return bool(
+            getattr(execution, "cowork_indexer_model_role_strict", False),
+        )
+
+    def _cowork_memory_index_llm_extraction_enabled(self) -> bool:
+        if self._config is None:
+            return True
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return True
+        return bool(
+            getattr(
+                execution,
+                "cowork_memory_index_llm_extraction_enabled",
+                True,
+            ),
+        )
+
+    def _cowork_memory_index_queue_max_batches(self) -> int:
+        if self._config is None:
+            return 32
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return 32
+        return max(
+            1,
+            int(
+                getattr(
+                    execution,
+                    "cowork_memory_index_queue_max_batches",
+                    32,
+                ),
+            ),
+        )
+
+    def _cowork_memory_index_section_limit(self) -> int:
+        if self._config is None:
+            return 4
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return 4
+        return max(
+            1,
+            int(
+                getattr(
+                    execution,
+                    "cowork_memory_index_section_limit",
+                    4,
+                ),
+            ),
+        )
+
+    def _cowork_recall_index_max_chars(self) -> int:
+        if self._config is None:
+            return 1200
+        execution = getattr(self._config, "execution", None)
+        if execution is None:
+            return 1200
+        return max(
+            600,
+            int(
+                getattr(
+                    execution,
+                    "cowork_recall_index_max_chars",
+                    1200,
+                ),
+            ),
+        )
+
     def _cowork_max_context_tokens(self) -> int:
         runner_limits = getattr(getattr(self._config, "limits", None), "runner", None)
         if runner_limits is None:
@@ -5512,6 +5669,8 @@ class LoomApp(App):
 
         # Build approver
         approver = ToolApprover(prompt_callback=self._approval_callback)
+        compactor_model = self._cowork_compactor_model()
+        memory_index_model, memory_index_role = self._cowork_memory_indexer_model()
 
         resume_target, auto_resume = await self._resolve_startup_resume_target()
         resume_info_message: str | None = None
@@ -5522,6 +5681,7 @@ class LoomApp(App):
             self._session = CoworkSession(
                 model=self._model,
                 tools=self._tools,
+                compactor_model=compactor_model,
                 workspace=self._workspace,
                 scratch_dir=self._cowork_scratch_dir(),
                 system_prompt=system_prompt,
@@ -5535,6 +5695,14 @@ class LoomApp(App):
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
                 ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
                 delegate_progress_callback=self._on_cowork_delegate_progress_event,
+                memory_index_enabled=self._cowork_memory_index_enabled(),
+                memory_index_llm_extraction_enabled=self._cowork_memory_index_llm_extraction_enabled(),
+                memory_index_model=memory_index_model,
+                memory_index_model_role=memory_index_role,
+                memory_index_role_strict=self._cowork_indexer_model_role_strict(),
+                memory_index_queue_max_batches=self._cowork_memory_index_queue_max_batches(),
+                memory_index_section_limit=self._cowork_memory_index_section_limit(),
+                recall_index_max_chars=self._cowork_recall_index_max_chars(),
             )
             try:
                 await self._session.resume(resume_target)
@@ -5569,6 +5737,7 @@ class LoomApp(App):
             self._session = CoworkSession(
                 model=self._model,
                 tools=self._tools,
+                compactor_model=compactor_model,
                 workspace=self._workspace,
                 scratch_dir=self._cowork_scratch_dir(),
                 system_prompt=system_prompt,
@@ -5583,12 +5752,21 @@ class LoomApp(App):
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
                 ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
                 delegate_progress_callback=self._on_cowork_delegate_progress_event,
+                memory_index_enabled=self._cowork_memory_index_enabled(),
+                memory_index_llm_extraction_enabled=self._cowork_memory_index_llm_extraction_enabled(),
+                memory_index_model=memory_index_model,
+                memory_index_model_role=memory_index_role,
+                memory_index_role_strict=self._cowork_indexer_model_role_strict(),
+                memory_index_queue_max_batches=self._cowork_memory_index_queue_max_batches(),
+                memory_index_section_limit=self._cowork_memory_index_section_limit(),
+                recall_index_max_chars=self._cowork_recall_index_max_chars(),
             )
         else:
             # Ephemeral session (no database)
             self._session = CoworkSession(
                 model=self._model,
                 tools=self._tools,
+                compactor_model=compactor_model,
                 workspace=self._workspace,
                 scratch_dir=self._cowork_scratch_dir(),
                 system_prompt=system_prompt,
@@ -5601,6 +5779,14 @@ class LoomApp(App):
                 ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
                 ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
                 delegate_progress_callback=self._on_cowork_delegate_progress_event,
+                memory_index_enabled=self._cowork_memory_index_enabled(),
+                memory_index_llm_extraction_enabled=self._cowork_memory_index_llm_extraction_enabled(),
+                memory_index_model=memory_index_model,
+                memory_index_model_role=memory_index_role,
+                memory_index_role_strict=self._cowork_indexer_model_role_strict(),
+                memory_index_queue_max_batches=self._cowork_memory_index_queue_max_batches(),
+                memory_index_section_limit=self._cowork_memory_index_section_limit(),
+                recall_index_max_chars=self._cowork_recall_index_max_chars(),
             )
 
         self._reset_cowork_steering_state(clear_session=True)
@@ -10276,6 +10462,8 @@ class LoomApp(App):
                 session_id=self._session.session_id,
                 session_state=self._session.session_state,
                 compactor=getattr(self._session, "compactor", None),
+                v2_actions_enabled=self._cowork_memory_index_v2_actions_enabled(),
+                force_fts=self._cowork_memory_index_force_fts(),
             )
         if self._delegate_tool and self._config and self._db:
             try:
@@ -10870,6 +11058,8 @@ class LoomApp(App):
 
         system_prompt = self._build_system_prompt()
         approver = ToolApprover(prompt_callback=self._approval_callback)
+        compactor_model = self._cowork_compactor_model()
+        memory_index_model, memory_index_role = self._cowork_memory_indexer_model()
         session_id = await self._store.create_session(
             workspace=str(self._workspace),
             model_name=self._model.name,
@@ -10878,6 +11068,7 @@ class LoomApp(App):
         self._session = CoworkSession(
             model=self._model,
             tools=self._tools,
+            compactor_model=compactor_model,
             workspace=self._workspace,
             scratch_dir=self._cowork_scratch_dir(),
             system_prompt=system_prompt,
@@ -10892,6 +11083,14 @@ class LoomApp(App):
             ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
             ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
             delegate_progress_callback=self._on_cowork_delegate_progress_event,
+            memory_index_enabled=self._cowork_memory_index_enabled(),
+            memory_index_llm_extraction_enabled=self._cowork_memory_index_llm_extraction_enabled(),
+            memory_index_model=memory_index_model,
+            memory_index_model_role=memory_index_role,
+            memory_index_role_strict=self._cowork_indexer_model_role_strict(),
+            memory_index_queue_max_batches=self._cowork_memory_index_queue_max_batches(),
+            memory_index_section_limit=self._cowork_memory_index_section_limit(),
+            recall_index_max_chars=self._cowork_recall_index_max_chars(),
         )
         self._reset_cowork_steering_state(clear_session=True)
         self._total_tokens = 0
@@ -10920,6 +11119,8 @@ class LoomApp(App):
 
         system_prompt = self._build_system_prompt()
         approver = ToolApprover(prompt_callback=self._approval_callback)
+        compactor_model = self._cowork_compactor_model()
+        memory_index_model, memory_index_role = self._cowork_memory_indexer_model()
 
         # Persist outgoing session UI state before switching.
         await self._persist_process_run_ui_state(is_active=False)
@@ -10927,6 +11128,7 @@ class LoomApp(App):
         new_session = CoworkSession(
             model=self._model,
             tools=self._tools,
+            compactor_model=compactor_model,
             workspace=self._workspace,
             scratch_dir=self._cowork_scratch_dir(),
             system_prompt=system_prompt,
@@ -10940,6 +11142,14 @@ class LoomApp(App):
             ingest_artifact_retention_max_files_per_scope=self._cowork_ingest_artifact_retention_max_files_per_scope(),
             ingest_artifact_retention_max_bytes_per_scope=self._cowork_ingest_artifact_retention_max_bytes_per_scope(),
             delegate_progress_callback=self._on_cowork_delegate_progress_event,
+            memory_index_enabled=self._cowork_memory_index_enabled(),
+            memory_index_llm_extraction_enabled=self._cowork_memory_index_llm_extraction_enabled(),
+            memory_index_model=memory_index_model,
+            memory_index_model_role=memory_index_role,
+            memory_index_role_strict=self._cowork_indexer_model_role_strict(),
+            memory_index_queue_max_batches=self._cowork_memory_index_queue_max_batches(),
+            memory_index_section_limit=self._cowork_memory_index_section_limit(),
+            recall_index_max_chars=self._cowork_recall_index_max_chars(),
         )
         await new_session.resume(session_id)
 

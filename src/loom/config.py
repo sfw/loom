@@ -251,6 +251,14 @@ class ExecutionConfig:
     model_call_retry_max_delay_seconds: float = 8.0
     model_call_retry_jitter_seconds: float = 0.25
     cowork_tool_exposure_mode: str = "adaptive"  # full | adaptive | hybrid
+    cowork_memory_index_enabled: bool = True
+    cowork_memory_index_v2_actions_enabled: bool = True
+    cowork_memory_index_force_fts: bool = False
+    cowork_indexer_model_role_strict: bool = False
+    cowork_memory_index_llm_extraction_enabled: bool = True
+    cowork_memory_index_queue_max_batches: int = 32
+    cowork_memory_index_section_limit: int = 4
+    cowork_recall_index_max_chars: int = 1200
     enable_software_dev_tools: bool = False
     enable_agent_tools: bool = False
     enable_wp_tools: bool = False
@@ -874,6 +882,52 @@ def load_config(path: Path | None = None) -> Config:
                 ),
             ).strip().lower()
         ),
+        cowork_memory_index_enabled=_bool_from(
+            exec_data,
+            "cowork_memory_index_enabled",
+            ExecutionConfig.cowork_memory_index_enabled,
+        ),
+        cowork_memory_index_v2_actions_enabled=_bool_from(
+            exec_data,
+            "cowork_memory_index_v2_actions_enabled",
+            ExecutionConfig.cowork_memory_index_v2_actions_enabled,
+        ),
+        cowork_memory_index_force_fts=_bool_from(
+            exec_data,
+            "cowork_memory_index_force_fts",
+            ExecutionConfig.cowork_memory_index_force_fts,
+        ),
+        cowork_indexer_model_role_strict=_bool_from(
+            exec_data,
+            "cowork_indexer_model_role_strict",
+            ExecutionConfig.cowork_indexer_model_role_strict,
+        ),
+        cowork_memory_index_llm_extraction_enabled=_bool_from(
+            exec_data,
+            "cowork_memory_index_llm_extraction_enabled",
+            ExecutionConfig.cowork_memory_index_llm_extraction_enabled,
+        ),
+        cowork_memory_index_queue_max_batches=_int_from(
+            exec_data,
+            "cowork_memory_index_queue_max_batches",
+            ExecutionConfig.cowork_memory_index_queue_max_batches,
+            minimum=1,
+            maximum=256,
+        ),
+        cowork_memory_index_section_limit=_int_from(
+            exec_data,
+            "cowork_memory_index_section_limit",
+            ExecutionConfig.cowork_memory_index_section_limit,
+            minimum=1,
+            maximum=8,
+        ),
+        cowork_recall_index_max_chars=_int_from(
+            exec_data,
+            "cowork_recall_index_max_chars",
+            ExecutionConfig.cowork_recall_index_max_chars,
+            minimum=600,
+            maximum=4000,
+        ),
         enable_agent_tools=_bool_from(
             exec_data,
             "enable_agent_tools",
@@ -922,6 +976,18 @@ def load_config(path: Path | None = None) -> Config:
     cowork_tool_exposure_mode = execution.cowork_tool_exposure_mode
     if cowork_tool_exposure_mode not in {"full", "adaptive", "hybrid"}:
         cowork_tool_exposure_mode = ExecutionConfig.cowork_tool_exposure_mode
+    cowork_memory_index_queue_max_batches = max(
+        1,
+        min(256, int(execution.cowork_memory_index_queue_max_batches)),
+    )
+    cowork_memory_index_section_limit = max(
+        1,
+        min(8, int(execution.cowork_memory_index_section_limit)),
+    )
+    cowork_recall_index_max_chars = max(
+        600,
+        min(4000, int(execution.cowork_recall_index_max_chars)),
+    )
     agent_tools_default_network_mode = execution.agent_tools_default_network_mode
     if agent_tools_default_network_mode not in {"on", "off"}:
         agent_tools_default_network_mode = ExecutionConfig.agent_tools_default_network_mode
@@ -938,6 +1004,9 @@ def load_config(path: Path | None = None) -> Config:
             "executor_completion_contract_mode": completion_mode,
             "planner_degraded_mode": planner_mode,
             "cowork_tool_exposure_mode": cowork_tool_exposure_mode,
+            "cowork_memory_index_queue_max_batches": cowork_memory_index_queue_max_batches,
+            "cowork_memory_index_section_limit": cowork_memory_index_section_limit,
+            "cowork_recall_index_max_chars": cowork_recall_index_max_chars,
             "agent_tools_default_network_mode": agent_tools_default_network_mode,
             "iteration_command_exit_allowlisted_prefixes": loop_prefixes,
         },

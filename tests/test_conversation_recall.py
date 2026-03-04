@@ -46,6 +46,36 @@ async def populated_store(store: ConversationStore) -> tuple[ConversationStore, 
         tool_name="shell_execute", tool_call_id="c3",
     )
 
+    await store.upsert_cowork_memory_entries(
+        sid,
+        [
+            {
+                "entry_type": "decision",
+                "status": "active",
+                "summary": "Use RS256 for JWT signing",
+                "rationale": "Meets security requirement from user",
+                "topic": "jwt-auth",
+                "source_turn_start": 5,
+                "source_turn_end": 8,
+                "source_roles": ["user", "assistant"],
+                "evidence_excerpt": "Use RS256 algorithm",
+                "confidence": 0.94,
+                "fingerprint": "recall-fp-1",
+            },
+            {
+                "entry_type": "open_question",
+                "status": "active",
+                "summary": "How should migration be validated post-change?",
+                "topic": "database-migration",
+                "source_turn_start": 9,
+                "source_turn_end": 10,
+                "source_roles": ["user", "tool"],
+                "confidence": 0.61,
+                "fingerprint": "recall-fp-2",
+            },
+        ],
+    )
+
     return store, sid
 
 
@@ -171,6 +201,77 @@ class TestConversationRecallTool:
 
         result = await tool.execute({"action": "search", "query": "the", "limit": 2}, ctx)
         assert result.success
+
+    async def test_entries_action(self, populated_store, ctx):
+        store, sid = populated_store
+        tool = ConversationRecallTool(store=store, session_id=sid)
+
+        result = await tool.execute(
+            {"action": "entries", "entry_type": "decision", "status": "active"},
+            ctx,
+        )
+        assert result.success
+        assert "DECISION" in result.output
+        assert "source=index" in result.output
+
+    async def test_decision_context_action(self, populated_store, ctx):
+        store, sid = populated_store
+        tool = ConversationRecallTool(store=store, session_id=sid)
+
+        result = await tool.execute(
+            {"action": "decision_context", "topic": "jwt"},
+            ctx,
+        )
+        assert result.success
+        assert "RS256" in result.output or "DECISION" in result.output
+
+    async def test_timeline_action(self, populated_store, ctx):
+        store, sid = populated_store
+        tool = ConversationRecallTool(store=store, session_id=sid)
+
+        result = await tool.execute(
+            {"action": "timeline", "topic": "jwt-auth"},
+            ctx,
+        )
+        assert result.success
+        assert "turn" in result.output
+
+    async def test_open_questions_action(self, populated_store, ctx):
+        store, sid = populated_store
+        tool = ConversationRecallTool(store=store, session_id=sid)
+
+        result = await tool.execute({"action": "open_questions"}, ctx)
+        assert result.success
+        assert "OPEN_QUESTION" in result.output or "open questions" in result.output.lower()
+
+    async def test_source_turns_by_entry_ids_action(self, populated_store, ctx):
+        store, sid = populated_store
+        entries = await store.search_cowork_memory_entries(
+            sid,
+            entry_type="decision",
+            status="active",
+            limit=5,
+        )
+        assert entries
+        entry_id = entries[0]["id"]
+        tool = ConversationRecallTool(store=store, session_id=sid)
+        result = await tool.execute(
+            {"action": "source_turns", "entry_ids": [entry_id]},
+            ctx,
+        )
+        assert result.success
+        assert "Turn" in result.output
+
+    async def test_v2_actions_can_be_disabled(self, populated_store, ctx):
+        store, sid = populated_store
+        tool = ConversationRecallTool(
+            store=store,
+            session_id=sid,
+            v2_actions_enabled=False,
+        )
+        result = await tool.execute({"action": "entries"}, ctx)
+        assert result.success is False
+        assert "disabled" in (result.error or "")
 
 
 class TestRecallHint:
