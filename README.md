@@ -334,7 +334,7 @@ Role routing note:
 
 ## Architecture
 
-Large Python codebase in `src/` with an extensive automated test suite (roughly ~93k LOC and ~2.2k tests as of March 2026). No frameworks (no LangChain, no CrewAI).
+Large Python codebase in `src/` with an extensive automated test suite. No frameworks (no LangChain, no CrewAI).
 
 ```
 src/loom/
