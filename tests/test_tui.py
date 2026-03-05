@@ -4208,6 +4208,61 @@ class TestStartupSessionResume:
         assert auto is False
         app._store.list_sessions.assert_not_called()
 
+    def test_should_show_startup_landing_respects_config_and_resume(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                tui=SimpleNamespace(
+                    startup_landing_enabled=True,
+                    always_open_chat_directly=False,
+                ),
+            ),
+        )
+        app._store = MagicMock()
+
+        assert app._should_show_startup_landing(resume_target=None) is True
+        assert app._should_show_startup_landing(resume_target="existing-session") is False
+
+        app._config.tui.always_open_chat_directly = True
+        assert app._should_show_startup_landing(resume_target=None) is False
+
+        app._config.tui.always_open_chat_directly = False
+        app._config.tui.startup_landing_enabled = False
+        assert app._should_show_startup_landing(resume_target=None) is False
+
+    @pytest.mark.asyncio
+    async def test_on_mount_shows_landing_when_no_resume(self):
+        from textual.widgets import Static
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                tui=SimpleNamespace(
+                    startup_landing_enabled=True,
+                    always_open_chat_directly=False,
+                ),
+            ),
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock(return_value=[])
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app._startup_landing_active is True
+            workspace_line = app.query_one("#landing-workspace-path", Static)
+            assert "/tmp" in str(workspace_line.render())
+
+        app._initialize_session.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_initialize_session_auto_resume_restores_input_history(self, monkeypatch):
         from loom.tui.app import LoomApp
@@ -4407,6 +4462,37 @@ class TestStartupSessionResume:
             force=True,
         )
         assert to_thread_calls
+
+    @pytest.mark.asyncio
+    async def test_new_session_without_existing_session_initializes_once(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._store = MagicMock()
+        app._session = None
+        app._initialize_session = AsyncMock(
+            side_effect=lambda **_kwargs: setattr(
+                app,
+                "_session",
+                SimpleNamespace(session_id="abc123"),
+            ),
+        )
+        app._enter_workspace_surface = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._new_session()
+
+        app._initialize_session.assert_awaited_once_with(
+            allow_auto_resume=False,
+            emit_info_messages=False,
+        )
+        app._enter_workspace_surface.assert_awaited_once_with(ensure_session=False)
+        chat.add_info.assert_called_once()
 
     def test_start_workspace_watch_does_not_scan_synchronously(self):
         from loom.tui.app import LoomApp
@@ -11558,8 +11644,8 @@ class TestCommandPaletteProcessActions:
             await pilot.pause()
             auth_label = app.query_one("#footer-auth-shortcut", Button).label.plain.lower()
             mcp_label = app.query_one("#footer-mcp-shortcut", Button).label.plain.lower()
-            assert "^a" in auth_label and "auth" in auth_label
-            assert "^m" in mcp_label and "mcp" in mcp_label
+            assert "ctrl + a" in auth_label and "auth" in auth_label
+            assert "ctrl + m" in mcp_label and "mcp" in mcp_label
             dividers = app.query("#footer-shortcuts .footer-shortcut-divider")
             assert len(list(dividers)) == 2
 
@@ -11690,7 +11776,11 @@ class TestCommandPaletteProcessActions:
         await app.action_loom_command("reload_workspace")
 
         app._refresh_workspace_tree.assert_called_once()
-        app.notify.assert_called_once_with("Workspace reloaded", timeout=2)
+        app.notify.assert_called_once_with(
+            "Workspace reloaded.",
+            severity="information",
+            timeout=2,
+        )
 
     @pytest.mark.asyncio
     async def test_show_learned_patterns_queries_behavioral(self, monkeypatch):
@@ -13242,10 +13332,11 @@ class TestSlashHelp:
         assert "run-id-prefix" in rendered
         assert "/quit (aliases: /exit, /q)" in rendered
         assert "/setup" in rendered
-        assert "Ctrl+R reload workspace" in rendered
-        assert "Ctrl+W close tab" in rendered
-        assert "Ctrl+A auth" in rendered
-        assert "Ctrl+M mcp" in rendered
+        assert "ctrl + r reload workspace" in rendered
+        assert "ctrl + w close tab" in rendered
+        assert "ctrl + a auth" in rendered
+        assert "ctrl + m" in rendered
+        assert "mcp" in rendered
 
     @pytest.mark.asyncio
     async def test_resume_without_arg_shows_usage(self):

@@ -92,11 +92,14 @@ class Sidebar(Vertical):
 
     DEFAULT_CSS = """
     Sidebar {
-        width: 32;
+        width: 30;
         dock: left;
         background: $panel;
         border-right: solid $surface-lighten-2;
         overflow-y: auto;
+    }
+    Sidebar.compact {
+        width: 24;
     }
     Sidebar.hidden {
         display: none;
@@ -155,7 +158,15 @@ class Sidebar(Vertical):
     def update_tasks(self, tasks: list[dict]) -> None:
         """Update the task progress panel with new task data."""
         panel = self.query_one("#task-progress", TaskProgressPanel)
+        label = self.query_one("#progress-label", Label)
         panel.tasks = tasks
+        has_rows = bool(tasks)
+        label.display = has_rows
+        panel.display = has_rows
+        if has_rows:
+            self.remove_class("compact")
+        else:
+            self.add_class("compact")
 
     def refresh_workspace_tree(self) -> None:
         """Reload workspace tree so newly-created files become visible."""
@@ -164,3 +175,12 @@ class Sidebar(Vertical):
         except Exception:
             return
         tree.reload()
+
+    def on_mount(self) -> None:
+        """Start with compact layout until task progress exists."""
+        self.add_class("compact")
+        try:
+            self.query_one("#progress-label", Label).display = False
+            self.query_one("#task-progress", TaskProgressPanel).display = False
+        except Exception:
+            return

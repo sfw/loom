@@ -111,6 +111,8 @@ class TestDefaultConfig:
 
     def test_default_tui_config(self):
         config = Config()
+        assert config.tui.startup_landing_enabled is True
+        assert config.tui.always_open_chat_directly is False
         assert config.tui.chat_resume_page_size == 250
         assert config.tui.chat_resume_max_rendered_rows == 1200
         assert config.tui.chat_resume_use_event_journal is True
@@ -503,6 +505,8 @@ llm_run_folder_naming_enabled = false
         toml_file = tmp_path / "loom.toml"
         toml_file.write_text("""\
 [tui]
+startup_landing_enabled = false
+always_open_chat_directly = true
 chat_resume_page_size = 180
 chat_resume_max_rendered_rows = 2500
 chat_resume_use_event_journal = false
@@ -524,6 +528,8 @@ run_progress_refresh_interval_ms = 320
 run_preflight_async_enabled = false
 """)
         config = load_config(toml_file)
+        assert config.tui.startup_landing_enabled is False
+        assert config.tui.always_open_chat_directly is True
         assert config.tui.chat_resume_page_size == 180
         assert config.tui.chat_resume_max_rendered_rows == 2500
         assert config.tui.chat_resume_use_event_journal is False

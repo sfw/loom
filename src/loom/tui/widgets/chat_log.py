@@ -69,11 +69,13 @@ class ChatLog(VerticalScroll):
         margin: 1 0 0 0;
         padding: 0;
         width: 100%;
+        max-width: 140;
     }
     ChatLog .model-text {
         margin: 0;
         padding: 0;
         width: 100%;
+        max-width: 140;
     }
     ChatLog .turn-separator {
         margin: 1 0;
@@ -84,6 +86,7 @@ class ChatLog(VerticalScroll):
         margin: 0;
         padding: 0;
         width: 100%;
+        max-width: 140;
         color: $text-muted;
     }
     """

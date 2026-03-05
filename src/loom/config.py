@@ -359,6 +359,8 @@ class ProcessConfig:
 class TUIConfig:
     """Configuration for TUI replay/render behavior."""
 
+    startup_landing_enabled: bool = True
+    always_open_chat_directly: bool = False
     chat_resume_page_size: int = 250
     chat_resume_max_rendered_rows: int = 1200
     chat_resume_use_event_journal: bool = True
@@ -1286,6 +1288,16 @@ def load_config(path: Path | None = None) -> Config:
     if workspace_watch_backend not in {"poll", "native"}:
         workspace_watch_backend = TUIConfig.workspace_watch_backend
     tui = TUIConfig(
+        startup_landing_enabled=_bool_from(
+            tui_data,
+            "startup_landing_enabled",
+            TUIConfig.startup_landing_enabled,
+        ),
+        always_open_chat_directly=_bool_from(
+            tui_data,
+            "always_open_chat_directly",
+            TUIConfig.always_open_chat_directly,
+        ),
         chat_resume_page_size=_int_from(
             tui_data,
             "chat_resume_page_size",

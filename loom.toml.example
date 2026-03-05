@@ -95,6 +95,8 @@ agent_tools_max_timeout_seconds = 1800
 agent_tools_default_network_mode = "on" # on | off
 
 [tui]
+startup_landing_enabled = true
+always_open_chat_directly = false
 chat_resume_page_size = 250
 chat_resume_max_rendered_rows = 1200
 chat_resume_use_event_journal = true
