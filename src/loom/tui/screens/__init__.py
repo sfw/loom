@@ -3,6 +3,7 @@
 from loom.tui.screens.approval import ToolApprovalScreen
 from loom.tui.screens.ask_user import AskUserScreen
 from loom.tui.screens.auth_manager import AuthManagerModalScreen, AuthManagerScreen
+from loom.tui.screens.command_palette import LoomCommandPaletteScreen
 from loom.tui.screens.confirm_exit import ExitConfirmScreen
 from loom.tui.screens.file_viewer import FileViewerScreen
 from loom.tui.screens.learned import LearnedScreen
@@ -16,6 +17,7 @@ __all__ = [
     "AuthManagerModalScreen",
     "AuthManagerScreen",
     "AskUserScreen",
+    "LoomCommandPaletteScreen",
     "ExitConfirmScreen",
     "FileViewerScreen",
     "LearnedScreen",

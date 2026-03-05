@@ -2,6 +2,8 @@
 [![CI](https://github.com/sfw/loom/actions/workflows/ci.yml/badge.svg)](https://github.com/sfw/loom/actions/workflows/ci.yml)
 [![Process Canary](https://github.com/sfw/loom/actions/workflows/process-canary.yml/badge.svg)](https://github.com/sfw/loom/actions/workflows/process-canary.yml)
 
+![Loom hero](docs/images/loom2.png)
+
 **Local-ready LLM execution harness** for complex tasks.
 
 Loom decomposes goals, drives execution through verified steps, routes between thinking and acting models, and keeps work on track with structured state instead of chat history. Use it via TUI, CLI, API, or MCP with local or mixed local/cloud models.
@@ -148,6 +150,16 @@ ingest_artifact_retention_max_age_days = 14
 ingest_artifact_retention_max_files_per_scope = 96
 ingest_artifact_retention_max_bytes_per_scope = 268435456
 ```
+
+For TUI startup behavior:
+
+```toml
+[tui]
+startup_landing_enabled = true    # show landing when startup is not resuming
+always_open_chat_directly = false # bypass landing and enter chat immediately
+```
+
+`always_open_chat_directly` takes precedence when set to `true`.
 
 Three model backends: Ollama, OpenAI-compatible APIs (LM Studio, vLLM, text-generation-webui), and Anthropic/Claude. Models are assigned roles (`planner`, `executor`, `extractor`, `verifier`, `compactor`). A common split is stronger model for planning + verification and cheaper model for extraction + execution + compaction.
 Manage external MCP servers in `~/.loom/mcp.toml` (or workspace `./.loom/mcp.toml`):

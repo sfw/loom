@@ -19,7 +19,7 @@ Layout:
   +-----+----------------------------------------------+
   | [>] Input bar                 Ready | ws | 3.2k    |
   +-----+----------------------------------------------+
-  | ^B Sidebar  ^L Clear  ^P Commands   ^C Quit        |
+  | ctrl + b Sidebar  ctrl + l Clear  ctrl + p Commands  ctrl + c Quit |
   +-----+----------------------------------------------+
 """
 
@@ -79,6 +79,7 @@ from loom.tui.screens import (
     ExitConfirmScreen,
     FileViewerScreen,
     LearnedScreen,
+    LoomCommandPaletteScreen,
     MCPManagerScreen,
     ProcessRunCloseScreen,
     ProcessRunWorkspaceScreen,
@@ -91,6 +92,7 @@ from loom.tui.widgets import (
     ChatLog,
     EventPanel,
     FilesChangedPanel,
+    LandingSurface,
     Sidebar,
     StatusBar,
 )
@@ -166,7 +168,7 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec(
         canonical="/resume",
         usage="<session-id-prefix>",
-        description="resume session by ID prefix",
+        description="resume old cowork session by session ID prefix",
     ),
     SlashCommandSpec(
         canonical="/history",
@@ -477,56 +479,62 @@ class ProcessRunPane(VerticalScroll):
         min-width: 22;
     }
     ProcessRunPane .process-run-control-btn {
-        width: 5;
-        min-width: 5;
-        max-width: 5;
+        width: 7;
+        min-width: 7;
+        max-width: 7;
         height: 3;
+        min-height: 3;
+        max-height: 3;
         margin: 0;
         padding: 0;
         content-align: center middle;
-        border: none;
+        border: solid $primary-darken-1;
+        background: $surface;
+        color: $text-muted;
         text-style: bold;
     }
     ProcessRunPane .process-run-toggle-btn {
-        background: #324c79;
-        color: #e4eeff;
-        border: none;
+        background: $surface;
+        color: $text;
+        border: solid $primary-darken-1;
     }
     ProcessRunPane .process-run-toggle-btn:hover {
-        background: #3d5d93;
-        color: #ffffff;
+        background: $surface;
+        color: $primary;
+        border: solid $primary;
     }
     ProcessRunPane .process-run-toggle-btn:focus {
-        background: #496dab;
-        color: #ffffff;
+        background: $surface;
+        color: $primary;
         text-style: bold;
-        border: none;
+        border: solid $primary;
     }
     ProcessRunPane .process-run-toggle-btn:disabled {
-        background: #253652;
-        color: #8b9ebf;
-        border: none;
+        background: $surface;
+        color: $text-muted;
+        border: solid $primary-darken-2;
     }
     ProcessRunPane .process-run-stop-btn {
         margin-left: 1;
-        background: #c76684;
-        color: #fff2f7;
-        border: none;
+        background: $surface;
+        color: $error;
+        border: solid $primary-darken-1;
     }
     ProcessRunPane .process-run-stop-btn:hover {
-        background: #d97895;
-        color: #ffffff;
+        background: $surface;
+        color: $error;
+        border: solid $error;
     }
     ProcessRunPane .process-run-stop-btn:focus {
-        background: #e588a4;
-        color: #ffffff;
+        background: $surface;
+        color: $error;
         text-style: bold;
-        border: none;
+        border: solid $error;
     }
     ProcessRunPane .process-run-stop-btn:disabled {
-        background: #4a303a;
-        color: #b8929e;
-        border: none;
+        background: $surface;
+        color: $text-muted;
+        border: solid $primary-darken-2;
     }
     ProcessRunPane .process-run-section {
         color: $text-muted;
@@ -670,7 +678,7 @@ class ProcessRunPane(VerticalScroll):
         can_pause = status == "running"
         can_play = status == "paused"
         can_stop = status in {"queued", "running", "paused", "cancel_requested"}
-        can_restart = status == "failed" and bool(task_id.strip())
+        can_restart = status in {"failed", "cancel_failed"}
         show_toggle = can_pause or can_play
         show_stop = not terminal
         self._actions.display = show_toggle or show_stop or can_restart
@@ -874,8 +882,18 @@ class LoomApp(App):
     _AUTH_MANAGER_TAB_ID = "tab-auth-manager"
 
     CSS = """
+    #content-stack {
+        height: 1fr;
+        width: 1fr;
+    }
+    #landing-surface {
+        height: 1fr;
+    }
     #main-layout {
         height: 1fr;
+    }
+    #main-layout.hidden {
+        display: none;
     }
     #main-area {
         width: 1fr;
@@ -884,6 +902,9 @@ class LoomApp(App):
         dock: bottom;
         height: 4;
         background: $panel;
+    }
+    #bottom-stack.landing {
+        display: none;
     }
     #input-top-rule {
         height: 1;
@@ -1009,6 +1030,25 @@ class LoomApp(App):
         offset: -10 0;
         margin: 0;
         height: 100%;
+    }
+    TabbedContent > ContentTabs {
+        background: $panel;
+        border-bottom: solid $surface-lighten-1;
+    }
+    TabbedContent > ContentTabs Tab {
+        background: $panel;
+        color: $text-muted;
+    }
+    TabbedContent > ContentTabs Tab:hover,
+    TabbedContent > ContentTabs Tab:focus {
+        background: $panel;
+        color: $text;
+    }
+    TabbedContent > ContentTabs Tab.-active {
+        background: $panel;
+        color: $text;
+        text-style: bold underline;
+        border-bottom: none;
     }
     #footer-row {
         width: 100%;
@@ -1144,11 +1184,19 @@ class LoomApp(App):
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "request_quit", "Quit", show=True, priority=True),
-        Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True),
-        Binding("ctrl+l", "clear_chat", "Clear", show=True),
-        Binding("ctrl+r", "reload_workspace", "Reload", show=True),
-        Binding("ctrl+w", "close_process_tab", "Close Tab", show=True),
+        Binding(
+            "ctrl+c",
+            "request_quit",
+            "Quit",
+            show=True,
+            key_display="ctrl + c",
+            priority=True,
+        ),
+        Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True, key_display="ctrl + b"),
+        Binding("ctrl+l", "clear_chat", "Clear", show=True, key_display="ctrl + l"),
+        Binding("ctrl+r", "reload_workspace", "Reload", show=True, key_display="ctrl + r"),
+        Binding("ctrl+p", "command_palette", "Commands", show=False, key_display="ctrl + p"),
+        Binding("ctrl+w", "close_process_tab", "Close Tab", show=True, key_display="ctrl + w"),
         Binding("ctrl+1", "tab_chat", "Chat"),
         Binding("ctrl+2", "tab_files", "Files"),
         Binding("ctrl+3", "tab_events", "Events"),
@@ -1270,6 +1318,8 @@ class LoomApp(App):
         self._workspace_scan_overflow_notified = False
         self._files_panel_recent_ops: dict[str, float] = {}
         self._files_panel_dedupe_window_seconds = 1.5
+        self._startup_landing_active = False
+        self._last_landing_slash_hint_text = ""
 
     def _mount_header_activity_indicator(self) -> None:
         """Mount the header activity indicator immediately left of the clock."""
@@ -1356,7 +1406,8 @@ class LoomApp(App):
     def _current_steering_hint_text(self) -> str:
         current = ""
         try:
-            current = self.query_one("#user-input", Input).value
+            selector = "#landing-input" if self._startup_landing_active else "#user-input"
+            current = self.query_one(selector, Input).value
         except Exception:
             current = ""
         return self._render_slash_hint(current)
@@ -1476,22 +1527,140 @@ class LoomApp(App):
         self._sync_chat_stop_control()
         self._refresh_hint_panel()
 
+    def _tui_startup_landing_enabled(self) -> bool:
+        tui_cfg = getattr(self._config, "tui", None)
+        if tui_cfg is None:
+            return True
+        try:
+            value = getattr(tui_cfg, "startup_landing_enabled", True)
+            if isinstance(value, bool):
+                return value
+            return True
+        except Exception:
+            return True
+
+    def _tui_always_open_chat_directly(self) -> bool:
+        tui_cfg = getattr(self._config, "tui", None)
+        if tui_cfg is None:
+            return False
+        try:
+            value = getattr(tui_cfg, "always_open_chat_directly", False)
+            if isinstance(value, bool):
+                return value
+            return False
+        except Exception:
+            return False
+
+    def _should_show_startup_landing(self, *, resume_target: str | None) -> bool:
+        """Return True when startup should show the landing surface."""
+        if self._store is None:
+            return False
+        if self._tui_always_open_chat_directly():
+            return False
+        if not self._tui_startup_landing_enabled():
+            return False
+        return not bool(str(resume_target or "").strip())
+
+    def _landing_model_display_name(self) -> str:
+        """Resolve startup landing model label from config when possible."""
+        if self._model is None:
+            return "unconfigured"
+        model_alias = str(getattr(self._model, "name", "") or "").strip()
+        models_cfg = getattr(self._config, "models", None)
+        if isinstance(models_cfg, dict):
+            model_cfg = models_cfg.get(model_alias)
+            configured_model = str(getattr(model_cfg, "model", "") or "").strip()
+            if configured_model:
+                return configured_model
+            if len(models_cfg) == 1:
+                first_cfg = next(iter(models_cfg.values()), None)
+                configured_model = str(getattr(first_cfg, "model", "") or "").strip()
+                if configured_model:
+                    return configured_model
+        runtime_model = str(getattr(self._model, "model", "") or "").strip()
+        if runtime_model:
+            return runtime_model
+        if model_alias:
+            return model_alias
+        return "unconfigured"
+
+    def _sync_landing_surface(self) -> None:
+        """Refresh landing metadata labels (workspace + model)."""
+        try:
+            landing = self.query_one("#landing-surface", LandingSurface)
+        except Exception:
+            return
+        landing.set_context(
+            model_name=self._landing_model_display_name(),
+        )
+
+    def _set_startup_surface(self, *, show_landing: bool) -> None:
+        """Toggle between startup landing surface and workspace layout."""
+        self._startup_landing_active = bool(show_landing)
+        try:
+            landing = self.query_one("#landing-surface", LandingSurface)
+        except Exception:
+            landing = None
+        try:
+            main_layout = self.query_one("#main-layout", Horizontal)
+        except Exception:
+            main_layout = None
+        try:
+            bottom_stack = self.query_one("#bottom-stack", Vertical)
+        except Exception:
+            bottom_stack = None
+
+        if landing is not None:
+            if show_landing:
+                landing.add_class("active")
+            else:
+                landing.remove_class("active")
+        if main_layout is not None:
+            if show_landing:
+                main_layout.add_class("hidden")
+            else:
+                main_layout.remove_class("hidden")
+        if bottom_stack is not None:
+            if show_landing:
+                bottom_stack.add_class("landing")
+            else:
+                bottom_stack.remove_class("landing")
+        if show_landing:
+            self._set_slash_hint("")
+            self._sync_landing_surface()
+        self._sync_chat_stop_control()
+
+    async def _enter_workspace_surface(self, *, ensure_session: bool) -> None:
+        """Exit landing surface and optionally initialize session first."""
+        if ensure_session and self._session is None and self._model is not None:
+            await self._initialize_session(
+                allow_auto_resume=False,
+                emit_info_messages=False,
+            )
+        self._set_startup_surface(show_landing=False)
+        try:
+            self.query_one("#user-input", Input).focus()
+        except Exception:
+            pass
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, id="app-header")
-        with Horizontal(id="main-layout"):
-            yield Sidebar(
-                self._workspace,
-                progress_auto_follow=self._tui_progress_auto_follow(),
-                id="sidebar",
-            )
-            with Vertical(id="main-area"):
-                with TabbedContent(id="tabs"):
-                    with TabPane("Chat", id="tab-chat"):
-                        yield ChatLog(id="chat-log")
-                    with TabPane("Files", id="tab-files"):
-                        yield FilesChangedPanel(id="files-panel")
-                    with TabPane("Events", id="tab-events"):
-                        yield EventPanel(id="events-panel")
+        with Vertical(id="content-stack"):
+            yield LandingSurface(self._workspace, id="landing-surface")
+            with Horizontal(id="main-layout"):
+                yield Sidebar(
+                    self._workspace,
+                    progress_auto_follow=self._tui_progress_auto_follow(),
+                    id="sidebar",
+                )
+                with Vertical(id="main-area"):
+                    with TabbedContent(id="tabs"):
+                        with TabPane("Chat", id="tab-chat"):
+                            yield ChatLog(id="chat-log")
+                        with TabPane("Files", id="tab-files"):
+                            yield FilesChangedPanel(id="files-panel")
+                        with TabPane("Events", id="tab-events"):
+                            yield EventPanel(id="events-panel")
         with VerticalScroll(id="slash-hint"):
             with Grid(id="steer-queue-grid"):
                 yield Static("", id="slash-hint-body")
@@ -1513,13 +1682,13 @@ class LoomApp(App):
                 with Horizontal(id="footer-shortcuts"):
                     yield Static("|", classes="footer-shortcut-divider")
                     yield Button(
-                        "[#ff9e64]^a[/] auth",
+                        "[#ff9e64]ctrl + a[/] auth",
                         id="footer-auth-shortcut",
                         classes="footer-shortcut-btn",
                     )
                     yield Static("|", classes="footer-shortcut-divider")
                     yield Button(
-                        "[#ff9e64]^m[/] mcp",
+                        "[#ff9e64]ctrl + m[/] mcp",
                         id="footer-mcp-shortcut",
                         classes="footer-shortcut-btn",
                     )
@@ -1563,7 +1732,22 @@ class LoomApp(App):
             )
             return
 
-        await self._initialize_session()
+        resume_target, auto_resume = await self._resolve_startup_resume_target()
+        show_landing = self._should_show_startup_landing(resume_target=resume_target)
+        self._set_startup_surface(show_landing=show_landing)
+        if show_landing:
+            self._start_workspace_watch()
+            try:
+                self.query_one("#landing-surface", LandingSurface).focus_input()
+            except Exception:
+                pass
+            return
+
+        await self._initialize_session(
+            startup_resume=(resume_target, auto_resume),
+            allow_auto_resume=False,
+            emit_info_messages=True,
+        )
         self._start_workspace_watch()
         # Keep input focus deterministic even when _initialize_session is mocked
         # in tests or returns early in partial startup paths.
@@ -1645,6 +1829,7 @@ class LoomApp(App):
                 )
             self._session = None
 
+        self._set_startup_surface(show_landing=False)
         await self._initialize_session()
         self._start_workspace_watch()
 
@@ -1732,6 +1917,29 @@ class LoomApp(App):
         if was_active or not str(getattr(tabs, "active", "") or ""):
             tabs.active = fallback_active
 
+    def _announce_user_feedback(
+        self,
+        message: str,
+        *,
+        chat_line: bool = False,
+        severity: str = "information",
+        timeout: int = 3,
+    ) -> None:
+        """Emit consistent short feedback via notification and optional chat line."""
+        text = str(message or "").strip()
+        if not text:
+            return
+        try:
+            self.notify(text, severity=severity, timeout=timeout)
+        except Exception:
+            pass
+        if not chat_line:
+            return
+        try:
+            self.query_one("#chat-log", ChatLog).add_info(text)
+        except Exception:
+            return
+
     def _handle_mcp_manager_tab_close(self, result: dict[str, object]) -> None:
         """Handle embedded MCP manager close callback."""
         if bool(result.get("changed")):
@@ -1740,11 +1948,10 @@ class LoomApp(App):
                 group="mcp-manager-refresh",
                 exclusive=True,
             )
-            try:
-                chat = self.query_one("#chat-log", ChatLog)
-                chat.add_info("MCP configuration updated.")
-            except Exception:
-                pass
+            self._announce_user_feedback(
+                "MCP configuration updated.",
+                chat_line=True,
+            )
         self.run_worker(
             self._remove_tab_if_present(self._MCP_MANAGER_TAB_ID),
             group="mcp-manager-tab-close",
@@ -1789,11 +1996,10 @@ class LoomApp(App):
     def _handle_auth_manager_tab_close(self, result: dict[str, object]) -> None:
         """Handle embedded auth manager close callback."""
         if bool(result.get("changed")):
-            try:
-                chat = self.query_one("#chat-log", ChatLog)
-                chat.add_info("Auth configuration updated.")
-            except Exception:
-                pass
+            self._announce_user_feedback(
+                "Auth configuration updated.",
+                chat_line=True,
+            )
         self.run_worker(
             self._remove_tab_if_present(self._AUTH_MANAGER_TAB_ID),
             group="auth-manager-tab-close",
@@ -5031,7 +5237,7 @@ class LoomApp(App):
         """Render `/sessions` output with readable per-session rows."""
         lines = [
             "[bold #7dcfff]Recent Sessions[/bold #7dcfff]",
-            "[dim]Use /resume <session-id-prefix> to switch[/dim]",
+            "[dim]Use /resume <session-id-prefix> to switch old cowork sessions[/dim]",
         ]
         for row in sessions[:10]:
             sid = self._escape_markup(str(row.get("id", "")))
@@ -5643,7 +5849,13 @@ class LoomApp(App):
                 return name in _MUTATING_TOOL_FALLBACK
         return name in _MUTATING_TOOL_FALLBACK
 
-    async def _initialize_session(self) -> None:
+    async def _initialize_session(
+        self,
+        *,
+        startup_resume: tuple[str | None, bool] | None = None,
+        allow_auto_resume: bool = True,
+        emit_info_messages: bool = True,
+    ) -> None:
         """Initialize tools, session, and welcome message.
 
         Called from on_mount (normal start) or _finalize_setup (post-wizard).
@@ -5679,7 +5891,12 @@ class LoomApp(App):
         compactor_model = self._cowork_compactor_model()
         memory_index_model, memory_index_role = self._cowork_memory_indexer_model()
 
-        resume_target, auto_resume = await self._resolve_startup_resume_target()
+        if startup_resume is not None:
+            resume_target, auto_resume = startup_resume
+        elif allow_auto_resume:
+            resume_target, auto_resume = await self._resolve_startup_resume_target()
+        else:
+            resume_target, auto_resume = None, False
         resume_info_message: str | None = None
 
         # Create or resume session
@@ -5719,10 +5936,11 @@ class LoomApp(App):
                     if auto_resume
                     else "Resumed session"
                 )
+                short_id = self._escape_markup(str(resume_target)[:12])
+                turns = int(getattr(self._session.session_state, "turn_count", 0) or 0)
                 resume_info_message = (
-                    f"[bold #7dcfff]{resume_label}[/bold #7dcfff]\n"
-                    f"  [bold]Session ID:[/] [dim]{self._escape_markup(resume_target)}[/dim]\n"
-                    f"  [bold]Turns:[/] {self._session.session_state.turn_count}"
+                    f"[dim]{self._escape_markup(resume_label)}: "
+                    f"{short_id}... ({turns} turns)[/dim]"
                 )
             except Exception as e:
                 chat.add_info(
@@ -5802,7 +6020,7 @@ class LoomApp(App):
         # Bind session-dependent tools
         self._bind_session_tools()
         await self._hydrate_chat_history_for_active_session()
-        if resume_info_message:
+        if emit_info_messages and resume_info_message:
             chat.add_info(resume_info_message)
 
         # Configure status bar
@@ -5811,10 +6029,6 @@ class LoomApp(App):
         status.model_name = self._model.name
         status.process_name = self._active_process_name()
 
-        # Welcome message
-        tool_count = len(self._tools.list_tools())
-        persisted = "persisted" if self._store else "ephemeral"
-        chat.add_info(self._render_startup_summary(tool_count=tool_count, persisted=persisted))
         await self._restore_process_run_tabs(chat)
         self._process_close_hint_shown = bool(self._process_runs)
 
@@ -7253,7 +7467,7 @@ class LoomApp(App):
                 chat = self.query_one("#chat-log", ChatLog)
                 chat.add_info(
                     f"Close confirmation timed out for run [dim]{run.run_id}[/dim]. "
-                    "Please try Ctrl+W again."
+                    "Please try ctrl + w again."
                 )
             except Exception:
                 pass
@@ -8272,9 +8486,9 @@ class LoomApp(App):
                 f"Run [dim]{run.run_id}[/dim] is already active and cannot be {verb_denied}."
             )
             return False
-        if not run.task_id:
+        if not run.task_id and is_resume:
             chat.add_info(
-                f"Run [dim]{run.run_id}[/dim] has no task ID, so it cannot be {verb_denied}."
+                f"Run [dim]{run.run_id}[/dim] has no task ID, so it cannot be resumed."
             )
             return False
 
@@ -8296,7 +8510,12 @@ class LoomApp(App):
         run.paused_accumulated_seconds = 0.0
         self._clear_process_run_cancel_handler(run.run_id)
         self._process_run_pending_inject.pop(run.run_id, None)
-        run.tasks, run.task_labels = self._resume_seed_task_rows(run)
+        if run.task_id:
+            run.tasks, run.task_labels = self._resume_seed_task_rows(run)
+        else:
+            run.tasks = []
+            run.task_labels = {}
+            run.subtask_phase_ids = {}
         row_ids = {
             str(row.get("id", "")).strip()
             for row in run.tasks
@@ -8318,12 +8537,37 @@ class LoomApp(App):
         self._update_process_run_visuals(run)
         self._refresh_process_run_progress(run)
         self._refresh_process_run_outputs(run)
-        self._append_process_run_activity(
-            run,
-            f"{verb_ongoing} in place from task state {run.task_id}.",
-        )
+        if run.task_id:
+            self._append_process_run_activity(
+                run,
+                f"{verb_ongoing} in place from task state {run.task_id}.",
+            )
+            worker_coro = self._execute_process_run(run_id)
+        else:
+            self._append_process_run_activity(
+                run,
+                "Restarting in place from run goal (no prior task ID).",
+            )
+            launch_request = ProcessRunLaunchRequest(
+                goal=str(getattr(run, "goal", "") or "").strip(),
+                command_prefix="/run",
+                process_defn=getattr(run, "process_defn", None),
+                process_name_override=(
+                    ""
+                    if getattr(run, "process_defn", None) is not None
+                    else str(getattr(run, "process_name", "") or "").strip()
+                ),
+                is_adhoc=bool(getattr(run, "is_adhoc", False)),
+                recommended_tools=list(getattr(run, "recommended_tools", []) or []),
+                goal_context_overrides=dict(
+                    getattr(run, "goal_context_overrides", {}) or {},
+                ),
+                run_workspace_override=Path(getattr(run, "run_workspace", self._workspace)),
+                resume_task_id="",
+            )
+            worker_coro = self._prepare_and_execute_process_run(run_id, launch_request)
         run.worker = self.run_worker(
-            self._execute_process_run(run_id),
+            worker_coro,
             name=f"process-run-{run_id}",
             group=f"process-run-{run_id}",
             exclusive=False,
@@ -8667,6 +8911,15 @@ class LoomApp(App):
         chat = self.query_one("#chat-log", ChatLog)
         events_panel = self.query_one("#events-panel", EventPanel)
 
+        delegate_ready, delegate_reason = self._ensure_delegate_task_ready_for_run()
+        if not delegate_ready:
+            detail = self._escape_markup(delegate_reason or "delegate_task unavailable.")
+            chat.add_info(
+                "[bold #f7768e]Process orchestration is unavailable in this "
+                f"session.[/]\n[dim]{detail}[/]"
+            )
+            return
+
         if not self._tools.has("delegate_task"):
             chat.add_info(
                 "[bold #f7768e]Process orchestration is unavailable in this "
@@ -8779,8 +9032,8 @@ class LoomApp(App):
         self._append_process_run_activity(run, "Queued process run.")
         if not self._process_close_hint_shown:
             chat.add_info(
-                "[dim]Tip: close tabs with Ctrl+W, /run close "
-                "[run-id-prefix], or Ctrl+P -> Close tab.[/]"
+                "[dim]Tip: close tabs with ctrl + w, /run close "
+                "[run-id-prefix], or ctrl + p -> Close tab.[/]"
             )
             self._process_close_hint_shown = True
         events_panel.add_event(
@@ -9275,24 +9528,23 @@ class LoomApp(App):
         """
         self._recall_tool = None
         self._delegate_tool = None
-        if self._store is None:
-            return
 
         from loom.tools.conversation_recall import ConversationRecallTool
         from loom.tools.delegate_task import DelegateTaskTool
 
-        recall = self._tools.get("conversation_recall")
-        if recall is not None and not isinstance(recall, ConversationRecallTool):
-            logger.warning(
-                "Replacing unexpected conversation_recall tool type: %s",
-                type(recall).__name__,
-            )
-            self._tools.exclude("conversation_recall")
-            recall = None
-        if recall is None:
-            recall = ConversationRecallTool()
-            self._tools.register(recall)
-        self._recall_tool = recall
+        if self._store is not None:
+            recall = self._tools.get("conversation_recall")
+            if recall is not None and not isinstance(recall, ConversationRecallTool):
+                logger.warning(
+                    "Replacing unexpected conversation_recall tool type: %s",
+                    type(recall).__name__,
+                )
+                self._tools.exclude("conversation_recall")
+                recall = None
+            if recall is None:
+                recall = ConversationRecallTool()
+                self._tools.register(recall)
+            self._recall_tool = recall
 
         delegate = self._tools.get("delegate_task")
         if delegate is not None and not isinstance(delegate, DelegateTaskTool):
@@ -9306,6 +9558,24 @@ class LoomApp(App):
             delegate = DelegateTaskTool()
             self._tools.register(delegate)
         self._delegate_tool = delegate
+
+    def _ensure_delegate_task_ready_for_run(self) -> tuple[bool, str]:
+        """Best-effort rebind of delegate_task before `/run` launch."""
+        if self._session is not None and self._config is not None and self._db is not None:
+            self._ensure_persistence_tools()
+            self._bind_session_tools()
+        delegate = self._tools.get("delegate_task")
+        if delegate is None:
+            return False, "delegate_task tool is missing."
+        factory = getattr(delegate, "_factory", None)
+        if (
+            self._session is not None
+            and self._config is not None
+            and self._db is not None
+            and not callable(factory)
+        ):
+            return False, "delegate_task is unbound (no orchestrator configured)."
+        return True, ""
 
     def _slash_command_catalog(self) -> list[tuple[str, str]]:
         """Return canonical slash commands with optional alias annotations."""
@@ -9404,9 +9674,9 @@ class LoomApp(App):
             "",
             "[bold #7dcfff]Keys[/bold #7dcfff]",
             self._wrap_info_text(
-                "Ctrl+B sidebar, Ctrl+L clear, Ctrl+R reload workspace, "
-                "Ctrl+W close tab, Ctrl+A auth, Ctrl+M mcp, "
-                "Ctrl+P palette, Ctrl+1/2/3 tabs",
+                "ctrl + b sidebar, ctrl + l clear, ctrl + r reload workspace, "
+                "ctrl + w close tab, ctrl + a auth, ctrl + m mcp, "
+                "ctrl + p commands, ctrl + 1/2/3 tabs",
                 initial_indent="  ",
                 subsequent_indent="  ",
             ),
@@ -9709,9 +9979,24 @@ class LoomApp(App):
                 seen.add(key)
         return candidates
 
-    def _apply_slash_tab_completion(self, *, reverse: bool = False) -> bool:
+    def _apply_slash_tab_completion(
+        self,
+        *,
+        reverse: bool = False,
+        input_widget: Input | None = None,
+    ) -> bool:
         """Apply slash tab completion (forward/backward)."""
-        input_widget = self.query_one("#user-input", Input)
+        if input_widget is None:
+            focused = None
+            try:
+                focused = self.focused
+            except ScreenStackError:
+                focused = None
+            if isinstance(focused, Input) and focused.id in {"user-input", "landing-input"}:
+                input_widget = focused
+            else:
+                selector = "#landing-input" if self._startup_landing_active else "#user-input"
+                input_widget = self.query_one(selector, Input)
         raw_current = str(input_widget.value or "")
         current = raw_current.lstrip()
         if not current.startswith("/"):
@@ -9811,8 +10096,57 @@ class LoomApp(App):
             return text[1:-1].strip()
         return text
 
+    def _set_landing_slash_hint(self, hint_text: str) -> None:
+        """Show or hide slash hints anchored under the landing input."""
+        try:
+            landing_hint = self.query_one("#landing-slash-hint", VerticalScroll)
+            landing_hint_body = self.query_one("#landing-slash-hint-body", Static)
+        except Exception:
+            return
+        update_body = getattr(landing_hint_body, "update", None)
+        scroll_home = getattr(landing_hint, "scroll_home", None)
+        if not callable(update_body) or not callable(scroll_home):
+            return
+        text = str(hint_text or "")
+        if (
+            text
+            and text == self._last_landing_slash_hint_text
+            and bool(getattr(landing_hint, "display", False))
+            and bool(getattr(landing_hint_body, "display", False))
+        ):
+            return
+        if text:
+            update_body(text)
+            landing_hint_body.display = True
+            landing_hint.display = True
+            scroll_home(animate=False)
+            self._last_landing_slash_hint_text = text
+            return
+        if (
+            not self._last_landing_slash_hint_text
+            and not bool(getattr(landing_hint, "display", False))
+        ):
+            return
+        landing_hint.display = False
+        landing_hint_body.display = False
+        update_body("")
+        self._last_landing_slash_hint_text = ""
+
     def _set_slash_hint(self, hint_text: str) -> None:
         """Show or hide the slash-command hint panel."""
+        if self._startup_landing_active:
+            self._set_landing_slash_hint(hint_text)
+            try:
+                hint = self.query_one("#slash-hint", VerticalScroll)
+                hint_body = self.query_one("#slash-hint-body", Static)
+                hint.display = False
+                hint_body.display = False
+                hint_body.update("")
+                hint.scroll_home(animate=False)
+            except Exception:
+                pass
+            return
+        self._set_landing_slash_hint("")
         hint = self.query_one("#slash-hint", VerticalScroll)
         hint_body = self.query_one("#slash-hint-body", Static)
         queue_grid: Grid | None = None
@@ -11118,7 +11452,21 @@ class LoomApp(App):
 
     async def _new_session(self) -> None:
         """Create a fresh session, replacing the current one."""
-        if self._store is None or self._session is None or self._model is None:
+        if self._store is None or self._model is None:
+            return
+        if self._session is None:
+            await self._initialize_session(
+                allow_auto_resume=False,
+                emit_info_messages=False,
+            )
+            await self._enter_workspace_surface(ensure_session=False)
+            if self._session is None:
+                return
+            sid = str(getattr(self._session, "session_id", "") or "").strip()
+            if sid:
+                chat = self.query_one("#chat-log", ChatLog)
+                short_id = self._escape_markup(sid[:12])
+                chat.add_info(f"[dim]New session: {short_id}...[/dim]")
             return
 
         # Persist any UI state for the old session before rotating.
@@ -11169,16 +11517,14 @@ class LoomApp(App):
         chat = self.query_one("#chat-log", ChatLog)
         await self._restore_process_run_tabs(chat)
         self._process_close_hint_shown = bool(self._process_runs)
-        info_message = (
-            "[bold #7dcfff]New Session Created[/bold #7dcfff]\n"
-            f"  [bold]Session ID:[/] [dim]{self._escape_markup(session_id)}[/dim]"
-        )
+        info_message = f"[dim]New session: {self._escape_markup(session_id[:12])}...[/dim]"
         chat.add_info(info_message)
         await self._append_chat_replay_event(
             "info",
             {"text": info_message, "markup": True},
             render=False,
         )
+        await self._enter_workspace_surface(ensure_session=False)
 
     async def _switch_to_session(self, session_id: str) -> None:
         """Resume a different session by ID."""
@@ -11326,24 +11672,36 @@ class LoomApp(App):
     # User input
     # ------------------------------------------------------------------
 
-    @on(Input.Submitted, "#user-input")
-    async def on_user_submit(self, event: Input.Submitted) -> None:
-        # P0-2: Only handle submissions from the main chat input
-        text = event.value.strip()
-        if not text:
+    async def _submit_user_text(self, text: str, *, source: str) -> None:
+        """Shared submit path for chat and landing composer inputs."""
+        clean = str(text or "").strip()
+        if not clean:
             return
+        original_clean = clean
 
-        input_widget = self.query_one("#user-input", Input)
-        input_widget.value = ""
+        if source == "chat":
+            input_widget = self.query_one("#user-input", Input)
+            input_widget.value = ""
+        elif source == "landing":
+            try:
+                landing_input = self.query_one("#landing-input", Input)
+                landing_input.value = ""
+            except Exception:
+                pass
+            token = clean.split(None, 1)[0].lower()
+            await self._enter_workspace_surface(ensure_session=(token != "/new"))
+            if not original_clean.startswith("/"):
+                clean = f"/run {original_clean}"
+
         self._reset_slash_tab_cycle()
         self._reset_input_history_navigation()
         self._set_slash_hint("")
 
         # Handle slash commands
-        if text.startswith("/"):
-            handled = await self._handle_slash_command(text)
+        if clean.startswith("/"):
+            handled = await self._handle_slash_command(clean)
             if handled:
-                self._append_input_history(text)
+                self._append_input_history(clean)
                 await self._persist_process_run_ui_state()
                 return
 
@@ -11354,12 +11712,12 @@ class LoomApp(App):
         ):
             injected = await self._inject_process_run(
                 focused_run,
-                text,
+                clean,
                 source="enter",
                 queue_if_unavailable=True,
             )
             if injected:
-                self._append_input_history(text)
+                self._append_input_history(clean)
                 await self._persist_process_run_ui_state()
                 return
             # Preserve user text if process-run inject remains unavailable.
@@ -11367,22 +11725,38 @@ class LoomApp(App):
                 focused_run is not None
                 and self._is_process_run_active_status(focused_run.status)
             ):
-                self._set_user_input_text(text)
+                self._set_user_input_text(clean)
                 return
 
         if self._is_cowork_stop_visible():
-            queued = await self._queue_chat_inject_instruction(text, source="enter")
+            queued = await self._queue_chat_inject_instruction(clean, source="enter")
             if queued:
-                self._append_input_history(text)
+                self._append_input_history(clean)
                 await self._persist_process_run_ui_state()
                 return
             # Preserve user text if steering is still active but queueing failed.
             if self._is_cowork_stop_visible():
-                self._set_user_input_text(text)
+                self._set_user_input_text(clean)
                 return
 
-        self._append_input_history(text)
-        self._chat_turn_worker = self._run_turn(text)
+        self._append_input_history(clean)
+        self._chat_turn_worker = self._run_turn(clean)
+
+    @on(Input.Submitted, "#user-input")
+    async def on_user_submit(self, event: Input.Submitted) -> None:
+        await self._submit_user_text(event.value, source="chat")
+
+    @on(Input.Submitted, "#landing-input")
+    async def on_landing_submit(self, event: Input.Submitted) -> None:
+        """Handle initial startup prompt submission from landing composer."""
+        await self._submit_user_text(event.value, source="landing")
+
+    @on(events.Click, "#landing-close-btn")
+    async def on_landing_close_pressed(self, event: events.Click) -> None:
+        """Exit startup landing and open the main workspace chat surface."""
+        event.stop()
+        event.prevent_default()
+        await self._enter_workspace_surface(ensure_session=True)
 
     @on(Input.Changed, "#user-input")
     def on_user_input_changed(self, _event: Input.Changed) -> None:
@@ -11399,6 +11773,12 @@ class LoomApp(App):
         # stale-value edge cases that can appear one keypress behind.
         current = self.query_one("#user-input", Input).value
         self._sync_chat_stop_control()
+        self._set_slash_hint(self._render_slash_hint(current))
+
+    @on(Input.Changed, "#landing-input")
+    def on_landing_input_changed(self, _event: Input.Changed) -> None:
+        """Show slash-command hints while typing on the startup landing input."""
+        current = self.query_one("#landing-input", Input).value
         self._set_slash_hint(self._render_slash_hint(current))
 
     @on(Button.Pressed, ".process-run-restart-btn")
@@ -11554,7 +11934,30 @@ class LoomApp(App):
                 event.prevent_default()
                 return
 
+        if event.key == "escape":
+            try:
+                if len(self.screen_stack) > 1:
+                    return
+            except Exception:
+                pass
+
+        if event.key == "escape" and self._startup_landing_active:
+            event.stop()
+            event.prevent_default()
+            self.run_worker(
+                self._enter_workspace_surface(ensure_session=True),
+                name="landing-open-chat",
+                group="landing-open-chat",
+                exclusive=True,
+            )
+            return
+
         if event.key in {"ctrl+w", "ctrl+a", "ctrl+m"}:
+            try:
+                if len(self.screen_stack) > 1:
+                    return
+            except Exception:
+                pass
             focused = self.focused
             if isinstance(focused, Input) and focused.id == "user-input":
                 event.stop()
@@ -11578,9 +11981,12 @@ class LoomApp(App):
         if event.key not in ("tab", "shift+tab"):
             return
         focused = self.focused
-        if not isinstance(focused, Input) or focused.id != "user-input":
+        if not isinstance(focused, Input) or focused.id not in {"user-input", "landing-input"}:
             return
-        if self._apply_slash_tab_completion(reverse=event.key == "shift+tab"):
+        if self._apply_slash_tab_completion(
+            reverse=event.key == "shift+tab",
+            input_widget=focused,
+        ):
             event.stop()
             event.prevent_default()
 
@@ -14978,7 +15384,11 @@ class LoomApp(App):
     def action_reload_workspace(self) -> None:
         """Reload sidebar workspace tree to show external file changes."""
         self._request_workspace_refresh("manual", immediate=True)
-        self.notify("Workspace reloaded", timeout=2)
+        self._announce_user_feedback(
+            "Workspace reloaded.",
+            chat_line=True,
+            timeout=2,
+        )
 
     async def _request_manager_tab_close(self, pane_id: str) -> bool:
         """Ask active manager widget to run its guarded close flow when available."""
@@ -15001,8 +15411,16 @@ class LoomApp(App):
             await result
         return True
 
+    def _command_palette_active(self) -> bool:
+        try:
+            return isinstance(self.screen, LoomCommandPaletteScreen)
+        except ScreenStackError:
+            return False
+
     def action_close_process_tab(self) -> None:
         """Close current tab (process run tab or manager tab)."""
+        if self._command_palette_active():
+            return
         current = self._current_process_run()
         active_tab = ""
         try:
@@ -15027,7 +15445,7 @@ class LoomApp(App):
                     try:
                         chat = self.query_one("#chat-log", ChatLog)
                         chat.add_info(
-                            "No closable tabs are open. Ctrl+W closes run, MCP, or Auth tabs."
+                            "No closable tabs are open. ctrl + w closes run, MCP, or Auth tabs."
                         )
                     except Exception:
                         pass
@@ -15058,10 +15476,18 @@ class LoomApp(App):
         tabs = self.query_one("#tabs", TabbedContent)
         tabs.active = "tab-events"
 
+    def action_command_palette(self) -> None:
+        """Open Loom's custom command palette surface."""
+        self.push_screen(LoomCommandPaletteScreen())
+
     def action_open_auth_tab(self) -> None:
+        if self._command_palette_active():
+            return
         self._open_auth_manager_screen()
 
     def action_open_mcp_tab(self) -> None:
+        if self._command_palette_active():
+            return
         self._open_mcp_manager_screen()
 
     async def action_quit(self) -> None:
@@ -15174,7 +15600,7 @@ class LoomApp(App):
             self._prefill_user_input("/resume ")
             return
         if command == "close_process_tab":
-            await self._close_process_run_from_target("current")
+            self.action_close_process_tab()
             return
         actions = {
             "clear_chat": self.action_clear_chat,

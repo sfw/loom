@@ -2070,10 +2070,10 @@ class TestProcessRunPane:
         assert pane._toggle_pause_button.label == "\u25b6"
 
         pane.set_status_header(status="failed", elapsed="0:42", task_id="")
-        assert pane._actions.display is False
+        assert pane._actions.display is True
         assert pane._toggle_pause_button.display is False
-        assert pane._restart_button.display is False
-        assert pane._restart_button.disabled is True
+        assert pane._restart_button.display is True
+        assert pane._restart_button.disabled is False
 
         pane.set_status_header(status="failed", elapsed="0:42", task_id="cowork-1")
         assert pane._actions.display is True
@@ -4208,6 +4208,293 @@ class TestStartupSessionResume:
         assert auto is False
         app._store.list_sessions.assert_not_called()
 
+    def test_should_show_startup_landing_respects_config_and_resume(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                tui=SimpleNamespace(
+                    startup_landing_enabled=True,
+                    always_open_chat_directly=False,
+                ),
+            ),
+        )
+        app._store = MagicMock()
+
+        assert app._should_show_startup_landing(resume_target=None) is True
+        assert app._should_show_startup_landing(resume_target="existing-session") is False
+
+        app._config.tui.always_open_chat_directly = True
+        assert app._should_show_startup_landing(resume_target=None) is False
+
+        app._config.tui.always_open_chat_directly = False
+        app._config.tui.startup_landing_enabled = False
+        assert app._should_show_startup_landing(resume_target=None) is False
+
+    @pytest.mark.asyncio
+    async def test_on_mount_shows_landing_when_no_resume(self):
+        from textual.widgets import Input, Static
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="primary"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                models={"primary": SimpleNamespace(model="kimi-k2.5")},
+                tui=SimpleNamespace(
+                    startup_landing_enabled=True,
+                    always_open_chat_directly=False,
+                ),
+            ),
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock(return_value=[])
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app._startup_landing_active is True
+            assert app.query_one("#bottom-stack").has_class("landing")
+            assert app.query_one("#bottom-stack").display is False
+            workspace_line = app.query_one("#landing-workspace-path", Static)
+            assert "workspace:" in str(workspace_line.render()).lower()
+            assert "/tmp" in str(workspace_line.render())
+            model_line = app.query_one("#landing-model-name", Static)
+            assert "model:" in str(model_line.render()).lower()
+            assert "kimi-k2.5" in str(model_line.render())
+            logo = app.query_one("#landing-logo", Static)
+            assert "___" in str(logo.render())
+            close_button = app.query_one("#landing-close-btn", Static)
+            assert "x" in str(close_button.render()).lower()
+            landing_input = app.query_one("#landing-input", Input)
+            assert landing_input.placeholder == "Give me a challenge"
+            landing_shortcuts = " ".join(
+                str(widget.render())
+                for widget in app.query("#landing-shortcuts .landing-shortcut")
+            ).lower()
+            assert "ctrl + p" in landing_shortcuts
+            assert "ctrl + c" in landing_shortcuts
+            assert "esc" in landing_shortcuts
+            assert "goto main window" in landing_shortcuts
+            assert "ctrl + a" not in landing_shortcuts
+            assert "ctrl + m" not in landing_shortcuts
+
+        app._initialize_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_landing_close_button_enters_workspace_surface(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="primary"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                models={"primary": SimpleNamespace(model="kimi-k2.5")},
+                tui=SimpleNamespace(
+                    startup_landing_enabled=True,
+                    always_open_chat_directly=False,
+                ),
+            ),
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock(return_value=[])
+        app._initialize_session = AsyncMock(
+            side_effect=lambda **_kwargs: setattr(
+                app,
+                "_session",
+                SimpleNamespace(session_id="landing-session"),
+            ),
+        )
+
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app._startup_landing_active is True
+            await pilot.click("#landing-close-btn")
+            await pilot.pause()
+            assert app._startup_landing_active is False
+            assert app.query_one("#bottom-stack").display is True
+
+        app._initialize_session.assert_awaited_once_with(
+            allow_auto_resume=False,
+            emit_info_messages=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_landing_escape_enters_workspace_surface(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="primary"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                models={"primary": SimpleNamespace(model="kimi-k2.5")},
+                tui=SimpleNamespace(
+                    startup_landing_enabled=True,
+                    always_open_chat_directly=False,
+                ),
+            ),
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock(return_value=[])
+        app._initialize_session = AsyncMock(
+            side_effect=lambda **_kwargs: setattr(
+                app,
+                "_session",
+                SimpleNamespace(session_id="landing-session"),
+            ),
+        )
+
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app._startup_landing_active is True
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._startup_landing_active is False
+            assert app.query_one("#bottom-stack").display is True
+
+        app._initialize_session.assert_awaited_once_with(
+            allow_auto_resume=False,
+            emit_info_messages=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_landing_input_accepts_slash_commands(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="primary"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        landing_input = SimpleNamespace(value="seeded")
+        app.query_one = MagicMock(return_value=landing_input)
+        app._enter_workspace_surface = AsyncMock()
+        app._reset_slash_tab_cycle = MagicMock()
+        app._reset_input_history_navigation = MagicMock()
+        app._set_slash_hint = MagicMock()
+        app._handle_slash_command = AsyncMock(return_value=True)
+        app._append_input_history = MagicMock()
+        app._persist_process_run_ui_state = AsyncMock()
+
+        await app._submit_user_text("/help", source="landing")
+
+        app._enter_workspace_surface.assert_awaited_once_with(ensure_session=True)
+        app._handle_slash_command.assert_awaited_once_with("/help")
+        app._append_input_history.assert_called_once_with("/help")
+        app._persist_process_run_ui_state.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_landing_input_plain_text_dispatches_run_goal(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="primary"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        landing_input = SimpleNamespace(value="seeded")
+        app.query_one = MagicMock(return_value=landing_input)
+        app._enter_workspace_surface = AsyncMock()
+        app._reset_slash_tab_cycle = MagicMock()
+        app._reset_input_history_navigation = MagicMock()
+        app._set_slash_hint = MagicMock()
+        app._handle_slash_command = AsyncMock(return_value=True)
+        app._append_input_history = MagicMock()
+        app._persist_process_run_ui_state = AsyncMock()
+        app._chat_turn_worker = None
+
+        await app._submit_user_text("analyze cloud infra spend", source="landing")
+
+        app._enter_workspace_surface.assert_awaited_once_with(ensure_session=True)
+        app._handle_slash_command.assert_awaited_once_with(
+            "/run analyze cloud infra spend"
+        )
+        app._append_input_history.assert_called_once_with(
+            "/run analyze cloud infra spend"
+        )
+        app._persist_process_run_ui_state.assert_awaited_once()
+        assert app._chat_turn_worker is None
+
+    @pytest.mark.asyncio
+    async def test_landing_slash_hint_is_anchored_and_persists_refresh(self):
+        from textual.containers import VerticalScroll
+        from textual.widgets import Static
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="primary"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                models={"primary": SimpleNamespace(model="kimi-k2.5")},
+                tui=SimpleNamespace(
+                    startup_landing_enabled=True,
+                    always_open_chat_directly=False,
+                ),
+            ),
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock(return_value=[])
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app._startup_landing_active is True
+
+            await pilot.press("/")
+            await pilot.pause()
+
+            landing_hint = app.query_one("#landing-slash-hint", VerticalScroll)
+            landing_hint_body = app.query_one("#landing-slash-hint-body", Static)
+            chat_hint = app.query_one("#slash-hint", VerticalScroll)
+            assert landing_hint.display is True
+            assert landing_hint_body.display is True
+            assert "slash commands" in str(landing_hint_body.render()).lower()
+            assert chat_hint.display is False
+
+            app._refresh_hint_panel()
+            await pilot.pause()
+
+            assert landing_hint.display is True
+            assert "slash commands" in str(landing_hint_body.render()).lower()
+
+    @pytest.mark.asyncio
+    async def test_on_mount_bypass_opens_chat_directly(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                tui=SimpleNamespace(
+                    startup_landing_enabled=True,
+                    always_open_chat_directly=True,
+                ),
+            ),
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock(return_value=[])
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app._startup_landing_active is False
+
+        app._initialize_session.assert_awaited_once_with(
+            startup_resume=(None, False),
+            allow_auto_resume=False,
+            emit_info_messages=True,
+        )
+
     @pytest.mark.asyncio
     async def test_initialize_session_auto_resume_restores_input_history(self, monkeypatch):
         from loom.tui.app import LoomApp
@@ -4407,6 +4694,37 @@ class TestStartupSessionResume:
             force=True,
         )
         assert to_thread_calls
+
+    @pytest.mark.asyncio
+    async def test_new_session_without_existing_session_initializes_once(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._store = MagicMock()
+        app._session = None
+        app._initialize_session = AsyncMock(
+            side_effect=lambda **_kwargs: setattr(
+                app,
+                "_session",
+                SimpleNamespace(session_id="abc123"),
+            ),
+        )
+        app._enter_workspace_surface = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._new_session()
+
+        app._initialize_session.assert_awaited_once_with(
+            allow_auto_resume=False,
+            emit_info_messages=False,
+        )
+        app._enter_workspace_surface.assert_awaited_once_with(ensure_session=False)
+        chat.add_info.assert_called_once()
 
     def test_start_workspace_watch_does_not_scan_synchronously(self):
         from loom.tui.app import LoomApp
@@ -5085,6 +5403,25 @@ class TestSlashCommandHints:
 
         stale_event = SimpleNamespace(value="/")
         app.on_user_input_changed(stale_event)
+
+        assert captured
+
+    def test_landing_input_changed_uses_live_widget_value(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        landing_input = SimpleNamespace(value="/h")
+        app.query_one = MagicMock(return_value=landing_input)
+
+        captured = []
+        app._set_slash_hint = lambda text: captured.append(text)
+
+        stale_event = SimpleNamespace(value="/")
+        app.on_landing_input_changed(stale_event)
 
         assert captured
 
@@ -7844,6 +8181,126 @@ class TestProcessSlashCommands:
         app._persist_process_run_ui_state.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_restart_process_run_in_place_without_task_id_retries_goal(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        run = SimpleNamespace(
+            run_id="abc123",
+            process_name="market-research",
+            process_defn=None,
+            goal="Analyze EPCOR",
+            status="failed",
+            task_id="",
+            run_workspace=Path("/tmp/process-run"),
+            pane_id="tab-run-abc123",
+            pane=MagicMock(),
+            is_adhoc=True,
+            recommended_tools=["ripgrep_search"],
+            goal_context_overrides={"priority": "high"},
+            tasks=[{"id": "old", "status": "failed", "content": "old"}],
+            task_labels={"old": "old"},
+            subtask_phase_ids={"old": "phase-1"},
+            last_progress_message="old",
+            last_progress_at=12.0,
+            worker=None,
+            closed=False,
+        )
+        app._process_runs = {"abc123": run}
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_process_run_outputs = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        app._persist_process_run_ui_state = AsyncMock()
+        app._prepare_and_execute_process_run = AsyncMock(return_value=None)
+        app._execute_process_run = AsyncMock(return_value=None)
+        chat = MagicMock()
+        events_panel = MagicMock()
+
+        def _query_one(selector, *_args, **_kwargs):
+            if selector == "#chat-log":
+                return chat
+            if selector == "#events-panel":
+                return events_panel
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        app.query_one = MagicMock(side_effect=_query_one)
+        captured = {}
+
+        def fake_run_worker(coro, **kwargs):
+            captured["kwargs"] = kwargs
+            coro.close()
+            return MagicMock()
+
+        app.run_worker = fake_run_worker
+
+        restarted = await app._restart_process_run_in_place("abc123")
+
+        assert restarted is True
+        assert run.status == "queued"
+        assert run.tasks == []
+        assert run.task_labels == {}
+        assert run.subtask_phase_ids == {}
+        assert run.worker is not None
+        assert captured["kwargs"]["name"] == "process-run-abc123"
+        assert captured["kwargs"]["group"] == "process-run-abc123"
+        task_rows = run.pane.set_tasks.call_args.args[0]
+        assert task_rows[0]["id"] in {"stage:summary", "stage:accepted"}
+        assert (
+            "Queueing delegate" in task_rows[0]["content"]
+            or "Accepted" in task_rows[0]["content"]
+        )
+        app._prepare_and_execute_process_run.assert_called_once()
+        app._execute_process_run.assert_not_called()
+        app._persist_process_run_ui_state.assert_awaited_once()
+
+    def test_ensure_delegate_task_ready_for_run_detects_bound_delegate(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(),
+            db=MagicMock(),
+        )
+        app._session = SimpleNamespace(session_id="s1")
+        app._ensure_persistence_tools = MagicMock()
+        app._bind_session_tools = MagicMock()
+        app._tools.get = MagicMock(return_value=SimpleNamespace(_factory=lambda: None))
+
+        ready, reason = app._ensure_delegate_task_ready_for_run()
+
+        assert ready is True
+        assert reason == ""
+        app._ensure_persistence_tools.assert_called_once()
+        app._bind_session_tools.assert_called_once()
+        app._tools.get.assert_called_once_with("delegate_task")
+
+    def test_ensure_delegate_task_ready_for_run_reports_unbound_delegate(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(),
+            db=MagicMock(),
+        )
+        app._session = SimpleNamespace(session_id="s1")
+        app._ensure_persistence_tools = MagicMock()
+        app._bind_session_tools = MagicMock()
+        app._tools.get = MagicMock(return_value=SimpleNamespace(_factory=None))
+
+        ready, reason = app._ensure_delegate_task_ready_for_run()
+
+        assert ready is False
+        assert "unbound" in reason.lower()
+
+    @pytest.mark.asyncio
     async def test_resume_process_run_continues_in_place(self):
         from loom.tui.app import LoomApp
 
@@ -9206,6 +9663,32 @@ class TestProcessSlashCommands:
         assert "can't be revived" in screen._detail_override
         assert screen._confirm_label == "Stop Process"
         assert screen._cancel_label == "Keep Running"
+
+    @pytest.mark.asyncio
+    async def test_process_run_close_screen_mounts_when_running_true(self):
+        from loom.tui.app import LoomApp
+        from loom.tui.screens.process_run_close import ProcessRunCloseScreen
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.push_screen(
+                ProcessRunCloseScreen(
+                    run_label="investment-analysis #abc123",
+                    running=True,
+                ),
+            )
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ProcessRunCloseScreen)
+            assert screen.is_mounted is True
+            assert len(list(screen.children)) == 1
+            screen.query_one("#process-close-dialog")
 
     @pytest.mark.asyncio
     async def test_stop_process_run_respects_confirmation_decline(self):
@@ -11495,6 +11978,7 @@ class TestCommandPaletteProcessActions:
 
         keys = {binding.key for binding in LoomApp.BINDINGS}
         assert "ctrl+r" in keys
+        assert "ctrl+p" in keys
         assert "ctrl+a" in keys
         assert "ctrl+m" in keys
 
@@ -11505,10 +11989,152 @@ class TestCommandPaletteProcessActions:
         key_to_action = {key: binding.action for key, binding in bindings.items()}
         assert key_to_action["ctrl+a"] == "open_auth_tab"
         assert key_to_action["ctrl+m"] == "open_mcp_tab"
+        assert key_to_action["ctrl+p"] == "command_palette"
+        assert bindings["ctrl+p"].description == "Commands"
+        assert bindings["ctrl+p"].show is False
         assert bindings["ctrl+a"].priority is True
         assert bindings["ctrl+m"].priority is True
         assert bindings["ctrl+a"].show is False
         assert bindings["ctrl+m"].show is False
+
+    @pytest.mark.asyncio
+    async def test_action_command_palette_opens_custom_grouped_screen(self):
+        from textual.widgets import OptionList
+
+        from loom.tui.app import LoomApp
+        from loom.tui.screens.command_palette import LoomCommandPaletteScreen
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            app.action_command_palette()
+            await pilot.pause()
+            assert isinstance(app.screen, LoomCommandPaletteScreen)
+            assert len(list(app.screen.query("SearchIcon"))) == 0
+            command_list = app.screen.query_one("#loom-command-list", OptionList)
+            first = command_list.get_option_at_index(0)
+            assert first.disabled is True
+            assert "Suggested" in str(first.prompt)
+
+    def test_command_palette_click_outside_dismisses(self):
+        from loom.tui.screens.command_palette import LoomCommandPaletteScreen
+
+        screen = LoomCommandPaletteScreen()
+        screen.dismiss = MagicMock()
+        card = MagicMock()
+        card.region.contains.return_value = False
+        screen.query_one = MagicMock(return_value=card)
+
+        event = MagicMock()
+        event.screen_x = 0
+        event.screen_y = 0
+
+        screen.on_mouse_down(event)
+
+        screen.dismiss.assert_called_once_with()
+        event.stop.assert_called_once()
+        event.prevent_default.assert_called_once()
+
+    def test_command_palette_click_inside_does_not_dismiss(self):
+        from loom.tui.screens.command_palette import LoomCommandPaletteScreen
+
+        screen = LoomCommandPaletteScreen()
+        screen.dismiss = MagicMock()
+        card = MagicMock()
+        card.region.contains.return_value = True
+        screen.query_one = MagicMock(return_value=card)
+
+        event = MagicMock()
+        event.screen_x = 1
+        event.screen_y = 1
+
+        screen.on_mouse_down(event)
+
+        screen.dismiss.assert_not_called()
+        event.stop.assert_not_called()
+        event.prevent_default.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_command_palette_escape_closes_palette_not_landing(self):
+        from loom.tui.app import LoomApp
+        from loom.tui.screens.command_palette import LoomCommandPaletteScreen
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                tui=SimpleNamespace(
+                    startup_landing_enabled=True,
+                    always_open_chat_directly=False,
+                ),
+            ),
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock(return_value=[])
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            assert app._startup_landing_active is True
+            app.action_command_palette()
+            await pilot.pause()
+            assert isinstance(app.screen, LoomCommandPaletteScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._startup_landing_active is True
+            assert not isinstance(app.screen, LoomCommandPaletteScreen)
+
+    @pytest.mark.asyncio
+    async def test_command_palette_ctrl_p_closes_palette(self):
+        from loom.tui.app import LoomApp
+        from loom.tui.screens.command_palette import LoomCommandPaletteScreen
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            app.action_command_palette()
+            await pilot.pause()
+            assert isinstance(app.screen, LoomCommandPaletteScreen)
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            assert not isinstance(app.screen, LoomCommandPaletteScreen)
+
+    @pytest.mark.asyncio
+    async def test_command_palette_ctrl_a_does_not_trigger_global_auth_shortcut(self):
+        from loom.tui.app import LoomApp
+        from loom.tui.screens.command_palette import LoomCommandPaletteScreen
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._initialize_session = AsyncMock()
+        app._open_auth_manager_screen = MagicMock()
+
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            app.action_command_palette()
+            await pilot.pause()
+            assert isinstance(app.screen, LoomCommandPaletteScreen)
+            await pilot.press("ctrl+a")
+            await pilot.pause()
+            assert isinstance(app.screen, LoomCommandPaletteScreen)
+
+        app._open_auth_manager_screen.assert_not_called()
 
     def test_footer_manager_shortcut_buttons_trigger_actions(self):
         from loom.tui.app import LoomApp
@@ -11558,8 +12184,8 @@ class TestCommandPaletteProcessActions:
             await pilot.pause()
             auth_label = app.query_one("#footer-auth-shortcut", Button).label.plain.lower()
             mcp_label = app.query_one("#footer-mcp-shortcut", Button).label.plain.lower()
-            assert "^a" in auth_label and "auth" in auth_label
-            assert "^m" in mcp_label and "mcp" in mcp_label
+            assert "ctrl + a" in auth_label and "auth" in auth_label
+            assert "ctrl + m" in mcp_label and "mcp" in mcp_label
             dividers = app.query("#footer-shortcuts .footer-shortcut-divider")
             assert len(list(dividers)) == 2
 
@@ -11690,7 +12316,11 @@ class TestCommandPaletteProcessActions:
         await app.action_loom_command("reload_workspace")
 
         app._refresh_workspace_tree.assert_called_once()
-        app.notify.assert_called_once_with("Workspace reloaded", timeout=2)
+        app.notify.assert_called_once_with(
+            "Workspace reloaded.",
+            severity="information",
+            timeout=2,
+        )
 
     @pytest.mark.asyncio
     async def test_show_learned_patterns_queries_behavioral(self, monkeypatch):
@@ -11833,6 +12463,23 @@ class TestCommandPaletteProcessActions:
         await app.action_loom_command("stop_chat")
 
         app.action_stop_chat.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_palette_close_tab_action_uses_unified_close_flow(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app.action_close_process_tab = MagicMock()
+        app._close_process_run_from_target = AsyncMock(return_value=True)
+
+        await app.action_loom_command("close_process_tab")
+
+        app.action_close_process_tab.assert_called_once()
+        app._close_process_run_from_target.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_palette_prompt_actions_prefill_input(self):
@@ -12987,6 +13634,46 @@ class TestCommandPaletteProcessActions:
             assert input_widget.value == "/session"
 
     @pytest.mark.asyncio
+    async def test_tab_key_is_captured_for_slash_autocomplete_on_landing_input(self):
+        from textual.widgets import Input
+
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=SimpleNamespace(name="test-model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+            config=SimpleNamespace(
+                tui=SimpleNamespace(
+                    startup_landing_enabled=True,
+                    always_open_chat_directly=False,
+                ),
+            ),
+        )
+        app._store = MagicMock()
+        app._store.list_sessions = AsyncMock(return_value=[])
+        app._initialize_session = AsyncMock()
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            landing_input = app.query_one("#landing-input", Input)
+            assert app._startup_landing_active is True
+            assert landing_input.value == ""
+
+            await pilot.press("/")
+            await pilot.press("s")
+            await pilot.pause()
+            assert landing_input.value == "/s"
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert landing_input.value == "/sessions"
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert landing_input.value == "/session"
+
+    @pytest.mark.asyncio
     async def test_ctrl_w_closes_process_tab_from_input_focus(self):
         from textual.widgets import Input
 
@@ -13242,10 +13929,12 @@ class TestSlashHelp:
         assert "run-id-prefix" in rendered
         assert "/quit (aliases: /exit, /q)" in rendered
         assert "/setup" in rendered
-        assert "Ctrl+R reload workspace" in rendered
-        assert "Ctrl+W close tab" in rendered
-        assert "Ctrl+A auth" in rendered
-        assert "Ctrl+M mcp" in rendered
+        assert "ctrl + r reload workspace" in rendered
+        assert "ctrl + w close tab" in rendered
+        assert "ctrl + p commands" in rendered
+        assert "ctrl + a auth" in rendered
+        assert "ctrl + m" in rendered
+        assert "mcp" in rendered
 
     @pytest.mark.asyncio
     async def test_resume_without_arg_shows_usage(self):
