@@ -126,6 +126,16 @@ class Sidebar(Vertical):
     }
     Sidebar FilteredTree {
         height: 1fr;
+        background: $panel;
+    }
+    Sidebar FilteredTree > .tree--cursor {
+        background: $surface-lighten-1;
+        color: $text;
+    }
+    Sidebar FilteredTree:focus > .tree--cursor {
+        background: $primary-darken-1;
+        color: $text;
+        text-style: bold;
     }
     """
 

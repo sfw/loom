@@ -27,7 +27,7 @@ async def test_discover_returns_sorted_full_command_list() -> None:
 
     assert labels == sorted(labels, key=str.casefold)
 
-    expected = [label for label, _, _ in _COMMANDS] + [
+    expected = [command.label for command in _COMMANDS] + [
         "Run zeta-process…",
         "Run alpha-process…",
     ]
@@ -42,6 +42,6 @@ async def test_discover_without_dynamic_entries_uses_sorted_builtins() -> None:
 
     hits = [hit async for hit in provider.discover()]
     labels = [str(hit.text) for hit in hits]
-    expected = [label for label, _, _ in _COMMANDS]
+    expected = [command.label for command in _COMMANDS]
 
     assert labels == sorted(expected, key=str.casefold)

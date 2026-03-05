@@ -58,7 +58,8 @@ class ProcessRunCloseScreen(ModalScreen[bool]):
     ) -> None:
         super().__init__()
         self._run_label = run_label
-        self._running = running
+        # Do not reuse Textual's internal MessagePump._running lifecycle flag.
+        self._run_is_active = bool(running)
         self._prompt_override = str(prompt_override or "").strip()
         self._detail_override = str(detail_override or "").strip()
         self._confirm_label = str(confirm_label or "").strip()
@@ -70,14 +71,14 @@ class ProcessRunCloseScreen(ModalScreen[bool]):
         if not prompt:
             prompt = (
                 f"[bold #e0af68]Close running tab {self._run_label}?[/]"
-                if self._running
+                if self._run_is_active
                 else f"[bold #e0af68]Close tab {self._run_label}?[/]"
             )
         detail = self._detail_override
         if not detail:
             detail = (
                 "This requests cancellation and closes the tab once the run stops."
-                if self._running
+                if self._run_is_active
                 else "You can still inspect logs in events history."
             )
         confirm_label = self._confirm_label or "Close Tab"
