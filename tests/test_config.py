@@ -45,9 +45,9 @@ class TestDefaultConfig:
         assert config.execution.enable_mutation_idempotency is False
         assert config.execution.enable_slo_metrics is False
         assert config.execution.delegate_task_timeout_seconds == 3600
-        assert config.execution.ask_user_v2_enabled is False
-        assert config.execution.ask_user_runtime_blocking_enabled is False
-        assert config.execution.ask_user_durable_state_enabled is False
+        assert config.execution.ask_user_v2_enabled is True
+        assert config.execution.ask_user_runtime_blocking_enabled is True
+        assert config.execution.ask_user_durable_state_enabled is True
         assert config.execution.ask_user_api_enabled is False
         assert config.execution.ask_user_policy == "block"
         assert config.execution.ask_user_timeout_seconds == 0

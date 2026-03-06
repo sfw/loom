@@ -246,9 +246,9 @@ class ExecutionConfig:
     enable_mutation_idempotency: bool = False
     enable_slo_metrics: bool = False
     delegate_task_timeout_seconds: int = 3600
-    ask_user_v2_enabled: bool = False
-    ask_user_runtime_blocking_enabled: bool = False
-    ask_user_durable_state_enabled: bool = False
+    ask_user_v2_enabled: bool = True
+    ask_user_runtime_blocking_enabled: bool = True
+    ask_user_durable_state_enabled: bool = True
     ask_user_api_enabled: bool = False
     ask_user_policy: str = "block"  # block | timeout_default | fail_closed
     ask_user_timeout_seconds: int = 0
