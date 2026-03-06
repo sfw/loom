@@ -221,6 +221,19 @@ class SubtaskRunner:
         "updated",
         "new",
     )
+    _VERIFIED_SEAL_OUTCOMES = frozenset({
+        "pass",
+        "pass_with_warnings",
+        "partial_verified",
+    })
+    _SEAL_CONFIRMATION_EVIDENCE_TOOLS = frozenset({
+        "read_file",
+        "spreadsheet",
+        "web_search",
+        "web_fetch",
+        "web_fetch_html",
+        "fact_checker",
+    })
 
     def __init__(
         self,
@@ -1644,6 +1657,11 @@ class SubtaskRunner:
             if isinstance(item, dict)
         }
         known_evidence_ids.discard("")
+        historical_successful_tool_calls = [
+            call
+            for call in (prior_successful_tool_calls or [])
+            if isinstance(call, ToolCallRecord)
+        ]
         total_tokens = 0
         response = None
         streaming = self._config.execution.enable_streaming
@@ -1881,6 +1899,15 @@ class SubtaskRunner:
                         enforce_deliverable_paths=enforce_deliverable_paths,
                         edit_existing_only=edit_existing_only,
                     )
+                    if not policy_error:
+                        policy_error = self._validate_sealed_artifact_mutation_policy(
+                            task=task,
+                            tool_name=tc.name,
+                            tool_args=tc.arguments,
+                            workspace=workspace,
+                            prior_successful_tool_calls=historical_successful_tool_calls,
+                            current_tool_calls=tool_calls_record,
+                        )
                     if policy_error:
                         tool_result = ToolResult.fail(policy_error)
                     else:
@@ -2098,6 +2125,20 @@ class SubtaskRunner:
                                 subtask_id=subtask.id,
                                 auth_context=auth_context,
                                 execution_surface=execution_surface,
+                            )
+                        if (
+                            is_mutating_tool
+                            and not deduped
+                            and tool_result.success
+                        ):
+                            self._reseal_tracked_artifacts_after_mutation(
+                                task=task,
+                                workspace=workspace,
+                                tool_name=tc.name,
+                                tool_args=tc.arguments,
+                                tool_result=tool_result,
+                                subtask_id=subtask.id,
+                                tool_call_id=str(getattr(tc, "id", "") or ""),
                             )
                         if (
                             self._enable_mutation_idempotency
@@ -2322,6 +2363,11 @@ class SubtaskRunner:
             tool_calls=tool_calls_record,
             evidence_tool_calls=evidence_tool_calls,
             evidence_records=combined_evidence_records,
+            validity_contract=(
+                dict(subtask.validity_contract_snapshot)
+                if isinstance(subtask.validity_contract_snapshot, dict)
+                else {}
+            ),
             workspace=workspace,
             tier=subtask.verification_tier,
             task_id=task.id,
@@ -2927,6 +2973,340 @@ class SubtaskRunner:
                 "Do not rename or delete files during retry."
             )
         return None
+
+    @staticmethod
+    def _artifact_seal_registry(task: Task) -> dict[str, dict[str, object]]:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        registry = metadata.get("artifact_seals")
+        if not isinstance(registry, dict):
+            registry = {}
+            metadata["artifact_seals"] = registry
+        task.metadata = metadata
+        return registry
+
+    @staticmethod
+    def _seal_timestamp_is_after(candidate: str, baseline: str) -> bool:
+        candidate_text = str(candidate or "").strip()
+        baseline_text = str(baseline or "").strip()
+        if not candidate_text:
+            return False
+        if not baseline_text:
+            return True
+        try:
+            return datetime.fromisoformat(candidate_text) > datetime.fromisoformat(baseline_text)
+        except Exception:
+            return candidate_text > baseline_text
+
+    @staticmethod
+    def _verification_outcome_for_subtask(task: Task, subtask_id: str) -> str:
+        if not subtask_id:
+            return ""
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            return ""
+        scorecard = metadata.get("validity_scorecard")
+        if not isinstance(scorecard, dict):
+            return ""
+        per_subtask = scorecard.get("subtask_metrics")
+        if not isinstance(per_subtask, dict):
+            return ""
+        entry = per_subtask.get(subtask_id)
+        if not isinstance(entry, dict):
+            return ""
+        return str(entry.get("verification_outcome", "") or "").strip().lower()
+
+    @classmethod
+    def _seal_origin_is_verified(
+        cls,
+        *,
+        task: Task,
+        seal: dict[str, object] | None,
+    ) -> bool:
+        if not isinstance(seal, dict):
+            return False
+        if bool(seal.get("verified_origin", False)):
+            return True
+        explicit_outcome = str(seal.get("verification_outcome", "") or "").strip().lower()
+        if explicit_outcome in cls._VERIFIED_SEAL_OUTCOMES:
+            return True
+        subtask_id = str(seal.get("subtask_id", "") or "").strip()
+        if not subtask_id:
+            return False
+        outcome = cls._verification_outcome_for_subtask(task, subtask_id)
+        return outcome in cls._VERIFIED_SEAL_OUTCOMES
+
+    @classmethod
+    def _is_confirmation_evidence_call(cls, call: ToolCallRecord) -> bool:
+        if not isinstance(call, ToolCallRecord):
+            return False
+        if not bool(getattr(call.result, "success", False)):
+            return False
+        tool_name = str(getattr(call, "tool", "") or "").strip().lower()
+        if tool_name not in cls._SEAL_CONFIRMATION_EVIDENCE_TOOLS:
+            return False
+        if tool_name == "spreadsheet":
+            operation = str(call.args.get("operation", "")).strip().lower()
+            return operation in {"read", "summary"}
+        return True
+
+    @classmethod
+    def _has_post_seal_confirmation_evidence(
+        cls,
+        *,
+        baseline_timestamp: str,
+        prior_successful_tool_calls: list[ToolCallRecord],
+        current_tool_calls: list[ToolCallRecord],
+    ) -> bool:
+        for call in [*prior_successful_tool_calls, *current_tool_calls]:
+            if not cls._is_confirmation_evidence_call(call):
+                continue
+            timestamp = str(getattr(call, "timestamp", "") or "").strip()
+            if (
+                baseline_timestamp
+                and not cls._seal_timestamp_is_after(timestamp, baseline_timestamp)
+            ):
+                continue
+            return True
+        return False
+
+    @classmethod
+    def _latest_seal_timestamp(
+        cls,
+        protected_paths: list[tuple[str, dict[str, object]]],
+    ) -> str:
+        latest = ""
+        for _path, seal in protected_paths:
+            if not isinstance(seal, dict):
+                continue
+            sealed_at = str(seal.get("sealed_at", "") or "").strip()
+            if not sealed_at:
+                continue
+            if cls._seal_timestamp_is_after(sealed_at, latest):
+                latest = sealed_at
+        return latest
+
+    @classmethod
+    def _validate_sealed_artifact_mutation_policy(
+        cls,
+        *,
+        task: Task,
+        tool_name: str,
+        tool_args: dict,
+        workspace: Path | None,
+        prior_successful_tool_calls: list[ToolCallRecord],
+        current_tool_calls: list[ToolCallRecord],
+    ) -> str | None:
+        paths = cls._target_paths_for_policy(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            workspace=workspace,
+        )
+        if not paths:
+            return None
+
+        seals = cls._artifact_seal_registry(task)
+        protected_paths: list[tuple[str, dict[str, object]]] = []
+        for path in paths:
+            seal = seals.get(path)
+            if not isinstance(seal, dict):
+                continue
+            if not str(seal.get("sha256", "") or "").strip():
+                continue
+            if not cls._seal_origin_is_verified(task=task, seal=seal):
+                continue
+            protected_paths.append((path, seal))
+        if not protected_paths:
+            return None
+
+        latest_seal = cls._latest_seal_timestamp(protected_paths)
+        has_confirmation = cls._has_post_seal_confirmation_evidence(
+            baseline_timestamp=latest_seal,
+            prior_successful_tool_calls=prior_successful_tool_calls,
+            current_tool_calls=current_tool_calls,
+        )
+        if has_confirmation:
+            return None
+
+        unique_paths = []
+        seen: set[str] = set()
+        for path, _seal in protected_paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            unique_paths.append(path)
+        path_preview = ", ".join(unique_paths[:3])
+        if len(unique_paths) > 3:
+            path_preview = f"{path_preview}, ..."
+        if latest_seal:
+            return (
+                "Sealed artifact edit blocked: target is sealed and verified "
+                f"({path_preview}) but no confirmation evidence was recorded "
+                f"after seal time {latest_seal}. "
+                "Gather evidence first (for example: read_file, web_search/web_fetch, "
+                "or fact_checker), then retry the edit."
+            )
+        return (
+            "Sealed artifact edit blocked: target is sealed and verified "
+            f"({path_preview}) but no confirmation evidence is recorded in this subtask. "
+            "Gather evidence first (for example: read_file, web_search/web_fetch, "
+            "or fact_checker), then retry the edit."
+        )
+
+    @classmethod
+    def _mutation_paths_for_reseal(
+        cls,
+        *,
+        tool_name: str,
+        tool_args: dict,
+        workspace: Path | None,
+        tool_result: ToolResult,
+    ) -> list[str]:
+        paths = cls._target_paths_for_policy(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            workspace=workspace,
+        )
+        seen = set(paths)
+        for raw in tool_result.files_changed:
+            normalized = cls._normalize_path_for_policy(str(raw), workspace)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            paths.append(normalized)
+        return paths
+
+    @classmethod
+    def _reseal_tracked_artifacts_after_mutation(
+        cls,
+        *,
+        task: Task,
+        workspace: Path | None,
+        tool_name: str,
+        tool_args: dict,
+        tool_result: ToolResult,
+        subtask_id: str,
+        tool_call_id: str,
+    ) -> int:
+        if workspace is None or tool_result is None or not tool_result.success:
+            return 0
+
+        seals = cls._artifact_seal_registry(task)
+        if not seals:
+            return 0
+
+        affected_paths = cls._mutation_paths_for_reseal(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            workspace=workspace,
+            tool_result=tool_result,
+        )
+        if not affected_paths:
+            return 0
+
+        normalized_tool = str(tool_name or "").strip().lower()
+        move_source = cls._normalize_path_for_policy(str(tool_args.get("source", "")), workspace)
+        move_destination = cls._normalize_path_for_policy(
+            str(tool_args.get("destination", "")),
+            workspace,
+        )
+        source_seal = seals.get(move_source)
+        source_was_verified = (
+            normalized_tool == "move_file"
+            and isinstance(source_seal, dict)
+            and cls._seal_origin_is_verified(task=task, seal=source_seal)
+        )
+
+        tracked_paths: list[str] = []
+        seen: set[str] = set()
+        for path in affected_paths:
+            if path in seen:
+                continue
+            if path in seals:
+                tracked_paths.append(path)
+                seen.add(path)
+                continue
+            if (
+                normalized_tool == "move_file"
+                and path == move_destination
+                and move_source in seals
+            ):
+                tracked_paths.append(path)
+                seen.add(path)
+
+        if not tracked_paths:
+            return 0
+
+        try:
+            workspace_resolved = workspace.resolve()
+        except Exception:
+            return 0
+
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        run_id = str(metadata.get("run_id", "") or "").strip() if isinstance(metadata, dict) else ""
+        resealed_at = datetime.now().isoformat()
+        updated = 0
+
+        for relpath in tracked_paths:
+            previous = seals.get(relpath)
+            previous_dict = dict(previous) if isinstance(previous, dict) else {}
+            verified_origin = cls._seal_origin_is_verified(task=task, seal=previous_dict)
+            if (
+                normalized_tool == "move_file"
+                and relpath == move_destination
+                and source_was_verified
+            ):
+                verified_origin = True
+            try:
+                artifact_path = (workspace_resolved / relpath).resolve()
+                artifact_path.relative_to(workspace_resolved)
+            except Exception:
+                continue
+
+            if not artifact_path.exists() or not artifact_path.is_file():
+                if relpath in seals:
+                    seals.pop(relpath, None)
+                    updated += 1
+                continue
+
+            try:
+                payload = artifact_path.read_bytes()
+            except Exception:
+                continue
+
+            observed_sha = hashlib.sha256(payload).hexdigest()
+            previous_sha = str(previous_dict.get("sha256", "") or "").strip()
+
+            next_seal = dict(previous_dict)
+            next_seal.update({
+                "path": relpath,
+                "sha256": observed_sha,
+                "size_bytes": int(len(payload)),
+                "tool": normalized_tool,
+                "tool_call_id": str(tool_call_id or ""),
+                "subtask_id": str(subtask_id or ""),
+                "sealed_at": resealed_at,
+                "resealed_after_mutation": True,
+                "resealed_reason": "post_edit_evidence_confirmed",
+            })
+            if run_id:
+                next_seal["run_id"] = run_id
+            if previous_sha and previous_sha != observed_sha:
+                next_seal["previous_sha256"] = previous_sha
+            else:
+                next_seal.pop("previous_sha256", None)
+            if verified_origin:
+                next_seal["verified_origin"] = True
+            else:
+                next_seal.pop("verified_origin", None)
+
+            seals[relpath] = next_seal
+            updated += 1
+
+        if updated > 0:
+            task.metadata["artifact_seals"] = seals
+        return updated
 
     def _tool_output_limit(self, tool_name: str) -> int:
         heavy_limit = int(

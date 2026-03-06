@@ -478,3 +478,88 @@ CREATE INDEX IF NOT EXISTS idx_iteration_gate_results_loop
     ON iteration_gate_results(loop_run_id, attempt_index);
 CREATE INDEX IF NOT EXISTS idx_iteration_gate_results_task
     ON iteration_gate_results(task_id, subtask_id, gate_id);
+
+-- Claim/evidence validity lineage
+CREATE TABLE IF NOT EXISTS artifact_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    run_id TEXT DEFAULT '',
+    subtask_id TEXT NOT NULL,
+    phase_id TEXT DEFAULT '',
+    claim_id TEXT NOT NULL,
+    claim_text TEXT NOT NULL,
+    claim_type TEXT DEFAULT 'qualitative',
+    criticality TEXT DEFAULT 'important',
+    lifecycle_state TEXT NOT NULL,
+    reason_code TEXT DEFAULT '',
+    metadata TEXT,                              -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_claims_task_subtask
+    ON artifact_claims(task_id, subtask_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_artifact_claims_claim_id
+    ON artifact_claims(claim_id);
+
+CREATE TABLE IF NOT EXISTS claim_evidence_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    run_id TEXT DEFAULT '',
+    subtask_id TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    link_type TEXT DEFAULT 'supporting',
+    score REAL DEFAULT 0.0,
+    metadata TEXT,                              -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_evidence_links_task_subtask
+    ON claim_evidence_links(task_id, subtask_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_claim_evidence_links_claim
+    ON claim_evidence_links(claim_id);
+
+CREATE TABLE IF NOT EXISTS claim_verification_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    run_id TEXT DEFAULT '',
+    subtask_id TEXT NOT NULL,
+    phase_id TEXT DEFAULT '',
+    claim_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason_code TEXT DEFAULT '',
+    verifier TEXT DEFAULT '',
+    confidence REAL DEFAULT 0.0,
+    metadata TEXT,                              -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_verification_results_task_subtask
+    ON claim_verification_results(task_id, subtask_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_claim_verification_results_claim
+    ON claim_verification_results(claim_id);
+
+CREATE TABLE IF NOT EXISTS artifact_validity_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    run_id TEXT DEFAULT '',
+    subtask_id TEXT NOT NULL,
+    phase_id TEXT DEFAULT '',
+    extracted_count INTEGER NOT NULL DEFAULT 0,
+    supported_count INTEGER NOT NULL DEFAULT 0,
+    contradicted_count INTEGER NOT NULL DEFAULT 0,
+    insufficient_evidence_count INTEGER NOT NULL DEFAULT 0,
+    pruned_count INTEGER NOT NULL DEFAULT 0,
+    supported_ratio REAL NOT NULL DEFAULT 0.0,
+    gate_decision TEXT DEFAULT '',
+    reason_code TEXT DEFAULT '',
+    metadata TEXT,                              -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_validity_summaries_task_subtask
+    ON artifact_validity_summaries(task_id, subtask_id, created_at);

@@ -2082,7 +2082,74 @@ class LoomApp(App):
         try:
             return shlex.split(raw)
         except ValueError as e:
-            raise ValueError(f"Invalid quoted argument syntax: {e}") from e
+            # Compatibility fallback: keep apostrophes inside words (e.g. "don't")
+            # without forcing users to escape them in slash commands.
+            try:
+                tokens = shlex.split(raw, posix=False)
+            except ValueError:
+                tokens = LoomApp._split_slash_args_forgiving(raw)
+                if tokens:
+                    return tokens
+                raise ValueError(f"Invalid quoted argument syntax: {e}") from e
+            normalized: list[str] = []
+            for token in tokens:
+                text = str(token or "")
+                if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+                    normalized.append(text[1:-1])
+                else:
+                    normalized.append(text)
+            return normalized
+
+    @staticmethod
+    def _split_slash_args_forgiving(raw: str) -> list[str]:
+        """Best-effort tokenizer that never fails on unmatched quote punctuation."""
+        tokens: list[str] = []
+        current: list[str] = []
+        quote: str | None = None
+        open_quote: str | None = None
+        escaped = False
+        for char in str(raw or ""):
+            if quote is not None:
+                if escaped:
+                    current.append(char)
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = True
+                    continue
+                if char == quote:
+                    quote = None
+                    open_quote = None
+                    continue
+                current.append(char)
+                continue
+
+            if char.isspace():
+                if current:
+                    tokens.append("".join(current))
+                    current = []
+                continue
+
+            if char in {"'", '"'}:
+                # Only treat quote chars as wrappers at token boundary. Apostrophes
+                # and quote punctuation inside words remain literal characters.
+                if not current:
+                    quote = char
+                    open_quote = char
+                else:
+                    current.append(char)
+                continue
+
+            current.append(char)
+
+        if escaped:
+            current.append("\\")
+        if quote is not None and open_quote is not None:
+            # Unclosed leading quote: preserve it as literal punctuation.
+            current.insert(0, open_quote)
+        if current:
+            tokens.append("".join(current))
+        return tokens
 
     @staticmethod
     def _split_tool_slash_args(raw: str) -> tuple[str, str]:
@@ -2641,8 +2708,33 @@ class LoomApp(App):
             }
             for phase in list(process_defn.phases)
         ]
+        verification_policy = getattr(process_defn, "verification_policy", None)
+        static_checks = (
+            dict(getattr(verification_policy, "static_checks", {}))
+            if isinstance(getattr(verification_policy, "static_checks", {}), dict)
+            else {}
+        )
+        semantic_checks_raw = getattr(verification_policy, "semantic_checks", [])
+        semantic_checks = (
+            [item for item in semantic_checks_raw if isinstance(item, dict)]
+            if isinstance(semantic_checks_raw, list)
+            else []
+        )
+        output_contract = (
+            dict(getattr(verification_policy, "output_contract", {}))
+            if isinstance(getattr(verification_policy, "output_contract", {}), dict)
+            else {}
+        )
+        outcome_policy = (
+            dict(getattr(verification_policy, "outcome_policy", {}))
+            if isinstance(getattr(verification_policy, "outcome_policy", {}), dict)
+            else {}
+        )
         return {
             "intent": cls._infer_adhoc_intent_from_phases(phases),
+            "risk_level": ProcessDefinition._normalize_risk_level(
+                getattr(process_defn, "risk_level", ""),
+            ),
             "name": str(process_defn.name or "").strip(),
             "description": str(process_defn.description or "").strip(),
             "persona": str(process_defn.persona or "").strip(),
@@ -2658,6 +2750,20 @@ class LoomApp(App):
                 for item in recommended_tools
                 if str(item).strip()
             ],
+            "validity_contract": (
+                dict(getattr(process_defn, "validity_contract", {}))
+                if isinstance(getattr(process_defn, "validity_contract", {}), dict)
+                else {}
+            ),
+            "verification_policy": {
+                "mode": str(getattr(verification_policy, "mode", "llm_first") or "llm_first")
+                .strip()
+                .lower(),
+                "static_checks": static_checks,
+                "semantic_checks": semantic_checks,
+                "output_contract": output_contract,
+                "outcome_policy": outcome_policy,
+            },
             "phases": phases,
         }
 
@@ -3015,6 +3121,16 @@ class LoomApp(App):
             return fallback
         return "research"
 
+    @staticmethod
+    def _normalize_adhoc_risk_level(risk_level: str, *, default: str = "") -> str:
+        """Normalize ad hoc risk level to the process schema enum."""
+        from loom.processes.schema import ProcessDefinition
+
+        normalized = ProcessDefinition._normalize_risk_level(risk_level)
+        if normalized:
+            return normalized
+        return ProcessDefinition._normalize_risk_level(default)
+
     @classmethod
     def _infer_adhoc_intent_from_phases(cls, phases: list[dict[str, Any]]) -> str:
         """Infer intent from phase semantics when explicit intent is unavailable."""
@@ -3053,6 +3169,40 @@ class LoomApp(App):
                 return cls._infer_adhoc_intent_from_phases(phase_rows)
         return "research"
 
+    @classmethod
+    def _resolve_adhoc_risk_level(
+        cls,
+        *,
+        goal: str,
+        intent: str,
+        raw: dict[str, Any] | None,
+    ) -> str:
+        """Resolve risk level from explicit model field, then goal heuristics."""
+        if isinstance(raw, dict):
+            for key in ("risk_level", "risk", "domain_risk"):
+                candidate = cls._normalize_adhoc_risk_level(str(raw.get(key, "")))
+                if candidate:
+                    return candidate
+
+        goal_text = str(goal or "").strip().lower()
+        high_risk_tokens = (
+            "investment",
+            "investing",
+            "finance",
+            "financial",
+            "medical",
+            "medicine",
+            "healthcare",
+            "legal",
+            "law",
+            "compliance",
+        )
+        if any(token in goal_text for token in high_risk_tokens):
+            return "high"
+        if intent in {"research", "writing"}:
+            return "medium"
+        return "low"
+
     @staticmethod
     def _adhoc_intent_progression(intent: str) -> str:
         """Return phase progression guidance for the inferred intent."""
@@ -3070,6 +3220,118 @@ class LoomApp(App):
             "scope -> source planning -> evidence collection -> "
             "analysis/synthesis -> verification -> final delivery"
         )
+
+    @staticmethod
+    def _adhoc_default_validity_contract(intent: str, risk_level: str) -> dict[str, Any]:
+        """Return intent-aware validity defaults for ad hoc process synthesis."""
+        normalized_intent = str(intent or "").strip().lower()
+        normalized_risk = LoomApp._normalize_adhoc_risk_level(risk_level)
+        high_risk = normalized_risk in {"high", "critical"}
+        require_fact_checker = bool(high_risk)
+        min_supported_ratio = 0.8 if normalized_intent in {"research", "writing"} else 0.65
+        max_unverified_ratio = 0.2 if normalized_intent in {"research", "writing"} else 0.35
+        if high_risk:
+            min_supported_ratio = max(min_supported_ratio, 0.8)
+            max_unverified_ratio = min(max_unverified_ratio, 0.2)
+        temporal_consistency = {
+            "enabled": bool(high_risk),
+            "require_as_of_alignment": bool(high_risk),
+            "enforce_cross_claim_date_conflict_check": bool(high_risk),
+            "max_source_age_days": 365 if high_risk else 0,
+            "as_of": "",
+        }
+        contract = {
+            "enabled": True,
+            "claim_extraction": {"enabled": True},
+            "critical_claim_types": ["numeric", "date", "entity_fact"],
+            "min_supported_ratio": min_supported_ratio,
+            "max_unverified_ratio": max_unverified_ratio,
+            "max_contradicted_count": 0,
+            "prune_mode": "rewrite_uncertainty",
+            "require_fact_checker_for_synthesis": require_fact_checker,
+            "final_gate": {
+                "enforce_verified_context_only": True,
+                "synthesis_min_verification_tier": 2,
+                "critical_claim_support_ratio": 1.0,
+                "temporal_consistency": temporal_consistency,
+            },
+        }
+        if normalized_intent == "build":
+            contract["critical_claim_types"] = ["numeric", "date"]
+            contract["prune_mode"] = "drop"
+        return contract
+
+    @staticmethod
+    def _adhoc_default_verification_policy() -> dict[str, Any]:
+        """Return verification policy defaults for synthesized ad hoc processes."""
+        return {
+            "mode": "llm_first",
+            "static_checks": {
+                # Keep safety/integrity failures hard while avoiding brittle
+                # hard-fails from incidental tool errors during remediation.
+                "tool_success_policy": "safety_integrity_only",
+            },
+            "semantic_checks": [],
+            "output_contract": {},
+            "outcome_policy": {},
+        }
+
+    @staticmethod
+    def _merge_adhoc_verification_policy(
+        base: dict[str, Any],
+        incoming: object,
+    ) -> dict[str, Any]:
+        """Merge model-provided verification policy into ad hoc defaults."""
+        merged = {
+            "mode": str(base.get("mode", "llm_first") or "llm_first").strip().lower(),
+            "static_checks": (
+                dict(base.get("static_checks", {}))
+                if isinstance(base.get("static_checks", {}), dict)
+                else {}
+            ),
+            "semantic_checks": (
+                [item for item in base.get("semantic_checks", []) if isinstance(item, dict)]
+                if isinstance(base.get("semantic_checks", []), list)
+                else []
+            ),
+            "output_contract": (
+                dict(base.get("output_contract", {}))
+                if isinstance(base.get("output_contract", {}), dict)
+                else {}
+            ),
+            "outcome_policy": (
+                dict(base.get("outcome_policy", {}))
+                if isinstance(base.get("outcome_policy", {}), dict)
+                else {}
+            ),
+        }
+        if not isinstance(incoming, dict):
+            return merged
+
+        mode = str(incoming.get("mode", "") or "").strip().lower()
+        if mode in {"llm_first", "static_first"}:
+            merged["mode"] = mode
+
+        static_checks = incoming.get("static_checks")
+        if isinstance(static_checks, dict):
+            for key, value in static_checks.items():
+                merged["static_checks"][str(key)] = value
+
+        semantic_checks = incoming.get("semantic_checks")
+        if isinstance(semantic_checks, list):
+            merged["semantic_checks"] = [
+                item for item in semantic_checks if isinstance(item, dict)
+            ]
+
+        output_contract = incoming.get("output_contract")
+        if isinstance(output_contract, dict):
+            merged["output_contract"].update(output_contract)
+
+        outcome_policy = incoming.get("outcome_policy")
+        if isinstance(outcome_policy, dict):
+            merged["outcome_policy"].update(outcome_policy)
+
+        return merged
 
     @staticmethod
     def _adhoc_intent_phase_blueprint(intent: str, slug: str) -> list[dict[str, Any]]:
@@ -3344,9 +3606,15 @@ class LoomApp(App):
             for name in recommended_by_intent.get(resolved_intent, [])
             if name not in available
         ]
+        resolved_risk_level = self._resolve_adhoc_risk_level(
+            goal=goal,
+            intent=resolved_intent,
+            raw=None,
+        )
         return {
             "source": "fallback_template",
             "intent": resolved_intent,
+            "risk_level": resolved_risk_level,
             "name": f"{slug}-adhoc",
             "description": f"Ad hoc process synthesized for goal: {goal.strip()}",
             "persona": (
@@ -3362,6 +3630,11 @@ class LoomApp(App):
             ),
             "required_tools": required_tools,
             "recommended_tools": recommended,
+            "validity_contract": self._adhoc_default_validity_contract(
+                resolved_intent,
+                resolved_risk_level,
+            ),
+            "verification_policy": self._adhoc_default_verification_policy(),
             "phases": self._adhoc_intent_phase_blueprint(resolved_intent, slug),
         }
 
@@ -3376,12 +3649,55 @@ class LoomApp(App):
     ) -> dict[str, Any]:
         """Normalize model-produced ad hoc process spec into safe structure."""
         resolved_intent = self._resolve_adhoc_intent(raw, intent_hint=intent)
+        resolved_risk_level = self._resolve_adhoc_risk_level(
+            goal=goal,
+            intent=resolved_intent,
+            raw=raw,
+        )
         fallback = self._fallback_adhoc_spec(
             goal,
             available_tools=available_tools,
             intent=resolved_intent,
         )
+        fallback["risk_level"] = resolved_risk_level
+        from loom.processes.schema import ProcessDefinition
+
+        fallback_validity = self._adhoc_default_validity_contract(
+            resolved_intent,
+            resolved_risk_level,
+        )
+        fallback["validity_contract"] = fallback_validity
+        fallback_verification_policy = self._adhoc_default_verification_policy()
+        fallback["verification_policy"] = fallback_verification_policy
+        baseline_validity_contract = ProcessDefinition._normalize_validity_contract(
+            fallback.get("validity_contract", {}),
+        )
+        baseline_verification_policy = self._merge_adhoc_verification_policy(
+            fallback_verification_policy,
+            {},
+        )
+        raw_validity_contract: object = {}
+        if isinstance(raw, dict):
+            raw_validity_contract = raw.get("validity_contract", {})
+        if isinstance(raw_validity_contract, bool):
+            raw_validity_contract = {"enabled": raw_validity_contract}
+        if isinstance(raw_validity_contract, dict) and raw_validity_contract:
+            validity_contract = ProcessDefinition._merge_validity_contract(
+                baseline_validity_contract,
+                raw_validity_contract,
+            )
+        else:
+            validity_contract = baseline_validity_contract
+        raw_verification_policy: object = {}
+        if isinstance(raw, dict):
+            raw_verification_policy = raw.get("verification_policy", {})
+        verification_policy = self._merge_adhoc_verification_policy(
+            baseline_verification_policy,
+            raw_verification_policy,
+        )
         if not isinstance(raw, dict):
+            fallback["validity_contract"] = validity_contract
+            fallback["verification_policy"] = verification_policy
             return fallback
 
         raw_synthesis = self._sanitize_synthesis_trace(
@@ -3529,6 +3845,7 @@ class LoomApp(App):
         return {
             "source": source,
             "intent": resolved_intent,
+            "risk_level": resolved_risk_level,
             "name": name,
             "description": description,
             "persona": persona,
@@ -3536,6 +3853,8 @@ class LoomApp(App):
             "tool_guidance": tool_guidance,
             "required_tools": required_tools,
             "recommended_tools": recommended_tools,
+            "validity_contract": validity_contract,
+            "verification_policy": verification_policy,
             "phases": phases,
             "_synthesis": raw_synthesis,
         }
@@ -3548,7 +3867,12 @@ class LoomApp(App):
         spec: dict[str, Any],
     ) -> AdhocProcessCacheEntry:
         """Build a cached ad hoc process entry from normalized spec."""
-        from loom.processes.schema import PhaseTemplate, ProcessDefinition, ToolRequirements
+        from loom.processes.schema import (
+            PhaseTemplate,
+            ProcessDefinition,
+            ToolRequirements,
+            VerificationPolicyContract,
+        )
 
         phases = [
             PhaseTemplate(
@@ -3571,11 +3895,16 @@ class LoomApp(App):
             for phase in spec.get("phases", [])
             if isinstance(phase, dict)
         ]
+        verification_policy_raw = self._merge_adhoc_verification_policy(
+            self._adhoc_default_verification_policy(),
+            spec.get("verification_policy", {}),
+        )
         process_defn = ProcessDefinition(
             name=str(spec.get("name", "")).strip() or f"adhoc-{key[:8]}",
             version="adhoc-1",
             description=str(spec.get("description", "")).strip(),
             persona=str(spec.get("persona", "")).strip(),
+            risk_level=self._normalize_adhoc_risk_level(str(spec.get("risk_level", ""))),
             tool_guidance=str(spec.get("tool_guidance", "")).strip(),
             tools=ToolRequirements(
                 required=[
@@ -3586,6 +3915,54 @@ class LoomApp(App):
             ),
             phase_mode=str(spec.get("phase_mode", "guided")).strip() or "guided",
             phases=phases,
+            validity_contract=(
+                dict(spec.get("validity_contract", {}))
+                if isinstance(spec.get("validity_contract", {}), dict)
+                else {}
+            ),
+            verification_policy=VerificationPolicyContract(
+                mode=(
+                    str(verification_policy_raw.get("mode", "llm_first") or "llm_first")
+                    .strip()
+                    .lower()
+                    or "llm_first"
+                ),
+                static_checks=(
+                    dict(verification_policy_raw.get("static_checks", {}))
+                    if isinstance(
+                        verification_policy_raw.get("static_checks", {}),
+                        dict,
+                    )
+                    else {}
+                ),
+                semantic_checks=(
+                    [
+                        item
+                        for item in (
+                            verification_policy_raw.get("semantic_checks", [])
+                            if isinstance(verification_policy_raw.get("semantic_checks", []), list)
+                            else []
+                        )
+                        if isinstance(item, dict)
+                    ]
+                ),
+                output_contract=(
+                    dict(verification_policy_raw.get("output_contract", {}))
+                    if isinstance(
+                        verification_policy_raw.get("output_contract", {}),
+                        dict,
+                    )
+                    else {}
+                ),
+                outcome_policy=(
+                    dict(verification_policy_raw.get("outcome_policy", {}))
+                    if isinstance(
+                        verification_policy_raw.get("outcome_policy", {}),
+                        dict,
+                    )
+                    else {}
+                ),
+            ),
             tags=["adhoc", "generated"],
         )
         try:

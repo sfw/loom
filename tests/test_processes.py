@@ -1666,6 +1666,210 @@ class TestProcessDefinitionEdgeCases:
             phase_scope_default="current_phase",
         ) is True
 
+    def test_resolve_validity_contract_merges_phase_floor(self):
+        defn = ProcessDefinition(
+            name="validity-merge",
+            validity_contract={
+                "enabled": True,
+                "claim_extraction": {"enabled": True},
+                "min_supported_ratio": 0.7,
+                "max_unverified_ratio": 0.3,
+                "max_contradicted_count": 0,
+                "final_gate": {
+                    "enforce_verified_context_only": True,
+                    "synthesis_min_verification_tier": 2,
+                    "critical_claim_support_ratio": 0.9,
+                },
+            },
+            phases=[
+                PhaseTemplate(
+                    id="final-phase",
+                    description="final",
+                    is_synthesis=True,
+                    validity_contract={
+                        "min_supported_ratio": 0.85,
+                        "max_unverified_ratio": 0.15,
+                        "require_fact_checker_for_synthesis": True,
+                        "final_gate": {
+                            "synthesis_min_verification_tier": 3,
+                            "critical_claim_support_ratio": 1.0,
+                        },
+                    },
+                ),
+            ],
+        )
+
+        resolved = defn.resolve_validity_contract_for_phase("final-phase", is_synthesis=True)
+
+        assert resolved["enabled"] is True
+        assert resolved["claim_extraction"]["enabled"] is True
+        assert resolved["min_supported_ratio"] == 0.85
+        assert resolved["max_unverified_ratio"] == 0.15
+        assert resolved["require_fact_checker_for_synthesis"] is True
+        assert resolved["final_gate"]["enforce_verified_context_only"] is True
+        assert resolved["final_gate"]["synthesis_min_verification_tier"] == 3
+        assert resolved["final_gate"]["critical_claim_support_ratio"] == 1.0
+
+    def test_resolve_validity_contract_applies_defined_default_floor_when_missing(self):
+        defn = ProcessDefinition(
+            name="generic-process",
+            phases=[
+                PhaseTemplate(
+                    id="final-phase",
+                    description="final",
+                    is_synthesis=True,
+                ),
+            ],
+        )
+
+        resolved = defn.resolve_validity_contract_for_phase("final-phase", is_synthesis=True)
+
+        assert resolved["enabled"] is True
+        assert resolved["claim_extraction"]["enabled"] is True
+        assert resolved["max_contradicted_count"] == 0
+        assert resolved["final_gate"]["enforce_verified_context_only"] is True
+        assert resolved["final_gate"]["synthesis_min_verification_tier"] >= 2
+
+    def test_high_risk_defined_process_floor_enforces_strict_claim_gates(self):
+        defn = ProcessDefinition(
+            name="investment-analysis",
+            tags=["finance"],
+            phases=[
+                PhaseTemplate(
+                    id="final-phase",
+                    description="final",
+                    is_synthesis=True,
+                ),
+            ],
+        )
+
+        resolved = defn.resolve_validity_contract_for_phase("final-phase", is_synthesis=True)
+        assert resolved["min_supported_ratio"] >= 0.8
+        assert resolved["max_unverified_ratio"] <= 0.2
+        assert resolved["max_contradicted_count"] == 0
+        assert resolved["claim_extraction"]["enabled"] is True
+        assert resolved["require_fact_checker_for_synthesis"] is True
+        assert resolved["final_gate"]["critical_claim_support_ratio"] >= 1.0
+        temporal = resolved["final_gate"].get("temporal_consistency", {})
+        assert temporal.get("enabled") is True
+        assert temporal.get("require_as_of_alignment") is True
+
+    def test_explicit_high_risk_level_enforces_high_rigor_floor(self):
+        defn = ProcessDefinition(
+            name="custom-recommendation",
+            risk_level="high",
+            phases=[
+                PhaseTemplate(
+                    id="final-phase",
+                    description="final",
+                    is_synthesis=True,
+                ),
+            ],
+        )
+
+        resolved = defn.resolve_validity_contract_for_phase("final-phase", is_synthesis=True)
+        assert resolved["min_supported_ratio"] >= 0.8
+        assert resolved["max_unverified_ratio"] <= 0.2
+        assert resolved["max_contradicted_count"] == 0
+        assert resolved["require_fact_checker_for_synthesis"] is True
+        temporal = resolved["final_gate"].get("temporal_consistency", {})
+        assert temporal.get("enabled") is True
+
+    def test_explicit_low_risk_level_overrides_name_token_heuristic(self):
+        defn = ProcessDefinition(
+            name="investment-analysis",
+            risk_level="low",
+            phases=[
+                PhaseTemplate(
+                    id="final-phase",
+                    description="final",
+                    is_synthesis=True,
+                ),
+            ],
+        )
+
+        resolved = defn.resolve_validity_contract_for_phase("final-phase", is_synthesis=True)
+        assert resolved["min_supported_ratio"] == 0.65
+        assert resolved["max_unverified_ratio"] == 0.35
+        temporal = resolved["final_gate"].get("temporal_consistency", {})
+        assert temporal.get("enabled") is False
+
+    def test_loader_rejects_invalid_validity_contract_values(self, tmp_path):
+        yaml_content = """\
+name: invalid-validity
+version: "1.0"
+validity_contract:
+  enabled: true
+  min_supported_ratio: 1.5
+  final_gate:
+    synthesis_min_verification_tier: 0
+"""
+        f = tmp_path / "invalid-validity.yaml"
+        f.write_text(yaml_content)
+        loader = ProcessLoader()
+        with pytest.raises(ProcessValidationError) as exc_info:
+            loader.load(str(f))
+        errors = exc_info.value.errors
+        assert any("min_supported_ratio" in err for err in errors)
+
+    def test_loader_rejects_unsafe_high_risk_validity_overrides(self, tmp_path):
+        yaml_content = """\
+name: unsafe-finance
+version: "1.0"
+tags: [finance]
+validity_contract:
+  max_contradicted_count: 2
+  require_fact_checker_for_synthesis: false
+phases:
+  - id: final
+    description: Final synthesis
+    is_synthesis: true
+"""
+        f = tmp_path / "unsafe-finance.yaml"
+        f.write_text(yaml_content)
+        loader = ProcessLoader()
+        with pytest.raises(ProcessValidationError) as exc_info:
+            loader.load(str(f))
+        errors = exc_info.value.errors
+        assert any("high-risk" in err for err in errors)
+        assert any("max_contradicted_count" in err for err in errors)
+        assert any("require_fact_checker_for_synthesis" in err for err in errors)
+
+    def test_loader_rejects_invalid_risk_level(self, tmp_path):
+        yaml_content = """\
+name: invalid-risk-level
+version: "1.0"
+risk_level: urgent
+phases:
+  - id: final
+    description: Final synthesis
+    is_synthesis: true
+"""
+        f = tmp_path / "invalid-risk-level.yaml"
+        f.write_text(yaml_content)
+        loader = ProcessLoader()
+        with pytest.raises(ProcessValidationError) as exc_info:
+            loader.load(str(f))
+        errors = exc_info.value.errors
+        assert any("risk_level must be one of" in err for err in errors)
+
+    def test_loader_rejects_invalid_temporal_consistency_values(self, tmp_path):
+        yaml_content = """\
+name: invalid-temporal
+version: "1.0"
+validity_contract:
+  final_gate:
+    temporal_consistency:
+      max_source_age_days: -2
+"""
+        f = tmp_path / "invalid-temporal.yaml"
+        f.write_text(yaml_content)
+        loader = ProcessLoader()
+        with pytest.raises(ProcessValidationError) as exc_info:
+            loader.load(str(f))
+        errors = exc_info.value.errors
+        assert any("max_source_age_days" in err for err in errors)
+
 
 class TestToolOverlapValidation:
     """Tests for tool required/excluded overlap detection."""

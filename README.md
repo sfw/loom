@@ -282,8 +282,41 @@ missing tools, process activation/task creation fails fast with a clear error.
 
 Process contract v2 is the recommended authoring format (`schema_version: 2`),
 with behavior declared under `verification.policy`, `verification.remediation`,
-`evidence`, and `prompt_contracts`. v1 definitions still load in compatibility
+`evidence`, `validity_contract`, and `prompt_contracts`. v1 definitions still load in compatibility
 mode, with compatibility removal targeted for June 30, 2026.
+
+Current schema additions for process safety/evidence rigor:
+- `risk_level` (`low|medium|high|critical`) to make default rigor floors explicit.
+- `validity_contract` for claim extraction, prune behavior, and synthesis gates.
+- `final_gate.temporal_consistency` for as-of alignment, stale-source checks, and date-conflict detection.
+
+```yaml
+schema_version: 2
+risk_level: high
+validity_contract:
+  enabled: true
+  claim_extraction: { enabled: true }
+  min_supported_ratio: 0.8
+  max_unverified_ratio: 0.2
+  max_contradicted_count: 0
+  prune_mode: rewrite_uncertainty
+  final_gate:
+    enforce_verified_context_only: true
+    synthesis_min_verification_tier: 2
+    critical_claim_support_ratio: 1.0
+    temporal_consistency:
+      enabled: true
+      require_as_of_alignment: true
+      enforce_cross_claim_date_conflict_check: true
+      max_source_age_days: 365
+```
+
+Both ad hoc and defined process runs use the same enforcement path for these
+contracts (claim pruning/intermediate continuation, synthesis gating, and final
+failure on unsupported critical claims). For full authoring + migration guidance,
+see [docs/creating-packages.md](docs/creating-packages.md).
+Run telemetry now includes `run_validity_scorecard` and
+`artifact_seal_validation` for evidence/provenance audits.
 
 ## Adaptive Learning
 

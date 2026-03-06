@@ -228,6 +228,37 @@ class TestTaskStateManager:
         assert loaded.plan.subtasks[0].is_critical_path is True
         assert loaded.plan.subtasks[1].is_synthesis is True
 
+    def test_roundtrip_preserves_subtask_validity_policy_fields(self, tmp_path: Path):
+        mgr = TaskStateManager(tmp_path)
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="verify-policy",
+                    description="Policy-bearing subtask",
+                    model_tier=3,
+                    verification_tier=2,
+                    acceptance_criteria="Must preserve policy fields",
+                    validity_contract_snapshot={
+                        "enabled": True,
+                        "claim_extraction": {"enabled": True},
+                        "final_gate": {"synthesis_min_verification_tier": 2},
+                    },
+                    validity_contract_hash="abc123hash",
+                ),
+            ],
+        )
+        mgr.create(task)
+
+        loaded = mgr.load("test-123")
+        restored = loaded.plan.subtasks[0]
+        assert restored.model_tier == 3
+        assert restored.verification_tier == 2
+        assert restored.acceptance_criteria == "Must preserve policy fields"
+        assert restored.validity_contract_snapshot["enabled"] is True
+        assert restored.validity_contract_snapshot["claim_extraction"]["enabled"] is True
+        assert restored.validity_contract_hash == "abc123hash"
+
     def test_workspace_changes_roundtrip(self, tmp_path: Path):
         mgr = TaskStateManager(tmp_path)
         task = _make_task()

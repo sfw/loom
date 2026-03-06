@@ -908,6 +908,170 @@ class Database:
             normalized.append(parsed)
         return normalized
 
+    # --- Claim/evidence validity lineage ---
+
+    async def insert_artifact_claims(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        claims: list[dict] | None = None,
+    ) -> list[int]:
+        rows = []
+        now = datetime.now().isoformat()
+        for claim in claims or []:
+            if not isinstance(claim, dict):
+                continue
+            claim_id = str(claim.get("claim_id", "") or "").strip()
+            claim_text = str(claim.get("text", "") or "").strip()
+            if not claim_id or not claim_text:
+                continue
+            rows.append((
+                task_id,
+                run_id,
+                subtask_id,
+                phase_id,
+                claim_id,
+                claim_text,
+                str(claim.get("claim_type", "qualitative") or "qualitative"),
+                str(claim.get("criticality", "important") or "important"),
+                str(claim.get("status", "extracted") or "extracted"),
+                str(claim.get("reason_code", "") or ""),
+                json.dumps(claim.get("metadata", {}), ensure_ascii=False, sort_keys=True),
+                now,
+            ))
+        if not rows:
+            return []
+        return await self.execute_many_returning_ids(
+            """INSERT INTO artifact_claims
+               (task_id, run_id, subtask_id, phase_id, claim_id, claim_text, claim_type,
+                criticality, lifecycle_state, reason_code, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+    async def insert_claim_evidence_links(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        links: list[dict] | None = None,
+    ) -> list[int]:
+        rows = []
+        now = datetime.now().isoformat()
+        for link in links or []:
+            if not isinstance(link, dict):
+                continue
+            claim_id = str(link.get("claim_id", "") or "").strip()
+            evidence_id = str(link.get("evidence_id", "") or "").strip()
+            if not claim_id or not evidence_id:
+                continue
+            rows.append((
+                task_id,
+                run_id,
+                subtask_id,
+                claim_id,
+                evidence_id,
+                str(link.get("link_type", "supporting") or "supporting"),
+                float(link.get("score", 0.0) or 0.0),
+                json.dumps(link.get("metadata", {}), ensure_ascii=False, sort_keys=True),
+                now,
+            ))
+        if not rows:
+            return []
+        return await self.execute_many_returning_ids(
+            """INSERT INTO claim_evidence_links
+               (task_id, run_id, subtask_id, claim_id, evidence_id, link_type, score,
+                metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+    async def insert_claim_verification_results(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        results: list[dict] | None = None,
+    ) -> list[int]:
+        rows = []
+        now = datetime.now().isoformat()
+        for result in results or []:
+            if not isinstance(result, dict):
+                continue
+            claim_id = str(result.get("claim_id", "") or "").strip()
+            status = str(result.get("status", "") or "").strip()
+            if not claim_id or not status:
+                continue
+            rows.append((
+                task_id,
+                run_id,
+                subtask_id,
+                phase_id,
+                claim_id,
+                status,
+                str(result.get("reason_code", "") or ""),
+                str(result.get("verifier", "") or ""),
+                float(result.get("confidence", 0.0) or 0.0),
+                json.dumps(result.get("metadata", {}), ensure_ascii=False, sort_keys=True),
+                now,
+            ))
+        if not rows:
+            return []
+        return await self.execute_many_returning_ids(
+            """INSERT INTO claim_verification_results
+               (task_id, run_id, subtask_id, phase_id, claim_id, status, reason_code,
+                verifier, confidence, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+    async def insert_artifact_validity_summary(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        extracted_count: int = 0,
+        supported_count: int = 0,
+        contradicted_count: int = 0,
+        insufficient_evidence_count: int = 0,
+        pruned_count: int = 0,
+        supported_ratio: float = 0.0,
+        gate_decision: str = "",
+        reason_code: str = "",
+        metadata: dict | None = None,
+    ) -> int:
+        return await self.execute_returning_id(
+            """INSERT INTO artifact_validity_summaries
+               (task_id, run_id, subtask_id, phase_id, extracted_count, supported_count,
+                contradicted_count, insufficient_evidence_count, pruned_count, supported_ratio,
+                gate_decision, reason_code, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                task_id,
+                run_id,
+                subtask_id,
+                phase_id,
+                max(0, int(extracted_count)),
+                max(0, int(supported_count)),
+                max(0, int(contradicted_count)),
+                max(0, int(insufficient_evidence_count)),
+                max(0, int(pruned_count)),
+                max(0.0, min(1.0, float(supported_ratio))),
+                str(gate_decision or ""),
+                str(reason_code or ""),
+                json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                datetime.now().isoformat(),
+            ),
+        )
+
     @staticmethod
     def _decode_json_columns(row: dict, columns: tuple[str, ...]) -> dict:
         parsed = dict(row)
@@ -1566,6 +1730,88 @@ class MemoryManager:
 
     async def list_iteration_gate_results(self, *, loop_run_id: str) -> list[dict]:
         return await self._db.list_iteration_gate_results(loop_run_id=loop_run_id)
+
+    async def insert_artifact_claims(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        claims: list[dict] | None = None,
+    ) -> list[int]:
+        return await self._db.insert_artifact_claims(
+            task_id=task_id,
+            run_id=run_id,
+            subtask_id=subtask_id,
+            phase_id=phase_id,
+            claims=claims,
+        )
+
+    async def insert_claim_evidence_links(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        links: list[dict] | None = None,
+    ) -> list[int]:
+        return await self._db.insert_claim_evidence_links(
+            task_id=task_id,
+            run_id=run_id,
+            subtask_id=subtask_id,
+            links=links,
+        )
+
+    async def insert_claim_verification_results(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        results: list[dict] | None = None,
+    ) -> list[int]:
+        return await self._db.insert_claim_verification_results(
+            task_id=task_id,
+            run_id=run_id,
+            subtask_id=subtask_id,
+            phase_id=phase_id,
+            results=results,
+        )
+
+    async def insert_artifact_validity_summary(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        phase_id: str = "",
+        extracted_count: int = 0,
+        supported_count: int = 0,
+        contradicted_count: int = 0,
+        insufficient_evidence_count: int = 0,
+        pruned_count: int = 0,
+        supported_ratio: float = 0.0,
+        gate_decision: str = "",
+        reason_code: str = "",
+        metadata: dict | None = None,
+    ) -> int:
+        return await self._db.insert_artifact_validity_summary(
+            task_id=task_id,
+            run_id=run_id,
+            subtask_id=subtask_id,
+            phase_id=phase_id,
+            extracted_count=extracted_count,
+            supported_count=supported_count,
+            contradicted_count=contradicted_count,
+            insufficient_evidence_count=insufficient_evidence_count,
+            pruned_count=pruned_count,
+            supported_ratio=supported_ratio,
+            gate_decision=gate_decision,
+            reason_code=reason_code,
+            metadata=metadata,
+        )
 
     async def get_mutation_ledger_entry(self, idempotency_key: str) -> dict | None:
         return await self._db.get_mutation_ledger_entry(idempotency_key)

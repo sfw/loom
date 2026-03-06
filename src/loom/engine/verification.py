@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from loom.config import CompactorLimitsConfig, VerificationConfig, VerifierLimit
 from loom.engine.semantic_compactor import SemanticCompactor
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
+    CLAIM_VERIFICATION_SUMMARY,
     MODEL_INVOCATION,
     VERIFICATION_DETERMINISTIC_BLOCK_RATE,
     VERIFICATION_FALSE_NEGATIVE_CANDIDATE,
@@ -193,12 +195,30 @@ class DeterministicVerifier:
             return "all_tools_hard"
         policy = getattr(process, "verification_policy", None)
         static_checks = getattr(policy, "static_checks", {})
-        if not isinstance(static_checks, dict):
-            return "all_tools_hard"
-        raw = str(static_checks.get("tool_success_policy", "") or "").strip().lower()
-        if raw in cls._TOOL_SUCCESS_POLICIES:
-            return raw
+        if isinstance(static_checks, dict):
+            raw = str(static_checks.get("tool_success_policy", "") or "").strip().lower()
+            if raw in cls._TOOL_SUCCESS_POLICIES:
+                return raw
+        if cls._is_adhoc_process(process):
+            # Backward compatibility for cached/generated ad-hoc processes that
+            # predate verification_policy defaults.
+            return "safety_integrity_only"
         return "all_tools_hard"
+
+    @staticmethod
+    def _is_adhoc_process(process: ProcessDefinition) -> bool:
+        tags = getattr(process, "tags", [])
+        if isinstance(tags, list):
+            for tag in tags:
+                if str(tag or "").strip().lower() == "adhoc":
+                    return True
+
+        version = str(getattr(process, "version", "") or "").strip().lower()
+        if version.startswith("adhoc-"):
+            return True
+
+        name = str(getattr(process, "name", "") or "").strip().lower()
+        return name.endswith("-adhoc")
 
     async def verify(
         self,
@@ -951,6 +971,7 @@ class LLMVerifier:
         "read_file",
         "spreadsheet",
         "document_write",
+        "write_file",
     })
     _ARTIFACT_PREVIEW_SUFFIXES = frozenset({
         ".md",
@@ -1186,6 +1207,19 @@ class LLMVerifier:
                 output,
                 max_chars=self._max_tool_output_excerpt_chars,
                 label="verification tool output excerpt (document_write)",
+            )
+            return compacted.strip()
+
+        if tool_name == "write_file":
+            path = str(normalized_args.get("path", "")).strip()
+            raw_content = str(normalized_args.get("content", "")).strip()
+            if not raw_content:
+                return ""
+            prefix = f"Path: {path}\n\n" if path else ""
+            compacted = await self._compact_text(
+                f"{prefix}{raw_content}",
+                max_chars=self._max_tool_output_excerpt_chars,
+                label="verification tool output excerpt (write_file)",
             )
             return compacted.strip()
 
@@ -3532,6 +3566,176 @@ class VerificationGates:
             metadata=metadata,
         )
 
+    @staticmethod
+    def _normalize_claim_type(text: str) -> str:
+        value = str(text or "")
+        lowered = value.lower()
+        if re.search(r"\b\d[\d,]*(?:\.\d+)?\b", lowered):
+            return "numeric"
+        if re.search(r"\b(?:19|20)\d{2}\b", lowered):
+            return "date"
+        if re.search(r"\b(?:forecast|project|expect|guidance|assum)\b", lowered):
+            return "forecast_assumption"
+        if re.search(r"\b(?:company|entity|organization|person|team)\b", lowered):
+            return "entity_fact"
+        return "qualitative"
+
+    @staticmethod
+    def _claim_id(text: str) -> str:
+        digest = hashlib.sha1(
+            str(text or "").encode("utf-8", errors="replace"),
+        ).hexdigest().upper()
+        return f"CLM-{digest[:10]}"
+
+    @staticmethod
+    def _claim_status_from_fact_verdict(verdict: str) -> tuple[str, str]:
+        normalized = str(verdict or "").strip().lower()
+        if normalized == "supported":
+            return "supported", "claim_supported"
+        if normalized == "contradicted":
+            return "contradicted", "claim_contradicted"
+        if normalized == "stale":
+            return "stale", "claim_stale_source"
+        return "insufficient_evidence", "claim_insufficient_evidence"
+
+    @staticmethod
+    def _critical_claim_types(validity_contract: dict[str, object]) -> set[str]:
+        raw = validity_contract.get("critical_claim_types", [])
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return set()
+        return {
+            str(item or "").strip().lower()
+            for item in raw
+            if str(item or "").strip()
+        }
+
+    def _extract_claim_lifecycle(
+        self,
+        *,
+        tool_calls: list,
+        result: VerificationResult,
+        validity_contract: dict[str, object],
+    ) -> list[dict[str, object]]:
+        claims: list[dict[str, object]] = []
+        critical_types = self._critical_claim_types(validity_contract)
+        for tc in tool_calls:
+            if str(getattr(tc, "tool", "") or "").strip().lower() != "fact_checker":
+                continue
+            tool_result = getattr(tc, "result", None)
+            if tool_result is None or not bool(getattr(tool_result, "success", False)):
+                continue
+            data = getattr(tool_result, "data", {})
+            if not isinstance(data, dict):
+                data = {}
+            verdicts = data.get("verdicts", [])
+            if not isinstance(verdicts, list):
+                continue
+            for verdict in verdicts:
+                if not isinstance(verdict, dict):
+                    continue
+                text = str(verdict.get("claim", "") or "").strip()
+                if not text:
+                    continue
+                status, reason = self._claim_status_from_fact_verdict(
+                    str(verdict.get("verdict", "") or ""),
+                )
+                claim_type = self._normalize_claim_type(text)
+                source_hint = str(verdict.get("source", "") or "").strip()
+                as_of = str(verdict.get("as_of", "") or "").strip()
+                source_as_of = str(verdict.get("source_as_of", "") or "").strip()
+                period_start = str(verdict.get("period_start", "") or "").strip()
+                period_end = str(verdict.get("period_end", "") or "").strip()
+                claims.append({
+                    "claim_id": self._claim_id(text),
+                    "text": text,
+                    "claim_type": claim_type,
+                    "criticality": (
+                        "critical" if claim_type in critical_types else "important"
+                    ),
+                    "status": status,
+                    "reason_code": reason,
+                    "evidence_refs": [source_hint] if source_hint else [],
+                    "as_of": as_of,
+                    "source_as_of": source_as_of,
+                    "period_start": period_start,
+                    "period_end": period_end,
+                    "lifecycle": ["extracted", status],
+                })
+
+        if claims:
+            return claims
+
+        # Do not fabricate synthetic supported claims from aggregate counters.
+        # Missing concrete claim verdicts should remain "no extracted claims" so
+        # synthesis gates can enforce stricter behavior.
+        return claims
+
+    @staticmethod
+    def _claim_counts(claims: list[dict[str, object]]) -> dict[str, int]:
+        counts = {
+            "extracted": len(claims),
+            "supported": 0,
+            "contradicted": 0,
+            "insufficient_evidence": 0,
+            "stale": 0,
+            "pruned": 0,
+        }
+        for claim in claims:
+            status = str(claim.get("status", "") or "").strip().lower()
+            if status in counts:
+                counts[status] += 1
+        return counts
+
+    def _attach_claim_lifecycle(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        result: VerificationResult,
+        tool_calls: list,
+        validity_contract: dict[str, object],
+    ) -> VerificationResult:
+        metadata = dict(result.metadata) if isinstance(result.metadata, dict) else {}
+        claims = self._extract_claim_lifecycle(
+            tool_calls=tool_calls,
+            result=result,
+            validity_contract=validity_contract,
+        )
+        counts = self._claim_counts(claims)
+        metadata["claim_lifecycle"] = claims
+        metadata["claim_status_counts"] = counts
+        metadata["claim_reason_codes"] = sorted({
+            str(item.get("reason_code", "") or "").strip().lower()
+            for item in claims
+            if str(item.get("reason_code", "") or "").strip()
+        })
+        if self._event_bus and task_id:
+            self._event_bus.emit(Event(
+                event_type=CLAIM_VERIFICATION_SUMMARY,
+                task_id=task_id,
+                data={
+                    "subtask_id": subtask_id,
+                    "extracted": int(counts.get("extracted", 0)),
+                    "supported": int(counts.get("supported", 0)),
+                    "contradicted": int(counts.get("contradicted", 0)),
+                    "insufficient_evidence": int(counts.get("insufficient_evidence", 0)),
+                    "pruned": int(counts.get("pruned", 0)),
+                },
+            ))
+        return VerificationResult(
+            tier=result.tier,
+            passed=result.passed,
+            confidence=result.confidence,
+            checks=list(result.checks or []),
+            feedback=result.feedback,
+            outcome=result.outcome,
+            reason_code=result.reason_code,
+            severity_class=result.severity_class,
+            metadata=metadata,
+        )
+
     def _emit_outcome_event(
         self,
         *,
@@ -3872,6 +4076,7 @@ class VerificationGates:
         workspace: Path | None,
         evidence_tool_calls: list | None = None,
         evidence_records: list[dict] | None = None,
+        validity_contract: dict[str, object] | None = None,
         tier: int = 1,
         task_id: str = "",
     ) -> VerificationResult:
@@ -3881,6 +4086,28 @@ class VerificationGates:
         """
         policy_enabled = bool(getattr(self._config, "policy_engine_enabled", True))
         results: list[VerificationResult] = []
+        effective_validity_contract: dict[str, object] = {}
+        if isinstance(validity_contract, dict) and validity_contract:
+            effective_validity_contract = dict(validity_contract)
+        elif self._process is not None:
+            resolver = getattr(self._process, "resolve_validity_contract_for_phase", None)
+            if callable(resolver):
+                phase_hint = str(getattr(subtask, "phase_id", "") or "").strip() or subtask.id
+                try:
+                    resolved = resolver(phase_hint, is_synthesis=bool(subtask.is_synthesis))
+                except TypeError:
+                    resolved = resolver(phase_hint)
+                if isinstance(resolved, dict):
+                    effective_validity_contract = dict(resolved)
+
+        def finalize(result: VerificationResult) -> VerificationResult:
+            return self._attach_claim_lifecycle(
+                task_id=task_id,
+                subtask_id=subtask.id,
+                result=result,
+                tool_calls=tool_calls,
+                validity_contract=effective_validity_contract,
+            )
 
         # Tier 1 always runs when enabled.
         if self._config.tier1_enabled:
@@ -3894,6 +4121,7 @@ class VerificationGates:
             )
             results.append(t1)
             if not t1.passed:
+                t1 = finalize(t1)
                 self._emit_outcome_event(
                     task_id=task_id,
                     subtask_id=subtask.id,
@@ -3912,6 +4140,7 @@ class VerificationGates:
                 )
             else:
                 result = self._aggregate_non_failing(results)
+            result = finalize(result)
             legacy = None
             if policy_enabled and bool(getattr(self._config, "shadow_compare_enabled", False)):
                 legacy = self._legacy_result_from_tiers(results)
@@ -3953,6 +4182,7 @@ class VerificationGates:
             tier2_result=t2,
         )
         if inconclusive_fallback is not None:
+            inconclusive_fallback = finalize(inconclusive_fallback)
             self._emit_instrumentation_events(
                 task_id=task_id,
                 subtask_id=subtask.id,
@@ -3965,6 +4195,7 @@ class VerificationGates:
             )
             return inconclusive_fallback
         if not t2.passed:
+            t2 = finalize(t2)
             self._emit_instrumentation_events(
                 task_id=task_id,
                 subtask_id=subtask.id,
@@ -3979,6 +4210,7 @@ class VerificationGates:
 
         if tier < 3 or not self._config.tier3_enabled:
             result = t2 if not policy_enabled else self._aggregate_non_failing(results)
+            result = finalize(result)
             legacy = None
             if policy_enabled and bool(getattr(self._config, "shadow_compare_enabled", False)):
                 legacy = self._legacy_result_from_tiers(results)
@@ -4007,6 +4239,7 @@ class VerificationGates:
         )
         results.append(t3)
         if not t3.passed:
+            t3 = finalize(t3)
             self._emit_instrumentation_events(
                 task_id=task_id,
                 subtask_id=subtask.id,
@@ -4020,6 +4253,7 @@ class VerificationGates:
             return t3
 
         result = t3 if not policy_enabled else self._aggregate_non_failing(results)
+        result = finalize(result)
         legacy = None
         if policy_enabled and bool(getattr(self._config, "shadow_compare_enabled", False)):
             legacy = self._legacy_result_from_tiers(results)

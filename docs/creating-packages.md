@@ -38,6 +38,21 @@ persona: |
   [Constraints and style guidance].
 
 phase_mode: guided    # strict | guided | suggestive
+risk_level: medium    # low | medium | high | critical (recommended explicit)
+
+validity_contract:
+  enabled: true
+  claim_extraction:
+    enabled: true
+  critical_claim_types: [numeric, date, entity_fact]
+  min_supported_ratio: 0.75
+  max_unverified_ratio: 0.25
+  max_contradicted_count: 0
+  prune_mode: rewrite_uncertainty
+  final_gate:
+    enforce_verified_context_only: true
+    synthesis_min_verification_tier: 2
+    critical_claim_support_ratio: 1.0
 
 phases:
   - id: research
@@ -83,6 +98,7 @@ instead of runtime code:
 - `verification.policy` -- LLM-first/static-first mode, static safety checks, semantic checks, verifier output contract.
 - `verification.remediation` -- strategy metadata, retry budget, critical-path behavior.
 - `evidence` -- record schema, extraction mappings, and summarization controls.
+- `validity_contract` -- claim extraction, prune behavior, and final synthesis gates.
 - `prompt_contracts` -- process-specific executor/verifier/remediation instructions and evidence-contract activation.
 
 Minimal v2 structure:
@@ -103,6 +119,19 @@ evidence:
     required_fields: [evidence_id, tool, source_url, created_at, quality]
     facets: [target, entity, subject, region, category]
 
+validity_contract:
+  enabled: true
+  claim_extraction:
+    enabled: true
+  min_supported_ratio: 0.75
+  max_unverified_ratio: 0.25
+  max_contradicted_count: 0
+  prune_mode: rewrite_uncertainty
+  final_gate:
+    enforce_verified_context_only: true
+    synthesis_min_verification_tier: 2
+    critical_claim_support_ratio: 1.0
+
 prompt_contracts:
   evidence_contract:
     enabled: true
@@ -116,6 +145,8 @@ prompt_contracts:
 3. Add `verification.policy.output_contract.required_fields` including `passed`.
 4. Move remediation wording into `prompt_contracts.remediation_instructions`.
 5. Add `evidence.record_schema`/`evidence.extraction` and enable `prompt_contracts.evidence_contract`.
+6. Add explicit `risk_level` and a process-level `validity_contract`.
+7. Add `validity_contract` overrides to synthesis phases only when you need stricter floors than process defaults.
 
 Legacy v1 compatibility remains available during the transition window and is
 scheduled for removal on June 30, 2026. New or updated packages should migrate
@@ -133,9 +164,24 @@ description: >                 # What the process does, when to use it.
   Multi-line description.
 author: "Name or Org"
 tags: [keyword1, keyword2]     # For discovery and filtering.
+risk_level: medium             # Optional, but strongly recommended.
 ```
 
 **Name rules:** Must match `^[a-z0-9][a-z0-9-]*$`. No underscores, no uppercase. This name is used in `--process my-name` and in the install directory.
+
+### Risk level and rigor floors
+
+`risk_level` controls default validity rigor floors before process/phase overrides
+are merged:
+
+| `risk_level` | Default floor profile |
+|--------------|-----------------------|
+| `low` or `medium` | `min_supported_ratio: 0.65`, `max_unverified_ratio: 0.35`, temporal gate disabled by default |
+| `high` or `critical` | `min_supported_ratio: 0.8`, `max_unverified_ratio: 0.2`, temporal gate enabled with as-of + cross-claim conflict checks |
+
+If `risk_level` is omitted, Loom may infer high-risk intent from process `name` and
+`tags` tokens (for example `investment`, `financial`, `medical`, `legal`,
+`compliance`). Set `risk_level` explicitly to avoid accidental policy drift.
 
 ### Dependencies
 
@@ -248,6 +294,11 @@ phases:
     deliverables:                   # Expected output files
       - "filename.md — description"
       - "data.csv — description"
+    validity_contract:              # Optional per-phase policy floor override
+      min_supported_ratio: 0.8
+      max_unverified_ratio: 0.2
+      final_gate:
+        synthesis_min_verification_tier: 2
     iteration:                      # Optional phase-level loop policy
       enabled: true
       max_attempts: 4
@@ -281,6 +332,7 @@ phases:
 | `is_synthesis` | No | If true, this is a final phase that combines prior work. |
 | `acceptance_criteria` | No | Concrete criteria for phase completion. |
 | `deliverables` | No | List of expected output files with descriptions. |
+| `validity_contract` | No | Optional phase-level claim/evidence policy override (merged with process defaults). |
 | `iteration` | No | Gate-driven loop policy for repeating the phase until gates pass or budgets exhaust. |
 
 Deliverables are enforced by exact filename at execution and verification time.
@@ -296,6 +348,71 @@ exact path (not `tesla_financial_summary.csv` or other variants).
 - **Tier 1** — Simple extraction, formatting, data manipulation
 - **Tier 2** — Research, analysis, structured reasoning
 - **Tier 3** — Complex synthesis, creative work, multi-source integration
+
+### Validity contract (claim and evidence rigor)
+
+`validity_contract` can be declared at the process level and overridden at the
+phase level. Loom resolves it as:
+
+1. Risk-based default floor
+2. Process-level `validity_contract`
+3. Phase-level `validity_contract` (if present)
+4. Synthesis hardening (`enforce_verified_context_only=true` for synthesis phases)
+
+Canonical structure:
+
+```yaml
+validity_contract:
+  enabled: true
+  claim_extraction:
+    enabled: true
+  critical_claim_types: [numeric, date, entity_fact]
+  min_supported_ratio: 0.75
+  max_unverified_ratio: 0.25
+  max_contradicted_count: 0
+  prune_mode: rewrite_uncertainty   # drop | rewrite_uncertainty
+  require_fact_checker_for_synthesis: false
+  final_gate:
+    enforce_verified_context_only: true
+    synthesis_min_verification_tier: 2
+    critical_claim_support_ratio: 1.0
+    temporal_consistency:
+      enabled: false
+      require_as_of_alignment: false
+      enforce_cross_claim_date_conflict_check: false
+      max_source_age_days: 0
+      as_of: ""
+```
+
+Field guidance:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `enabled` | bool | Master switch for validity pipeline. |
+| `claim_extraction.enabled` | bool | Enables claim extraction and claim lifecycle tracking. |
+| `critical_claim_types` | list[str] | Claim categories that must meet stricter support floors. |
+| `min_supported_ratio` | float (0..1) | Minimum supported/extracted ratio required by gate checks. |
+| `max_unverified_ratio` | float (0..1) | Maximum unresolved/extracted ratio allowed. |
+| `max_contradicted_count` | int (`>=0`) | Maximum contradicted claims allowed (set `0` for strict use). |
+| `prune_mode` | enum | `drop` removes unresolved claims, `rewrite_uncertainty` keeps uncertainty notes while excluding unresolved claims from synthesis context. |
+| `require_fact_checker_for_synthesis` | bool | Requires fact checker use before synthesis passes. |
+| `final_gate.enforce_verified_context_only` | bool | Excludes unresolved claims from synthesis input. |
+| `final_gate.synthesis_min_verification_tier` | int (`>=1`) | Minimum verification tier for synthesis phases. |
+| `final_gate.critical_claim_support_ratio` | float (0..1) | Required support ratio for critical claim types. |
+| `final_gate.temporal_consistency.*` | mapping | Temporal checks (`as_of` alignment, stale-source age, cross-claim date conflicts). |
+
+Operational behavior:
+
+- Claim lifecycle states emitted by the runtime are:
+  `extracted`, `supported`, `contradicted`, `insufficient_evidence`, `pruned`.
+- Intermediate phases are non-fatal by default when unresolved claims are
+  prunable and post-prune thresholds still pass.
+- Final synthesis fails if critical claim thresholds are not met or if
+  unresolved/contradicted claims violate final gate limits.
+- High-risk and critical processes cannot weaken core safety constraints in
+  explicit overrides (for example `max_contradicted_count > 0` is rejected).
+- Write-path artifacts (`write_file`, `document_write`, final synthesis output)
+  are captured with provenance metadata and included in run-level validity events.
 
 ### Phase iteration loops (optional)
 
@@ -825,6 +942,50 @@ analysis ──┘
 
 `research` and `analysis` run in parallel. `synthesize` waits for both.
 
+### Building process YAMLs for reliability (detailed)
+
+Use this build sequence when authoring new process definitions:
+
+1. Define intent and risk first:
+   - Set `risk_level` explicitly.
+   - Use `high`/`critical` for finance, medical, legal, compliance, or any output
+     that can cause material harm.
+2. Design the phase graph around evidence flow:
+   - Early phases gather and normalize sources.
+   - Middle phases perform claim-bearing analysis.
+   - Final synthesis phase (`is_synthesis: true`) consumes only verified context.
+3. Attach clear acceptance criteria to each phase:
+   - Prefer measurable criteria ("contains source-backed numeric comparison for
+     each vendor") over style-only criteria.
+4. Configure `validity_contract` before tuning prompts:
+   - Set claim coverage thresholds (`min_supported_ratio`,
+     `max_unverified_ratio`, `max_contradicted_count`).
+   - Choose `prune_mode` for intermediate behavior (`rewrite_uncertainty` is
+     generally safer than `drop` because it preserves explicit uncertainty notes).
+   - For final phases, keep `final_gate.enforce_verified_context_only: true`.
+5. Enable temporal gates where recency matters:
+   - Use `final_gate.temporal_consistency.enabled: true`.
+   - Add `max_source_age_days` for freshness-sensitive workflows.
+   - Set `as_of` when an explicit reporting date is required.
+6. Keep synthesis verification strict:
+   - Set synthesis phase `verification_tier` >= 2.
+   - Keep `final_gate.synthesis_min_verification_tier` >= 2.
+   - Keep `max_contradicted_count: 0` for production-grade processes.
+7. Add deterministic + semantic verification:
+   - Regex rules for structure/placeholders.
+   - LLM rules for domain quality and claim-source alignment.
+8. Validate migration and behavior in CI:
+   - Add `tests:` cases in the package.
+   - Include at least one failure-path test for unsupported or contradicted claims.
+
+Suggested policy baselines:
+
+| Context | Starting thresholds |
+|---------|---------------------|
+| Low/medium risk exploratory work | `min_supported_ratio: 0.65`, `max_unverified_ratio: 0.35`, `prune_mode: rewrite_uncertainty` |
+| High/critical risk deliverables | `min_supported_ratio: 0.8`, `max_unverified_ratio: 0.2`, `max_contradicted_count: 0`, temporal gate enabled |
+| Final synthesis (all risk levels) | `enforce_verified_context_only: true`, `synthesis_min_verification_tier: 2`, `critical_claim_support_ratio: 1.0` for high/critical |
+
 ### Writing verification rules
 
 Every process should include at minimum:
@@ -861,7 +1022,8 @@ Define 3-6 memory types that capture the most reusable knowledge from your domai
 
 ## Validation
 
-Loom validates `process.yaml` at load time with 22 rules. Common errors:
+Loom validates `process.yaml` at load time with structural, contract, and
+policy-floor checks. Common errors:
 
 | Error | Fix |
 |-------|-----|
@@ -883,11 +1045,61 @@ to satisfy this checklist before returning YAML:
 
 1. Output valid `process.yaml` only (no prose around it).
 2. Use `schema_version: 2`.
-3. Provide at least one phase with unique `id` values and valid `depends_on`.
-4. If `iteration.enabled: true`, include all required iteration fields and at least one deterministic blocking gate.
-5. Never emit blocking `verifier_field` gates.
-6. For `command_exit`, use allowlisted prefixes only and tokenized argv lists.
-7. Keep deliverable filenames canonical and stable across phases.
+3. Set explicit `risk_level` (`low|medium|high|critical`).
+4. Include a process-level `validity_contract` with claim extraction enabled.
+5. Provide at least one phase with unique `id` values and valid `depends_on`.
+6. Mark final phase(s) with `is_synthesis: true` and keep synthesis verification tier >= 2.
+7. If `iteration.enabled: true`, include all required iteration fields and at least one deterministic blocking gate.
+8. Never emit blocking `verifier_field` gates.
+9. For `command_exit`, use allowlisted prefixes only and tokenized argv lists.
+10. Keep deliverable filenames canonical and stable across phases.
+
+### Migration guide: previous definition -> current schema
+
+Use this when upgrading older process definitions (v1 or early v2 without
+validity contract fields).
+
+Step 1: Set contract version and risk intent.
+
+```yaml
+schema_version: 2
+risk_level: medium   # or high/critical for high-stakes domains
+```
+
+Step 2: Preserve your existing phase DAG and verification rules.
+- Keep `phases`, `depends_on`, `deliverables`, and `verification.rules`.
+- Keep existing `verification.policy` and `verification.remediation`.
+
+Step 3: Add process-level validity contract.
+
+```yaml
+validity_contract:
+  enabled: true
+  claim_extraction: { enabled: true }
+  critical_claim_types: [numeric, date, entity_fact]
+  min_supported_ratio: 0.75
+  max_unverified_ratio: 0.25
+  max_contradicted_count: 0
+  prune_mode: rewrite_uncertainty
+  final_gate:
+    enforce_verified_context_only: true
+    synthesis_min_verification_tier: 2
+    critical_claim_support_ratio: 1.0
+    temporal_consistency:
+      enabled: false
+      require_as_of_alignment: false
+      enforce_cross_claim_date_conflict_check: false
+      max_source_age_days: 0
+```
+
+Step 4: Add phase-level overrides only where needed.
+- Tighten synthesis or high-stakes phases with per-phase `validity_contract`.
+- Avoid loosening below process defaults for high-risk domains.
+
+Step 5: Verify with loader + process tests.
+- Run `loom process test <name-or-path>`.
+- Add at least one case where unsupported claims are pruned in intermediate
+  phases and blocked in final synthesis if thresholds fail.
 
 Test validation without running:
 
@@ -918,9 +1130,15 @@ Before publishing a package:
 
 - [ ] `name` is lowercase kebab-case and descriptive
 - [ ] `description` is one clear paragraph
+- [ ] `schema_version` is `2`
+- [ ] `risk_level` is explicitly set (`low|medium|high|critical`)
 - [ ] `persona` gives the model a specific expert identity
 - [ ] Phases form a valid DAG (no cycles)
 - [ ] Each phase has `acceptance_criteria` and `deliverables`
+- [ ] Process-level `validity_contract` is present with claim extraction enabled
+- [ ] Synthesis phase(s) are marked `is_synthesis: true`
+- [ ] `final_gate.enforce_verified_context_only` is true for synthesis
+- [ ] `max_contradicted_count` is `0` unless you have a documented exception
 - [ ] If `iteration.enabled`, loop policy includes budgets, gates, and bounded caps
 - [ ] If `command_exit` gate is used, command prefix is allowlisted and runtime flags are documented
 - [ ] `no-placeholders` regex rule is included in verification

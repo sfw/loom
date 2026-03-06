@@ -113,6 +113,7 @@ class PhaseTemplate:
     is_synthesis: bool = False
     acceptance_criteria: str = ""
     deliverables: list[str] = field(default_factory=list)
+    validity_contract: dict[str, Any] = field(default_factory=dict)
     iteration: IterationPolicy | None = None
 
 
@@ -259,6 +260,7 @@ class ProcessDefinition:
     description: str = ""
     author: str = ""
     tags: list[str] = field(default_factory=list)
+    risk_level: str = ""
 
     # Behavior
     persona: str = ""
@@ -285,6 +287,7 @@ class ProcessDefinition:
         default_factory=VerificationRemediationContract,
     )
     evidence: EvidenceContract = field(default_factory=EvidenceContract)
+    validity_contract: dict[str, Any] = field(default_factory=dict)
     prompt_contracts: PromptContracts = field(default_factory=PromptContracts)
 
     # Package metadata
@@ -293,6 +296,27 @@ class ProcessDefinition:
     # Resolved paths (set by loader)
     source_path: Path | None = None
     package_dir: Path | None = None
+    _HIGH_RISK_INTENT_TOKENS = frozenset({
+        "investment",
+        "investing",
+        "finance",
+        "financial",
+        "medical",
+        "medicine",
+        "healthcare",
+        "health",
+        "legal",
+        "law",
+        "compliance",
+    })
+    _RISK_LEVEL_ALIASES = {
+        "normal": "medium",
+        "med": "medium",
+        "mid": "medium",
+        "std": "medium",
+        "standard": "medium",
+    }
+    _VALID_RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
 
     def has_phases(self) -> bool:
         return bool(self.phases)
@@ -347,6 +371,302 @@ class ProcessDefinition:
                 if text:
                     fields.append(text)
         return list(dict.fromkeys(fields))
+
+    @staticmethod
+    def _to_bool(value: object, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        lowered = str(value or "").strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+        return bool(default)
+
+    @staticmethod
+    def _to_ratio(value: object, default: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = float(default)
+        return max(0.0, min(1.0, parsed))
+
+    @staticmethod
+    def _to_non_negative_int(value: object, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = int(default)
+        return max(0, parsed)
+
+    @classmethod
+    def _normalize_risk_level(cls, value: object) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        normalized = cls._RISK_LEVEL_ALIASES.get(text, text)
+        if normalized in cls._VALID_RISK_LEVELS:
+            return normalized
+        return ""
+
+    @classmethod
+    def _normalize_validity_contract(cls, raw: dict[str, Any] | None) -> dict[str, Any]:
+        payload = dict(raw or {})
+        claim_extraction_raw = payload.get("claim_extraction", {})
+        if isinstance(claim_extraction_raw, bool):
+            claim_extraction_raw = {"enabled": claim_extraction_raw}
+        if not isinstance(claim_extraction_raw, dict):
+            claim_extraction_raw = {}
+
+        final_gate_raw = payload.get("final_gate", {})
+        if not isinstance(final_gate_raw, dict):
+            final_gate_raw = {}
+        temporal_raw = final_gate_raw.get("temporal_consistency", {})
+        if not isinstance(temporal_raw, dict):
+            temporal_raw = {}
+
+        critical_claim_types_raw = payload.get("critical_claim_types", [])
+        if isinstance(critical_claim_types_raw, str):
+            critical_claim_types_raw = [critical_claim_types_raw]
+        if not isinstance(critical_claim_types_raw, list):
+            critical_claim_types_raw = []
+        critical_claim_types = list(dict.fromkeys(
+            str(item or "").strip().lower()
+            for item in critical_claim_types_raw
+            if str(item or "").strip()
+        ))
+
+        prune_mode = str(payload.get("prune_mode", "drop") or "").strip().lower()
+        if prune_mode not in {"drop", "rewrite_uncertainty"}:
+            prune_mode = "drop"
+
+        return {
+            "enabled": cls._to_bool(payload.get("enabled", False), False),
+            "claim_extraction": {
+                "enabled": cls._to_bool(claim_extraction_raw.get("enabled", False), False),
+            },
+            "critical_claim_types": critical_claim_types,
+            "min_supported_ratio": cls._to_ratio(payload.get("min_supported_ratio", 0.75), 0.75),
+            "max_unverified_ratio": cls._to_ratio(payload.get("max_unverified_ratio", 0.25), 0.25),
+            "max_contradicted_count": cls._to_non_negative_int(
+                payload.get("max_contradicted_count", 0),
+                0,
+            ),
+            "prune_mode": prune_mode,
+            "require_fact_checker_for_synthesis": cls._to_bool(
+                payload.get("require_fact_checker_for_synthesis", False),
+                False,
+            ),
+            "final_gate": {
+                "enforce_verified_context_only": cls._to_bool(
+                    final_gate_raw.get("enforce_verified_context_only", True),
+                    True,
+                ),
+                "synthesis_min_verification_tier": max(
+                    1,
+                    cls._to_non_negative_int(
+                        final_gate_raw.get("synthesis_min_verification_tier", 2),
+                        2,
+                    ),
+                ),
+                "critical_claim_support_ratio": cls._to_ratio(
+                    final_gate_raw.get("critical_claim_support_ratio", 1.0),
+                    1.0,
+                ),
+                "temporal_consistency": {
+                    "enabled": cls._to_bool(temporal_raw.get("enabled", False), False),
+                    "require_as_of_alignment": cls._to_bool(
+                        temporal_raw.get("require_as_of_alignment", False),
+                        False,
+                    ),
+                    "enforce_cross_claim_date_conflict_check": cls._to_bool(
+                        temporal_raw.get("enforce_cross_claim_date_conflict_check", False),
+                        False,
+                    ),
+                    "max_source_age_days": cls._to_non_negative_int(
+                        temporal_raw.get("max_source_age_days", 0),
+                        0,
+                    ),
+                    "as_of": str(temporal_raw.get("as_of", "") or "").strip(),
+                },
+            },
+        }
+
+    @classmethod
+    def _merge_validity_contract(
+        cls,
+        base: dict[str, Any],
+        override: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = cls._normalize_validity_contract(base)
+        incoming = cls._normalize_validity_contract(override)
+
+        merged["enabled"] = bool(merged.get("enabled", False) or incoming.get("enabled", False))
+        merged["claim_extraction"] = {
+            "enabled": bool(
+                merged.get("claim_extraction", {}).get("enabled", False)
+                or incoming.get("claim_extraction", {}).get("enabled", False)
+            ),
+        }
+        merged["critical_claim_types"] = list(dict.fromkeys([
+            *list(merged.get("critical_claim_types", [])),
+            *list(incoming.get("critical_claim_types", [])),
+        ]))
+        merged["min_supported_ratio"] = max(
+            cls._to_ratio(merged.get("min_supported_ratio", 0.75), 0.75),
+            cls._to_ratio(incoming.get("min_supported_ratio", 0.75), 0.75),
+        )
+        merged["max_unverified_ratio"] = min(
+            cls._to_ratio(merged.get("max_unverified_ratio", 0.25), 0.25),
+            cls._to_ratio(incoming.get("max_unverified_ratio", 0.25), 0.25),
+        )
+        merged["max_contradicted_count"] = min(
+            cls._to_non_negative_int(merged.get("max_contradicted_count", 0), 0),
+            cls._to_non_negative_int(incoming.get("max_contradicted_count", 0), 0),
+        )
+        incoming_prune_mode = str(incoming.get("prune_mode", "") or "").strip().lower()
+        if incoming_prune_mode in {"drop", "rewrite_uncertainty"}:
+            merged["prune_mode"] = incoming_prune_mode
+        merged["require_fact_checker_for_synthesis"] = bool(
+            merged.get("require_fact_checker_for_synthesis", False)
+            or incoming.get("require_fact_checker_for_synthesis", False)
+        )
+
+        final_gate = dict(merged.get("final_gate", {}))
+        incoming_final_gate = dict(incoming.get("final_gate", {}))
+        final_gate["enforce_verified_context_only"] = bool(
+            final_gate.get("enforce_verified_context_only", True)
+            or incoming_final_gate.get("enforce_verified_context_only", True)
+        )
+        final_gate["synthesis_min_verification_tier"] = max(
+            1,
+            max(
+                int(final_gate.get("synthesis_min_verification_tier", 2) or 2),
+                int(incoming_final_gate.get("synthesis_min_verification_tier", 2) or 2),
+            ),
+        )
+        final_gate["critical_claim_support_ratio"] = max(
+            cls._to_ratio(final_gate.get("critical_claim_support_ratio", 1.0), 1.0),
+            cls._to_ratio(incoming_final_gate.get("critical_claim_support_ratio", 1.0), 1.0),
+        )
+        temporal = dict(final_gate.get("temporal_consistency", {}))
+        incoming_temporal = dict(incoming_final_gate.get("temporal_consistency", {}))
+        temporal["enabled"] = bool(
+            temporal.get("enabled", False)
+            or incoming_temporal.get("enabled", False)
+        )
+        temporal["require_as_of_alignment"] = bool(
+            temporal.get("require_as_of_alignment", False)
+            or incoming_temporal.get("require_as_of_alignment", False)
+        )
+        temporal["enforce_cross_claim_date_conflict_check"] = bool(
+            temporal.get("enforce_cross_claim_date_conflict_check", False)
+            or incoming_temporal.get("enforce_cross_claim_date_conflict_check", False)
+        )
+        base_age = cls._to_non_negative_int(temporal.get("max_source_age_days", 0), 0)
+        incoming_age = cls._to_non_negative_int(incoming_temporal.get("max_source_age_days", 0), 0)
+        if base_age > 0 and incoming_age > 0:
+            temporal["max_source_age_days"] = min(base_age, incoming_age)
+        else:
+            temporal["max_source_age_days"] = max(base_age, incoming_age)
+        incoming_as_of = str(incoming_temporal.get("as_of", "") or "").strip()
+        base_as_of = str(temporal.get("as_of", "") or "").strip()
+        temporal["as_of"] = incoming_as_of or base_as_of
+        final_gate["temporal_consistency"] = temporal
+        merged["final_gate"] = final_gate
+        return merged
+
+    def _domain_tokens(self) -> set[str]:
+        tokens: set[str] = set()
+        for raw in [self.name, *list(self.tags or [])]:
+            text = str(raw or "").strip().lower()
+            if not text:
+                continue
+            for token in re.split(r"[^a-z0-9]+", text):
+                if token:
+                    tokens.add(token)
+        return tokens
+
+    def _is_high_risk_intent(self) -> bool:
+        explicit_risk = self._normalize_risk_level(self.risk_level)
+        if explicit_risk in {"high", "critical"}:
+            return True
+        if explicit_risk in {"low", "medium"}:
+            return False
+        return bool(self._domain_tokens() & self._HIGH_RISK_INTENT_TOKENS)
+
+    def _default_validity_contract_floor(self, *, is_synthesis: bool) -> dict[str, Any]:
+        high_risk = self._is_high_risk_intent()
+        if high_risk:
+            min_supported_ratio = 0.8
+            max_unverified_ratio = 0.2
+            require_fact_checker = True
+            critical_support_ratio = 1.0
+            temporal_consistency = {
+                "enabled": True,
+                "require_as_of_alignment": True,
+                "enforce_cross_claim_date_conflict_check": True,
+                "max_source_age_days": 365,
+            }
+        else:
+            min_supported_ratio = 0.65
+            max_unverified_ratio = 0.35
+            require_fact_checker = False
+            critical_support_ratio = 0.9
+            temporal_consistency = {
+                "enabled": False,
+                "require_as_of_alignment": False,
+                "enforce_cross_claim_date_conflict_check": False,
+                "max_source_age_days": 0,
+            }
+        return self._normalize_validity_contract({
+            "enabled": True,
+            "claim_extraction": {"enabled": True},
+            "critical_claim_types": ["numeric", "date", "entity_fact"],
+            "min_supported_ratio": min_supported_ratio,
+            "max_unverified_ratio": max_unverified_ratio,
+            "max_contradicted_count": 0,
+            "prune_mode": "rewrite_uncertainty",
+            "require_fact_checker_for_synthesis": require_fact_checker,
+            "final_gate": {
+                "enforce_verified_context_only": bool(is_synthesis),
+                "synthesis_min_verification_tier": 2,
+                "critical_claim_support_ratio": critical_support_ratio,
+                "temporal_consistency": temporal_consistency,
+            },
+        })
+
+    def resolve_validity_contract_for_phase(
+        self,
+        phase_id: str,
+        *,
+        is_synthesis: bool = False,
+    ) -> dict[str, Any]:
+        contract = self._default_validity_contract_floor(
+            is_synthesis=bool(is_synthesis),
+        )
+        if isinstance(self.validity_contract, dict) and self.validity_contract:
+            contract = self._merge_validity_contract(contract, self.validity_contract)
+        normalized_phase_id = str(phase_id or "").strip()
+        if normalized_phase_id:
+            for phase in self.phases:
+                if str(getattr(phase, "id", "")).strip() != normalized_phase_id:
+                    continue
+                phase_contract = getattr(phase, "validity_contract", {})
+                if isinstance(phase_contract, dict) and phase_contract:
+                    contract = self._merge_validity_contract(contract, phase_contract)
+                break
+        if is_synthesis:
+            final_gate = dict(contract.get("final_gate", {}))
+            final_gate["enforce_verified_context_only"] = True
+            final_gate["synthesis_min_verification_tier"] = max(
+                1,
+                int(final_gate.get("synthesis_min_verification_tier", 2) or 2),
+            )
+            contract["final_gate"] = final_gate
+        return contract
 
     def evidence_facets(self) -> list[str]:
         record_schema = self.evidence.record_schema
@@ -732,10 +1052,16 @@ class ProcessLoader:
             schema_version = 1
         if schema_version < 1:
             schema_version = 1
+        risk_level_raw = str(raw.get("risk_level", "") or "").strip().lower()
 
         # Phases
         phases = []
         for p in raw.get("phases", []):
+            phase_validity_contract = p.get("validity_contract", {})
+            if isinstance(phase_validity_contract, bool):
+                phase_validity_contract = {"enabled": phase_validity_contract}
+            if not isinstance(phase_validity_contract, dict):
+                phase_validity_contract = {}
             phases.append(PhaseTemplate(
                 id=p.get("id", ""),
                 description=p.get("description", ""),
@@ -746,6 +1072,7 @@ class ProcessLoader:
                 is_synthesis=p.get("is_synthesis", False),
                 acceptance_criteria=p.get("acceptance_criteria", ""),
                 deliverables=p.get("deliverables", []),
+                validity_contract=phase_validity_contract,
                 iteration=self._parse_iteration_policy(p.get("iteration")),
             ))
 
@@ -1005,6 +1332,13 @@ class ProcessLoader:
             summarization=evidence_summarization,
         )
 
+        # Validity contract (claim-level verification / pruning / synthesis gates)
+        validity_contract_raw = raw.get("validity_contract", {})
+        if isinstance(validity_contract_raw, bool):
+            validity_contract_raw = {"enabled": validity_contract_raw}
+        if not isinstance(validity_contract_raw, dict):
+            validity_contract_raw = {}
+
         # Prompt contracts v2
         prompt_contracts_raw = raw.get("prompt_contracts", {})
         if not isinstance(prompt_contracts_raw, dict):
@@ -1061,6 +1395,7 @@ class ProcessLoader:
             description=raw.get("description", ""),
             author=raw.get("author", ""),
             tags=raw.get("tags", []),
+            risk_level=risk_level_raw,
             persona=raw.get("persona", ""),
             tool_guidance=tool_guidance,
             tools=tools,
@@ -1081,6 +1416,7 @@ class ProcessLoader:
             verification_policy=verification_policy,
             verification_remediation=verification_remediation,
             evidence=evidence_contract,
+            validity_contract=validity_contract_raw,
             prompt_contracts=prompt_contracts,
             dependencies=deps_raw,
         )
@@ -1208,6 +1544,198 @@ class ProcessLoader:
             gates=gates,
         )
 
+    @staticmethod
+    def _validate_validity_contract(
+        contract: dict[str, Any],
+        *,
+        label: str,
+        errors: list[str],
+    ) -> None:
+        if not isinstance(contract, dict):
+            errors.append(f"{label} validity_contract must be a mapping")
+            return
+
+        prune_mode = str(contract.get("prune_mode", "") or "").strip().lower()
+        if prune_mode and prune_mode not in {"drop", "rewrite_uncertainty"}:
+            errors.append(
+                f"{label} validity_contract.prune_mode must be one of "
+                "{'drop', 'rewrite_uncertainty'}",
+            )
+
+        for field_name in ("min_supported_ratio", "max_unverified_ratio"):
+            raw_value = contract.get(field_name)
+            if raw_value in (None, ""):
+                continue
+            try:
+                parsed = float(raw_value)
+            except (TypeError, ValueError):
+                errors.append(
+                    f"{label} validity_contract.{field_name} must be a number between 0 and 1",
+                )
+                continue
+            if parsed < 0.0 or parsed > 1.0:
+                errors.append(
+                    f"{label} validity_contract.{field_name} must be between 0 and 1",
+                )
+
+        contradicted_raw = contract.get("max_contradicted_count")
+        if contradicted_raw not in (None, ""):
+            try:
+                contradicted_count = int(contradicted_raw)
+            except (TypeError, ValueError):
+                errors.append(
+                    f"{label} validity_contract.max_contradicted_count must be an integer >= 0",
+                )
+            else:
+                if contradicted_count < 0:
+                    errors.append(
+                        f"{label} validity_contract.max_contradicted_count must be >= 0",
+                    )
+
+        claim_extraction = contract.get("claim_extraction", {})
+        if claim_extraction not in ({}, None) and not isinstance(claim_extraction, dict):
+            errors.append(f"{label} validity_contract.claim_extraction must be a mapping")
+
+        final_gate = contract.get("final_gate", {})
+        if final_gate not in ({}, None) and not isinstance(final_gate, dict):
+            errors.append(f"{label} validity_contract.final_gate must be a mapping")
+            return
+        if isinstance(final_gate, dict):
+            tier_raw = final_gate.get("synthesis_min_verification_tier")
+            if tier_raw not in (None, ""):
+                try:
+                    tier = int(tier_raw)
+                except (TypeError, ValueError):
+                    errors.append(
+                        f"{label} validity_contract.final_gate.synthesis_min_verification_tier "
+                        "must be an integer >= 1",
+                    )
+                else:
+                    if tier < 1:
+                        errors.append(
+                            f"{label} validity_contract.final_gate.synthesis_min_verification_tier "
+                            "must be >= 1",
+                        )
+            temporal = final_gate.get("temporal_consistency", {})
+            if temporal not in ({}, None) and not isinstance(temporal, dict):
+                errors.append(
+                    f"{label} validity_contract.final_gate.temporal_consistency must be a mapping",
+                )
+            if isinstance(temporal, dict):
+                max_age_raw = temporal.get("max_source_age_days")
+                if max_age_raw not in (None, ""):
+                    try:
+                        max_age = int(max_age_raw)
+                    except (TypeError, ValueError):
+                        errors.append(
+                            f"{label} validity_contract.final_gate.temporal_consistency."
+                            "max_source_age_days must be an integer >= 0",
+                        )
+                    else:
+                        if max_age < 0:
+                            errors.append(
+                                f"{label} validity_contract.final_gate.temporal_consistency."
+                                "max_source_age_days must be >= 0",
+                            )
+
+    @staticmethod
+    def _validate_high_risk_validity_override(
+        contract: dict[str, Any],
+        *,
+        label: str,
+        errors: list[str],
+    ) -> None:
+        if not isinstance(contract, dict) or not contract:
+            return
+        if "enabled" in contract and not ProcessDefinition._to_bool(
+            contract.get("enabled", True),
+            True,
+        ):
+            errors.append(
+                f"{label} high-risk validity_contract must not disable validity enforcement",
+            )
+
+        claim_extraction = contract.get("claim_extraction")
+        if isinstance(claim_extraction, dict) and "enabled" in claim_extraction:
+            if not ProcessDefinition._to_bool(
+                claim_extraction.get("enabled", True),
+                True,
+            ):
+                errors.append(
+                    f"{label} high-risk validity_contract.claim_extraction.enabled "
+                    "must be true when explicitly set",
+                )
+
+        if "max_contradicted_count" in contract:
+            try:
+                max_contradicted_count = int(contract.get("max_contradicted_count", 0))
+            except (TypeError, ValueError):
+                max_contradicted_count = 0
+            if max_contradicted_count > 0:
+                errors.append(
+                    f"{label} high-risk validity_contract.max_contradicted_count "
+                    "must be 0",
+                )
+        if "require_fact_checker_for_synthesis" in contract and not ProcessDefinition._to_bool(
+            contract.get("require_fact_checker_for_synthesis", True),
+            True,
+        ):
+            errors.append(
+                f"{label} high-risk validity_contract.require_fact_checker_for_synthesis "
+                "must be true when explicitly set",
+            )
+
+        final_gate = contract.get("final_gate")
+        if not isinstance(final_gate, dict):
+            return
+        if "enforce_verified_context_only" in final_gate:
+            if not ProcessDefinition._to_bool(
+                final_gate.get("enforce_verified_context_only", True),
+                True,
+            ):
+                errors.append(
+                    f"{label} high-risk validity_contract.final_gate."
+                    "enforce_verified_context_only must be true when explicitly set",
+                )
+        if "synthesis_min_verification_tier" in final_gate:
+            try:
+                min_tier = int(final_gate.get("synthesis_min_verification_tier", 2))
+            except (TypeError, ValueError):
+                min_tier = 2
+            if min_tier < 2:
+                errors.append(
+                    f"{label} high-risk validity_contract.final_gate."
+                    "synthesis_min_verification_tier must be >= 2",
+                )
+        temporal = final_gate.get("temporal_consistency")
+        if isinstance(temporal, dict) and "enabled" in temporal:
+            if not ProcessDefinition._to_bool(temporal.get("enabled", True), True):
+                errors.append(
+                    f"{label} high-risk validity_contract.final_gate.temporal_consistency."
+                    "enabled must be true when explicitly set",
+                )
+        if isinstance(temporal, dict) and "require_as_of_alignment" in temporal:
+            if not ProcessDefinition._to_bool(
+                temporal.get("require_as_of_alignment", True),
+                True,
+            ):
+                errors.append(
+                    f"{label} high-risk validity_contract.final_gate.temporal_consistency."
+                    "require_as_of_alignment must be true when explicitly set",
+                )
+        if (
+            isinstance(temporal, dict)
+            and "enforce_cross_claim_date_conflict_check" in temporal
+            and not ProcessDefinition._to_bool(
+                temporal.get("enforce_cross_claim_date_conflict_check", True),
+                True,
+            )
+        ):
+            errors.append(
+                f"{label} high-risk validity_contract.final_gate.temporal_consistency."
+                "enforce_cross_claim_date_conflict_check must be true when explicitly set",
+            )
+
     def _validate(self, defn: ProcessDefinition) -> list[str]:
         """Validate a ProcessDefinition beyond schema structure."""
         errors: list[str] = []
@@ -1218,6 +1746,16 @@ class ProcessLoader:
 
         if int(defn.schema_version or 1) < 1:
             errors.append("schema_version must be >= 1")
+
+        if str(defn.risk_level or "").strip():
+            normalized_risk = ProcessDefinition._normalize_risk_level(defn.risk_level)
+            if not normalized_risk:
+                errors.append(
+                    "risk_level must be one of {'low', 'medium', 'high', 'critical'} "
+                    "when provided",
+                )
+            else:
+                defn.risk_level = normalized_risk
 
         if self._require_v2_contract and not defn.is_contract_v2():
             errors.append(
@@ -1283,6 +1821,19 @@ class ProcessLoader:
                     "{'block', 'confirm_or_prune_then_queue', 'queue_follow_up'}",
                 )
 
+        if isinstance(defn.validity_contract, dict) and defn.validity_contract:
+            self._validate_validity_contract(
+                defn.validity_contract,
+                label="process",
+                errors=errors,
+            )
+        if defn._is_high_risk_intent():
+            self._validate_high_risk_validity_override(
+                defn.validity_contract,
+                label="process",
+                errors=errors,
+            )
+
         # Phase validation
         phase_ids = set()
         for phase in defn.phases:
@@ -1294,7 +1845,94 @@ class ProcessLoader:
             phase_ids.add(phase.id)
             if not phase.description:
                 errors.append(f"Phase {phase.id!r} has empty description")
+            if isinstance(phase.validity_contract, dict) and phase.validity_contract:
+                self._validate_validity_contract(
+                    phase.validity_contract,
+                    label=f"phase {phase.id!r}",
+                    errors=errors,
+                )
+            if defn._is_high_risk_intent() and bool(getattr(phase, "is_synthesis", False)):
+                self._validate_high_risk_validity_override(
+                    phase.validity_contract,
+                    label=f"phase {phase.id!r}",
+                    errors=errors,
+                )
             self._validate_iteration_policy(phase, errors)
+
+        if defn._is_high_risk_intent():
+            for phase in defn.phases:
+                if not bool(getattr(phase, "is_synthesis", False)):
+                    continue
+                resolved = defn.resolve_validity_contract_for_phase(
+                    str(getattr(phase, "id", "") or ""),
+                    is_synthesis=True,
+                )
+                claim_extraction = resolved.get("claim_extraction", {})
+                final_gate = resolved.get("final_gate", {})
+                if not ProcessDefinition._to_bool(resolved.get("enabled", False), False):
+                    errors.append(
+                        f"phase {phase.id!r} high-risk resolved validity contract disabled",
+                    )
+                if not (
+                    isinstance(claim_extraction, dict)
+                    and ProcessDefinition._to_bool(
+                        claim_extraction.get("enabled", False),
+                        False,
+                    )
+                ):
+                    errors.append(
+                        f"phase {phase.id!r} high-risk resolved contract must enable "
+                        "claim extraction",
+                    )
+                if int(resolved.get("max_contradicted_count", 0) or 0) > 0:
+                    errors.append(
+                        f"phase {phase.id!r} high-risk resolved contract must enforce "
+                        "max_contradicted_count=0",
+                    )
+                if not (
+                    isinstance(final_gate, dict)
+                    and ProcessDefinition._to_bool(
+                        final_gate.get("enforce_verified_context_only", False),
+                        False,
+                    )
+                ):
+                    errors.append(
+                        f"phase {phase.id!r} high-risk resolved contract must enforce "
+                        "verified-context-only synthesis",
+                    )
+                if int(final_gate.get("synthesis_min_verification_tier", 1) or 1) < 2:
+                    errors.append(
+                        f"phase {phase.id!r} high-risk resolved contract must require "
+                        "synthesis_min_verification_tier >= 2",
+                    )
+                if not ProcessDefinition._to_bool(
+                    resolved.get("require_fact_checker_for_synthesis", False),
+                    False,
+                ):
+                    errors.append(
+                        f"phase {phase.id!r} high-risk resolved contract must require "
+                        "fact_checker for synthesis",
+                    )
+                temporal = final_gate.get("temporal_consistency", {})
+                if not (
+                    isinstance(temporal, dict)
+                    and ProcessDefinition._to_bool(temporal.get("enabled", False), False)
+                ):
+                    errors.append(
+                        f"phase {phase.id!r} high-risk resolved contract must enable "
+                        "temporal consistency gate",
+                    )
+                if not (
+                    isinstance(temporal, dict)
+                    and ProcessDefinition._to_bool(
+                        temporal.get("require_as_of_alignment", False),
+                        False,
+                    )
+                ):
+                    errors.append(
+                        f"phase {phase.id!r} high-risk resolved contract must require "
+                        "as_of alignment",
+                    )
 
         # Dependency graph validation
         for phase in defn.phases:
