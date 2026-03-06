@@ -204,6 +204,7 @@ class TestExecutorPrompt:
         assert "include an explicit options array" in prompt
         assert "Do NOT encode answer options as bullet points" in prompt
         assert "Set question_type explicitly" in prompt
+        assert "do NOT add a redundant" in prompt
 
     def test_executor_includes_memory(
         self,

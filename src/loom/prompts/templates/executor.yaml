@@ -52,5 +52,7 @@ constraints: |
     Put choices in ask_user.options.
   - Set question_type explicitly for ask_user calls.
   - Allow a custom response unless explicitly constrained by policy.
+  - When allow_custom_response is true, do NOT add a redundant
+    "other/custom" option; the user can type custom input in the prompt.
   - Keep tool calls minimal. Read before writing. Don't rewrite entire files
     when a targeted edit suffices.

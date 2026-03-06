@@ -348,6 +348,57 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         assert result.exit_code == 0
         assert "[PASS] case=smoke mode=deterministic" in result.output
 
+    def test_process_test_defaults_execution_workspace_to_tmp(self, tmp_path, monkeypatch):
+        import loom.__main__ as main_mod
+
+        captured: dict[str, object] = {}
+        temp_workspace = tmp_path / "tmp-process-workspace"
+
+        def fake_mkdtemp(*, prefix: str) -> str:
+            assert prefix == "loom-process-test-"
+            temp_workspace.mkdir(parents=True, exist_ok=True)
+            return str(temp_workspace)
+
+        async def fake_run_process_tests(*args, **kwargs):
+            captured["workspace"] = kwargs.get("workspace")
+            return [
+                ProcessCaseResult(
+                    case_id="smoke",
+                    mode="deterministic",
+                    passed=True,
+                    duration_seconds=0.01,
+                    message="Passed",
+                    task_status="completed",
+                )
+            ]
+
+        monkeypatch.setattr(main_mod.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(
+            "loom.processes.testing.run_process_tests",
+            fake_run_process_tests,
+        )
+
+        cfg_path = tmp_path / "loom.toml"
+        cfg_path.write_text("[server]\nport = 9000\n")
+        process_yaml = tmp_path / "demo-process.yaml"
+        process_yaml.write_text("name: demo-process\nversion: '1.0'\n")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg_path),
+                "process",
+                "test",
+                str(process_yaml),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert captured["workspace"] == temp_workspace.resolve()
+        assert f"Using temporary test workspace: {temp_workspace.resolve()}" in result.output
+
 
 class TestAuthCli:
     def test_auth_help(self):

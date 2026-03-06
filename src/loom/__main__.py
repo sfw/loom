@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -3624,7 +3625,11 @@ def process() -> None:
     "--workspace", "-w",
     type=click.Path(exists=True, path_type=Path),
     default=None,
-    help="Workspace for process execution and local process discovery.",
+    help=(
+        "Workspace for process execution and local process discovery. "
+        "Defaults to current directory for discovery and a temporary directory "
+        "for execution."
+    ),
 )
 @click.option(
     "--live",
@@ -3654,11 +3659,16 @@ def process_test(
     from loom.processes.schema import ProcessLoader
     from loom.processes.testing import run_process_tests
 
-    ws = (workspace or Path.cwd()).resolve()
-    config = _effective_config(ctx, ws)
+    discovery_ws = (workspace or Path.cwd()).resolve()
+    execution_ws = (
+        workspace.resolve()
+        if workspace is not None
+        else Path(tempfile.mkdtemp(prefix="loom-process-test-")).resolve()
+    )
+    config = _effective_config(ctx, discovery_ws)
     extra = [Path(p) for p in config.process.search_paths]
     loader = ProcessLoader(
-        workspace=ws,
+        workspace=discovery_ws,
         extra_search_paths=extra,
         require_rule_scope_metadata=bool(
             getattr(config.process, "require_rule_scope_metadata", False),
@@ -3677,12 +3687,14 @@ def process_test(
     click.echo(
         f"Running process tests for {process_def.name} v{process_def.version}"
     )
+    if workspace is None:
+        click.echo(f"Using temporary test workspace: {execution_ws}")
 
     try:
         results = asyncio.run(run_process_tests(
             process_def,
             config=config,
-            workspace=ws,
+            workspace=execution_ws,
             include_live=live,
             case_id=case_id,
         ))

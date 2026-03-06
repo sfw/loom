@@ -11,6 +11,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
+from textual.widgets import Button
 
 from loom.tui.api_client import LoomAPIClient
 from loom.tui.screens.approval import ToolApprovalScreen
@@ -479,6 +480,66 @@ class TestAskUserScreen:
         assert isinstance(payload, dict)
         assert payload["response_type"] == "multi_choice"
         assert payload["selected_option_ids"] == ["a", "b"]
+
+    def test_set_button_selected_uses_selector_only_query_signature(self):
+        screen = AskUserScreen(
+            "Pick one:",
+            question_type="single_choice",
+            option_items=[
+                {"id": "k12", "label": "K-12", "description": ""},
+                {"id": "higher_ed", "label": "Higher Ed", "description": ""},
+            ],
+            allow_custom_response=False,
+            return_payload=True,
+        )
+        screen._button_to_option_id = {
+            "ask-user-option-1": "k12",
+            "ask-user-option-2": "higher_ed",
+        }
+
+        button1 = Button("K-12", id="ask-user-option-1")
+        button2 = Button("Higher Ed", id="ask-user-option-2")
+        calls: list[object] = []
+
+        def _query(selector):
+            calls.append(selector)
+            return [button1, button2]
+
+        screen.query = _query
+        screen._set_button_selected("k12", True)
+
+        assert calls == [".ask-user-option-btn"]
+        assert button1.has_class("selected")
+        assert not button2.has_class("selected")
+
+    def test_prunes_redundant_custom_option_when_custom_input_enabled(self):
+        screen = AskUserScreen(
+            "Pick one:",
+            question_type="single_choice",
+            option_items=[
+                {"id": "k12", "label": "K-12", "description": ""},
+                {"id": "custom", "label": "Custom/Other", "description": ""},
+            ],
+            allow_custom_response=True,
+            return_payload=True,
+        )
+        option_ids = [str(item.get("id", "")) for item in screen._option_items]
+        assert option_ids == ["k12"]
+        assert screen._show_input is True
+
+    def test_keeps_non_redundant_custom_prefixed_option(self):
+        screen = AskUserScreen(
+            "Pick one:",
+            question_type="single_choice",
+            option_items=[
+                {"id": "open_source", "label": "Open-source", "description": ""},
+                {"id": "custom_ml", "label": "Custom ML models", "description": ""},
+            ],
+            allow_custom_response=True,
+            return_payload=True,
+        )
+        option_ids = [str(item.get("id", "")) for item in screen._option_items]
+        assert option_ids == ["open_source", "custom_ml"]
 
 
 class TestExitConfirmScreen:
