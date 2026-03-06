@@ -28,6 +28,7 @@ from loom.events.bus import Event, EventBus
 from loom.events.types import (
     CLAIM_VERIFICATION_SUMMARY,
     MODEL_INVOCATION,
+    PLACEHOLDER_FINDINGS_EXTRACTED,
     VERIFICATION_DETERMINISTIC_BLOCK_RATE,
     VERIFICATION_FALSE_NEGATIVE_CANDIDATE,
     VERIFICATION_INCONCLUSIVE_RATE,
@@ -169,6 +170,15 @@ class DeterministicVerifier:
         "all_tools_hard",
         "safety_integrity_only",
     })
+    _PLACEHOLDER_RULE_HEURISTIC_MARKERS = (
+        "placeholder",
+        "todo",
+        "tbd",
+        "missing",
+        "insert",
+        "n/a",
+        r"\bn/?a\b",
+    )
 
     def __init__(
         self,
@@ -230,6 +240,9 @@ class DeterministicVerifier:
         evidence_records: list[dict] | None = None,
     ) -> VerificationResult:
         checks: list[Check] = []
+        expected_deliverables: list[str] = []
+        recoverable_placeholder_check_names: set[str] = set()
+        placeholder_findings: list[dict[str, object]] = []
 
         # 1. Did tool calls succeed?
         for tc in tool_calls:
@@ -281,6 +294,7 @@ class DeterministicVerifier:
 
         # 4. Process regex rules
         if self._process:
+            expected_deliverables = self._expected_deliverables_for_subtask(subtask)
             for rule in self._process.regex_rules_for_subtask(
                 subtask.id,
                 phase_scope_default=self._phase_scope_default,
@@ -302,8 +316,9 @@ class DeterministicVerifier:
                 # as a violation, so finding it = failure.
                 hard_enforced = self._is_regex_rule_hard(rule)
                 is_failure = found and hard_enforced
+                check_name = f"process_rule_{rule.name}"
                 checks.append(Check(
-                    name=f"process_rule_{rule.name}",
+                    name=check_name,
                     passed=not is_failure,
                     detail=(
                         f"Rule '{rule.name}' matched (hard): {rule.description}"
@@ -315,15 +330,25 @@ class DeterministicVerifier:
                         )
                     ),
                 ))
+                if is_failure and self._is_recoverable_placeholder_regex_rule(rule):
+                    recoverable_placeholder_check_names.add(check_name)
+                    placeholder_findings.extend(
+                        self._extract_placeholder_findings_for_regex_rule(
+                            rule=rule,
+                            result_summary=result_summary,
+                            tool_calls=tool_calls,
+                            workspace=workspace,
+                            expected_deliverables=expected_deliverables,
+                        ),
+                    )
 
             # 5. Process deliverables check
             # Enforce only deliverables for the matching phase/subtask id.
-            expected = self._expected_deliverables_for_subtask(subtask)
-            if expected and workspace:
+            if expected_deliverables and workspace:
                 files_created = set()
                 for tc in tool_calls:
                     files_created.update(tc.result.files_changed)
-                for expected_path in expected:
+                for expected_path in expected_deliverables:
                     found_file = (
                         expected_path in files_created
                         or (workspace / expected_path).exists()
@@ -351,7 +376,13 @@ class DeterministicVerifier:
         # This prevents hard-coding process-specific schemas into core static
         # verification and keeps modular process packages decoupled.
 
-        hard_failures = [c for c in checks if not c.passed]
+        all_failures = [c for c in checks if not c.passed]
+        recoverable_placeholder_failures = [
+            c for c in all_failures if c.name in recoverable_placeholder_check_names
+        ]
+        hard_failures = [
+            c for c in all_failures if c.name not in recoverable_placeholder_check_names
+        ]
         advisory_hits = [
             c for c in checks
             if c.passed and c.detail and (
@@ -360,28 +391,59 @@ class DeterministicVerifier:
                 or str(c.detail).lower().startswith("advisory")
             )
         ]
-        all_passed = not hard_failures
+        placeholder_findings = self._dedupe_placeholder_findings(placeholder_findings)
+        if recoverable_placeholder_failures and not placeholder_findings:
+            placeholder_findings = self._fallback_placeholder_findings_from_checks(
+                recoverable_placeholder_failures,
+            )
+
+        all_passed = not all_failures
         outcome = "pass"
-        if hard_failures:
+        if all_failures:
             outcome = "fail"
         elif advisory_hits:
             outcome = "pass_with_warnings"
+        reason_code = ""
+        severity_class = "semantic"
+        feedback = self._build_advisory_feedback(advisory_hits)
+        if hard_failures:
+            reason_code = "hard_invariant_failed"
+            severity_class = "hard_invariant"
+            feedback = self._build_feedback(hard_failures)
+        elif recoverable_placeholder_failures:
+            reason_code = "incomplete_deliverable_placeholder"
+            severity_class = "semantic"
+            feedback = (
+                f"{self._build_feedback(recoverable_placeholder_failures)}\n"
+                "Recoverable placeholder findings require confirm-or-prune remediation."
+            )
+        metadata: dict[str, object] = {
+            "hard_failure_count": len(hard_failures),
+            "recoverable_placeholder_failure_count": len(
+                recoverable_placeholder_failures,
+            ),
+            "advisory_count": len(advisory_hits),
+        }
+        if placeholder_findings:
+            metadata["placeholder_findings"] = placeholder_findings
+            metadata["placeholder_finding_count"] = len(placeholder_findings)
+        if recoverable_placeholder_failures:
+            metadata["remediation_required"] = True
+            metadata["remediation_mode"] = "confirm_or_prune"
+            metadata["failure_class"] = "recoverable_placeholder"
+            metadata["candidate_fill_sources"] = []
+            metadata["missing_targets"] = self._placeholder_missing_targets(
+                placeholder_findings,
+            )
         return VerificationResult(
             tier=1,
             passed=all_passed,
             checks=checks,
-            feedback=(
-                self._build_feedback(hard_failures)
-                if hard_failures
-                else self._build_advisory_feedback(advisory_hits)
-            ),
+            feedback=feedback,
             outcome=outcome,
-            reason_code="hard_invariant_failed" if hard_failures else "",
-            severity_class="hard_invariant" if hard_failures else "semantic",
-            metadata={
-                "hard_failure_count": len(hard_failures),
-                "advisory_count": len(advisory_hits),
-            },
+            reason_code=reason_code,
+            severity_class=severity_class,
+            metadata=metadata,
         )
 
     def _is_regex_rule_hard(self, rule) -> bool:
@@ -393,6 +455,296 @@ class DeterministicVerifier:
         if self._regex_default_advisory:
             return False
         return str(getattr(rule, "severity", "warning")).strip().lower() == "error"
+
+    def _is_recoverable_placeholder_regex_rule(self, rule) -> bool:
+        failure_class = str(getattr(rule, "failure_class", "") or "").strip().lower()
+        if failure_class == "recoverable_placeholder":
+            return True
+        if failure_class in {"hard_integrity", "semantic"}:
+            return False
+
+        remediation_mode = str(
+            getattr(rule, "remediation_mode", "") or "",
+        ).strip().lower()
+        if remediation_mode == "confirm_or_prune":
+            return True
+        if remediation_mode in {
+            "none",
+            "targeted_remediation",
+            "queue_follow_up",
+            "remediate_and_retry",
+        }:
+            return False
+
+        target = str(getattr(rule, "target", "") or "").strip().lower()
+        if target not in {"deliverables", "output"}:
+            return False
+        heuristic_haystack = " ".join([
+            str(getattr(rule, "name", "") or ""),
+            str(getattr(rule, "description", "") or ""),
+            str(getattr(rule, "check", "") or ""),
+        ]).lower()
+        return any(
+            marker in heuristic_haystack
+            for marker in self._PLACEHOLDER_RULE_HEURISTIC_MARKERS
+        )
+
+    @staticmethod
+    def _normalize_workspace_relpath(
+        workspace: Path,
+        raw_path: str,
+    ) -> str | None:
+        text = str(raw_path or "").strip()
+        if not text:
+            return None
+        root = workspace.resolve(strict=False)
+        candidate = Path(text)
+        if candidate.is_absolute():
+            resolved = candidate.resolve(strict=False)
+        else:
+            resolved = (root / candidate).resolve(strict=False)
+        try:
+            rel = resolved.relative_to(root)
+        except ValueError:
+            return None
+        rel_text = rel.as_posix().strip()
+        if not rel_text or rel_text == ".":
+            return None
+        return rel_text
+
+    @staticmethod
+    def _extract_placeholder_matches_from_text(
+        *,
+        pattern: re.Pattern[str],
+        text: str,
+        max_items: int = 80,
+    ) -> list[tuple[int, int, str, str]]:
+        findings: list[tuple[int, int, str, str]] = []
+        if not text:
+            return findings
+        for match in pattern.finditer(text):
+            start = max(0, int(match.start()))
+            end = max(start, int(match.end()))
+            line = text.count("\n", 0, start) + 1
+            line_start = text.rfind("\n", 0, start) + 1
+            line_end = text.find("\n", end)
+            if line_end < 0:
+                line_end = len(text)
+            column = max(1, start - line_start + 1)
+            context = text[line_start:line_end].strip()
+            if len(context) > 280:
+                context = f"{context[:277]}..."
+            token = str(match.group(0) or "").strip()
+            findings.append((line, column, token, context))
+            if len(findings) >= max_items:
+                break
+        return findings
+
+    def _extract_placeholder_findings_for_regex_rule(
+        self,
+        *,
+        rule,
+        result_summary: str,
+        tool_calls: list,
+        workspace: Path | None,
+        expected_deliverables: list[str],
+        max_findings: int = 120,
+    ) -> list[dict[str, object]]:
+        pattern_text = str(getattr(rule, "check", "") or "")
+        try:
+            pattern = re.compile(pattern_text)
+        except re.error:
+            return []
+
+        findings: list[dict[str, object]] = []
+        rule_name = str(getattr(rule, "name", "") or "").strip()
+        target = str(getattr(rule, "target", "output") or "").strip().lower() or "output"
+
+        def add_finding(
+            *,
+            file_path: str,
+            source: str,
+            line: int,
+            column: int,
+            token: str,
+            context: str,
+        ) -> None:
+            if len(findings) >= max_findings:
+                return
+            findings.append({
+                "rule_name": rule_name,
+                "pattern": pattern_text,
+                "source": source,
+                "file_path": file_path,
+                "line": max(0, int(line)),
+                "column": max(0, int(column)),
+                "token": str(token or ""),
+                "context": str(context or ""),
+            })
+
+        if target == "deliverables" and workspace is not None:
+            candidates: list[str] = []
+            seen_candidates: set[str] = set()
+            for rel_path in expected_deliverables:
+                normalized = self._normalize_workspace_relpath(workspace, rel_path)
+                if not normalized or normalized in seen_candidates:
+                    continue
+                seen_candidates.add(normalized)
+                candidates.append(normalized)
+            for call in tool_calls:
+                result = getattr(call, "result", None)
+                changed = getattr(result, "files_changed", [])
+                if not isinstance(changed, list):
+                    continue
+                for rel_path in changed:
+                    normalized = self._normalize_workspace_relpath(
+                        workspace,
+                        str(rel_path or ""),
+                    )
+                    if not normalized or normalized in seen_candidates:
+                        continue
+                    seen_candidates.add(normalized)
+                    candidates.append(normalized)
+
+            for rel_path in candidates:
+                file_path = workspace / rel_path
+                try:
+                    if not file_path.exists() or not file_path.is_file():
+                        continue
+                    if file_path.stat().st_size > 1_500_000:
+                        continue
+                    text = file_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                for line, column, token, context in self._extract_placeholder_matches_from_text(
+                    pattern=pattern,
+                    text=text,
+                    max_items=max_findings,
+                ):
+                    add_finding(
+                        file_path=rel_path,
+                        source="deliverable",
+                        line=line,
+                        column=column,
+                        token=token,
+                        context=context,
+                    )
+                    if len(findings) >= max_findings:
+                        break
+                if len(findings) >= max_findings:
+                    break
+        else:
+            for line, column, token, context in self._extract_placeholder_matches_from_text(
+                pattern=pattern,
+                text=str(result_summary or ""),
+                max_items=max_findings,
+            ):
+                add_finding(
+                    file_path="<result_summary>",
+                    source="result_summary",
+                    line=line,
+                    column=column,
+                    token=token,
+                    context=context,
+                )
+                if len(findings) >= max_findings:
+                    break
+        return findings
+
+    @classmethod
+    def _dedupe_placeholder_findings(
+        cls,
+        findings: list[dict[str, object]],
+        *,
+        max_items: int = 120,
+    ) -> list[dict[str, object]]:
+        deduped: list[dict[str, object]] = []
+        seen: set[tuple[str, str, int, int, str]] = set()
+        for raw in findings:
+            if not isinstance(raw, dict):
+                continue
+            file_path = str(raw.get("file_path", "") or "").strip()
+            rule_name = str(raw.get("rule_name", "") or "").strip()
+            token = str(raw.get("token", "") or "").strip()
+            try:
+                line = int(raw.get("line", 0) or 0)
+            except (TypeError, ValueError):
+                line = 0
+            try:
+                column = int(raw.get("column", 0) or 0)
+            except (TypeError, ValueError):
+                column = 0
+            key = (
+                file_path,
+                rule_name,
+                max(0, line),
+                max(0, column),
+                token,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append({
+                "rule_name": rule_name,
+                "pattern": str(raw.get("pattern", "") or ""),
+                "source": str(raw.get("source", "") or ""),
+                "file_path": file_path,
+                "line": max(0, line),
+                "column": max(0, column),
+                "token": token,
+                "context": str(raw.get("context", "") or ""),
+            })
+            if len(deduped) >= max_items:
+                break
+        return deduped
+
+    @staticmethod
+    def _fallback_placeholder_findings_from_checks(
+        checks: list[Check],
+    ) -> list[dict[str, object]]:
+        fallback: list[dict[str, object]] = []
+        for check in checks:
+            rule_name = str(check.name or "").removeprefix("process_rule_").strip()
+            fallback.append({
+                "rule_name": rule_name,
+                "pattern": "",
+                "source": "rule_match_fallback",
+                "file_path": "",
+                "line": 0,
+                "column": 0,
+                "token": "",
+                "context": str(check.detail or ""),
+            })
+            if len(fallback) >= 24:
+                break
+        return fallback
+
+    @staticmethod
+    def _placeholder_missing_targets(findings: list[dict[str, object]]) -> list[str]:
+        targets: list[str] = []
+        seen: set[str] = set()
+        for item in findings:
+            if not isinstance(item, dict):
+                continue
+            file_path = str(item.get("file_path", "") or "").strip()
+            rule_name = str(item.get("rule_name", "") or "").strip()
+            try:
+                line = int(item.get("line", 0) or 0)
+            except (TypeError, ValueError):
+                line = 0
+            if file_path:
+                target = f"{file_path}:{line}" if line > 0 else file_path
+            elif rule_name:
+                target = f"rule:{rule_name}"
+            else:
+                continue
+            if target in seen:
+                continue
+            seen.add(target)
+            targets.append(target)
+            if len(targets) >= 40:
+                break
+        return targets
 
     async def _check_syntax(self, path: Path) -> Check | None:
         """Run syntax checks based on file extension."""
@@ -3759,6 +4111,65 @@ class VerificationGates:
             },
         ))
 
+    def _emit_placeholder_findings_event(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        result: VerificationResult,
+    ) -> None:
+        if not self._event_bus or not task_id:
+            return
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        raw_findings = metadata.get("placeholder_findings")
+        if not isinstance(raw_findings, list) or not raw_findings:
+            return
+        findings: list[dict[str, object]] = []
+        def _safe_int(value: object) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        for raw in raw_findings:
+            if not isinstance(raw, dict):
+                continue
+            findings.append({
+                "rule_name": str(raw.get("rule_name", "") or "").strip(),
+                "file_path": str(raw.get("file_path", "") or "").strip(),
+                "line": _safe_int(raw.get("line", 0)),
+                "column": _safe_int(raw.get("column", 0)),
+                "token": str(raw.get("token", "") or ""),
+                "context": str(raw.get("context", "") or ""),
+            })
+            if len(findings) >= 120:
+                break
+        if not findings:
+            return
+        finding_count = int(
+            metadata.get("placeholder_finding_count", len(findings)) or len(findings),
+        )
+        missing_targets_raw = metadata.get("missing_targets", [])
+        missing_targets = (
+            list(missing_targets_raw)
+            if isinstance(missing_targets_raw, list)
+            else []
+        )
+        self._event_bus.emit(Event(
+            event_type=PLACEHOLDER_FINDINGS_EXTRACTED,
+            task_id=task_id,
+            data={
+                "subtask_id": subtask_id,
+                "tier": result.tier,
+                "reason_code": result.reason_code,
+                "remediation_mode": str(metadata.get("remediation_mode", "") or ""),
+                "failure_class": str(metadata.get("failure_class", "") or ""),
+                "finding_count": finding_count,
+                "missing_targets": missing_targets,
+                "findings": findings,
+            },
+        ))
+
     @staticmethod
     def classify_shadow_diff(
         legacy_result: VerificationResult,
@@ -4120,6 +4531,11 @@ class VerificationGates:
                 workspace=workspace,
             )
             results.append(t1)
+            self._emit_placeholder_findings_event(
+                task_id=task_id,
+                subtask_id=subtask.id,
+                result=t1,
+            )
             if not t1.passed:
                 t1 = finalize(t1)
                 self._emit_outcome_event(

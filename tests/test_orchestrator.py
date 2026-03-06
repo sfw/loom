@@ -40,6 +40,9 @@ from loom.events.types import (
     ITERATION_COMPLETED,
     ITERATION_RETRYING,
     OVERFLOW_FALLBACK_APPLIED,
+    PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED,
+    PLACEHOLDER_PRUNED,
+    PLACEHOLDER_REMEDIATION_UNRESOLVED,
     RUN_VALIDITY_SCORECARD,
     SUBTASK_POLICY_RECONCILED,
     SYNTHESIS_INPUT_GATE_DECISION,
@@ -1769,6 +1772,182 @@ class TestOrchestratorExecution:
         assert "s1" in attempted
         assert isinstance(attempted["s1"], list)
         assert attempted["s1"]
+
+    @pytest.mark.asyncio
+    async def test_confirm_or_prune_runs_deterministic_placeholder_prune_before_model_retry(
+        self,
+        tmp_path,
+    ):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "Critical"}]
+        })
+        state_manager = _make_state_manager(tmp_path)
+        process = _make_process_with_critical_behavior("confirm_or_prune_then_queue")
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda event: events.append(event))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=bus,
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task(workspace=str(tmp_path))
+        subtask = Subtask(
+            id="s1",
+            description="Critical",
+            is_critical_path=True,
+            max_retries=0,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        (tmp_path / "report.md").write_text("Evidence status: N/A\n", encoding="utf-8")
+
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="incomplete_deliverable_placeholder",
+            severity_class="semantic",
+            metadata={
+                "failure_class": "recoverable_placeholder",
+                "remediation_mode": "confirm_or_prune",
+                "placeholder_findings": [{
+                    "rule_name": "no-placeholders",
+                    "pattern": r"\bN/A\b",
+                    "source": "deliverable",
+                    "file_path": "report.md",
+                    "line": 1,
+                    "column": 18,
+                    "token": "N/A",
+                    "context": "Evidence status: N/A",
+                }],
+            },
+        )
+
+        async def _runner_side_effect(*_args, **_kwargs):
+            assert "UNSUPPORTED_NO_EVIDENCE" in (tmp_path / "report.md").read_text(
+                encoding="utf-8",
+            )
+            return (
+                SubtaskResult(status="success", summary="runner executed"),
+                VerificationResult(tier=1, passed=True, outcome="pass"),
+            )
+
+        orch._runner.run = AsyncMock(side_effect=_runner_side_effect)
+        orch._handle_success = AsyncMock()
+
+        recovered, _ = await orch._run_confirm_or_prune_remediation(
+            task=task,
+            subtask=subtask,
+            attempts=[],
+            verification=verification,
+        )
+
+        assert recovered is True
+        assert orch._runner.run.await_count == 1
+        orch._handle_success.assert_awaited_once()
+        assert "UNSUPPORTED_NO_EVIDENCE" in (tmp_path / "report.md").read_text(
+            encoding="utf-8",
+        )
+        event_types = [event.event_type for event in events]
+        assert PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED in event_types
+        assert PLACEHOLDER_PRUNED in event_types
+        assert PLACEHOLDER_REMEDIATION_UNRESOLVED not in event_types
+        started_events = [
+            event for event in events
+            if event.event_type == PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED
+        ]
+        assert started_events
+        assert started_events[-1].data.get("mode") == "deterministic_placeholder_prepass"
+        assert started_events[-1].data.get("parent_mode") == "confirm_or_prune_remediation"
+        pruned_events = [event for event in events if event.event_type == PLACEHOLDER_PRUNED]
+        assert pruned_events
+        assert int(pruned_events[-1].data.get("applied_count", 0) or 0) >= 1
+        assert pruned_events[-1].data.get("mode") == "deterministic_placeholder_prepass"
+
+    @pytest.mark.asyncio
+    async def test_deterministic_placeholder_prune_emits_unresolved_when_no_mutation(
+        self,
+        tmp_path,
+    ):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "Critical"}]
+        })
+        state_manager = _make_state_manager(tmp_path)
+        process = _make_process_with_critical_behavior("confirm_or_prune_then_queue")
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda event: events.append(event))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=bus,
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task(workspace=str(tmp_path))
+        subtask = Subtask(
+            id="s1",
+            description="Critical",
+            is_critical_path=True,
+            max_retries=0,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        (tmp_path / "report.md").write_text("Evidence status: complete\n", encoding="utf-8")
+
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="incomplete_deliverable_placeholder",
+            severity_class="semantic",
+            metadata={
+                "failure_class": "recoverable_placeholder",
+                "remediation_mode": "confirm_or_prune",
+                "placeholder_findings": [{
+                    "rule_name": "no-placeholders",
+                    "pattern": r"\bN/A\b",
+                    "source": "deliverable",
+                    "file_path": "report.md",
+                    "line": 1,
+                    "column": 18,
+                    "token": "N/A",
+                    "context": "Evidence status: N/A",
+                }],
+            },
+        )
+
+        resolved, _, _ = await orch._run_deterministic_placeholder_prepass(
+            task=task,
+            subtask=subtask,
+            verification=verification,
+            origin="confirm_or_prune_remediation",
+            attempt_number=1,
+            max_attempts=2,
+        )
+
+        assert resolved is False
+        event_types = [event.event_type for event in events]
+        assert PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED in event_types
+        assert PLACEHOLDER_REMEDIATION_UNRESOLVED in event_types
+        assert PLACEHOLDER_PRUNED not in event_types
+        unresolved_events = [
+            event for event in events
+            if event.event_type == PLACEHOLDER_REMEDIATION_UNRESOLVED
+        ]
+        assert unresolved_events
+        assert unresolved_events[-1].data.get("outcome") == "no_mutations_applied"
+        assert unresolved_events[-1].data.get("mode") == "deterministic_placeholder_prepass"
+        assert unresolved_events[-1].data.get("parent_mode") == "confirm_or_prune_remediation"
 
     @pytest.mark.asyncio
     async def test_confirm_or_prune_retries_transient_failures_before_abort(self, tmp_path):

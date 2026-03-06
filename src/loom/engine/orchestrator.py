@@ -44,6 +44,10 @@ from loom.events.types import (
     ITERATION_STATE_RECONCILED,
     ITERATION_TERMINAL,
     MODEL_INVOCATION,
+    PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED,
+    PLACEHOLDER_FILLED,
+    PLACEHOLDER_PRUNED,
+    PLACEHOLDER_REMEDIATION_UNRESOLVED,
     REMEDIATION_ATTEMPT,
     REMEDIATION_EXPIRED,
     REMEDIATION_FAILED,
@@ -116,7 +120,10 @@ _VALID_CRITICAL_PATH_BEHAVIORS = frozenset({
 _FAILURE_RESOLUTION_METADATA_KEYS = (
     "remediation_required",
     "remediation_mode",
+    "failure_class",
     "missing_targets",
+    "placeholder_finding_count",
+    "placeholder_findings",
     "unverified_claim_count",
     "verified_claim_count",
     "supporting_ratio",
@@ -150,6 +157,11 @@ _CLAIM_RECOVERABLE_FAILURE_CODES = frozenset({
     "claim_stale_source",
     "coverage_below_threshold",
 })
+_PLACEHOLDER_UNCONFIRMED_REASON_CODES = frozenset({
+    "incomplete_deliverable_placeholder",
+    "incomplete_deliverable_content",
+})
+_PLACEHOLDER_PREPASS_MODE = "deterministic_placeholder_prepass"
 
 # Re-export dataclasses that existing code imports from here
 __all__ = [
@@ -3160,6 +3172,37 @@ class Orchestrator:
             "reason_code": verification.reason_code,
         })
 
+        if (
+            strategy == RetryStrategy.UNCONFIRMED_DATA
+            and not hard_invariant_failure
+            and self._is_placeholder_unconfirmed_failure(verification=verification)
+            and subtask.retry_count < subtask.max_retries
+        ):
+            (
+                _resolved_deterministically,
+                deterministic_note,
+                deterministic_details,
+            ) = await self._run_deterministic_placeholder_prepass(
+                task=task,
+                subtask=subtask,
+                verification=verification,
+                origin="unconfirmed_data_retry",
+            )
+            if deterministic_note:
+                verification.feedback = (
+                    f"{verification.feedback}\n{deterministic_note}".strip()
+                    if verification.feedback
+                    else deterministic_note
+                )
+            if deterministic_details:
+                metadata = (
+                    dict(verification.metadata)
+                    if isinstance(verification.metadata, dict)
+                    else {}
+                )
+                metadata["deterministic_placeholder_prepass"] = deterministic_details
+                verification.metadata = metadata
+
         runner_cap_exhausted = False
         iteration_policy = self._phase_iteration_policy(subtask)
         iteration_budget_reason = ""
@@ -3302,6 +3345,7 @@ class Orchestrator:
                                 task=task,
                                 subtask=subtask,
                                 attempts=attempt_list,
+                                verification=verification,
                             )
                         )
                         if remediation_recovered:
@@ -4211,9 +4255,39 @@ class Orchestrator:
         if remediation_mode:
             extracted["remediation_mode"] = remediation_mode
 
+        failure_class = str(metadata.get("failure_class", "") or "").strip().lower()
+        if failure_class:
+            extracted["failure_class"] = failure_class
+
         missing_targets = cls._normalize_missing_targets(metadata.get("missing_targets"))
         if missing_targets:
             extracted["missing_targets"] = missing_targets
+
+        placeholder_findings = metadata.get("placeholder_findings", [])
+        if isinstance(placeholder_findings, list) and placeholder_findings:
+            compacted: list[dict[str, object]] = []
+            for raw in placeholder_findings:
+                if not isinstance(raw, dict):
+                    continue
+                compacted.append({
+                    "rule_name": str(raw.get("rule_name", "") or "").strip(),
+                    "pattern": str(raw.get("pattern", "") or ""),
+                    "source": str(raw.get("source", "") or ""),
+                    "file_path": str(raw.get("file_path", "") or "").strip(),
+                    "line": cls._to_int_or_none(raw.get("line")) or 0,
+                    "column": cls._to_int_or_none(raw.get("column")) or 0,
+                    "token": str(raw.get("token", "") or ""),
+                    "context": str(raw.get("context", "") or ""),
+                })
+                if len(compacted) >= 120:
+                    break
+            if compacted:
+                extracted["placeholder_findings"] = compacted
+                extracted["placeholder_finding_count"] = len(compacted)
+        else:
+            finding_count = cls._to_int_or_none(metadata.get("placeholder_finding_count"))
+            if finding_count is not None and finding_count > 0:
+                extracted["placeholder_finding_count"] = int(finding_count)
 
         unverified_claim_count = cls._to_int_or_none(
             metadata.get("unverified_claim_count"),
@@ -4232,6 +4306,418 @@ class Orchestrator:
             extracted["supporting_ratio"] = supporting_ratio
 
         return extracted
+
+    @staticmethod
+    def _is_placeholder_unconfirmed_failure(
+        *,
+        verification: VerificationResult | None,
+        placeholder_metadata: dict[str, object] | None = None,
+    ) -> bool:
+        reason_code = ""
+        metadata: dict[str, object] = {}
+        if verification is not None:
+            reason_code = str(verification.reason_code or "").strip().lower()
+            if isinstance(verification.metadata, dict):
+                metadata = dict(verification.metadata)
+        if isinstance(placeholder_metadata, dict):
+            metadata = {**metadata, **placeholder_metadata}
+        if reason_code in _PLACEHOLDER_UNCONFIRMED_REASON_CODES:
+            return True
+        failure_class = str(metadata.get("failure_class", "") or "").strip().lower()
+        remediation_mode = str(metadata.get("remediation_mode", "") or "").strip().lower()
+        findings = metadata.get("placeholder_findings")
+        has_findings = isinstance(findings, list) and bool(findings)
+        if not has_findings:
+            try:
+                has_findings = int(metadata.get("placeholder_finding_count", 0) or 0) > 0
+            except (TypeError, ValueError):
+                has_findings = False
+        return (
+            has_findings
+            and (
+                failure_class == "recoverable_placeholder"
+                or remediation_mode == "confirm_or_prune"
+            )
+        )
+
+    @classmethod
+    def _normalize_placeholder_findings(
+        cls,
+        findings: object,
+        *,
+        max_items: int = 120,
+    ) -> list[dict[str, object]]:
+        if not isinstance(findings, list):
+            return []
+        normalized: list[dict[str, object]] = []
+        seen: set[tuple[str, int, int, str, str]] = set()
+        for raw in findings:
+            if not isinstance(raw, dict):
+                continue
+            file_path = str(raw.get("file_path", "") or "").strip()
+            token = str(raw.get("token", "") or "")
+            rule_name = str(raw.get("rule_name", "") or "").strip()
+            pattern = str(raw.get("pattern", "") or "")
+            line = cls._to_int_or_none(raw.get("line")) or 0
+            column = cls._to_int_or_none(raw.get("column")) or 0
+            key = (file_path, max(0, line), max(0, column), token, pattern)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append({
+                "rule_name": rule_name,
+                "pattern": pattern,
+                "source": str(raw.get("source", "") or ""),
+                "file_path": file_path,
+                "line": max(0, line),
+                "column": max(0, column),
+                "token": token,
+                "context": str(raw.get("context", "") or ""),
+            })
+            if len(normalized) >= max_items:
+                break
+        return normalized
+
+    @staticmethod
+    def _normalize_workspace_relpath(workspace: Path, raw_path: str) -> str | None:
+        text = str(raw_path or "").strip()
+        if not text:
+            return None
+        root = workspace.resolve(strict=False)
+        candidate = Path(text)
+        if candidate.is_absolute():
+            resolved = candidate.resolve(strict=False)
+        else:
+            resolved = (root / candidate).resolve(strict=False)
+        try:
+            rel = resolved.relative_to(root)
+        except ValueError:
+            return None
+        rel_text = rel.as_posix().strip()
+        if not rel_text or rel_text == ".":
+            return None
+        return rel_text
+
+    @staticmethod
+    def _apply_deterministic_placeholder_prune_actions(
+        *,
+        workspace: Path,
+        findings: list[dict[str, object]],
+        replacement_token: str = "UNSUPPORTED_NO_EVIDENCE",
+    ) -> dict[str, object]:
+        root = workspace.resolve(strict=False)
+        grouped: dict[str, list[dict[str, object]]] = {}
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            rel_path = Orchestrator._normalize_workspace_relpath(
+                root,
+                str(finding.get("file_path", "") or ""),
+            )
+            if not rel_path:
+                continue
+            grouped.setdefault(rel_path, []).append(finding)
+
+        actions: list[dict[str, object]] = []
+        files_modified: list[str] = []
+        remaining_count = 0
+        applied_count = 0
+
+        for rel_path, rows in grouped.items():
+            file_path = root / rel_path
+            try:
+                if not file_path.exists() or not file_path.is_file():
+                    continue
+                original = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            lines = original.splitlines(keepends=True)
+            changed = False
+
+            for row in rows:
+                token = str(row.get("token", "") or "")
+                if not token:
+                    continue
+                line_no = 0
+                try:
+                    line_no = int(row.get("line", 0) or 0)
+                except (TypeError, ValueError):
+                    line_no = 0
+                replaced = False
+                if 1 <= line_no <= len(lines):
+                    line_text = lines[line_no - 1]
+                    if token in line_text:
+                        lines[line_no - 1] = line_text.replace(
+                            token,
+                            replacement_token,
+                            1,
+                        )
+                        replaced = True
+                if not replaced:
+                    current_text = "".join(lines)
+                    if token in current_text:
+                        lines = current_text.replace(token, replacement_token, 1).splitlines(
+                            keepends=True,
+                        )
+                        replaced = True
+                if replaced:
+                    changed = True
+                    applied_count += 1
+                    actions.append({
+                        "file_path": rel_path,
+                        "line": max(0, line_no),
+                        "token": token,
+                        "action": "pruned_token",
+                        "replacement": replacement_token,
+                    })
+
+            updated = "".join(lines)
+            if changed and updated != original:
+                try:
+                    file_path.write_text(updated, encoding="utf-8")
+                    files_modified.append(rel_path)
+                except OSError:
+                    continue
+
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            token = str(finding.get("token", "") or "")
+            if not token:
+                continue
+            rel_path = Orchestrator._normalize_workspace_relpath(
+                root,
+                str(finding.get("file_path", "") or ""),
+            )
+            if not rel_path:
+                continue
+            file_path = root / rel_path
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                remaining_count += 1
+                continue
+            if token in text:
+                remaining_count += 1
+
+        return {
+            "applied_count": int(applied_count),
+            "remaining_count": int(remaining_count),
+            "files_modified": files_modified,
+            "actions": actions,
+        }
+
+    @staticmethod
+    def _summarize_placeholder_resolution_state(
+        *,
+        workspace: Path,
+        findings: list[dict[str, object]],
+        replacement_token: str = "UNSUPPORTED_NO_EVIDENCE",
+    ) -> dict[str, int]:
+        root = workspace.resolve(strict=False)
+        tracked_findings = 0
+        remaining_findings = 0
+        replacement_token_occurrences = 0
+        scanned_file_count = 0
+
+        grouped_tokens: dict[str, set[str]] = {}
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            token = str(finding.get("token", "") or "")
+            if not token:
+                continue
+            rel_path = Orchestrator._normalize_workspace_relpath(
+                root,
+                str(finding.get("file_path", "") or ""),
+            )
+            if not rel_path:
+                continue
+            tracked_findings += 1
+            grouped_tokens.setdefault(rel_path, set()).add(token)
+
+        for rel_path, tokens in grouped_tokens.items():
+            file_path = root / rel_path
+            try:
+                if not file_path.exists() or not file_path.is_file():
+                    remaining_findings += len(tokens)
+                    continue
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                remaining_findings += len(tokens)
+                continue
+            scanned_file_count += 1
+            replacement_token_occurrences += text.count(replacement_token)
+            for token in tokens:
+                if token in text:
+                    remaining_findings += 1
+
+        return {
+            "tracked_findings": int(tracked_findings),
+            "remaining_findings": int(remaining_findings),
+            "replacement_token_occurrences": int(replacement_token_occurrences),
+            "scanned_file_count": int(scanned_file_count),
+        }
+
+    async def _run_deterministic_placeholder_prepass(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        verification: VerificationResult | None = None,
+        placeholder_metadata: dict[str, object] | None = None,
+        origin: str = "unconfirmed_data_retry",
+        attempt_number: int | None = None,
+        max_attempts: int | None = None,
+    ) -> tuple[bool, str, dict[str, object]]:
+        metadata: dict[str, object] = {}
+        if verification is not None and isinstance(verification.metadata, dict):
+            metadata.update(verification.metadata)
+        if isinstance(placeholder_metadata, dict):
+            metadata.update(placeholder_metadata)
+        findings = self._normalize_placeholder_findings(metadata.get("placeholder_findings"))
+        reason_code = str(getattr(verification, "reason_code", "") or "").strip().lower()
+        parent_mode = str(origin or "unconfirmed_data_retry").strip().lower()
+        source_remediation_mode = str(metadata.get("remediation_mode", "") or "").strip().lower()
+        failure_class = str(metadata.get("failure_class", "") or "").strip().lower()
+        finding_count = len(findings)
+        self._emit(PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED, task.id, {
+            "subtask_id": subtask.id,
+            "reason_code": reason_code,
+            "mode": _PLACEHOLDER_PREPASS_MODE,
+            "parent_mode": parent_mode,
+            "attempt": int(attempt_number or 0),
+            "max_attempts": int(max_attempts or 0),
+            "remediation_mode": _PLACEHOLDER_PREPASS_MODE,
+            "source_remediation_mode": source_remediation_mode,
+            "failure_class": failure_class,
+            "finding_count": finding_count,
+        })
+
+        workspace_text = str(getattr(task, "workspace", "") or "").strip()
+        if not workspace_text:
+            self._emit(PLACEHOLDER_REMEDIATION_UNRESOLVED, task.id, {
+                "subtask_id": subtask.id,
+                "reason_code": reason_code,
+                "mode": _PLACEHOLDER_PREPASS_MODE,
+                "parent_mode": parent_mode,
+                "attempt": int(attempt_number or 0),
+                "max_attempts": int(max_attempts or 0),
+                "stage": "deterministic_prepass",
+                "outcome": "workspace_unavailable",
+                "finding_count": finding_count,
+            })
+            return False, "deterministic placeholder remediation skipped: workspace unavailable", {}
+        workspace = Path(workspace_text)
+        if not workspace.exists() or not workspace.is_dir():
+            self._emit(PLACEHOLDER_REMEDIATION_UNRESOLVED, task.id, {
+                "subtask_id": subtask.id,
+                "reason_code": reason_code,
+                "mode": _PLACEHOLDER_PREPASS_MODE,
+                "parent_mode": parent_mode,
+                "attempt": int(attempt_number or 0),
+                "max_attempts": int(max_attempts or 0),
+                "stage": "deterministic_prepass",
+                "outcome": "workspace_path_missing",
+                "finding_count": finding_count,
+            })
+            return (
+                False,
+                "deterministic placeholder remediation skipped: workspace path missing",
+                {},
+            )
+
+        if not findings:
+            self._emit(PLACEHOLDER_REMEDIATION_UNRESOLVED, task.id, {
+                "subtask_id": subtask.id,
+                "reason_code": reason_code,
+                "mode": _PLACEHOLDER_PREPASS_MODE,
+                "parent_mode": parent_mode,
+                "attempt": int(attempt_number or 0),
+                "max_attempts": int(max_attempts or 0),
+                "stage": "deterministic_prepass",
+                "outcome": "no_structured_findings",
+                "finding_count": finding_count,
+            })
+            return (
+                False,
+                "deterministic placeholder remediation skipped: no structured findings",
+                {},
+            )
+
+        outcome = await run_blocking_io(
+            self._apply_deterministic_placeholder_prune_actions,
+            workspace=workspace,
+            findings=findings,
+        )
+        if not isinstance(outcome, dict):
+            self._emit(PLACEHOLDER_REMEDIATION_UNRESOLVED, task.id, {
+                "subtask_id": subtask.id,
+                "reason_code": reason_code,
+                "mode": _PLACEHOLDER_PREPASS_MODE,
+                "parent_mode": parent_mode,
+                "attempt": int(attempt_number or 0),
+                "max_attempts": int(max_attempts or 0),
+                "stage": "deterministic_prepass",
+                "outcome": "invalid_outcome",
+                "finding_count": finding_count,
+            })
+            return False, "deterministic placeholder remediation failed: invalid outcome", {}
+
+        applied_count = int(outcome.get("applied_count", 0) or 0)
+        remaining_count = int(outcome.get("remaining_count", 0) or 0)
+        files_modified = outcome.get("files_modified", [])
+        if not isinstance(files_modified, list):
+            files_modified = []
+        summary = (
+            "Deterministic placeholder prepass "
+            f"applied={applied_count} remaining={remaining_count} "
+            f"files={len(files_modified)}."
+        )
+        details = {
+            "mode": _PLACEHOLDER_PREPASS_MODE,
+            "parent_mode": parent_mode,
+            "applied_count": applied_count,
+            "remaining_count": remaining_count,
+            "files_modified": files_modified[:40],
+            "actions": outcome.get("actions", [])[:120],
+        }
+        if applied_count > 0:
+            self._emit(PLACEHOLDER_PRUNED, task.id, {
+                "subtask_id": subtask.id,
+                "reason_code": reason_code,
+                "mode": _PLACEHOLDER_PREPASS_MODE,
+                "parent_mode": parent_mode,
+                "attempt": int(attempt_number or 0),
+                "max_attempts": int(max_attempts or 0),
+                "stage": "deterministic_prepass",
+                "finding_count": finding_count,
+                "applied_count": applied_count,
+                "remaining_count": remaining_count,
+                "files_modified_count": len(files_modified),
+                "files_modified": files_modified[:40],
+            })
+        if remaining_count > 0 or applied_count <= 0:
+            unresolved_outcome = (
+                "placeholders_remaining"
+                if remaining_count > 0
+                else "no_mutations_applied"
+            )
+            self._emit(PLACEHOLDER_REMEDIATION_UNRESOLVED, task.id, {
+                "subtask_id": subtask.id,
+                "reason_code": reason_code,
+                "mode": _PLACEHOLDER_PREPASS_MODE,
+                "parent_mode": parent_mode,
+                "attempt": int(attempt_number or 0),
+                "max_attempts": int(max_attempts or 0),
+                "stage": "deterministic_prepass",
+                "outcome": unresolved_outcome,
+                "finding_count": finding_count,
+                "applied_count": applied_count,
+                "remaining_count": remaining_count,
+                "files_modified_count": len(files_modified),
+            })
+        return (applied_count > 0 and remaining_count == 0), summary, details
 
     def _remediation_queue_limits(self) -> tuple[int, float, float]:
         max_attempts = int(
@@ -4862,6 +5348,8 @@ class Orchestrator:
         subtask: Subtask,
         attempts: list[AttemptRecord],
         remediation_id: str | None = None,
+        verification: VerificationResult | None = None,
+        placeholder_metadata: dict[str, object] | None = None,
     ) -> tuple[bool, str]:
         if not self._config.verification.auto_confirm_prune_critical_path:
             return False, "auto_confirm_prune_critical_path disabled"
@@ -4894,6 +5382,31 @@ class Orchestrator:
             ),
         )
         last_failure = "process remediation failed"
+        placeholder_unconfirmed = self._is_placeholder_unconfirmed_failure(
+            verification=verification,
+            placeholder_metadata=placeholder_metadata,
+        )
+        deterministic_note = ""
+        deterministic_details: dict[str, object] = {}
+        placeholder_reason_code = (
+            str(getattr(verification, "reason_code", "") or "").strip().lower()
+        )
+        placeholder_findings: list[dict[str, object]] = []
+        if placeholder_unconfirmed:
+            placeholder_context: dict[str, object] = {}
+            if verification is not None and isinstance(verification.metadata, dict):
+                placeholder_context.update(verification.metadata)
+            if isinstance(placeholder_metadata, dict):
+                placeholder_context.update(placeholder_metadata)
+            placeholder_findings = self._normalize_placeholder_findings(
+                placeholder_context.get("placeholder_findings"),
+            )
+        workspace_path: Path | None = None
+        workspace_text = str(getattr(task, "workspace", "") or "").strip()
+        if workspace_text:
+            candidate_workspace = Path(workspace_text)
+            if candidate_workspace.exists() and candidate_workspace.is_dir():
+                workspace_path = candidate_workspace
 
         for attempt_number in range(1, max_attempts + 1):
             self._run_budget.observe_remediation_attempt()
@@ -4919,6 +5432,23 @@ class Orchestrator:
                 max_attempts=max_attempts,
                 phase="start",
             )
+
+            if attempt_number == 1 and placeholder_unconfirmed:
+                (
+                    _resolved_deterministically,
+                    deterministic_note,
+                    deterministic_details,
+                ) = await self._run_deterministic_placeholder_prepass(
+                    task=task,
+                    subtask=subtask,
+                    verification=verification,
+                    placeholder_metadata=placeholder_metadata,
+                    origin="confirm_or_prune_remediation",
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                )
+                if deterministic_note:
+                    last_failure = deterministic_note
 
             prior_successful_tool_calls: list[ToolCallRecord] = []
             prior_evidence_records = self._evidence_for_subtask(task.id, subtask.id)
@@ -4948,11 +5478,38 @@ class Orchestrator:
                 expected_deliverables=expected_deliverables,
                 base_context=remediation_context,
             )
+            if deterministic_note:
+                remediation_context = (
+                    f"{remediation_context}\n\n"
+                    "DETERMINISTIC PLACEHOLDER REMEDIATION RESULT:\n"
+                    f"- {deterministic_note}"
+                ).strip()
+            if deterministic_details:
+                remediation_context = (
+                    f"{remediation_context}\n"
+                    "DETERMINISTIC PLACEHOLDER PREPASS DETAILS:\n"
+                    f"{json.dumps(deterministic_details, ensure_ascii=True)}"
+                ).strip()
             escalated_tier = self._retry.get_escalation_tier(
                 attempt=len(attempts),
                 original_tier=subtask.model_tier,
             )
             changelog = self._get_changelog(task)
+            pre_resolution_state: dict[str, int] | None = None
+            if placeholder_unconfirmed and placeholder_findings and workspace_path is not None:
+                raw_pre_state = await run_blocking_io(
+                    self._summarize_placeholder_resolution_state,
+                    workspace=workspace_path,
+                    findings=placeholder_findings,
+                )
+                if isinstance(raw_pre_state, dict):
+                    pre_resolution_state = {
+                        "tracked_findings": int(raw_pre_state.get("tracked_findings", 0) or 0),
+                        "remaining_findings": int(raw_pre_state.get("remaining_findings", 0) or 0),
+                        "replacement_token_occurrences": int(
+                            raw_pre_state.get("replacement_token_occurrences", 0) or 0,
+                        ),
+                    }
             remediation_result, remediation_verification = await self._runner.run(
                 task,
                 subtask,
@@ -4980,6 +5537,66 @@ class Orchestrator:
                     remediation_result,
                     remediation_verification,
                 )
+                if (
+                    placeholder_unconfirmed
+                    and placeholder_findings
+                    and workspace_path is not None
+                    and pre_resolution_state is not None
+                ):
+                    raw_post_state = await run_blocking_io(
+                        self._summarize_placeholder_resolution_state,
+                        workspace=workspace_path,
+                        findings=placeholder_findings,
+                    )
+                    if isinstance(raw_post_state, dict):
+                        pre_remaining = int(
+                            pre_resolution_state.get("remaining_findings", 0) or 0,
+                        )
+                        post_remaining = int(raw_post_state.get("remaining_findings", 0) or 0)
+                        pre_replacement_count = int(
+                            pre_resolution_state.get("replacement_token_occurrences", 0) or 0,
+                        )
+                        post_replacement_count = int(
+                            raw_post_state.get("replacement_token_occurrences", 0) or 0,
+                        )
+                        resolved_count = max(0, pre_remaining - post_remaining)
+                        replacement_delta = max(0, post_replacement_count - pre_replacement_count)
+                        if post_remaining > 0:
+                            self._emit(PLACEHOLDER_REMEDIATION_UNRESOLVED, task.id, {
+                                "subtask_id": subtask.id,
+                                "reason_code": placeholder_reason_code,
+                                "mode": "confirm_or_prune_remediation",
+                                "attempt": attempt_number,
+                                "max_attempts": max_attempts,
+                                "stage": "post_model_success",
+                                "outcome": "placeholders_remaining",
+                                "finding_count": len(placeholder_findings),
+                                "remaining_count": post_remaining,
+                            })
+                        elif resolved_count > 0:
+                            if replacement_delta > 0:
+                                self._emit(PLACEHOLDER_PRUNED, task.id, {
+                                    "subtask_id": subtask.id,
+                                    "reason_code": placeholder_reason_code,
+                                    "mode": "confirm_or_prune_remediation",
+                                    "attempt": attempt_number,
+                                    "max_attempts": max_attempts,
+                                    "stage": "model_retry",
+                                    "finding_count": len(placeholder_findings),
+                                    "resolved_count": resolved_count,
+                                    "replacement_delta": replacement_delta,
+                                })
+                            else:
+                                self._emit(PLACEHOLDER_FILLED, task.id, {
+                                    "subtask_id": subtask.id,
+                                    "reason_code": placeholder_reason_code,
+                                    "mode": "confirm_or_prune_remediation",
+                                    "attempt": attempt_number,
+                                    "max_attempts": max_attempts,
+                                    "stage": "model_retry",
+                                    "finding_count": len(placeholder_findings),
+                                    "filled_count": resolved_count,
+                                })
                 self._emit(REMEDIATION_ATTEMPT, task.id, {
                     "remediation_id": remediation_id or "",
                     "subtask_id": subtask.id,
@@ -5097,6 +5714,18 @@ class Orchestrator:
                 continue
             break
 
+        if placeholder_unconfirmed:
+            self._emit(PLACEHOLDER_REMEDIATION_UNRESOLVED, task.id, {
+                "subtask_id": subtask.id,
+                "reason_code": placeholder_reason_code,
+                "mode": "confirm_or_prune_remediation",
+                "attempt": max_attempts,
+                "max_attempts": max_attempts,
+                "stage": "terminal",
+                "outcome": "max_attempts_exhausted",
+                "finding_count": len(placeholder_findings),
+                "error": last_failure,
+            })
         return False, last_failure
 
     def _record_confirm_or_prune_attempt(
@@ -5531,6 +6160,7 @@ class Orchestrator:
             subtask=subtask,
             attempts=attempts,
             remediation_id=str(item.get("id", "")).strip() or None,
+            placeholder_metadata=item if isinstance(item, dict) else None,
         )
 
     def _expected_deliverables_for_subtask(self, subtask: Subtask) -> list[str]:

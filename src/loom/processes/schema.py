@@ -128,6 +128,8 @@ class VerificationRule:
     type: str = "llm"  # "llm" | "regex"
     target: str = "output"  # "output" | "deliverables"
     enforcement: str = ""  # "" | "hard" | "advisory"
+    failure_class: str = ""  # "" | "hard_integrity" | "recoverable_placeholder" | "semantic"
+    remediation_mode: str = ""  # Optional remediation routing hint
     scope: str = ""  # "" | "phase" | "global"
     applies_to_phases: list[str] = field(default_factory=list)  # [] | ["phase-a"] | ["*"]
     requires_exact_cardinality: bool = False
@@ -1095,6 +1097,8 @@ class ProcessLoader:
                 type=r.get("type", "llm"),
                 target=r.get("target", "output"),
                 enforcement=r.get("enforcement", ""),
+                failure_class=str(r.get("failure_class", "") or "").strip().lower(),
+                remediation_mode=str(r.get("remediation_mode", "") or "").strip().lower(),
                 scope=r.get("scope", ""),
                 applies_to_phases=[str(p).strip() for p in applies_to if str(p).strip()],
                 requires_exact_cardinality=bool(
@@ -2069,6 +2073,26 @@ class ProcessLoader:
             if rule.enforcement and rule.enforcement not in ("hard", "advisory"):
                 errors.append(
                     f"Rule {rule.name!r}: invalid enforcement {rule.enforcement!r}",
+                )
+            if rule.failure_class and rule.failure_class not in (
+                "hard_integrity",
+                "recoverable_placeholder",
+                "semantic",
+            ):
+                errors.append(
+                    f"Rule {rule.name!r}: invalid failure_class "
+                    f"{rule.failure_class!r}",
+                )
+            if rule.remediation_mode and rule.remediation_mode not in (
+                "none",
+                "confirm_or_prune",
+                "targeted_remediation",
+                "queue_follow_up",
+                "remediate_and_retry",
+            ):
+                errors.append(
+                    f"Rule {rule.name!r}: invalid remediation_mode "
+                    f"{rule.remediation_mode!r}",
                 )
             if rule.scope and rule.scope not in ("phase", "global"):
                 errors.append(

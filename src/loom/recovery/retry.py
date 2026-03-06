@@ -206,7 +206,9 @@ class RetryManager:
         haystack = " ".join([feedback, error]).lower()
         reason_code = RetryManager._extract_reason_code(verification)
         remediation_mode = RetryManager._extract_remediation_mode(verification)
+        failure_class = RetryManager._extract_failure_class(verification)
         severity_class = RetryManager._extract_severity_class(verification)
+        has_placeholder_findings = RetryManager._has_placeholder_findings(verification)
         missing_targets = RetryManager._extract_missing_targets_from_verification(
             verification,
         )
@@ -227,6 +229,14 @@ class RetryManager:
 
         # Prefer structured verification contract when available.
         if reason_code == "hard_invariant_failed":
+            if (
+                has_placeholder_findings
+                and (
+                    failure_class == "recoverable_placeholder"
+                    or remediation_mode == "confirm_or_prune"
+                )
+            ):
+                return RetryStrategy.UNCONFIRMED_DATA, missing_targets
             return RetryStrategy.GENERIC, []
         if reason_code in {"parse_inconclusive", "infra_verifier_error"}:
             return RetryStrategy.VERIFIER_PARSE, []
@@ -318,6 +328,43 @@ class RetryManager:
                 metadata = candidate
         raw = metadata.get("remediation_mode", "")
         return str(raw or "").strip().lower()
+
+    @staticmethod
+    def _extract_failure_class(verification: object | None) -> str:
+        if verification is None:
+            return ""
+        metadata = {}
+        if isinstance(verification, dict):
+            candidate = verification.get("metadata", {})
+            if isinstance(candidate, dict):
+                metadata = candidate
+        else:
+            candidate = getattr(verification, "metadata", {})
+            if isinstance(candidate, dict):
+                metadata = candidate
+        raw = metadata.get("failure_class", "")
+        return str(raw or "").strip().lower()
+
+    @staticmethod
+    def _has_placeholder_findings(verification: object | None) -> bool:
+        if verification is None:
+            return False
+        metadata = {}
+        if isinstance(verification, dict):
+            candidate = verification.get("metadata", {})
+            if isinstance(candidate, dict):
+                metadata = candidate
+        else:
+            candidate = getattr(verification, "metadata", {})
+            if isinstance(candidate, dict):
+                metadata = candidate
+        raw_count = metadata.get("placeholder_finding_count")
+        if isinstance(raw_count, bool):
+            raw_count = int(raw_count)
+        if isinstance(raw_count, int):
+            return raw_count > 0
+        findings = metadata.get("placeholder_findings")
+        return isinstance(findings, list) and bool(findings)
 
     @staticmethod
     def _extract_missing_targets_from_verification(

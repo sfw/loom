@@ -78,6 +78,11 @@ REMEDIATION_FAILED = "remediation_failed"
 REMEDIATION_EXPIRED = "remediation_expired"
 REMEDIATION_TERMINAL = "remediation_terminal"
 UNCONFIRMED_DATA_QUEUED = "unconfirmed_data_queued"
+PLACEHOLDER_FINDINGS_EXTRACTED = "placeholder_findings_extracted"
+PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED = "placeholder_confirm_or_prune_started"
+PLACEHOLDER_FILLED = "placeholder_filled"
+PLACEHOLDER_PRUNED = "placeholder_pruned"
+PLACEHOLDER_REMEDIATION_UNRESOLVED = "placeholder_remediation_unresolved"
 
 # Iteration loop events
 ITERATION_STARTED = "iteration_started"
