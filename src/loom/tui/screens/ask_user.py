@@ -19,6 +19,18 @@ class AskUserScreen(ModalScreen[object]):
     """Display a question from the model and collect the user's answer."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    _REDUNDANT_CUSTOM_OPTION_IDS = {
+        "custom",
+        "custom option",
+        "custom response",
+        "other",
+        "other option",
+        "other response",
+        "other specify",
+        "other please specify",
+        "free text",
+        "write in",
+    }
 
     CSS = """
     AskUserScreen {
@@ -134,6 +146,7 @@ class AskUserScreen(ModalScreen[object]):
         self._default_option_id = str(normalized.get("default_option_id", "") or "")
         self._return_payload = bool(return_payload)
         self._allow_cancel = bool(allow_cancel)
+        self._prune_redundant_custom_options()
         self._show_input = self._compute_show_input()
         self._option_id_to_label: dict[str, str] = {
             str(item.get("id", "")).strip(): str(item.get("label", "")).strip()
@@ -144,6 +157,56 @@ class AskUserScreen(ModalScreen[object]):
         self._selected_option_ids: list[str] = []
         if self._default_option_id in self._option_id_to_label:
             self._selected_option_ids = [self._default_option_id]
+
+    @staticmethod
+    def _normalize_option_token(value: str) -> str:
+        collapsed = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+        return re.sub(r"\s+", " ", collapsed)
+
+    @classmethod
+    def _is_redundant_custom_option(cls, option: dict[str, str]) -> bool:
+        option_id = cls._normalize_option_token(str(option.get("id", "") or ""))
+        if option_id in cls._REDUNDANT_CUSTOM_OPTION_IDS:
+            return True
+
+        label = cls._normalize_option_token(str(option.get("label", "") or ""))
+        if label in cls._REDUNDANT_CUSTOM_OPTION_IDS:
+            return True
+        if label.startswith("other") and "specif" in label:
+            return True
+        if label.startswith("custom") and ("response" in label or "specif" in label):
+            return True
+        return False
+
+    def _prune_redundant_custom_options(self) -> None:
+        if not self._allow_custom_response:
+            return
+        if self._question_type not in {"single_choice", "multi_choice"}:
+            return
+        if not self._option_items:
+            return
+
+        filtered_items: list[dict[str, str]] = []
+        removed_option_ids: set[str] = set()
+        for item in self._option_items:
+            if self._is_redundant_custom_option(item):
+                option_id = str(item.get("id", "") or "").strip()
+                if option_id:
+                    removed_option_ids.add(option_id)
+                continue
+            filtered_items.append(item)
+
+        if len(filtered_items) == len(self._option_items):
+            return
+
+        self._option_items = filtered_items
+        self._options = [
+            str(item.get("label", "") or "").strip()
+            for item in self._option_items
+            if str(item.get("label", "") or "").strip()
+        ]
+        if self._default_option_id and self._default_option_id in removed_option_ids:
+            self._default_option_id = ""
 
     def compose(self) -> ComposeResult:
         self._button_to_option_id = {}
@@ -204,13 +267,17 @@ class AskUserScreen(ModalScreen[object]):
     def on_mount(self) -> None:
         if self._show_input:
             try:
-                self.query_one("#ask-user-input", Input).focus()
-                return
+                input_widget = self.query_one("#ask-user-input")
+                if isinstance(input_widget, Input):
+                    input_widget.focus()
+                    return
             except Exception:
                 pass
         if self._option_items:
             try:
-                self.query_one(".ask-user-option-btn", Button).focus()
+                option_button = self.query_one(".ask-user-option-btn")
+                if isinstance(option_button, Button):
+                    option_button.focus()
             except Exception:
                 pass
 
@@ -255,7 +322,9 @@ class AskUserScreen(ModalScreen[object]):
 
     def _set_error(self, message: str) -> None:
         try:
-            self.query_one("#ask-user-error", Label).update(message)
+            error_label = self.query_one("#ask-user-error")
+            if isinstance(error_label, Label):
+                error_label.update(message)
         except Exception:
             pass
 
@@ -369,7 +438,9 @@ class AskUserScreen(ModalScreen[object]):
         custom_text = ""
         if self._show_input:
             try:
-                custom_text = self.query_one("#ask-user-input", Input).value
+                input_widget = self.query_one("#ask-user-input")
+                if isinstance(input_widget, Input):
+                    custom_text = input_widget.value
             except Exception:
                 custom_text = ""
 
@@ -394,7 +465,9 @@ class AskUserScreen(ModalScreen[object]):
         self.dismiss(answer)
 
     def _set_button_selected(self, option_id: str, selected: bool) -> None:
-        for button in self.query(".ask-user-option-btn", Button):
+        for button in self.query(".ask-user-option-btn"):
+            if not isinstance(button, Button):
+                continue
             button_id = str(button.id or "")
             if self._button_to_option_id.get(button_id, "") != option_id:
                 continue

@@ -254,7 +254,7 @@ class ExecutionConfig:
     ask_user_timeout_seconds: int = 0
     ask_user_timeout_default_response: str = ""
     ask_user_max_pending_per_task: int = 3
-    ask_user_max_questions_per_subtask: int = 3
+    ask_user_max_questions_per_subtask: int = 25
     ask_user_min_seconds_between_questions: int = 10
     model_call_max_attempts: int = 5
     model_call_retry_base_delay_seconds: float = 0.5

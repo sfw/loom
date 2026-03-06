@@ -53,7 +53,7 @@ class TestDefaultConfig:
         assert config.execution.ask_user_timeout_seconds == 0
         assert config.execution.ask_user_timeout_default_response == ""
         assert config.execution.ask_user_max_pending_per_task == 3
-        assert config.execution.ask_user_max_questions_per_subtask == 3
+        assert config.execution.ask_user_max_questions_per_subtask == 25
         assert config.execution.ask_user_min_seconds_between_questions == 10
         assert config.execution.model_call_max_attempts == 5
         assert config.execution.model_call_retry_base_delay_seconds == 0.5

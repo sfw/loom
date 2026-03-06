@@ -564,7 +564,7 @@ class SubtaskRunner:
         )
         self._ask_user_max_questions_per_subtask = max(
             1,
-            int(getattr(execution_cfg, "ask_user_max_questions_per_subtask", 3) or 3),
+            int(getattr(execution_cfg, "ask_user_max_questions_per_subtask", 25) or 25),
         )
         self._ask_user_min_seconds_between_questions = max(
             0.0,
