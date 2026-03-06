@@ -2786,9 +2786,9 @@ class TestCoworkSessionTokens:
 class TestInitPersistence:
     """Test graceful degradation when database init fails."""
 
-    def test_returns_none_on_db_error(self, tmp_path):
-        """If the db path is unwritable, return (None, None)."""
-        from loom.__main__ import _init_persistence
+    def test_new_db_error_raises_without_ephemeral_opt_in(self, tmp_path):
+        """New DB init failure should be blocking unless --ephemeral is enabled."""
+        from loom.__main__ import PersistenceInitError, _init_persistence
         from loom.config import Config, MemoryConfig
 
         # Point database_path at a path with a null byte (invalid)
@@ -2797,7 +2797,20 @@ class TestInitPersistence:
                 database_path=str(tmp_path / "no" / "such" / "parent" / "\0invalid" / "loom.db"),
             ),
         )
-        db, store = _init_persistence(cfg)
+        with pytest.raises(PersistenceInitError):
+            _init_persistence(cfg)
+
+    def test_returns_none_on_db_error_with_ephemeral_opt_in(self, tmp_path):
+        """With explicit --ephemeral semantics, fallback returns (None, None)."""
+        from loom.__main__ import _init_persistence
+        from loom.config import Config, MemoryConfig
+
+        cfg = Config(
+            memory=MemoryConfig(
+                database_path=str(tmp_path / "no" / "such" / "parent" / "\0invalid" / "loom.db"),
+            ),
+        )
+        db, store = _init_persistence(cfg, allow_ephemeral=True)
         assert db is None
         assert store is None
 
@@ -2812,6 +2825,46 @@ class TestInitPersistence:
         db, store = _init_persistence(cfg)
         assert db is not None
         assert store is not None
+
+    def test_existing_db_failure_raises_persistence_error(self, tmp_path, monkeypatch):
+        """Existing DB init failures should block startup (no silent ephemeral fallback)."""
+        from loom.__main__ import PersistenceInitError, _init_persistence
+        from loom.config import Config, MemoryConfig
+
+        db_path = tmp_path / "loom.db"
+        db_path.write_text("corrupt", encoding="utf-8")
+
+        async def _boom(_self):
+            raise RuntimeError("migration blew up")
+
+        monkeypatch.setattr("loom.state.memory.Database.initialize", _boom)
+
+        cfg = Config(
+            memory=MemoryConfig(database_path=str(db_path)),
+        )
+        with pytest.raises(PersistenceInitError):
+            _init_persistence(cfg)
+
+    def test_existing_db_locked_raises_persistence_error(self, tmp_path, monkeypatch):
+        """Locked existing DB should be surfaced as blocking startup failure."""
+        import sqlite3
+
+        from loom.__main__ import PersistenceInitError, _init_persistence
+        from loom.config import Config, MemoryConfig
+
+        db_path = tmp_path / "loom.db"
+        db_path.write_text("locked", encoding="utf-8")
+
+        async def _locked(_self):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr("loom.state.memory.Database.initialize", _locked)
+
+        cfg = Config(
+            memory=MemoryConfig(database_path=str(db_path)),
+        )
+        with pytest.raises(PersistenceInitError):
+            _init_persistence(cfg)
 
 
 # --- Sad-path: delegate_task unbound ----------------------------------------
@@ -3525,7 +3578,11 @@ class TestCLIResumeNoDB:
         import loom.__main__ as main_mod
         from loom.__main__ import cli
 
-        monkeypatch.setattr(main_mod, "_init_persistence", lambda cfg: (None, None))
+        monkeypatch.setattr(
+            main_mod,
+            "_init_persistence",
+            lambda cfg, **_kwargs: (None, None),
+        )
         # Mock model resolution so we don't need a real config
         monkeypatch.setattr(
             main_mod, "_resolve_model", lambda cfg, name: MagicMock(name="mock"),

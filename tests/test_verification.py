@@ -17,6 +17,13 @@ from loom.engine.verification import (
     VotingVerifier,
 )
 from loom.events.bus import EventBus
+from loom.events.types import (
+    PLACEHOLDER_FINDINGS_EXTRACTED,
+    VERIFICATION_CONTRADICTION_DETECTED,
+    VERIFICATION_FAILED,
+    VERIFICATION_PASSED,
+    VERIFICATION_STARTED,
+)
 from loom.models.base import ModelResponse, TokenUsage
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
@@ -1259,6 +1266,112 @@ class TestVerificationGates:
         assert payload.get("contradicted") == 0
 
     @pytest.mark.asyncio
+    async def test_verify_emits_verification_lifecycle_events(self):
+        config = VerificationConfig(tier1_enabled=True, tier2_enabled=False)
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        event_bus = EventBus()
+        events = []
+        event_bus.subscribe_all(lambda event: events.append(event))
+        gates = VerificationGates(router, prompts, config, event_bus=event_bus)
+
+        passed = await gates.verify(
+            _make_subtask(subtask_id="ok-subtask"),
+            "summary",
+            [],
+            None,
+            tier=1,
+            task_id="task-verification-pass",
+        )
+        assert passed.passed
+        event_types = [event.event_type for event in events]
+        assert VERIFICATION_STARTED in event_types
+        assert VERIFICATION_PASSED in event_types
+
+        events.clear()
+        failed = await gates.verify(
+            _make_subtask(subtask_id="failed-subtask"),
+            "summary",
+            [
+                MockToolCallRecord(
+                    tool="write_file",
+                    args={"path": "broken.py"},
+                    result=ToolResult.fail("write failed"),
+                ),
+            ],
+            None,
+            tier=1,
+            task_id="task-verification-fail",
+        )
+        assert not failed.passed
+        failed_types = [event.event_type for event in events]
+        assert VERIFICATION_STARTED in failed_types
+        assert VERIFICATION_FAILED in failed_types
+
+    @pytest.mark.asyncio
+    async def test_verify_emits_placeholder_findings_extracted_event(self, tmp_path):
+        config = VerificationConfig(tier1_enabled=True, tier2_enabled=False)
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        event_bus = EventBus()
+        events = []
+        event_bus.subscribe_all(lambda event: events.append(event))
+        process = _make_process(
+            deliverables={"phase-a": ["report.md"]},
+            regex_rules=[{
+                "name": "no-placeholders",
+                "description": "No unresolved placeholders in deliverables",
+                "check": r"\bN/A\b",
+                "severity": "error",
+                "type": "regex",
+                "target": "deliverables",
+                "enforcement": "hard",
+            }],
+        )
+        gates = VerificationGates(
+            router,
+            prompts,
+            config,
+            process=process,
+            event_bus=event_bus,
+        )
+        (tmp_path / "report.md").write_text(
+            "| evidence | status |\n| N/A | open |\n",
+            encoding="utf-8",
+        )
+        tool_call = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "report.md"},
+            result=ToolResult.ok("ok", files_changed=["report.md"]),
+        )
+
+        result = await gates.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "Updated report",
+            [tool_call],
+            tmp_path,
+            tier=1,
+            task_id="task-placeholder-events",
+        )
+
+        assert not result.passed
+        placeholder_events = [
+            event
+            for event in events
+            if event.event_type == PLACEHOLDER_FINDINGS_EXTRACTED
+        ]
+        assert placeholder_events
+        payload = placeholder_events[-1].data
+        assert payload.get("subtask_id") == "phase-a"
+        assert payload.get("reason_code") == "incomplete_deliverable_placeholder"
+        assert int(payload.get("finding_count", 0) or 0) >= 1
+        findings = payload.get("findings", [])
+        assert isinstance(findings, list)
+        assert findings
+        assert findings[0].get("file_path") == "report.md"
+        assert findings[0].get("token") == "N/A"
+
+    @pytest.mark.asyncio
     async def test_tier1_failure_blocks_tier2(self, tmp_path):
         config = VerificationConfig(tier1_enabled=True, tier2_enabled=True)
         router = MagicMock(spec=ModelRouter)
@@ -1361,10 +1474,10 @@ class TestVerificationGates:
         assert scan.get("coverage_sufficient") is True
         assert scan.get("scan_mode") in {"targeted_only", "targeted_plus_fallback"}
         event_types = [event.event_type for event in events]
-        assert "verification_contradiction_detected" in event_types
+        assert VERIFICATION_CONTRADICTION_DETECTED in event_types
         contradiction_event = next(
             event for event in events
-            if event.event_type == "verification_contradiction_detected"
+            if event.event_type == VERIFICATION_CONTRADICTION_DETECTED
         )
         assert contradiction_event.data.get("coverage_sufficient") is True
         assert contradiction_event.data.get("contradiction_downgrade_count") == 1
@@ -1569,7 +1682,7 @@ class TestVerificationGates:
         assert result.metadata.get("contradiction_detected_no_downgrade") is True
         contradiction_event = next(
             event for event in events
-            if event.event_type == "verification_contradiction_detected"
+            if event.event_type == VERIFICATION_CONTRADICTION_DETECTED
         )
         assert contradiction_event.data.get("contradiction_detected_no_downgrade_count") == 1
         assert contradiction_event.data.get("cap_exhaustion_count") == 1
@@ -2080,6 +2193,78 @@ class TestDeterministicVerifierRegexRules:
         )
         assert not result.passed
         assert result.outcome == "fail"
+
+    @pytest.mark.asyncio
+    async def test_hard_placeholder_rule_routes_to_recoverable_unconfirmed(self, tmp_path):
+        process = _make_process(
+            deliverables={"phase-a": ["report.md"]},
+            regex_rules=[{
+                "name": "no-placeholders",
+                "description": "No unresolved placeholders in deliverables",
+                "check": r"\bN/A\b",
+                "severity": "error",
+                "type": "regex",
+                "target": "deliverables",
+                "enforcement": "hard",
+            }],
+        )
+        (tmp_path / "report.md").write_text(
+            "## Test Strategy\n\n| evidence | status |\n| N/A | open |\n",
+            encoding="utf-8",
+        )
+        tool_call = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "report.md"},
+            result=ToolResult.ok("ok", files_changed=["report.md"]),
+        )
+        verifier = DeterministicVerifier(process=process)
+        result = await verifier.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "Updated report",
+            [tool_call],
+            tmp_path,
+        )
+
+        assert not result.passed
+        assert result.reason_code == "incomplete_deliverable_placeholder"
+        assert result.severity_class == "semantic"
+        assert result.metadata.get("remediation_required") is True
+        assert result.metadata.get("remediation_mode") == "confirm_or_prune"
+        findings = result.metadata.get("placeholder_findings", [])
+        assert isinstance(findings, list)
+        assert findings
+        first = findings[0]
+        assert first.get("file_path") == "report.md"
+        assert int(first.get("line", 0) or 0) >= 1
+        assert first.get("token") == "N/A"
+
+    @pytest.mark.asyncio
+    async def test_hard_safety_failure_remains_hard_even_with_placeholder_rule(self):
+        process = _make_process(regex_rules=[{
+            "name": "no-placeholders",
+            "description": "No unresolved placeholders in output",
+            "check": r"\bN/A\b",
+            "severity": "error",
+            "type": "regex",
+            "target": "output",
+            "enforcement": "hard",
+        }])
+        verifier = DeterministicVerifier(process=process)
+        tool_call = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "report.md"},
+            result=ToolResult.fail("Permission denied"),
+        )
+        result = await verifier.verify(
+            _make_subtask(),
+            "Evidence status: N/A",
+            [tool_call],
+            None,
+        )
+
+        assert not result.passed
+        assert result.reason_code == "hard_invariant_failed"
+        assert result.severity_class == "hard_invariant"
 
     @pytest.mark.asyncio
     async def test_warning_severity_rule_passes_on_match(self):

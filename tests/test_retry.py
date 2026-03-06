@@ -200,6 +200,27 @@ class TestRetryManager:
         assert strategy == RetryStrategy.GENERIC
         assert markets == []
 
+    def test_classify_failure_routes_recoverable_placeholder_hard_invariant(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="hard invariant failed",
+            execution_error="",
+            verification={
+                "reason_code": "hard_invariant_failed",
+                "metadata": {
+                    "failure_class": "recoverable_placeholder",
+                    "remediation_mode": "confirm_or_prune",
+                    "placeholder_findings": [{
+                        "file_path": "report.md",
+                        "line": 42,
+                        "token": "N/A",
+                    }],
+                    "missing_targets": ["report.md:42"],
+                },
+            },
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == ["report.md:42"]
+
     def test_classify_failure_prefers_structured_remediation_mode(self):
         strategy, markets = RetryManager.classify_failure(
             verification_feedback="No obvious markers",

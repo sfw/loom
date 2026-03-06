@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loom.auth.runtime import coerce_auth_requirements, serialize_auth_requirements
+from loom.events.bus import Event
 from loom.state.task_state import SubtaskStatus, TaskStatus
 from loom.tools.registry import (
     Tool,
@@ -252,6 +253,13 @@ class DelegateTaskTool(Tool):
         event_log_path = ""
         event_log_sequence = 0
         event_log_broken = False
+        from loom.events.types import (
+            STEER_INSTRUCTION,
+            TASK_CANCEL_ACK,
+            TASK_CANCEL_TIMEOUT,
+            TASK_CREATED,
+            TASK_INJECTED,
+        )
 
         if wait:
             event_log_file = _resolve_delegate_event_log_file(orchestrator, task.id)
@@ -313,6 +321,23 @@ class DelegateTaskTool(Tool):
             except Exception:
                 logger.debug("delegate optional callback failed", exc_info=True)
 
+        def _emit_event_bus(event_type: str, payload: dict | None = None) -> None:
+            if event_bus is None:
+                return
+            try:
+                event_bus.emit(Event(
+                    event_type=event_type,
+                    task_id=task.id,
+                    data=dict(payload or {}),
+                ))
+            except Exception:
+                logger.debug(
+                    "delegate telemetry emit failed for %s/%s",
+                    task.id,
+                    event_type,
+                    exc_info=True,
+                )
+
         def _task_status_text(task_obj: Task) -> str:
             raw_status = getattr(task_obj, "status", "")
             if hasattr(raw_status, "value"):
@@ -332,6 +357,14 @@ class DelegateTaskTool(Tool):
             },
             event_log_path=event_log_path,
         )
+        if not reuse_existing_plan:
+            _emit_event_bus(TASK_CREATED, {
+                "goal": goal,
+                "workspace": workspace,
+                "approval_mode": approval_mode,
+                "execution_surface": execution_surface,
+                "source_component": "delegate_task",
+            })
         subscriptions: list[tuple[str, object]] = []
         token_burst_count = 0
         token_burst_subtask = ""
@@ -382,6 +415,12 @@ class DelegateTaskTool(Tool):
                     "task_cancel_ack",
                     {"path": "orchestrator", "requested": False, "error": error},
                 )
+                _emit_event_bus(TASK_CANCEL_ACK, {
+                    "path": "orchestrator",
+                    "requested": False,
+                    "error": error,
+                    "source_component": "delegate_task",
+                })
                 return {
                     "requested": False,
                     "path": "orchestrator",
@@ -406,6 +445,12 @@ class DelegateTaskTool(Tool):
                     "task_cancel_ack",
                     {"path": "orchestrator", "requested": False, "error": error},
                 )
+                _emit_event_bus(TASK_CANCEL_ACK, {
+                    "path": "orchestrator",
+                    "requested": False,
+                    "error": error,
+                    "source_component": "delegate_task",
+                })
                 return {
                     "requested": False,
                     "path": "orchestrator",
@@ -418,6 +463,11 @@ class DelegateTaskTool(Tool):
                 "task_cancel_ack",
                 {"path": "orchestrator", "requested": True},
             )
+            _emit_event_bus(TASK_CANCEL_ACK, {
+                "path": "orchestrator",
+                "requested": True,
+                "source_component": "delegate_task",
+            })
             if timeout_seconds <= 0:
                 return {
                     "requested": True,
@@ -454,6 +504,11 @@ class DelegateTaskTool(Tool):
                 "task_cancel_timeout",
                 {"path": "orchestrator", "timeout_seconds": timeout_seconds},
             )
+            _emit_event_bus(TASK_CANCEL_TIMEOUT, {
+                "path": "orchestrator",
+                "timeout_seconds": timeout_seconds,
+                "source_component": "delegate_task",
+            })
             return {
                 "requested": True,
                 "path": "orchestrator",
@@ -616,6 +671,12 @@ class DelegateTaskTool(Tool):
                     "task_injected",
                     {"path": "orchestrator", "requested": False, "error": error},
                 )
+                _emit_event_bus(TASK_INJECTED, {
+                    "path": "orchestrator",
+                    "requested": False,
+                    "error": error,
+                    "source_component": "delegate_task",
+                })
                 return {
                     "requested": False,
                     "path": "orchestrator",
@@ -631,6 +692,12 @@ class DelegateTaskTool(Tool):
                     "task_injected",
                     {"path": "orchestrator", "requested": False, "error": error},
                 )
+                _emit_event_bus(TASK_INJECTED, {
+                    "path": "orchestrator",
+                    "requested": False,
+                    "error": error,
+                    "source_component": "delegate_task",
+                })
                 return {
                     "requested": False,
                     "path": "orchestrator",
@@ -662,6 +729,12 @@ class DelegateTaskTool(Tool):
                     "task_injected",
                     {"path": "orchestrator", "requested": False, "error": error},
                 )
+                _emit_event_bus(TASK_INJECTED, {
+                    "path": "orchestrator",
+                    "requested": False,
+                    "error": error,
+                    "source_component": "delegate_task",
+                })
                 return {
                     "requested": False,
                     "path": "orchestrator",
@@ -684,6 +757,16 @@ class DelegateTaskTool(Tool):
                     "chars": len(clean),
                 },
             )
+            _emit_event_bus(TASK_INJECTED, {
+                "path": "orchestrator",
+                "requested": True,
+                "chars": len(clean),
+                "source_component": "delegate_task",
+            })
+            _emit_event_bus(STEER_INSTRUCTION, {
+                "instruction_chars": len(clean),
+                "source_component": "delegate_task",
+            })
             return {
                 "requested": True,
                 "path": "orchestrator",
@@ -784,32 +867,83 @@ class DelegateTaskTool(Tool):
                 ASK_USER_CANCELLED,
                 ASK_USER_REQUESTED,
                 ASK_USER_TIMEOUT,
+                CLAIM_VERIFICATION_SUMMARY,
                 COMPACTION_POLICY_DECISION,
                 MODEL_INVOCATION,
                 OVERFLOW_FALLBACK_APPLIED,
+                PLACEHOLDER_FILLED,
+                REMEDIATION_ATTEMPT,
+                REMEDIATION_EXPIRED,
+                REMEDIATION_FAILED,
+                REMEDIATION_QUEUED,
+                REMEDIATION_RESOLVED,
+                REMEDIATION_STARTED,
+                REMEDIATION_TERMINAL,
+                RUN_VALIDITY_SCORECARD,
+                STEER_INSTRUCTION,
+                SUBTASK_BLOCKED,
                 SUBTASK_COMPLETED,
                 SUBTASK_FAILED,
                 SUBTASK_RETRYING,
                 SUBTASK_STARTED,
+                TASK_BUDGET_EXHAUSTED,
+                TASK_CANCEL_ACK,
+                TASK_CANCEL_REQUESTED,
+                TASK_CANCEL_TIMEOUT,
                 TASK_CANCELLED,
                 TASK_COMPLETED,
                 TASK_EXECUTING,
                 TASK_FAILED,
+                TASK_INJECTED,
+                TASK_PAUSED,
+                TASK_PLAN_DEGRADED,
+                TASK_PLAN_NORMALIZED,
                 TASK_PLAN_READY,
                 TASK_PLANNING,
                 TASK_REPLANNING,
+                TASK_RESUMED,
+                TASK_RUN_ACQUIRED,
+                TASK_RUN_HEARTBEAT,
+                TASK_RUN_RECOVERED,
+                TASK_STALLED,
+                TASK_STALLED_RECOVERY_ATTEMPTED,
                 TELEMETRY_RUN_SUMMARY,
                 TOKEN_STREAMED,
                 TOOL_CALL_COMPLETED,
                 TOOL_CALL_STARTED,
+                UNCONFIRMED_DATA_QUEUED,
+                VERIFICATION_CONTRADICTION_DETECTED,
+                VERIFICATION_DETERMINISTIC_BLOCK_RATE,
+                VERIFICATION_FAILED,
+                VERIFICATION_INCONCLUSIVE_RATE,
+                VERIFICATION_OUTCOME,
+                VERIFICATION_PASSED,
+                VERIFICATION_RULE_FAILURE_BY_TYPE,
+                VERIFICATION_STARTED,
             )
 
             observed = (
                 TASK_PLANNING,
                 TASK_PLAN_READY,
+                TASK_PLAN_NORMALIZED,
                 TASK_EXECUTING,
+                TASK_REPLANNING,
+                TASK_STALLED,
+                TASK_STALLED_RECOVERY_ATTEMPTED,
+                TASK_PLAN_DEGRADED,
+                TASK_BUDGET_EXHAUSTED,
+                TASK_RUN_ACQUIRED,
+                TASK_RUN_HEARTBEAT,
+                TASK_RUN_RECOVERED,
+                TASK_PAUSED,
+                TASK_RESUMED,
+                TASK_INJECTED,
+                TASK_CANCEL_REQUESTED,
+                TASK_CANCEL_ACK,
+                TASK_CANCEL_TIMEOUT,
                 MODEL_INVOCATION,
                 SUBTASK_STARTED,
+                SUBTASK_BLOCKED,
                 SUBTASK_RETRYING,
                 TOKEN_STREAMED,
                 TOOL_CALL_STARTED,
@@ -820,13 +954,32 @@ class DelegateTaskTool(Tool):
                 ARTIFACT_READ_COMPLETED,
                 COMPACTION_POLICY_DECISION,
                 OVERFLOW_FALLBACK_APPLIED,
+                VERIFICATION_STARTED,
+                VERIFICATION_OUTCOME,
+                VERIFICATION_PASSED,
+                VERIFICATION_FAILED,
+                VERIFICATION_CONTRADICTION_DETECTED,
+                VERIFICATION_INCONCLUSIVE_RATE,
+                VERIFICATION_DETERMINISTIC_BLOCK_RATE,
+                VERIFICATION_RULE_FAILURE_BY_TYPE,
+                CLAIM_VERIFICATION_SUMMARY,
+                REMEDIATION_QUEUED,
+                REMEDIATION_STARTED,
+                REMEDIATION_ATTEMPT,
+                REMEDIATION_RESOLVED,
+                REMEDIATION_FAILED,
+                REMEDIATION_EXPIRED,
+                REMEDIATION_TERMINAL,
+                UNCONFIRMED_DATA_QUEUED,
+                PLACEHOLDER_FILLED,
+                STEER_INSTRUCTION,
                 SUBTASK_COMPLETED,
                 SUBTASK_FAILED,
-                TASK_REPLANNING,
                 ASK_USER_REQUESTED,
                 ASK_USER_ANSWERED,
                 ASK_USER_TIMEOUT,
                 ASK_USER_CANCELLED,
+                RUN_VALIDITY_SCORECARD,
                 TASK_CANCELLED,
                 TASK_COMPLETED,
                 TASK_FAILED,
@@ -975,6 +1128,11 @@ class DelegateTaskTool(Tool):
                         "task_cancel_ack",
                         {"path": "delegate_task_cancelled", "requested": True},
                     )
+                    _emit_event_bus(TASK_CANCEL_ACK, {
+                        "path": "delegate_task_cancelled",
+                        "requested": True,
+                        "source_component": "delegate_task",
+                    })
                 except Exception as e:
                     _log_event(
                         "task_cancel_failed",

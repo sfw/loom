@@ -225,6 +225,32 @@ uv run python scripts/latency_smoke.py --iterations 5 --workspace /path/to/works
 The script reports mean/p50/p95 timings for process catalog scan and tool
 registry creation with sync vs background MCP startup modes.
 
+### Database Upgrades
+
+Loom now uses explicit schema migrations tracked in `schema_migrations`.
+On startup, existing DBs are upgraded before runtime features are allowed to
+continue. If an existing DB cannot be upgraded, startup fails with a clear
+actionable error instead of silently falling back to ephemeral mode.
+For new DB initialization failures (path/permissions), startup is also a hard
+error by default; use `--ephemeral` to opt into non-persistent mode.
+
+Use:
+
+```bash
+uv run loom db status
+uv run loom db migrate
+uv run loom db doctor
+uv run loom db backup
+```
+
+```bash
+# explicit non-persistent mode when DB init fails
+uv run loom --ephemeral
+```
+
+See migration authoring and policy details in
+[`docs/DB-MIGRATIONS.md`](docs/DB-MIGRATIONS.md).
+
 ## Auth Profiles and Run-Time Resolution
 
 Loom stores credential metadata (not plaintext secrets) in `~/.loom/auth.toml`.

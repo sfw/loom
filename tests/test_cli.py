@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import threading
@@ -63,6 +64,7 @@ class TestCLI:
         result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
         assert "Loom" in result.output
+        assert "--ephemeral" in result.output
 
     def test_version(self):
         runner = CliRunner()
@@ -115,6 +117,115 @@ class TestCLI:
         result = runner.invoke(cli, ["cancel", "--help"])
         assert result.exit_code == 0
 
+    def test_db_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["db", "--help"])
+        assert result.exit_code == 0
+        assert "status" in result.output
+        assert "migrate" in result.output
+        assert "doctor" in result.output
+        assert "backup" in result.output
+
+    def test_db_status_missing_db(self, tmp_path):
+        db_path = tmp_path / "loom.db"
+        cfg_path = tmp_path / "loom.toml"
+        cfg_path.write_text(
+            "[memory]\n"
+            f"database_path = \"{db_path}\"\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "db", "status"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert "State: missing" in result.output
+
+    def test_db_status_and_doctor_for_initialized_db(self, tmp_path):
+        from loom.state.memory import Database
+        from loom.state.migrations import MIGRATIONS
+
+        db_path = tmp_path / "loom.db"
+        asyncio.run(Database(db_path).initialize())
+
+        cfg_path = tmp_path / "loom.toml"
+        cfg_path.write_text(
+            "[memory]\n"
+            f"database_path = \"{db_path}\"\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+
+        status_result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "db", "status"],
+            catch_exceptions=False,
+        )
+        assert status_result.exit_code == 0
+        assert f"Applied: {len(MIGRATIONS)}" in status_result.output
+        assert "Pending: 0" in status_result.output
+        assert "Schema health: ok" in status_result.output
+
+        doctor_result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "db", "doctor"],
+            catch_exceptions=False,
+        )
+        assert doctor_result.exit_code == 0
+        assert "Doctor passed" in doctor_result.output
+
+    def test_db_migrate_bootstraps_database(self, tmp_path):
+        db_path = tmp_path / "loom.db"
+        cfg_path = tmp_path / "loom.toml"
+        cfg_path.write_text(
+            "[memory]\n"
+            f"database_path = \"{db_path}\"\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "db", "migrate"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert db_path.exists()
+        assert "Migrations applied successfully" in result.output
+        assert "Applied migrations:" in result.output
+
+    def test_db_backup_creates_copy(self, tmp_path):
+        from loom.state.memory import Database
+
+        db_path = tmp_path / "loom.db"
+        backup_path = tmp_path / "loom.db.backup"
+        asyncio.run(Database(db_path).initialize())
+
+        cfg_path = tmp_path / "loom.toml"
+        cfg_path.write_text(
+            "[memory]\n"
+            f"database_path = \"{db_path}\"\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg_path),
+                "db",
+                "backup",
+                "--output",
+                str(backup_path),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert backup_path.exists()
+        assert backup_path.stat().st_size > 0
+        assert "Backup created" in result.output
+
     def test_models_no_config(self, tmp_path):
         # Use a config with no models to avoid picking up project loom.toml
         empty_toml = tmp_path / "loom.toml"
@@ -138,6 +249,7 @@ class TestCLI:
         assert "--workspace" in result.output
         assert "--model" in result.output
         assert "--resume" in result.output
+        assert "--ephemeral" in result.output
         assert "--process" not in result.output
 
     def test_default_shows_help_with_workspace_and_model(self):
@@ -161,7 +273,7 @@ class TestCLI:
                 captured["run_kwargs"] = kwargs
                 return None
 
-        monkeypatch.setattr(main_mod, "_init_persistence", lambda _cfg: (None, None))
+        monkeypatch.setattr(main_mod, "_init_persistence", lambda _cfg, **_kwargs: (None, None))
         monkeypatch.setattr(
             "loom.tools.create_default_registry",
             lambda _config=None, **_kwargs: MagicMock(),

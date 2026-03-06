@@ -2065,6 +2065,40 @@ verification:
         assert "verified_claim_count" in metadata_fields
         assert "supporting_ratio" in metadata_fields
 
+    def test_loader_accepts_placeholder_rule_recovery_metadata(self, tmp_path):
+        yaml_content = """\
+name: placeholder-recovery-metadata
+schema_version: 2
+version: '1.0'
+description: test
+persona: test
+phases:
+  - id: draft
+    description: Draft
+verification:
+  rules:
+    - name: no-placeholders
+      description: No unresolved placeholders
+      check: "\\\\bN/A\\\\b"
+      severity: error
+      type: regex
+      target: deliverables
+      enforcement: hard
+      failure_class: recoverable_placeholder
+      remediation_mode: confirm_or_prune
+"""
+        path = tmp_path / "placeholder-recovery.yaml"
+        path.write_text(yaml_content)
+        loader = ProcessLoader()
+        defn = loader.load(str(path))
+        rule = next(
+            (item for item in defn.verification_rules if item.name == "no-placeholders"),
+            None,
+        )
+        assert rule is not None
+        assert rule.failure_class == "recoverable_placeholder"
+        assert rule.remediation_mode == "confirm_or_prune"
+
 
 class TestPhaseIterationPolicyValidation:
     """Tests for phase-level iteration policy parsing and linting."""

@@ -861,11 +861,25 @@
     <tr><td><code>verification_started</code></td><td>Verification check beginning</td></tr>
     <tr><td><code>verification_passed</code></td><td>Verification check passed</td></tr>
     <tr><td><code>verification_failed</code></td><td>Verification check failed</td></tr>
+    <tr><td><code>verification_outcome</code></td><td>Structured verification outcome and reason code</td></tr>
     <tr><td><code>approval_requested</code></td><td>Waiting for human approval (with confidence score)</td></tr>
+    <tr><td><code>task_paused</code></td><td>Pause request accepted/rejected at control-plane boundary</td></tr>
+    <tr><td><code>task_resumed</code></td><td>Resume request accepted/rejected at control-plane boundary</td></tr>
+    <tr><td><code>task_injected</code></td><td>Instruction injected into active execution context</td></tr>
+    <tr><td><code>task_cancel_requested</code></td><td>Cancellation requested</td></tr>
+    <tr><td><code>task_cancel_ack</code></td><td>Cancellation acknowledged by orchestrator</td></tr>
+    <tr><td><code>task_cancel_timeout</code></td><td>Cancellation wait timed out</td></tr>
+    <tr><td><code>telemetry_run_summary</code></td><td>End-of-run audit counter summary</td></tr>
+    <tr><td><code>webhook_delivery_attempted</code></td><td>Terminal callback delivery attempt started</td></tr>
+    <tr><td><code>webhook_delivery_succeeded</code></td><td>Terminal callback delivery succeeded</td></tr>
+    <tr><td><code>webhook_delivery_failed</code></td><td>Terminal callback delivery exhausted retries</td></tr>
+    <tr><td><code>webhook_delivery_dropped</code></td><td>Terminal callback delivery skipped (unsafe/unregistered)</td></tr>
     <tr><td><code>task_completed</code></td><td>All subtasks done</td></tr>
     <tr><td><code>task_failed</code></td><td>Task could not complete</td></tr>
     <tr><td><code>token_streamed</code></td><td>A model token was generated (streaming mode)</td></tr>
   </table>
+
+  <p>For the complete active/internal telemetry lifecycle and payload contract details, see <code>docs/telemetry-catalog.md</code>.</p>
 
   <p>The stream terminates automatically when the task reaches a terminal state (<code>completed</code>, <code>failed</code>, or <code>cancelled</code>). If no events arrive for 30 seconds, a keepalive comment is sent to maintain the connection.</p>
 </section>

@@ -12,6 +12,7 @@ from loom.api.engine import Engine
 from loom.config import Config, ExecutionConfig, ProcessConfig
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import EventBus
+from loom.events.types import STEER_INSTRUCTION, TASK_CREATED
 from loom.events.webhook import WebhookDelivery
 from loom.learning.manager import LearningManager
 from loom.models.router import ModelRouter
@@ -256,6 +257,22 @@ class TestTaskCreate:
         assert response.status_code == 422
 
     @pytest.mark.asyncio
+    async def test_create_task_emits_task_created_event(self, client, event_bus):
+        events = []
+        event_bus.subscribe_all(lambda event: events.append(event))
+        response = await client.post("/tasks", json={"goal": "Emit telemetry"})
+        assert response.status_code == 201
+        task_id = response.json()["task_id"]
+        created_events = [
+            event for event in events
+            if event.event_type == TASK_CREATED and event.task_id == task_id
+        ]
+        assert created_events
+        payload = created_events[-1].data
+        assert payload.get("goal") == "Emit telemetry"
+        assert str(payload.get("run_id", "")).strip()
+
+    @pytest.mark.asyncio
     async def test_create_task_forces_api_execution_surface(
         self,
         client,
@@ -378,6 +395,21 @@ class TestTaskSteer:
         })
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_steer_emits_steer_instruction_event(self, client, state_manager, event_bus):
+        _make_task(state_manager, status=TaskStatus.EXECUTING)
+        events = []
+        event_bus.subscribe_all(lambda event: events.append(event))
+        instruction = "Use PostgreSQL instead of MySQL"
+        response = await client.patch("/tasks/test-1", json={"instruction": instruction})
+        assert response.status_code == 200
+        steer_events = [
+            event for event in events
+            if event.event_type == STEER_INSTRUCTION and event.task_id == "test-1"
+        ]
+        assert steer_events
+        assert steer_events[-1].data.get("instruction_chars") == len(instruction)
 
     @pytest.mark.asyncio
     async def test_steer_completed_task(self, client, state_manager):

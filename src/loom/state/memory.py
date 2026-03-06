@@ -7,11 +7,25 @@ Retrieval is deterministic SQL (by task, subtask, type, tags).
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
+
+from loom.events.types import DB_MIGRATION_FAILED, DB_SCHEMA_READY
+from loom.state.migrations import (
+    MIGRATIONS,
+    MigrationExecutionError,
+    apply_pending_migrations,
+    ensure_migration_table,
+    has_user_tables,
+    verify_schema,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -40,6 +54,37 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _iter_sql_statements(script: str) -> list[str]:
+    """Split SQL script into complete statements while preserving trigger bodies."""
+    statements: list[str] = []
+    buffer: list[str] = []
+    for raw_line in script.splitlines():
+        line = str(raw_line or "")
+        if not buffer and not line.strip():
+            continue
+        buffer.append(line)
+        candidate = "\n".join(buffer).strip()
+        if not candidate:
+            buffer.clear()
+            continue
+        if sqlite3.complete_statement(candidate):
+            statement = candidate.strip()
+            if statement.endswith(";"):
+                statement = statement[:-1].strip()
+            if statement:
+                statements.append(statement)
+            buffer.clear()
+
+    if any(str(part).strip() for part in buffer):
+        raise RuntimeError("Incomplete SQL statement detected in schema script.")
+    return statements
+
+
+async def _apply_schema_script(db: aiosqlite.Connection, script: str) -> None:
+    for statement in _iter_sql_statements(script):
+        await db.execute(statement)
+
+
 class Database:
     """Async SQLite database wrapper for Loom.
 
@@ -54,15 +99,81 @@ class Database:
         pass
 
     async def initialize(self) -> None:
-        """Create tables from schema.sql if they don't exist."""
+        """Initialize database schema and apply ordered migrations."""
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        schema_path = Path(__file__).parent / "schema.sql"
+        state_dir = Path(__file__).parent
+        schema_path = state_dir / "schema.sql"
+        base_schema_path = state_dir / "schema" / "base.sql"
         schema = schema_path.read_text()
+        base_schema = base_schema_path.read_text() if base_schema_path.exists() else schema
+        db_path_text = str(self._db_path)
+
+        def _report(event_type: str, payload: dict[str, object]) -> None:
+            body = {
+                "event_type": event_type,
+                "db_path": db_path_text,
+                **payload,
+            }
+            logger.info("db_migration_diagnostic %s", json.dumps(body, sort_keys=True))
+
         async with aiosqlite.connect(self._db_path) as db:
             # Enable WAL mode for better concurrent read/write performance
             await db.execute("PRAGMA journal_mode=WAL")
-            await db.executescript(schema)
-            await db.commit()
+            await db.execute("BEGIN IMMEDIATE")
+            existing_db = False
+            applied_now: list[str] = []
+            try:
+                existing_db = await has_user_tables(db)
+                if existing_db:
+                    await ensure_migration_table(db)
+                    applied_now = await apply_pending_migrations(
+                        db,
+                        steps=MIGRATIONS,
+                        reporter=_report,
+                        db_path=db_path_text,
+                    )
+                    # Create any newer tables/indexes not present in older databases.
+                    await _apply_schema_script(db, schema)
+                else:
+                    await _apply_schema_script(db, base_schema)
+                    await ensure_migration_table(db)
+                    # Record bootstrap at latest migration state and verify idempotency.
+                    applied_now = await apply_pending_migrations(
+                        db,
+                        steps=MIGRATIONS,
+                        reporter=_report,
+                        db_path=db_path_text,
+                    )
+                await verify_schema(db, steps=MIGRATIONS)
+                _report(
+                    DB_SCHEMA_READY,
+                    {
+                        "existing_db": bool(existing_db),
+                        "applied_migration_ids": applied_now,
+                    },
+                )
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                _report(
+                    DB_MIGRATION_FAILED,
+                    {
+                        "migration_id": (
+                            e.migration_id
+                            if isinstance(e, MigrationExecutionError)
+                            else ""
+                        ),
+                        "phase": (
+                            e.phase
+                            if isinstance(e, MigrationExecutionError)
+                            else "startup"
+                        ),
+                        "error_class": e.__class__.__name__,
+                        "error_message": str(e),
+                        "actionable_suggestion_key": "loom_db_doctor_then_migrate",
+                    },
+                )
+                raise
 
     async def execute(self, sql: str, params: tuple = ()) -> None:
         """Execute a write query."""
@@ -1326,12 +1437,34 @@ class Database:
         correlation_id: str,
         event_type: str,
         data: dict,
+        *,
+        timestamp: str = "",
+        run_id: str = "",
+        event_id: str = "",
+        sequence: int = 0,
+        source_component: str = "",
+        schema_version: int = 1,
     ) -> int:
         """Insert an event log entry."""
+        emitted_timestamp = str(timestamp or "").strip() or datetime.now(UTC).isoformat()
+        payload = data if isinstance(data, dict) else {}
         return await self.execute_returning_id(
-            """INSERT INTO events (task_id, correlation_id, timestamp, event_type, data)
-               VALUES (?, ?, ?, ?, ?)""",
-            (task_id, correlation_id, datetime.now().isoformat(), event_type, json.dumps(data)),
+            """INSERT INTO events
+               (task_id, run_id, correlation_id, event_id, sequence, timestamp, event_type,
+                source_component, schema_version, data)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                task_id,
+                run_id,
+                correlation_id,
+                event_id,
+                max(0, int(sequence)),
+                emitted_timestamp,
+                event_type,
+                source_component,
+                max(1, int(schema_version)),
+                json.dumps(payload, ensure_ascii=False, default=str),
+            ),
         )
 
     async def query_events(
@@ -1344,11 +1477,11 @@ class Database:
         if event_type:
             return await self.query(
                 """SELECT * FROM events WHERE task_id=? AND event_type=?
-                   ORDER BY timestamp DESC LIMIT ?""",
+                   ORDER BY sequence DESC, id DESC LIMIT ?""",
                 (task_id, event_type, limit),
             )
         return await self.query(
-            "SELECT * FROM events WHERE task_id=? ORDER BY timestamp DESC LIMIT ?",
+            "SELECT * FROM events WHERE task_id=? ORDER BY sequence DESC, id DESC LIMIT ?",
             (task_id, limit),
         )
 

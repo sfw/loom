@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -84,6 +86,10 @@ from loom.mcp.config import (
 )
 from loom.oauth.engine import OAuthEngine, OAuthEngineError, OAuthProviderConfig
 from loom.tools import create_default_registry
+
+
+class PersistenceInitError(RuntimeError):
+    """Raised when an existing Loom database cannot be initialized safely."""
 
 
 def _resolve_config_path(config_path: Path | None) -> Path | None:
@@ -292,6 +298,13 @@ def _close_runtime_mcp_registry(registry) -> None:
 )
 @click.option("--model", "-m", default=None, help="Model name from config to use.")
 @click.option("--resume", "resume_session", default=None, help="Resume a previous session by ID.")
+@click.option(
+    "--ephemeral",
+    "allow_ephemeral",
+    is_flag=True,
+    default=False,
+    help="Allow startup without SQLite persistence when DB initialization fails.",
+)
 @click.pass_context
 def cli(
     ctx: click.Context,
@@ -301,6 +314,7 @@ def cli(
     auth_config_path: Path | None,
     model: str | None,
     resume_session: str | None,
+    allow_ephemeral: bool,
 ) -> None:
     """Loom — Local model orchestration engine.
 
@@ -328,6 +342,7 @@ def cli(
         ctx.obj["explicit_auth_path"] = (
             auth_config_path.expanduser().resolve() if auth_config_path else None
         )
+        ctx.obj["allow_ephemeral"] = bool(allow_ephemeral)
     except ConfigError as e:
         if ctx.invoked_subcommand == "setup":
             # Let setup proceed even with broken/missing config
@@ -341,6 +356,7 @@ def cli(
             ctx.obj["explicit_auth_path"] = (
                 auth_config_path.expanduser().resolve() if auth_config_path else None
             )
+            ctx.obj["allow_ephemeral"] = bool(allow_ephemeral)
         else:
             click.echo(f"Configuration error: {e}", err=True)
             sys.exit(1)
@@ -353,6 +369,7 @@ def cli(
             ctx.obj.get("explicit_mcp_path"),
             ctx.obj.get("config_path"),
             ctx.obj.get("explicit_auth_path"),
+            ctx.obj.get("allow_ephemeral", False),
         )
 
 
@@ -382,6 +399,7 @@ def _launch_tui(
     explicit_mcp_path: Path | None = None,
     legacy_config_path: Path | None = None,
     explicit_auth_path: Path | None = None,
+    allow_ephemeral: bool = False,
 ) -> None:
     """Launch the Loom TUI with full cowork backend."""
     from loom.tools import create_default_registry
@@ -395,8 +413,13 @@ def _launch_tui(
     if config.models:
         provider = _resolve_model(config, model_name)
 
-    # Initialize database and conversation store (fall back to ephemeral)
-    db, store = _init_persistence(config)
+    # Initialize database and conversation store (fall back to ephemeral only
+    # for new/invalid paths, never for existing DB upgrade failures).
+    try:
+        db, store = _init_persistence(config, allow_ephemeral=allow_ephemeral)
+    except PersistenceInitError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
     if db is None:
         click.echo(
             "Warning: database unavailable, running in ephemeral mode.",
@@ -427,17 +450,28 @@ def _launch_tui(
     app.run(mouse=True)
 
 
-def _init_persistence(config: Config):
+def _init_persistence(config: Config, *, allow_ephemeral: bool = False):
     """Initialize database and conversation store.
 
-    Returns (db, store) on success, or (None, None) if initialization fails.
-    The TUI will fall back to ephemeral mode when store is None.
+    Returns (db, store) on success, or (None, None) when creating a new DB
+    fails and ephemeral fallback is explicitly enabled.
+
+    Raises:
+        PersistenceInitError: Existing DB file could not be initialized. This
+        is treated as a blocking upgrade failure.
     """
     from loom.state.conversation_store import ConversationStore
     from loom.state.memory import Database
+    from loom.state.migrations import MigrationExecutionError
+
+    db_path = config.database_path
+    existing_db = False
+    try:
+        existing_db = db_path.exists() and db_path.is_file() and db_path.stat().st_size > 0
+    except Exception:
+        existing_db = False
 
     try:
-        db_path = config.database_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
         db = Database(db_path)
 
@@ -449,6 +483,23 @@ def _init_persistence(config: Config):
         return db, store
     except Exception as e:
         click.echo(f"Warning: database init failed: {e}", err=True)
+        if existing_db:
+            if isinstance(e, MigrationExecutionError):
+                raise PersistenceInitError(
+                    "Existing Loom database migration failed "
+                    f"({e.migration_id}/{e.phase}): {e}. "
+                    "Run `loom db doctor` and `loom db migrate`, then retry."
+                ) from e
+            raise PersistenceInitError(
+                "Existing Loom database could not be upgraded. "
+                "Run `loom db doctor` and `loom db migrate`, then retry."
+            ) from e
+        if not allow_ephemeral:
+            raise PersistenceInitError(
+                "Database initialization failed for a new database path. "
+                "Fix filesystem permissions/path, or rerun with `--ephemeral` "
+                "to continue without persistence."
+            ) from e
         return None, None
 
 
@@ -463,12 +514,20 @@ def _init_persistence(config: Config):
 )
 @click.option("--model", "-m", default=None, help="Model name from config to use.")
 @click.option("--resume", "resume_session", default=None, help="Resume a previous session by ID.")
+@click.option(
+    "--ephemeral",
+    "allow_ephemeral",
+    is_flag=True,
+    default=False,
+    help="Allow startup without SQLite persistence when DB initialization fails.",
+)
 @click.pass_context
 def cowork(
     ctx: click.Context,
     workspace: Path | None,
     model: str | None,
     resume_session: str | None,
+    allow_ephemeral: bool,
 ) -> None:
     """Start an interactive cowork session (alias for default TUI).
 
@@ -488,6 +547,7 @@ def cowork(
         ctx.obj.get("explicit_mcp_path"),
         ctx.obj.get("config_path"),
         ctx.obj.get("explicit_auth_path"),
+        bool(allow_ephemeral or ctx.obj.get("allow_ephemeral", False)),
     )
 
 
@@ -3859,6 +3919,154 @@ def uninstall(
     except UninstallError as e:
         click.echo(f"Uninstall failed: {e}", err=True)
         sys.exit(1)
+
+
+@cli.group(name="db")
+def db_group() -> None:
+    """Inspect and manage Loom SQLite migrations."""
+
+
+@db_group.command(name="status")
+@click.pass_context
+def db_status(ctx: click.Context) -> None:
+    """Show migration status for the configured Loom database."""
+    from loom.state.migrations import MIGRATIONS, migration_status, verify_schema
+
+    config = _effective_config(ctx, None)
+    db_path = config.database_path
+    if not db_path.exists():
+        click.echo(f"Database: {db_path}")
+        click.echo("State: missing (will initialize on first run)")
+        return
+
+    async def _run() -> tuple[dict[str, object], str]:
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            payload = await migration_status(conn, steps=MIGRATIONS)
+            health = "ok"
+            try:
+                await verify_schema(conn, steps=MIGRATIONS)
+            except Exception as e:
+                health = f"failed ({e})"
+            return payload, health
+
+    payload, health = asyncio.run(_run())
+    applied_ids = list(payload.get("applied_ids", []))
+    pending_ids = list(payload.get("pending_ids", []))
+    latest_id = str(payload.get("latest_id", "") or "")
+
+    click.echo(f"Database: {db_path}")
+    click.echo(f"Latest migration: {latest_id or '(none)'}")
+    click.echo(f"Applied: {len(applied_ids)}")
+    click.echo(f"Pending: {len(pending_ids)}")
+    click.echo(f"Schema health: {health}")
+    for mid in pending_ids:
+        click.echo(f"  - {mid}")
+
+
+@db_group.command(name="migrate")
+@click.pass_context
+def db_migrate(ctx: click.Context) -> None:
+    """Apply pending migrations to the configured Loom database."""
+    import aiosqlite
+
+    from loom.state.memory import Database
+    from loom.state.migrations import MIGRATIONS, migration_status
+
+    config = _effective_config(ctx, None)
+    db_path = config.database_path
+
+    async def _run() -> list[tuple[str, int]]:
+        pending_before: list[str] = []
+        async with aiosqlite.connect(db_path) as conn:
+            status_before = await migration_status(conn, steps=MIGRATIONS)
+            pending_before = list(status_before.get("pending_ids", []))
+
+        db = Database(str(db_path))
+        await db.initialize()
+        if not pending_before:
+            return []
+
+        placeholders = ",".join("?" for _ in pending_before)
+        query = (
+            "SELECT id, duration_ms FROM schema_migrations "
+            f"WHERE id IN ({placeholders}) ORDER BY id"
+        )
+        async with aiosqlite.connect(db_path) as conn:
+            cursor = await conn.execute(query, tuple(pending_before))
+            rows = await cursor.fetchall()
+        return [(str(row[0]), int(row[1] or 0)) for row in rows]
+
+    try:
+        applied = asyncio.run(_run())
+    except Exception as e:
+        click.echo(f"Migration failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Migrations applied successfully for {db_path}")
+    if not applied:
+        click.echo("No pending migrations.")
+        return
+    click.echo("Applied migrations:")
+    for migration_id, duration_ms in applied:
+        click.echo(f"  - {migration_id} ({duration_ms} ms)")
+
+
+@db_group.command(name="doctor")
+@click.pass_context
+def db_doctor(ctx: click.Context) -> None:
+    """Run migration and schema verification checks."""
+    from loom.state.migrations import MIGRATIONS, verify_schema
+
+    config = _effective_config(ctx, None)
+    db_path = config.database_path
+    if not db_path.exists():
+        click.echo(f"Database: {db_path}")
+        click.echo("Doctor: database file does not exist yet.")
+        return
+
+    async def _run() -> None:
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            await verify_schema(conn, steps=MIGRATIONS)
+
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        click.echo(f"Doctor failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Doctor passed: {db_path}")
+
+
+@db_group.command(name="backup")
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional destination path. Defaults to <db>.backup-<timestamp>.",
+)
+@click.pass_context
+def db_backup(ctx: click.Context, output_path: Path | None) -> None:
+    """Create a timestamped backup copy of the Loom database."""
+    config = _effective_config(ctx, None)
+    db_path = config.database_path
+    if not db_path.exists():
+        click.echo(f"Database does not exist: {db_path}", err=True)
+        sys.exit(1)
+    if output_path is None:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output_path = db_path.with_name(f"{db_path.name}.backup-{stamp}")
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_path) as source:
+            with sqlite3.connect(output_path) as target:
+                source.backup(target)
+    except Exception as e:
+        click.echo(f"Backup failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Backup created: {output_path}")
 
 
 @cli.command()
