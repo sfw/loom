@@ -3737,6 +3737,167 @@ class TestSubtaskRunnerContextBudget:
         assert noncanonical_error is not None
         assert "Unexpected target(s)" in noncanonical_error
 
+    def test_sealed_artifact_policy_blocks_edit_without_post_seal_evidence(self, tmp_path):
+        from loom.engine.runner import SubtaskRunner
+
+        task = _make_task(goal="Seal enforcement", workspace=str(tmp_path))
+        task.metadata["artifact_seals"] = {
+            "analysis.md": {
+                "path": "analysis.md",
+                "sha256": hashlib.sha256(b"sealed").hexdigest(),
+                "subtask_id": "s1",
+                "sealed_at": "2026-03-05T10:00:00",
+            },
+        }
+        task.metadata["validity_scorecard"] = {
+            "subtask_metrics": {
+                "s1": {"verification_outcome": "pass"},
+            },
+        }
+        prior_calls = [
+            ToolCallRecord(
+                tool="read_file",
+                args={"path": "analysis.md"},
+                result=ToolResult.ok("old evidence"),
+                timestamp="2026-03-05T09:59:59",
+            ),
+        ]
+
+        error = SubtaskRunner._validate_sealed_artifact_mutation_policy(
+            task=task,
+            tool_name="edit_file",
+            tool_args={"path": "analysis.md"},
+            workspace=tmp_path,
+            prior_successful_tool_calls=prior_calls,
+            current_tool_calls=[],
+        )
+
+        assert error is not None
+        assert "analysis.md" in error
+        assert "blocked" in error.lower()
+
+    def test_sealed_artifact_policy_allows_edit_with_post_seal_evidence(self, tmp_path):
+        from loom.engine.runner import SubtaskRunner
+
+        task = _make_task(goal="Seal enforcement", workspace=str(tmp_path))
+        task.metadata["artifact_seals"] = {
+            "analysis.md": {
+                "path": "analysis.md",
+                "sha256": hashlib.sha256(b"sealed").hexdigest(),
+                "subtask_id": "s1",
+                "sealed_at": "2026-03-05T10:00:00",
+            },
+        }
+        task.metadata["validity_scorecard"] = {
+            "subtask_metrics": {
+                "s1": {"verification_outcome": "pass"},
+            },
+        }
+        prior_calls = [
+            ToolCallRecord(
+                tool="web_fetch",
+                args={"url": "https://example.com"},
+                result=ToolResult.ok("new evidence"),
+                timestamp="2026-03-05T10:10:00",
+            ),
+        ]
+
+        error = SubtaskRunner._validate_sealed_artifact_mutation_policy(
+            task=task,
+            tool_name="edit_file",
+            tool_args={"path": "analysis.md"},
+            workspace=tmp_path,
+            prior_successful_tool_calls=prior_calls,
+            current_tool_calls=[],
+        )
+
+        assert error is None
+
+    def test_reseal_updates_sha_for_tracked_verified_artifact(self, tmp_path):
+        from loom.engine.runner import SubtaskRunner
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        artifact = workspace / "analysis.md"
+        artifact.write_text("sealed", encoding="utf-8")
+
+        task = _make_task(goal="Reseal", workspace=str(workspace))
+        task.metadata["artifact_seals"] = {
+            "analysis.md": {
+                "path": "analysis.md",
+                "sha256": hashlib.sha256(b"sealed").hexdigest(),
+                "subtask_id": "s1",
+                "sealed_at": "2026-03-05T10:00:00",
+            },
+        }
+        task.metadata["validity_scorecard"] = {
+            "subtask_metrics": {
+                "s1": {"verification_outcome": "pass"},
+            },
+        }
+
+        artifact.write_text("updated with evidence", encoding="utf-8")
+        updated = SubtaskRunner._reseal_tracked_artifacts_after_mutation(
+            task=task,
+            workspace=workspace,
+            tool_name="edit_file",
+            tool_args={"path": "analysis.md"},
+            tool_result=ToolResult.ok("edited", files_changed=["analysis.md"]),
+            subtask_id="s2",
+            tool_call_id="call-1",
+        )
+
+        assert updated == 1
+        seal = task.metadata.get("artifact_seals", {}).get("analysis.md", {})
+        assert seal.get("sha256") == hashlib.sha256(b"updated with evidence").hexdigest()
+        assert seal.get("subtask_id") == "s2"
+        assert seal.get("verified_origin") is True
+
+    def test_reseal_moves_verified_seal_to_destination(self, tmp_path):
+        from loom.engine.runner import SubtaskRunner
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        source = workspace / "analysis.md"
+        source.write_text("sealed", encoding="utf-8")
+        destination = workspace / "analysis-v2.md"
+        source.rename(destination)
+
+        task = _make_task(goal="Reseal move", workspace=str(workspace))
+        task.metadata["artifact_seals"] = {
+            "analysis.md": {
+                "path": "analysis.md",
+                "sha256": hashlib.sha256(b"sealed").hexdigest(),
+                "subtask_id": "s1",
+                "sealed_at": "2026-03-05T10:00:00",
+            },
+        }
+        task.metadata["validity_scorecard"] = {
+            "subtask_metrics": {
+                "s1": {"verification_outcome": "pass"},
+            },
+        }
+
+        updated = SubtaskRunner._reseal_tracked_artifacts_after_mutation(
+            task=task,
+            workspace=workspace,
+            tool_name="move_file",
+            tool_args={"source": "analysis.md", "destination": "analysis-v2.md"},
+            tool_result=ToolResult.ok(
+                "moved",
+                files_changed=["analysis.md", "analysis-v2.md"],
+            ),
+            subtask_id="s2",
+            tool_call_id="call-2",
+        )
+
+        assert updated == 2
+        seals = task.metadata.get("artifact_seals", {})
+        assert "analysis.md" not in seals
+        moved = seals.get("analysis-v2.md", {})
+        assert moved.get("sha256") == hashlib.sha256(b"sealed").hexdigest()
+        assert moved.get("verified_origin") is True
+
 
 class TestIterationLoops:
     def _make_iteration_process(
@@ -5006,6 +5167,65 @@ class TestOrchestratorValidityPolicy:
         assert seal_events
         assert seal_events[-1].data.get("passed") is False
         assert seal_events[-1].data.get("mismatch_count", 0) >= 1
+
+    @pytest.mark.asyncio
+    async def test_synthesis_gate_blocks_on_stale_seals_from_internal_changes(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        workspace = tmp_path / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        artifact = workspace / "reports" / "final.md"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text("original", encoding="utf-8")
+
+        task = _make_task(goal="Seal refresh", workspace=str(workspace))
+        task.metadata["artifact_seals"] = {
+            "reports/final.md": {
+                "path": "reports/final.md",
+                "sha256": hashlib.sha256(b"original").hexdigest(),
+                "sealed_at": "2026-03-05T12:00:00",
+                "subtask_id": "seed",
+            },
+        }
+        changelog = orch._get_changelog(task)
+        assert changelog is not None
+        changelog.record_before_write("reports/final.md", subtask_id="synth")
+        artifact.write_text("updated-by-process", encoding="utf-8")
+
+        subtask = Subtask(
+            id="synth",
+            description="Synthesize",
+            is_synthesis=True,
+            validity_contract_snapshot={
+                "enabled": True,
+                "claim_extraction": {"enabled": False},
+                "final_gate": {
+                    "enforce_verified_context_only": False,
+                    "synthesis_min_verification_tier": 2,
+                    "critical_claim_support_ratio": 1.0,
+                },
+            },
+        )
+        task.plan = Plan(subtasks=[subtask])
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="ok"),
+            VerificationResult(tier=2, passed=True, outcome="pass"),
+        ))
+
+        _, result, verification = await orch._dispatch_subtask(task, subtask, {})
+
+        assert result.status == SubtaskResultStatus.FAILED
+        assert verification.passed is False
+        assert verification.reason_code == "artifact_seal_invalid"
+        orch._runner.run.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_synthesis_success_adds_provenance_footer_and_updates_scorecard(self, tmp_path):
