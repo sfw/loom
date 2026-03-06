@@ -569,6 +569,27 @@ Templates in `prompts/templates/*.yaml` define text protocol and output contract
 - `remediation_attempts`
 - `tool_mutation_ledger`
 
+Schema evolution is managed by a versioned migration subsystem:
+- `state/migrations/registry.py`: ordered migration declarations.
+- `state/migrations/runner.py`: apply/verify orchestration and status helpers.
+- `state/migrations/steps/*.py`: additive migration units with explicit verify hooks.
+- `schema_migrations` table stores applied migration metadata (`id`, timestamps,
+  duration, checksum, notes).
+
+Startup flow:
+1. Detect existing-vs-fresh DB state.
+2. Ensure migration metadata table exists.
+3. Apply pending migrations before relying on upgraded columns/indexes.
+4. Apply canonical `schema.sql` idempotently for existing DBs, and use
+   `schema/base.sql` for fresh bootstrap.
+5. Run global schema verification hooks.
+
+Failure policy:
+- Existing DB upgrade failures are blocking startup errors.
+- Existing DB failures do not auto-fallback to ephemeral mode.
+- New DB initialization failures are also blocking by default; ephemeral mode
+  requires explicit `--ephemeral` opt-in.
+
 Conversation storage is append-only for full traceability.
 `cowork_chat_events` is a UI-facing transcript journal used for fast session resume and `/history older` paging, with legacy synthesis fallback from `conversation_turns`.
 
