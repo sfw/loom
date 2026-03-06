@@ -9,13 +9,15 @@ from datetime import UTC, datetime
 
 import aiosqlite
 
+from loom.events.types import (
+    DB_MIGRATION_APPLIED,
+    DB_MIGRATION_FAILED,
+    DB_MIGRATION_START,
+    DB_MIGRATION_VERIFY_FAILED,
+)
+
 MigrationFn = Callable[[aiosqlite.Connection], Awaitable[None]]
 MigrationReporter = Callable[[str, dict[str, object]], None]
-
-DB_MIGRATION_START = "db_migration_start"
-DB_MIGRATION_APPLIED = "db_migration_applied"
-DB_MIGRATION_VERIFY_FAILED = "db_migration_verify_failed"
-DB_MIGRATION_FAILED = "db_migration_failed"
 
 
 @dataclass(frozen=True)

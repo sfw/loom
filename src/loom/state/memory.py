@@ -15,6 +15,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from loom.events.types import DB_MIGRATION_FAILED, DB_SCHEMA_READY
 from loom.state.migrations import (
     MIGRATIONS,
     MigrationExecutionError,
@@ -25,9 +26,6 @@ from loom.state.migrations import (
 )
 
 logger = logging.getLogger(__name__)
-
-DB_MIGRATION_FAILED = "db_migration_failed"
-DB_SCHEMA_READY = "db_schema_ready"
 
 
 @dataclass
