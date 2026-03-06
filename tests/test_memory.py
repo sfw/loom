@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from loom.state.memory import Database, MemoryEntry, MemoryManager
+from loom.state.migrations import MIGRATIONS
+from loom.state.migrations.runner import MigrationStep
 
 
 @pytest.fixture
@@ -45,6 +48,240 @@ class TestDatabase:
         table_names = {t["name"] for t in tables}
         assert "tasks" in table_names
         assert "memory_entries" in table_names
+
+    async def test_initialize_migrates_legacy_events_before_sequence_indexes(
+        self,
+        tmp_path: Path,
+    ):
+        legacy_path = tmp_path / "legacy.db"
+        async with aiosqlite.connect(legacy_path) as conn:
+            await conn.executescript(
+                """CREATE TABLE tasks (
+                       id TEXT PRIMARY KEY,
+                       goal TEXT NOT NULL,
+                       status TEXT NOT NULL DEFAULT 'pending',
+                       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                   );
+                   CREATE TABLE events (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       task_id TEXT NOT NULL,
+                       correlation_id TEXT NOT NULL,
+                       timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                       event_type TEXT NOT NULL,
+                       data TEXT NOT NULL,
+                       FOREIGN KEY (task_id) REFERENCES tasks(id)
+                   );
+                   CREATE INDEX idx_events_task ON events(task_id);
+                   CREATE INDEX idx_events_correlation ON events(correlation_id);
+                   CREATE INDEX idx_events_type ON events(event_type);
+                """,
+            )
+            await conn.execute(
+                """INSERT INTO tasks (id, goal, status, created_at, updated_at)
+                   VALUES ('t1', 'legacy', 'pending', datetime('now'), datetime('now'))""",
+            )
+            await conn.execute(
+                """INSERT INTO events (task_id, correlation_id, event_type, data)
+                   VALUES ('t1', 'corr-1', 'task_started', '{}')""",
+            )
+            await conn.commit()
+
+        db = Database(legacy_path)
+        await db.initialize()
+
+        async with aiosqlite.connect(legacy_path) as conn:
+            cursor = await conn.execute("PRAGMA table_info(events)")
+            columns = {str(row[1]) for row in await cursor.fetchall()}
+            required_columns = {
+                "run_id",
+                "event_id",
+                "sequence",
+                "source_component",
+                "schema_version",
+            }
+            assert required_columns.issubset(columns)
+
+            cursor = await conn.execute("SELECT sequence FROM events LIMIT 1")
+            row = await cursor.fetchone()
+            assert row is not None
+            assert int(row[0]) == 0
+
+            for index_name in (
+                "idx_events_task_sequence",
+                "idx_events_run_sequence",
+                "idx_events_event_id",
+            ):
+                cursor = await conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=? LIMIT 1",
+                    (index_name,),
+                )
+                assert await cursor.fetchone() is not None
+
+    async def test_initialize_stamps_schema_migrations_to_latest(self, tmp_path: Path):
+        db_path = tmp_path / "fresh.db"
+        db = Database(db_path)
+        await db.initialize()
+        await db.initialize()
+
+        rows = await db.query("SELECT id FROM schema_migrations ORDER BY id")
+        assert [str(row["id"]) for row in rows] == [step.id for step in MIGRATIONS]
+
+    async def test_initialize_upgrades_pre_task_questions_fixture(self, tmp_path: Path):
+        db_path = tmp_path / "pre-task-questions.db"
+        first = MIGRATIONS[0]
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.executescript(
+                """CREATE TABLE tasks (
+                       id TEXT PRIMARY KEY,
+                       goal TEXT NOT NULL,
+                       status TEXT NOT NULL DEFAULT 'pending',
+                       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                   );
+                   CREATE TABLE events (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       task_id TEXT NOT NULL,
+                       run_id TEXT NOT NULL DEFAULT '',
+                       correlation_id TEXT NOT NULL,
+                       event_id TEXT NOT NULL DEFAULT '',
+                       sequence INTEGER NOT NULL DEFAULT 0,
+                       timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                       event_type TEXT NOT NULL,
+                       source_component TEXT NOT NULL DEFAULT '',
+                       schema_version INTEGER NOT NULL DEFAULT 1,
+                       data TEXT NOT NULL,
+                       FOREIGN KEY (task_id) REFERENCES tasks(id)
+                   );
+                   CREATE TABLE schema_migrations (
+                       id TEXT PRIMARY KEY,
+                       applied_at TEXT NOT NULL,
+                       duration_ms INTEGER NOT NULL DEFAULT 0,
+                       checksum TEXT NOT NULL,
+                       notes TEXT NOT NULL DEFAULT ''
+                   );
+                """,
+            )
+            await conn.execute(
+                """INSERT INTO schema_migrations (id, applied_at, duration_ms, checksum, notes)
+                   VALUES (?, datetime('now'), 1, ?, 'legacy bootstrap')""",
+                (first.id, first.checksum),
+            )
+            await conn.commit()
+
+        db = Database(db_path)
+        await db.initialize()
+
+        ids = await db.query("SELECT id FROM schema_migrations ORDER BY id")
+        assert [str(row["id"]) for row in ids] == [step.id for step in MIGRATIONS]
+
+    async def test_initialize_upgrades_pre_validity_fixture(self, tmp_path: Path):
+        db_path = tmp_path / "pre-validity.db"
+        first = MIGRATIONS[0]
+        second = MIGRATIONS[1]
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.executescript(
+                """CREATE TABLE tasks (
+                       id TEXT PRIMARY KEY,
+                       goal TEXT NOT NULL,
+                       status TEXT NOT NULL DEFAULT 'pending',
+                       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                   );
+                   CREATE TABLE events (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       task_id TEXT NOT NULL,
+                       run_id TEXT NOT NULL DEFAULT '',
+                       correlation_id TEXT NOT NULL,
+                       event_id TEXT NOT NULL DEFAULT '',
+                       sequence INTEGER NOT NULL DEFAULT 0,
+                       timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                       event_type TEXT NOT NULL,
+                       source_component TEXT NOT NULL DEFAULT '',
+                       schema_version INTEGER NOT NULL DEFAULT 1,
+                       data TEXT NOT NULL,
+                       FOREIGN KEY (task_id) REFERENCES tasks(id)
+                   );
+                   CREATE TABLE task_questions (
+                       question_id TEXT PRIMARY KEY,
+                       task_id TEXT NOT NULL,
+                       subtask_id TEXT NOT NULL DEFAULT '',
+                       status TEXT NOT NULL DEFAULT 'pending',
+                       request_payload TEXT NOT NULL,
+                       answer_payload TEXT,
+                       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                       resolved_at TEXT,
+                       timeout_at TEXT,
+                       FOREIGN KEY (task_id) REFERENCES tasks(id)
+                   );
+                   CREATE TABLE schema_migrations (
+                       id TEXT PRIMARY KEY,
+                       applied_at TEXT NOT NULL,
+                       duration_ms INTEGER NOT NULL DEFAULT 0,
+                       checksum TEXT NOT NULL,
+                       notes TEXT NOT NULL DEFAULT ''
+                   );
+                """,
+            )
+            await conn.execute(
+                """INSERT INTO schema_migrations (id, applied_at, duration_ms, checksum, notes)
+                   VALUES (?, datetime('now'), 1, ?, 'legacy bootstrap')""",
+                (first.id, first.checksum),
+            )
+            await conn.execute(
+                """INSERT INTO schema_migrations (id, applied_at, duration_ms, checksum, notes)
+                   VALUES (?, datetime('now'), 1, ?, 'legacy bootstrap')""",
+                (second.id, second.checksum),
+            )
+            await conn.commit()
+
+        db = Database(db_path)
+        await db.initialize()
+
+        tables = await db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_claims'",
+        )
+        assert tables
+
+    async def test_initialize_rolls_back_on_failed_migration(self, tmp_path: Path, monkeypatch):
+        db_path = tmp_path / "rollback.db"
+
+        async def _apply(conn):
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS rollback_probe(id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            )
+            raise RuntimeError("forced migration failure")
+
+        async def _verify(_conn):
+            return None
+
+        monkeypatch.setattr(
+            "loom.state.memory.MIGRATIONS",
+            (
+                MigrationStep(
+                    id="99990101_001_forced_failure",
+                    description="forced failure",
+                    checksum="forced-failure",
+                    apply=_apply,
+                    verify=_verify,
+                ),
+            ),
+        )
+
+        db = Database(db_path)
+        with pytest.raises(RuntimeError, match="forced migration failure"):
+            await db.initialize()
+
+        async with aiosqlite.connect(db_path) as conn:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            # Transaction rollback must remove partial schema/migration artifacts.
+            assert int(row[0]) == 0
 
     async def test_insert_and_get_task(self, db: Database):
         await db.insert_task(
@@ -199,11 +436,37 @@ class TestDatabase:
 
     async def test_insert_and_query_events(self, db: Database):
         await db.insert_task(task_id="t1", goal="Test")
-        await db.insert_event("t1", "corr-1", "task_started", {"msg": "hello"})
-        await db.insert_event("t1", "corr-1", "subtask_completed", {"id": "s1"})
+        await db.insert_event(
+            "t1",
+            "corr-1",
+            "task_started",
+            {"msg": "hello"},
+            timestamp="2026-03-06T00:00:00+00:00",
+            event_id="evt-1",
+            sequence=1,
+            run_id="run-1",
+            source_component="tests",
+            schema_version=1,
+        )
+        await db.insert_event(
+            "t1",
+            "corr-1",
+            "subtask_completed",
+            {"id": "s1"},
+            timestamp="2026-03-06T00:00:01+00:00",
+            event_id="evt-2",
+            sequence=2,
+            run_id="run-1",
+            source_component="tests",
+            schema_version=1,
+        )
 
         events = await db.query_events("t1")
         assert len(events) == 2
+        assert events[0]["event_id"] == "evt-2"
+        assert events[0]["sequence"] == 2
+        assert events[1]["event_id"] == "evt-1"
+        assert events[1]["timestamp"] == "2026-03-06T00:00:00+00:00"
 
         typed = await db.query_events("t1", event_type="task_started")
         assert len(typed) == 1
