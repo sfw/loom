@@ -69,6 +69,18 @@ _PATTERNS: list[tuple[re.Pattern, ErrorCategory, str]] = [
         "Tool call failed. Check tool name and arguments.",
     ),
     (
+        re.compile(
+            r"Unsupported constant type:\s*<class 'str'>",
+            re.IGNORECASE,
+        ),
+        ErrorCategory.TOOL_ERROR,
+        (
+            "Calculator expressions only support numeric constants. "
+            "Avoid string literals and use numeric counting helpers such as "
+            "len([1, 2, 3])."
+        ),
+    ),
+    (
         re.compile(r"Invalid JSON|JSONDecodeError|expected_keys|validate", re.IGNORECASE),
         ErrorCategory.VALIDATION_ERROR,
         "Response validation failed. Ensure output matches the expected format.",

@@ -6069,6 +6069,96 @@ class TestProcessSlashCommands:
         assert kwargs["force_fresh"] is False
 
     @pytest.mark.asyncio
+    async def test_run_goal_with_apostrophe_synthesizes_adhoc(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._process_defn = None
+        app._config = SimpleNamespace(process=SimpleNamespace(default=""))
+        app._start_process_run = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/run I don't know")
+
+        assert handled is True
+        app._start_process_run.assert_awaited_once()
+        assert app._start_process_run.await_args.args == ("I don't know",)
+        kwargs = app._start_process_run.await_args.kwargs
+        assert kwargs["process_defn"] is None
+        assert kwargs["process_name_override"] is None
+        assert kwargs["is_adhoc"] is True
+        assert kwargs["synthesis_goal"] == "I don't know"
+        assert kwargs["force_fresh"] is False
+
+    @pytest.mark.asyncio
+    async def test_run_inject_accepts_apostrophe_text(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._inject_process_run_from_target = AsyncMock(return_value=True)
+        app.query_one = MagicMock(return_value=MagicMock())
+
+        handled = await app._handle_slash_command("/run inject current don't lose scope")
+
+        assert handled is True
+        app._inject_process_run_from_target.assert_awaited_once_with(
+            "current",
+            "don't lose scope",
+            source="slash",
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_goal_with_embedded_double_quote_synthesizes_adhoc(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._process_defn = None
+        app._config = SimpleNamespace(process=SimpleNamespace(default=""))
+        app._start_process_run = AsyncMock()
+        app.query_one = MagicMock(return_value=MagicMock())
+
+        handled = await app._handle_slash_command("/run Need a 6\" monitor review")
+
+        assert handled is True
+        app._start_process_run.assert_awaited_once()
+        assert app._start_process_run.await_args.args == ('Need a 6" monitor review',)
+
+    @pytest.mark.asyncio
+    async def test_run_goal_with_unclosed_leading_quote_is_tolerated(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._process_defn = None
+        app._config = SimpleNamespace(process=SimpleNamespace(default=""))
+        app._start_process_run = AsyncMock()
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command('/run "Need monitor review')
+
+        assert handled is True
+        app._start_process_run.assert_awaited_once()
+        assert app._start_process_run.await_args.args == ('"Need monitor review',)
+        chat.add_info.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_run_fresh_flag_bypasses_cache_lookup(self):
         from loom.tui.app import LoomApp
 
@@ -7143,6 +7233,262 @@ class TestProcessSlashCommands:
         ids = [phase["id"] for phase in normalized["phases"]]
         assert "verify-quality" in ids
         assert normalized["source"] == "fallback_template"
+
+    def test_normalize_adhoc_spec_injects_default_validity_contract_by_intent(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        normalized = app._normalize_adhoc_spec(
+            {
+                "intent": "research",
+                "name": "research-adhoc",
+                "description": "Research flow",
+                "persona": "Research analyst",
+                "phase_mode": "strict",
+                "tool_guidance": "Use evidence.",
+                "required_tools": [],
+                "recommended_tools": [],
+                "phases": [],
+            },
+            goal="research major claims",
+            key="aa11bb22cc33dd44",
+            available_tools=[],
+        )
+        contract = normalized.get("validity_contract", {})
+
+        assert isinstance(contract, dict)
+        assert contract.get("enabled") is True
+        assert contract.get("claim_extraction", {}).get("enabled") is True
+        assert contract.get("require_fact_checker_for_synthesis") is False
+        assert contract.get("final_gate", {}).get("enforce_verified_context_only") is True
+        assert contract.get("final_gate", {}).get("synthesis_min_verification_tier") == 2
+
+    def test_normalize_adhoc_spec_merges_model_validity_contract_with_default_floor(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        normalized = app._normalize_adhoc_spec(
+            {
+                "intent": "writing",
+                "name": "writing-adhoc",
+                "description": "Writing flow",
+                "persona": "Writer",
+                "phase_mode": "strict",
+                "tool_guidance": "Write carefully.",
+                "required_tools": [],
+                "recommended_tools": [],
+                "validity_contract": {
+                    "min_supported_ratio": 0.9,
+                    "max_unverified_ratio": 0.1,
+                    "final_gate": {"synthesis_min_verification_tier": 3},
+                },
+                "phases": [],
+            },
+            goal="draft a high-risk recommendation memo",
+            key="ee55ff66778899aa",
+            available_tools=[],
+        )
+        contract = normalized.get("validity_contract", {})
+
+        assert contract.get("enabled") is True
+        assert contract.get("claim_extraction", {}).get("enabled") is True
+        assert contract.get("min_supported_ratio") == 0.9
+        assert contract.get("max_unverified_ratio") == 0.1
+        assert contract.get("final_gate", {}).get("synthesis_min_verification_tier") == 3
+        assert contract.get("require_fact_checker_for_synthesis") is False
+
+    def test_normalize_adhoc_spec_injects_default_verification_policy(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        normalized = app._normalize_adhoc_spec(
+            {
+                "intent": "research",
+                "name": "research-adhoc",
+                "description": "Research flow",
+                "persona": "Research analyst",
+                "phase_mode": "strict",
+                "tool_guidance": "Use evidence.",
+                "required_tools": [],
+                "recommended_tools": [],
+                "phases": [],
+            },
+            goal="research major claims",
+            key="aa11bb22cc33dd44",
+            available_tools=[],
+        )
+        policy = normalized.get("verification_policy", {})
+
+        assert policy.get("mode") == "llm_first"
+        assert (
+            policy.get("static_checks", {}).get("tool_success_policy")
+            == "safety_integrity_only"
+        )
+        assert policy.get("semantic_checks") == []
+        assert policy.get("output_contract") == {}
+        assert policy.get("outcome_policy") == {}
+
+    def test_normalize_adhoc_spec_merges_model_verification_policy(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        normalized = app._normalize_adhoc_spec(
+            {
+                "intent": "research",
+                "name": "research-adhoc",
+                "description": "Research flow",
+                "persona": "Research analyst",
+                "phase_mode": "strict",
+                "tool_guidance": "Use evidence.",
+                "required_tools": [],
+                "recommended_tools": [],
+                "verification_policy": {
+                    "mode": "static_first",
+                    "static_checks": {"phase_scope": "global"},
+                    "semantic_checks": [{"name": "coverage"}, "ignore-me"],
+                    "output_contract": {"required_fields": ["passed"]},
+                    "outcome_policy": {"allow_partial_verified": True},
+                },
+                "phases": [],
+            },
+            goal="research major claims",
+            key="bb22cc33dd44ee55",
+            available_tools=[],
+        )
+        policy = normalized.get("verification_policy", {})
+
+        assert policy.get("mode") == "static_first"
+        assert (
+            policy.get("static_checks", {}).get("tool_success_policy")
+            == "safety_integrity_only"
+        )
+        assert policy.get("static_checks", {}).get("phase_scope") == "global"
+        assert policy.get("semantic_checks") == [{"name": "coverage"}]
+        assert policy.get("output_contract") == {"required_fields": ["passed"]}
+        assert policy.get("outcome_policy") == {"allow_partial_verified": True}
+
+    def test_build_adhoc_cache_entry_preserves_verification_policy(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        spec = app._fallback_adhoc_spec(
+            "research major claims",
+            available_tools=[],
+            intent="research",
+        )
+        spec["name"] = "policy-roundtrip-adhoc"
+        spec["verification_policy"] = {
+            "mode": "static_first",
+            "static_checks": {
+                "tool_success_policy": "all_tools_hard",
+                "phase_scope": "global",
+            },
+            "semantic_checks": [{"name": "coverage"}, "ignore-me"],
+            "output_contract": {"required_fields": ["passed"]},
+            "outcome_policy": {"allow_partial_verified": True},
+        }
+
+        entry = app._build_adhoc_cache_entry(
+            key="11aa22bb33cc44dd",
+            goal="research major claims",
+            spec=spec,
+        )
+        policy = entry.process_defn.verification_policy
+
+        assert policy.mode == "static_first"
+        assert policy.static_checks.get("tool_success_policy") == "all_tools_hard"
+        assert policy.static_checks.get("phase_scope") == "global"
+        assert policy.semantic_checks == [{"name": "coverage"}]
+        assert policy.output_contract == {"required_fields": ["passed"]}
+        assert policy.outcome_policy == {"allow_partial_verified": True}
+
+    def test_normalize_adhoc_spec_infers_high_risk_level_from_goal(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        normalized = app._normalize_adhoc_spec(
+            {
+                "intent": "build",
+                "name": "finance-build-adhoc",
+                "description": "Build workflow",
+                "persona": "Engineer",
+                "phase_mode": "strict",
+                "tool_guidance": "Use tools.",
+                "required_tools": [],
+                "recommended_tools": [],
+                "phases": [],
+            },
+            goal="build an investment recommendation engine",
+            key="cc22dd33ee44ff55",
+            available_tools=[],
+        )
+
+        assert normalized.get("risk_level") == "high"
+        contract = normalized.get("validity_contract", {})
+        assert contract.get("require_fact_checker_for_synthesis") is True
+        assert contract.get("max_unverified_ratio") <= 0.2
+        temporal = contract.get("final_gate", {}).get("temporal_consistency", {})
+        assert temporal.get("enabled") is True
+
+    def test_normalize_adhoc_spec_respects_explicit_model_risk_level(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        normalized = app._normalize_adhoc_spec(
+            {
+                "intent": "build",
+                "risk_level": "low",
+                "name": "safe-build-adhoc",
+                "description": "Build workflow",
+                "persona": "Engineer",
+                "phase_mode": "strict",
+                "tool_guidance": "Use tools.",
+                "required_tools": [],
+                "recommended_tools": [],
+                "phases": [],
+            },
+            goal="build an investment recommendation engine",
+            key="dd33ee44ff556677",
+            available_tools=[],
+        )
+
+        assert normalized.get("risk_level") == "low"
+        contract = normalized.get("validity_contract", {})
+        assert contract.get("require_fact_checker_for_synthesis") is False
 
     def test_extract_json_payload_handles_wrapped_text(self):
         from loom.tui.app import LoomApp

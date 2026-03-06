@@ -993,6 +993,7 @@
   <h2>Process Definitions</h2>
 
   <p>Process definitions let you specialize Loom for specific domains <strong>without writing any code</strong>. A process definition is a YAML file that injects domain expertise into every stage of the engine: planning, execution, verification, and memory extraction.</p>
+  <p>The current contract is <code>schema_version: 2</code> with explicit <code>risk_level</code> and <code>validity_contract</code> controls. Ad hoc and predefined processes share the same synthesis gates and claim-validation enforcement.</p>
 
   <div class="callout callout-info">
     <strong>Think of it like a programming language</strong>
@@ -1086,28 +1087,66 @@
     <tr><td><code>suggestive</code></td><td>Blueprint is optional inspiration</td><td>Creative or exploratory tasks</td></tr>
   </table>
 
+  <h3>Validity Contract Keys (Current Schema)</h3>
+  <table>
+    <tr><th>Key</th><th>Purpose</th></tr>
+    <tr><td><code>risk_level</code></td><td>Sets default rigor floor (<code>low|medium|high|critical</code>) for process safety policies</td></tr>
+    <tr><td><code>validity_contract.enabled</code></td><td>Master toggle for claim validation policy</td></tr>
+    <tr><td><code>validity_contract.claim_extraction.enabled</code></td><td>Turns on claim extraction/lifecycle tracking</td></tr>
+    <tr><td><code>min_supported_ratio</code> / <code>max_unverified_ratio</code></td><td>Coverage thresholds used by intermediate and synthesis gates</td></tr>
+    <tr><td><code>max_contradicted_count</code></td><td>Maximum contradicted claims allowed (usually <code>0</code>)</td></tr>
+    <tr><td><code>prune_mode</code></td><td><code>drop</code> or <code>rewrite_uncertainty</code> for unresolved intermediate claims</td></tr>
+    <tr><td><code>final_gate.enforce_verified_context_only</code></td><td>Removes unresolved claims from synthesis input context</td></tr>
+    <tr><td><code>final_gate.synthesis_min_verification_tier</code></td><td>Minimum verification tier required for synthesis phases</td></tr>
+    <tr><td><code>final_gate.temporal_consistency</code></td><td>Optional stale-source/as-of/date-conflict checks for time-sensitive outputs</td></tr>
+  </table>
+
+  <div class="callout callout-info">
+    <strong>Claim lifecycle states</strong>
+    Runtime claim states are <code>extracted</code>, <code>supported</code>, <code>contradicted</code>, <code>insufficient_evidence</code>, and <code>pruned</code>. Intermediate phases can continue after non-fatal pruning; final synthesis blocks unsupported critical claims.
+  </div>
+
   <h3>Creating Custom Processes</h3>
   <p>Drop a YAML file in <code>~/.loom/processes/</code> or <code>&lt;workspace&gt;/.loom/processes/</code>:</p>
 
   <pre><code><span class="label">my-process.yaml</span>
 <span class="key">name</span>: <span class="str">my-custom-process</span>
+<span class="key">schema_version</span>: <span class="val">2</span>
 <span class="key">version</span>: <span class="str">"1.0"</span>
 <span class="key">description</span>: <span class="str">"My domain specialization"</span>
+<span class="key">risk_level</span>: <span class="str">medium</span>
 <span class="key">persona</span>: <span class="str">|
   You are a domain expert specializing in...</span>
 
 <span class="key">phase_mode</span>: <span class="str">guided</span>
 
+<span class="key">validity_contract</span>:
+  <span class="key">enabled</span>: <span class="val">true</span>
+  <span class="key">claim_extraction</span>:
+    <span class="key">enabled</span>: <span class="val">true</span>
+  <span class="key">critical_claim_types</span>: [<span class="str">numeric</span>, <span class="str">date</span>, <span class="str">entity_fact</span>]
+  <span class="key">min_supported_ratio</span>: <span class="val">0.75</span>
+  <span class="key">max_unverified_ratio</span>: <span class="val">0.25</span>
+  <span class="key">max_contradicted_count</span>: <span class="val">0</span>
+  <span class="key">prune_mode</span>: <span class="str">rewrite_uncertainty</span>
+  <span class="key">final_gate</span>:
+    <span class="key">enforce_verified_context_only</span>: <span class="val">true</span>
+    <span class="key">synthesis_min_verification_tier</span>: <span class="val">2</span>
+    <span class="key">critical_claim_support_ratio</span>: <span class="val">1.0</span>
+
 <span class="key">phases</span>:
   - <span class="key">id</span>: <span class="str">research</span>
     <span class="key">description</span>: <span class="str">"Gather and analyze data"</span>
     <span class="key">depends_on</span>: []
+    <span class="key">verification_tier</span>: <span class="val">1</span>
     <span class="key">deliverables</span>:
       - <span class="str">"research-notes.md"</span>
 
   - <span class="key">id</span>: <span class="str">synthesize</span>
     <span class="key">description</span>: <span class="str">"Create final report"</span>
     <span class="key">depends_on</span>: [<span class="str">research</span>]
+    <span class="key">is_synthesis</span>: <span class="val">true</span>
+    <span class="key">verification_tier</span>: <span class="val">2</span>
     <span class="key">deliverables</span>:
       - <span class="str">"final-report.md"</span>
 
@@ -1117,6 +1156,30 @@
       <span class="key">check</span>: <span class="str">"(?i)(TODO|PLACEHOLDER|TBD)"</span>
       <span class="key">severity</span>: <span class="str">error</span>
       <span class="key">type</span>: <span class="str">regex</span></code></pre>
+
+  <h3>How to Build a Strong Process YAML</h3>
+  <ol style="padding-left: 24px; margin: 12px 0; color: var(--text-dim);">
+    <li>Set <code>schema_version: 2</code> and explicit <code>risk_level</code> first.</li>
+    <li>Model your phase DAG around evidence flow: gather &rarr; analyze &rarr; synthesize.</li>
+    <li>Use measurable <code>acceptance_criteria</code> per phase and stable deliverable filenames.</li>
+    <li>Add process-level <code>validity_contract</code> before prompt tuning; tighten synthesis gates, not loosen them.</li>
+    <li>Enable temporal consistency for freshness-sensitive domains.</li>
+    <li>Keep synthesis <code>verification_tier</code> and <code>final_gate.synthesis_min_verification_tier</code> at 2+.</li>
+    <li>Add package tests for both success paths and unsupported-claim failure paths.</li>
+  </ol>
+
+  <h3>Migrating Legacy Definitions</h3>
+  <p>When migrating from older process definitions, keep your phase graph and verification rules, then layer in new schema fields in this order:</p>
+  <ol style="padding-left: 24px; margin: 12px 0; color: var(--text-dim);">
+    <li>Add <code>schema_version: 2</code> and explicit <code>risk_level</code>.</li>
+    <li>Add process-level <code>validity_contract</code> with claim extraction enabled.</li>
+    <li>Mark synthesis phase(s) with <code>is_synthesis: true</code> and enforce verified-context-only final gate behavior.</li>
+    <li>Add per-phase <code>validity_contract</code> overrides only when you need stricter thresholds for specific phases.</li>
+  </ol>
+  <div class="callout callout-info">
+    <strong>Migration safety check</strong>
+    Run <code>loom process test &lt;name-or-path&gt;</code> after migration and include at least one case where unresolved claims are pruned in intermediate phases but blocked at final synthesis when critical thresholds are violated. In <code>.events.jsonl</code>, inspect <code>run_validity_scorecard</code> and <code>artifact_seal_validation</code> for auditability.
+  </div>
 
   <h3>Process Discovery Order</h3>
   <p>Loom searches for process definitions in this order (first match wins):</p>

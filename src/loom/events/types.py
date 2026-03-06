@@ -22,6 +22,7 @@ SUBTASK_COMPLETED = "subtask_completed"
 SUBTASK_FAILED = "subtask_failed"
 SUBTASK_OUTCOME_STALE = "subtask_outcome_stale"
 SUBTASK_BLOCKED = "subtask_blocked"
+SUBTASK_POLICY_RECONCILED = "subtask_policy_reconciled"
 
 # Tool events
 TOOL_CALL_STARTED = "tool_call_started"
@@ -35,6 +36,7 @@ ARTIFACT_READ_COMPLETED = "artifact_read_completed"
 COMPACTION_POLICY_DECISION = "compaction_policy_decision"
 OVERFLOW_FALLBACK_APPLIED = "overflow_fallback_applied"
 TELEMETRY_RUN_SUMMARY = "telemetry_run_summary"
+RUN_VALIDITY_SCORECARD = "run_validity_scorecard"
 
 # Model events
 MODEL_INVOCATION = "model_invocation"
@@ -52,6 +54,10 @@ VERIFICATION_INCONCLUSIVE_RATE = "verification_inconclusive_rate"
 VERIFICATION_RULE_FAILURE_BY_TYPE = "rule_failure_by_type"
 VERIFICATION_DETERMINISTIC_BLOCK_RATE = "deterministic_block_rate"
 VERIFICATION_CONTRADICTION_DETECTED = "verification_contradiction_detected"
+CLAIM_VERIFICATION_SUMMARY = "claim_verification_summary"
+CLAIMS_PRUNED = "claims_pruned"
+SYNTHESIS_INPUT_GATE_DECISION = "synthesis_input_gate_decision"
+ARTIFACT_SEAL_VALIDATION = "artifact_seal_validation"
 
 # Human interaction events
 APPROVAL_REQUESTED = "approval_requested"

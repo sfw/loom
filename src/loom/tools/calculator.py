@@ -73,6 +73,12 @@ def _eval_node(node: Any) -> Any:
     if isinstance(node, ast.Constant):
         if isinstance(node.value, (int, float)):
             return node.value
+        if isinstance(node.value, str):
+            raise ValueError(
+                "String literals are not supported in calculator expressions. "
+                "Use numeric constants only (e.g., len([1, 2, 3]) instead of "
+                "len(['A', 'B'])).",
+            )
         raise ValueError(f"Unsupported constant type: {type(node.value)}")
 
     if isinstance(node, ast.Name):
@@ -191,6 +197,8 @@ class CalculatorTool(Tool):
             "cagr(start, end, years), "
             "wacc(equity, debt, cost_equity, cost_debt, tax_rate), "
             "pmt(rate, nper, pv). "
+            "Only numeric constants are supported in expressions; string literals "
+            "are rejected. "
             "Examples: '1000 * 1.05 ** 10', 'npv(0.1, [-1000, 300, 400, 500])', "
             "'cagr(100, 200, 5)'."
         )
@@ -204,7 +212,8 @@ class CalculatorTool(Tool):
                     "type": "string",
                     "description": (
                         "Mathematical expression to evaluate. "
-                        "Use Python syntax."
+                        "Use Python syntax with numeric constants only "
+                        "(string literals are not supported)."
                     ),
                 },
             },

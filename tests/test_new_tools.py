@@ -149,6 +149,11 @@ class TestCalculatorMathFunctions:
         assert result.success
         assert "= 15" in result.output
 
+    async def test_len_numeric_list(self, calc, ctx):
+        result = await calc.execute({"expression": "len([1, 2, 3, 4])"}, ctx)
+        assert result.success
+        assert "= 4" in result.output
+
     async def test_ceil_floor(self, calc, ctx):
         r1 = await calc.execute({"expression": "ceil(3.2)"}, ctx)
         r2 = await calc.execute({"expression": "floor(3.8)"}, ctx)
@@ -275,6 +280,11 @@ class TestCalculatorErrorHandling:
     async def test_string_literal_rejected(self, calc, ctx):
         result = await calc.execute({"expression": "'hello'"}, ctx)
         assert not result.success
+
+    async def test_string_list_rejected_with_guidance(self, calc, ctx):
+        result = await calc.execute({"expression": "len(['A', 'B'])"}, ctx)
+        assert not result.success
+        assert "numeric constants only" in result.error.lower()
 
 
 class TestCalculatorSafety:

@@ -389,6 +389,115 @@ class TestDatabase:
         assert gates[0]["blocking"] is True
         assert gates[0]["measured_value"] == 72
 
+    async def test_claim_validity_lineage_tables_roundtrip(self, db: Database):
+        await db.insert_task(task_id="t1", goal="Claim lineage")
+        claim_ids = await db.insert_artifact_claims(
+            task_id="t1",
+            run_id="run-1",
+            subtask_id="s1",
+            phase_id="analysis",
+            claims=[
+                {
+                    "claim_id": "CLM-001",
+                    "text": "Revenue increased 12%.",
+                    "claim_type": "numeric",
+                    "criticality": "critical",
+                    "status": "supported",
+                    "reason_code": "claim_supported",
+                    "metadata": {"as_of": "2025-12-31"},
+                },
+            ],
+        )
+        assert len(claim_ids) == 1
+
+        verification_ids = await db.insert_claim_verification_results(
+            task_id="t1",
+            run_id="run-1",
+            subtask_id="s1",
+            phase_id="analysis",
+            results=[
+                {
+                    "claim_id": "CLM-001",
+                    "status": "supported",
+                    "reason_code": "claim_supported",
+                    "verifier": "verification_gates",
+                    "confidence": 0.92,
+                    "metadata": {"notes": "fact_checker verdict supported"},
+                },
+            ],
+        )
+        assert len(verification_ids) == 1
+
+        link_ids = await db.insert_claim_evidence_links(
+            task_id="t1",
+            run_id="run-1",
+            subtask_id="s1",
+            links=[
+                {
+                    "claim_id": "CLM-001",
+                    "evidence_id": "EV-WRITE-ABC123",
+                    "link_type": "supporting",
+                    "score": 1.0,
+                    "metadata": {"source": "artifact"},
+                },
+            ],
+        )
+        assert len(link_ids) == 1
+
+        summary_id = await db.insert_artifact_validity_summary(
+            task_id="t1",
+            run_id="run-1",
+            subtask_id="s1",
+            phase_id="analysis",
+            extracted_count=1,
+            supported_count=1,
+            contradicted_count=0,
+            insufficient_evidence_count=0,
+            pruned_count=0,
+            supported_ratio=1.0,
+            gate_decision="pass",
+            reason_code="claim_supported",
+            metadata={"validity_contract_hash": "hash-123"},
+        )
+        assert summary_id > 0
+
+        claims = await db.query(
+            "SELECT claim_id, lifecycle_state FROM artifact_claims WHERE task_id = ?",
+            ("t1",),
+        )
+        assert len(claims) == 1
+        assert claims[0]["claim_id"] == "CLM-001"
+        assert claims[0]["lifecycle_state"] == "supported"
+
+        results = await db.query(
+            (
+                "SELECT claim_id, status, reason_code "
+                "FROM claim_verification_results WHERE task_id = ?"
+            ),
+            ("t1",),
+        )
+        assert len(results) == 1
+        assert results[0]["claim_id"] == "CLM-001"
+        assert results[0]["status"] == "supported"
+
+        links = await db.query(
+            "SELECT claim_id, evidence_id FROM claim_evidence_links WHERE task_id = ?",
+            ("t1",),
+        )
+        assert len(links) == 1
+        assert links[0]["evidence_id"] == "EV-WRITE-ABC123"
+
+        summaries = await db.query(
+            (
+                "SELECT gate_decision, supported_count "
+                "FROM artifact_validity_summaries WHERE task_id = ?"
+            ),
+            ("t1",),
+        )
+        assert len(summaries) == 1
+        assert summaries[0]["gate_decision"] == "pass"
+        assert summaries[0]["supported_count"] == 1
+
 
 class TestMemoryManager:
     """Test the high-level memory manager."""

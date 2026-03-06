@@ -8,6 +8,7 @@ description: >
   modeling, risk and catalyst planning, and investment memo output.
 author: "Loom Team"
 tags: [finance, investing, valuation, equities, due-diligence, memo, variant-view]
+risk_level: high
 
 persona: |
   You are a senior equity research analyst. Think in unit economics, moats,
@@ -17,6 +18,21 @@ persona: |
   probability-weighted return math, and thesis-break conditions.
 
 phase_mode: strict
+
+validity_contract:
+  enabled: true
+  claim_extraction:
+    enabled: true
+  critical_claim_types: [numeric, date, entity_fact]
+  min_supported_ratio: 0.8
+  max_unverified_ratio: 0.2
+  max_contradicted_count: 0
+  prune_mode: rewrite_uncertainty
+  require_fact_checker_for_synthesis: true
+  final_gate:
+    enforce_verified_context_only: true
+    synthesis_min_verification_tier: 2
+    critical_claim_support_ratio: 1.0
 
 tool_guidance: |
   Use CSV for models and Markdown for narrative. Always state fiscal period,

@@ -53,6 +53,8 @@ class Subtask:
     is_critical_path: bool = False
     is_synthesis: bool = False
     acceptance_criteria: str = ""
+    validity_contract_snapshot: dict[str, object] = field(default_factory=dict)
+    validity_contract_hash: str = ""
     retry_count: int = 0
     max_retries: int = 3
     iteration_attempt: int = 0
@@ -259,6 +261,8 @@ class TaskStateManager:
         subtasks_data = []
         for s in task.plan.subtasks:
             entry: dict = {"id": s.id, "status": s.status.value}
+            entry["model_tier"] = int(s.model_tier or 1)
+            entry["verification_tier"] = int(s.verification_tier or 1)
             if s.summary:
                 entry["summary"] = s.summary
             if s.active_issue:
@@ -273,6 +277,12 @@ class TaskStateManager:
                 entry["is_critical_path"] = True
             if s.is_synthesis:
                 entry["is_synthesis"] = True
+            if s.acceptance_criteria:
+                entry["acceptance_criteria"] = s.acceptance_criteria
+            if s.validity_contract_snapshot:
+                entry["validity_contract_snapshot"] = s.validity_contract_snapshot
+            if s.validity_contract_hash:
+                entry["validity_contract_hash"] = s.validity_contract_hash
             if s.retry_count:
                 entry["retry_count"] = int(s.retry_count)
             if s.max_retries != 3:
@@ -361,6 +371,9 @@ class TaskStateManager:
         for s in data.get("subtasks", []):
             if "_completed_count" in s:
                 continue
+            validity_snapshot_raw = s.get("validity_contract_snapshot", {})
+            if not isinstance(validity_snapshot_raw, dict):
+                validity_snapshot_raw = {}
             best_score_raw = s.get("iteration_best_score")
             try:
                 best_score = (
@@ -376,8 +389,13 @@ class TaskStateManager:
                 active_issue=s.get("active_issue", ""),
                 depends_on=s.get("depends_on", []),
                 phase_id=s.get("phase_id", ""),
+                model_tier=int(s.get("model_tier", 1) or 1),
+                verification_tier=int(s.get("verification_tier", 1) or 1),
                 is_critical_path=bool(s.get("is_critical_path", False)),
                 is_synthesis=bool(s.get("is_synthesis", False)),
+                acceptance_criteria=str(s.get("acceptance_criteria", "") or ""),
+                validity_contract_snapshot=dict(validity_snapshot_raw),
+                validity_contract_hash=str(s.get("validity_contract_hash", "") or ""),
                 retry_count=int(s.get("retry_count", 0) or 0),
                 max_retries=int(s.get("max_retries", 3) or 3),
                 iteration_attempt=int(s.get("iteration_attempt", 0) or 0),

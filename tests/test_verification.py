@@ -168,6 +168,46 @@ class TestDeterministicVerifier:
         )
 
     @pytest.mark.asyncio
+    async def test_adhoc_process_defaults_to_safety_integrity_policy(self):
+        process = _make_process(tags=["adhoc"])
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="edit_file",
+            args={"path": "pricing-access-grid.csv"},
+            result=ToolResult.fail(
+                "edit[0]: old_str appears 2 times in pricing-access-grid.csv",
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert result.passed
+        assert any(
+            c.name == "tool_edit_file_advisory" and c.passed
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_adhoc_process_honors_explicit_all_tools_hard_policy(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "all_tools_hard"},
+            tags=["adhoc"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="edit_file",
+            args={"path": "pricing-access-grid.csv"},
+            result=ToolResult.fail(
+                "edit[0]: old_str appears 2 times in pricing-access-grid.csv",
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert any(
+            c.name == "tool_edit_file_success" and not c.passed
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
     async def test_web_tool_transient_failure_is_advisory(self):
         v = DeterministicVerifier()
         tc = MockToolCallRecord(
@@ -1091,6 +1131,134 @@ class TestVerificationGates:
         assert result.passed
 
     @pytest.mark.asyncio
+    async def test_verify_attaches_claim_lifecycle_from_fact_checker_verdicts(self):
+        config = VerificationConfig(tier1_enabled=True, tier2_enabled=False)
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        gates = VerificationGates(router, prompts, config)
+        tool_calls = [
+            MockToolCallRecord(
+                tool="fact_checker",
+                args={"claims": ["Revenue grew 12% in 2025", "Margin will double"]},
+                result=ToolResult.ok(
+                    "ok",
+                    data={
+                        "verdicts": [
+                            {
+                                "claim": "Revenue grew 12% in 2025",
+                                "verdict": "supported",
+                                "source": "https://example.com/revenue",
+                            },
+                            {
+                                "claim": "Margin will double next year",
+                                "verdict": "contradicted",
+                                "source": "https://example.com/margin",
+                            },
+                            {
+                                "claim": "Market share will triple",
+                                "verdict": "unknown",
+                            },
+                            {
+                                "claim": "Legacy figure as of 2020-01-01",
+                                "verdict": "stale",
+                            },
+                        ],
+                    },
+                ),
+            ),
+        ]
+
+        result = await gates.verify(
+            _make_subtask(subtask_id="analysis"),
+            "summary",
+            tool_calls,
+            None,
+            validity_contract={"critical_claim_types": ["numeric"]},
+            tier=1,
+            task_id="task-claim-lifecycle",
+        )
+        lifecycle = result.metadata.get("claim_lifecycle", [])
+        counts = result.metadata.get("claim_status_counts", {})
+
+        assert result.passed
+        assert len(lifecycle) == 4
+        assert counts.get("supported") == 1
+        assert counts.get("contradicted") == 1
+        assert counts.get("insufficient_evidence") == 1
+        assert counts.get("stale") == 1
+        statuses = {claim.get("status") for claim in lifecycle}
+        assert statuses == {"supported", "contradicted", "insufficient_evidence", "stale"}
+        reason_codes = {claim.get("reason_code") for claim in lifecycle}
+        assert reason_codes == {
+            "claim_supported",
+            "claim_contradicted",
+            "claim_insufficient_evidence",
+            "claim_stale_source",
+        }
+
+    @pytest.mark.asyncio
+    async def test_verify_does_not_fabricate_synthetic_claims_from_count_metadata(self):
+        config = VerificationConfig(tier1_enabled=True, tier2_enabled=False)
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        gates = VerificationGates(router, prompts, config)
+
+        result = await gates.verify(
+            _make_subtask(subtask_id="analysis"),
+            "summary",
+            [],
+            None,
+            tier=1,
+            task_id="task-no-synthetic-claims",
+        )
+
+        lifecycle = result.metadata.get("claim_lifecycle", [])
+        counts = result.metadata.get("claim_status_counts", {})
+
+        assert result.passed
+        assert lifecycle == []
+        assert counts.get("extracted", 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_verify_emits_claim_verification_summary_event(self):
+        config = VerificationConfig(tier1_enabled=True, tier2_enabled=False)
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        event_bus = EventBus()
+        events = []
+        event_bus.subscribe_all(lambda event: events.append(event))
+        gates = VerificationGates(router, prompts, config, event_bus=event_bus)
+
+        result = await gates.verify(
+            _make_subtask(subtask_id="analysis"),
+            "summary",
+            [
+                MockToolCallRecord(
+                    tool="fact_checker",
+                    args={"claims": ["Claim A"]},
+                    result=ToolResult.ok(
+                        "ok",
+                        data={"verdicts": [{"claim": "Claim A", "verdict": "supported"}]},
+                    ),
+                ),
+            ],
+            None,
+            tier=1,
+            task_id="task-claim-events",
+        )
+
+        assert result.passed
+        summary_events = [
+            event for event in events
+            if event.event_type == "claim_verification_summary"
+        ]
+        assert summary_events
+        payload = summary_events[-1].data
+        assert payload.get("subtask_id") == "analysis"
+        assert payload.get("supported") == 1
+        assert payload.get("contradicted") == 0
+
+    @pytest.mark.asyncio
     async def test_tier1_failure_blocks_tier2(self, tmp_path):
         config = VerificationConfig(tier1_enabled=True, tier2_enabled=True)
         router = MagicMock(spec=ModelRouter)
@@ -1571,6 +1739,9 @@ def _make_process(
     deliverables: dict[str, list[str]] | None = None,
     regex_rules: list | None = None,
     static_checks: dict[str, object] | None = None,
+    *,
+    tags: list[str] | None = None,
+    version: str = "1.0",
 ):
     """Build a mock ProcessDefinition for verification tests."""
     from loom.processes.schema import (
@@ -1600,6 +1771,8 @@ def _make_process(
 
     return ProcessDefinition(
         name="test-proc",
+        version=version,
+        tags=list(tags or []),
         phases=phases,
         verification_rules=rules,
         verification_policy=policy,

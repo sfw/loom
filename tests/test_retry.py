@@ -68,6 +68,20 @@ class TestRetryManager:
         assert "Missing import" in context
         assert "Error" not in context  # No error field
 
+    def test_build_retry_context_includes_calculator_string_constant_hint(self):
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=1,
+                error="Evaluation error: Unsupported constant type: <class 'str'>",
+            ),
+        ]
+        context = mgr.build_retry_context(attempts)
+
+        assert "numeric constants" in context.lower()
+        assert "len([1, 2, 3])" in context
+
     def test_should_flag_for_human(self):
         mgr = RetryManager(max_retries=3)
         assert not mgr.should_flag_for_human(0)

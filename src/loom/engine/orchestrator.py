@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from copy import deepcopy
@@ -33,6 +35,8 @@ from loom.engine.scheduler import Scheduler
 from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
+    ARTIFACT_SEAL_VALIDATION,
+    CLAIMS_PRUNED,
     ITERATION_COMPLETED,
     ITERATION_GATE_FAILED,
     ITERATION_RETRYING,
@@ -47,11 +51,14 @@ from loom.events.types import (
     REMEDIATION_RESOLVED,
     REMEDIATION_STARTED,
     REMEDIATION_TERMINAL,
+    RUN_VALIDITY_SCORECARD,
     SUBTASK_COMPLETED,
     SUBTASK_FAILED,
     SUBTASK_OUTCOME_STALE,
+    SUBTASK_POLICY_RECONCILED,
     SUBTASK_RETRYING,
     SUBTASK_STARTED,
+    SYNTHESIS_INPUT_GATE_DECISION,
     TASK_BUDGET_EXHAUSTED,
     TASK_CANCELLED,
     TASK_COMPLETED,
@@ -121,6 +128,28 @@ _FAILURE_RESOLUTION_METADATA_KEYS = (
     "parser_stage",
     "issues",
 )
+_CLAIM_TERMINAL_UNRESOLVED = frozenset({
+    "contradicted",
+    "insufficient_evidence",
+    "extracted",
+    "stale",
+})
+_CLAIM_REASON_CODES = {
+    "supported": "claim_supported",
+    "contradicted": "claim_contradicted",
+    "insufficient_evidence": "claim_insufficient_evidence",
+    "stale": "claim_stale_source",
+    "pruned": "claim_pruned",
+}
+_CLAIM_RECOVERABLE_FAILURE_CODES = frozenset({
+    "recommendation_unconfirmed",
+    "unconfirmed_noncritical",
+    "unconfirmed_critical_path",
+    "claim_insufficient_evidence",
+    "claim_contradicted",
+    "claim_stale_source",
+    "coverage_below_threshold",
+})
 
 # Re-export dataclasses that existing code imports from here
 __all__ = [
@@ -419,6 +448,8 @@ class Orchestrator:
                     "run_id": run_id,
                 })
 
+            await self._reconcile_subtask_policy_state(task)
+
             # 2. Execution loop — parallel dispatch of independent subtasks
             self._emit(TASK_EXECUTING, task.id, {"run_id": run_id})
             iteration = 0
@@ -630,6 +661,1282 @@ class Orchestrator:
         )
         return subtask, failed, no_verif
 
+    def _validity_contract_for_subtask(self, subtask: Subtask) -> dict[str, object]:
+        contract = (
+            dict(subtask.validity_contract_snapshot)
+            if isinstance(subtask.validity_contract_snapshot, dict)
+            and subtask.validity_contract_snapshot
+            else self._resolve_subtask_validity_contract(subtask=subtask)
+        )
+        normalized = self._normalize_validity_contract(contract)
+        subtask.validity_contract_snapshot = normalized
+        subtask.validity_contract_hash = self._hash_validity_contract(normalized)
+        return normalized
+
+    def _synthesis_verification_floor(self, subtask: Subtask) -> int:
+        if not subtask.is_synthesis:
+            return max(1, int(subtask.verification_tier or 1))
+        contract = self._validity_contract_for_subtask(subtask)
+        final_gate = contract.get("final_gate", {})
+        if isinstance(final_gate, dict):
+            floor = max(
+                1,
+                self._to_non_negative_int(
+                    final_gate.get("synthesis_min_verification_tier", 2),
+                    2,
+                ),
+            )
+        else:
+            floor = 2
+        return max(floor, int(subtask.verification_tier or 1))
+
+    @staticmethod
+    def _tool_call_succeeded(call: ToolCallRecord) -> bool:
+        result = getattr(call, "result", None)
+        return bool(result is not None and getattr(result, "success", False))
+
+    def _fact_checker_used(self, tool_calls: list[ToolCallRecord]) -> bool:
+        for call in tool_calls:
+            if str(getattr(call, "tool", "") or "").strip().lower() != "fact_checker":
+                continue
+            if self._tool_call_succeeded(call):
+                return True
+        return False
+
+    def _fact_checker_verdict_count(self, tool_calls: list[ToolCallRecord]) -> int:
+        total = 0
+        for call in tool_calls:
+            if str(getattr(call, "tool", "") or "").strip().lower() != "fact_checker":
+                continue
+            result = getattr(call, "result", None)
+            if result is None or not bool(getattr(result, "success", False)):
+                continue
+            data = getattr(result, "data", {})
+            if not isinstance(data, dict):
+                continue
+            verdicts = data.get("verdicts", [])
+            if not isinstance(verdicts, list):
+                continue
+            total += sum(
+                1
+                for verdict in verdicts
+                if isinstance(verdict, dict)
+                and str(verdict.get("claim", "") or "").strip()
+            )
+        return total
+
+    def _requires_fact_checker_for_subtask(self, subtask: Subtask) -> bool:
+        if not subtask.is_synthesis:
+            return False
+        contract = self._validity_contract_for_subtask(subtask)
+        if not self._to_bool(contract.get("enabled", False), False):
+            return False
+        return self._to_bool(
+            contract.get("require_fact_checker_for_synthesis", False),
+            False,
+        )
+
+    def _claim_graph_state(self, task: Task) -> dict[str, object]:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        graph = metadata.get("claim_graph")
+        if not isinstance(graph, dict):
+            graph = {}
+        supported = graph.get("supported_by_subtask")
+        if not isinstance(supported, dict):
+            supported = {}
+        graph["supported_by_subtask"] = supported
+        unresolved = graph.get("unresolved_by_subtask")
+        if not isinstance(unresolved, dict):
+            unresolved = {}
+        graph["unresolved_by_subtask"] = unresolved
+        metadata["claim_graph"] = graph
+        task.metadata = metadata
+        return graph
+
+    def _update_claim_graph_from_verification(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        verification: VerificationResult,
+    ) -> None:
+        metadata = verification.metadata if isinstance(verification.metadata, dict) else {}
+        claims = metadata.get("claim_lifecycle", [])
+        if not isinstance(claims, list):
+            return
+        graph = self._claim_graph_state(task)
+        supported_by_subtask = graph.get("supported_by_subtask")
+        unresolved_by_subtask = graph.get("unresolved_by_subtask")
+        if (
+            not isinstance(supported_by_subtask, dict)
+            or not isinstance(unresolved_by_subtask, dict)
+        ):
+            return
+        supported_claims: list[dict[str, object]] = []
+        unresolved_claims: list[dict[str, object]] = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            status = str(claim.get("status", "") or "").strip().lower()
+            if status == "supported":
+                supported_claims.append(dict(claim))
+            elif status in _CLAIM_TERMINAL_UNRESOLVED:
+                unresolved_claims.append(dict(claim))
+        supported_by_subtask[subtask.id] = supported_claims
+        unresolved_by_subtask[subtask.id] = unresolved_claims
+
+    @staticmethod
+    def _claims_from_verification(verification: VerificationResult) -> list[dict[str, object]]:
+        metadata = verification.metadata if isinstance(verification.metadata, dict) else {}
+        raw_claims = metadata.get("claim_lifecycle", [])
+        if not isinstance(raw_claims, list):
+            return []
+        claims: list[dict[str, object]] = []
+        for item in raw_claims:
+            if not isinstance(item, dict):
+                continue
+            claim = dict(item)
+            status = str(claim.get("status", "extracted") or "extracted").strip().lower()
+            if not status:
+                status = "extracted"
+            claim["status"] = status
+            claim["claim_id"] = str(claim.get("claim_id", "") or "").strip()
+            claim["text"] = str(claim.get("text", "") or "").strip()
+            claim["claim_type"] = str(
+                claim.get("claim_type", "qualitative") or "qualitative",
+            ).strip().lower()
+            claim["criticality"] = str(
+                claim.get("criticality", "important") or "important",
+            ).strip().lower()
+            reason_code = str(claim.get("reason_code", "") or "").strip().lower()
+            claim["reason_code"] = reason_code
+            refs = claim.get("evidence_refs", [])
+            if isinstance(refs, str):
+                refs = [refs]
+            if not isinstance(refs, list):
+                refs = []
+            normalized_refs = [
+                str(ref or "").strip()
+                for ref in refs
+                if str(ref or "").strip()
+            ]
+            claim["evidence_refs"] = normalized_refs
+            lifecycle = claim.get("lifecycle", [])
+            if isinstance(lifecycle, str):
+                lifecycle = [lifecycle]
+            if not isinstance(lifecycle, list):
+                lifecycle = []
+            normalized_lifecycle = [
+                str(step or "").strip().lower()
+                for step in lifecycle
+                if str(step or "").strip()
+            ]
+            if "extracted" not in normalized_lifecycle:
+                normalized_lifecycle.insert(0, "extracted")
+            if status not in normalized_lifecycle:
+                normalized_lifecycle.append(status)
+            claim["lifecycle"] = normalized_lifecycle
+            claims.append(claim)
+        return claims
+
+    @staticmethod
+    def _normalize_claim_reason_code(status: str, reason_code: str) -> str:
+        normalized_reason = str(reason_code or "").strip().lower()
+        if normalized_reason:
+            return normalized_reason
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status in _CLAIM_REASON_CODES:
+            return _CLAIM_REASON_CODES[normalized_status]
+        return "claim_insufficient_evidence"
+
+    @staticmethod
+    def _claim_counts(claims: list[dict[str, object]]) -> dict[str, int]:
+        counts = {
+            "extracted": len(claims),
+            "supported": 0,
+            "contradicted": 0,
+            "insufficient_evidence": 0,
+            "stale": 0,
+            "pruned": 0,
+            "unresolved": 0,
+            "critical_total": 0,
+            "critical_supported": 0,
+            "critical_contradicted": 0,
+        }
+        for claim in claims:
+            status = str(claim.get("status", "") or "").strip().lower()
+            if status in counts:
+                counts[status] += 1
+            if status in _CLAIM_TERMINAL_UNRESOLVED:
+                counts["unresolved"] += 1
+            criticality = str(claim.get("criticality", "") or "").strip().lower()
+            if criticality != "critical":
+                continue
+            counts["critical_total"] += 1
+            if status == "supported":
+                counts["critical_supported"] += 1
+            elif status == "contradicted":
+                counts["critical_contradicted"] += 1
+        return counts
+
+    @staticmethod
+    def _claim_ratios(counts: dict[str, int]) -> dict[str, float]:
+        extracted = max(0, int(counts.get("extracted", 0) or 0))
+        supported = max(0, int(counts.get("supported", 0) or 0))
+        unresolved = max(0, int(counts.get("unresolved", 0) or 0))
+        critical_total = max(0, int(counts.get("critical_total", 0) or 0))
+        critical_supported = max(0, int(counts.get("critical_supported", 0) or 0))
+        return {
+            "supported_ratio": (float(supported) / float(extracted)) if extracted > 0 else 1.0,
+            "unverified_ratio": (float(unresolved) / float(extracted)) if extracted > 0 else 0.0,
+            "critical_support_ratio": (
+                float(critical_supported) / float(critical_total)
+            ) if critical_total > 0 else 1.0,
+        }
+
+    @staticmethod
+    def _verification_with_metadata(
+        verification: VerificationResult,
+        *,
+        metadata: dict[str, object],
+        passed: bool | None = None,
+        outcome: str | None = None,
+        reason_code: str | None = None,
+        feedback: str | None = None,
+        severity_class: str | None = None,
+        confidence: float | None = None,
+    ) -> VerificationResult:
+        return VerificationResult(
+            tier=int(verification.tier),
+            passed=verification.passed if passed is None else bool(passed),
+            confidence=float(verification.confidence if confidence is None else confidence),
+            checks=list(verification.checks or []),
+            feedback=verification.feedback if feedback is None else feedback,
+            outcome=str(verification.outcome if outcome is None else outcome),
+            reason_code=str(verification.reason_code if reason_code is None else reason_code),
+            severity_class=(
+                str(verification.severity_class or "")
+                if severity_class is None
+                else str(severity_class)
+            ),
+            metadata=metadata,
+        )
+
+    def _apply_intermediate_claim_pruning(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        result: SubtaskResult,
+        verification: VerificationResult,
+        contract: dict[str, object],
+    ) -> VerificationResult:
+        if subtask.is_synthesis:
+            return verification
+        claims = self._claims_from_verification(verification)
+        if not claims:
+            return verification
+        unresolved = [
+            claim for claim in claims
+            if str(claim.get("status", "") or "").strip().lower() in _CLAIM_TERMINAL_UNRESOLVED
+        ]
+        if not unresolved:
+            return verification
+
+        prune_mode = str(contract.get("prune_mode", "drop") or "").strip().lower()
+        if prune_mode not in {"drop", "rewrite_uncertainty"}:
+            prune_mode = "drop"
+
+        supported_claims: list[dict[str, object]] = []
+        pruned_claims: list[dict[str, object]] = []
+        uncertainty_notes: list[str] = []
+        for claim in claims:
+            normalized = dict(claim)
+            status = str(normalized.get("status", "") or "").strip().lower()
+            reason = self._normalize_claim_reason_code(
+                status=status,
+                reason_code=str(normalized.get("reason_code", "") or ""),
+            )
+            normalized["reason_code"] = reason
+            lifecycle = normalized.get("lifecycle", [])
+            if isinstance(lifecycle, str):
+                lifecycle = [lifecycle]
+            if not isinstance(lifecycle, list):
+                lifecycle = []
+            lifecycle_norm = [
+                str(item or "").strip().lower()
+                for item in lifecycle
+                if str(item or "").strip()
+            ]
+            if "extracted" not in lifecycle_norm:
+                lifecycle_norm.insert(0, "extracted")
+
+            if status in _CLAIM_TERMINAL_UNRESOLVED:
+                pruned = dict(normalized)
+                pruned["status"] = "pruned"
+                pruned["reason_code"] = _CLAIM_REASON_CODES["pruned"]
+                if "pruned" not in lifecycle_norm:
+                    lifecycle_norm.append("pruned")
+                pruned["lifecycle"] = lifecycle_norm
+                pruned_claims.append(pruned)
+                if prune_mode == "rewrite_uncertainty":
+                    text = str(pruned.get("text", "") or "").strip()
+                    if text:
+                        uncertainty_notes.append(
+                            f"Uncertain claim excluded from synthesis: {text}",
+                        )
+                continue
+
+            if status not in lifecycle_norm:
+                lifecycle_norm.append(status)
+            normalized["lifecycle"] = lifecycle_norm
+            supported_claims.append(normalized)
+
+        pruned_count = len(pruned_claims)
+        updated_claims = supported_claims + pruned_claims
+        counts = self._claim_counts(updated_claims)
+        ratios = self._claim_ratios(counts)
+
+        metadata = dict(verification.metadata) if isinstance(verification.metadata, dict) else {}
+        metadata["claim_lifecycle_original"] = claims
+        metadata["claim_lifecycle"] = updated_claims
+        metadata["claim_pruned"] = bool(pruned_count > 0)
+        metadata["claim_prune_mode"] = prune_mode
+        metadata["claim_pruned_count"] = int(pruned_count)
+        metadata["claim_status_counts"] = counts
+        metadata["claim_reason_codes"] = sorted({
+            self._normalize_claim_reason_code(
+                status=str(item.get("status", "") or ""),
+                reason_code=str(item.get("reason_code", "") or ""),
+            )
+            for item in updated_claims
+        })
+        metadata["supported_ratio"] = ratios["supported_ratio"]
+        metadata["unverified_ratio"] = ratios["unverified_ratio"]
+        min_supported_ratio = self._to_ratio(contract.get("min_supported_ratio", 0.75), 0.75)
+        max_unverified_ratio = self._to_ratio(contract.get("max_unverified_ratio", 0.25), 0.25)
+        max_contradicted = self._to_non_negative_int(
+            contract.get("max_contradicted_count", 0),
+            0,
+        )
+        metadata["claim_gate_thresholds"] = {
+            "min_supported_ratio": min_supported_ratio,
+            "max_unverified_ratio": max_unverified_ratio,
+            "max_contradicted_count": max_contradicted,
+        }
+        post_prune_gate_passed = (
+            int(counts.get("contradicted", 0) or 0) <= max_contradicted
+            and float(ratios.get("supported_ratio", 0.0) or 0.0) >= min_supported_ratio
+            and float(ratios.get("unverified_ratio", 0.0) or 0.0) <= max_unverified_ratio
+        )
+        metadata["post_prune_gate_passed"] = bool(post_prune_gate_passed)
+        if uncertainty_notes:
+            metadata["uncertainty_annotations"] = uncertainty_notes[:20]
+            note = (
+                "Unsupported or uncertain claims were rewritten as uncertainty "
+                "annotations and excluded from downstream verified context."
+            )
+            result.summary = "\n".join(part for part in [result.summary, note] if part).strip()
+
+        self._emit(CLAIMS_PRUNED, task.id, {
+            "subtask_id": subtask.id,
+            "phase_id": subtask.phase_id,
+            "pruned_count": int(pruned_count),
+            "supported_count": int(counts.get("supported", 0)),
+            "contradicted_count": int(counts.get("contradicted", 0)),
+            "insufficient_evidence_count": int(counts.get("insufficient_evidence", 0)),
+            "prune_mode": prune_mode,
+        })
+
+        reason_code = str(verification.reason_code or "").strip().lower()
+        if (
+            not verification.passed
+            and reason_code in _CLAIM_RECOVERABLE_FAILURE_CODES
+            and post_prune_gate_passed
+        ):
+            note = (
+                "Intermediate validity policy pruned unsupported claims and "
+                "allowed execution to continue."
+            )
+            result.status = SubtaskResultStatus.SUCCESS
+            return self._verification_with_metadata(
+                verification,
+                metadata=metadata,
+                passed=True,
+                outcome=(
+                    "partial_verified"
+                    if self._config.verification.allow_partial_verified
+                    else "pass_with_warnings"
+                ),
+                reason_code="claim_pruned",
+                feedback="\n".join(part for part in [verification.feedback or "", note] if part),
+                severity_class="semantic",
+                confidence=min(0.8, max(0.3, float(verification.confidence or 0.5))),
+            )
+        if not post_prune_gate_passed:
+            gate_reason = "coverage_below_threshold"
+            if int(counts.get("contradicted", 0) or 0) > max_contradicted:
+                gate_reason = "claim_contradicted"
+            elif float(ratios.get("unverified_ratio", 0.0) or 0.0) > max_unverified_ratio:
+                gate_reason = "claim_insufficient_evidence"
+            threshold_note = (
+                "Intermediate validity policy pruned unsupported claims, but "
+                "post-prune coverage did not satisfy contract thresholds."
+            )
+            return self._verification_with_metadata(
+                verification,
+                metadata=metadata,
+                passed=False,
+                outcome="fail",
+                reason_code=gate_reason,
+                feedback="\n".join(
+                    part
+                    for part in [verification.feedback or "", threshold_note]
+                    if part
+                ),
+                severity_class="semantic",
+                confidence=min(float(verification.confidence or 0.5), 0.45),
+            )
+        return self._verification_with_metadata(
+            verification,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _parse_temporal_date_token(value: object) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if isinstance(value, datetime):
+            return value
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            return parsed
+
+        ymd_match = re.search(r"\b(19|20)\d{2}[-/](0[1-9]|1[0-2])[-/](0[1-9]|[12]\d|3[01])\b", text)
+        if ymd_match:
+            try:
+                return datetime.strptime(ymd_match.group(0).replace("/", "-"), "%Y-%m-%d")
+            except ValueError:
+                pass
+        ym_match = re.search(r"\b(19|20)\d{2}[-/](0[1-9]|1[0-2])\b", text)
+        if ym_match:
+            try:
+                return datetime.strptime(ym_match.group(0).replace("/", "-"), "%Y-%m")
+            except ValueError:
+                pass
+        year_match = re.search(r"\b(19|20)\d{2}\b", text)
+        if year_match:
+            try:
+                return datetime.strptime(year_match.group(0), "%Y")
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _extract_temporal_dates_from_text(cls, text: str) -> list[datetime]:
+        parsed: list[datetime] = []
+        seen: set[str] = set()
+        pattern = (
+            r"\b(?:19|20)\d{2}"
+            r"(?:[-/](?:0[1-9]|1[0-2])"
+            r"(?:[-/](?:0[1-9]|[12]\d|3[01]))?)?\b"
+        )
+        for match in re.finditer(pattern, text):
+            token = str(match.group(0) or "").strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            parsed_date = cls._parse_temporal_date_token(token)
+            if parsed_date is not None:
+                parsed.append(parsed_date)
+        return parsed
+
+    @classmethod
+    def _claim_temporal_scope(cls, claim: dict[str, object]) -> dict[str, object]:
+        metadata = claim.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        source_scope = claim.get("source_time_scope", {})
+        if not isinstance(source_scope, dict):
+            source_scope = {}
+
+        def _lookup(*keys: str) -> str:
+            for key in keys:
+                for container in (claim, metadata, source_scope):
+                    value = container.get(key)
+                    text = str(value or "").strip()
+                    if text:
+                        return text
+            return ""
+
+        as_of_text = _lookup("as_of")
+        source_as_of_text = _lookup("source_as_of", "evidence_as_of")
+        period_start_text = _lookup("period_start")
+        period_end_text = _lookup("period_end")
+        text_dates = cls._extract_temporal_dates_from_text(str(claim.get("text", "") or ""))
+        return {
+            "as_of": cls._parse_temporal_date_token(as_of_text),
+            "source_as_of": cls._parse_temporal_date_token(source_as_of_text),
+            "period_start": cls._parse_temporal_date_token(period_start_text),
+            "period_end": cls._parse_temporal_date_token(period_end_text),
+            "text_dates": text_dates,
+        }
+
+    @staticmethod
+    def _temporal_claim_key(text: str) -> str:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return ""
+        cleaned = re.sub(
+            r"\b(?:19|20)\d{2}(?:[-/](?:0[1-9]|1[0-2])(?:[-/](?:0[1-9]|[12]\d|3[01]))?)?\b",
+            " ",
+            lowered,
+        )
+        cleaned = re.sub(r"\b\d+(?:\.\d+)?\b", " ", cleaned)
+        tokens = [
+            token
+            for token in re.split(r"[^a-z0-9]+", cleaned)
+            if len(token) >= 3
+        ]
+        if not tokens:
+            return ""
+        return " ".join(tokens[:8])
+
+    def _enforce_temporal_consistency_gate(
+        self,
+        *,
+        subtask: Subtask,
+        verification: VerificationResult,
+        contract: dict[str, object],
+    ) -> VerificationResult:
+        if not subtask.is_synthesis:
+            return verification
+        claims = self._claims_from_verification(verification)
+        if not claims:
+            return verification
+
+        final_gate = contract.get("final_gate", {})
+        temporal: dict[str, object] = {}
+        if isinstance(final_gate, dict):
+            raw_temporal = final_gate.get("temporal_consistency", {})
+            if isinstance(raw_temporal, dict):
+                temporal = raw_temporal
+        enabled = self._to_bool(temporal.get("enabled", False), False)
+        if not enabled:
+            return verification
+
+        require_as_of_alignment = self._to_bool(
+            temporal.get("require_as_of_alignment", False),
+            False,
+        )
+        enforce_date_conflicts = self._to_bool(
+            temporal.get("enforce_cross_claim_date_conflict_check", False),
+            False,
+        )
+        max_source_age_days = self._to_non_negative_int(
+            temporal.get("max_source_age_days", 0),
+            0,
+        )
+        as_of_text = str(temporal.get("as_of", "") or "").strip()
+        reference_dt = self._parse_temporal_date_token(as_of_text) or datetime.now()
+        reference_date = reference_dt.date()
+
+        as_of_values: set[str] = set()
+        stale_claims: list[dict[str, object]] = []
+        future_source_claims: list[str] = []
+        conflict_index: dict[str, set[str]] = {}
+
+        stale_ids: set[str] = set()
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            status = str(claim.get("status", "") or "").strip().lower()
+            if status != "supported":
+                continue
+            scope = self._claim_temporal_scope(claim)
+            as_of_dt = scope.get("as_of")
+            source_as_of_dt = scope.get("source_as_of")
+            period_end_dt = scope.get("period_end")
+            text_dates = scope.get("text_dates", [])
+            if not isinstance(text_dates, list):
+                text_dates = []
+
+            if require_as_of_alignment and isinstance(as_of_dt, datetime):
+                as_of_values.add(as_of_dt.date().isoformat())
+
+            source_dt = (
+                source_as_of_dt
+                if isinstance(source_as_of_dt, datetime)
+                else (
+                    as_of_dt
+                    if isinstance(as_of_dt, datetime)
+                    else (
+                        period_end_dt
+                        if isinstance(period_end_dt, datetime)
+                        else (text_dates[0] if text_dates else None)
+                    )
+                )
+            )
+            if isinstance(source_dt, datetime) and max_source_age_days > 0:
+                age_days = (reference_date - source_dt.date()).days
+                if age_days > max_source_age_days:
+                    claim_id = str(claim.get("claim_id", "") or "").strip()
+                    stale_ids.add(claim_id)
+                    stale_claims.append({
+                        "claim_id": claim_id,
+                        "text": str(claim.get("text", "") or "")[:200],
+                        "age_days": int(age_days),
+                        "source_date": source_dt.date().isoformat(),
+                    })
+                elif age_days < -1:
+                    text = str(claim.get("text", "") or "").strip()
+                    if text:
+                        future_source_claims.append(text[:160])
+
+            if enforce_date_conflicts:
+                key = self._temporal_claim_key(str(claim.get("text", "") or ""))
+                if not key:
+                    continue
+                anchor_dt = (
+                    as_of_dt
+                    if isinstance(as_of_dt, datetime)
+                    else (
+                        period_end_dt
+                        if isinstance(period_end_dt, datetime)
+                        else (text_dates[0] if text_dates else None)
+                    )
+                )
+                if not isinstance(anchor_dt, datetime):
+                    continue
+                conflict_index.setdefault(key, set()).add(anchor_dt.date().isoformat())
+
+        temporal_conflicts: list[dict[str, object]] = []
+        if require_as_of_alignment and len(as_of_values) > 1:
+            temporal_conflicts.append({
+                "kind": "as_of_misalignment",
+                "observed_as_of_values": sorted(as_of_values),
+            })
+        if future_source_claims:
+            temporal_conflicts.append({
+                "kind": "future_source_date",
+                "claims": future_source_claims[:10],
+            })
+        if enforce_date_conflicts:
+            for key, values in conflict_index.items():
+                if len(values) <= 1:
+                    continue
+                temporal_conflicts.append({
+                    "kind": "cross_claim_date_conflict",
+                    "claim_key": key,
+                    "observed_dates": sorted(values),
+                })
+
+        updated_claims = [dict(item) for item in claims]
+        if stale_ids:
+            for claim in updated_claims:
+                claim_id = str(claim.get("claim_id", "") or "").strip()
+                if claim_id not in stale_ids:
+                    continue
+                claim["status"] = "stale"
+                claim["reason_code"] = "claim_stale_source"
+                lifecycle = claim.get("lifecycle", [])
+                if isinstance(lifecycle, str):
+                    lifecycle = [lifecycle]
+                if not isinstance(lifecycle, list):
+                    lifecycle = []
+                lifecycle_norm = [
+                    str(step or "").strip().lower()
+                    for step in lifecycle
+                    if str(step or "").strip()
+                ]
+                if "stale" not in lifecycle_norm:
+                    lifecycle_norm.append("stale")
+                claim["lifecycle"] = lifecycle_norm
+
+        metadata = dict(verification.metadata) if isinstance(verification.metadata, dict) else {}
+        metadata["claim_lifecycle"] = updated_claims
+        metadata["claim_status_counts"] = self._claim_counts(updated_claims)
+        metadata["claim_reason_codes"] = sorted({
+            self._normalize_claim_reason_code(
+                status=str(item.get("status", "") or ""),
+                reason_code=str(item.get("reason_code", "") or ""),
+            )
+            for item in updated_claims
+        })
+        metadata["temporal_consistency"] = {
+            "enabled": True,
+            "reference_as_of": reference_date.isoformat(),
+            "require_as_of_alignment": require_as_of_alignment,
+            "enforce_cross_claim_date_conflict_check": enforce_date_conflicts,
+            "max_source_age_days": max_source_age_days,
+            "stale_claim_count": len(stale_claims),
+            "conflict_count": len(temporal_conflicts),
+        }
+        if stale_claims:
+            metadata["stale_claims"] = stale_claims[:20]
+        if temporal_conflicts:
+            metadata["temporal_conflicts"] = temporal_conflicts[:20]
+
+        if not stale_claims and not temporal_conflicts:
+            return self._verification_with_metadata(
+                verification,
+                metadata=metadata,
+            )
+
+        fail_reason_code = "claim_stale_source" if stale_claims else "temporal_conflict"
+        feedback_lines = [str(verification.feedback or "").strip()]
+        if stale_claims:
+            feedback_lines.append(
+                "Temporal gate failed: stale source dates exceeded max_source_age_days.",
+            )
+        if temporal_conflicts:
+            feedback_lines.append(
+                "Temporal gate failed: as_of alignment or cross-claim date consistency violation.",
+            )
+        return self._verification_with_metadata(
+            verification,
+            metadata=metadata,
+            passed=False,
+            outcome="fail",
+            reason_code=fail_reason_code,
+            feedback="\n".join(line for line in feedback_lines if line),
+            severity_class="semantic",
+            confidence=min(float(verification.confidence or 0.5), 0.45),
+        )
+
+    def _enforce_synthesis_claim_gate(
+        self,
+        *,
+        subtask: Subtask,
+        verification: VerificationResult,
+        contract: dict[str, object],
+    ) -> VerificationResult:
+        if not subtask.is_synthesis:
+            return verification
+        claims = self._claims_from_verification(verification)
+        if not claims:
+            return verification
+
+        counts = self._claim_counts(claims)
+        ratios = self._claim_ratios(counts)
+        min_supported_ratio = self._to_ratio(contract.get("min_supported_ratio", 0.75), 0.75)
+        max_unverified_ratio = self._to_ratio(contract.get("max_unverified_ratio", 0.25), 0.25)
+        max_contradicted = self._to_non_negative_int(
+            contract.get("max_contradicted_count", 0),
+            0,
+        )
+        final_gate = contract.get("final_gate", {})
+        critical_support_floor = 1.0
+        if isinstance(final_gate, dict):
+            critical_support_floor = self._to_ratio(
+                final_gate.get("critical_claim_support_ratio", 1.0),
+                1.0,
+            )
+
+        fail_reasons: list[str] = []
+        reason_code = ""
+        if counts["contradicted"] > max_contradicted:
+            fail_reasons.append(
+                "Synthesis claim gate failed: contradicted claims exceed contract threshold.",
+            )
+            reason_code = "claim_contradicted"
+        if counts["critical_supported"] < counts["critical_total"]:
+            if counts["critical_contradicted"] > 0:
+                fail_reasons.append(
+                    "Synthesis claim gate failed: contradicted critical claims detected.",
+                )
+                reason_code = "claim_contradicted"
+            else:
+                fail_reasons.append(
+                    "Synthesis claim gate failed: unsupported critical claims remain.",
+                )
+                if not reason_code:
+                    reason_code = "claim_insufficient_evidence"
+        if ratios["critical_support_ratio"] < critical_support_floor:
+            fail_reasons.append(
+                "Synthesis claim gate failed: critical claim support ratio below threshold.",
+            )
+            if not reason_code:
+                reason_code = "coverage_below_threshold"
+        if ratios["supported_ratio"] < min_supported_ratio:
+            fail_reasons.append(
+                "Synthesis claim gate failed: supported-claim ratio below threshold.",
+            )
+            if not reason_code:
+                reason_code = "coverage_below_threshold"
+        if ratios["unverified_ratio"] > max_unverified_ratio:
+            fail_reasons.append(
+                "Synthesis claim gate failed: unresolved claim ratio above threshold.",
+            )
+            if not reason_code:
+                reason_code = "claim_insufficient_evidence"
+
+        orphan_critical_numeric_claims: list[str] = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            claim_type = str(claim.get("claim_type", "") or "").strip().lower()
+            criticality = str(claim.get("criticality", "") or "").strip().lower()
+            if claim_type != "numeric" or criticality != "critical":
+                continue
+            refs = claim.get("evidence_refs", [])
+            if isinstance(refs, str):
+                refs = [refs]
+            if not isinstance(refs, list):
+                refs = []
+            normalized_refs = [
+                str(ref or "").strip()
+                for ref in refs
+                if str(ref or "").strip()
+            ]
+            if normalized_refs:
+                continue
+            claim_text = str(claim.get("text", "") or "").strip()
+            orphan_critical_numeric_claims.append(claim_text[:160] if claim_text else "")
+        if orphan_critical_numeric_claims:
+            fail_reasons.append(
+                "Synthesis claim gate failed: critical numeric claim missing evidence lineage.",
+            )
+            if not reason_code:
+                reason_code = "claim_insufficient_evidence"
+
+        metadata = dict(verification.metadata) if isinstance(verification.metadata, dict) else {}
+        metadata["claim_status_counts"] = counts
+        metadata["supported_ratio"] = ratios["supported_ratio"]
+        metadata["unverified_ratio"] = ratios["unverified_ratio"]
+        metadata["critical_support_ratio"] = ratios["critical_support_ratio"]
+        if orphan_critical_numeric_claims:
+            metadata["orphan_critical_numeric_claims"] = orphan_critical_numeric_claims[:10]
+        metadata["claim_gate_thresholds"] = {
+            "min_supported_ratio": min_supported_ratio,
+            "max_unverified_ratio": max_unverified_ratio,
+            "max_contradicted_count": max_contradicted,
+            "critical_claim_support_ratio": critical_support_floor,
+        }
+
+        if not fail_reasons:
+            return self._verification_with_metadata(verification, metadata=metadata)
+        return self._verification_with_metadata(
+            verification,
+            metadata=metadata,
+            passed=False,
+            outcome="fail",
+            reason_code=reason_code or "coverage_below_threshold",
+            feedback="\n".join([
+                *(part for part in [verification.feedback or ""] if part),
+                *fail_reasons,
+            ]),
+            severity_class="semantic",
+            confidence=min(float(verification.confidence or 0.5), 0.45),
+        )
+
+    @staticmethod
+    def _artifact_provenance_evidence(
+        *,
+        task_id: str,
+        subtask_id: str,
+        tool_calls: list[ToolCallRecord] | None,
+        existing_ids: set[str],
+    ) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for call in tool_calls or []:
+            tool = str(getattr(call, "tool", "") or "").strip().lower()
+            if tool not in {"write_file", "document_write"}:
+                continue
+            result = getattr(call, "result", None)
+            if result is None or not bool(getattr(result, "success", False)):
+                continue
+            args = getattr(call, "args", {})
+            if not isinstance(args, dict):
+                args = {}
+            data = getattr(result, "data", {})
+            if not isinstance(data, dict):
+                data = {}
+            relpath = str(
+                args.get("path")
+                or args.get("file_path")
+                or data.get("path")
+                or "",
+            ).strip()
+            if not relpath:
+                continue
+            content = ""
+            if tool == "write_file":
+                content = str(args.get("content", "") or "")
+            else:
+                parts: list[str] = []
+                title = str(args.get("title", "") or "").strip()
+                if title:
+                    parts.append(title)
+                body = str(args.get("content", "") or "")
+                if body:
+                    parts.append(body)
+                sections = args.get("sections", [])
+                if isinstance(sections, list):
+                    for section in sections[:8]:
+                        if not isinstance(section, dict):
+                            continue
+                        heading = str(section.get("heading", "") or "").strip()
+                        if heading:
+                            parts.append(heading)
+                        section_body = str(section.get("body", "") or "")
+                        if section_body:
+                            parts.append(section_body)
+                content = "\n\n".join(parts)
+            payload = f"{tool}|{subtask_id}|{relpath}|{content[:200]}"
+            evidence_id = "EV-WRITE-" + hashlib.sha1(
+                payload.encode("utf-8", errors="replace"),
+            ).hexdigest().upper()[:10]
+            if evidence_id in existing_ids:
+                continue
+            existing_ids.add(evidence_id)
+            sha256 = ""
+            size_bytes = 0
+            if content:
+                encoded = content.encode("utf-8", errors="replace")
+                size_bytes = len(encoded)
+                sha256 = hashlib.sha256(encoded).hexdigest()
+            records.append({
+                "evidence_id": evidence_id,
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "tool": tool,
+                "evidence_kind": "artifact",
+                "tool_call_id": str(getattr(call, "call_id", "") or ""),
+                "query": relpath,
+                "source_url": "",
+                "facets": {"artifact_path": relpath[:120]},
+                "artifact_workspace_relpath": relpath,
+                "artifact_sha256": sha256,
+                "artifact_size_bytes": int(size_bytes),
+                "snippet": f"{tool}:{relpath}",
+                "context_text": f"{tool} wrote {relpath}",
+                "quality": 1.0,
+                "created_at": str(getattr(call, "timestamp", "") or datetime.now().isoformat()),
+            })
+        return records
+
+    @staticmethod
+    def _claim_evidence_links(
+        *,
+        claims: list[dict[str, object]],
+        evidence_records: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        evidence_ids: list[str] = []
+        source_index: dict[str, str] = {}
+        artifact_index: dict[str, str] = {}
+        for record in evidence_records:
+            if not isinstance(record, dict):
+                continue
+            evidence_id = str(record.get("evidence_id", "") or "").strip()
+            if not evidence_id:
+                continue
+            evidence_ids.append(evidence_id)
+            source_url = str(record.get("source_url", "") or "").strip()
+            if source_url and source_url not in source_index:
+                source_index[source_url] = evidence_id
+            artifact_path = str(record.get("artifact_workspace_relpath", "") or "").strip()
+            if artifact_path and artifact_path not in artifact_index:
+                artifact_index[artifact_path] = evidence_id
+            facets = record.get("facets", {})
+            if isinstance(facets, dict):
+                facet_path = str(facets.get("artifact_path", "") or "").strip()
+                if facet_path and facet_path not in artifact_index:
+                    artifact_index[facet_path] = evidence_id
+
+        links: list[dict[str, object]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            claim_id = str(claim.get("claim_id", "") or "").strip()
+            if not claim_id:
+                continue
+            refs = claim.get("evidence_refs", [])
+            if isinstance(refs, str):
+                refs = [refs]
+            if not isinstance(refs, list):
+                refs = []
+            matched_ids: list[str] = []
+            for ref in refs:
+                ref_text = str(ref or "").strip()
+                if not ref_text:
+                    continue
+                if ref_text in evidence_ids:
+                    matched_ids.append(ref_text)
+                    continue
+                matched_source = False
+                for source_url, evidence_id in source_index.items():
+                    if ref_text == source_url or ref_text in source_url or source_url in ref_text:
+                        matched_ids.append(evidence_id)
+                        matched_source = True
+                        break
+                if matched_source:
+                    continue
+                for artifact_path, evidence_id in artifact_index.items():
+                    if (
+                        ref_text == artifact_path
+                        or ref_text.endswith(artifact_path)
+                        or artifact_path.endswith(ref_text)
+                    ):
+                        matched_ids.append(evidence_id)
+                        break
+            for evidence_id in matched_ids:
+                key = (claim_id, evidence_id)
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                links.append({
+                    "claim_id": claim_id,
+                    "evidence_id": evidence_id,
+                    "link_type": "supporting",
+                    "score": 1.0,
+                    "metadata": {},
+                })
+        return links
+
+    async def _persist_claim_validity_artifacts(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        verification: VerificationResult,
+        evidence_records: list[dict],
+        tool_calls: list[ToolCallRecord] | None = None,
+    ) -> None:
+        claims = self._claims_from_verification(verification)
+        if not claims:
+            return
+        normalized_evidence = [
+            item for item in evidence_records if isinstance(item, dict)
+        ]
+        existing_ids = {
+            str(item.get("evidence_id", "") or "").strip()
+            for item in normalized_evidence
+            if str(item.get("evidence_id", "") or "").strip()
+        }
+        provenance_records = self._artifact_provenance_evidence(
+            task_id=task.id,
+            subtask_id=subtask.id,
+            tool_calls=tool_calls,
+            existing_ids=existing_ids,
+        )
+        if provenance_records:
+            normalized_evidence = merge_evidence_records(
+                normalized_evidence,
+                provenance_records,
+            )
+        counts = self._claim_counts(claims)
+        ratios = self._claim_ratios(counts)
+        run_id = self._task_run_id(task)
+        phase_id = str(getattr(subtask, "phase_id", "") or "")
+        links = self._claim_evidence_links(
+            claims=claims,
+            evidence_records=normalized_evidence,
+        )
+        claim_results = []
+        for claim in claims:
+            status = str(claim.get("status", "extracted") or "extracted").strip().lower()
+            claim_results.append({
+                "claim_id": str(claim.get("claim_id", "") or "").strip(),
+                "status": status,
+                "reason_code": self._normalize_claim_reason_code(
+                    status=status,
+                    reason_code=str(claim.get("reason_code", "") or ""),
+                ),
+                "verifier": "verification_gates",
+                "confidence": float(verification.confidence or 0.0),
+                "metadata": {
+                    "claim_type": str(claim.get("claim_type", "qualitative") or "qualitative"),
+                    "criticality": str(claim.get("criticality", "important") or "important"),
+                },
+            })
+        try:
+            await self._memory.insert_artifact_claims(
+                task_id=task.id,
+                run_id=run_id,
+                subtask_id=subtask.id,
+                phase_id=phase_id,
+                claims=claims,
+            )
+            await self._memory.insert_claim_verification_results(
+                task_id=task.id,
+                run_id=run_id,
+                subtask_id=subtask.id,
+                phase_id=phase_id,
+                results=claim_results,
+            )
+            if links:
+                await self._memory.insert_claim_evidence_links(
+                    task_id=task.id,
+                    run_id=run_id,
+                    subtask_id=subtask.id,
+                    links=links,
+                )
+            await self._memory.insert_artifact_validity_summary(
+                task_id=task.id,
+                run_id=run_id,
+                subtask_id=subtask.id,
+                phase_id=phase_id,
+                extracted_count=int(counts["extracted"]),
+                supported_count=int(counts["supported"]),
+                contradicted_count=int(counts["contradicted"]),
+                insufficient_evidence_count=int(counts["insufficient_evidence"]),
+                pruned_count=int(counts["pruned"]),
+                supported_ratio=float(ratios["supported_ratio"]),
+                gate_decision="pass" if verification.passed else "fail",
+                reason_code=str(verification.reason_code or ""),
+                metadata={
+                    "critical_total": int(counts["critical_total"]),
+                    "critical_supported": int(counts["critical_supported"]),
+                    "critical_support_ratio": float(ratios["critical_support_ratio"]),
+                    "validity_contract_hash": str(
+                        getattr(subtask, "validity_contract_hash", "") or "",
+                    ),
+                },
+            )
+        except Exception:
+            logger.debug(
+                "Failed persisting claim validity artifacts for %s/%s",
+                task.id,
+                subtask.id,
+                exc_info=True,
+            )
+
+    def _verified_context_for_synthesis(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+    ) -> tuple[bool, str, str]:
+        contract = self._validity_contract_for_subtask(subtask)
+        claim_extraction = contract.get("claim_extraction", {})
+        claim_extraction_enabled = isinstance(claim_extraction, dict) and self._to_bool(
+            claim_extraction.get("enabled", False),
+            False,
+        )
+        final_gate = contract.get("final_gate", {})
+        enforce_verified_context = isinstance(final_gate, dict) and self._to_bool(
+            final_gate.get("enforce_verified_context_only", False),
+            False,
+        )
+        if not (subtask.is_synthesis and claim_extraction_enabled and enforce_verified_context):
+            return True, "", ""
+
+        graph = self._claim_graph_state(task)
+        supported_by_subtask = graph.get("supported_by_subtask", {})
+        if not isinstance(supported_by_subtask, dict):
+            supported_by_subtask = {}
+        unresolved_by_subtask = graph.get("unresolved_by_subtask", {})
+        if not isinstance(unresolved_by_subtask, dict):
+            unresolved_by_subtask = {}
+
+        lines: list[str] = []
+        total_supported = 0
+        for subtask_id, claims in supported_by_subtask.items():
+            if not isinstance(claims, list):
+                continue
+            for claim in claims:
+                if not isinstance(claim, dict):
+                    continue
+                text = str(claim.get("text", "") or "").strip()
+                if not text:
+                    continue
+                total_supported += 1
+                lines.append(f"- [{subtask_id}] {text}")
+        total_unresolved = sum(
+            len(claims)
+            for claims in unresolved_by_subtask.values()
+            if isinstance(claims, list)
+        )
+        if total_supported <= 0 and total_unresolved <= 0:
+            return True, "", ""
+        if total_supported <= 0:
+            return (
+                False,
+                "",
+                "Synthesis gate blocked: no supported claims available in verified context bundle.",
+            )
+        bundle = "\n".join(lines[:80]).strip()
+        return True, bundle, ""
+
+    def _enforce_required_fact_checker(
+        self,
+        *,
+        subtask: Subtask,
+        result: SubtaskResult,
+        verification: VerificationResult,
+    ) -> VerificationResult:
+        if not self._requires_fact_checker_for_subtask(subtask):
+            return verification
+        tool_calls = list(result.tool_calls or [])
+        if not self._fact_checker_used(tool_calls):
+            result.status = SubtaskResultStatus.FAILED
+            metadata = (
+                dict(verification.metadata)
+                if isinstance(verification.metadata, dict)
+                else {}
+            )
+            metadata["required_tool"] = "fact_checker"
+            metadata["required_verifier_missing"] = True
+            details = (
+                "Synthesis requires fact grounding, but no successful "
+                "`fact_checker` invocation was observed."
+            )
+            return VerificationResult(
+                tier=max(verification.tier, int(subtask.verification_tier or 1)),
+                passed=False,
+                confidence=min(verification.confidence, 0.3),
+                checks=list(verification.checks or []),
+                feedback=details,
+                outcome="fail",
+                reason_code="required_verifier_missing",
+                severity_class="semantic",
+                metadata=metadata,
+            )
+
+        contract = self._validity_contract_for_subtask(subtask)
+        claim_extraction = contract.get("claim_extraction", {})
+        claim_extraction_enabled = isinstance(claim_extraction, dict) and self._to_bool(
+            claim_extraction.get("enabled", False),
+            False,
+        )
+        verdict_count = self._fact_checker_verdict_count(tool_calls)
+        if claim_extraction_enabled and verdict_count <= 0:
+            result.status = SubtaskResultStatus.FAILED
+            metadata = (
+                dict(verification.metadata)
+                if isinstance(verification.metadata, dict)
+                else {}
+            )
+            metadata["required_tool"] = "fact_checker"
+            metadata["required_verifier_empty"] = True
+            metadata["fact_checker_verdict_count"] = 0
+            details = (
+                "Synthesis requires claim-level fact grounding, but `fact_checker` "
+                "returned no claim verdicts."
+            )
+            return VerificationResult(
+                tier=max(verification.tier, int(subtask.verification_tier or 1)),
+                passed=False,
+                confidence=min(verification.confidence, 0.3),
+                checks=list(verification.checks or []),
+                feedback=details,
+                outcome="fail",
+                reason_code="required_verifier_empty",
+                severity_class="semantic",
+                metadata=metadata,
+            )
+
+        return verification
+
     # ------------------------------------------------------------------
     # Subtask dispatch
     # ------------------------------------------------------------------
@@ -646,9 +1953,14 @@ class Orchestrator:
         and returns (subtask, result, verification) for the orchestrator
         to process.
         """
+        contract = self._validity_contract_for_subtask(subtask)
+        required_verification_tier = self._synthesis_verification_floor(subtask)
+
         # Mark running and emit event (under lock for parallel safety)
         async with self._state_lock:
             subtask.status = SubtaskStatus.RUNNING
+            if subtask.verification_tier < required_verification_tier:
+                subtask.verification_tier = required_verification_tier
             self._state.save(task)
         self._emit(SUBTASK_STARTED, task.id, {"subtask_id": subtask.id})
 
@@ -708,6 +2020,107 @@ class Orchestrator:
                     f"{prior_iteration_feedback}\n"
                     "Preserve already-correct content and fix only the listed gaps."
                 ).strip()
+
+        gate_passed = True
+        verified_context_bundle = ""
+        gate_error = ""
+        if subtask.is_synthesis:
+            seal_passed, seal_mismatches, validated_seals = self._validate_artifact_seals(
+                task=task,
+            )
+            self._emit(ARTIFACT_SEAL_VALIDATION, task.id, {
+                "subtask_id": subtask.id,
+                "phase_id": subtask.phase_id,
+                "passed": bool(seal_passed),
+                "validated_seal_count": int(validated_seals),
+                "mismatch_count": len(seal_mismatches),
+            })
+            if not seal_passed:
+                first = seal_mismatches[0] if seal_mismatches else {}
+                first_path = str(first.get("path", "") or "").strip()
+                first_reason = str(first.get("reason", "") or "").strip()
+                details = []
+                if first_path:
+                    details.append(first_path)
+                if first_reason:
+                    details.append(first_reason)
+                detail_suffix = f" ({', '.join(details)})" if details else ""
+                gate_error = (
+                    "Synthesis gate blocked: artifact seal validation failed"
+                    f"{detail_suffix}."
+                )
+                blocked = SubtaskResult(
+                    status=SubtaskResultStatus.FAILED,
+                    summary=gate_error,
+                )
+                blocked_verification = VerificationResult(
+                    tier=max(2, int(subtask.verification_tier or required_verification_tier)),
+                    passed=False,
+                    confidence=0.0,
+                    feedback=gate_error,
+                    outcome="fail",
+                    reason_code="artifact_seal_invalid",
+                    severity_class="semantic",
+                    metadata={
+                        "artifact_seal_validation_failed": True,
+                        "artifact_seal_mismatches": seal_mismatches[:10],
+                    },
+                )
+                return subtask, blocked, blocked_verification
+            gate_passed, verified_context_bundle, gate_error = self._verified_context_for_synthesis(
+                task=task,
+                subtask=subtask,
+            )
+            claim_graph = self._claim_graph_state(task)
+            supported_total = 0
+            unresolved_total = 0
+            supported_by_subtask = claim_graph.get("supported_by_subtask", {})
+            if isinstance(supported_by_subtask, dict):
+                supported_total = sum(
+                    len(value) for value in supported_by_subtask.values()
+                    if isinstance(value, list)
+                )
+            unresolved_by_subtask = claim_graph.get("unresolved_by_subtask", {})
+            if isinstance(unresolved_by_subtask, dict):
+                unresolved_total = sum(
+                    len(value) for value in unresolved_by_subtask.values()
+                    if isinstance(value, list)
+                )
+            self._emit(SYNTHESIS_INPUT_GATE_DECISION, task.id, {
+                "subtask_id": subtask.id,
+                "phase_id": subtask.phase_id,
+                "passed": bool(gate_passed),
+                "supported_claim_count": int(supported_total),
+                "unresolved_claim_count": int(unresolved_total),
+                "reason": gate_error if not gate_passed else "verified_context_bundle_ready",
+            })
+            if not gate_passed:
+                blocked = SubtaskResult(
+                    status=SubtaskResultStatus.FAILED,
+                    summary=gate_error,
+                )
+                blocked_verification = VerificationResult(
+                    tier=max(2, int(subtask.verification_tier or required_verification_tier)),
+                    passed=False,
+                    confidence=0.0,
+                    feedback=gate_error,
+                    outcome="fail",
+                    reason_code="coverage_below_threshold",
+                    severity_class="semantic",
+                    metadata={
+                        "synthesis_input_gate_blocked": True,
+                    },
+                )
+                return subtask, blocked, blocked_verification
+            if verified_context_bundle:
+                retry_context = (
+                    f"{retry_context}\n\n"
+                    "VERIFIED CONTEXT BUNDLE (SUPPORTED CLAIMS ONLY):\n"
+                    f"{verified_context_bundle}\n"
+                    "Use this verified bundle as the primary basis for final synthesis. "
+                    "Do not reintroduce unresolved claims."
+                ).strip()
+
         changelog = self._get_changelog(task)
 
         result, verification = await self._runner.run(
@@ -725,6 +2138,50 @@ class Orchestrator:
                 attempts or targeted_iteration_retry
             ),
             retry_strategy=retry_strategy.value,
+        )
+
+        verification = self._enforce_required_fact_checker(
+            subtask=subtask,
+            result=result,
+            verification=verification,
+        )
+        claim_extraction = contract.get("claim_extraction", {})
+        claim_policy_enabled = self._to_bool(contract.get("enabled", False), False) and (
+            isinstance(claim_extraction, dict)
+            and self._to_bool(claim_extraction.get("enabled", False), False)
+        )
+        if claim_policy_enabled:
+            verification = self._apply_intermediate_claim_pruning(
+                task=task,
+                subtask=subtask,
+                result=result,
+                verification=verification,
+                contract=contract,
+            )
+            verification = self._enforce_temporal_consistency_gate(
+                subtask=subtask,
+                verification=verification,
+                contract=contract,
+            )
+            if verification.passed:
+                verification = self._enforce_synthesis_claim_gate(
+                    subtask=subtask,
+                    verification=verification,
+                    contract=contract,
+                )
+            if not verification.passed:
+                result.status = SubtaskResultStatus.FAILED
+        self._update_claim_graph_from_verification(
+            task=task,
+            subtask=subtask,
+            verification=verification,
+        )
+        await self._persist_claim_validity_artifacts(
+            task=task,
+            subtask=subtask,
+            verification=verification,
+            evidence_records=result.evidence_records,
+            tool_calls=result.tool_calls,
         )
 
         return subtask, result, verification
@@ -1474,6 +2931,85 @@ class Orchestrator:
             "hydrated_subtask_ids": hydrated_subtask_ids,
         })
 
+    async def _reconcile_subtask_policy_state(self, task: Task) -> None:
+        process = self._process
+        phase_by_id: dict[str, object] = {}
+        if process is not None:
+            for phase in list(getattr(process, "phases", []) or []):
+                phase_id = str(getattr(phase, "id", "") or "").strip()
+                if phase_id:
+                    phase_by_id[phase_id] = phase
+
+        reconciled: list[dict[str, object]] = []
+        changed = False
+        for subtask in task.plan.subtasks:
+            phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
+            phase = phase_by_id.get(phase_id)
+
+            before = {
+                "model_tier": int(getattr(subtask, "model_tier", 1) or 1),
+                "verification_tier": int(getattr(subtask, "verification_tier", 1) or 1),
+                "acceptance_criteria": str(getattr(subtask, "acceptance_criteria", "") or ""),
+                "validity_contract_hash": str(
+                    getattr(subtask, "validity_contract_hash", "") or "",
+                ),
+            }
+
+            self._apply_subtask_policy_from_process_phase(
+                subtask=subtask,
+                phase=phase,
+            )
+
+            contract_snapshot = (
+                dict(subtask.validity_contract_snapshot)
+                if isinstance(subtask.validity_contract_snapshot, dict)
+                else self._default_validity_contract_for_subtask(subtask)
+            )
+            contract_final_gate = contract_snapshot.get("final_gate", {})
+            if isinstance(contract_final_gate, dict):
+                synthesis_floor = max(
+                    1,
+                    self._to_non_negative_int(
+                        contract_final_gate.get("synthesis_min_verification_tier", 2),
+                        2,
+                    ),
+                )
+            else:
+                synthesis_floor = 2
+            if subtask.is_synthesis:
+                subtask.verification_tier = max(
+                    int(getattr(subtask, "verification_tier", 1) or 1),
+                    synthesis_floor,
+                )
+
+            self._ensure_subtask_validity_snapshot(subtask=subtask)
+
+            after = {
+                "model_tier": int(getattr(subtask, "model_tier", 1) or 1),
+                "verification_tier": int(getattr(subtask, "verification_tier", 1) or 1),
+                "acceptance_criteria": str(getattr(subtask, "acceptance_criteria", "") or ""),
+                "validity_contract_hash": str(
+                    getattr(subtask, "validity_contract_hash", "") or "",
+                ),
+            }
+            if after != before:
+                changed = True
+                reconciled.append({
+                    "subtask_id": subtask.id,
+                    "phase_id": phase_id,
+                    "from": before,
+                    "to": after,
+                })
+
+        if not changed:
+            return
+        self._state.save(task)
+        self._emit(SUBTASK_POLICY_RECONCILED, task.id, {
+            "run_id": self._task_run_id(task),
+            "reconciled_subtasks": reconciled,
+            "reconciled_count": len(reconciled),
+        })
+
     async def _handle_failure(
         self,
         task: Task,
@@ -1483,7 +3019,12 @@ class Orchestrator:
         attempts_by_subtask: dict[str, list[AttemptRecord]],
     ) -> dict[str, str | None] | None:
         """Process a failed subtask: record attempt, retry or replan."""
-        self._persist_subtask_evidence(task.id, subtask.id, result.evidence_records)
+        self._persist_subtask_evidence(
+            task.id,
+            subtask.id,
+            result.evidence_records,
+            tool_calls=result.tool_calls,
+        )
         attempt_list = attempts_by_subtask.setdefault(subtask.id, [])
         strategy, missing_targets = self._retry.classify_failure(
             verification_feedback=verification.feedback,
@@ -1514,6 +3055,7 @@ class Orchestrator:
         attempt_list.append(attempt_record)
         await self._persist_subtask_attempt_record(
             task=task,
+            subtask=subtask,
             subtask_id=subtask.id,
             attempt_record=attempt_record,
             verification=verification,
@@ -1590,6 +3132,16 @@ class Orchestrator:
             return None
 
         async with self._state_lock:
+            self._record_artifact_seals(
+                task=task,
+                subtask_id=subtask.id,
+                tool_calls=result.tool_calls,
+            )
+            self._record_subtask_validity_metrics(
+                task=task,
+                subtask=subtask,
+                verification=verification,
+            )
             subtask.status = SubtaskStatus.FAILED
             subtask.summary = verification.feedback or "Verification failed"
             task.update_subtask(
@@ -2070,6 +3622,215 @@ class Orchestrator:
                     subtask.iteration_max_attempts = int(
                         max(1, getattr(policy, "max_attempts", 1)),
                     )
+                self._apply_subtask_policy_from_process_phase(
+                    subtask=subtask,
+                    phase=phase_obj,
+                )
+            else:
+                self._ensure_subtask_validity_snapshot(subtask=subtask)
+
+    @staticmethod
+    def _hash_validity_contract(contract: dict[str, object]) -> str:
+        serialized = json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(
+            serialized.encode("utf-8", errors="replace"),
+        ).hexdigest()
+
+    @staticmethod
+    def _to_bool(value: object, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        lowered = str(value or "").strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+        return bool(default)
+
+    @staticmethod
+    def _to_ratio(value: object, default: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = float(default)
+        return max(0.0, min(1.0, parsed))
+
+    @staticmethod
+    def _to_non_negative_int(value: object, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = int(default)
+        return max(0, parsed)
+
+    @classmethod
+    def _normalize_validity_contract(
+        cls,
+        contract: dict[str, object] | None,
+    ) -> dict[str, object]:
+        payload = dict(contract or {})
+        claim_extraction_raw = payload.get("claim_extraction", {})
+        if isinstance(claim_extraction_raw, bool):
+            claim_extraction_raw = {"enabled": claim_extraction_raw}
+        if not isinstance(claim_extraction_raw, dict):
+            claim_extraction_raw = {}
+
+        final_gate_raw = payload.get("final_gate", {})
+        if not isinstance(final_gate_raw, dict):
+            final_gate_raw = {}
+        temporal_raw = final_gate_raw.get("temporal_consistency", {})
+        if not isinstance(temporal_raw, dict):
+            temporal_raw = {}
+
+        critical_claim_types_raw = payload.get("critical_claim_types", [])
+        if isinstance(critical_claim_types_raw, str):
+            critical_claim_types_raw = [critical_claim_types_raw]
+        if not isinstance(critical_claim_types_raw, list):
+            critical_claim_types_raw = []
+
+        prune_mode = str(payload.get("prune_mode", "drop") or "").strip().lower()
+        if prune_mode not in {"drop", "rewrite_uncertainty"}:
+            prune_mode = "drop"
+
+        return {
+            "enabled": cls._to_bool(payload.get("enabled", False), False),
+            "claim_extraction": {
+                "enabled": cls._to_bool(claim_extraction_raw.get("enabled", False), False),
+            },
+            "critical_claim_types": list(dict.fromkeys(
+                str(item or "").strip().lower()
+                for item in critical_claim_types_raw
+                if str(item or "").strip()
+            )),
+            "min_supported_ratio": cls._to_ratio(payload.get("min_supported_ratio", 0.75), 0.75),
+            "max_unverified_ratio": cls._to_ratio(payload.get("max_unverified_ratio", 0.25), 0.25),
+            "max_contradicted_count": cls._to_non_negative_int(
+                payload.get("max_contradicted_count", 0),
+                0,
+            ),
+            "prune_mode": prune_mode,
+            "require_fact_checker_for_synthesis": cls._to_bool(
+                payload.get("require_fact_checker_for_synthesis", False),
+                False,
+            ),
+            "final_gate": {
+                "enforce_verified_context_only": cls._to_bool(
+                    final_gate_raw.get("enforce_verified_context_only", True),
+                    True,
+                ),
+                "synthesis_min_verification_tier": max(
+                    1,
+                    cls._to_non_negative_int(
+                        final_gate_raw.get("synthesis_min_verification_tier", 2),
+                        2,
+                    ),
+                ),
+                "critical_claim_support_ratio": cls._to_ratio(
+                    final_gate_raw.get("critical_claim_support_ratio", 1.0),
+                    1.0,
+                ),
+                "temporal_consistency": {
+                    "enabled": cls._to_bool(temporal_raw.get("enabled", False), False),
+                    "require_as_of_alignment": cls._to_bool(
+                        temporal_raw.get("require_as_of_alignment", False),
+                        False,
+                    ),
+                    "enforce_cross_claim_date_conflict_check": cls._to_bool(
+                        temporal_raw.get("enforce_cross_claim_date_conflict_check", False),
+                        False,
+                    ),
+                    "max_source_age_days": cls._to_non_negative_int(
+                        temporal_raw.get("max_source_age_days", 0),
+                        0,
+                    ),
+                    "as_of": str(temporal_raw.get("as_of", "") or "").strip(),
+                },
+            },
+        }
+
+    def _default_validity_contract_for_subtask(self, subtask: Subtask) -> dict[str, object]:
+        return self._normalize_validity_contract({
+            "enabled": False,
+            "claim_extraction": {"enabled": False},
+            "critical_claim_types": ["numeric", "date", "entity_fact"],
+            "min_supported_ratio": 0.75,
+            "max_unverified_ratio": 0.25,
+            "max_contradicted_count": 0,
+            "prune_mode": "drop",
+            "require_fact_checker_for_synthesis": False,
+            "final_gate": {
+                "enforce_verified_context_only": bool(subtask.is_synthesis),
+                "synthesis_min_verification_tier": 2 if subtask.is_synthesis else 1,
+                "critical_claim_support_ratio": 1.0,
+                "temporal_consistency": {
+                    "enabled": False,
+                    "require_as_of_alignment": False,
+                    "enforce_cross_claim_date_conflict_check": False,
+                    "max_source_age_days": 0,
+                    "as_of": "",
+                },
+            },
+        })
+
+    def _resolve_subtask_validity_contract(
+        self,
+        *,
+        subtask: Subtask,
+    ) -> dict[str, object]:
+        process = self._process
+        if process is None:
+            return self._default_validity_contract_for_subtask(subtask)
+        resolver = getattr(process, "resolve_validity_contract_for_phase", None)
+        if callable(resolver):
+            phase_hint = str(getattr(subtask, "phase_id", "") or "").strip() or subtask.id
+            try:
+                resolved = resolver(phase_hint, is_synthesis=bool(subtask.is_synthesis))
+            except TypeError:
+                resolved = resolver(phase_hint)
+            if isinstance(resolved, dict):
+                return self._normalize_validity_contract(resolved)
+        return self._default_validity_contract_for_subtask(subtask)
+
+    def _ensure_subtask_validity_snapshot(self, *, subtask: Subtask) -> None:
+        if (
+            isinstance(subtask.validity_contract_snapshot, dict)
+            and subtask.validity_contract_snapshot
+        ):
+            normalized = self._normalize_validity_contract(subtask.validity_contract_snapshot)
+        else:
+            normalized = self._resolve_subtask_validity_contract(subtask=subtask)
+        subtask.validity_contract_snapshot = normalized
+        subtask.validity_contract_hash = self._hash_validity_contract(normalized)
+
+    def _apply_subtask_policy_from_process_phase(
+        self,
+        *,
+        subtask: Subtask,
+        phase: object | None,
+    ) -> None:
+        if phase is not None:
+            subtask.model_tier = max(
+                int(getattr(subtask, "model_tier", 1) or 1),
+                int(getattr(phase, "model_tier", 1) or 1),
+            )
+            subtask.verification_tier = max(
+                int(getattr(subtask, "verification_tier", 1) or 1),
+                int(getattr(phase, "verification_tier", 1) or 1),
+            )
+            if not str(subtask.acceptance_criteria or "").strip():
+                subtask.acceptance_criteria = str(
+                    getattr(phase, "acceptance_criteria", "") or "",
+                ).strip()
+        resolved = self._resolve_subtask_validity_contract(subtask=subtask)
+        subtask.validity_contract_snapshot = resolved
+        subtask.validity_contract_hash = self._hash_validity_contract(resolved)
 
     @staticmethod
     def _normalize_non_terminal_synthesis(
@@ -3209,6 +4970,7 @@ class Orchestrator:
                 task.id,
                 subtask.id,
                 remediation_result.evidence_records,
+                tool_calls=remediation_result.tool_calls,
             )
 
             if remediation_verification.passed:
@@ -3375,12 +5137,45 @@ class Orchestrator:
         self,
         *,
         task: Task,
+        subtask: Subtask,
         subtask_id: str,
         attempt_record: AttemptRecord,
         verification: VerificationResult,
     ) -> None:
         if not bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
             return
+        verification_metadata = (
+            dict(verification.metadata)
+            if isinstance(verification.metadata, dict)
+            else {}
+        )
+        attempt_metadata: dict[str, object] = {
+            "model_tier": int(getattr(subtask, "model_tier", 1) or 1),
+            "verification_tier": int(getattr(subtask, "verification_tier", 1) or 1),
+            "acceptance_criteria": str(getattr(subtask, "acceptance_criteria", "") or ""),
+            "validity_contract_hash": str(
+                getattr(subtask, "validity_contract_hash", "") or "",
+            ),
+            "validity_contract_snapshot": (
+                dict(getattr(subtask, "validity_contract_snapshot", {}))
+                if isinstance(getattr(subtask, "validity_contract_snapshot", {}), dict)
+                else {}
+            ),
+        }
+        if "claim_status_counts" in verification_metadata:
+            attempt_metadata["claim_status_counts"] = verification_metadata.get(
+                "claim_status_counts",
+            )
+        if "claim_reason_codes" in verification_metadata:
+            attempt_metadata["claim_reason_codes"] = verification_metadata.get("claim_reason_codes")
+        if "supported_ratio" in verification_metadata:
+            attempt_metadata["supported_ratio"] = verification_metadata.get("supported_ratio")
+        if "unverified_ratio" in verification_metadata:
+            attempt_metadata["unverified_ratio"] = verification_metadata.get("unverified_ratio")
+        if "critical_support_ratio" in verification_metadata:
+            attempt_metadata["critical_support_ratio"] = verification_metadata.get(
+                "critical_support_ratio",
+            )
         try:
             await self._memory.insert_subtask_attempt(
                 task_id=task.id,
@@ -3404,6 +5199,7 @@ class Orchestrator:
                         "",
                     ) or ""
                 ),
+                metadata=attempt_metadata,
             )
         except Exception:
             logger.debug(
@@ -3907,14 +5703,20 @@ class Orchestrator:
             [item for item in result.evidence_records if isinstance(item, dict)],
         )
         workspace = Path(task.workspace) if task.workspace else None
+        contract = self._validity_contract_for_subtask(subtask)
+        verification_tier = max(
+            2,
+            self._synthesis_verification_floor(subtask),
+        )
         return await self._verification.verify(
             subtask=subtask,
             result_summary=result.summary or "",
             tool_calls=result.tool_calls,
             evidence_tool_calls=prior_calls,
             evidence_records=prior_evidence,
+            validity_contract=contract,
             workspace=workspace,
-            tier=max(2, subtask.verification_tier),
+            tier=verification_tier,
             task_id=task.id,
         )
 
@@ -3926,11 +5728,32 @@ class Orchestrator:
         verification: VerificationResult,
     ) -> None:
         """Process a successful subtask: update state, check approval."""
-        self._persist_subtask_evidence(task.id, subtask.id, result.evidence_records)
+        self._persist_subtask_evidence(
+            task.id,
+            subtask.id,
+            result.evidence_records,
+            tool_calls=result.tool_calls,
+        )
         summary = result.summary
 
         # Update state
         async with self._state_lock:
+            self._record_artifact_seals(
+                task=task,
+                subtask_id=subtask.id,
+                tool_calls=result.tool_calls,
+            )
+            self._record_subtask_validity_metrics(
+                task=task,
+                subtask=subtask,
+                verification=verification,
+            )
+            if subtask.is_synthesis:
+                summary = self._append_synthesis_provenance_footer(
+                    task=task,
+                    summary=summary,
+                )
+                result.summary = summary
             subtask.status = SubtaskStatus.COMPLETED
             subtask.summary = summary
             subtask.active_issue = ""
@@ -4248,6 +6071,7 @@ class Orchestrator:
         ext for exts in _DOC_EXTENSIONS.values() for ext in exts
     )
     _EVIDENCE_LEDGER_CSV_NAME = "evidence-ledger.csv"
+    _VALIDITY_SCORECARD_JSON_NAME = "validity-scorecard.json"
     _EVIDENCE_LEDGER_CSV_BASE_FIELDS: tuple[str, ...] = (
         "evidence_id",
         "task_id",
@@ -4816,24 +6640,515 @@ class Orchestrator:
         task_id: str,
         subtask_id: str,
         evidence_records: list[dict] | None,
+        *,
+        tool_calls: list[ToolCallRecord] | None = None,
     ) -> None:
         """Persist newly captured evidence records."""
-        if not evidence_records:
-            return
         scoped: list[dict] = []
-        for item in evidence_records:
-            if not isinstance(item, dict):
-                continue
-            normalized = dict(item)
-            normalized["subtask_id"] = subtask_id
-            normalized.setdefault("task_id", task_id)
-            scoped.append(normalized)
+        if evidence_records:
+            for item in evidence_records:
+                if not isinstance(item, dict):
+                    continue
+                normalized = dict(item)
+                normalized["subtask_id"] = subtask_id
+                normalized.setdefault("task_id", task_id)
+                scoped.append(normalized)
+        existing_ids: set[str] = {
+            str(item.get("evidence_id", "") or "").strip()
+            for item in scoped
+            if isinstance(item, dict) and str(item.get("evidence_id", "") or "").strip()
+        }
+        provenance_records = self._artifact_provenance_evidence(
+            task_id=task_id,
+            subtask_id=subtask_id,
+            tool_calls=tool_calls,
+            existing_ids=existing_ids,
+        )
+        if provenance_records:
+            scoped = merge_evidence_records(scoped, provenance_records)
         if not scoped:
             return
         try:
             self._state.append_evidence_records(task_id, scoped)
         except Exception as e:
             logger.warning("Failed persisting evidence ledger for %s: %s", task_id, e)
+
+    @staticmethod
+    def _artifact_content_for_call(
+        tool_name: str,
+        args: dict[str, object],
+        result_data: dict[str, object],
+    ) -> str:
+        if tool_name == "write_file":
+            return str(args.get("content", "") or "")
+        if tool_name == "document_write":
+            parts: list[str] = []
+            title = str(args.get("title", "") or "").strip()
+            if title:
+                parts.append(title)
+            content = str(args.get("content", "") or "")
+            if content:
+                parts.append(content)
+            sections = args.get("sections", [])
+            if isinstance(sections, list):
+                for section in sections[:8]:
+                    if not isinstance(section, dict):
+                        continue
+                    heading = str(section.get("heading", "") or "").strip()
+                    body = str(section.get("body", "") or "")
+                    if heading:
+                        parts.append(heading)
+                    if body:
+                        parts.append(body)
+            if parts:
+                return "\n\n".join(parts)
+            return str(result_data.get("content", "") or "")
+        return ""
+
+    def _artifact_seal_registry(self, task: Task) -> dict[str, dict[str, object]]:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        registry = metadata.get("artifact_seals")
+        if not isinstance(registry, dict):
+            registry = {}
+            metadata["artifact_seals"] = registry
+        task.metadata = metadata
+        return registry
+
+    def _record_artifact_seals(
+        self,
+        *,
+        task: Task,
+        subtask_id: str,
+        tool_calls: list[ToolCallRecord] | None,
+    ) -> int:
+        if not tool_calls:
+            return 0
+        workspace_text = str(task.workspace or "").strip()
+        if not workspace_text:
+            return 0
+        try:
+            workspace = Path(workspace_text).expanduser().resolve()
+        except Exception:
+            return 0
+        if not workspace.exists():
+            return 0
+
+        seals = self._artifact_seal_registry(task)
+        updated = 0
+        for call in tool_calls:
+            tool_name = str(getattr(call, "tool", "") or "").strip().lower()
+            if tool_name not in {"write_file", "document_write"}:
+                continue
+            result = getattr(call, "result", None)
+            if result is None or not bool(getattr(result, "success", False)):
+                continue
+            args = getattr(call, "args", {})
+            if not isinstance(args, dict):
+                args = {}
+            result_data = getattr(result, "data", {})
+            if not isinstance(result_data, dict):
+                result_data = {}
+            raw_path = str(
+                args.get("path")
+                or args.get("file_path")
+                or result_data.get("path")
+                or "",
+            ).strip()
+            if not raw_path:
+                continue
+
+            candidate = Path(raw_path)
+            if candidate.is_absolute():
+                try:
+                    resolved = candidate.expanduser().resolve()
+                    relpath = resolved.relative_to(workspace).as_posix()
+                except Exception:
+                    continue
+            else:
+                relpath = candidate.as_posix()
+                try:
+                    resolved = (workspace / relpath).resolve()
+                    resolved.relative_to(workspace)
+                except Exception:
+                    continue
+
+            sha256 = ""
+            size_bytes = 0
+            if resolved.exists() and resolved.is_file():
+                try:
+                    payload = resolved.read_bytes()
+                except Exception:
+                    payload = b""
+                if payload:
+                    size_bytes = len(payload)
+                    sha256 = hashlib.sha256(payload).hexdigest()
+            if not sha256:
+                content = self._artifact_content_for_call(tool_name, args, result_data)
+                if content:
+                    payload = content.encode("utf-8", errors="replace")
+                    size_bytes = len(payload)
+                    sha256 = hashlib.sha256(payload).hexdigest()
+            if not sha256:
+                continue
+
+            seals[relpath] = {
+                "path": relpath,
+                "sha256": sha256,
+                "size_bytes": int(size_bytes),
+                "tool": tool_name,
+                "tool_call_id": str(getattr(call, "call_id", "") or ""),
+                "subtask_id": subtask_id,
+                "run_id": self._task_run_id(task),
+                "sealed_at": datetime.now().isoformat(),
+            }
+            updated += 1
+
+        if updated > 0:
+            task.metadata["artifact_seals"] = seals
+        return updated
+
+    def _validate_artifact_seals(
+        self,
+        *,
+        task: Task,
+    ) -> tuple[bool, list[dict[str, object]], int]:
+        seals = self._artifact_seal_registry(task)
+        if not seals:
+            self._backfill_artifact_seals_from_evidence(task)
+            seals = self._artifact_seal_registry(task)
+        if not seals:
+            return True, [], 0
+
+        workspace_text = str(task.workspace or "").strip()
+        if not workspace_text:
+            return True, [], 0
+        try:
+            workspace = Path(workspace_text).expanduser().resolve()
+        except Exception:
+            return True, [], 0
+        if not workspace.exists():
+            return True, [], 0
+
+        mismatches: list[dict[str, object]] = []
+        validated = 0
+        for relpath, seal in seals.items():
+            if not isinstance(seal, dict):
+                continue
+            expected = str(seal.get("sha256", "") or "").strip()
+            if not expected:
+                continue
+            try:
+                artifact_path = (workspace / str(relpath)).resolve()
+                artifact_path.relative_to(workspace)
+            except Exception:
+                mismatches.append({
+                    "path": str(relpath),
+                    "reason": "path_outside_workspace",
+                })
+                continue
+            validated += 1
+            if not artifact_path.exists() or not artifact_path.is_file():
+                mismatches.append({
+                    "path": str(relpath),
+                    "reason": "artifact_missing",
+                })
+                continue
+            try:
+                observed = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+            except Exception:
+                mismatches.append({
+                    "path": str(relpath),
+                    "reason": "artifact_unreadable",
+                })
+                continue
+            if observed != expected:
+                mismatches.append({
+                    "path": str(relpath),
+                    "reason": "artifact_seal_mismatch",
+                    "expected_sha256": expected,
+                    "observed_sha256": observed,
+                })
+        return len(mismatches) == 0, mismatches, validated
+
+    def _backfill_artifact_seals_from_evidence(self, task: Task) -> int:
+        seals = self._artifact_seal_registry(task)
+        if seals:
+            return 0
+        try:
+            records = self._state.load_evidence_records(task.id)
+        except Exception:
+            return 0
+        latest_by_path: dict[str, dict[str, object]] = {}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            tool = str(record.get("tool", "") or "").strip().lower()
+            if tool not in {"write_file", "document_write"}:
+                continue
+            relpath = str(record.get("artifact_workspace_relpath", "") or "").strip()
+            sha256 = str(record.get("artifact_sha256", "") or "").strip()
+            if not relpath or not sha256:
+                continue
+            current = latest_by_path.get(relpath)
+            if current is None:
+                latest_by_path[relpath] = record
+                continue
+            current_ts = str(current.get("created_at", "") or "")
+            record_ts = str(record.get("created_at", "") or "")
+            if record_ts >= current_ts:
+                latest_by_path[relpath] = record
+
+        if not latest_by_path:
+            return 0
+
+        for relpath, record in latest_by_path.items():
+            seals[relpath] = {
+                "path": relpath,
+                "sha256": str(record.get("artifact_sha256", "") or ""),
+                "size_bytes": int(record.get("artifact_size_bytes", 0) or 0),
+                "tool": str(record.get("tool", "") or ""),
+                "tool_call_id": str(record.get("tool_call_id", "") or ""),
+                "subtask_id": str(record.get("subtask_id", "") or ""),
+                "run_id": self._task_run_id(task),
+                "sealed_at": str(record.get("created_at", "") or ""),
+                "backfilled_from_evidence": True,
+            }
+        task.metadata["artifact_seals"] = seals
+        return len(latest_by_path)
+
+    def _validity_scorecard_state(self, task: Task) -> dict[str, object]:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        scorecard = metadata.get("validity_scorecard")
+        if not isinstance(scorecard, dict):
+            scorecard = {}
+        per_subtask = scorecard.get("subtask_metrics")
+        if not isinstance(per_subtask, dict):
+            per_subtask = {}
+        scorecard["subtask_metrics"] = per_subtask
+        metadata["validity_scorecard"] = scorecard
+        task.metadata = metadata
+        return scorecard
+
+    def _record_subtask_validity_metrics(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        verification: VerificationResult,
+    ) -> None:
+        if verification is None:
+            return
+        scorecard = self._validity_scorecard_state(task)
+        per_subtask = scorecard.get("subtask_metrics", {})
+        if not isinstance(per_subtask, dict):
+            per_subtask = {}
+            scorecard["subtask_metrics"] = per_subtask
+
+        metadata = verification.metadata if isinstance(verification.metadata, dict) else {}
+        counts = metadata.get("claim_status_counts")
+        if not isinstance(counts, dict):
+            counts = self._claim_counts(self._claims_from_verification(verification))
+        counts = {
+            "extracted": int(counts.get("extracted", 0) or 0),
+            "supported": int(counts.get("supported", 0) or 0),
+            "contradicted": int(counts.get("contradicted", 0) or 0),
+            "insufficient_evidence": int(counts.get("insufficient_evidence", 0) or 0),
+            "stale": int(counts.get("stale", 0) or 0),
+            "pruned": int(counts.get("pruned", 0) or 0),
+            "unresolved": int(
+                counts.get(
+                    "unresolved",
+                    int(counts.get("contradicted", 0) or 0)
+                    + int(counts.get("insufficient_evidence", 0) or 0)
+                    + int(counts.get("stale", 0) or 0),
+                ) or 0,
+            ),
+            "critical_total": int(counts.get("critical_total", 0) or 0),
+            "critical_supported": int(counts.get("critical_supported", 0) or 0),
+            "critical_contradicted": int(counts.get("critical_contradicted", 0) or 0),
+        }
+        ratios = self._claim_ratios(counts)
+        reason_codes = metadata.get("claim_reason_codes")
+        if not isinstance(reason_codes, list):
+            reason_codes = []
+        normalized_reason_codes = sorted({
+            str(item or "").strip().lower()
+            for item in reason_codes
+            if str(item or "").strip()
+        })
+        per_subtask[subtask.id] = {
+            "subtask_id": subtask.id,
+            "phase_id": str(subtask.phase_id or ""),
+            "is_synthesis": bool(subtask.is_synthesis),
+            "verification_outcome": str(verification.outcome or ""),
+            "reason_code": str(verification.reason_code or "").strip().lower(),
+            "counts": counts,
+            "ratios": {
+                "supported_ratio": float(ratios.get("supported_ratio", 0.0)),
+                "unverified_ratio": float(ratios.get("unverified_ratio", 0.0)),
+                "critical_support_ratio": float(ratios.get("critical_support_ratio", 0.0)),
+            },
+            "reason_codes": normalized_reason_codes,
+            "updated_at": datetime.now().isoformat(),
+        }
+        scorecard["run"] = self._build_run_validity_scorecard(task)
+
+    def _scorecard_source_window(self, task: Task) -> dict[str, str]:
+        try:
+            records = self._state.load_evidence_records(task.id)
+        except Exception:
+            return {"min": "", "max": ""}
+        timestamps = sorted({
+            str(record.get("created_at", "") or "").strip()
+            for record in records
+            if isinstance(record, dict) and str(record.get("created_at", "") or "").strip()
+        })
+        if not timestamps:
+            return {"min": "", "max": ""}
+        return {"min": timestamps[0], "max": timestamps[-1]}
+
+    def _build_run_validity_scorecard(self, task: Task) -> dict[str, object]:
+        scorecard = self._validity_scorecard_state(task)
+        per_subtask = scorecard.get("subtask_metrics", {})
+        if not isinstance(per_subtask, dict):
+            per_subtask = {}
+        aggregate = {
+            "extracted": 0,
+            "supported": 0,
+            "contradicted": 0,
+            "insufficient_evidence": 0,
+            "stale": 0,
+            "pruned": 0,
+            "unresolved": 0,
+            "critical_total": 0,
+            "critical_supported": 0,
+            "critical_contradicted": 0,
+        }
+        reason_codes: set[str] = set()
+        for entry in per_subtask.values():
+            if not isinstance(entry, dict):
+                continue
+            counts = entry.get("counts", {})
+            if not isinstance(counts, dict):
+                continue
+            for key in aggregate:
+                aggregate[key] += int(counts.get(key, 0) or 0)
+            raw_codes = entry.get("reason_codes", [])
+            if isinstance(raw_codes, list):
+                reason_codes.update(
+                    str(item or "").strip().lower()
+                    for item in raw_codes
+                    if str(item or "").strip()
+                )
+            entry_reason = str(entry.get("reason_code", "") or "").strip().lower()
+            if entry_reason:
+                reason_codes.add(entry_reason)
+
+        ratios = self._claim_ratios(aggregate)
+        extracted = max(0, int(aggregate.get("extracted", 0) or 0))
+        contradicted = max(0, int(aggregate.get("contradicted", 0) or 0))
+        contradicted_ratio = (float(contradicted) / float(extracted)) if extracted > 0 else 0.0
+        trust_score = max(
+            0.0,
+            min(
+                1.0,
+                float(ratios.get("supported_ratio", 0.0))
+                - (0.6 * float(ratios.get("unverified_ratio", 0.0)))
+                - (0.9 * contradicted_ratio),
+            ),
+        )
+        source_window = self._scorecard_source_window(task)
+        return {
+            "analysis_timestamp": datetime.now().isoformat(),
+            "source_time_window": source_window,
+            "counts": aggregate,
+            "supported_ratio": round(float(ratios.get("supported_ratio", 0.0)), 4),
+            "unverified_ratio": round(float(ratios.get("unverified_ratio", 0.0)), 4),
+            "critical_support_ratio": round(
+                float(ratios.get("critical_support_ratio", 0.0)),
+                4,
+            ),
+            "trust_score": round(trust_score, 4),
+            "reason_codes": sorted(reason_codes),
+            "verification_report_path": self._VALIDITY_SCORECARD_JSON_NAME,
+        }
+
+    def _refresh_run_validity_scorecard(self, task: Task) -> dict[str, object]:
+        scorecard = self._validity_scorecard_state(task)
+        run_summary = self._build_run_validity_scorecard(task)
+        scorecard["run"] = run_summary
+        task.metadata["validity_scorecard"] = scorecard
+        return run_summary
+
+    def _export_validity_scorecard_json(self, task: Task) -> None:
+        workspace_text = str(task.workspace or "").strip()
+        if not workspace_text:
+            return
+        workspace = Path(workspace_text).expanduser()
+        if not workspace.exists() or not workspace.is_dir():
+            return
+        run_summary = self._refresh_run_validity_scorecard(task)
+        output = workspace / self._VALIDITY_SCORECARD_JSON_NAME
+        payload = {
+            "task_id": task.id,
+            "run_id": self._task_run_id(task),
+            "status": str(
+                task.status.value if isinstance(task.status, TaskStatus) else task.status,
+            ),
+            "summary": run_summary,
+        }
+        try:
+            output.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning("Failed exporting validity scorecard for %s: %s", task.id, e)
+
+    def _emit_run_validity_scorecard(self, task: Task) -> None:
+        run_summary = self._refresh_run_validity_scorecard(task)
+        self._emit(RUN_VALIDITY_SCORECARD, task.id, {
+            "run_id": self._task_run_id(task),
+            **run_summary,
+        })
+
+    def _append_synthesis_provenance_footer(
+        self,
+        *,
+        task: Task,
+        summary: str,
+    ) -> str:
+        base = str(summary or "").strip()
+        marker = "VALIDITY_PROVENANCE_FOOTER:"
+        if marker in base:
+            return base
+        run_summary = self._refresh_run_validity_scorecard(task)
+        source_window = run_summary.get("source_time_window", {})
+        if not isinstance(source_window, dict):
+            source_window = {}
+        footer_lines = [
+            marker,
+            f"analysis_timestamp={run_summary.get('analysis_timestamp', '')}",
+            f"source_time_window={source_window.get('min', '')}..{source_window.get('max', '')}",
+            f"supported_ratio={run_summary.get('supported_ratio', 0.0)}",
+            f"critical_support_ratio={run_summary.get('critical_support_ratio', 0.0)}",
+            f"trust_score={run_summary.get('trust_score', 0.0)}",
+            "verification_report="
+            + str(
+                run_summary.get(
+                    "verification_report_path",
+                    self._VALIDITY_SCORECARD_JSON_NAME,
+                ),
+            ),
+        ]
+        footer = "\n".join(footer_lines).strip()
+        if not base:
+            return footer
+        return f"{base}\n\n{footer}"
 
     def _get_changelog(self, task: Task) -> ChangeLog | None:
         """Get or create a ChangeLog for the task's workspace."""
@@ -4922,6 +7237,7 @@ class Orchestrator:
     def _finalize_task(self, task: Task) -> Task:
         """Finalize task: set status, emit events."""
         completed, total = task.progress
+        run_validity_summary = self._refresh_run_validity_scorecard(task)
         blocking_remediation_failures: list[str] = []
         blocked_subtasks: list[dict[str, object]] = []
         raw_blocked_subtasks = task.metadata.get("blocked_subtasks")
@@ -4985,6 +7301,7 @@ class Orchestrator:
             self._emit(TASK_COMPLETED, task.id, {
                 "completed": completed,
                 "total": total,
+                "validity_summary": run_validity_summary,
             })
         else:
             task.status = TaskStatus.FAILED
@@ -5011,9 +7328,12 @@ class Orchestrator:
                 "failed_subtasks": [s.id for s in failed],
                 "blocking_remediation_failures": blocking_remediation_failures,
                 "blocked_subtasks": blocked_subtasks,
+                "validity_summary": run_validity_summary,
             })
 
+        self._emit_run_validity_scorecard(task)
         self._emit_telemetry_run_summary(task)
+        self._export_validity_scorecard_json(task)
         self._state.save(task)
         return task
 
@@ -5153,6 +7473,14 @@ class Orchestrator:
         rollup = getattr(self, "_telemetry_rollup", None)
         if not isinstance(rollup, dict):
             rollup = self._new_telemetry_rollup()
+        validity_summary = {}
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if isinstance(metadata, dict):
+            scorecard = metadata.get("validity_scorecard", {})
+            if isinstance(scorecard, dict):
+                run_summary = scorecard.get("run", {})
+                if isinstance(run_summary, dict):
+                    validity_summary = run_summary
         self._emit(TELEMETRY_RUN_SUMMARY, task.id, {
             "run_id": self._task_run_id(task),
             "model_invocations": int(rollup.get("model_invocations", 0)),
@@ -5165,6 +7493,7 @@ class Orchestrator:
             "overflow_fallback_count": int(rollup.get("overflow_fallback_count", 0)),
             "compactor_warning_count": int(rollup.get("compactor_warning_count", 0)),
             "budget_snapshot": self._run_budget.snapshot(),
+            "validity_summary": validity_summary,
         })
 
     def cancel_task(self, task: Task) -> None:

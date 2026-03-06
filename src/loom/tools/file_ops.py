@@ -519,6 +519,7 @@ class EditFileTool(Tool):
             "1. Single edit: provide old_str and new_str (old_str must be unique).\n"
             "2. Batch edit: provide an 'edits' array of {old_str, new_str} objects, "
             "applied sequentially.\n"
+            "If the file does not exist, single-edit mode with empty old_str creates it.\n"
             "Whitespace-tolerant: minor whitespace differences are handled automatically."
         )
 
@@ -530,7 +531,10 @@ class EditFileTool(Tool):
                 "path": {"type": "string", "description": "File path relative to workspace"},
                 "old_str": {
                     "type": "string",
-                    "description": "Exact string to find (must be unique). Use for single edits.",
+                    "description": (
+                        "Exact string to find (must be unique). Use for single edits. "
+                        "Use empty old_str to create a missing file."
+                    ),
                 },
                 "new_str": {
                     "type": "string",
@@ -564,10 +568,6 @@ class EditFileTool(Tool):
             return ToolResult.fail("No workspace set")
 
         path = self._resolve_path(args["path"], ctx.workspace)
-        if not path.exists():
-            return ToolResult.fail(f"File not found: {args['path']}")
-
-        content = path.read_text(encoding="utf-8")
         rel_path = str(path.relative_to(ctx.workspace.resolve()))
 
         # Build edit list from either single or batch mode
@@ -587,12 +587,25 @@ class EditFileTool(Tool):
         else:
             return ToolResult.fail("Provide either old_str/new_str or an edits array.")
 
+        file_missing = not path.exists()
+        if not file_missing and not path.is_file():
+            return ToolResult.fail(f"Not a file: {args['path']}")
+
         # Validate all edits before applying any
+        allow_missing_file_create = (
+            file_missing
+            and len(edit_pairs) == 1
+            and edit_pairs[0][0] == ""
+        )
         for i, (old_str, _) in enumerate(edit_pairs):
-            if not old_str:
+            if not old_str and not allow_missing_file_create:
                 label = f"edit[{i}]" if len(edit_pairs) > 1 else "old_str"
                 return ToolResult.fail(f"{label}: old_str cannot be empty.")
 
+        if file_missing:
+            content = ""
+        else:
+            content = path.read_text(encoding="utf-8")
         original_content = content
         applied = []
         fuzzy_used = []
@@ -600,6 +613,10 @@ class EditFileTool(Tool):
         language = detect_language(rel_path)
 
         for i, (old_str, new_str) in enumerate(edit_pairs):
+            if allow_missing_file_create:
+                content = new_str
+                applied.append((old_str, new_str))
+                continue
             label = f"edit[{i}]" if len(edit_pairs) > 1 else ""
             result = self._apply_single_edit(content, old_str, new_str, rel_path, label, language)
 
@@ -617,6 +634,7 @@ class EditFileTool(Tool):
             ctx.changelog.record_before_write(rel_path, subtask_id=ctx.subtask_id)
 
         # Write the final result
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
         # Build diff for the response
@@ -624,7 +642,10 @@ class EditFileTool(Tool):
 
         # Build summary message
         n = len(applied)
-        if n == 1:
+        if allow_missing_file_create and n == 1:
+            lines_new = applied[0][1].count("\n") + 1
+            msg = f"Created {rel_path} with {lines_new} lines"
+        elif n == 1:
             lines_old = applied[0][0].count("\n") + 1
             lines_new = applied[0][1].count("\n") + 1
             msg = f"Edited {rel_path}: replaced {lines_old} lines with {lines_new} lines"

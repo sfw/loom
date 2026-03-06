@@ -2322,6 +2322,11 @@ class SubtaskRunner:
             tool_calls=tool_calls_record,
             evidence_tool_calls=evidence_tool_calls,
             evidence_records=combined_evidence_records,
+            validity_contract=(
+                dict(subtask.validity_contract_snapshot)
+                if isinstance(subtask.validity_contract_snapshot, dict)
+                else {}
+            ),
             workspace=workspace,
             tier=subtask.verification_tier,
             task_id=task.id,

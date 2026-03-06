@@ -52,6 +52,13 @@ class TestCategorizeError:
         result = categorize_error("Invalid JSON response from model")
         assert result.category == ErrorCategory.VALIDATION_ERROR
 
+    def test_calculator_string_constant_error(self):
+        result = categorize_error(
+            "Evaluation error: Unsupported constant type: <class 'str'>"
+        )
+        assert result.category == ErrorCategory.TOOL_ERROR
+        assert "numeric constants" in result.recovery_hint.lower()
+
     def test_model_error(self):
         result = categorize_error("ConnectError: failed to reach model server")
         assert result.category == ErrorCategory.MODEL_ERROR

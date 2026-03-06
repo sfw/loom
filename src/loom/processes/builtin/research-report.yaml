@@ -7,6 +7,7 @@ description: >
   explicit assumptions, challenge testing, and QA checks.
 author: "Loom Team"
 tags: [research, analysis, writing, report, evidence-based, quality-control]
+risk_level: medium
 
 persona: |
   You are a methodical researcher who values evidence over opinion. Frame
@@ -15,6 +16,21 @@ persona: |
   prose and avoid jargon unless the audience requires it.
 
 phase_mode: strict
+
+validity_contract:
+  enabled: true
+  claim_extraction:
+    enabled: true
+  critical_claim_types: [numeric, date, entity_fact]
+  min_supported_ratio: 0.8
+  max_unverified_ratio: 0.2
+  max_contradicted_count: 0
+  prune_mode: rewrite_uncertainty
+  require_fact_checker_for_synthesis: false
+  final_gate:
+    enforce_verified_context_only: true
+    synthesis_min_verification_tier: 2
+    critical_claim_support_ratio: 1.0
 
 tool_guidance: |
   Use Markdown for narrative and CSV for structured evidence. Cite sources

@@ -14,7 +14,9 @@ from typing import Any
 
 _SOURCE_TOOLS = frozenset({"web_fetch", "web_fetch_html"})
 _DISCOVERY_TOOLS = frozenset({"web_search"})
-_FILE_EVIDENCE_TOOLS = frozenset({"read_file", "spreadsheet", "document_write"})
+_FILE_EVIDENCE_TOOLS = frozenset(
+    {"read_file", "spreadsheet", "document_write", "write_file"},
+)
 _EVIDENCE_TOOLS = _SOURCE_TOOLS | _DISCOVERY_TOOLS | _FILE_EVIDENCE_TOOLS
 
 _DEFAULT_FACET_KEYS = (
@@ -110,7 +112,48 @@ def _should_capture_tool_evidence(tool_name: str, args: dict[str, Any]) -> bool:
             return True
         sections = args.get("sections")
         return isinstance(sections, list) and len(sections) > 0
+    if tool_name == "write_file":
+        return bool(_normalize_text(args.get("path", "")))
     return True
+
+
+def _artifact_content_text(
+    tool_name: str,
+    args: dict[str, Any],
+    result_data: dict[str, Any],
+) -> str:
+    if tool_name == "write_file":
+        return str(args.get("content", "") or "")
+    if tool_name == "document_write":
+        parts: list[str] = []
+        title = str(args.get("title", "") or "").strip()
+        if title:
+            parts.append(title)
+        content = str(args.get("content", "") or "")
+        if content:
+            parts.append(content)
+        sections = args.get("sections", [])
+        if isinstance(sections, list):
+            for section in sections[:8]:
+                if not isinstance(section, dict):
+                    continue
+                heading = str(section.get("heading", "") or "").strip()
+                body = str(section.get("body", "") or "")
+                if heading:
+                    parts.append(heading)
+                if body:
+                    parts.append(body)
+        if parts:
+            return "\n\n".join(parts)
+        return str(result_data.get("content", "") or "")
+    return ""
+
+
+def _artifact_sha256(text: str) -> str:
+    payload = str(text or "")
+    if not payload:
+        return ""
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
 def _next_evidence_id(
@@ -316,6 +359,9 @@ def extract_evidence_records(
         )
         if artifact_path:
             facets.setdefault("artifact_path", artifact_path[:120])
+        artifact_content = _artifact_content_text(tool, args, result_data)
+        artifact_sha = _artifact_sha256(artifact_content)
+        artifact_size = len(artifact_content.encode("utf-8", errors="replace"))
         quality = _score_quality(source_url, snippet_text, query_text)
         evidence_id = _next_evidence_id(
             tool_name=tool,
@@ -340,6 +386,9 @@ def extract_evidence_records(
             "source_url": source_url,
             "query": query_text,
             "facets": facets,
+            "artifact_workspace_relpath": artifact_path,
+            "artifact_sha256": artifact_sha,
+            "artifact_size_bytes": artifact_size if artifact_content else 0,
             "snippet": snippet_text,
             "context_text": context_text[:context_limit],
             "quality": quality,

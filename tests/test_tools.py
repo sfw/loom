@@ -616,6 +616,24 @@ class TestEditFile:
             ctx,
         )
         assert not result.success
+        assert "not found" in (result.error or "").lower()
+
+    async def test_edit_missing_file_created_when_old_str_empty(
+        self,
+        ctx: ToolContext,
+        workspace: Path,
+    ):
+        tool = EditFileTool()
+        result = await tool.execute(
+            {"path": "notes/new.md", "old_str": "", "new_str": "# Title\n"},
+            ctx,
+        )
+        assert result.success
+        assert "Created notes/new.md" in result.output
+        created = workspace / "notes" / "new.md"
+        assert created.exists()
+        assert created.read_text() == "# Title\n"
+        assert "notes/new.md" in result.files_changed
 
 
 # --- ShellExecuteTool ---
