@@ -409,8 +409,12 @@ class DeterministicVerifier:
         severity_class = "semantic"
         feedback = self._build_advisory_feedback(advisory_hits)
         if hard_failures:
-            reason_code = "hard_invariant_failed"
-            severity_class = "hard_invariant"
+            reason_code = self._hard_failure_reason_code(hard_failures)
+            severity_class = (
+                "hard_invariant"
+                if reason_code == "hard_invariant_failed"
+                else "semantic"
+            )
             feedback = self._build_feedback(hard_failures)
         elif recoverable_placeholder_failures:
             reason_code = "incomplete_deliverable_placeholder"
@@ -426,6 +430,8 @@ class DeterministicVerifier:
             ),
             "advisory_count": len(advisory_hits),
         }
+        if hard_failures and reason_code:
+            metadata["hard_failure_reason_code"] = reason_code
         if placeholder_findings:
             metadata["placeholder_findings"] = placeholder_findings
             metadata["placeholder_finding_count"] = len(placeholder_findings)
@@ -447,6 +453,23 @@ class DeterministicVerifier:
             severity_class=severity_class,
             metadata=metadata,
         )
+
+    @classmethod
+    def _hard_failure_reason_code(cls, hard_failures: list[Check]) -> str:
+        for check in hard_failures:
+            detail = str(getattr(check, "detail", "") or "").strip()
+            if not detail:
+                continue
+            match = re.search(
+                r"\breason_code\b\s*[:=]\s*([a-z0-9_]+)",
+                detail,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                reason = str(match.group(1) or "").strip().lower()
+                if reason:
+                    return reason
+        return "hard_invariant_failed"
 
     def _is_regex_rule_hard(self, rule) -> bool:
         enforcement = str(getattr(rule, "enforcement", "") or "").strip().lower()

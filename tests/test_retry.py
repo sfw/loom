@@ -200,6 +200,15 @@ class TestRetryManager:
         assert strategy == RetryStrategy.GENERIC
         assert markets == []
 
+    def test_classify_failure_forbidden_output_path_reason_code_is_generic(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="output policy violation",
+            execution_error="",
+            verification={"reason_code": "forbidden_output_path"},
+        )
+        assert strategy == RetryStrategy.GENERIC
+        assert markets == []
+
     def test_classify_failure_routes_recoverable_placeholder_hard_invariant(self):
         strategy, markets = RetryManager.classify_failure(
             verification_feedback="hard invariant failed",
@@ -314,3 +323,24 @@ class TestRetryManager:
         assert "Model-planned remediation" in context
         assert "canonical filename mismatch" in context
         assert "Update canonical file in place" in context
+
+    def test_build_retry_context_includes_output_path_policy_plan(self):
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=1,
+                feedback=(
+                    "Verification failed: reason_code=forbidden_output_path "
+                    "Canonical deliverable policy violation."
+                ),
+                error=(
+                    "reason_code=forbidden_output_path; retry/remediation writes "
+                    "must stay in canonical deliverables."
+                ),
+                retry_strategy=RetryStrategy.GENERIC,
+            ),
+        ]
+        context = mgr.build_retry_context(attempts)
+        assert "TARGETED RETRY PLAN" in context
+        assert "canonical deliverable path policy" in context.lower()

@@ -36,12 +36,15 @@ SUBTASK_COMPLETED = "subtask_completed"
 SUBTASK_FAILED = "subtask_failed"
 SUBTASK_OUTCOME_STALE = "subtask_outcome_stale"
 SUBTASK_BLOCKED = "subtask_blocked"
+SUBTASK_OUTPUT_CONFLICT_DEFERRED = "subtask_output_conflict_deferred"
+SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING = "subtask_output_conflict_starvation_warning"
 SUBTASK_POLICY_RECONCILED = "subtask_policy_reconciled"
 
 # Tool events
 TOOL_CALL_STARTED = "tool_call_started"
 TOOL_CALL_COMPLETED = "tool_call_completed"
 TOOL_CALL_DEDUPLICATED = "tool_call_deduplicated"
+FORBIDDEN_CANONICAL_WRITE_BLOCKED = "forbidden_canonical_write_blocked"
 ARTIFACT_CONFINEMENT_VIOLATION = "artifact_confinement_violation"
 ARTIFACT_INGEST_CLASSIFIED = "artifact_ingest_classified"
 ARTIFACT_INGEST_COMPLETED = "artifact_ingest_completed"
@@ -175,11 +178,14 @@ EVENT_LIFECYCLE: dict[str, EventLifecycle] = {
     SUBTASK_FAILED: "active",
     SUBTASK_OUTCOME_STALE: "active",
     SUBTASK_BLOCKED: "active",
+    SUBTASK_OUTPUT_CONFLICT_DEFERRED: "active",
+    SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING: "active",
     SUBTASK_POLICY_RECONCILED: "active",
     # Tool events
     TOOL_CALL_STARTED: "active",
     TOOL_CALL_COMPLETED: "active",
     TOOL_CALL_DEDUPLICATED: "active",
+    FORBIDDEN_CANONICAL_WRITE_BLOCKED: "active",
     ARTIFACT_CONFINEMENT_VIOLATION: "active",
     ARTIFACT_INGEST_CLASSIFIED: "active",
     ARTIFACT_INGEST_COMPLETED: "active",

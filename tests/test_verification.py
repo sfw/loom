@@ -135,6 +135,22 @@ class TestDeterministicVerifier:
         assert "Permission denied" in result.feedback
 
     @pytest.mark.asyncio
+    async def test_failed_tool_call_reason_code_is_promoted_from_detail(self):
+        v = DeterministicVerifier()
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "test.py"},
+            result=ToolResult.fail(
+                "reason_code=forbidden_output_path; "
+                "Canonical deliverable policy violation.",
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert result.reason_code == "forbidden_output_path"
+        assert result.severity_class == "semantic"
+
+    @pytest.mark.asyncio
     async def test_safety_integrity_policy_downgrades_non_safety_tool_failures(self):
         process = _make_process(static_checks={
             "tool_success_policy": "safety_integrity_only",

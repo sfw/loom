@@ -277,6 +277,28 @@ phase_mode: guided    # strict | guided | suggestive
 | `guided` | Phases are recommended but can be reordered or skipped. |
 | `suggestive` | Phases are hints. The planner is free to restructure. |
 
+### Output coordination
+
+```yaml
+output_coordination:
+  strategy: direct                 # direct | fan_in
+  intermediate_root: .loom/phase-artifacts
+  enforce_single_writer: true
+  publish_mode: transactional      # transactional | best_effort
+  conflict_policy: defer_fifo      # defer_fifo | fail_fast
+  finalizer_input_policy: require_all_workers  # require_all_workers | allow_partial
+```
+
+- `strategy` controls canonical deliverable ownership behavior.
+- `intermediate_root` must be a normalized workspace-relative path (no absolute or `..` segments).
+- `publish_mode` controls fan-in finalizer publish behavior (`transactional` uses staged writes + commit).
+- `conflict_policy` controls handling when canonical deliverable writers conflict.
+- `finalizer_input_policy` controls whether fan-in finalizers require artifacts from every worker (`require_all_workers`) or can continue with partial worker coverage (`allow_partial`).
+
+When fan-in applies to a phase with deliverables, Loom reserves the deterministic
+phase-finalizer ID `<phase_id>__finalize_output`. Avoid declaring a phase with
+that ID directly.
+
 ### Phases
 
 ```yaml
@@ -289,6 +311,8 @@ phases:
     verification_tier: 2            # 1 (light), 2 (thorough)
     is_critical_path: true          # Optional. Default false.
     is_synthesis: false             # Optional. Mark final synthesis phases.
+    output_strategy: fan_in         # Optional override: direct | fan_in
+    finalizer_input_policy: allow_partial  # Optional override
     acceptance_criteria: >          # Concrete completion criteria
       Measurable criteria.
     deliverables:                   # Expected output files
@@ -330,6 +354,8 @@ phases:
 | `verification_tier` | No | 1-2. Higher = more thorough verification. Default 1. |
 | `is_critical_path` | No | If true, failure here blocks the entire process. |
 | `is_synthesis` | No | If true, this is a final phase that combines prior work. |
+| `output_strategy` | No | Optional phase override for output ownership mode (`direct` or `fan_in`). |
+| `finalizer_input_policy` | No | Optional phase override for fan-in finalizer artifact requirements (`require_all_workers` or `allow_partial`). |
 | `acceptance_criteria` | No | Concrete criteria for phase completion. |
 | `deliverables` | No | List of expected output files with descriptions. |
 | `validity_contract` | No | Optional phase-level claim/evidence policy override (merged with process defaults). |

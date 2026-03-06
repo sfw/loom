@@ -33,6 +33,7 @@ from loom.events.types import (
     ARTIFACT_READ_COMPLETED,
     ARTIFACT_RETENTION_PRUNED,
     COMPACTION_POLICY_DECISION,
+    FORBIDDEN_CANONICAL_WRITE_BLOCKED,
     MODEL_INVOCATION,
     OVERFLOW_FALLBACK_APPLIED,
     TOKEN_STREAMED,
@@ -1228,6 +1229,54 @@ class SubtaskRunner:
             return False, "Completion contract 'verification_notes' must be a string."
         return True, ""
 
+    def _completion_contract_mutation_mismatch(
+        self,
+        *,
+        response_text: str,
+        tool_calls: list[ToolCallRecord],
+        workspace: Path | None,
+    ) -> str:
+        contract = self._extract_completion_json(response_text)
+        if not isinstance(contract, dict):
+            return ""
+        touched = contract.get("deliverables_touched")
+        if not isinstance(touched, list):
+            return ""
+        declared = [
+            str(item).strip()
+            for item in touched
+            if str(item).strip()
+        ]
+        declared_normalized = self._normalize_deliverable_paths(
+            declared,
+            workspace=workspace,
+        )
+        actual: list[str] = []
+        seen: set[str] = set()
+        for call in list(tool_calls or []):
+            result = getattr(call, "result", None)
+            if not getattr(result, "success", False):
+                continue
+            changed = list(getattr(result, "files_changed", []) or [])
+            for raw in changed:
+                normalized = self._normalize_path_for_policy(
+                    str(raw),
+                    workspace,
+                )
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                actual.append(normalized)
+        if set(declared_normalized) == set(actual):
+            return ""
+        declared_text = ", ".join(declared_normalized) if declared_normalized else "(none)"
+        actual_text = ", ".join(actual) if actual else "(none)"
+        return (
+            "Completion contract mismatch: "
+            "deliverables_touched does not match actual file mutations. "
+            f"Declared: {declared_text}. Actual: {actual_text}."
+        )
+
     def _artifact_event_common_payload(
         self,
         *,
@@ -1560,6 +1609,8 @@ class SubtaskRunner:
         prior_successful_tool_calls: list[ToolCallRecord] | None = None,
         prior_evidence_records: list[dict] | None = None,
         expected_deliverables: list[str] | None = None,
+        forbidden_deliverables: list[str] | None = None,
+        allowed_output_prefixes: list[str] | None = None,
         enforce_deliverable_paths: bool = False,
         edit_existing_only: bool = False,
         retry_strategy: str = "",
@@ -1670,6 +1721,14 @@ class SubtaskRunner:
         budget_exhaustion_note: str | None = None
         canonical_deliverables = self._normalize_deliverable_paths(
             expected_deliverables or [],
+            workspace=workspace,
+        )
+        canonical_forbidden_deliverables = self._normalize_deliverable_paths(
+            forbidden_deliverables or [],
+            workspace=workspace,
+        )
+        normalized_allowed_output_prefixes = self._normalize_deliverable_paths(
+            allowed_output_prefixes or [],
             workspace=workspace,
         )
         iteration_budget = self._tool_iteration_budget(
@@ -1896,6 +1955,8 @@ class SubtaskRunner:
                         tool_args=tc.arguments,
                         workspace=workspace,
                         expected_deliverables=canonical_deliverables,
+                        forbidden_deliverables=canonical_forbidden_deliverables,
+                        allowed_output_prefixes=normalized_allowed_output_prefixes,
                         enforce_deliverable_paths=enforce_deliverable_paths,
                         edit_existing_only=edit_existing_only,
                     )
@@ -1909,6 +1970,29 @@ class SubtaskRunner:
                             current_tool_calls=tool_calls_record,
                         )
                     if policy_error:
+                        if self._is_forbidden_output_path_error(policy_error):
+                            blocked_paths = self._target_paths_for_policy(
+                                tool_name=tc.name,
+                                tool_args=tc.arguments,
+                                workspace=workspace,
+                            )
+                            self._emit_telemetry_event(
+                                event_type=FORBIDDEN_CANONICAL_WRITE_BLOCKED,
+                                task_id=task.id,
+                                data={
+                                    "subtask_id": subtask.id,
+                                    "tool": tc.name,
+                                    "attempted_paths": blocked_paths,
+                                    "expected_deliverables": list(canonical_deliverables),
+                                    "forbidden_deliverables": list(
+                                        canonical_forbidden_deliverables,
+                                    ),
+                                    "allowed_output_prefixes": list(
+                                        normalized_allowed_output_prefixes,
+                                    ),
+                                    "policy_error": policy_error,
+                                },
+                            )
                         tool_result = ToolResult.fail(policy_error)
                     else:
                         deduped = False
@@ -2307,6 +2391,17 @@ class SubtaskRunner:
                     )
                 else:
                     model_output = budget_exhaustion_note
+            contract_mismatch = self._completion_contract_mutation_mismatch(
+                response_text=response.text if response and response.text else "",
+                tool_calls=tool_calls_record,
+                workspace=workspace,
+            )
+            if contract_mismatch:
+                model_output = (
+                    f"{model_output}\n\n{contract_mismatch}".strip()
+                    if model_output
+                    else contract_mismatch
+                )
         summary = await self._summarize_model_output(
             model_output,
             max_chars=self._max_state_summary_chars,
@@ -2737,6 +2832,11 @@ class SubtaskRunner:
         text = str(error or "").lower()
         return "safety violation" in text and "escapes workspace" in text
 
+    @staticmethod
+    def _is_forbidden_output_path_error(error: str | None) -> bool:
+        text = str(error or "").strip().lower()
+        return "reason_code=forbidden_output_path" in text
+
     def _emit_compactor_model_event(self, payload: dict) -> None:
         """Bridge semantic-compactor model events into task model_invocation events."""
         context = _COMPACTOR_EVENT_CONTEXT.get()
@@ -2927,11 +3027,18 @@ class SubtaskRunner:
         tool_args: dict,
         workspace: Path | None,
         expected_deliverables: list[str],
+        forbidden_deliverables: list[str],
+        allowed_output_prefixes: list[str],
         enforce_deliverable_paths: bool,
         edit_existing_only: bool,
     ) -> str | None:
         canonical = list(expected_deliverables)
-        if not canonical:
+        forbidden = list(forbidden_deliverables)
+        prefixes = cls._normalize_deliverable_paths(
+            list(allowed_output_prefixes),
+            workspace=None,
+        )
+        if not canonical and not forbidden and not prefixes:
             return None
         paths = cls._target_paths_for_policy(
             tool_name=tool_name,
@@ -2941,24 +3048,46 @@ class SubtaskRunner:
         if not paths:
             return None
         canonical_set = set(canonical)
+        forbidden_set = set(forbidden)
+        variant_candidates = list(dict.fromkeys([*canonical, *forbidden]))
         for path in paths:
+            if path in forbidden_set:
+                blocked = ", ".join(forbidden)
+                return (
+                    "reason_code=forbidden_output_path; "
+                    "Canonical deliverable ownership violation: "
+                    f"'{path}' is reserved for a phase finalizer subtask. "
+                    f"Forbidden canonical path(s): {blocked}."
+                )
             if path in canonical_set:
                 continue
             if any(
                 cls._looks_like_deliverable_variant(candidate=path, canonical=item)
-                for item in canonical
+                for item in variant_candidates
             ):
-                allowed = ", ".join(canonical)
+                allowed = ", ".join(variant_candidates)
                 return (
+                    "reason_code=forbidden_output_path; "
                     "Canonical deliverable policy violation: "
                     f"'{path}' looks like a versioned copy of a required file. "
                     f"Update canonical file(s) instead: {allowed}."
                 )
-        if enforce_deliverable_paths:
+            if prefixes:
+                if any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes):
+                    continue
+                allowed_prefixes = ", ".join(prefixes)
+                return (
+                    "reason_code=forbidden_output_path; "
+                    "Fan-in worker output path violation: "
+                    f"'{path}' must be under intermediate artifact prefix(es): "
+                    f"{allowed_prefixes}."
+                )
+        if enforce_deliverable_paths and canonical:
             extras = [path for path in paths if path not in canonical_set]
             if extras:
                 allowed = ", ".join(canonical)
                 return (
+                    "reason_code=forbidden_output_path; "
                     "Canonical deliverable policy violation: "
                     "retry/remediation writes must stay in canonical deliverables. "
                     f"Unexpected target(s): {', '.join(extras)}. "
@@ -2969,6 +3098,7 @@ class SubtaskRunner:
             and str(tool_name or "").strip().lower() in {"move_file", "delete_file"}
         ):
             return (
+                "reason_code=forbidden_output_path; "
                 "Remediation requires in-place edits to canonical deliverables. "
                 "Do not rename or delete files during retry."
             )
