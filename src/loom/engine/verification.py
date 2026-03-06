@@ -417,7 +417,7 @@ class DeterministicVerifier:
             severity_class = "semantic"
             feedback = (
                 f"{self._build_feedback(recoverable_placeholder_failures)}\n"
-                "Recoverable placeholder findings require confirm-or-prune remediation."
+                "Recoverable placeholder findings require follow-up remediation."
             )
         metadata: dict[str, object] = {
             "hard_failure_count": len(hard_failures),

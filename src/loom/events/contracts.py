@@ -271,6 +271,8 @@ def _should_redact_key(key: str) -> bool:
     normalized = str(key or "").strip().lower()
     if not normalized:
         return False
+    if normalized == "token":
+        return False
     return any(marker in normalized for marker in _REDACTION_MARKERS)
 
 
