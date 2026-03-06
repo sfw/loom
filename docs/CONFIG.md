@@ -235,8 +235,8 @@ Compactor validation warnings:
 
 ### Run Telemetry Event Contracts
 
-When `limits.runner.enable_artifact_telemetry_events = true`, Loom emits these
-run-log events (`.events.jsonl`) from orchestration boundaries:
+Loom emits these run-log events (`.events.jsonl`) from orchestration boundaries.
+For the full active/internals lifecycle catalog, see `docs/telemetry-catalog.md`.
 
 - `artifact_ingest_classified`
 - `artifact_ingest_completed`
@@ -251,6 +251,20 @@ run-log events (`.events.jsonl`) from orchestration boundaries:
 - `task_run_acquired`
 - `task_run_heartbeat`
 - `task_run_recovered`
+- `task_paused`
+- `task_resumed`
+- `task_injected`
+- `task_cancel_requested`
+- `task_cancel_ack`
+- `task_cancel_timeout`
+- `verification_started`
+- `verification_passed`
+- `verification_failed`
+- `verification_outcome`
+- `webhook_delivery_attempted`
+- `webhook_delivery_succeeded`
+- `webhook_delivery_failed`
+- `webhook_delivery_dropped`
 
 Artifact event required fields:
 - `subtask_id`, `tool`, `url` (sanitized), `content_kind`, `content_type`, `status` (`ok|error`)
@@ -300,6 +314,14 @@ Safety notes:
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `database_path` | `string` | `"~/.loom/loom.db"` | SQLite database location. |
+
+Operational notes:
+- Existing DB upgrade failures are treated as blocking errors (no automatic
+  ephemeral fallback for existing files).
+- New DB creation failures are blocking by default; pass CLI flag
+  `--ephemeral` to explicitly allow ephemeral fallback.
+- Use `loom db status|migrate|doctor|backup` for migration operations.
+- See `docs/DB-MIGRATIONS.md` for schema authoring and upgrade policy.
 
 ### `[logging]`
 

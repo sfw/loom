@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
-from loom.events.bus import Event, EventBus
+from loom.events.bus import Event, EventBus, EventPersister
+from loom.events.contracts import validate_payload_shape
 from loom.events.types import (
+    ACTIVE_EVENT_TYPES,
     ASK_USER_ANSWERED,
     ASK_USER_REQUESTED,
+    EVENT_LIFECYCLE,
+    EVENT_NAME_TO_TYPE,
+    SUBTASK_BLOCKED,
     SUBTASK_COMPLETED,
     SUBTASK_STARTED,
     TASK_COMPLETED,
+    TASK_CREATED,
     TASK_EXECUTING,
     TASK_FAILED,
     TASK_PLANNING,
@@ -154,6 +161,48 @@ class TestEventBus:
         assert ASK_USER_REQUESTED == "ask_user_requested"
         assert ASK_USER_ANSWERED == "ask_user_answered"
 
+    def test_catalog_lifecycle_covers_all_declared_events(self):
+        assert set(EVENT_NAME_TO_TYPE.values()) == set(EVENT_LIFECYCLE.keys())
+        assert TASK_CREATED in ACTIVE_EVENT_TYPES
+
+    def test_emit_enriches_payload_with_audit_fields(self):
+        bus = EventBus()
+        bus.emit(Event(event_type=TASK_CREATED, task_id="task-1", data={"goal": "ship"}))
+        event = bus.recent_events(limit=1)[0]
+        payload = event.data
+        assert payload["task_id"] == "task-1"
+        assert payload["timestamp"] == event.timestamp
+        assert payload["schema_version"] == 1
+        assert payload["source_component"] == "unknown"
+        assert str(payload.get("event_id", "")).strip()
+        assert str(payload.get("correlation_id", "")).startswith("task:")
+        assert int(payload.get("sequence", 0)) == 1
+
+    def test_emit_redacts_sensitive_fields(self):
+        bus = EventBus()
+        bus.emit(Event(
+            event_type=TASK_CREATED,
+            task_id="task-2",
+            data={
+                "goal": "ship",
+                "auth_token": "secret-token",
+                "nested": {"api_key": "xyz"},
+            },
+        ))
+        event = bus.recent_events(limit=1)[0]
+        assert event.data["auth_token"] == "[REDACTED]"
+        nested = event.data.get("nested", {})
+        assert isinstance(nested, dict)
+        assert nested.get("api_key") == "[REDACTED]"
+
+    def test_emit_assigns_monotonic_task_sequence(self):
+        bus = EventBus()
+        bus.emit(Event(event_type=TASK_CREATED, task_id="task-seq", data={"goal": "a"}))
+        bus.emit(Event(event_type=TASK_CREATED, task_id="task-seq", data={"goal": "b"}))
+        events = bus.recent_events(limit=2)
+        assert int(events[0].data.get("sequence", 0)) == 1
+        assert int(events[1].data.get("sequence", 0)) == 2
+
     def test_async_handler_called(self):
         """Test that async handlers are invoked when an event loop is running."""
         bus = EventBus()
@@ -229,3 +278,55 @@ class TestEventBus:
 
         asyncio.run(run())
         assert received == ["t0", "t1", "t2", "t3", "t4"]
+
+    def test_event_persister_preserves_emitted_timestamp_and_metadata(self):
+        db = AsyncMock()
+        persister = EventPersister(db)
+        event = Event(
+            event_type=TASK_CREATED,
+            task_id="task-persist",
+            timestamp="2026-03-06T00:00:00+00:00",
+            data={
+                "goal": "persist",
+                "correlation_id": "run:abc123",
+                "run_id": "abc123",
+                "event_id": "evt-1",
+                "sequence": 7,
+                "source_component": "api",
+                "schema_version": 1,
+            },
+        )
+
+        async def run():
+            await persister.handle(event)
+
+        asyncio.run(run())
+        db.insert_event.assert_awaited_once()
+        kwargs = db.insert_event.await_args.kwargs
+        assert kwargs["correlation_id"] == "run:abc123"
+        assert kwargs["timestamp"] == "2026-03-06T00:00:00+00:00"
+        assert kwargs["run_id"] == "abc123"
+        assert kwargs["event_id"] == "evt-1"
+        assert kwargs["sequence"] == 7
+
+    def test_payload_contract_validation_reports_missing_required_keys(self):
+        errors = validate_payload_shape(TASK_CREATED, {"task_id": "task-1"})
+        assert "missing required key: goal" in errors
+
+        errors = validate_payload_shape(SUBTASK_BLOCKED, {"subtask_id": "s1"})
+        assert "missing required key: reasons" in errors
+
+    def test_event_persister_tracks_failed_persistence_attempts(self):
+        class FailingDB:
+            async def insert_event(self, **kwargs):  # type: ignore[no-untyped-def]
+                raise RuntimeError("db unavailable")
+
+        persister = EventPersister(FailingDB())
+        event = Event(event_type=TASK_CREATED, task_id="task-fail", data={"goal": "x"})
+
+        async def run():
+            await persister.handle(event)
+            await persister.handle(event)
+
+        asyncio.run(run())
+        assert persister._failed_persist_count == 2

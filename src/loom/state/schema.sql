@@ -41,16 +41,24 @@ CREATE INDEX IF NOT EXISTS idx_memory_tags ON memory_entries(tags);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL DEFAULT '',
     correlation_id TEXT NOT NULL,                -- Groups related events
+    event_id TEXT NOT NULL DEFAULT '',           -- Stable unique emitted event id
+    sequence INTEGER NOT NULL DEFAULT 0,         -- Monotonic ordering key per task/run scope
     timestamp TEXT NOT NULL DEFAULT (datetime('now')),
     event_type TEXT NOT NULL,
+    source_component TEXT NOT NULL DEFAULT '',
+    schema_version INTEGER NOT NULL DEFAULT 1,
     data TEXT NOT NULL,                          -- JSON payload
     FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
+CREATE INDEX IF NOT EXISTS idx_events_task_sequence ON events(task_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_events_run_sequence ON events(run_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id) WHERE event_id <> '';
 
 -- Learning database (Phase 2)
 CREATE TABLE IF NOT EXISTS learned_patterns (

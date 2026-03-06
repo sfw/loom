@@ -13,8 +13,11 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
+
+from loom.events.contracts import redact_payload, validate_payload_shape
+from loom.events.types import is_known_event_type
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +32,10 @@ class Event:
     timestamp: str = ""
 
     def __post_init__(self):
+        if not isinstance(self.data, dict):
+            self.data = {}
         if not self.timestamp:
-            self.timestamp = datetime.now().isoformat()
+            self.timestamp = datetime.now(UTC).isoformat()
 
 
 # Callback type: async function that takes an Event
@@ -52,6 +57,7 @@ class EventBus:
         self._history: list[Event] = []
         self._max_history = 1000
         self._pending_tasks: set[asyncio.Task[Any]] = set()
+        self._task_sequences: dict[str, int] = {}
 
     def subscribe(self, event_type: str, handler: EventHandler) -> None:
         """Subscribe to a specific event type."""
@@ -81,6 +87,7 @@ class EventBus:
 
         Handlers are called as fire-and-forget tasks on the event loop.
         """
+        self._normalize_event_payload(event)
         self._history.append(event)
         if len(self._history) > self._max_history:
             self._history = self._history[-self._max_history:]
@@ -111,6 +118,43 @@ class EventBus:
                         "Event handler %s failed for %s: %s",
                         getattr(handler, '__name__', handler), event.event_type, e,
                     )
+
+    def _normalize_event_payload(self, event: Event) -> None:
+        payload = redact_payload(event.data if isinstance(event.data, dict) else {})
+        if "task_id" not in payload:
+            payload["task_id"] = event.task_id
+        if "timestamp" not in payload:
+            payload["timestamp"] = event.timestamp
+        payload["schema_version"] = int(payload.get("schema_version", 1) or 1)
+        source_component = str(payload.get("source_component", "") or "").strip()
+        payload["source_component"] = source_component or "unknown"
+        run_id = str(payload.get("run_id", "") or "").strip()
+        correlation_id = str(payload.get("correlation_id", "") or "").strip()
+        if not correlation_id:
+            correlation_id = f"run:{run_id}" if run_id else f"task:{event.task_id}"
+        payload["correlation_id"] = correlation_id
+        payload["event_id"] = str(payload.get("event_id", "") or "").strip() or uuid.uuid4().hex
+
+        raw_sequence = payload.get("sequence")
+        sequence = 0
+        if isinstance(raw_sequence, int):
+            sequence = raw_sequence
+        elif isinstance(raw_sequence, str) and raw_sequence.strip().isdigit():
+            sequence = int(raw_sequence.strip())
+        if sequence <= 0:
+            sequence = int(self._task_sequences.get(event.task_id, 0)) + 1
+        current_sequence = int(self._task_sequences.get(event.task_id, 0))
+        self._task_sequences[event.task_id] = max(sequence, current_sequence)
+        payload["sequence"] = sequence
+        event.data = payload
+
+        if not is_known_event_type(event.event_type):
+            logger.warning("Unknown event type emitted: %s", event.event_type)
+            return
+        errors = validate_payload_shape(event.event_type, payload)
+        if errors:
+            joined = "; ".join(errors)
+            logger.warning("Invalid payload for %s: %s", event.event_type, joined)
 
     def recent_events(self, limit: int = 50) -> list[Event]:
         """Return recent events."""
@@ -164,19 +208,43 @@ class EventPersister:
 
     def __init__(self, database: Any) -> None:
         self._db = database
+        self._failed_persist_count = 0
 
     async def handle(self, event: Event) -> None:
         """Persist a single event to the database."""
         try:
-            correlation_id = str(uuid.uuid4().hex[:12])
+            payload = event.data if isinstance(event.data, dict) else {}
+            correlation_id = str(payload.get("correlation_id", "") or "").strip()
+            if not correlation_id:
+                correlation_id = f"task:{event.task_id}"
+            try:
+                sequence = int(payload.get("sequence", 0) or 0)
+            except (TypeError, ValueError):
+                sequence = 0
+            try:
+                schema_version = int(payload.get("schema_version", 1) or 1)
+            except (TypeError, ValueError):
+                schema_version = 1
             await self._db.insert_event(
                 task_id=event.task_id,
                 correlation_id=correlation_id,
                 event_type=event.event_type,
-                data=event.data,
+                data=payload,
+                timestamp=event.timestamp,
+                run_id=str(payload.get("run_id", "") or "").strip(),
+                event_id=str(payload.get("event_id", "") or "").strip(),
+                sequence=sequence,
+                source_component=str(payload.get("source_component", "") or "").strip(),
+                schema_version=schema_version,
             )
         except Exception as e:
-            logger.warning("Event persistence failed for %s: %s", event.event_type, e)
+            self._failed_persist_count += 1
+            logger.warning(
+                "Event persistence failed for %s (count=%d): %s",
+                event.event_type,
+                self._failed_persist_count,
+                e,
+            )
 
     def attach(self, event_bus: EventBus) -> None:
         """Subscribe to all events on the given bus."""

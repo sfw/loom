@@ -17,7 +17,13 @@ from loom.engine.verification import (
     VotingVerifier,
 )
 from loom.events.bus import EventBus
-from loom.events.types import PLACEHOLDER_FINDINGS_EXTRACTED
+from loom.events.types import (
+    PLACEHOLDER_FINDINGS_EXTRACTED,
+    VERIFICATION_CONTRADICTION_DETECTED,
+    VERIFICATION_FAILED,
+    VERIFICATION_PASSED,
+    VERIFICATION_STARTED,
+)
 from loom.models.base import ModelResponse, TokenUsage
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
@@ -1260,6 +1266,49 @@ class TestVerificationGates:
         assert payload.get("contradicted") == 0
 
     @pytest.mark.asyncio
+    async def test_verify_emits_verification_lifecycle_events(self):
+        config = VerificationConfig(tier1_enabled=True, tier2_enabled=False)
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        event_bus = EventBus()
+        events = []
+        event_bus.subscribe_all(lambda event: events.append(event))
+        gates = VerificationGates(router, prompts, config, event_bus=event_bus)
+
+        passed = await gates.verify(
+            _make_subtask(subtask_id="ok-subtask"),
+            "summary",
+            [],
+            None,
+            tier=1,
+            task_id="task-verification-pass",
+        )
+        assert passed.passed
+        event_types = [event.event_type for event in events]
+        assert VERIFICATION_STARTED in event_types
+        assert VERIFICATION_PASSED in event_types
+
+        events.clear()
+        failed = await gates.verify(
+            _make_subtask(subtask_id="failed-subtask"),
+            "summary",
+            [
+                MockToolCallRecord(
+                    tool="write_file",
+                    args={"path": "broken.py"},
+                    result=ToolResult.fail("write failed"),
+                ),
+            ],
+            None,
+            tier=1,
+            task_id="task-verification-fail",
+        )
+        assert not failed.passed
+        failed_types = [event.event_type for event in events]
+        assert VERIFICATION_STARTED in failed_types
+        assert VERIFICATION_FAILED in failed_types
+
+    @pytest.mark.asyncio
     async def test_verify_emits_placeholder_findings_extracted_event(self, tmp_path):
         config = VerificationConfig(tier1_enabled=True, tier2_enabled=False)
         router = MagicMock(spec=ModelRouter)
@@ -1425,10 +1474,10 @@ class TestVerificationGates:
         assert scan.get("coverage_sufficient") is True
         assert scan.get("scan_mode") in {"targeted_only", "targeted_plus_fallback"}
         event_types = [event.event_type for event in events]
-        assert "verification_contradiction_detected" in event_types
+        assert VERIFICATION_CONTRADICTION_DETECTED in event_types
         contradiction_event = next(
             event for event in events
-            if event.event_type == "verification_contradiction_detected"
+            if event.event_type == VERIFICATION_CONTRADICTION_DETECTED
         )
         assert contradiction_event.data.get("coverage_sufficient") is True
         assert contradiction_event.data.get("contradiction_downgrade_count") == 1
@@ -1633,7 +1682,7 @@ class TestVerificationGates:
         assert result.metadata.get("contradiction_detected_no_downgrade") is True
         contradiction_event = next(
             event for event in events
-            if event.event_type == "verification_contradiction_detected"
+            if event.event_type == VERIFICATION_CONTRADICTION_DETECTED
         )
         assert contradiction_event.data.get("contradiction_detected_no_downgrade_count") == 1
         assert contradiction_event.data.get("cap_exhaustion_count") == 1

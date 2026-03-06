@@ -35,6 +35,8 @@ from loom.events.types import (
     ARTIFACT_READ_COMPLETED,
     ARTIFACT_RETENTION_PRUNED,
     ARTIFACT_SEAL_VALIDATION,
+    ASK_USER_ANSWERED,
+    ASK_USER_REQUESTED,
     CLAIMS_PRUNED,
     COMPACTION_POLICY_DECISION,
     ITERATION_COMPLETED,
@@ -43,19 +45,32 @@ from loom.events.types import (
     PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED,
     PLACEHOLDER_PRUNED,
     PLACEHOLDER_REMEDIATION_UNRESOLVED,
+    REMEDIATION_QUEUED,
+    REMEDIATION_RESOLVED,
     RUN_VALIDITY_SCORECARD,
+    SUBTASK_BLOCKED,
     SUBTASK_POLICY_RECONCILED,
     SYNTHESIS_INPUT_GATE_DECISION,
+    TASK_CANCEL_REQUESTED,
+    TASK_CANCELLED,
     TASK_COMPLETED,
     TASK_EXECUTING,
     TASK_FAILED,
+    TASK_PAUSED,
+    TASK_PLAN_DEGRADED,
     TASK_PLAN_NORMALIZED,
     TASK_PLAN_READY,
     TASK_PLANNING,
     TASK_REPLAN_REJECTED,
+    TASK_REPLANNING,
+    TASK_RESUMED,
     TASK_STALLED,
     TELEMETRY_RUN_SUMMARY,
     TOOL_CALL_COMPLETED,
+    VERIFICATION_FAILED,
+    VERIFICATION_OUTCOME,
+    VERIFICATION_PASSED,
+    VERIFICATION_STARTED,
 )
 from loom.models.base import ModelConnectionError, ModelResponse, TokenUsage, ToolCall
 from loom.models.router import ModelRouter
@@ -378,6 +393,143 @@ class TestOrchestratorPlan:
         assert summary_event.data["compactor_warning_count"] == 2
         assert "run_id" in summary_event.data
         assert "budget_snapshot" in summary_event.data
+
+    @pytest.mark.asyncio
+    async def test_telemetry_run_summary_reconciles_event_counters(self, tmp_path):
+        bus = _make_event_bus()
+        events_received = []
+        bus.subscribe_all(lambda e: events_received.append(e))
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=_make_config(),
+        )
+        task = _make_task()
+        run_id = orch._initialize_task_run_id(task)
+
+        orch._emit(VERIFICATION_STARTED, task.id, {
+            "run_id": run_id,
+            "subtask_id": "s1",
+            "target_tier": 1,
+        })
+        orch._emit(VERIFICATION_OUTCOME, task.id, {
+            "run_id": run_id,
+            "subtask_id": "s1",
+            "tier": 1,
+            "passed": False,
+            "outcome": "fail",
+            "reason_code": "hard_invariant_failed",
+            "severity_class": "hard_invariant",
+            "confidence": 0.0,
+        })
+        orch._emit(VERIFICATION_FAILED, task.id, {
+            "run_id": run_id,
+            "subtask_id": "s1",
+            "tier": 1,
+            "outcome": "fail",
+            "reason_code": "hard_invariant_failed",
+        })
+        orch._emit(REMEDIATION_QUEUED, task.id, {
+            "run_id": run_id,
+            "subtask_id": "s1",
+        })
+        orch._emit(REMEDIATION_RESOLVED, task.id, {
+            "run_id": run_id,
+            "subtask_id": "s1",
+        })
+        orch._emit(ASK_USER_REQUESTED, task.id, {"run_id": run_id})
+        orch._emit(ASK_USER_ANSWERED, task.id, {"run_id": run_id})
+        orch._emit(TASK_PAUSED, task.id, {"run_id": run_id, "requested": True})
+        orch._emit(TASK_RESUMED, task.id, {"run_id": run_id, "requested": True})
+        orch._emit(SUBTASK_BLOCKED, task.id, {
+            "run_id": run_id,
+            "subtask_id": "s1",
+            "reasons": ["dependency_unmet"],
+        })
+        orch._emit(TASK_PLAN_DEGRADED, task.id, {"run_id": run_id})
+        orch._emit(TASK_REPLANNING, task.id, {"run_id": run_id, "reason": "retriable"})
+        orch._emit(TASK_STALLED, task.id, {"run_id": run_id})
+
+        orch._emit_telemetry_run_summary(task)
+        orch._emit_telemetry_run_summary(task)
+
+        summary_events = [
+            event for event in events_received
+            if event.event_type == TELEMETRY_RUN_SUMMARY
+        ]
+        assert len(summary_events) == 1
+        summary = summary_events[0].data
+
+        assert summary["verification_lifecycle_counts"] == {
+            "started": 1,
+            "passed": 0,
+            "failed": 1,
+            "outcome": 1,
+        }
+        assert summary["verification_reason_counts"] == {"hard_invariant_failed": 1}
+        assert summary["remediation_lifecycle_counts"]["queued"] == 1
+        assert summary["remediation_lifecycle_counts"]["resolved"] == 1
+        assert summary["human_loop_counts"]["ask_user_requested"] == 1
+        assert summary["human_loop_counts"]["ask_user_answered"] == 1
+        assert summary["control_plane_counts"]["paused"] == 1
+        assert summary["control_plane_counts"]["resumed"] == 1
+        assert summary["blocked_indicator"] is True
+        assert summary["degraded_indicator"] is True
+        assert summary["replanned_count"] == 1
+        assert summary["stalled_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_events_follow_partial_order(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "s1", "description": "Order assertions"}]
+        })
+        bus = _make_event_bus()
+        events_received = []
+        bus.subscribe_all(lambda e: events_received.append(e))
+
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=_make_config(),
+        )
+
+        task = _make_task()
+        result = await orch.execute_task(task)
+        assert result.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+
+        event_types = [event.event_type for event in events_received]
+        planning_ix = event_types.index(TASK_PLANNING)
+        ready_ix = event_types.index(TASK_PLAN_READY)
+        executing_ix = event_types.index(TASK_EXECUTING)
+        assert planning_ix < ready_ix < executing_ix
+
+        terminal_task_ix = min(
+            event_types.index(event_type)
+            for event_type in (TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED)
+            if event_type in event_types
+        )
+        assert executing_ix < terminal_task_ix
+
+        if VERIFICATION_STARTED in event_types:
+            verification_start_ix = event_types.index(VERIFICATION_STARTED)
+            assert executing_ix < verification_start_ix < terminal_task_ix
+            verification_terminal_candidates = [
+                event_types.index(event_type)
+                for event_type in (VERIFICATION_PASSED, VERIFICATION_FAILED)
+                if event_type in event_types
+            ]
+            if verification_terminal_candidates:
+                verification_terminal_ix = min(verification_terminal_candidates)
+                assert verification_start_ix < verification_terminal_ix < terminal_task_ix
 
     @pytest.mark.asyncio
     async def test_execute_task_reuses_existing_plan_when_requested(self, tmp_path):
@@ -1153,6 +1305,7 @@ class TestOrchestratorExecution:
 
         assert result.status == TaskStatus.FAILED
         assert TASK_STALLED in [e.event_type for e in events]
+        assert SUBTASK_BLOCKED in [e.event_type for e in events]
         failed_events = [e for e in events if e.event_type == TASK_FAILED]
         assert failed_events
         blocked_subtasks = failed_events[-1].data.get("blocked_subtasks")
@@ -2605,13 +2758,16 @@ class TestOrchestratorFinalize:
 
         router.select = MagicMock(side_effect=select_fn)
 
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda event: events.append(event))
         orch = Orchestrator(
             model_router=router,
             tool_registry=_make_mock_tools(),
             memory_manager=_make_mock_memory(),
             prompt_assembler=_make_mock_prompts(),
             state_manager=_make_state_manager(tmp_path),
-            event_bus=_make_event_bus(),
+            event_bus=bus,
             config=_make_config(),
         )
 
@@ -2622,15 +2778,19 @@ class TestOrchestratorFinalize:
         result = await orch.execute_task(task)
 
         assert result.status == TaskStatus.CANCELLED
+        assert TASK_CANCEL_REQUESTED in [event.event_type for event in events]
 
     def test_pause_and_resume_task(self, tmp_path):
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda event: events.append(event))
         orch = Orchestrator(
             model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
             tool_registry=_make_mock_tools(),
             memory_manager=_make_mock_memory(),
             prompt_assembler=_make_mock_prompts(),
             state_manager=_make_state_manager(tmp_path),
-            event_bus=_make_event_bus(),
+            event_bus=bus,
             config=_make_config(),
         )
         task = _make_task()
@@ -2639,10 +2799,12 @@ class TestOrchestratorFinalize:
         orch.pause_task(task)
         assert task.status == TaskStatus.PAUSED
         assert task.metadata.get("paused_from_status") == TaskStatus.EXECUTING.value
+        assert TASK_PAUSED in [event.event_type for event in events]
 
         orch.resume_task(task)
         assert task.status == TaskStatus.EXECUTING
         assert "paused_from_status" not in task.metadata
+        assert TASK_RESUMED in [event.event_type for event in events]
 
     def test_pause_and_resume_preserves_planning_status(self, tmp_path):
         orch = Orchestrator(
@@ -3614,7 +3776,7 @@ class TestSubtaskRunnerContextBudget:
         )
 
         tool_event = next(event for event in events if event.event_type == TOOL_CALL_COMPLETED)
-        assert tool_event.data == {
+        expected_fields = {
             "subtask_id": "subtask-1",
             "tool": "web_fetch",
             "args": {"url": "https://example.com/report.pdf"},
@@ -3623,6 +3785,17 @@ class TestSubtaskRunnerContextBudget:
             "files_changed": [],
             "files_changed_paths": [],
         }
+        for key, value in expected_fields.items():
+            assert tool_event.data.get(key) == value
+
+        # EventBus normalization is additive; required business fields must remain stable.
+        assert tool_event.data.get("task_id") == "task-1"
+        assert str(tool_event.data.get("timestamp", "")).strip()
+        assert str(tool_event.data.get("event_id", "")).strip()
+        assert str(tool_event.data.get("correlation_id", "")).strip().startswith("task:")
+        assert int(tool_event.data.get("sequence", 0)) >= 1
+        assert int(tool_event.data.get("schema_version", 0)) >= 1
+        assert str(tool_event.data.get("source_component", "")).strip()
 
     def test_artifact_ingest_telemetry_required_fields_and_redaction(self):
         runner = self._make_runner_for_telemetry()

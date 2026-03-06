@@ -40,6 +40,15 @@ from loom.auth.runtime import (
 )
 from loom.engine.orchestrator import create_task
 from loom.events.bus import Event
+from loom.events.types import (
+    CONVERSATION_MESSAGE,
+    STEER_INSTRUCTION,
+    TASK_CANCELLED,
+    TASK_COMPLETED,
+    TASK_CREATED,
+    TASK_FAILED,
+    TOKEN_STREAMED,
+)
 from loom.state.memory import MemoryEntry
 from loom.state.task_state import SubtaskStatus, TaskStatus
 from loom.tools.registry import (
@@ -291,6 +300,18 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         process=process_def,
         process_name=effective_process or "",
     )
+    engine.event_bus.emit(Event(
+        event_type=TASK_CREATED,
+        task_id=task.id,
+        data={
+            "run_id": run_id,
+            "goal": task.goal,
+            "workspace": task.workspace,
+            "approval_mode": task.approval_mode,
+            "execution_surface": metadata.get("execution_surface", "api"),
+            "process": effective_process or "",
+        },
+    ))
     log_latency_event(
         logger,
         event="api_task_create",
@@ -443,7 +464,7 @@ async def stream_task_events(request: Request, task_id: str):
                     }
                     # Stop streaming when task is terminal
                     if event.event_type in (
-                        "task_completed", "task_failed", "task_cancelled",
+                        TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED,
                     ):
                         return
                 except TimeoutError:
@@ -469,7 +490,7 @@ async def stream_task_tokens(request: Request, task_id: str):
         queue: asyncio.Queue[Event] = asyncio.Queue()
 
         def handler(event: Event):
-            if event.task_id == task_id and event.event_type == "token_streamed":
+            if event.task_id == task_id and event.event_type == TOKEN_STREAMED:
                 queue.put_nowait(event)
 
         # Also listen for terminal events to know when to stop
@@ -477,11 +498,11 @@ async def stream_task_tokens(request: Request, task_id: str):
 
         def terminal_handler(event: Event):
             if event.task_id == task_id and event.event_type in (
-                "task_completed", "task_failed", "task_cancelled",
+                TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED,
             ):
                 terminal_queue.put_nowait(event)
 
-        engine.event_bus.subscribe("token_streamed", handler)
+        engine.event_bus.subscribe(TOKEN_STREAMED, handler)
         engine.event_bus.subscribe_all(terminal_handler)
 
         try:
@@ -504,7 +525,7 @@ async def stream_task_tokens(request: Request, task_id: str):
         except asyncio.CancelledError:
             return
         finally:
-            engine.event_bus.unsubscribe("token_streamed", handler)
+            engine.event_bus.unsubscribe(TOKEN_STREAMED, handler)
             engine.event_bus.unsubscribe_all(terminal_handler)
 
     return EventSourceResponse(token_generator())
@@ -618,6 +639,14 @@ async def steer_task(request: Request, task_id: str, body: TaskSteerRequest):
         summary=body.instruction[:150],
         detail=body.instruction,
         tags="steer",
+    ))
+    engine.event_bus.emit(Event(
+        event_type=STEER_INSTRUCTION,
+        task_id=task_id,
+        data={
+            "instruction_chars": len(str(body.instruction or "")),
+            "source": "api_patch",
+        },
     ))
 
     return {"status": "ok", "message": "Instruction injected."}
@@ -769,7 +798,7 @@ async def send_conversation_message(
 
     # Emit conversation event
     engine.event_bus.emit(Event(
-        event_type="conversation_message",
+        event_type=CONVERSATION_MESSAGE,
         task_id=task_id,
         data={
             "role": body.role,

@@ -29,14 +29,18 @@ from loom.events.types import (
     CLAIM_VERIFICATION_SUMMARY,
     MODEL_INVOCATION,
     PLACEHOLDER_FINDINGS_EXTRACTED,
+    VERIFICATION_CONTRADICTION_DETECTED,
     VERIFICATION_DETERMINISTIC_BLOCK_RATE,
+    VERIFICATION_FAILED,
     VERIFICATION_FALSE_NEGATIVE_CANDIDATE,
     VERIFICATION_INCONCLUSIVE_RATE,
     VERIFICATION_OUTCOME,
+    VERIFICATION_PASSED,
     VERIFICATION_RULE_APPLIED,
     VERIFICATION_RULE_FAILURE_BY_TYPE,
     VERIFICATION_RULE_SKIPPED,
     VERIFICATION_SHADOW_DIFF,
+    VERIFICATION_STARTED,
 )
 from loom.models.request_diagnostics import (
     collect_request_diagnostics,
@@ -57,8 +61,6 @@ logger = logging.getLogger(__name__)
 _COMPACTOR_EVENT_CONTEXT: contextvars.ContextVar[tuple[str, str] | None] = (
     contextvars.ContextVar("verification_compactor_event_context", default=None)
 )
-_VERIFICATION_CONTRADICTION_EVENT_TYPE = "verification_contradiction_detected"
-
 _VALID_OUTCOMES = {
     "pass",
     "pass_with_warnings",
@@ -4108,6 +4110,50 @@ class VerificationGates:
                 "reason_code": result.reason_code,
                 "severity_class": result.severity_class,
                 "confidence": result.confidence,
+                "source_component": "verification",
+            },
+        ))
+
+    def _emit_verification_started(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        target_tier: int,
+    ) -> None:
+        if not self._event_bus or not task_id:
+            return
+        self._event_bus.emit(Event(
+            event_type=VERIFICATION_STARTED,
+            task_id=task_id,
+            data={
+                "subtask_id": subtask_id,
+                "target_tier": max(1, int(target_tier or 1)),
+                "source_component": "verification",
+            },
+        ))
+
+    def _emit_verification_terminal(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        result: VerificationResult,
+    ) -> None:
+        if not self._event_bus or not task_id:
+            return
+        terminal_type = VERIFICATION_PASSED if bool(result.passed) else VERIFICATION_FAILED
+        self._event_bus.emit(Event(
+            event_type=terminal_type,
+            task_id=task_id,
+            data={
+                "subtask_id": subtask_id,
+                "tier": int(result.tier),
+                "outcome": str(result.outcome or ""),
+                "reason_code": str(result.reason_code or ""),
+                "severity_class": str(result.severity_class or ""),
+                "confidence": float(result.confidence),
+                "source_component": "verification",
             },
         ))
 
@@ -4210,7 +4256,7 @@ class VerificationGates:
                 metadata.get("contradiction_detected_no_downgrade", False),
             )
             self._event_bus.emit(Event(
-                event_type=_VERIFICATION_CONTRADICTION_EVENT_TYPE,
+                event_type=VERIFICATION_CONTRADICTION_DETECTED,
                 task_id=task_id,
                 data={
                     "subtask_id": subtask_id,
@@ -4520,6 +4566,12 @@ class VerificationGates:
                 validity_contract=effective_validity_contract,
             )
 
+        self._emit_verification_started(
+            task_id=task_id,
+            subtask_id=subtask.id,
+            target_tier=max(1, int(tier or 1)),
+        )
+
         # Tier 1 always runs when enabled.
         if self._config.tier1_enabled:
             t1 = await self._tier1.verify(
@@ -4539,6 +4591,11 @@ class VerificationGates:
             if not t1.passed:
                 t1 = finalize(t1)
                 self._emit_outcome_event(
+                    task_id=task_id,
+                    subtask_id=subtask.id,
+                    result=t1,
+                )
+                self._emit_verification_terminal(
                     task_id=task_id,
                     subtask_id=subtask.id,
                     result=t1,
@@ -4567,6 +4624,11 @@ class VerificationGates:
                 legacy_result=legacy,
             )
             self._emit_outcome_event(
+                task_id=task_id,
+                subtask_id=subtask.id,
+                result=result,
+            )
+            self._emit_verification_terminal(
                 task_id=task_id,
                 subtask_id=subtask.id,
                 result=result,
@@ -4609,6 +4671,11 @@ class VerificationGates:
                 subtask_id=subtask.id,
                 result=inconclusive_fallback,
             )
+            self._emit_verification_terminal(
+                task_id=task_id,
+                subtask_id=subtask.id,
+                result=inconclusive_fallback,
+            )
             return inconclusive_fallback
         if not t2.passed:
             t2 = finalize(t2)
@@ -4618,6 +4685,11 @@ class VerificationGates:
                 result=t2,
             )
             self._emit_outcome_event(
+                task_id=task_id,
+                subtask_id=subtask.id,
+                result=t2,
+            )
+            self._emit_verification_terminal(
                 task_id=task_id,
                 subtask_id=subtask.id,
                 result=t2,
@@ -4637,6 +4709,11 @@ class VerificationGates:
                 legacy_result=legacy,
             )
             self._emit_outcome_event(
+                task_id=task_id,
+                subtask_id=subtask.id,
+                result=result,
+            )
+            self._emit_verification_terminal(
                 task_id=task_id,
                 subtask_id=subtask.id,
                 result=result,
@@ -4666,6 +4743,11 @@ class VerificationGates:
                 subtask_id=subtask.id,
                 result=t3,
             )
+            self._emit_verification_terminal(
+                task_id=task_id,
+                subtask_id=subtask.id,
+                result=t3,
+            )
             return t3
 
         result = t3 if not policy_enabled else self._aggregate_non_failing(results)
@@ -4680,6 +4762,11 @@ class VerificationGates:
             legacy_result=legacy,
         )
         self._emit_outcome_event(
+            task_id=task_id,
+            subtask_id=subtask.id,
+            result=result,
+        )
+        self._emit_verification_terminal(
             task_id=task_id,
             subtask_id=subtask.id,
             result=result,

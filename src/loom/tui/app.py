@@ -14363,6 +14363,25 @@ class LoomApp(App):
                 "task_paused",
                 "task_resumed",
                 "task_injected",
+                "verification_started",
+                "verification_passed",
+                "verification_failed",
+                "verification_outcome",
+                "verification_contradiction_detected",
+                "rule_failure_by_type",
+                "deterministic_block_rate",
+                "verification_inconclusive_rate",
+                "claim_verification_summary",
+                "remediation_queued",
+                "remediation_started",
+                "remediation_attempt",
+                "remediation_resolved",
+                "remediation_failed",
+                "remediation_expired",
+                "remediation_terminal",
+                "subtask_blocked",
+                "run_validity_scorecard",
+                "telemetry_run_summary",
                 "subtask_started",
                 "subtask_retrying",
                 "subtask_completed",
@@ -15104,7 +15123,20 @@ class LoomApp(App):
             if reason:
                 return f"Process run failed: {reason}"
             return "Process run failed."
-        return None
+        detail = self._one_line(
+            event_data.get("reason")
+            or event_data.get("error")
+            or event_data.get("outcome")
+            or event_data.get("subtask_id")
+            or event_data.get("check_name")
+            or event_data.get("classification")
+            or "",
+            140,
+        )
+        label = event_type.replace("_", " ").strip()
+        if detail:
+            return f"{label}: {detail}"
+        return label or None
 
     def _mark_process_run_failed(self, error: str) -> None:
         """Reflect a failed /run execution in the progress panel."""

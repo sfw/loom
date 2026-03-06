@@ -35,7 +35,13 @@ from loom.engine.scheduler import Scheduler
 from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
+    APPROVAL_RECEIVED,
+    APPROVAL_REQUESTED,
     ARTIFACT_SEAL_VALIDATION,
+    ASK_USER_ANSWERED,
+    ASK_USER_CANCELLED,
+    ASK_USER_REQUESTED,
+    ASK_USER_TIMEOUT,
     CLAIMS_PRUNED,
     ITERATION_COMPLETED,
     ITERATION_GATE_FAILED,
@@ -56,6 +62,8 @@ from loom.events.types import (
     REMEDIATION_STARTED,
     REMEDIATION_TERMINAL,
     RUN_VALIDITY_SCORECARD,
+    STEER_INSTRUCTION,
+    SUBTASK_BLOCKED,
     SUBTASK_COMPLETED,
     SUBTASK_FAILED,
     SUBTASK_OUTCOME_STALE,
@@ -64,21 +72,31 @@ from loom.events.types import (
     SUBTASK_STARTED,
     SYNTHESIS_INPUT_GATE_DECISION,
     TASK_BUDGET_EXHAUSTED,
+    TASK_CANCEL_ACK,
+    TASK_CANCEL_REQUESTED,
+    TASK_CANCEL_TIMEOUT,
     TASK_CANCELLED,
     TASK_COMPLETED,
     TASK_EXECUTING,
     TASK_FAILED,
+    TASK_INJECTED,
+    TASK_PAUSED,
     TASK_PLAN_DEGRADED,
     TASK_PLAN_NORMALIZED,
     TASK_PLAN_READY,
     TASK_PLANNING,
     TASK_REPLAN_REJECTED,
     TASK_REPLANNING,
+    TASK_RESUMED,
     TASK_RUN_ACQUIRED,
     TASK_STALLED,
     TASK_STALLED_RECOVERY_ATTEMPTED,
     TELEMETRY_RUN_SUMMARY,
     UNCONFIRMED_DATA_QUEUED,
+    VERIFICATION_FAILED,
+    VERIFICATION_OUTCOME,
+    VERIFICATION_PASSED,
+    VERIFICATION_STARTED,
 )
 from loom.learning.manager import LearningManager
 from loom.models.base import ModelResponse
@@ -348,6 +366,7 @@ class Orchestrator:
         self._state_lock = asyncio.Lock()
         self._changelog_cache: dict[str, ChangeLog] = {}
         self._telemetry_rollup: dict[str, int] = self._new_telemetry_rollup()
+        self._emitted_telemetry_summary_runs: set[str] = set()
         self._run_budget = _RunBudget(config)
         self._active_run_id = ""
         self._iteration_enabled = bool(
@@ -486,6 +505,19 @@ class Orchestrator:
                 runnable = self._scheduler.runnable_subtasks(task.plan)
                 if not runnable:
                     blocked_subtasks = self._blocked_pending_subtasks(task.plan)
+                    for blocked in blocked_subtasks:
+                        if not isinstance(blocked, dict):
+                            continue
+                        raw_reasons = blocked.get("reasons", [])
+                        if isinstance(raw_reasons, list):
+                            reasons = [str(reason) for reason in raw_reasons]
+                        else:
+                            text_reason = str(raw_reasons).strip()
+                            reasons = [text_reason] if text_reason else []
+                        self._emit(SUBTASK_BLOCKED, task.id, {
+                            "subtask_id": str(blocked.get("subtask_id", "") or "").strip(),
+                            "reasons": reasons,
+                        })
                     self._emit(TASK_STALLED, task.id, {
                         "pending_subtasks": [
                             item["subtask_id"] for item in blocked_subtasks
@@ -645,7 +677,10 @@ class Orchestrator:
             self._emit(TASK_FAILED, task.id, {
                 "error": str(e),
                 "error_type": type(e).__name__,
+                "reason": "uncaught_exception",
+                "outcome": "failed",
             })
+            self._emit_telemetry_run_summary(task)
             self._export_evidence_ledger_csv(task)
             await self._learn_from_task(task)
             return task
@@ -7924,24 +7959,36 @@ class Orchestrator:
             for s in task.plan.subtasks:
                 if s.status == SubtaskStatus.PENDING:
                     s.status = SubtaskStatus.SKIPPED
-            self._emit(TASK_CANCELLED, task.id, {"completed": completed, "total": total})
+            cancel_reason = ""
+            if isinstance(task.metadata, dict):
+                cancel_reason = str(task.metadata.get("cancel_reason", "") or "").strip()
+            self._emit(TASK_CANCELLED, task.id, {
+                "completed": completed,
+                "total": total,
+                "reason": cancel_reason or "cancel_requested",
+                "outcome": "cancelled",
+            })
         elif all_done:
             task.status = TaskStatus.COMPLETED
             task.completed_at = datetime.now().isoformat()
             self._emit(TASK_COMPLETED, task.id, {
                 "completed": completed,
                 "total": total,
+                "reason": "all_subtasks_completed",
+                "outcome": "completed",
                 "validity_summary": run_validity_summary,
             })
         else:
             task.status = TaskStatus.FAILED
             failed = [s for s in task.plan.subtasks if s.status == SubtaskStatus.FAILED]
+            failure_reason = "subtask_failure"
             if blocking_remediation_failures:
                 task.add_error(
                     "remediation",
                     "Blocking remediation unresolved for: "
                     + ", ".join(blocking_remediation_failures),
                 )
+                failure_reason = "blocking_remediation_unresolved"
             if blocked_subtasks:
                 labels = ", ".join(
                     entry["subtask_id"] for entry in blocked_subtasks
@@ -7952,10 +7999,13 @@ class Orchestrator:
                     "Execution stalled with blocked pending subtasks: "
                     + (labels or "unknown"),
                 )
+                failure_reason = "blocked_pending_subtasks"
             self._emit(TASK_FAILED, task.id, {
                 "completed": completed,
                 "total": total,
                 "failed_subtasks": [s.id for s in failed],
+                "reason": failure_reason,
+                "outcome": "failed",
                 "blocking_remediation_failures": blocking_remediation_failures,
                 "blocked_subtasks": blocked_subtasks,
                 "validity_summary": run_validity_summary,
@@ -7978,6 +8028,7 @@ class Orchestrator:
 
     def _emit(self, event_type: str, task_id: str, data: dict) -> None:
         payload = dict(data or {})
+        payload.setdefault("source_component", "orchestrator")
         run_id = str(payload.get("run_id", "") or "").strip()
         if not run_id:
             run_id = str(getattr(self, "_active_run_id", "") or "").strip()
@@ -8096,9 +8147,38 @@ class Orchestrator:
                 continue
             rollup[key] = int(rollup.get(key, 0)) + increment
 
+    def _task_event_counts(self, task_id: str) -> dict[str, int]:
+        history_limit = max(1000, int(getattr(self._events, "_max_history", 1000) or 1000))
+        counters: dict[str, int] = {}
+        for event in self._events.recent_events(limit=history_limit):
+            if str(getattr(event, "task_id", "") or "") != task_id:
+                continue
+            event_type = str(getattr(event, "event_type", "") or "").strip()
+            if not event_type:
+                continue
+            counters[event_type] = int(counters.get(event_type, 0)) + 1
+        return counters
+
+    def _verification_reason_counts(self, task_id: str) -> dict[str, int]:
+        history_limit = max(1000, int(getattr(self._events, "_max_history", 1000) or 1000))
+        reasons: dict[str, int] = {}
+        for event in self._events.recent_events(limit=history_limit):
+            if str(getattr(event, "task_id", "") or "") != task_id:
+                continue
+            if str(getattr(event, "event_type", "") or "").strip() != VERIFICATION_OUTCOME:
+                continue
+            payload = getattr(event, "data", None)
+            if not isinstance(payload, dict):
+                continue
+            reason = str(payload.get("reason_code", "") or "").strip().lower()
+            if not reason:
+                reason = "unspecified"
+            reasons[reason] = int(reasons.get(reason, 0)) + 1
+        return reasons
+
     def _emit_telemetry_run_summary(self, task: Task) -> None:
-        runner_limits = getattr(getattr(self._config, "limits", None), "runner", None)
-        if not bool(getattr(runner_limits, "enable_artifact_telemetry_events", False)):
+        run_key = self._task_run_id(task) or task.id
+        if run_key in self._emitted_telemetry_summary_runs:
             return
         rollup = getattr(self, "_telemetry_rollup", None)
         if not isinstance(rollup, dict):
@@ -8111,6 +8191,40 @@ class Orchestrator:
                 run_summary = scorecard.get("run", {})
                 if isinstance(run_summary, dict):
                     validity_summary = run_summary
+        event_counts = self._task_event_counts(task.id)
+        verification_reason_counts = self._verification_reason_counts(task.id)
+        verification_lifecycle_counts = {
+            "started": int(event_counts.get(VERIFICATION_STARTED, 0)),
+            "passed": int(event_counts.get(VERIFICATION_PASSED, 0)),
+            "failed": int(event_counts.get(VERIFICATION_FAILED, 0)),
+            "outcome": int(event_counts.get(VERIFICATION_OUTCOME, 0)),
+        }
+        remediation_lifecycle_counts = {
+            "queued": int(event_counts.get(REMEDIATION_QUEUED, 0)),
+            "started": int(event_counts.get(REMEDIATION_STARTED, 0)),
+            "attempt": int(event_counts.get(REMEDIATION_ATTEMPT, 0)),
+            "resolved": int(event_counts.get(REMEDIATION_RESOLVED, 0)),
+            "failed": int(event_counts.get(REMEDIATION_FAILED, 0)),
+            "expired": int(event_counts.get(REMEDIATION_EXPIRED, 0)),
+            "terminal": int(event_counts.get(REMEDIATION_TERMINAL, 0)),
+        }
+        human_loop_counts = {
+            "approval_requested": int(event_counts.get(APPROVAL_REQUESTED, 0)),
+            "approval_received": int(event_counts.get(APPROVAL_RECEIVED, 0)),
+            "ask_user_requested": int(event_counts.get(ASK_USER_REQUESTED, 0)),
+            "ask_user_answered": int(event_counts.get(ASK_USER_ANSWERED, 0)),
+            "ask_user_timeout": int(event_counts.get(ASK_USER_TIMEOUT, 0)),
+            "ask_user_cancelled": int(event_counts.get(ASK_USER_CANCELLED, 0)),
+            "steer_instruction": int(event_counts.get(STEER_INSTRUCTION, 0)),
+        }
+        control_plane_counts = {
+            "paused": int(event_counts.get(TASK_PAUSED, 0)),
+            "resumed": int(event_counts.get(TASK_RESUMED, 0)),
+            "injected": int(event_counts.get(TASK_INJECTED, 0)),
+            "cancel_requested": int(event_counts.get(TASK_CANCEL_REQUESTED, 0)),
+            "cancel_ack": int(event_counts.get(TASK_CANCEL_ACK, 0)),
+            "cancel_timeout": int(event_counts.get(TASK_CANCEL_TIMEOUT, 0)),
+        }
         self._emit(TELEMETRY_RUN_SUMMARY, task.id, {
             "run_id": self._task_run_id(task),
             "model_invocations": int(rollup.get("model_invocations", 0)),
@@ -8122,28 +8236,60 @@ class Orchestrator:
             "compaction_policy_decisions": int(rollup.get("compaction_policy_decisions", 0)),
             "overflow_fallback_count": int(rollup.get("overflow_fallback_count", 0)),
             "compactor_warning_count": int(rollup.get("compactor_warning_count", 0)),
+            "verification_lifecycle_counts": verification_lifecycle_counts,
+            "verification_reason_counts": verification_reason_counts,
+            "remediation_lifecycle_counts": remediation_lifecycle_counts,
+            "human_loop_counts": human_loop_counts,
+            "control_plane_counts": control_plane_counts,
+            "blocked_indicator": bool(event_counts.get(SUBTASK_BLOCKED, 0) > 0),
+            "degraded_indicator": bool(event_counts.get(TASK_PLAN_DEGRADED, 0) > 0),
+            "replanned_count": int(event_counts.get(TASK_REPLANNING, 0)),
+            "stalled_count": int(event_counts.get(TASK_STALLED, 0)),
             "budget_snapshot": self._run_budget.snapshot(),
             "validity_summary": validity_summary,
         })
+        self._emitted_telemetry_summary_runs.add(run_key)
 
     def cancel_task(self, task: Task) -> None:
         """Mark a task for cancellation."""
+        if not isinstance(task.metadata, dict):
+            task.metadata = {}
+        task.metadata["cancel_reason"] = "cancel_requested"
         task.status = TaskStatus.CANCELLED
         self._state.save(task)
+        self._emit(TASK_CANCEL_REQUESTED, task.id, {
+            "requested": True,
+            "path": "orchestrator",
+        })
 
     def pause_task(self, task: Task) -> None:
         """Pause a running task at the next orchestration boundary."""
         if task.status not in {TaskStatus.EXECUTING, TaskStatus.PLANNING}:
+            self._emit(TASK_PAUSED, task.id, {
+                "requested": False,
+                "error": f"invalid_status:{task.status.value}",
+                "path": "orchestrator",
+            })
             return
         if not isinstance(task.metadata, dict):
             task.metadata = {}
         task.metadata["paused_from_status"] = task.status.value
         task.status = TaskStatus.PAUSED
         self._state.save(task)
+        self._emit(TASK_PAUSED, task.id, {
+            "requested": True,
+            "status": task.status.value,
+            "path": "orchestrator",
+        })
 
     def resume_task(self, task: Task) -> None:
         """Resume a paused task."""
         if task.status != TaskStatus.PAUSED:
+            self._emit(TASK_RESUMED, task.id, {
+                "requested": False,
+                "error": f"invalid_status:{task.status.value}",
+                "path": "orchestrator",
+            })
             return
         paused_from = ""
         if isinstance(task.metadata, dict):
@@ -8153,6 +8299,11 @@ class Orchestrator:
         else:
             task.status = TaskStatus.EXECUTING
         self._state.save(task)
+        self._emit(TASK_RESUMED, task.id, {
+            "requested": True,
+            "status": task.status.value,
+            "path": "orchestrator",
+        })
 
     @property
     def question_manager(self) -> QuestionManager | None:

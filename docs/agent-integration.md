@@ -876,6 +876,32 @@ scratch_dir = "~/.loom/scratch"
 `delegate_task_timeout_seconds` controls `/run` (delegated orchestration) timeout.
 Environment variable `LOOM_DELEGATE_TIMEOUT_SECONDS` overrides it when set.
 
+### Database Migration Operations
+
+For agent-driven or non-interactive environments, treat DB migration as part of
+startup readiness:
+
+```bash
+uv run loom db status
+uv run loom db doctor
+uv run loom db migrate
+```
+
+Behavioral contract:
+- Existing DB migration failures are blocking startup errors.
+- Loom does not silently drop to ephemeral mode for existing DB upgrade failures.
+- New DB creation failures are blocking by default; use `--ephemeral` as an
+  explicit opt-in fallback when non-persistent operation is acceptable.
+
+Schema-change contribution contract (for humans and coding agents):
+1. Add migration step(s) in `src/loom/state/migrations/steps/`.
+2. Register in `src/loom/state/migrations/registry.py`.
+3. Update `src/loom/state/schema.sql` and `src/loom/state/schema/base.sql` as needed.
+4. Add upgrade/idempotency tests.
+5. Update docs/changelog.
+
+Never use "delete the DB" as the normal upgrade path.
+
 MCP server configuration is managed separately in `~/.loom/mcp.toml`
 (workspace override: `./.loom/mcp.toml`):
 
@@ -957,6 +983,7 @@ Events your agent can listen for via SSE or event bus subscription:
 
 | Event | Description |
 |-------|-------------|
+| `task_created` | Task accepted and assigned a run id |
 | `task_planning` | Task decomposition started |
 | `task_plan_ready` | Plan created, subtasks defined |
 | `task_executing` | Execution loop started |
@@ -970,4 +997,22 @@ Events your agent can listen for via SSE or event bus subscription:
 | `subtask_retrying` | Subtask being retried with escalation |
 | `approval_requested` | Paused for human review |
 | `approval_received` | Human responded to approval request |
+| `task_paused` | Control-plane pause request state |
+| `task_resumed` | Control-plane resume request state |
+| `task_injected` | Steering instruction injected into execution context |
+| `task_cancel_requested` | Cancellation requested |
+| `task_cancel_ack` | Cancellation acknowledged |
+| `task_cancel_timeout` | Cancellation wait timed out |
+| `verification_started` | Verification lifecycle started |
+| `verification_passed` | Verification accepted output |
+| `verification_failed` | Verification rejected output |
+| `verification_outcome` | Structured verification outcome payload |
+| `telemetry_run_summary` | End-of-run audit summary counters |
+| `webhook_delivery_attempted` | Callback delivery attempt started |
+| `webhook_delivery_succeeded` | Callback delivery succeeded |
+| `webhook_delivery_failed` | Callback delivery exhausted retries |
+| `webhook_delivery_dropped` | Callback delivery skipped/unregistered |
 | `token_streamed` | Model token generated (streaming mode) |
+
+See `docs/telemetry-catalog.md` for lifecycle status (`active` vs `internal_only`) and
+payload contract requirements.
