@@ -21,7 +21,7 @@ DOC_REQUIRED = {
 MIGRATION_TEST_HINTS = (
     "tests/test_memory.py",
     "tests/test_cli.py",
-    "tests/test_tui.py",
+    "tests/tui/<module>.py",
     "tests/test_migrations.py",
 )
 
@@ -30,6 +30,8 @@ def _is_migration_focused_test(path: str) -> bool:
     normalized = str(path or "").strip()
     if not normalized.startswith("tests/"):
         return False
+    if normalized.startswith("tests/tui/"):
+        return True
     if normalized in MIGRATION_TEST_HINTS:
         return True
     filename = normalized.rsplit("/", 1)[-1].lower()
