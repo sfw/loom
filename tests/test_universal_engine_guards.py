@@ -7,10 +7,13 @@ from pathlib import Path
 
 CORE_FILES = (
     "src/loom/state/evidence.py",
-    "src/loom/engine/verification.py",
     "src/loom/recovery/retry.py",
-    "src/loom/engine/orchestrator.py",
     "src/loom/prompts/templates/verifier.yaml",
+)
+
+CORE_PACKAGE_DIRS = (
+    "src/loom/engine/verification",
+    "src/loom/engine/orchestrator",
 )
 
 FORBIDDEN_PATTERNS: dict[str, re.Pattern[str]] = {
@@ -41,17 +44,41 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _guard_target_files() -> list[str]:
+    root = _repo_root()
+    targets = list(CORE_FILES)
+    for rel_dir in CORE_PACKAGE_DIRS:
+        package_dir = root / rel_dir
+        for path in sorted(package_dir.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            targets.append(str(path.relative_to(root)))
+    # Preserve order while removing accidental duplicates.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for rel in targets:
+        if rel in seen:
+            continue
+        seen.add(rel)
+        deduped.append(rel)
+    return deduped
+
+
 def test_guard_files_exist():
     root = _repo_root()
     for rel in CORE_FILES:
         assert (root / rel).exists(), f"Missing guard target file: {rel}"
+    for rel_dir in CORE_PACKAGE_DIRS:
+        package_dir = root / rel_dir
+        assert package_dir.exists(), f"Missing guard target package: {rel_dir}"
+        assert any(package_dir.rglob("*.py")), f"No Python files under guard package: {rel_dir}"
 
 
 def test_no_domain_specific_hardcoding_in_core_runtime():
     root = _repo_root()
     violations: list[str] = []
 
-    for rel in CORE_FILES:
+    for rel in _guard_target_files():
         content = (root / rel).read_text(encoding="utf-8")
         for label, pattern in FORBIDDEN_PATTERNS.items():
             for match in pattern.finditer(content):
