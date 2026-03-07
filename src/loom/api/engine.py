@@ -4,15 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import tempfile
+import threading
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loom.config import Config
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import Event, EventBus, EventPersister
-from loom.events.types import TASK_RUN_ACQUIRED, TASK_RUN_HEARTBEAT, TASK_RUN_RECOVERED
+from loom.events.types import (
+    TASK_RUN_ACQUIRED,
+    TASK_RUN_HEARTBEAT,
+    TASK_RUN_RECOVERED,
+    TELEMETRY_MODE_CHANGED,
+    TELEMETRY_SETTINGS_WARNING,
+    TelemetryMode,
+)
+from loom.events.verbosity import DEFAULT_TELEMETRY_MODE, normalize_telemetry_mode
 from loom.events.webhook import WebhookDelivery
 from loom.learning.manager import LearningManager
 from loom.models.router import ModelRouter
@@ -31,6 +43,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _API_EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS = 0.5
 _API_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS = 0.05
+
+
+class TelemetryPersistConflictError(RuntimeError):
+    """Raised when persisted telemetry override conflicts with external edits."""
+
+
+class TelemetryPersistDisabledError(RuntimeError):
+    """Raised when callers request persisted override while feature is disabled."""
 
 
 class Engine:
@@ -69,6 +89,35 @@ class Engine:
         self._runner_id = f"api-{uuid.uuid4().hex[:8]}"
         self._run_lease_seconds = 30
         self._run_heartbeat_interval_seconds = 10
+        telemetry_mode_input = str(
+            getattr(self.config.telemetry, "configured_mode_input", ""),
+        ).strip()
+        configured_resolution = normalize_telemetry_mode(
+            getattr(self.config.telemetry, "mode", DEFAULT_TELEMETRY_MODE),
+            default=DEFAULT_TELEMETRY_MODE,
+        )
+        input_resolution = normalize_telemetry_mode(
+            telemetry_mode_input,
+            default=configured_resolution.mode,
+        )
+        self._telemetry_lock = threading.Lock()
+        self._telemetry_configured_mode: TelemetryMode = configured_resolution.mode
+        self._telemetry_configured_input = telemetry_mode_input or configured_resolution.mode
+        self._telemetry_runtime_override: TelemetryMode | None = None
+        self._telemetry_updated_at = datetime.now(UTC).isoformat()
+        source_path_text = str(getattr(config, "source_path", "") or "").strip()
+        self._telemetry_config_path: Path | None = (
+            Path(source_path_text).expanduser() if source_path_text else None
+        )
+        self._telemetry_config_mtime_ns = self._read_config_mtime_ns(self._telemetry_config_path)
+        self.event_bus.set_operator_mode_provider(self.effective_telemetry_mode)
+        if input_resolution.warning_code:
+            self._emit_telemetry_settings_warning(
+                warning_code=input_resolution.warning_code,
+                input_value=input_resolution.input_value,
+                normalized_mode=configured_resolution.mode,
+                source="config.telemetry.mode",
+            )
         if diagnostics_enabled():
             probe_task = asyncio.create_task(self._monitor_event_loop_lag())
             self._background_tasks.add(probe_task)
@@ -98,6 +147,235 @@ class Engine:
                     fields={"threshold_ms": int(_API_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS * 1000)},
                 )
             expected = now + _API_EVENT_LOOP_LAG_PROBE_INTERVAL_SECONDS
+
+    @staticmethod
+    def _read_config_mtime_ns(path: Path | None) -> int | None:
+        if path is None or not path.exists():
+            return None
+        try:
+            return int(path.stat().st_mtime_ns)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _upsert_telemetry_mode_toml(text: str, mode: TelemetryMode) -> str:
+        lines = text.splitlines()
+        section_start: int | None = None
+        section_end = len(lines)
+
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not (stripped.startswith("[") and stripped.endswith("]")):
+                continue
+            section_name = stripped[1:-1].strip().lower()
+            if section_name == "telemetry":
+                section_start = idx
+                continue
+            if section_start is not None and idx > section_start:
+                section_end = idx
+                break
+
+        mode_line = f'mode = "{mode}"'
+        if section_start is None:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.extend(["[telemetry]", mode_line])
+        else:
+            replaced = False
+            for idx in range(section_start + 1, section_end):
+                stripped = lines[idx].strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                key = stripped.split("=", 1)[0].strip().lower()
+                if key != "mode":
+                    continue
+                lines[idx] = mode_line
+                replaced = True
+                break
+            if not replaced:
+                lines.insert(section_start + 1, mode_line)
+
+        rendered = "\n".join(lines)
+        if text.endswith("\n"):
+            rendered += "\n"
+        return rendered
+
+    def configured_telemetry_mode(self) -> TelemetryMode:
+        with self._telemetry_lock:
+            return self._telemetry_configured_mode
+
+    def runtime_telemetry_mode(self) -> TelemetryMode | None:
+        with self._telemetry_lock:
+            return self._telemetry_runtime_override
+
+    def effective_telemetry_mode(self) -> TelemetryMode:
+        with self._telemetry_lock:
+            return self._telemetry_runtime_override or self._telemetry_configured_mode
+
+    @staticmethod
+    def telemetry_mode_scope() -> str:
+        return "process_local"
+
+    def telemetry_settings_snapshot(self) -> dict[str, str]:
+        with self._telemetry_lock:
+            runtime_override_mode = self._telemetry_runtime_override or ""
+            effective_mode = runtime_override_mode or self._telemetry_configured_mode
+            return {
+                "configured_mode": self._telemetry_configured_mode,
+                "runtime_override_mode": runtime_override_mode,
+                "effective_mode": effective_mode,
+                "scope": self.telemetry_mode_scope(),
+                "updated_at": self._telemetry_updated_at,
+            }
+
+    def _emit_telemetry_settings_warning(
+        self,
+        *,
+        warning_code: str,
+        input_value: str,
+        normalized_mode: TelemetryMode,
+        source: str,
+    ) -> None:
+        self.event_bus.emit(
+            Event(
+                event_type=TELEMETRY_SETTINGS_WARNING,
+                task_id="system",
+                data={
+                    "warning_code": str(warning_code or "").strip(),
+                    "input_value": str(input_value or "").strip() or "<empty>",
+                    "normalized_mode": normalized_mode,
+                    "configured_mode": self.configured_telemetry_mode(),
+                    "runtime_override_mode": self.runtime_telemetry_mode() or "",
+                    "effective_mode": self.effective_telemetry_mode(),
+                    "scope": self.telemetry_mode_scope(),
+                    "source": str(source or "").strip() or "unknown",
+                    "source_component": "api_engine",
+                },
+            ),
+        )
+
+    def _persist_runtime_telemetry_mode(self, mode: TelemetryMode) -> None:
+        if not bool(getattr(self.config.telemetry, "persist_runtime_override", False)):
+            raise TelemetryPersistDisabledError(
+                "Persisted telemetry override is disabled. "
+                "Set [telemetry].persist_runtime_override=true to enable persisted writes.",
+            )
+
+        path = self._telemetry_config_path
+        if path is None or not path.exists():
+            raise TelemetryPersistDisabledError(
+                "Persisted telemetry override requires a writable loom.toml source path.",
+            )
+
+        lock_path = path.with_suffix(f"{path.suffix}.lock")
+        temp_path: Path | None = None
+        try:
+            import fcntl  # POSIX advisory locks
+        except ImportError as e:  # pragma: no cover - non-POSIX fallback
+            raise TelemetryPersistDisabledError(
+                "Persisted telemetry override is unavailable on this platform.",
+            ) from e
+
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+            current_mtime = self._read_config_mtime_ns(path)
+            expected_mtime = self._telemetry_config_mtime_ns
+            if (
+                expected_mtime is not None
+                and current_mtime is not None
+                and current_mtime != expected_mtime
+            ):
+                raise TelemetryPersistConflictError(
+                    "loom.toml changed since startup; reload config and retry telemetry persist.",
+                )
+
+            original_text = path.read_text(encoding="utf-8")
+            updated_text = self._upsert_telemetry_mode_toml(original_text, mode)
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent),
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+            try:
+                temp_path = Path(tmp_name)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(updated_text)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, path)
+            finally:
+                if temp_path is not None and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+
+            self._telemetry_config_mtime_ns = self._read_config_mtime_ns(path)
+
+    def set_runtime_telemetry_mode(
+        self,
+        *,
+        mode_input: object,
+        actor: str,
+        source: str,
+        persist: bool = False,
+    ) -> dict[str, str]:
+        if not bool(getattr(self.config.telemetry, "runtime_override_enabled", True)):
+            raise TelemetryPersistDisabledError(
+                "Runtime telemetry override is disabled by config.",
+            )
+
+        resolution = normalize_telemetry_mode(
+            mode_input,
+            default=DEFAULT_TELEMETRY_MODE,
+        )
+        actor_text = str(actor or "").strip() or "unknown"
+        source_text = str(source or "").strip() or "unknown"
+        updated_at = datetime.now(UTC).isoformat()
+
+        with self._telemetry_lock:
+            previous_runtime = self._telemetry_runtime_override
+            previous_configured = self._telemetry_configured_mode
+            previous_effective = previous_runtime or self._telemetry_configured_mode
+            if persist:
+                self._persist_runtime_telemetry_mode(resolution.mode)
+                self._telemetry_configured_mode = resolution.mode
+                self._telemetry_configured_input = resolution.mode
+            self._telemetry_runtime_override = resolution.mode
+            self._telemetry_updated_at = updated_at
+            runtime_override_mode = self._telemetry_runtime_override or ""
+            effective_mode = runtime_override_mode or self._telemetry_configured_mode
+            changed = (
+                previous_runtime != self._telemetry_runtime_override
+                or previous_effective != effective_mode
+                or previous_configured != self._telemetry_configured_mode
+            )
+
+        if resolution.warning_code:
+            self._emit_telemetry_settings_warning(
+                warning_code=resolution.warning_code,
+                input_value=resolution.input_value,
+                normalized_mode=resolution.mode,
+                source=source_text,
+            )
+
+        if changed:
+            self.event_bus.emit(
+                Event(
+                    event_type=TELEMETRY_MODE_CHANGED,
+                    task_id="system",
+                    data={
+                        "configured_mode": self.configured_telemetry_mode(),
+                        "runtime_override_mode": self.runtime_telemetry_mode() or "",
+                        "effective_mode": self.effective_telemetry_mode(),
+                        "scope": self.telemetry_mode_scope(),
+                        "actor": actor_text,
+                        "source": source_text,
+                        "persisted": bool(persist),
+                        "updated_at": updated_at,
+                        "source_component": "api_engine",
+                    },
+                ),
+            )
+        return self.telemetry_settings_snapshot()
 
     def create_task_orchestrator(
         self, process: ProcessDefinition | None = None,
@@ -422,7 +700,18 @@ async def create_engine(config: Config) -> Engine:
     prompt_assembler = PromptAssembler()
 
     # Events
-    event_bus = EventBus()
+    event_bus = EventBus(
+        debug_diagnostics_rate_per_minute=int(
+            getattr(
+                config.telemetry,
+                "debug_diagnostics_rate_per_minute",
+                120,
+            ),
+        ),
+        debug_diagnostics_burst=int(
+            getattr(config.telemetry, "debug_diagnostics_burst", 30),
+        ),
+    )
 
     # Event persistence — subscribe to all events and write to SQLite
     event_persister = EventPersister(database)

@@ -122,6 +122,9 @@ class TestGenerateToml:
         assert parsed["server"]["port"] == 9000
         assert parsed["execution"]["delegate_task_timeout_seconds"] == 3600
         assert parsed["execution"]["cowork_tool_exposure_mode"] == "adaptive"
+        assert parsed["telemetry"]["mode"] == "active"
+        assert parsed["telemetry"]["runtime_override_enabled"] is True
+        assert parsed["telemetry"]["runtime_override_api_enabled"] is False
         assert parsed["memory"]["database_path"] == "~/.loom/loom.db"
 
     def test_generated_toml_loads_as_config(self):
@@ -200,6 +203,8 @@ class TestRunSetup:
         assert 'model = "qwen3:14b"' in content
         assert "delegate_task_timeout_seconds = 3600" in content
         assert 'cowork_tool_exposure_mode = "adaptive"' in content
+        assert "[telemetry]" in content
+        assert 'mode = "active"' in content
         assert "ingest_artifact_retention_max_age_days = 14" in content
         assert "ingest_artifact_retention_max_files_per_scope = 96" in content
         assert "ingest_artifact_retention_max_bytes_per_scope = 268435456" in content

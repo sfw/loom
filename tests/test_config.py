@@ -102,6 +102,15 @@ class TestDefaultConfig:
         assert config.verification.contradiction_scan_min_files_for_sufficiency == 2
         assert ".md" in config.verification.contradiction_scan_allowed_suffixes
 
+    def test_default_telemetry(self):
+        config = Config()
+        assert config.telemetry.mode == "active"
+        assert config.telemetry.runtime_override_enabled is True
+        assert config.telemetry.runtime_override_api_enabled is False
+        assert config.telemetry.persist_runtime_override is False
+        assert config.telemetry.debug_diagnostics_rate_per_minute == 120
+        assert config.telemetry.debug_diagnostics_burst == 30
+
     def test_default_process_flags(self):
         config = Config()
         assert config.process.require_rule_scope_metadata is False
@@ -209,6 +218,15 @@ roles = ["executor", "planner"]
 [execution]
 max_subtask_retries = 5
 
+[telemetry]
+mode = "all_typed"
+runtime_override_enabled = true
+runtime_override_api_enabled = true
+runtime_override_api_token = "dev-token"
+persist_runtime_override = false
+debug_diagnostics_rate_per_minute = 240
+debug_diagnostics_burst = 60
+
 [memory]
 database_path = "/tmp/test.db"
 """)
@@ -221,7 +239,37 @@ database_path = "/tmp/test.db"
         assert config.models["test_model"].reasoning_effort == "none"
         assert config.models["test_model"].roles == ["executor", "planner"]
         assert config.execution.max_subtask_retries == 5
+        assert config.telemetry.mode == "all_typed"
+        assert config.telemetry.runtime_override_enabled is True
+        assert config.telemetry.runtime_override_api_enabled is True
+        assert config.telemetry.runtime_override_api_token == "dev-token"
+        assert config.telemetry.debug_diagnostics_rate_per_minute == 240
+        assert config.telemetry.debug_diagnostics_burst == 60
         assert config.memory.database_path == "/tmp/test.db"
+
+    def test_telemetry_alias_internal_only_normalizes_to_all_typed(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[telemetry]
+mode = "internal_only"
+""")
+        config = load_config(toml_file)
+        assert config.telemetry.mode == "all_typed"
+        assert config.telemetry.configured_mode_input == "internal_only"
+
+    def test_telemetry_invalid_mode_defaults_to_active(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[telemetry]
+mode = "nope"
+debug_diagnostics_rate_per_minute = -1
+debug_diagnostics_burst = 0
+""")
+        config = load_config(toml_file)
+        assert config.telemetry.mode == "active"
+        assert config.telemetry.configured_mode_input == "nope"
+        assert config.telemetry.debug_diagnostics_rate_per_minute == 1
+        assert config.telemetry.debug_diagnostics_burst == 1
 
     def test_load_partial_toml(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

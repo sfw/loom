@@ -21,6 +21,11 @@ from typing import TYPE_CHECKING
 
 from loom.auth.runtime import coerce_auth_requirements, serialize_auth_requirements
 from loom.events.bus import Event
+from loom.events.verbosity import (
+    DEFAULT_TELEMETRY_MODE,
+    normalize_telemetry_mode,
+    should_deliver_operator,
+)
 from loom.state.task_state import SubtaskStatus, TaskStatus
 from loom.tools.registry import (
     Tool,
@@ -859,6 +864,7 @@ class DelegateTaskTool(Tool):
             callable(progress_callback) or event_log_handle is not None
         ):
             from loom.events.types import (
+                APPROVAL_REQUESTED,
                 ARTIFACT_INGEST_CLASSIFIED,
                 ARTIFACT_INGEST_COMPLETED,
                 ARTIFACT_READ_COMPLETED,
@@ -892,6 +898,7 @@ class DelegateTaskTool(Tool):
                 TASK_CANCEL_TIMEOUT,
                 TASK_CANCELLED,
                 TASK_COMPLETED,
+                TASK_CREATED,
                 TASK_EXECUTING,
                 TASK_FAILED,
                 TASK_INJECTED,
@@ -923,6 +930,7 @@ class DelegateTaskTool(Tool):
             )
 
             observed = (
+                TASK_CREATED,
                 TASK_PLANNING,
                 TASK_PLAN_READY,
                 TASK_PLAN_NORMALIZED,
@@ -975,6 +983,7 @@ class DelegateTaskTool(Tool):
                 STEER_INSTRUCTION,
                 SUBTASK_COMPLETED,
                 SUBTASK_FAILED,
+                APPROVAL_REQUESTED,
                 ASK_USER_REQUESTED,
                 ASK_USER_ANSWERED,
                 ASK_USER_TIMEOUT,
@@ -986,9 +995,27 @@ class DelegateTaskTool(Tool):
                 TELEMETRY_RUN_SUMMARY,
             )
 
+            def _effective_operator_mode() -> str:
+                mode_provider = getattr(event_bus, "operator_mode", None)
+                if callable(mode_provider):
+                    try:
+                        return normalize_telemetry_mode(
+                            mode_provider(),
+                            default=DEFAULT_TELEMETRY_MODE,
+                        ).mode
+                    except Exception:
+                        pass
+                telemetry_cfg = getattr(getattr(orchestrator, "_config", None), "telemetry", None)
+                return normalize_telemetry_mode(
+                    getattr(telemetry_cfg, "mode", DEFAULT_TELEMETRY_MODE),
+                    default=DEFAULT_TELEMETRY_MODE,
+                ).mode
+
             def _on_event(event) -> None:
                 nonlocal token_burst_count, token_burst_subtask, last_token_emit
                 if getattr(event, "task_id", "") != task.id:
+                    return
+                if not should_deliver_operator(event.event_type, _effective_operator_mode()):
                     return
                 event_data = getattr(event, "data", None)
                 _log_event(

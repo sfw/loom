@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal
 
 EventLifecycle = Literal["active", "deprecated", "internal_only"]
+TelemetryMode = Literal["off", "active", "all_typed", "debug"]
 
 # Task lifecycle events
 TASK_CREATED = "task_created"
@@ -120,6 +121,11 @@ DB_MIGRATION_APPLIED = "db_migration_applied"
 DB_MIGRATION_VERIFY_FAILED = "db_migration_verify_failed"
 DB_MIGRATION_FAILED = "db_migration_failed"
 DB_SCHEMA_READY = "db_schema_ready"
+
+# Telemetry runtime/settings events
+TELEMETRY_MODE_CHANGED = "telemetry_mode_changed"
+TELEMETRY_SETTINGS_WARNING = "telemetry_settings_warning"
+TELEMETRY_DIAGNOSTIC = "telemetry_diagnostic"
 
 # Streaming events
 TOKEN_STREAMED = "token_streamed"
@@ -254,6 +260,10 @@ EVENT_LIFECYCLE: dict[str, EventLifecycle] = {
     DB_MIGRATION_VERIFY_FAILED: "internal_only",
     DB_MIGRATION_FAILED: "internal_only",
     DB_SCHEMA_READY: "internal_only",
+    # Telemetry runtime/settings
+    TELEMETRY_MODE_CHANGED: "active",
+    TELEMETRY_SETTINGS_WARNING: "active",
+    TELEMETRY_DIAGNOSTIC: "internal_only",
     # Streaming / conversation
     TOKEN_STREAMED: "internal_only",
     CONVERSATION_MESSAGE: "internal_only",

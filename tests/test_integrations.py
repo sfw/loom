@@ -15,6 +15,7 @@ import pytest
 from loom.config import Config
 from loom.engine.orchestrator import Orchestrator, create_task
 from loom.events.bus import Event, EventBus, EventPersister
+from loom.events.types import TASK_EXECUTING
 from loom.models.base import ModelResponse, TokenUsage, ToolCall
 from loom.models.router import ModelRouter
 from loom.prompts.assembler import PromptAssembler
@@ -198,14 +199,14 @@ class TestEventPersistence:
 
         for i in range(5):
             bus.emit(Event(
-                event_type=f"event_{i}",
+                event_type=TASK_EXECUTING,
                 task_id="t1",
                 data={"index": i},
             ))
 
         await bus.drain(timeout=1.0)
 
-        rows = await db.query_events("t1")
+        rows = await db.query_events("t1", event_type=TASK_EXECUTING)
         assert len(rows) == 5
 
 

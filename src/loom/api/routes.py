@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
-from loom.api.engine import Engine
+from loom.api.engine import (
+    Engine,
+    TelemetryPersistConflictError,
+    TelemetryPersistDisabledError,
+)
 from loom.api.schemas import (
     ApprovalRequest,
     ConversationMessageRequest,
@@ -29,6 +35,8 @@ from loom.api.schemas import (
     TaskQuestionResponse,
     TaskResponse,
     TaskSteerRequest,
+    TelemetrySettingsPatchRequest,
+    TelemetrySettingsResponse,
     ToolInfo,
 )
 from loom.auth.runtime import (
@@ -49,6 +57,7 @@ from loom.events.types import (
     TASK_FAILED,
     TOKEN_STREAMED,
 )
+from loom.events.verbosity import should_deliver_operator
 from loom.state.memory import MemoryEntry
 from loom.state.task_state import SubtaskStatus, TaskStatus
 from loom.tools.registry import (
@@ -120,6 +129,87 @@ def _required_auth_resources_for_process(
 def _get_engine(request: Request) -> Engine:
     """Get the engine from the app state."""
     return request.app.state.engine
+
+
+def _normalize_host(raw_host: str) -> str:
+    host = str(raw_host or "").strip().lower()
+    if not host:
+        return ""
+    if host.startswith("[") and "]" in host:
+        host = host[1:host.index("]")]
+    elif host.count(":") == 1:
+        candidate, maybe_port = host.rsplit(":", 1)
+        if maybe_port.isdigit():
+            host = candidate
+    return host
+
+
+def _is_loopback_host(raw_host: str) -> bool:
+    host = _normalize_host(raw_host)
+    if host in {"localhost", "127.0.0.1", "::1", "testclient", "testserver", "test"}:
+        return True
+    try:
+        return bool(ipaddress.ip_address(host).is_loopback)
+    except ValueError:
+        return False
+
+
+def _request_is_local(request: Request) -> bool:
+    client_host = _normalize_host(getattr(request.client, "host", "") if request.client else "")
+    if not _is_loopback_host(client_host):
+        return False
+
+    forwarded_for = str(request.headers.get("x-forwarded-for", "") or "").strip()
+    if forwarded_for:
+        first_hop = forwarded_for.split(",", 1)[0].strip()
+        if not _is_loopback_host(first_hop):
+            return False
+
+    origin = str(request.headers.get("origin", "") or "").strip()
+    if origin:
+        parsed = urlparse(origin)
+        if not _is_loopback_host(parsed.hostname or ""):
+            return False
+    return True
+
+
+def _extract_admin_token(request: Request) -> str:
+    explicit = str(request.headers.get("x-loom-admin-token", "") or "").strip()
+    if explicit:
+        return explicit
+    authorization = str(request.headers.get("authorization", "") or "").strip()
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+def _build_telemetry_settings_response(engine: Engine) -> TelemetrySettingsResponse:
+    snapshot = engine.telemetry_settings_snapshot()
+    return TelemetrySettingsResponse(
+        configured_mode=str(snapshot.get("configured_mode", "active") or "active"),
+        runtime_override_mode=str(snapshot.get("runtime_override_mode", "") or ""),
+        effective_mode=str(snapshot.get("effective_mode", "active") or "active"),
+        scope=str(snapshot.get("scope", "process_local") or "process_local"),
+        updated_at=str(snapshot.get("updated_at", "") or ""),
+    )
+
+
+def _require_telemetry_mutation_access(request: Request, engine: Engine) -> None:
+    telemetry_cfg = getattr(engine.config, "telemetry", None)
+    if not bool(getattr(telemetry_cfg, "runtime_override_api_enabled", False)):
+        raise HTTPException(status_code=404, detail="Telemetry settings API is disabled.")
+    if not _request_is_local(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Telemetry settings mutation requires a local loopback caller.",
+        )
+    expected_token = str(getattr(telemetry_cfg, "runtime_override_api_token", "") or "").strip()
+    provided_token = _extract_admin_token(request)
+    if not expected_token or provided_token != expected_token:
+        raise HTTPException(
+            status_code=403,
+            detail="Telemetry settings mutation requires a valid admin token.",
+        )
 
 
 def _serialize_task_question(row: dict) -> TaskQuestionResponse:
@@ -445,7 +535,13 @@ async def stream_task_events(request: Request, task_id: str):
         queue: asyncio.Queue[Event] = asyncio.Queue()
 
         def handler(event: Event):
-            if event.task_id == task_id:
+            if (
+                event.task_id == task_id
+                and should_deliver_operator(
+                    event.event_type,
+                    engine.effective_telemetry_mode(),
+                )
+            ):
                 queue.put_nowait(event)
 
         engine.event_bus.subscribe_all(handler)
@@ -490,7 +586,14 @@ async def stream_task_tokens(request: Request, task_id: str):
         queue: asyncio.Queue[Event] = asyncio.Queue()
 
         def handler(event: Event):
-            if event.task_id == task_id and event.event_type == TOKEN_STREAMED:
+            if (
+                event.task_id == task_id
+                and event.event_type == TOKEN_STREAMED
+                and should_deliver_operator(
+                    event.event_type,
+                    engine.effective_telemetry_mode(),
+                )
+            ):
                 queue.put_nowait(event)
 
         # Also listen for terminal events to know when to stop
@@ -1048,7 +1151,53 @@ async def get_config(request: Request):
             ),
             "enable_slo_metrics": bool(config.execution.enable_slo_metrics),
         },
+        "telemetry": {
+            "mode": str(getattr(config.telemetry, "mode", "active")),
+            "runtime_override_enabled": bool(
+                getattr(config.telemetry, "runtime_override_enabled", True),
+            ),
+            "runtime_override_api_enabled": bool(
+                getattr(config.telemetry, "runtime_override_api_enabled", False),
+            ),
+            "persist_runtime_override": bool(
+                getattr(config.telemetry, "persist_runtime_override", False),
+            ),
+            "debug_diagnostics_rate_per_minute": int(
+                getattr(config.telemetry, "debug_diagnostics_rate_per_minute", 120),
+            ),
+            "debug_diagnostics_burst": int(
+                getattr(config.telemetry, "debug_diagnostics_burst", 30),
+            ),
+        },
     }
+
+
+@router.get("/settings/telemetry", response_model=TelemetrySettingsResponse)
+async def get_telemetry_settings(request: Request):
+    """Return configured, runtime-override, and effective telemetry mode state."""
+    engine = _get_engine(request)
+    return _build_telemetry_settings_response(engine)
+
+
+@router.patch("/settings/telemetry", response_model=TelemetrySettingsResponse)
+async def patch_telemetry_settings(request: Request, body: TelemetrySettingsPatchRequest):
+    """Update runtime telemetry mode with loopback + admin-token guard."""
+    engine = _get_engine(request)
+    _require_telemetry_mutation_access(request, engine)
+    actor = str(request.headers.get("x-loom-actor", "") or "").strip() or "api"
+    source = f"api:{request.url.path}"
+    try:
+        engine.set_runtime_telemetry_mode(
+            mode_input=body.mode,
+            actor=actor,
+            source=source,
+            persist=bool(body.persist),
+        )
+    except TelemetryPersistConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except TelemetryPersistDisabledError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _build_telemetry_settings_response(engine)
 
 
 @router.get("/slo")

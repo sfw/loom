@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
+from loom.events.types import TelemetryMode
+from loom.events.verbosity import DEFAULT_TELEMETRY_MODE, normalize_telemetry_mode
+
 
 class ConfigError(Exception):
     """Raised when configuration loading or validation fails."""
@@ -344,6 +347,20 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class TelemetryConfig:
+    """Configuration for runtime telemetry verbosity and diagnostics behavior."""
+
+    mode: TelemetryMode = DEFAULT_TELEMETRY_MODE
+    configured_mode_input: str = DEFAULT_TELEMETRY_MODE
+    runtime_override_enabled: bool = True
+    runtime_override_api_enabled: bool = False
+    runtime_override_api_token: str = ""
+    persist_runtime_override: bool = False
+    debug_diagnostics_rate_per_minute: int = 120
+    debug_diagnostics_burst: int = 30
+
+
+@dataclass(frozen=True)
 class ProcessConfig:
     """Configuration for the process definition system."""
 
@@ -514,10 +531,12 @@ class Config:
     verification: VerificationConfig = field(default_factory=VerificationConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     process: ProcessConfig = field(default_factory=ProcessConfig)
     tui: TUIConfig = field(default_factory=TUIConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
+    source_path: str = ""
 
     def _resolve_database_path(self) -> Path:
         """Resolve the configured database path with scratch-temp redirect.
@@ -1257,6 +1276,56 @@ def load_config(path: Path | None = None) -> Config:
         event_log_path=log_data.get("event_log_path", "~/.loom/logs"),
     )
 
+    telemetry_data = raw.get("telemetry", {})
+    if not isinstance(telemetry_data, dict):
+        telemetry_data = {}
+    raw_mode_value = telemetry_data.get("mode", TelemetryConfig.mode)
+    configured_mode_input = str(raw_mode_value or "").strip()
+    mode_resolution = normalize_telemetry_mode(
+        raw_mode_value,
+        default=DEFAULT_TELEMETRY_MODE,
+    )
+    telemetry = TelemetryConfig(
+        mode=mode_resolution.mode,
+        configured_mode_input=(
+            configured_mode_input
+            if "mode" in telemetry_data
+            else mode_resolution.mode
+        ),
+        runtime_override_enabled=_bool_from(
+            telemetry_data,
+            "runtime_override_enabled",
+            TelemetryConfig.runtime_override_enabled,
+        ),
+        runtime_override_api_enabled=_bool_from(
+            telemetry_data,
+            "runtime_override_api_enabled",
+            TelemetryConfig.runtime_override_api_enabled,
+        ),
+        runtime_override_api_token=str(
+            telemetry_data.get("runtime_override_api_token", ""),
+        ).strip(),
+        persist_runtime_override=_bool_from(
+            telemetry_data,
+            "persist_runtime_override",
+            TelemetryConfig.persist_runtime_override,
+        ),
+        debug_diagnostics_rate_per_minute=_int_from(
+            telemetry_data,
+            "debug_diagnostics_rate_per_minute",
+            TelemetryConfig.debug_diagnostics_rate_per_minute,
+            minimum=1,
+            maximum=20_000,
+        ),
+        debug_diagnostics_burst=_int_from(
+            telemetry_data,
+            "debug_diagnostics_burst",
+            TelemetryConfig.debug_diagnostics_burst,
+            minimum=1,
+            maximum=10_000,
+        ),
+    )
+
     proc_data = raw.get("process", {})
     process = ProcessConfig(
         default=proc_data.get("default", ""),
@@ -1952,6 +2021,7 @@ def load_config(path: Path | None = None) -> Config:
         verification=verification,
         memory=memory,
         logging=logging_cfg,
+        telemetry=telemetry,
         process=process,
         tui=tui,
         limits=limits,
@@ -1961,4 +2031,5 @@ def load_config(path: Path | None = None) -> Config:
                 mcp_data.get("oauth_browser_login", True)
             ) if isinstance(mcp_data, dict) else True,
         ),
+        source_path=str(path) if path is not None else "",
     )
