@@ -159,6 +159,18 @@ class RetryManager:
                 "unverified according to process policy.\n"
                 "- Avoid broad reruns when only targeted remediation is needed."
             )
+        elif (
+            strategy == RetryStrategy.GENERIC
+            and attempts
+            and self._is_output_path_policy_failure(attempts[-1])
+        ):
+            lines.append(
+                "\nTARGETED RETRY PLAN:\n"
+                "- Previous attempt violated canonical deliverable path policy.\n"
+                "- Write only to required canonical deliverable filenames.\n"
+                "- Edit in place; do not create variants, copies, or renamed outputs.\n"
+                "- Keep validated content; apply minimal filename/path corrections."
+            )
 
         lines.append(
             "\nFix the issues identified above. "
@@ -241,6 +253,11 @@ class RetryManager:
         if reason_code in {"parse_inconclusive", "infra_verifier_error"}:
             return RetryStrategy.VERIFIER_PARSE, []
         if reason_code in {
+            "forbidden_output_path",
+            "output_path_policy_violation",
+        }:
+            return RetryStrategy.GENERIC, missing_targets
+        if reason_code in {
             "evidence_gap",
             "missing_evidence",
             "insufficient_evidence_targets",
@@ -279,6 +296,16 @@ class RetryManager:
             "verification inconclusive:",
         )):
             return RetryStrategy.VERIFIER_PARSE, []
+
+        if any(marker in haystack for marker in (
+            "forbidden_output_path",
+            "output_path_policy_violation",
+            "canonical deliverable policy violation",
+            "retry/remediation writes must stay in canonical deliverables",
+            "looks like a versioned copy of a required file",
+            "do not rename or delete files during retry",
+        )):
+            return RetryStrategy.GENERIC, []
 
         if any(marker in haystack for marker in (
             "unconfirmed",
@@ -437,6 +464,22 @@ class RetryManager:
             if target and target not in targets:
                 targets.append(target)
         return targets
+
+    @staticmethod
+    def _is_output_path_policy_failure(attempt: AttemptRecord) -> bool:
+        haystack = " ".join([
+            str(getattr(attempt, "feedback", "") or ""),
+            str(getattr(attempt, "error", "") or ""),
+        ]).lower()
+        markers = (
+            "forbidden_output_path",
+            "output_path_policy_violation",
+            "canonical deliverable policy violation",
+            "retry/remediation writes must stay in canonical deliverables",
+            "looks like a versioned copy of a required file",
+            "do not rename or delete files during retry",
+        )
+        return any(marker in haystack for marker in markers)
 
     def should_flag_for_human(self, attempt: int) -> bool:
         """Check if all retries are exhausted and human review is needed."""

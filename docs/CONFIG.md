@@ -330,6 +330,33 @@ Operational notes:
 | `level` | `string` | `"INFO"` | Log level (`DEBUG`, `INFO`, etc.). |
 | `event_log_path` | `string` | `"~/.loom/logs"` | Directory for event log files. |
 
+### `[telemetry]`
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | `string` | `"active"` | Operator sink verbosity mode (`off`, `active`, `all_typed`, `debug`). |
+| `runtime_override_enabled` | `bool` | `true` | Enables process-local runtime telemetry override resolution. |
+| `runtime_override_api_enabled` | `bool` | `false` | Enables `PATCH /settings/telemetry` mutation endpoint. |
+| `runtime_override_api_token` | `string` | `""` | Required admin token value for telemetry mutation requests (`x-loom-admin-token` header or `Authorization: Bearer ...`). |
+| `persist_runtime_override` | `bool` | `false` | Allows persisted mode writes back to `loom.toml` when requested with `persist=true`. |
+| `debug_diagnostics_rate_per_minute` | `int` | `120` | Debug diagnostics refill rate for typed diagnostics channel. |
+| `debug_diagnostics_burst` | `int` | `30` | Debug diagnostics burst capacity before rate limiting applies. |
+
+Mode semantics:
+- `off`: suppresses non-essential operator telemetry but keeps liveness/control/human-gate passthrough events.
+- `active`: shows `ACTIVE_EVENT_TYPES` plus passthrough events.
+- `all_typed`: shows `ACTIVE_EVENT_TYPES ∪ INTERNAL_ONLY_EVENT_TYPES` plus passthrough.
+- `debug`: same as `all_typed` plus diagnostics channel events.
+
+Mutation security for `PATCH /settings/telemetry`:
+- Endpoint must be enabled (`runtime_override_api_enabled=true`).
+- Caller must be loopback-local.
+- Caller must provide `x-loom-admin-token` (or `Authorization: Bearer ...`) matching `runtime_override_api_token`.
+- Every mode change emits `telemetry_mode_changed` audit telemetry.
+
+TUI runtime control:
+- Use `/telemetry` to view or set process-local operator mode (`/telemetry status`, `/telemetry debug`, etc.).
+
 ### `[process]`
 
 | Key | Type | Default | Description |

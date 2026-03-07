@@ -963,6 +963,7 @@
     <tr><td><code>/model</code></td><td>Show current model</td></tr>
     <tr><td><code>/tools</code></td><td>List available tools</td></tr>
     <tr><td><code>/tokens</code></td><td>Show session token usage</td></tr>
+    <tr><td><code>/telemetry [status|off|active|all_typed|debug|internal_only]</code></td><td>Show/set process-local runtime telemetry mode</td></tr>
     <tr><td><code>/mcp list</code></td><td>List merged MCP server config entries</td></tr>
     <tr><td><code>/mcp show &lt;alias&gt;</code></td><td>Show one MCP config entry (redacted env values)</td></tr>
     <tr><td><code>/mcp test &lt;alias&gt;</code></td><td>Run a <code>tools/list</code> probe against one MCP server</td></tr>
@@ -1433,6 +1434,8 @@
   <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/tools</span><span class="endpoint-desc">Available tools and schemas</span></div>
   <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/health</span><span class="endpoint-desc">Health check</span></div>
   <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/config</span><span class="endpoint-desc">Current configuration</span></div>
+  <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/settings/telemetry</span><span class="endpoint-desc">Configured/runtime/effective telemetry mode</span></div>
+  <div class="endpoint"><span class="method method-patch">PATCH</span><span class="endpoint-path">/settings/telemetry</span><span class="endpoint-desc">Mutate runtime telemetry mode (loopback + admin token header/Bearer)</span></div>
   <div class="endpoint"><span class="method method-get">GET</span><span class="endpoint-path">/slo</span><span class="endpoint-desc">SLO snapshot metrics (when enabled)</span></div>
 
   <div class="callout callout-info">
@@ -1446,6 +1449,7 @@
   <h2>SSE Streaming Details</h2>
 
   <p>The <code>/tasks/{id}/stream</code> endpoint uses <strong>Server-Sent Events</strong> (SSE), a standard HTTP streaming protocol supported by all browsers and most HTTP clients.</p>
+  <p>Operator stream visibility follows <code>[telemetry].mode</code> (or runtime override): <code>off</code>, <code>active</code>, <code>all_typed</code>, <code>debug</code>. Terminal/liveness/human-gate events remain visible in all modes.</p>
 
   <h3>JavaScript client</h3>
   <pre><code><span class="cmt">// Browser or Node.js with EventSource</span>
@@ -1702,6 +1706,18 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     <tr><td><code>memory.database_path</code></td><td><code>~/.loom/loom.db</code></td><td>SQLite database location</td></tr>
     <tr><td><code>logging.level</code></td><td><code>INFO</code></td><td>Log verbosity (DEBUG, INFO, WARN, ERROR)</td></tr>
     <tr><td><code>logging.event_log_path</code></td><td><code>~/.loom/logs</code></td><td>Event log directory</td></tr>
+  </table>
+
+  <h3>Telemetry</h3>
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>telemetry.mode</code></td><td><code>active</code></td><td>Operator sink verbosity mode (<code>off</code>, <code>active</code>, <code>all_typed</code>, <code>debug</code>)</td></tr>
+    <tr><td><code>telemetry.runtime_override_enabled</code></td><td><code>true</code></td><td>Enable process-local runtime override support</td></tr>
+    <tr><td><code>telemetry.runtime_override_api_enabled</code></td><td><code>false</code></td><td>Enable <code>PATCH /settings/telemetry</code></td></tr>
+    <tr><td><code>telemetry.runtime_override_api_token</code></td><td><code>""</code></td><td>Required admin token for runtime mode mutation (header or Bearer)</td></tr>
+    <tr><td><code>telemetry.persist_runtime_override</code></td><td><code>false</code></td><td>Allow persisted override writes to <code>loom.toml</code></td></tr>
+    <tr><td><code>telemetry.debug_diagnostics_rate_per_minute</code></td><td><code>120</code></td><td>Diagnostics channel refill rate cap</td></tr>
+    <tr><td><code>telemetry.debug_diagnostics_burst</code></td><td><code>30</code></td><td>Diagnostics burst capacity</td></tr>
   </table>
 
   <h3>Process</h3>

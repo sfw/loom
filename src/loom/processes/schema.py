@@ -17,7 +17,7 @@ import re
 import shlex
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -101,6 +101,18 @@ class IterationPolicy:
 
 
 @dataclass
+class OutputCoordination:
+    """Process-level output ownership and publish coordination policy."""
+
+    strategy: str = "direct"  # "direct" | "fan_in"
+    intermediate_root: str = ".loom/phase-artifacts"
+    enforce_single_writer: bool = True
+    publish_mode: str = "transactional"  # "transactional" | "best_effort"
+    conflict_policy: str = "defer_fifo"  # "defer_fifo" | "fail_fast"
+    finalizer_input_policy: str = "require_all_workers"  # "require_all_workers" | "allow_partial"
+
+
+@dataclass
 class PhaseTemplate:
     """A blueprint phase in the process definition."""
 
@@ -111,6 +123,8 @@ class PhaseTemplate:
     verification_tier: int = 1
     is_critical_path: bool = False
     is_synthesis: bool = False
+    output_strategy: str = ""  # "" | "direct" | "fan_in"
+    finalizer_input_policy: str = ""  # "" | "require_all_workers" | "allow_partial"
     acceptance_criteria: str = ""
     deliverables: list[str] = field(default_factory=list)
     validity_contract: dict[str, Any] = field(default_factory=dict)
@@ -270,6 +284,7 @@ class ProcessDefinition:
     tools: ToolRequirements = field(default_factory=ToolRequirements)
     auth: AuthRequirements = field(default_factory=AuthRequirements)
     phase_mode: str = "guided"  # "strict" | "guided" | "suggestive"
+    output_coordination: OutputCoordination = field(default_factory=OutputCoordination)
     phases: list[PhaseTemplate] = field(default_factory=list)
     verification_rules: list[VerificationRule] = field(
         default_factory=list,
@@ -319,12 +334,66 @@ class ProcessDefinition:
         "standard": "medium",
     }
     _VALID_RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
+    _OUTPUT_STRATEGIES = frozenset({"direct", "fan_in"})
+    _OUTPUT_PUBLISH_MODES = frozenset({"transactional", "best_effort"})
+    _OUTPUT_CONFLICT_POLICIES = frozenset({"defer_fifo", "fail_fast"})
+    _FINALIZER_INPUT_POLICIES = frozenset({"require_all_workers", "allow_partial"})
+    _PHASE_FINALIZER_SUFFIX = "__finalize_output"
 
     def has_phases(self) -> bool:
         return bool(self.phases)
 
     def has_verification_rules(self) -> bool:
         return bool(self.verification_rules)
+
+    @classmethod
+    def _normalize_output_strategy(cls, value: object, *, default: str = "direct") -> str:
+        text = str(value or "").strip().lower()
+        if text in cls._OUTPUT_STRATEGIES:
+            return text
+        return default
+
+    def phase_output_strategy(self, phase_id: str) -> str:
+        default_strategy = self._normalize_output_strategy(
+            getattr(self.output_coordination, "strategy", "direct"),
+            default="direct",
+        )
+        normalized_phase_id = str(phase_id or "").strip()
+        if not normalized_phase_id:
+            return default_strategy
+        for phase in self.phases:
+            if str(getattr(phase, "id", "")).strip() != normalized_phase_id:
+                continue
+            override = str(getattr(phase, "output_strategy", "") or "").strip().lower()
+            if override in self._OUTPUT_STRATEGIES:
+                return override
+            break
+        return default_strategy
+
+    def phase_finalizer_input_policy(self, phase_id: str) -> str:
+        default_policy = str(
+            getattr(self.output_coordination, "finalizer_input_policy", "require_all_workers"),
+        ).strip().lower() or "require_all_workers"
+        if default_policy not in self._FINALIZER_INPUT_POLICIES:
+            default_policy = "require_all_workers"
+        normalized_phase_id = str(phase_id or "").strip()
+        if not normalized_phase_id:
+            return default_policy
+        for phase in self.phases:
+            if str(getattr(phase, "id", "")).strip() != normalized_phase_id:
+                continue
+            override = str(getattr(phase, "finalizer_input_policy", "") or "").strip().lower()
+            if override in self._FINALIZER_INPUT_POLICIES:
+                return override
+            break
+        return default_policy
+
+    @classmethod
+    def phase_finalizer_id(cls, phase_id: str) -> str:
+        normalized_phase_id = str(phase_id or "").strip()
+        if not normalized_phase_id:
+            return ""
+        return f"{normalized_phase_id}{cls._PHASE_FINALIZER_SUFFIX}"
 
     def is_contract_v2(self) -> bool:
         return int(self.schema_version or 1) >= 2
@@ -1072,11 +1141,43 @@ class ProcessLoader:
                 verification_tier=p.get("verification_tier", 1),
                 is_critical_path=p.get("is_critical_path", False),
                 is_synthesis=p.get("is_synthesis", False),
+                output_strategy=str(p.get("output_strategy", "") or "").strip().lower(),
+                finalizer_input_policy=str(
+                    p.get("finalizer_input_policy", "") or "",
+                ).strip().lower(),
                 acceptance_criteria=p.get("acceptance_criteria", ""),
                 deliverables=p.get("deliverables", []),
                 validity_contract=phase_validity_contract,
                 iteration=self._parse_iteration_policy(p.get("iteration")),
             ))
+
+        # Output coordination policy
+        output_coordination_raw = raw.get("output_coordination", {})
+        if not isinstance(output_coordination_raw, dict):
+            output_coordination_raw = {}
+        output_coordination = OutputCoordination(
+            strategy=str(output_coordination_raw.get("strategy", "direct") or "")
+            .strip()
+            .lower(),
+            intermediate_root=str(
+                output_coordination_raw.get("intermediate_root", ".loom/phase-artifacts")
+                or "",
+            ).strip(),
+            enforce_single_writer=self._bool_or_default(
+                output_coordination_raw.get("enforce_single_writer", True),
+                True,
+            ),
+            publish_mode=str(output_coordination_raw.get("publish_mode", "transactional") or "")
+            .strip()
+            .lower(),
+            conflict_policy=str(output_coordination_raw.get("conflict_policy", "defer_fifo") or "")
+            .strip()
+            .lower(),
+            finalizer_input_policy=str(
+                output_coordination_raw.get("finalizer_input_policy", "require_all_workers")
+                or "",
+            ).strip().lower(),
+        )
 
         # Verification rules + contract v2 verification blocks
         rules = []
@@ -1405,6 +1506,7 @@ class ProcessLoader:
             tools=tools,
             auth=auth,
             phase_mode=raw.get("phase_mode", "guided"),
+            output_coordination=output_coordination,
             phases=phases,
             verification_rules=rules,
             memory_types=memory_types,
@@ -1472,6 +1574,33 @@ class ProcessLoader:
             if command_tuple[: len(prefix)] == prefix:
                 return True
         return False
+
+    @staticmethod
+    def _normalize_workspace_relative_path(value: object) -> tuple[str, str]:
+        text = str(value or "").strip()
+        if not text:
+            return "", "must be a non-empty workspace-relative path"
+        if text.startswith("~"):
+            return "", "must be workspace-relative, not home-relative"
+        if re.match(r"^[A-Za-z]:[/\\\\]", text):
+            return "", "must be workspace-relative, not an absolute drive path"
+
+        normalized = text.replace("\\", "/")
+        path = PurePosixPath(normalized)
+        if path.is_absolute():
+            return "", "must be workspace-relative, not absolute"
+
+        normalized_parts: list[str] = []
+        for part in path.parts:
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                return "", "must not contain parent path segments ('..')"
+            normalized_parts.append(part)
+
+        if not normalized_parts:
+            return "", "must resolve to a non-empty workspace-relative path"
+        return str(PurePosixPath(*normalized_parts)), ""
 
     def _parse_iteration_policy(self, raw: object) -> IterationPolicy | None:
         if not isinstance(raw, dict):
@@ -1781,6 +1910,60 @@ class ProcessLoader:
                 f"must be one of {valid_modes}",
             )
 
+        output_coordination = defn.output_coordination
+        strategy = str(output_coordination.strategy or "").strip().lower() or "direct"
+        if strategy not in ProcessDefinition._OUTPUT_STRATEGIES:
+            errors.append(
+                "output_coordination.strategy must be one of {'direct', 'fan_in'}",
+            )
+        else:
+            output_coordination.strategy = strategy
+
+        publish_mode = (
+            str(output_coordination.publish_mode or "").strip().lower() or "transactional"
+        )
+        if publish_mode not in ProcessDefinition._OUTPUT_PUBLISH_MODES:
+            errors.append(
+                "output_coordination.publish_mode must be one of "
+                "{'transactional', 'best_effort'}",
+            )
+        else:
+            output_coordination.publish_mode = publish_mode
+
+        conflict_policy = (
+            str(output_coordination.conflict_policy or "").strip().lower() or "defer_fifo"
+        )
+        if conflict_policy not in ProcessDefinition._OUTPUT_CONFLICT_POLICIES:
+            errors.append(
+                "output_coordination.conflict_policy must be one of "
+                "{'defer_fifo', 'fail_fast'}",
+            )
+        else:
+            output_coordination.conflict_policy = conflict_policy
+
+        finalizer_input_policy = (
+            str(output_coordination.finalizer_input_policy or "").strip().lower()
+            or "require_all_workers"
+        )
+        if finalizer_input_policy not in ProcessDefinition._FINALIZER_INPUT_POLICIES:
+            errors.append(
+                "output_coordination.finalizer_input_policy must be one of "
+                "{'require_all_workers', 'allow_partial'}",
+            )
+        else:
+            output_coordination.finalizer_input_policy = finalizer_input_policy
+
+        normalized_intermediate_root, root_error = self._normalize_workspace_relative_path(
+            output_coordination.intermediate_root,
+        )
+        if root_error:
+            errors.append(
+                "output_coordination.intermediate_root "
+                f"{root_error}",
+            )
+        else:
+            output_coordination.intermediate_root = normalized_intermediate_root
+
         if defn.is_contract_v2() or self._require_v2_contract:
             policy_mode = str(defn.verification_policy.mode or "").strip().lower()
             if policy_mode not in {"llm_first", "static_first"}:
@@ -1849,6 +2032,27 @@ class ProcessLoader:
             phase_ids.add(phase.id)
             if not phase.description:
                 errors.append(f"Phase {phase.id!r} has empty description")
+            output_strategy = str(getattr(phase, "output_strategy", "") or "").strip().lower()
+            if output_strategy and output_strategy not in ProcessDefinition._OUTPUT_STRATEGIES:
+                errors.append(
+                    f"Phase {phase.id!r}: output_strategy must be one of "
+                    "{'direct', 'fan_in'} when provided",
+                )
+            else:
+                phase.output_strategy = output_strategy
+            finalizer_input_policy = str(
+                getattr(phase, "finalizer_input_policy", "") or "",
+            ).strip().lower()
+            if (
+                finalizer_input_policy
+                and finalizer_input_policy not in ProcessDefinition._FINALIZER_INPUT_POLICIES
+            ):
+                errors.append(
+                    f"Phase {phase.id!r}: finalizer_input_policy must be one of "
+                    "{'require_all_workers', 'allow_partial'} when provided",
+                )
+            else:
+                phase.finalizer_input_policy = finalizer_input_policy
             if isinstance(phase.validity_contract, dict) and phase.validity_contract:
                 self._validate_validity_contract(
                     phase.validity_contract,
@@ -1862,6 +2066,32 @@ class ProcessLoader:
                     errors=errors,
                 )
             self._validate_iteration_policy(phase, errors)
+
+        phase_finalizer_owners: dict[str, str] = {}
+        for phase in defn.phases:
+            phase_id = str(getattr(phase, "id", "") or "").strip()
+            if not phase_id:
+                continue
+            if not bool(getattr(phase, "deliverables", [])):
+                continue
+            if defn.phase_output_strategy(phase_id) != "fan_in":
+                continue
+            finalizer_id = ProcessDefinition.phase_finalizer_id(phase_id)
+            if not finalizer_id:
+                continue
+            if finalizer_id in phase_ids:
+                errors.append(
+                    f"Phase {phase_id!r}: fan_in finalizer id {finalizer_id!r} "
+                    "collides with declared phase id; rename the phase id",
+                )
+            owner_phase = phase_finalizer_owners.get(finalizer_id, "")
+            if owner_phase and owner_phase != phase_id:
+                errors.append(
+                    f"fan_in finalizer id collision: {owner_phase!r} and "
+                    f"{phase_id!r} both resolve to {finalizer_id!r}",
+                )
+            else:
+                phase_finalizer_owners[finalizer_id] = phase_id
 
         if defn._is_high_risk_intent():
             for phase in defn.phases:

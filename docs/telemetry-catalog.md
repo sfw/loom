@@ -16,6 +16,65 @@ The source of truth is:
 - `ACTIVE_EVENT_TYPES`
 - `INTERNAL_ONLY_EVENT_TYPES`
 
+## Runtime Verbosity Modes
+
+Operator sinks (`/tasks/{id}/stream`, `/tasks/{id}/tokens`, delegate/TUI progress surfaces)
+apply one shared policy over effective runtime mode:
+
+- `off`
+- `active`
+- `all_typed`
+- `debug`
+
+`internal_only` is accepted as a temporary input alias and normalized to `all_typed`.
+Runtime override scope is process-local in the current phase.
+
+Always-pass-through operator events (including `off`):
+
+- `task_created`
+- `task_run_acquired`
+- `task_run_heartbeat`
+- `task_run_recovered`
+- `task_cancel_requested`
+- `task_cancel_ack`
+- `task_cancel_timeout`
+- `task_paused`
+- `task_resumed`
+- `task_injected`
+- `approval_requested`
+- `ask_user_requested`
+- `task_completed`
+- `task_failed`
+- `task_cancelled`
+
+Diagnostics channel behavior:
+
+- `telemetry_diagnostic` is typed `internal_only`.
+- It is only delivered to operator sinks in `debug`.
+- It is rate-limited and recursion-guarded in `EventBus`.
+
+## Sink Matrix
+
+| Sink class | Example sinks | Mode suppression |
+| --- | --- | --- |
+| Compliance | SQLite `events` persistence | Not suppressed by operator mode in phase A |
+| Operator | SSE streams, delegate progress, TUI progress | Filtered by `should_deliver_operator(event_type, effective_mode)` |
+
+## Troubleshooting by Sink/Mode
+
+- Symptom: `token_streamed` is missing from SSE/delegate/TUI while runs still complete.
+  Cause: expected in `off` mode; token streaming is suppressed outside passthrough set.
+  Action: check effective mode via `GET /settings/telemetry` (or TUI `/telemetry`) and switch to `active`/`all_typed`/`debug`.
+- Symptom: approvals or ask-user prompts appear stalled in operator views.
+  Cause: usually not telemetry filtering; `approval_requested` and `ask_user_requested` are passthrough in all modes.
+  Action: verify upstream task state and pending human-loop handlers, then inspect `events` table for corresponding records.
+- Symptom: audit rows appear missing in `off`.
+  Cause: should not happen in phase A because compliance persistence is mode-independent.
+  Action: query SQLite `events` directly and inspect `telemetry_diagnostic` rows for persistence failures.
+- Symptom: diagnostics are missing in operator sinks.
+  Cause: `telemetry_diagnostic` is operator-visible only in `debug`, and may be rate-limited.
+  Action: set mode to `debug`, then reproduce once with low event volume.
+
 ## Common Payload Contract
 
 Event payloads are normalized in [`src/loom/events/bus.py`](../src/loom/events/bus.py) and include:
@@ -49,6 +108,8 @@ Control-plane task actions are tracked with typed events:
 - `task_cancel_ack`
 - `task_cancel_timeout`
 - `steer_instruction`
+- `telemetry_mode_changed`
+- `telemetry_settings_warning`
 
 ## Verification Lifecycle Telemetry
 

@@ -195,15 +195,83 @@ class PromptAssembler:
         ).strip()
         # PROCESS: enforce exact deliverable filenames for active phase/subtask.
         if self._process:
-            deliverables = self._expected_deliverables_for_subtask(subtask.id)
-            if deliverables:
-                names = "\n".join(f"- {name}" for name in deliverables)
+            phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
+            output_role = str(getattr(subtask, "output_role", "") or "").strip().lower()
+            phase_strategy = ""
+            strategy_resolver = getattr(self._process, "phase_output_strategy", None)
+            if callable(strategy_resolver):
+                phase_strategy = str(
+                    strategy_resolver(phase_id or subtask.id),
+                ).strip().lower()
+            publish_mode = str(
+                getattr(
+                    getattr(self._process, "output_coordination", None),
+                    "publish_mode",
+                    "transactional",
+                ) or "transactional",
+            ).strip().lower()
+
+            if phase_strategy == "fan_in" and output_role != "phase_finalizer":
+                intermediate_root = str(
+                    getattr(
+                        getattr(self._process, "output_coordination", None),
+                        "intermediate_root",
+                        ".loom/phase-artifacts",
+                    ) or ".loom/phase-artifacts",
+                ).strip() or ".loom/phase-artifacts"
+                phase_hint = phase_id or subtask.id
                 subtask_section += (
-                    "\n\nREQUIRED OUTPUT FILES (EXACT FILENAMES):\n"
-                    f"{names}\n"
-                    "You MUST create/update these exact filenames before "
-                    "finishing this subtask. Do not rename them."
+                    "\n\nOUTPUT COORDINATION (FAN-IN WORKER MODE):\n"
+                    "- Do not write canonical phase deliverable filenames in this step.\n"
+                    "- Produce worker intermediate artifacts only.\n"
+                    "- Preferred artifact path prefix:\n"
+                    f"  {intermediate_root}/<run-id>/{phase_hint}/{subtask.id}/"
                 )
+            elif (
+                phase_strategy == "fan_in"
+                and output_role == "phase_finalizer"
+                and publish_mode == "transactional"
+            ):
+                intermediate_root = str(
+                    getattr(
+                        getattr(self._process, "output_coordination", None),
+                        "intermediate_root",
+                        ".loom/phase-artifacts",
+                    ) or ".loom/phase-artifacts",
+                ).strip() or ".loom/phase-artifacts"
+                phase_hint = phase_id or subtask.id
+                subtask_section += (
+                    "\n\nOUTPUT COORDINATION (FAN-IN FINALIZER TRANSACTIONAL MODE):\n"
+                    "- Read worker inputs from the phase artifact manifest.\n"
+                    "- Write staged outputs only; do not write canonical targets directly.\n"
+                    "- Staging path prefix:\n"
+                    f"  {intermediate_root}/<run-id>/{phase_hint}/{subtask.id}/publish-stage/"
+                )
+                deliverables = self._expected_deliverables_for_subtask(
+                    subtask.id,
+                    phase_id=phase_id,
+                )
+                if deliverables:
+                    names = "\n".join(f"- {name}" for name in deliverables)
+                    subtask_section += (
+                        "\n\nCANONICAL DELIVERABLE TARGETS (PUBLISHED AFTER SUCCESS):\n"
+                        f"{names}\n"
+                        "Stage finalized content for these targets and let the orchestrator "
+                        "publish them atomically."
+                    )
+            else:
+                deliverables = self._expected_deliverables_for_subtask(
+                    subtask.id,
+                    phase_id=phase_id,
+                )
+                if deliverables:
+                    names = "\n".join(f"- {name}" for name in deliverables)
+                    subtask_section += (
+                        "\n\nREQUIRED OUTPUT FILES (EXACT FILENAMES):\n"
+                        f"{names}\n"
+                        "You MUST create/update these exact filenames before "
+                        "finishing this subtask. Do not rename them."
+                    )
 
         if self._requires_evidence_contract(subtask):
             subtask_section += (
@@ -313,13 +381,21 @@ class PromptAssembler:
 
         return self._trim_to_budget(prompt)
 
-    def _expected_deliverables_for_subtask(self, subtask_id: str) -> list[str]:
+    def _expected_deliverables_for_subtask(
+        self,
+        subtask_id: str,
+        *,
+        phase_id: str = "",
+    ) -> list[str]:
         """Return expected deliverable filenames for the given subtask id."""
         if not self._process:
             return []
         deliverables = self._process.get_deliverables()
         if not deliverables:
             return []
+        normalized_phase_id = str(phase_id or "").strip()
+        if normalized_phase_id in deliverables:
+            return deliverables[normalized_phase_id]
         if subtask_id in deliverables:
             return deliverables[subtask_id]
         if len(deliverables) == 1:

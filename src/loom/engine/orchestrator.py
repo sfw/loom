@@ -43,6 +43,7 @@ from loom.events.types import (
     ASK_USER_REQUESTED,
     ASK_USER_TIMEOUT,
     CLAIMS_PRUNED,
+    FORBIDDEN_CANONICAL_WRITE_BLOCKED,
     ITERATION_COMPLETED,
     ITERATION_GATE_FAILED,
     ITERATION_RETRYING,
@@ -67,6 +68,8 @@ from loom.events.types import (
     SUBTASK_COMPLETED,
     SUBTASK_FAILED,
     SUBTASK_OUTCOME_STALE,
+    SUBTASK_OUTPUT_CONFLICT_DEFERRED,
+    SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING,
     SUBTASK_POLICY_RECONCILED,
     SUBTASK_RETRYING,
     SUBTASK_STARTED,
@@ -304,6 +307,9 @@ class Orchestrator:
     Subtask execution (tool loop, verification, memory extraction)
     is delegated to SubtaskRunner.
     """
+    _OUTPUT_CONFLICT_STARVATION_THRESHOLD = 3
+    _OUTPUT_ROLE_WORKER = "worker"
+    _OUTPUT_ROLE_PHASE_FINALIZER = "phase_finalizer"
 
     def __init__(
         self,
@@ -487,6 +493,8 @@ class Orchestrator:
             max_iterations = self._config.execution.max_loop_iterations
             max_parallel = self._config.execution.max_parallel_subtasks
             attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
+            output_conflict_tracker: dict[str, dict[str, object]] = {}
+            output_conflict_sequence = 1
             pending_replan: dict[str, str | None] | None = None
             stall_recovery_attempts = 0
             max_stall_recovery_attempts = 2
@@ -543,8 +551,66 @@ class Orchestrator:
                 stall_recovery_attempts = 0
                 task.metadata.pop("blocked_subtasks", None)
 
-                # Cap to max_parallel_subtasks
-                batch = runnable[:max_parallel]
+                # Cap to max_parallel_subtasks.
+                # Additional guard: do not execute subtasks in parallel when they
+                # target overlapping canonical deliverable paths.
+                conflict_deferrals: list[dict[str, object]] = []
+                if self._output_enforce_single_writer():
+                    batch, conflict_deferrals, output_conflict_sequence = (
+                        self._select_conflict_safe_batch(
+                            task=task,
+                            runnable=runnable,
+                            max_parallel=max_parallel,
+                            conflict_tracker=output_conflict_tracker,
+                            sequence_counter=output_conflict_sequence,
+                        )
+                    )
+                    if not batch:
+                        batch = runnable[:max_parallel]
+                else:
+                    batch = runnable[:max_parallel]
+                    output_conflict_tracker.clear()
+                    output_conflict_sequence = 1
+
+                if conflict_deferrals and self._output_conflict_policy() == "fail_fast":
+                    first = conflict_deferrals[0]
+                    first_id = str(first.get("subtask_id", "") or "").strip()
+                    conflicting_paths = list(first.get("conflicting_paths", []))
+                    conflicting_with = list(first.get("conflicting_with", []))
+                    raise RuntimeError(
+                        "Output conflict policy fail_fast blocked dispatch for "
+                        f"subtask '{first_id}' due to overlapping canonical paths "
+                        f"{conflicting_paths} with {conflicting_with}.",
+                    )
+                for deferred in conflict_deferrals:
+                    subtask_id = str(deferred.get("subtask_id", "")).strip()
+                    if not subtask_id:
+                        continue
+                    self._emit(SUBTASK_OUTPUT_CONFLICT_DEFERRED, task.id, {
+                        "subtask_id": subtask_id,
+                        "phase_id": str(deferred.get("phase_id", "")).strip(),
+                        "conflicting_paths": list(deferred.get("conflicting_paths", [])),
+                        "conflicting_with": list(deferred.get("conflicting_with", [])),
+                        "deferral_streak": int(deferred.get("deferral_streak", 0) or 0),
+                        "deferral_count": int(deferred.get("deferral_count", 0) or 0),
+                    })
+                    if bool(deferred.get("starvation_warning", False)):
+                        self._emit(SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING, task.id, {
+                            "subtask_id": subtask_id,
+                            "phase_id": str(deferred.get("phase_id", "")).strip(),
+                            "deferral_streak": int(
+                                deferred.get("deferral_streak", 0) or 0,
+                            ),
+                            "threshold": int(
+                                deferred.get("starvation_threshold", 0) or 0,
+                            ),
+                            "conflicting_paths": list(
+                                deferred.get("conflicting_paths", []),
+                            ),
+                            "conflicting_with": list(
+                                deferred.get("conflicting_with", []),
+                            ),
+                        })
                 iteration += 1
                 batch_plan_version = task.plan.version
 
@@ -2036,7 +2102,33 @@ class Orchestrator:
             attempt=len(attempts),
             original_tier=subtask.model_tier,
         )
-        expected_deliverables = self._expected_deliverables_for_subtask(subtask)
+        output_policy = self._output_write_policy_for_subtask(subtask=subtask)
+        expected_deliverables = list(output_policy.get("expected_deliverables", []))
+        forbidden_deliverables = list(output_policy.get("forbidden_deliverables", []))
+        allowed_output_prefixes = self._fan_in_worker_output_prefixes(
+            task=task,
+            subtask=subtask,
+        )
+        stage_plan = self._finalizer_stage_publish_plan(
+            task=task,
+            subtask=subtask,
+            canonical_deliverables=expected_deliverables,
+            attempt_index=len(attempts) + 1,
+        )
+        runner_expected_deliverables = list(expected_deliverables)
+        runner_forbidden_deliverables = list(forbidden_deliverables)
+        if bool(stage_plan.get("enabled", False)):
+            runner_expected_deliverables = list(stage_plan.get("stage_deliverables", []))
+            runner_forbidden_deliverables = self._merge_unique_paths(
+                runner_forbidden_deliverables,
+                expected_deliverables,
+            )
+        subtask.output_role = str(output_policy.get("output_role", "") or self._OUTPUT_ROLE_WORKER)
+        subtask.output_strategy = str(output_policy.get("output_strategy", "") or "direct")
+        manifest_requirements = self._evaluate_finalizer_manifest_requirements(
+            task=task,
+            subtask=subtask,
+        )
         is_iteration_retry, iteration_strategy = self._iteration_retry_mode(subtask)
         targeted_iteration_retry = (
             is_iteration_retry and iteration_strategy == "targeted_remediation"
@@ -2047,8 +2139,52 @@ class Orchestrator:
             attempts=attempts,
             strategy=retry_strategy,
             expected_deliverables=expected_deliverables,
+            forbidden_deliverables=runner_forbidden_deliverables,
             base_context=retry_context,
         )
+        retry_context = self._augment_retry_context_for_stage_publish(
+            base_context=retry_context,
+            stage_plan=stage_plan,
+        )
+        retry_context = self._augment_retry_context_with_phase_artifacts(
+            task=task,
+            subtask=subtask,
+            base_context=retry_context,
+        )
+        if bool(manifest_requirements.get("enabled", False)):
+            policy = str(manifest_requirements.get("policy", "") or "").strip().lower()
+            missing_worker_ids = list(manifest_requirements.get("missing_worker_ids", []))
+            if missing_worker_ids:
+                retry_context = (
+                    f"{retry_context}\n\n"
+                    "FINALIZER INPUT POLICY STATUS:\n"
+                    f"- policy: {policy}\n"
+                    "- workers missing manifest artifacts: "
+                    f"{', '.join(missing_worker_ids)}"
+                ).strip()
+            if missing_worker_ids and policy == "require_all_workers":
+                message = (
+                    "Finalizer blocked: missing worker artifacts for phase policy "
+                    f"'require_all_workers': {', '.join(missing_worker_ids)}"
+                )
+                blocked = SubtaskResult(
+                    status=SubtaskResultStatus.FAILED,
+                    summary=message,
+                )
+                blocked_verification = VerificationResult(
+                    tier=max(1, int(subtask.verification_tier or required_verification_tier)),
+                    passed=False,
+                    confidence=0.0,
+                    feedback=message,
+                    outcome="fail",
+                    reason_code="finalizer_missing_worker_artifacts",
+                    severity_class="semantic",
+                    metadata={
+                        "finalizer_input_policy": policy,
+                        "missing_worker_ids": missing_worker_ids,
+                    },
+                )
+                return subtask, blocked, blocked_verification
         prior_iteration_feedback = str(
             getattr(subtask, "iteration_last_gate_summary", "") or "",
         ).strip()
@@ -2177,15 +2313,52 @@ class Orchestrator:
             changelog=changelog,
             prior_successful_tool_calls=prior_successful_tool_calls,
             prior_evidence_records=prior_evidence_records,
-            expected_deliverables=expected_deliverables,
-            enforce_deliverable_paths=bool(expected_deliverables) and bool(
-                attempts or targeted_iteration_retry
+            expected_deliverables=runner_expected_deliverables,
+            forbidden_deliverables=runner_forbidden_deliverables,
+            allowed_output_prefixes=allowed_output_prefixes,
+            enforce_deliverable_paths=bool(runner_expected_deliverables) and bool(
+                attempts or targeted_iteration_retry or bool(stage_plan.get("enabled", False))
             ),
-            edit_existing_only=bool(expected_deliverables) and bool(
-                attempts or targeted_iteration_retry
+            edit_existing_only=bool(runner_expected_deliverables) and bool(
+                attempts or targeted_iteration_retry or bool(stage_plan.get("enabled", False))
             ),
             retry_strategy=retry_strategy.value,
         )
+
+        if bool(manifest_requirements.get("enabled", False)):
+            allowed_manifest_paths = list(
+                manifest_requirements.get("allowed_manifest_paths", []),
+            )
+            allowed_stage_prefixes = list(stage_plan.get("stage_prefixes", []))
+            violations = self._manifest_only_input_violations(
+                task=task,
+                subtask=subtask,
+                tool_calls=result.tool_calls,
+                allowed_manifest_paths=allowed_manifest_paths,
+                allowed_extra_prefixes=allowed_stage_prefixes,
+            )
+            if violations:
+                message = (
+                    "Finalizer input policy violation: read access to intermediate "
+                    "artifacts outside latest worker manifest entries: "
+                    + ", ".join(violations)
+                )
+                result.status = SubtaskResultStatus.FAILED
+                verification = VerificationResult(
+                    tier=max(1, int(subtask.verification_tier or required_verification_tier)),
+                    passed=False,
+                    confidence=0.0,
+                    feedback=message,
+                    outcome="fail",
+                    reason_code="manifest_input_policy_violation",
+                    severity_class="semantic",
+                    metadata={
+                        "violating_paths": violations,
+                        "finalizer_input_policy": str(
+                            manifest_requirements.get("policy", ""),
+                        ),
+                    },
+                )
 
         verification = self._enforce_required_fact_checker(
             subtask=subtask,
@@ -2230,6 +2403,33 @@ class Orchestrator:
             evidence_records=result.evidence_records,
             tool_calls=result.tool_calls,
         )
+        if (
+            bool(stage_plan.get("enabled", False))
+            and result.status != SubtaskResultStatus.FAILED
+            and verification.passed
+        ):
+            commit_ok, commit_error = self._commit_finalizer_stage_publish(
+                task=task,
+                subtask=subtask,
+                stage_plan=stage_plan,
+            )
+            if not commit_ok:
+                result.status = SubtaskResultStatus.FAILED
+                message = commit_error or "Transactional stage+commit publish failed."
+                verification = VerificationResult(
+                    tier=max(1, int(subtask.verification_tier or required_verification_tier)),
+                    passed=False,
+                    confidence=0.0,
+                    feedback=message,
+                    outcome="fail",
+                    reason_code="output_publish_commit_failed",
+                    severity_class="semantic",
+                )
+                result.summary = (
+                    f"{result.summary}\n{message}".strip()
+                    if result.summary
+                    else message
+                )
 
         return subtask, result, verification
 
@@ -2626,12 +2826,14 @@ class Orchestrator:
 
         evaluation: IterationEvaluation | None = None
         if not budget_reason:
+            output_policy = self._output_write_policy_for_subtask(subtask=subtask)
+            expected_deliverables = list(output_policy.get("expected_deliverables", []))
             evaluation = await self._iteration_gates.evaluate(
                 policy=policy,
                 result=result,
                 verification=verification,
                 workspace=Path(task.workspace) if task.workspace else None,
-                expected_deliverables=self._expected_deliverables_for_subtask(subtask),
+                expected_deliverables=expected_deliverables,
             )
 
         attempt_index = int(max(0, subtask.iteration_attempt) + 1)
@@ -2997,6 +3199,8 @@ class Orchestrator:
                 "model_tier": int(getattr(subtask, "model_tier", 1) or 1),
                 "verification_tier": int(getattr(subtask, "verification_tier", 1) or 1),
                 "acceptance_criteria": str(getattr(subtask, "acceptance_criteria", "") or ""),
+                "output_role": str(getattr(subtask, "output_role", "") or ""),
+                "output_strategy": str(getattr(subtask, "output_strategy", "") or ""),
                 "validity_contract_hash": str(
                     getattr(subtask, "validity_contract_hash", "") or "",
                 ),
@@ -3006,6 +3210,14 @@ class Orchestrator:
                 subtask=subtask,
                 phase=phase,
             )
+            phase_hint = phase_id or subtask.id
+            phase_strategy = self._phase_output_strategy(phase_hint)
+            subtask.output_strategy = phase_strategy
+            finalizer_id = self._phase_finalizer_id(phase_hint)
+            if phase_strategy == "fan_in" and finalizer_id and subtask.id == finalizer_id:
+                subtask.output_role = self._OUTPUT_ROLE_PHASE_FINALIZER
+            else:
+                subtask.output_role = self._OUTPUT_ROLE_WORKER
 
             contract_snapshot = (
                 dict(subtask.validity_contract_snapshot)
@@ -3035,6 +3247,8 @@ class Orchestrator:
                 "model_tier": int(getattr(subtask, "model_tier", 1) or 1),
                 "verification_tier": int(getattr(subtask, "verification_tier", 1) or 1),
                 "acceptance_criteria": str(getattr(subtask, "acceptance_criteria", "") or ""),
+                "output_role": str(getattr(subtask, "output_role", "") or ""),
+                "output_strategy": str(getattr(subtask, "output_strategy", "") or ""),
                 "validity_contract_hash": str(
                     getattr(subtask, "validity_contract_hash", "") or "",
                 ),
@@ -3627,6 +3841,21 @@ class Orchestrator:
                 f"Invalid plan topology from {context}: " + "; ".join(topology_issues),
             )
         self._annotate_subtask_phase_ids(task=task, plan=working)
+        working, output_alignment = self._align_plan_output_coordination(
+            plan=working,
+        )
+        if output_alignment:
+            self._emit(TASK_PLAN_NORMALIZED, task.id, {
+                "context": context,
+                "normalized_subtasks": output_alignment,
+                "plan_version": int(working.version),
+            })
+            post_alignment_issues = self._plan_topology_issues(working)
+            if post_alignment_issues:
+                raise ValueError(
+                    "Output-coordination normalization introduced invalid topology from "
+                    f"{context}: " + "; ".join(post_alignment_issues),
+                )
         return working
 
     def _annotate_subtask_phase_ids(self, *, task: Task, plan: Plan) -> None:
@@ -3707,6 +3936,251 @@ class Orchestrator:
                 )
             else:
                 self._ensure_subtask_validity_snapshot(subtask=subtask)
+
+    def _phase_output_strategy(self, phase_id: str) -> str:
+        process = self._process
+        if process is None:
+            return "direct"
+        resolver = getattr(process, "phase_output_strategy", None)
+        if callable(resolver):
+            try:
+                resolved = str(resolver(phase_id)).strip().lower()
+            except Exception:
+                resolved = ""
+            if resolved in {"direct", "fan_in"}:
+                return resolved
+        return "direct"
+
+    def _phase_finalizer_id(self, phase_id: str) -> str:
+        process = self._process
+        if process is None:
+            return ""
+        resolver = getattr(process, "phase_finalizer_id", None)
+        if callable(resolver):
+            try:
+                return str(resolver(phase_id) or "").strip()
+            except Exception:
+                return ""
+        normalized_phase_id = str(phase_id or "").strip()
+        if not normalized_phase_id:
+            return ""
+        return f"{normalized_phase_id}__finalize_output"
+
+    def _subtask_output_role(self, subtask: Subtask) -> str:
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip() or subtask.id
+        if self._phase_output_strategy(phase_id) != "fan_in":
+            return self._OUTPUT_ROLE_WORKER
+        explicit = str(getattr(subtask, "output_role", "") or "").strip().lower()
+        if explicit in {self._OUTPUT_ROLE_WORKER, self._OUTPUT_ROLE_PHASE_FINALIZER}:
+            return explicit
+        finalizer_id = self._phase_finalizer_id(phase_id)
+        if finalizer_id and str(getattr(subtask, "id", "")).strip() == finalizer_id:
+            return self._OUTPUT_ROLE_PHASE_FINALIZER
+        return self._OUTPUT_ROLE_WORKER
+
+    def _align_plan_output_coordination(
+        self,
+        *,
+        plan: Plan,
+    ) -> tuple[Plan, list[dict[str, object]]]:
+        process = self._process
+        if process is None:
+            return plan, []
+
+        deliverables_by_phase = process.get_deliverables()
+        if not isinstance(deliverables_by_phase, dict):
+            deliverables_by_phase = {}
+
+        phase_by_id: dict[str, object] = {}
+        for phase in list(getattr(process, "phases", []) or []):
+            phase_id = str(getattr(phase, "id", "") or "").strip()
+            if phase_id:
+                phase_by_id[phase_id] = phase
+
+        changed: list[dict[str, object]] = []
+        finalizer_id_by_phase: dict[str, str] = {}
+        subtask_by_id = {subtask.id: subtask for subtask in plan.subtasks}
+
+        for phase_id, deliverables in deliverables_by_phase.items():
+            normalized_phase_id = str(phase_id or "").strip()
+            if (
+                not normalized_phase_id
+                or not isinstance(deliverables, list)
+                or not deliverables
+                or self._phase_output_strategy(normalized_phase_id) != "fan_in"
+            ):
+                continue
+            finalizer_id = self._phase_finalizer_id(normalized_phase_id)
+            if not finalizer_id:
+                continue
+            phase_subtasks = [
+                subtask
+                for subtask in plan.subtasks
+                if str(getattr(subtask, "phase_id", "") or "").strip() == normalized_phase_id
+            ]
+            if not phase_subtasks:
+                continue
+
+            worker_subtasks = [subtask for subtask in phase_subtasks if subtask.id != finalizer_id]
+            finalizer = subtask_by_id.get(finalizer_id)
+            if (
+                finalizer is not None
+                and str(getattr(finalizer, "phase_id", "") or "").strip() != normalized_phase_id
+            ):
+                finalizer = None
+            if finalizer is None and worker_subtasks:
+                phase = phase_by_id.get(normalized_phase_id)
+                worker_ids = sorted({
+                    worker.id
+                    for worker in worker_subtasks
+                    if worker.id and worker.id != finalizer_id
+                })
+                model_tier = int(getattr(phase, "model_tier", 1) or 1) if phase else 1
+                verification_tier = (
+                    int(getattr(phase, "verification_tier", 1) or 1) if phase else 1
+                )
+                if worker_subtasks:
+                    model_tier = max(
+                        model_tier,
+                        max(
+                            int(getattr(worker, "model_tier", 1) or 1)
+                            for worker in worker_subtasks
+                        ),
+                    )
+                    verification_tier = max(
+                        verification_tier,
+                        max(
+                            int(getattr(worker, "verification_tier", 1) or 1)
+                            for worker in worker_subtasks
+                        ),
+                    )
+                finalizer = Subtask(
+                    id=finalizer_id,
+                    description=(
+                        f"Finalize canonical deliverables for phase '{normalized_phase_id}' "
+                        "from worker artifacts."
+                    ),
+                    depends_on=worker_ids,
+                    phase_id=normalized_phase_id,
+                    output_role=self._OUTPUT_ROLE_PHASE_FINALIZER,
+                    output_strategy="fan_in",
+                    model_tier=model_tier,
+                    verification_tier=verification_tier,
+                    is_critical_path=bool(getattr(phase, "is_critical_path", False)),
+                    acceptance_criteria=str(
+                        getattr(phase, "acceptance_criteria", "") or "",
+                    ).strip(),
+                    max_retries=self._config.execution.max_subtask_retries,
+                )
+                plan.subtasks.append(finalizer)
+                subtask_by_id[finalizer_id] = finalizer
+                changed.append({
+                    "subtask_id": finalizer_id,
+                    "phase_id": normalized_phase_id,
+                    "reason": "fan_in_finalizer_injected",
+                    "depends_on": list(worker_ids),
+                })
+
+            if finalizer is not None:
+                finalizer_id_by_phase[normalized_phase_id] = finalizer.id
+                finalizer.output_role = self._OUTPUT_ROLE_PHASE_FINALIZER
+                finalizer.output_strategy = "fan_in"
+                required_deps = sorted({
+                    worker.id
+                    for worker in worker_subtasks
+                    if worker.id and worker.id != finalizer.id
+                })
+                merged_deps = sorted({
+                    dep_id
+                    for dep_id in [*list(getattr(finalizer, "depends_on", [])), *required_deps]
+                    if dep_id and dep_id != finalizer.id
+                })
+                if merged_deps != list(getattr(finalizer, "depends_on", [])):
+                    finalizer.depends_on = merged_deps
+                    changed.append({
+                        "subtask_id": finalizer.id,
+                        "phase_id": normalized_phase_id,
+                        "reason": "fan_in_finalizer_dependencies_updated",
+                        "depends_on": list(merged_deps),
+                    })
+
+            if not worker_subtasks:
+                continue
+            for worker in worker_subtasks:
+                worker.output_role = self._OUTPUT_ROLE_WORKER
+                worker.output_strategy = "fan_in"
+                worker_dependencies = list(getattr(worker, "depends_on", []))
+                if finalizer is not None and finalizer.id in worker_dependencies:
+                    worker.depends_on = [
+                        dep_id
+                        for dep_id in worker_dependencies
+                        if dep_id != finalizer.id
+                    ]
+                    changed.append({
+                        "subtask_id": worker.id,
+                        "phase_id": normalized_phase_id,
+                        "reason": "fan_in_worker_cycle_dependency_removed",
+                        "depends_on": list(worker.depends_on),
+                    })
+
+        subtask_phase_by_id = {
+            subtask.id: str(getattr(subtask, "phase_id", "") or "").strip()
+            for subtask in plan.subtasks
+            if str(getattr(subtask, "id", "") or "").strip()
+        }
+        for subtask in plan.subtasks:
+            current_phase = str(getattr(subtask, "phase_id", "") or "").strip()
+            remapped_dependencies: list[str] = []
+            for dep in list(getattr(subtask, "depends_on", [])):
+                dep_id = str(dep or "").strip()
+                if not dep_id:
+                    continue
+                dep_phase = subtask_phase_by_id.get(dep_id, "")
+                replacement = dep_id
+                if dep_phase and dep_phase in finalizer_id_by_phase:
+                    finalizer_id = finalizer_id_by_phase[dep_phase]
+                    if current_phase != dep_phase and dep_id != finalizer_id:
+                        replacement = finalizer_id
+                if replacement and replacement not in remapped_dependencies:
+                    remapped_dependencies.append(replacement)
+            if remapped_dependencies != list(getattr(subtask, "depends_on", [])):
+                subtask.depends_on = remapped_dependencies
+                changed.append({
+                    "subtask_id": subtask.id,
+                    "phase_id": current_phase,
+                    "reason": "fan_in_dependency_remapped_to_finalizer",
+                    "depends_on": list(remapped_dependencies),
+                })
+
+        for subtask in plan.subtasks:
+            phase_id = str(getattr(subtask, "phase_id", "") or "").strip() or subtask.id
+            strategy = self._phase_output_strategy(phase_id)
+            role = self._subtask_output_role(subtask)
+            before_role = str(getattr(subtask, "output_role", "") or "")
+            before_strategy = str(getattr(subtask, "output_strategy", "") or "")
+            subtask.output_role = role
+            subtask.output_strategy = strategy
+            if before_role != subtask.output_role or before_strategy != subtask.output_strategy:
+                changed.append({
+                    "subtask_id": subtask.id,
+                    "phase_id": str(getattr(subtask, "phase_id", "") or "").strip(),
+                    "reason": "subtask_output_policy_aligned",
+                    "output_role": subtask.output_role,
+                    "output_strategy": subtask.output_strategy,
+                })
+
+        deduped: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in changed:
+            key = (
+                str(item.get("subtask_id", "")).strip(),
+                str(item.get("reason", "")).strip(),
+            )
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return plan, deduped
 
     @staticmethod
     def _hash_validity_contract(contract: dict[str, object]) -> str:
@@ -5206,7 +5680,9 @@ class Orchestrator:
                 indent=2,
                 sort_keys=True,
             )
-        expected_deliverables = self._expected_deliverables_for_subtask(subtask)
+        output_policy = self._output_write_policy_for_subtask(subtask=subtask)
+        expected_deliverables = list(output_policy.get("expected_deliverables", []))
+        forbidden_deliverables = list(output_policy.get("forbidden_deliverables", []))
         changed_files = self._files_from_attempts(prior_attempts)
         current_changed = self._files_from_tool_calls(result.tool_calls)
         for path in current_changed:
@@ -5246,6 +5722,11 @@ class Orchestrator:
         if expected_deliverables:
             lines.append(
                 "Expected deliverables: " + ", ".join(expected_deliverables),
+            )
+        if forbidden_deliverables:
+            lines.append(
+                "Forbidden canonical deliverables for this subtask: "
+                + ", ".join(forbidden_deliverables),
             )
         if changed_files:
             lines.append("Touched files: " + ", ".join(changed_files))
@@ -5505,14 +5986,85 @@ class Orchestrator:
                     strategy=RetryStrategy.UNCONFIRMED_DATA,
                 )
             )
-            expected_deliverables = self._expected_deliverables_for_subtask(subtask)
+            output_policy = self._output_write_policy_for_subtask(subtask=subtask)
+            expected_deliverables = list(output_policy.get("expected_deliverables", []))
+            forbidden_deliverables = list(output_policy.get("forbidden_deliverables", []))
+            allowed_output_prefixes = self._fan_in_worker_output_prefixes(
+                task=task,
+                subtask=subtask,
+            )
+            stage_plan = self._finalizer_stage_publish_plan(
+                task=task,
+                subtask=subtask,
+                canonical_deliverables=expected_deliverables,
+                attempt_index=len(attempts) + 1,
+            )
+            runner_expected_deliverables = list(expected_deliverables)
+            runner_forbidden_deliverables = list(forbidden_deliverables)
+            if bool(stage_plan.get("enabled", False)):
+                runner_expected_deliverables = list(stage_plan.get("stage_deliverables", []))
+                runner_forbidden_deliverables = self._merge_unique_paths(
+                    runner_forbidden_deliverables,
+                    expected_deliverables,
+                )
+            manifest_requirements = self._evaluate_finalizer_manifest_requirements(
+                task=task,
+                subtask=subtask,
+            )
             remediation_context = self._augment_retry_context_for_outputs(
                 subtask=subtask,
                 attempts=attempts,
                 strategy=RetryStrategy.UNCONFIRMED_DATA,
                 expected_deliverables=expected_deliverables,
+                forbidden_deliverables=runner_forbidden_deliverables,
                 base_context=remediation_context,
             )
+            remediation_context = self._augment_retry_context_for_stage_publish(
+                base_context=remediation_context,
+                stage_plan=stage_plan,
+            )
+            remediation_context = self._augment_retry_context_with_phase_artifacts(
+                task=task,
+                subtask=subtask,
+                base_context=remediation_context,
+            )
+            if bool(manifest_requirements.get("enabled", False)):
+                policy = str(manifest_requirements.get("policy", "") or "").strip().lower()
+                missing_worker_ids = list(manifest_requirements.get("missing_worker_ids", []))
+                if missing_worker_ids:
+                    remediation_context = (
+                        f"{remediation_context}\n\n"
+                        "FINALIZER INPUT POLICY STATUS:\n"
+                        f"- policy: {policy}\n"
+                        "- workers missing manifest artifacts: "
+                        f"{', '.join(missing_worker_ids)}"
+                    ).strip()
+                if missing_worker_ids and policy == "require_all_workers":
+                    message = (
+                        "Finalizer blocked: missing worker artifacts for phase policy "
+                        f"'require_all_workers': {', '.join(missing_worker_ids)}"
+                    )
+                    last_failure = message
+                    self._emit(REMEDIATION_ATTEMPT, task.id, {
+                        "remediation_id": remediation_id or "",
+                        "subtask_id": subtask.id,
+                        "attempt": attempt_number,
+                        "max_attempts": max_attempts,
+                        "phase": "done",
+                        "outcome": "failed",
+                        "error": message,
+                    })
+                    await self._persist_remediation_attempt(
+                        task=task,
+                        remediation_id=remediation_id or "",
+                        subtask_id=subtask.id,
+                        attempt=attempt_number,
+                        max_attempts=max_attempts,
+                        phase="done",
+                        outcome="failed",
+                        error=message,
+                    )
+                    continue
             if deterministic_note:
                 remediation_context = (
                     f"{remediation_context}\n\n"
@@ -5553,11 +6105,68 @@ class Orchestrator:
                 changelog=changelog,
                 prior_successful_tool_calls=prior_successful_tool_calls,
                 prior_evidence_records=prior_evidence_records,
-                expected_deliverables=expected_deliverables,
-                enforce_deliverable_paths=bool(expected_deliverables),
-                edit_existing_only=bool(expected_deliverables),
+                expected_deliverables=runner_expected_deliverables,
+                forbidden_deliverables=runner_forbidden_deliverables,
+                allowed_output_prefixes=allowed_output_prefixes,
+                enforce_deliverable_paths=bool(runner_expected_deliverables),
+                edit_existing_only=bool(runner_expected_deliverables),
                 retry_strategy=RetryStrategy.UNCONFIRMED_DATA.value,
             )
+            if bool(manifest_requirements.get("enabled", False)):
+                allowed_manifest_paths = list(
+                    manifest_requirements.get("allowed_manifest_paths", []),
+                )
+                allowed_stage_prefixes = list(stage_plan.get("stage_prefixes", []))
+                violations = self._manifest_only_input_violations(
+                    task=task,
+                    subtask=subtask,
+                    tool_calls=remediation_result.tool_calls,
+                    allowed_manifest_paths=allowed_manifest_paths,
+                    allowed_extra_prefixes=allowed_stage_prefixes,
+                )
+                if violations:
+                    message = (
+                        "Finalizer input policy violation: read access to intermediate "
+                        "artifacts outside latest worker manifest entries: "
+                        + ", ".join(violations)
+                    )
+                    remediation_result.status = SubtaskResultStatus.FAILED
+                    remediation_verification = VerificationResult(
+                        tier=max(1, int(subtask.verification_tier or 1)),
+                        passed=False,
+                        confidence=0.0,
+                        feedback=message,
+                        outcome="fail",
+                        reason_code="manifest_input_policy_violation",
+                        severity_class="semantic",
+                    )
+            if (
+                bool(stage_plan.get("enabled", False))
+                and remediation_result.status != SubtaskResultStatus.FAILED
+                and remediation_verification.passed
+            ):
+                commit_ok, commit_error = self._commit_finalizer_stage_publish(
+                    task=task,
+                    subtask=subtask,
+                    stage_plan=stage_plan,
+                )
+                if not commit_ok:
+                    message = commit_error or "Transactional stage+commit publish failed."
+                    remediation_result.status = SubtaskResultStatus.FAILED
+                    remediation_verification = VerificationResult(
+                        tier=max(1, int(subtask.verification_tier or 1)),
+                        passed=False,
+                        confidence=0.0,
+                        feedback=message,
+                        outcome="fail",
+                        reason_code="output_publish_commit_failed",
+                        severity_class="semantic",
+                    )
+                    remediation_result.summary = (
+                        f"{remediation_result.summary}\n{message}".strip()
+                        if remediation_result.summary
+                        else message
+                    )
             self._persist_subtask_evidence(
                 task.id,
                 subtask.id,
@@ -6204,6 +6813,13 @@ class Orchestrator:
         deliverables = self._process.get_deliverables()
         if not deliverables:
             return []
+        phase_hint = str(getattr(subtask, "phase_id", "") or "").strip()
+        if phase_hint in deliverables:
+            return [
+                str(item).strip()
+                for item in deliverables[phase_hint]
+                if str(item).strip()
+            ]
         if subtask.id in deliverables:
             return [
                 str(item).strip()
@@ -6216,7 +6832,912 @@ class Orchestrator:
                 for item in next(iter(deliverables.values()))
                 if str(item).strip()
             ]
+        phase_descriptions: dict[str, str] = {}
+        for phase in getattr(self._process, "phases", []):
+            phase_id = str(getattr(phase, "id", "")).strip()
+            if not phase_id:
+                continue
+            phase_descriptions[phase_id] = str(
+                getattr(phase, "description", ""),
+            ).strip()
+        phase_id = infer_phase_id_for_subtask(
+            subtask_id=subtask.id,
+            text=" ".join([
+                str(getattr(subtask, "description", "")).strip(),
+                str(getattr(subtask, "acceptance_criteria", "")).strip(),
+            ]).strip(),
+            phase_ids=list(deliverables.keys()),
+            phase_descriptions=phase_descriptions,
+            phase_deliverables=deliverables,
+        )
+        if phase_id in deliverables:
+            return [
+                str(item).strip()
+                for item in deliverables[phase_id]
+                if str(item).strip()
+            ]
         return []
+
+    def _output_intermediate_root(self) -> str:
+        process = self._process
+        if process is None:
+            return ".loom/phase-artifacts"
+        coordination = getattr(process, "output_coordination", None)
+        root = str(getattr(coordination, "intermediate_root", "") or "").strip()
+        return root or ".loom/phase-artifacts"
+
+    def _output_enforce_single_writer(self) -> bool:
+        process = self._process
+        if process is None:
+            return True
+        coordination = getattr(process, "output_coordination", None)
+        return bool(getattr(coordination, "enforce_single_writer", True))
+
+    def _output_conflict_policy(self) -> str:
+        process = self._process
+        if process is None:
+            return "defer_fifo"
+        coordination = getattr(process, "output_coordination", None)
+        policy = str(getattr(coordination, "conflict_policy", "") or "").strip().lower()
+        if policy in {"defer_fifo", "fail_fast"}:
+            return policy
+        return "defer_fifo"
+
+    def _output_publish_mode(self) -> str:
+        process = self._process
+        if process is None:
+            return "transactional"
+        coordination = getattr(process, "output_coordination", None)
+        mode = str(getattr(coordination, "publish_mode", "") or "").strip().lower()
+        if mode in {"transactional", "best_effort"}:
+            return mode
+        return "transactional"
+
+    def _phase_finalizer_input_policy(self, phase_id: str) -> str:
+        process = self._process
+        if process is None:
+            return "require_all_workers"
+        resolver = getattr(process, "phase_finalizer_input_policy", None)
+        if callable(resolver):
+            try:
+                resolved = str(resolver(phase_id)).strip().lower()
+            except Exception:
+                resolved = ""
+            if resolved in {"require_all_workers", "allow_partial"}:
+                return resolved
+        return "require_all_workers"
+
+    def _output_write_policy_for_subtask(
+        self,
+        *,
+        subtask: Subtask,
+    ) -> dict[str, object]:
+        canonical_deliverables = self._expected_deliverables_for_subtask(subtask)
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip() or subtask.id
+        output_strategy = self._phase_output_strategy(phase_id)
+        output_role = self._subtask_output_role(subtask)
+        expected_deliverables: list[str] = []
+        forbidden_deliverables: list[str] = []
+        if output_strategy == "fan_in" and canonical_deliverables:
+            if output_role == self._OUTPUT_ROLE_PHASE_FINALIZER:
+                expected_deliverables = list(canonical_deliverables)
+            else:
+                forbidden_deliverables = list(canonical_deliverables)
+        else:
+            expected_deliverables = list(canonical_deliverables)
+            output_role = self._OUTPUT_ROLE_WORKER
+        return {
+            "output_role": output_role,
+            "output_strategy": output_strategy,
+            "expected_deliverables": expected_deliverables,
+            "forbidden_deliverables": forbidden_deliverables,
+        }
+
+    def _fan_in_worker_output_prefixes(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+    ) -> list[str]:
+        output_policy = self._output_write_policy_for_subtask(subtask=subtask)
+        output_strategy = str(output_policy.get("output_strategy", "") or "").strip().lower()
+        output_role = str(output_policy.get("output_role", "") or "").strip().lower()
+        if output_strategy != "fan_in" or output_role != self._OUTPUT_ROLE_WORKER:
+            return []
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip() or subtask.id
+        intermediate_root = self._output_intermediate_root()
+        run_id = self._task_run_id(task)
+        candidates = [
+            f"{intermediate_root}/{phase_id}/{subtask.id}",
+        ]
+        if run_id:
+            candidates.insert(
+                0,
+                f"{intermediate_root}/{run_id}/{phase_id}/{subtask.id}",
+            )
+        normalized = self._normalize_deliverable_paths_for_conflict(
+            [str(item).strip() for item in candidates if str(item).strip()],
+            workspace=Path(task.workspace) if task.workspace else None,
+        )
+        return normalized
+
+    def _phase_artifact_manifest_path(
+        self,
+        *,
+        task: Task,
+        phase_id: str,
+    ) -> Path | None:
+        workspace = Path(task.workspace) if task.workspace else None
+        normalized_phase_id = str(phase_id or "").strip()
+        if workspace is None or not normalized_phase_id:
+            return None
+        run_id = self._task_run_id(task)
+        if not run_id:
+            return None
+        return (
+            workspace
+            / self._output_intermediate_root()
+            / run_id
+            / normalized_phase_id
+            / "manifest.jsonl"
+        )
+
+    def _phase_worker_subtask_ids(
+        self,
+        *,
+        task: Task,
+        phase_id: str,
+        finalizer_id: str,
+    ) -> list[str]:
+        normalized_phase_id = str(phase_id or "").strip()
+        if not normalized_phase_id:
+            return []
+        worker_ids: list[str] = []
+        for candidate in task.plan.subtasks:
+            if str(getattr(candidate, "phase_id", "") or "").strip() != normalized_phase_id:
+                continue
+            candidate_id = str(getattr(candidate, "id", "") or "").strip()
+            if not candidate_id or candidate_id == finalizer_id:
+                continue
+            role = str(getattr(candidate, "output_role", "") or "").strip().lower()
+            if role == self._OUTPUT_ROLE_PHASE_FINALIZER:
+                continue
+            if candidate_id not in worker_ids:
+                worker_ids.append(candidate_id)
+        return sorted(worker_ids)
+
+    def _phase_worker_artifact_paths(
+        self,
+        *,
+        task: Task,
+        phase_id: str,
+    ) -> dict[str, list[str]]:
+        latest = self._latest_worker_artifacts_for_phase(task=task, phase_id=phase_id)
+        artifact_paths: dict[str, list[str]] = {}
+        for worker_id, entries in latest.items():
+            if not isinstance(entries, list):
+                continue
+            paths = sorted({
+                str(item.get("artifact_path", "")).strip()
+                for item in entries
+                if isinstance(item, dict) and str(item.get("artifact_path", "")).strip()
+            })
+            if paths:
+                artifact_paths[str(worker_id).strip()] = paths
+        return artifact_paths
+
+    def _evaluate_finalizer_manifest_requirements(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+    ) -> dict[str, object]:
+        output_policy = self._output_write_policy_for_subtask(subtask=subtask)
+        output_strategy = str(output_policy.get("output_strategy", "") or "").strip().lower()
+        output_role = str(output_policy.get("output_role", "") or "").strip().lower()
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
+        if output_strategy != "fan_in" or output_role != self._OUTPUT_ROLE_PHASE_FINALIZER:
+            return {
+                "enabled": False,
+                "policy": "",
+                "worker_ids": [],
+                "artifact_paths_by_worker": {},
+                "missing_worker_ids": [],
+                "allowed_manifest_paths": [],
+            }
+
+        finalizer_id = str(getattr(subtask, "id", "") or "").strip()
+        worker_ids = self._phase_worker_subtask_ids(
+            task=task,
+            phase_id=phase_id,
+            finalizer_id=finalizer_id,
+        )
+        artifact_paths_by_worker = self._phase_worker_artifact_paths(
+            task=task,
+            phase_id=phase_id,
+        )
+        missing_worker_ids = [
+            worker_id
+            for worker_id in worker_ids
+            if worker_id not in artifact_paths_by_worker
+        ]
+        allowed_manifest_paths = sorted({
+            path
+            for paths in artifact_paths_by_worker.values()
+            for path in paths
+            if str(path).strip()
+        })
+        return {
+            "enabled": True,
+            "policy": self._phase_finalizer_input_policy(phase_id),
+            "worker_ids": worker_ids,
+            "artifact_paths_by_worker": artifact_paths_by_worker,
+            "missing_worker_ids": missing_worker_ids,
+            "allowed_manifest_paths": allowed_manifest_paths,
+        }
+
+    def _record_fan_in_worker_artifacts(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        result: SubtaskResult,
+    ) -> None:
+        output_policy = self._output_write_policy_for_subtask(subtask=subtask)
+        output_strategy = str(output_policy.get("output_strategy", "") or "").strip().lower()
+        output_role = str(output_policy.get("output_role", "") or "").strip().lower()
+        if output_strategy != "fan_in" or output_role != self._OUTPUT_ROLE_WORKER:
+            return
+
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
+        manifest_path = self._phase_artifact_manifest_path(task=task, phase_id=phase_id)
+        workspace = Path(task.workspace) if task.workspace else None
+        if manifest_path is None or workspace is None:
+            return
+
+        allowed_prefixes = self._fan_in_worker_output_prefixes(
+            task=task,
+            subtask=subtask,
+        )
+        if not allowed_prefixes:
+            return
+
+        changed_files = self._normalize_deliverable_paths_for_conflict(
+            self._files_from_tool_calls(result.tool_calls),
+            workspace=workspace,
+        )
+        artifact_paths = [
+            path
+            for path in changed_files
+            if any(path == prefix or path.startswith(prefix + "/") for prefix in allowed_prefixes)
+        ]
+        if not artifact_paths:
+            return
+
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        generated_at = datetime.now().isoformat()
+        attempt = max(1, int(getattr(subtask, "retry_count", 0) or 0) + 1)
+        entries: list[dict[str, object]] = []
+        for artifact_path in artifact_paths:
+            digest = ""
+            try:
+                payload = (workspace / artifact_path).read_bytes()
+                digest = hashlib.sha1(payload).hexdigest()
+            except Exception:
+                digest = ""
+            entries.append({
+                "schema_version": 1,
+                "task_id": task.id,
+                "run_id": self._task_run_id(task),
+                "phase_id": phase_id,
+                "subtask_id": subtask.id,
+                "attempt": attempt,
+                "generated_at": generated_at,
+                "output_role": self._OUTPUT_ROLE_WORKER,
+                "output_strategy": "fan_in",
+                "artifact_path": artifact_path,
+                "content_hash": digest,
+            })
+        with manifest_path.open("a", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry, ensure_ascii=False))
+                handle.write("\n")
+
+    def _latest_worker_artifacts_for_phase(
+        self,
+        *,
+        task: Task,
+        phase_id: str,
+    ) -> dict[str, list[dict[str, object]]]:
+        manifest_path = self._phase_artifact_manifest_path(task=task, phase_id=phase_id)
+        if manifest_path is None or not manifest_path.exists():
+            return {}
+        run_id = self._task_run_id(task)
+        latest: dict[str, dict[str, object]] = {}
+        grouped: dict[str, list[dict[str, object]]] = {}
+        try:
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    text = str(line or "").strip()
+                    if not text:
+                        continue
+                    try:
+                        entry = json.loads(text)
+                    except Exception:
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    if str(entry.get("run_id", "")).strip() != run_id:
+                        continue
+                    if str(entry.get("task_id", "")).strip() != task.id:
+                        continue
+                    if str(entry.get("phase_id", "")).strip() != str(phase_id).strip():
+                        continue
+                    role = str(entry.get("output_role", "")).strip().lower()
+                    if role != self._OUTPUT_ROLE_WORKER:
+                        continue
+                    worker_id = str(entry.get("subtask_id", "")).strip()
+                    if not worker_id:
+                        continue
+                    try:
+                        attempt = int(entry.get("attempt", 0) or 0)
+                    except (TypeError, ValueError):
+                        attempt = 0
+                    generated_at = str(entry.get("generated_at", "") or "").strip()
+                    marker = latest.get(worker_id)
+                    if not isinstance(marker, dict):
+                        latest[worker_id] = {
+                            "attempt": attempt,
+                            "generated_at": generated_at,
+                        }
+                        grouped[worker_id] = [entry]
+                        continue
+                    marker_attempt = int(marker.get("attempt", 0) or 0)
+                    marker_generated = str(marker.get("generated_at", "") or "")
+                    if (attempt, generated_at) > (marker_attempt, marker_generated):
+                        latest[worker_id] = {
+                            "attempt": attempt,
+                            "generated_at": generated_at,
+                        }
+                        grouped[worker_id] = [entry]
+                    elif (attempt, generated_at) == (marker_attempt, marker_generated):
+                        grouped.setdefault(worker_id, []).append(entry)
+        except Exception:
+            return {}
+        return grouped
+
+    def _augment_retry_context_with_phase_artifacts(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        base_context: str,
+    ) -> str:
+        output_policy = self._output_write_policy_for_subtask(subtask=subtask)
+        output_strategy = str(output_policy.get("output_strategy", "") or "").strip().lower()
+        output_role = str(output_policy.get("output_role", "") or "").strip().lower()
+        if output_strategy != "fan_in" or output_role != self._OUTPUT_ROLE_PHASE_FINALIZER:
+            return base_context
+
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
+        latest = self._latest_worker_artifacts_for_phase(task=task, phase_id=phase_id)
+        if not latest:
+            return (
+                f"{base_context}\n\n"
+                "FAN-IN WORKER ARTIFACT MANIFEST: no worker artifacts were discovered "
+                "for this phase in the current run. Verify worker output paths first."
+            ).strip()
+
+        lines = ["FAN-IN WORKER ARTIFACT MANIFEST (LATEST SUCCESSFUL BY WORKER):"]
+        for worker_id in sorted(latest):
+            entries = latest.get(worker_id, [])
+            artifact_paths = sorted({
+                str(item.get("artifact_path", "")).strip()
+                for item in entries
+                if str(item.get("artifact_path", "")).strip()
+            })
+            if artifact_paths:
+                lines.append(f"- {worker_id}: {', '.join(artifact_paths)}")
+            else:
+                lines.append(f"- {worker_id}: (manifest entry without artifact_path)")
+        section = "\n".join(lines)
+        return f"{base_context}\n\n{section}".strip()
+
+    def _finalizer_stage_publish_plan(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        canonical_deliverables: list[str],
+        attempt_index: int,
+    ) -> dict[str, object]:
+        output_policy = self._output_write_policy_for_subtask(subtask=subtask)
+        output_strategy = str(output_policy.get("output_strategy", "") or "").strip().lower()
+        output_role = str(output_policy.get("output_role", "") or "").strip().lower()
+        if output_strategy != "fan_in" or output_role != self._OUTPUT_ROLE_PHASE_FINALIZER:
+            return {"enabled": False}
+        if self._output_publish_mode() != "transactional":
+            return {"enabled": False}
+
+        workspace = Path(task.workspace) if task.workspace else None
+        if workspace is None:
+            return {"enabled": False}
+
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip() or subtask.id
+        run_id = self._task_run_id(task)
+        if not run_id:
+            return {"enabled": False}
+        canonical = self._normalize_deliverable_paths_for_conflict(
+            canonical_deliverables,
+            workspace=workspace,
+        )
+        if not canonical:
+            return {"enabled": False}
+
+        intermediate_root = self._output_intermediate_root()
+        stage_root = (
+            f"{intermediate_root}/{run_id}/{phase_id}/{subtask.id}/"
+            f"publish-stage/attempt-{attempt_index}"
+        )
+        stage_to_canonical: dict[str, str] = {}
+        stage_deliverables: list[str] = []
+        for canonical_path in canonical:
+            stage_path = SubtaskRunner._normalize_path_for_policy(
+                f"{stage_root}/{canonical_path}",
+                workspace,
+            )
+            if not stage_path:
+                continue
+            stage_to_canonical[stage_path] = canonical_path
+            stage_deliverables.append(stage_path)
+        if not stage_deliverables:
+            return {"enabled": False}
+        stage_prefix = SubtaskRunner._normalize_path_for_policy(stage_root, workspace)
+        return {
+            "enabled": True,
+            "stage_deliverables": stage_deliverables,
+            "stage_to_canonical": stage_to_canonical,
+            "stage_prefixes": [stage_prefix] if stage_prefix else [],
+            "canonical_deliverables": canonical,
+        }
+
+    @staticmethod
+    def _merge_unique_paths(*groups: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for raw in list(group or []):
+                value = str(raw or "").strip()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                merged.append(value)
+        return merged
+
+    def _augment_retry_context_for_stage_publish(
+        self,
+        *,
+        base_context: str,
+        stage_plan: dict[str, object],
+    ) -> str:
+        if not bool(stage_plan.get("enabled", False)):
+            return base_context
+        stage_deliverables = list(stage_plan.get("stage_deliverables", []))
+        canonical_deliverables = list(stage_plan.get("canonical_deliverables", []))
+        lines = [
+            "TRANSACTIONAL FINALIZER PUBLISH MODE:",
+            "- Write output files to STAGING paths only in this attempt.",
+            "- Do not write canonical deliverable paths directly.",
+        ]
+        if stage_deliverables:
+            lines.append("REQUIRED STAGING OUTPUT FILES (EXACT FILENAMES):")
+            for name in stage_deliverables:
+                lines.append(f"- {name}")
+        if canonical_deliverables:
+            lines.append("CANONICAL DELIVERABLES (PUBLISH TARGETS):")
+            for name in canonical_deliverables:
+                lines.append(f"- {name}")
+        section = "\n".join(lines)
+        return f"{base_context}\n\n{section}".strip()
+
+    def _intermediate_phase_prefix(
+        self,
+        *,
+        task: Task,
+        phase_id: str,
+    ) -> str:
+        workspace = Path(task.workspace) if task.workspace else None
+        run_id = self._task_run_id(task)
+        normalized_phase_id = str(phase_id or "").strip()
+        if workspace is None or not run_id or not normalized_phase_id:
+            return ""
+        return SubtaskRunner._normalize_path_for_policy(
+            f"{self._output_intermediate_root()}/{run_id}/{normalized_phase_id}",
+            workspace,
+        )
+
+    def _intermediate_read_paths_from_tool_calls(
+        self,
+        *,
+        task: Task,
+        tool_calls: list[ToolCallRecord],
+    ) -> list[str]:
+        workspace = Path(task.workspace) if task.workspace else None
+        if workspace is None:
+            return []
+        read_paths: list[str] = []
+        seen: set[str] = set()
+        for call in list(tool_calls or []):
+            tool_name = str(getattr(call, "tool", "") or "").strip().lower()
+            args = getattr(call, "args", {})
+            if not isinstance(args, dict):
+                continue
+            candidates: list[str] = []
+            if tool_name in {"read_file", "document_read"}:
+                raw = args.get("path") or args.get("file") or args.get("file_path")
+                if raw is not None:
+                    candidates.append(str(raw))
+            elif tool_name == "read_multiple_files":
+                raw_paths = args.get("paths", [])
+                if isinstance(raw_paths, list):
+                    candidates.extend(str(item) for item in raw_paths)
+            for raw in candidates:
+                normalized = SubtaskRunner._normalize_path_for_policy(raw, workspace)
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                read_paths.append(normalized)
+        return read_paths
+
+    def _manifest_only_input_violations(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        tool_calls: list[ToolCallRecord],
+        allowed_manifest_paths: list[str],
+        allowed_extra_prefixes: list[str],
+    ) -> list[str]:
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
+        phase_prefix = self._intermediate_phase_prefix(task=task, phase_id=phase_id)
+        if not phase_prefix:
+            return []
+        allowed_paths = {
+            str(item).strip()
+            for item in allowed_manifest_paths
+            if str(item).strip()
+        }
+        extra_prefixes = [
+            str(item).strip()
+            for item in allowed_extra_prefixes
+            if str(item).strip()
+        ]
+        manifest_path = self._phase_artifact_manifest_path(task=task, phase_id=phase_id)
+        workspace = Path(task.workspace) if task.workspace else None
+        manifest_rel = ""
+        if manifest_path is not None and workspace is not None:
+            manifest_rel = SubtaskRunner._normalize_path_for_policy(str(manifest_path), workspace)
+        if manifest_rel:
+            allowed_paths.add(manifest_rel)
+
+        violations: list[str] = []
+        for path in self._intermediate_read_paths_from_tool_calls(task=task, tool_calls=tool_calls):
+            if not (path == phase_prefix or path.startswith(phase_prefix + "/")):
+                continue
+            if path in allowed_paths:
+                continue
+            if any(path == prefix or path.startswith(prefix + "/") for prefix in extra_prefixes):
+                continue
+            violations.append(path)
+        return sorted(set(violations))
+
+    @staticmethod
+    def _artifact_seals_snapshot(task: Task) -> dict[str, dict[str, object]]:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        registry = metadata.get("artifact_seals") if isinstance(metadata, dict) else {}
+        if not isinstance(registry, dict):
+            return {}
+        return deepcopy(registry)
+
+    @staticmethod
+    def _restore_artifact_seals_snapshot(
+        *,
+        task: Task,
+        snapshot: dict[str, dict[str, object]],
+    ) -> None:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["artifact_seals"] = deepcopy(snapshot) if isinstance(snapshot, dict) else {}
+        task.metadata = metadata
+
+    def _seal_paths_after_commit(
+        self,
+        *,
+        task: Task,
+        subtask_id: str,
+        paths: list[str],
+    ) -> None:
+        workspace = Path(task.workspace) if task.workspace else None
+        if workspace is None:
+            return
+        seals = self._artifact_seal_registry(task)
+        run_id = self._task_run_id(task)
+        sealed_at = datetime.now().isoformat()
+        for relpath in paths:
+            text = str(relpath or "").strip()
+            if not text:
+                continue
+            resolved = (workspace / text).resolve()
+            try:
+                resolved.relative_to(workspace.resolve())
+            except Exception:
+                continue
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            payload = resolved.read_bytes()
+            seals[text] = {
+                "path": text,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": int(len(payload)),
+                "tool": "fan_in_commit",
+                "tool_call_id": "",
+                "subtask_id": subtask_id,
+                "run_id": run_id,
+                "sealed_at": sealed_at,
+            }
+        task.metadata["artifact_seals"] = seals
+
+    def _commit_finalizer_stage_publish(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        stage_plan: dict[str, object],
+    ) -> tuple[bool, str]:
+        if not bool(stage_plan.get("enabled", False)):
+            return True, ""
+        workspace = Path(task.workspace) if task.workspace else None
+        if workspace is None:
+            return False, "Transactional publish failed: workspace unavailable."
+        stage_to_canonical = dict(stage_plan.get("stage_to_canonical", {}))
+        if not stage_to_canonical:
+            return False, "Transactional publish failed: no staged outputs declared."
+
+        canonical_paths = sorted({
+            str(path).strip()
+            for path in stage_to_canonical.values()
+            if str(path).strip()
+        })
+        seals_snapshot = self._artifact_seals_snapshot(task)
+        backup_paths: dict[str, str] = {}
+        installed_paths: set[str] = set()
+        try:
+            workspace_resolved = workspace.resolve()
+            for stage_rel, canonical_rel in stage_to_canonical.items():
+                stage_path = (workspace_resolved / str(stage_rel)).resolve()
+                stage_path.relative_to(workspace_resolved)
+                if not stage_path.exists() or not stage_path.is_file():
+                    return False, (
+                        "Transactional publish failed: missing staged output "
+                        f"'{stage_rel}' for canonical '{canonical_rel}'."
+                    )
+
+            for stage_rel, canonical_rel in stage_to_canonical.items():
+                stage_path = (workspace_resolved / str(stage_rel)).resolve()
+                canonical_path = (workspace_resolved / str(canonical_rel)).resolve()
+                canonical_path.relative_to(workspace_resolved)
+                canonical_path.parent.mkdir(parents=True, exist_ok=True)
+                canonical_rel_text = str(canonical_rel).strip()
+                if canonical_path.exists():
+                    backup_name = (
+                        canonical_path.name
+                        + f".loom-backup-{uuid.uuid4().hex[:10]}"
+                    )
+                    backup_path = canonical_path.with_name(backup_name)
+                    canonical_path.replace(backup_path)
+                    backup_paths[canonical_rel_text] = str(
+                        backup_path.relative_to(workspace_resolved).as_posix(),
+                    )
+                stage_path.replace(canonical_path)
+                installed_paths.add(canonical_rel_text)
+
+            self._seal_paths_after_commit(
+                task=task,
+                subtask_id=str(getattr(subtask, "id", "") or ""),
+                paths=canonical_paths,
+            )
+            for backup_rel in backup_paths.values():
+                backup_path = (workspace_resolved / backup_rel).resolve()
+                backup_path.unlink(missing_ok=True)
+            return True, ""
+        except Exception as e:
+            logger.debug(
+                "Transactional stage+commit publish failed for %s/%s",
+                task.id,
+                subtask.id,
+                exc_info=True,
+            )
+            try:
+                workspace_resolved = workspace.resolve()
+                for canonical_rel in installed_paths:
+                    path = (workspace_resolved / canonical_rel).resolve()
+                    path.unlink(missing_ok=True)
+                for canonical_rel, backup_rel in backup_paths.items():
+                    canonical_path = (workspace_resolved / canonical_rel).resolve()
+                    backup_path = (workspace_resolved / backup_rel).resolve()
+                    if backup_path.exists():
+                        backup_path.replace(canonical_path)
+            except Exception:
+                logger.debug(
+                    "Failed rollback during transactional publish failure for %s/%s",
+                    task.id,
+                    subtask.id,
+                    exc_info=True,
+                )
+            self._restore_artifact_seals_snapshot(task=task, snapshot=seals_snapshot)
+            return False, f"Transactional stage+commit publish failed: {e}"
+
+    @staticmethod
+    def _normalize_deliverable_paths_for_conflict(
+        raw_paths: list[str],
+        *,
+        workspace: Path | None,
+    ) -> list[str]:
+        return SubtaskRunner._normalize_deliverable_paths(
+            raw_paths,
+            workspace=workspace,
+        )
+
+    def _canonical_deliverable_paths_for_subtask(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+    ) -> list[str]:
+        workspace = Path(task.workspace) if str(task.workspace or "").strip() else None
+        policy = self._output_write_policy_for_subtask(subtask=subtask)
+        expected = [
+            str(item).strip()
+            for item in list(policy.get("expected_deliverables", []))
+            if str(item).strip()
+        ]
+        return self._normalize_deliverable_paths_for_conflict(
+            expected,
+            workspace=workspace,
+        )
+
+    def _prioritize_runnable_for_output_conflicts(
+        self,
+        *,
+        runnable: list[Subtask],
+        conflict_tracker: dict[str, dict[str, object]],
+    ) -> list[Subtask]:
+        threshold = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "_output_conflict_starvation_threshold",
+                    self._OUTPUT_CONFLICT_STARVATION_THRESHOLD,
+                ),
+            ),
+        )
+        indexed = list(enumerate(runnable))
+
+        def _sort_key(item: tuple[int, Subtask]) -> tuple[int, int, int]:
+            index, subtask = item
+            state = conflict_tracker.get(subtask.id, {})
+            streak = int(state.get("streak", 0) or 0)
+            first_seq = int(state.get("first_seq", 10**9) or 10**9)
+            if streak >= threshold:
+                bucket = 0
+            elif streak > 0:
+                bucket = 1
+            else:
+                bucket = 2
+                first_seq = 10**9 + index
+            return bucket, first_seq, index
+
+        indexed.sort(key=_sort_key)
+        return [subtask for _, subtask in indexed]
+
+    def _select_conflict_safe_batch(
+        self,
+        *,
+        task: Task,
+        runnable: list[Subtask],
+        max_parallel: int,
+        conflict_tracker: dict[str, dict[str, object]],
+        sequence_counter: int,
+    ) -> tuple[list[Subtask], list[dict[str, object]], int]:
+        if not runnable or max_parallel <= 0:
+            return [], [], sequence_counter
+
+        prioritized = self._prioritize_runnable_for_output_conflicts(
+            runnable=runnable,
+            conflict_tracker=conflict_tracker,
+        )
+        deliverables_by_subtask: dict[str, list[str]] = {}
+        for subtask in prioritized:
+            deliverables_by_subtask[subtask.id] = self._canonical_deliverable_paths_for_subtask(
+                task=task,
+                subtask=subtask,
+            )
+
+        selected: list[Subtask] = []
+        selected_paths: set[str] = set()
+        owner_by_path: dict[str, str] = {}
+        deferred: list[dict[str, object]] = []
+
+        for subtask in prioritized:
+            if len(selected) >= max_parallel:
+                break
+            paths = set(deliverables_by_subtask.get(subtask.id, []))
+            overlap = sorted(path for path in paths if path in selected_paths)
+            if overlap:
+                conflicting_with = sorted({
+                    str(owner_by_path.get(path, "")).strip()
+                    for path in overlap
+                    if str(owner_by_path.get(path, "")).strip()
+                })
+                deferred.append({
+                    "subtask_id": subtask.id,
+                    "phase_id": str(getattr(subtask, "phase_id", "") or "").strip(),
+                    "conflicting_paths": overlap,
+                    "conflicting_with": conflicting_with,
+                })
+                continue
+            selected.append(subtask)
+            for path in paths:
+                selected_paths.add(path)
+                owner_by_path[path] = subtask.id
+
+        active_pending = {
+            s.id
+            for s in task.plan.subtasks
+            if s.status == SubtaskStatus.PENDING
+        }
+        for subtask_id in list(conflict_tracker.keys()):
+            if subtask_id not in active_pending:
+                conflict_tracker.pop(subtask_id, None)
+
+        selected_ids = {subtask.id for subtask in selected}
+        for subtask_id in selected_ids:
+            conflict_tracker.pop(subtask_id, None)
+
+        threshold = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "_output_conflict_starvation_threshold",
+                    self._OUTPUT_CONFLICT_STARVATION_THRESHOLD,
+                ),
+            ),
+        )
+        for item in deferred:
+            subtask_id = str(item.get("subtask_id", "") or "").strip()
+            if not subtask_id:
+                continue
+            state = conflict_tracker.get(subtask_id, {})
+            if "first_seq" not in state:
+                state["first_seq"] = int(sequence_counter)
+                sequence_counter += 1
+            streak = int(state.get("streak", 0) or 0) + 1
+            total = int(state.get("total", 0) or 0) + 1
+            warned = bool(state.get("warned", False))
+            starvation_warning = bool(streak >= threshold and not warned)
+            state["streak"] = streak
+            state["total"] = total
+            state["warned"] = bool(warned or starvation_warning)
+            conflict_tracker[subtask_id] = state
+            item["deferral_streak"] = streak
+            item["deferral_count"] = total
+            item["starvation_warning"] = starvation_warning
+            item["starvation_threshold"] = threshold
+
+        return selected, deferred, sequence_counter
 
     @staticmethod
     def _files_from_attempts(attempts: list[AttemptRecord], *, max_items: int = 24) -> list[str]:
@@ -6271,9 +7792,9 @@ class Orchestrator:
         attempts: list[AttemptRecord],
         strategy: RetryStrategy,
         expected_deliverables: list[str],
+        forbidden_deliverables: list[str],
         base_context: str,
     ) -> str:
-        del subtask  # Reserved for future per-subtask formatting.
         lines: list[str] = []
         existing_files = self._files_from_attempts(attempts)
         if existing_files:
@@ -6283,6 +7804,37 @@ class Orchestrator:
             lines.append(
                 "Do not create alternate copies such as *-v2.*, *_v2.*, *-copy.*, "
                 "or similarly suffixed variants."
+            )
+
+        output_role = str(getattr(subtask, "output_role", "") or "").strip().lower()
+        output_strategy = str(getattr(subtask, "output_strategy", "") or "").strip().lower()
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip() or subtask.id
+        intermediate_root = self._output_intermediate_root()
+        if output_strategy == "fan_in":
+            if output_role == self._OUTPUT_ROLE_PHASE_FINALIZER:
+                lines.append("OUTPUT COORDINATION MODE: FAN-IN PHASE FINALIZER")
+                lines.append(
+                    "Consolidate worker intermediate artifacts into canonical deliverables."
+                )
+                lines.append(
+                    "Read worker artifacts from phase intermediate root before publishing:"
+                )
+                lines.append(
+                    f"- {intermediate_root}/<run-id>/{phase_id}/",
+                )
+            else:
+                lines.append("OUTPUT COORDINATION MODE: FAN-IN WORKER")
+                lines.append(
+                    "This worker must not modify canonical deliverables for the phase."
+                )
+                lines.append("Write intermediate artifacts under:")
+                lines.append(f"- {intermediate_root}/<run-id>/{phase_id}/{subtask.id}/")
+        if forbidden_deliverables:
+            lines.append("CANONICAL DELIVERABLE FILES FORBIDDEN IN THIS SUBTASK:")
+            for name in forbidden_deliverables:
+                lines.append(f"- {name}")
+            lines.append(
+                "Do not write these canonical filenames in this step."
             )
         if expected_deliverables:
             lines.append("CANONICAL DELIVERABLE FILES FOR THIS SUBTASK:")
@@ -6399,6 +7951,19 @@ class Orchestrator:
             result.evidence_records,
             tool_calls=result.tool_calls,
         )
+        try:
+            self._record_fan_in_worker_artifacts(
+                task=task,
+                subtask=subtask,
+                result=result,
+            )
+        except Exception:
+            logger.debug(
+                "Failed recording fan-in worker artifact manifest for %s/%s",
+                task.id,
+                subtask.id,
+                exc_info=True,
+            )
         summary = result.summary
 
         # Update state
@@ -7177,6 +8742,8 @@ class Orchestrator:
                 description=s.get("description", ""),
                 depends_on=s.get("depends_on", []),
                 phase_id=s.get("phase_id", ""),
+                output_role=str(s.get("output_role", "") or ""),
+                output_strategy=str(s.get("output_strategy", "") or ""),
                 model_tier=s.get("model_tier", 1),
                 verification_tier=s.get("verification_tier", 1),
                 is_critical_path=s.get("is_critical_path", False),
@@ -7214,6 +8781,8 @@ class Orchestrator:
                         description=phase.description,
                         depends_on=list(phase.depends_on),
                         phase_id=phase.id,
+                        output_role=self._OUTPUT_ROLE_WORKER,
+                        output_strategy=self._phase_output_strategy(phase.id),
                         model_tier=phase.model_tier,
                         verification_tier=phase.verification_tier,
                         is_critical_path=phase.is_critical_path,
@@ -7228,6 +8797,8 @@ class Orchestrator:
             existing.description = phase.description or existing.description
             existing.depends_on = list(phase.depends_on)
             existing.phase_id = phase.id
+            existing.output_strategy = self._phase_output_strategy(phase.id)
+            existing.output_role = self._OUTPUT_ROLE_WORKER
             existing.model_tier = phase.model_tier
             existing.verification_tier = phase.verification_tier
             existing.is_critical_path = phase.is_critical_path
@@ -7438,6 +9009,9 @@ class Orchestrator:
                     resolved.relative_to(workspace)
                 except Exception:
                     continue
+            if self._is_intermediate_artifact_path(task=task, relpath=relpath):
+                # Intermediate fan-in artifacts are not part of the canonical seal set.
+                continue
 
             sha256 = ""
             size_bytes = 0
@@ -7474,6 +9048,21 @@ class Orchestrator:
             task.metadata["artifact_seals"] = seals
         return updated
 
+    def _is_intermediate_artifact_path(self, *, task: Task, relpath: str) -> bool:
+        workspace = Path(task.workspace) if task.workspace else None
+        if workspace is None:
+            return False
+        normalized = SubtaskRunner._normalize_path_for_policy(str(relpath), workspace)
+        if not normalized:
+            return False
+        intermediate_root = SubtaskRunner._normalize_path_for_policy(
+            self._output_intermediate_root(),
+            workspace,
+        )
+        if not intermediate_root:
+            return False
+        return normalized == intermediate_root or normalized.startswith(intermediate_root + "/")
+
     def _validate_artifact_seals(
         self,
         *,
@@ -7500,6 +9089,8 @@ class Orchestrator:
         validated = 0
         for relpath, seal in seals.items():
             if not isinstance(seal, dict):
+                continue
+            if self._is_intermediate_artifact_path(task=task, relpath=str(relpath)):
                 continue
             expected = str(seal.get("sha256", "") or "").strip()
             if not expected:
@@ -7555,6 +9146,8 @@ class Orchestrator:
             relpath = str(record.get("artifact_workspace_relpath", "") or "").strip()
             sha256 = str(record.get("artifact_sha256", "") or "").strip()
             if not relpath or not sha256:
+                continue
+            if self._is_intermediate_artifact_path(task=task, relpath=relpath):
                 continue
             current = latest_by_path.get(relpath)
             if current is None:
@@ -8225,6 +9818,15 @@ class Orchestrator:
             "cancel_ack": int(event_counts.get(TASK_CANCEL_ACK, 0)),
             "cancel_timeout": int(event_counts.get(TASK_CANCEL_TIMEOUT, 0)),
         }
+        output_conflict_counts = {
+            "deferred": int(event_counts.get(SUBTASK_OUTPUT_CONFLICT_DEFERRED, 0)),
+            "starvation_warning": int(
+                event_counts.get(SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING, 0),
+            ),
+            "forbidden_canonical_write_blocked": int(
+                event_counts.get(FORBIDDEN_CANONICAL_WRITE_BLOCKED, 0),
+            ),
+        }
         self._emit(TELEMETRY_RUN_SUMMARY, task.id, {
             "run_id": self._task_run_id(task),
             "model_invocations": int(rollup.get("model_invocations", 0)),
@@ -8241,6 +9843,7 @@ class Orchestrator:
             "remediation_lifecycle_counts": remediation_lifecycle_counts,
             "human_loop_counts": human_loop_counts,
             "control_plane_counts": control_plane_counts,
+            "output_conflict_counts": output_conflict_counts,
             "blocked_indicator": bool(event_counts.get(SUBTASK_BLOCKED, 0) > 0),
             "degraded_indicator": bool(event_counts.get(TASK_PLAN_DEGRADED, 0) > 0),
             "replanned_count": int(event_counts.get(TASK_REPLANNING, 0)),

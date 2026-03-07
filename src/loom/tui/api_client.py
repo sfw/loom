@@ -96,6 +96,34 @@ class LoomAPIClient:
         r.raise_for_status()
         return r.json()
 
+    async def get_telemetry_settings(self) -> dict:
+        client = await self._get_client()
+        r = await client.get("/settings/telemetry")
+        r.raise_for_status()
+        return r.json()
+
+    async def set_telemetry_mode(
+        self,
+        mode: str,
+        *,
+        persist: bool = False,
+        admin_token: str = "",
+        actor: str = "tui",
+    ) -> dict:
+        client = await self._get_client()
+        headers: dict[str, str] = {}
+        if admin_token.strip():
+            headers["x-loom-admin-token"] = admin_token.strip()
+        if actor.strip():
+            headers["x-loom-actor"] = actor.strip()
+        r = await client.patch(
+            "/settings/telemetry",
+            json={"mode": mode, "persist": bool(persist)},
+            headers=headers or None,
+        )
+        r.raise_for_status()
+        return r.json()
+
     # --- SSE Streaming ---
 
     async def stream_task_events(self, task_id: str) -> AsyncIterator[dict]:
@@ -148,4 +176,3 @@ class LoomAPIClient:
         )
         r.raise_for_status()
         return r.json()
-

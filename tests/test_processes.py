@@ -17,6 +17,7 @@ import pytest
 from loom.config import Config, ProcessConfig, load_config
 from loom.processes.schema import (
     MemoryType,
+    OutputCoordination,
     PhaseTemplate,
     PlannerExample,
     ProcessDefinition,
@@ -539,6 +540,50 @@ class TestProcessDefinition:
         assert defn.planner_examples == []
         assert defn.source_path is None
         assert defn.package_dir is None
+        assert defn.output_coordination == OutputCoordination()
+
+    def test_phase_output_strategy_uses_process_default_with_override(self):
+        defn = ProcessDefinition(
+            name="output-strategy-process",
+            output_coordination=OutputCoordination(strategy="fan_in"),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="A",
+                ),
+                PhaseTemplate(
+                    id="phase-b",
+                    description="B",
+                    output_strategy="direct",
+                ),
+            ],
+        )
+        assert defn.phase_output_strategy("phase-a") == "fan_in"
+        assert defn.phase_output_strategy("phase-b") == "direct"
+        assert defn.phase_output_strategy("unknown-phase") == "fan_in"
+
+    def test_phase_finalizer_input_policy_uses_process_default_with_override(self):
+        defn = ProcessDefinition(
+            name="finalizer-input-policy-process",
+            output_coordination=OutputCoordination(finalizer_input_policy="allow_partial"),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="A",
+                ),
+                PhaseTemplate(
+                    id="phase-b",
+                    description="B",
+                    finalizer_input_policy="require_all_workers",
+                ),
+            ],
+        )
+        assert defn.phase_finalizer_input_policy("phase-a") == "allow_partial"
+        assert defn.phase_finalizer_input_policy("phase-b") == "require_all_workers"
+        assert defn.phase_finalizer_input_policy("unknown-phase") == "allow_partial"
+
+    def test_phase_finalizer_id_is_deterministic(self):
+        assert ProcessDefinition.phase_finalizer_id("phase-a") == "phase-a__finalize_output"
 
 
 # ===================================================================
@@ -790,6 +835,150 @@ class TestProcessLoaderValidation:
         with pytest.raises(ProcessValidationError) as exc_info:
             self._load_yaml_str(tmp_path, INVALID_PHASE_MODE_YAML)
         assert any("Invalid phase_mode" in e for e in exc_info.value.errors)
+
+    def test_output_coordination_defaults_parse(self, tmp_path):
+        defn = self._load_yaml_str(tmp_path, MINIMAL_YAML)
+        assert defn.output_coordination == OutputCoordination()
+
+    def test_output_coordination_parses_and_normalizes(self, tmp_path):
+        yaml_content = """\
+name: output-coordination-normalized
+version: '1.0'
+output_coordination:
+  strategy: fan_in
+  intermediate_root: .loom//phase-artifacts/./telecom
+  enforce_single_writer: false
+  publish_mode: best_effort
+  conflict_policy: fail_fast
+  finalizer_input_policy: allow_partial
+phases:
+  - id: phase-a
+    description: A
+    output_strategy: fan_in
+    finalizer_input_policy: require_all_workers
+"""
+        defn = self._load_yaml_str(tmp_path, yaml_content)
+        assert defn.output_coordination.strategy == "fan_in"
+        assert defn.output_coordination.intermediate_root == ".loom/phase-artifacts/telecom"
+        assert defn.output_coordination.enforce_single_writer is False
+        assert defn.output_coordination.publish_mode == "best_effort"
+        assert defn.output_coordination.conflict_policy == "fail_fast"
+        assert defn.output_coordination.finalizer_input_policy == "allow_partial"
+        assert defn.phases[0].output_strategy == "fan_in"
+        assert defn.phases[0].finalizer_input_policy == "require_all_workers"
+
+    def test_output_coordination_rejects_invalid_strategy(self, tmp_path):
+        yaml_content = """\
+name: output-coordination-bad-strategy
+version: '1.0'
+output_coordination:
+  strategy: merge_all
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("output_coordination.strategy" in err for err in exc_info.value.errors)
+
+    def test_output_coordination_rejects_invalid_publish_mode(self, tmp_path):
+        yaml_content = """\
+name: output-coordination-bad-publish
+version: '1.0'
+output_coordination:
+  publish_mode: atomic
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("output_coordination.publish_mode" in err for err in exc_info.value.errors)
+
+    def test_output_coordination_rejects_invalid_conflict_policy(self, tmp_path):
+        yaml_content = """\
+name: output-coordination-bad-conflict
+version: '1.0'
+output_coordination:
+  conflict_policy: queue_lifo
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("output_coordination.conflict_policy" in err for err in exc_info.value.errors)
+
+    def test_output_coordination_rejects_invalid_finalizer_input_policy(self, tmp_path):
+        yaml_content = """\
+name: output-coordination-bad-finalizer-policy
+version: '1.0'
+output_coordination:
+  finalizer_input_policy: strict_only
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any(
+            "output_coordination.finalizer_input_policy" in err
+            for err in exc_info.value.errors
+        )
+
+    def test_output_coordination_rejects_absolute_intermediate_root(self, tmp_path):
+        yaml_content = """\
+name: output-coordination-absolute-root
+version: '1.0'
+output_coordination:
+  intermediate_root: /tmp/phase-artifacts
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("output_coordination.intermediate_root" in err for err in exc_info.value.errors)
+
+    def test_output_coordination_rejects_parent_relative_intermediate_root(self, tmp_path):
+        yaml_content = """\
+name: output-coordination-parent-relative
+version: '1.0'
+output_coordination:
+  intermediate_root: ../phase-artifacts
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("output_coordination.intermediate_root" in err for err in exc_info.value.errors)
+
+    def test_phase_output_strategy_rejects_invalid_value(self, tmp_path):
+        yaml_content = """\
+name: phase-output-strategy-invalid
+version: '1.0'
+phases:
+  - id: phase-a
+    description: A
+    output_strategy: merge_all
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("output_strategy must be one of" in err for err in exc_info.value.errors)
+
+    def test_phase_finalizer_input_policy_rejects_invalid_value(self, tmp_path):
+        yaml_content = """\
+name: phase-finalizer-input-policy-invalid
+version: '1.0'
+phases:
+  - id: phase-a
+    description: A
+    finalizer_input_policy: strict_only
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("finalizer_input_policy must be one of" in err for err in exc_info.value.errors)
+
+    def test_fan_in_phase_rejects_reserved_finalizer_id_collision(self, tmp_path):
+        yaml_content = """\
+name: fan-in-finalizer-collision
+version: '1.0'
+output_coordination:
+  strategy: fan_in
+phases:
+  - id: telecom
+    description: Telecom research
+    deliverables:
+      - telecom-funding-details.md
+  - id: telecom__finalize_output
+    description: Existing phase collides with reserved fan-in finalizer id
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("fan_in finalizer id" in err for err in exc_info.value.errors)
 
     def test_valid_process_tests_parse(self, tmp_path):
         defn = self._load_yaml_str(tmp_path, VALID_TESTS_YAML)
@@ -1089,6 +1278,76 @@ class TestExecutorPromptWithProcess:
         assert "REQUIRED OUTPUT FILES (EXACT FILENAMES)" in prompt
         assert "main.py" in prompt
         assert "Do not rename them" in prompt
+
+    def test_fan_in_worker_prompt_suppresses_canonical_deliverable_requirements(
+        self,
+        sample_task,
+        state_manager,
+    ):
+        state_manager.create(sample_task)
+        defn = ProcessDefinition(
+            name="fan-in-executor-prompt",
+            output_coordination=OutputCoordination(strategy="fan_in"),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="A",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        assembler = PromptAssembler(process=defn)
+        subtask = Subtask(
+            id="phase-a-worker",
+            description="Gather evidence",
+            phase_id="phase-a",
+            output_role="worker",
+            output_strategy="fan_in",
+        )
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+        assert "OUTPUT COORDINATION (FAN-IN WORKER MODE)" in prompt
+        assert "REQUIRED OUTPUT FILES (EXACT FILENAMES)" not in prompt
+
+    def test_fan_in_finalizer_transactional_prompt_includes_stage_guidance(
+        self,
+        sample_task,
+        state_manager,
+    ):
+        state_manager.create(sample_task)
+        defn = ProcessDefinition(
+            name="fan-in-finalizer-transactional-prompt",
+            output_coordination=OutputCoordination(
+                strategy="fan_in",
+                publish_mode="transactional",
+            ),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="A",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        assembler = PromptAssembler(process=defn)
+        subtask = Subtask(
+            id=ProcessDefinition.phase_finalizer_id("phase-a"),
+            description="Finalize phase outputs",
+            phase_id="phase-a",
+            output_role="phase_finalizer",
+            output_strategy="fan_in",
+        )
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+        assert "OUTPUT COORDINATION (FAN-IN FINALIZER TRANSACTIONAL MODE)" in prompt
+        assert "Staging path prefix" in prompt
+        assert "CANONICAL DELIVERABLE TARGETS (PUBLISHED AFTER SUCCESS)" in prompt
 
 
 class TestVerifierPromptWithProcess:

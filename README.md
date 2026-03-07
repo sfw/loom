@@ -16,7 +16,7 @@ It handles coding, research, document analysis (PDF, Word docs, PowerPoint decks
 
 **Claude-class cowork UX, local-ready.** Tools like Claude Code and Claude cowork deliver strong agentic experiences, and Claude Code can be paired with local model stacks depending on your setup. Loom's focus is different: a model-agnostic harness designed to keep local and mixed local/cloud execution reliable with structured planning, tool safety, independent verification, and persistent memory. Loom is also cross-platform, while Claude cowork is currently macOS + Claude-model oriented. The result is an agentic workflow that stays robust on your own hardware without locking you to one provider.
 
-Loom also exposes a REST API and an MCP server built for agentic systems. Orchestrators like OpenClaw can call Loom's 20 REST endpoints -- or connect via the Model Context Protocol -- to offload complex multi-step tasks: decomposition, tool calling, verification, and memory. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive. The MCP integration also means any MCP-compatible agent or IDE can use Loom as a tool provider out of the box.
+Loom also exposes a REST API and an MCP server built for agentic systems. Orchestrators like OpenClaw can call Loom's REST endpoints -- or connect via the Model Context Protocol -- to offload complex multi-step tasks: decomposition, tool calling, verification, and memory. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive. The MCP integration also means any MCP-compatible agent or IDE can use Loom as a tool provider out of the box.
 
 ## Why Loom Exists
 
@@ -141,6 +141,15 @@ delegate_task_timeout_seconds = 3600
 enable_process_iteration_loops = false
 enable_iteration_command_exit_gate = false
 
+[telemetry]
+mode = "active" # off | active | all_typed | debug
+runtime_override_enabled = true
+runtime_override_api_enabled = false
+runtime_override_api_token = ""
+persist_runtime_override = false
+debug_diagnostics_rate_per_minute = 120
+debug_diagnostics_burst = 30
+
 [limits.runner]
 enable_filetype_ingest_router = true
 enable_artifact_telemetry_events = true
@@ -197,6 +206,11 @@ This store is intentionally separate from `/auth` profile token refs in
 For artifact and overflow transparency telemetry in `.events.jsonl`, enable
 `[limits.runner].enable_artifact_telemetry_events` (default `true`; set to `false` to disable).
 Use `artifact_telemetry_max_metadata_chars` to bound handler metadata payload size.
+For operator-facing runtime telemetry verbosity, use `[telemetry].mode` (`off`, `active`,
+`all_typed`, `debug`). You can inspect/change process-local runtime mode through
+`GET/PATCH /settings/telemetry` (loopback + admin token required when mutation is enabled,
+via `x-loom-admin-token` or `Authorization: Bearer ...`), or via TUI slash command
+`/telemetry`.
 For large fetched binaries/documents (PDFs, Office files, archives), tune
 `[limits.runner]` retention keys to control cleanup pressure:
 `ingest_artifact_retention_max_age_days`,

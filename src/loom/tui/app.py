@@ -66,6 +66,8 @@ from loom.cowork.session import (
     ToolCallEvent,
     build_cowork_system_prompt,
 )
+from loom.events.types import TelemetryMode
+from loom.events.verbosity import DEFAULT_TELEMETRY_MODE, normalize_telemetry_mode
 from loom.models.base import ModelProvider
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.processes.phase_alignment import infer_phase_id_for_subtask
@@ -162,6 +164,11 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     ),
     SlashCommandSpec(canonical="/tools", description="list available tools"),
     SlashCommandSpec(canonical="/tokens", description="show session token usage"),
+    SlashCommandSpec(
+        canonical="/telemetry",
+        usage="[status|off|active|all_typed|debug|internal_only]",
+        description="show/set runtime telemetry mode (process-local)",
+    ),
     SlashCommandSpec(canonical="/session", description="show current session info"),
     SlashCommandSpec(canonical="/new", description="start a new session"),
     SlashCommandSpec(canonical="/sessions", description="list recent sessions"),
@@ -240,6 +247,7 @@ _SLASH_COMMAND_PRIORITY: dict[str, int] = {
     "/model": 40,
     "/models": 41,
     "/tokens": 42,
+    "/telemetry": 42,
     "/setup": 43,
     "/learned": 44,
     "/help": 45,
@@ -1247,6 +1255,8 @@ class LoomApp(App):
         self._last_applied_directive_id = ""
         self._steer_last_error = ""
         self._total_tokens = 0
+        self._telemetry_runtime_override_mode: TelemetryMode | None = None
+        self._telemetry_mode_updated_at = datetime.now(UTC).isoformat()
 
         # Approval state — resolved via Textual modal
         self._approval_event: asyncio.Event | None = None
@@ -9993,6 +10003,43 @@ class LoomApp(App):
                 lines.append(f"  [#73daca]{safe_cmd:<10}[/] {safe_desc}")
         return "\n".join(lines)
 
+    def _configured_telemetry_mode(self) -> TelemetryMode:
+        telemetry_cfg = getattr(getattr(self, "_config", None), "telemetry", None)
+        return normalize_telemetry_mode(
+            getattr(telemetry_cfg, "mode", DEFAULT_TELEMETRY_MODE),
+            default=DEFAULT_TELEMETRY_MODE,
+        ).mode
+
+    def _runtime_telemetry_mode(self) -> TelemetryMode | None:
+        mode = self._telemetry_runtime_override_mode
+        if mode is None:
+            return None
+        return normalize_telemetry_mode(
+            mode,
+            default=DEFAULT_TELEMETRY_MODE,
+        ).mode
+
+    def _effective_telemetry_mode(self) -> TelemetryMode:
+        runtime_mode = self._runtime_telemetry_mode()
+        return runtime_mode or self._configured_telemetry_mode()
+
+    def _render_telemetry_mode_status(self) -> str:
+        configured_mode = self._configured_telemetry_mode()
+        runtime_mode = self._runtime_telemetry_mode()
+        effective_mode = runtime_mode or configured_mode
+        runtime_display = runtime_mode or "(none)"
+        updated_at = str(self._telemetry_mode_updated_at or "").strip()
+        lines = [
+            "[bold #7dcfff]Telemetry Mode[/]",
+            f"configured: [bold]{self._escape_markup(configured_mode)}[/bold]",
+            f"runtime override: [bold]{self._escape_markup(runtime_display)}[/bold]",
+            f"effective: [bold]{self._escape_markup(effective_mode)}[/bold]",
+            "scope: [bold]process_local[/bold]",
+        ]
+        if updated_at:
+            lines.append(f"updated_at: [dim]{self._escape_markup(updated_at)}[/dim]")
+        return "\n".join(lines)
+
     @staticmethod
     def _slash_spec_sort_key(spec: SlashCommandSpec) -> tuple[int, str]:
         """Return deterministic display/completion ordering key for slash specs."""
@@ -11269,13 +11316,31 @@ class LoomApp(App):
                 async def _orchestrator_factory(
                     process_override: ProcessDefinition | None = None,
                 ):
+                    telemetry_cfg = getattr(config, "telemetry", None)
+                    event_bus_kwargs = {
+                        "debug_diagnostics_rate_per_minute": int(
+                            getattr(
+                                telemetry_cfg,
+                                "debug_diagnostics_rate_per_minute",
+                                120,
+                            ),
+                        ),
+                        "debug_diagnostics_burst": int(
+                            getattr(telemetry_cfg, "debug_diagnostics_burst", 30),
+                        ),
+                    }
+                    try:
+                        event_bus = EventBus(**event_bus_kwargs)
+                    except TypeError:
+                        event_bus = EventBus()
+                    event_bus.set_operator_mode_provider(self._effective_telemetry_mode)
                     return Orchestrator(
                         model_router=router,
                         tool_registry=_create_tools(config),
                         memory_manager=MemoryManager(db),
                         prompt_assembler=PromptAssembler(),
                         state_manager=TaskStateManager(data_dir),
-                        event_bus=EventBus(),
+                        event_bus=event_bus,
                         config=config,
                         process=process_override or self._process_defn,
                     )
@@ -12885,6 +12950,41 @@ class LoomApp(App):
             return True
         if token == "/tokens":
             chat.add_info(f"Session tokens: {self._total_tokens:,}")
+            return True
+        if token == "/telemetry":
+            if not arg or arg.lower() in {"status", "show"}:
+                chat.add_info(self._render_telemetry_mode_status())
+                return True
+            try:
+                tokens = self._split_slash_args(arg)
+            except ValueError as e:
+                chat.add_info(f"[bold #f7768e]{e}[/]")
+                return True
+            if len(tokens) != 1:
+                chat.add_info(
+                    self._render_slash_command_usage(
+                        "/telemetry",
+                        "[status|off|active|all_typed|debug|internal_only]",
+                    ),
+                )
+                return True
+            resolution = normalize_telemetry_mode(
+                tokens[0],
+                default=DEFAULT_TELEMETRY_MODE,
+            )
+            self._telemetry_runtime_override_mode = resolution.mode
+            self._telemetry_mode_updated_at = datetime.now(UTC).isoformat()
+            lines = [
+                "Telemetry mode updated.",
+                f"effective mode: [bold]{self._escape_markup(resolution.mode)}[/bold]",
+            ]
+            if resolution.warning_code:
+                lines.append(
+                    "[dim]Input normalized to canonical mode "
+                    f"({self._escape_markup(resolution.warning_code)}).[/dim]"
+                )
+            lines.append(self._render_telemetry_mode_status())
+            chat.add_info("\n".join(lines))
             return True
         if token == "/processes":
             self._refresh_process_command_index()

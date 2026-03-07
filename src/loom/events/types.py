@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal
 
 EventLifecycle = Literal["active", "deprecated", "internal_only"]
+TelemetryMode = Literal["off", "active", "all_typed", "debug"]
 
 # Task lifecycle events
 TASK_CREATED = "task_created"
@@ -36,12 +37,15 @@ SUBTASK_COMPLETED = "subtask_completed"
 SUBTASK_FAILED = "subtask_failed"
 SUBTASK_OUTCOME_STALE = "subtask_outcome_stale"
 SUBTASK_BLOCKED = "subtask_blocked"
+SUBTASK_OUTPUT_CONFLICT_DEFERRED = "subtask_output_conflict_deferred"
+SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING = "subtask_output_conflict_starvation_warning"
 SUBTASK_POLICY_RECONCILED = "subtask_policy_reconciled"
 
 # Tool events
 TOOL_CALL_STARTED = "tool_call_started"
 TOOL_CALL_COMPLETED = "tool_call_completed"
 TOOL_CALL_DEDUPLICATED = "tool_call_deduplicated"
+FORBIDDEN_CANONICAL_WRITE_BLOCKED = "forbidden_canonical_write_blocked"
 ARTIFACT_CONFINEMENT_VIOLATION = "artifact_confinement_violation"
 ARTIFACT_INGEST_CLASSIFIED = "artifact_ingest_classified"
 ARTIFACT_INGEST_COMPLETED = "artifact_ingest_completed"
@@ -118,6 +122,11 @@ DB_MIGRATION_VERIFY_FAILED = "db_migration_verify_failed"
 DB_MIGRATION_FAILED = "db_migration_failed"
 DB_SCHEMA_READY = "db_schema_ready"
 
+# Telemetry runtime/settings events
+TELEMETRY_MODE_CHANGED = "telemetry_mode_changed"
+TELEMETRY_SETTINGS_WARNING = "telemetry_settings_warning"
+TELEMETRY_DIAGNOSTIC = "telemetry_diagnostic"
+
 # Streaming events
 TOKEN_STREAMED = "token_streamed"
 
@@ -175,11 +184,14 @@ EVENT_LIFECYCLE: dict[str, EventLifecycle] = {
     SUBTASK_FAILED: "active",
     SUBTASK_OUTCOME_STALE: "active",
     SUBTASK_BLOCKED: "active",
+    SUBTASK_OUTPUT_CONFLICT_DEFERRED: "active",
+    SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING: "active",
     SUBTASK_POLICY_RECONCILED: "active",
     # Tool events
     TOOL_CALL_STARTED: "active",
     TOOL_CALL_COMPLETED: "active",
     TOOL_CALL_DEDUPLICATED: "active",
+    FORBIDDEN_CANONICAL_WRITE_BLOCKED: "active",
     ARTIFACT_CONFINEMENT_VIOLATION: "active",
     ARTIFACT_INGEST_CLASSIFIED: "active",
     ARTIFACT_INGEST_COMPLETED: "active",
@@ -248,6 +260,10 @@ EVENT_LIFECYCLE: dict[str, EventLifecycle] = {
     DB_MIGRATION_VERIFY_FAILED: "internal_only",
     DB_MIGRATION_FAILED: "internal_only",
     DB_SCHEMA_READY: "internal_only",
+    # Telemetry runtime/settings
+    TELEMETRY_MODE_CHANGED: "active",
+    TELEMETRY_SETTINGS_WARNING: "active",
+    TELEMETRY_DIAGNOSTIC: "internal_only",
     # Streaming / conversation
     TOKEN_STREAMED: "internal_only",
     CONVERSATION_MESSAGE: "internal_only",

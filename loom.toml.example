@@ -178,6 +178,15 @@ chars_per_token_estimate = 2.8
 token_headroom = 128
 target_chars_ratio = 0.82
 
+[telemetry]
+mode = "active" # off | active | all_typed | debug
+runtime_override_enabled = true
+runtime_override_api_enabled = false
+runtime_override_api_token = ""
+persist_runtime_override = false
+debug_diagnostics_rate_per_minute = 120
+debug_diagnostics_burst = 30
+
 [memory]
 database_path = "~/.loom/loom.db"
 

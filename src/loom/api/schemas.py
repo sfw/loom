@@ -49,6 +49,11 @@ class TaskQuestionAnswerRequest(BaseModel):
     client_id: str | None = None
 
 
+class TelemetrySettingsPatchRequest(BaseModel):
+    mode: str
+    persist: bool = False
+
+
 # --- Response Schemas ---
 
 
@@ -167,3 +172,11 @@ class TaskQuestionResponse(BaseModel):
     updated_at: str = ""
     resolved_at: str = ""
     timeout_at: str = ""
+
+
+class TelemetrySettingsResponse(BaseModel):
+    configured_mode: str
+    runtime_override_mode: str = ""
+    effective_mode: str
+    scope: str
+    updated_at: str

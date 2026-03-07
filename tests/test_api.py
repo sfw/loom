@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,10 +11,19 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from loom.api.engine import Engine
-from loom.config import Config, ExecutionConfig, ProcessConfig
+from loom.config import Config, ExecutionConfig, ProcessConfig, TelemetryConfig
 from loom.engine.orchestrator import Orchestrator
-from loom.events.bus import EventBus
-from loom.events.types import STEER_INSTRUCTION, TASK_CREATED
+from loom.events.bus import Event, EventBus
+from loom.events.types import (
+    STEER_INSTRUCTION,
+    TASK_COMPLETED,
+    TASK_CREATED,
+    TASK_EXECUTING,
+    TASK_RUN_HEARTBEAT,
+    TELEMETRY_MODE_CHANGED,
+    TELEMETRY_SETTINGS_WARNING,
+    TOKEN_STREAMED,
+)
 from loom.events.webhook import WebhookDelivery
 from loom.learning.manager import LearningManager
 from loom.models.router import ModelRouter
@@ -218,6 +229,275 @@ class TestSystemEndpoints:
         assert response.status_code == 200
         payload = response.json()
         assert payload["enabled"] is False
+
+
+class TestTelemetrySettings:
+    @pytest.mark.asyncio
+    async def test_get_telemetry_settings_defaults(self, client):
+        response = await client.get("/settings/telemetry")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["configured_mode"] == "active"
+        assert payload["effective_mode"] == "active"
+        assert payload["scope"] == "process_local"
+
+    @pytest.mark.asyncio
+    async def test_patch_telemetry_settings_disabled_by_default(self, client):
+        response = await client.patch(
+            "/settings/telemetry",
+            json={"mode": "debug", "persist": False},
+        )
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_patch_telemetry_settings_requires_admin_token(self, client, engine):
+        engine.config = Config(
+            telemetry=TelemetryConfig(
+                mode="active",
+                configured_mode_input="active",
+                runtime_override_enabled=True,
+                runtime_override_api_enabled=True,
+                runtime_override_api_token="local-secret",
+            ),
+        )
+        response = await client.patch(
+            "/settings/telemetry",
+            json={"mode": "debug", "persist": False},
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_patch_telemetry_settings_accepts_bearer_admin_token(self, client, engine):
+        engine.config = Config(
+            telemetry=TelemetryConfig(
+                mode="active",
+                configured_mode_input="active",
+                runtime_override_enabled=True,
+                runtime_override_api_enabled=True,
+                runtime_override_api_token="local-secret",
+            ),
+        )
+        response = await client.patch(
+            "/settings/telemetry",
+            json={"mode": "debug", "persist": False},
+            headers={"authorization": "Bearer local-secret"},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["runtime_override_mode"] == "debug"
+
+    @pytest.mark.asyncio
+    async def test_patch_telemetry_settings_requires_loopback_origin(self, client, engine):
+        engine.config = Config(
+            telemetry=TelemetryConfig(
+                mode="active",
+                configured_mode_input="active",
+                runtime_override_enabled=True,
+                runtime_override_api_enabled=True,
+                runtime_override_api_token="local-secret",
+            ),
+        )
+        response = await client.patch(
+            "/settings/telemetry",
+            json={"mode": "debug", "persist": False},
+            headers={
+                "x-loom-admin-token": "local-secret",
+                "x-forwarded-for": "203.0.113.20",
+            },
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_patch_telemetry_settings_updates_mode_and_emits_audit_event(
+        self,
+        client,
+        engine,
+        event_bus,
+    ):
+        engine.config = Config(
+            telemetry=TelemetryConfig(
+                mode="active",
+                configured_mode_input="active",
+                runtime_override_enabled=True,
+                runtime_override_api_enabled=True,
+                runtime_override_api_token="local-secret",
+            ),
+        )
+        observed = []
+        event_bus.subscribe_all(lambda event: observed.append(event))
+        response = await client.patch(
+            "/settings/telemetry",
+            json={"mode": "debug", "persist": False},
+            headers={"x-loom-admin-token": "local-secret"},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["configured_mode"] == "active"
+        assert payload["runtime_override_mode"] == "debug"
+        assert payload["effective_mode"] == "debug"
+        mode_events = [
+            event
+            for event in observed
+            if event.event_type == TELEMETRY_MODE_CHANGED
+        ]
+        assert mode_events
+        assert mode_events[-1].data.get("effective_mode") == "debug"
+
+    @pytest.mark.asyncio
+    async def test_patch_telemetry_settings_normalizes_alias_and_emits_warning(
+        self,
+        client,
+        engine,
+        event_bus,
+    ):
+        engine.config = Config(
+            telemetry=TelemetryConfig(
+                mode="active",
+                configured_mode_input="active",
+                runtime_override_enabled=True,
+                runtime_override_api_enabled=True,
+                runtime_override_api_token="local-secret",
+            ),
+        )
+        observed = []
+        event_bus.subscribe_all(lambda event: observed.append(event))
+        response = await client.patch(
+            "/settings/telemetry",
+            json={"mode": "internal_only", "persist": False},
+            headers={"x-loom-admin-token": "local-secret"},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["runtime_override_mode"] == "all_typed"
+        warnings = [
+            event
+            for event in observed
+            if event.event_type == TELEMETRY_SETTINGS_WARNING
+        ]
+        assert warnings
+        assert warnings[-1].data.get("warning_code") == "telemetry_mode_alias_normalized"
+
+    @pytest.mark.asyncio
+    async def test_patch_telemetry_settings_persist_disabled_returns_400(self, client, engine):
+        engine.config = Config(
+            telemetry=TelemetryConfig(
+                mode="active",
+                configured_mode_input="active",
+                runtime_override_enabled=True,
+                runtime_override_api_enabled=True,
+                runtime_override_api_token="local-secret",
+                persist_runtime_override=False,
+            ),
+        )
+        assert engine.runtime_telemetry_mode() is None
+        assert engine.effective_telemetry_mode() == "active"
+        response = await client.patch(
+            "/settings/telemetry",
+            json={"mode": "debug", "persist": True},
+            headers={"x-loom-admin-token": "local-secret"},
+        )
+        assert response.status_code == 400
+        assert engine.runtime_telemetry_mode() is None
+        assert engine.effective_telemetry_mode() == "active"
+
+
+class TestTelemetrySinkFiltering:
+    @pytest.mark.asyncio
+    async def test_stream_off_mode_keeps_passthrough_and_hides_tokens(
+        self,
+        client,
+        engine,
+        event_bus,
+        state_manager,
+    ):
+        _make_task(
+            state_manager,
+            task_id="stream-1",
+            status=TaskStatus.EXECUTING,
+        )
+        engine.set_runtime_telemetry_mode(
+            mode_input="off",
+            actor="test",
+            source="test-suite",
+            persist=False,
+        )
+
+        async def emit_events():
+            await asyncio.sleep(0.02)
+            event_bus.emit(
+                Event(
+                    event_type=TOKEN_STREAMED,
+                    task_id="stream-1",
+                    data={"token": "x", "subtask_id": "s1", "model": "m"},
+                ),
+            )
+            event_bus.emit(
+                Event(
+                    event_type=TASK_RUN_HEARTBEAT,
+                    task_id="stream-1",
+                    data={"run_id": "run-1"},
+                ),
+            )
+            event_bus.emit(
+                Event(
+                    event_type=TASK_COMPLETED,
+                    task_id="stream-1",
+                    data={},
+                ),
+            )
+
+        seen_event_types: list[str] = []
+        emitter = asyncio.create_task(emit_events())
+        async with client.stream("GET", "/tasks/stream-1/stream") as response:
+            current_event = ""
+            async for line in response.aiter_lines():
+                if not line.strip() or line.startswith(":"):
+                    continue
+                if line.startswith("event: "):
+                    current_event = line.removeprefix("event: ").strip()
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                payload = json.loads(line.removeprefix("data: "))
+                seen_event_types.append(current_event or str(payload.get("event_type", "")))
+                if current_event == TASK_COMPLETED:
+                    break
+        await emitter
+
+        assert TASK_RUN_HEARTBEAT in seen_event_types
+        assert TOKEN_STREAMED not in seen_event_types
+
+    @pytest.mark.asyncio
+    async def test_off_mode_does_not_suppress_compliance_persistence(
+        self,
+        engine,
+        event_bus,
+        state_manager,
+    ):
+        from loom.events.bus import EventPersister
+
+        _make_task(
+            state_manager,
+            task_id="persist-1",
+            status=TaskStatus.EXECUTING,
+        )
+        EventPersister(engine.database).attach(event_bus)
+        engine.set_runtime_telemetry_mode(
+            mode_input="off",
+            actor="test",
+            source="test-suite",
+            persist=False,
+        )
+        event_bus.emit(
+            Event(
+                event_type=TASK_EXECUTING,
+                task_id="persist-1",
+                data={},
+            ),
+        )
+        await event_bus.drain(timeout=1.0)
+        rows = await engine.database.query_events("persist-1", event_type=TASK_EXECUTING)
+        assert rows
 
 
 # --- Task CRUD ---

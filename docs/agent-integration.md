@@ -187,6 +187,16 @@ models = client.get("/models").json()
 
 # List available tools
 tools = client.get("/tools").json()
+
+# Inspect telemetry mode state
+telemetry = client.get("/settings/telemetry").json()
+
+# Update runtime telemetry mode (requires loopback caller + admin token)
+client.patch(
+    "/settings/telemetry",
+    json={"mode": "debug", "persist": False},
+    headers={"x-loom-admin-token": "YOUR_ADMIN_TOKEN"},  # or Authorization: Bearer YOUR_ADMIN_TOKEN
+)
 ```
 
 ---

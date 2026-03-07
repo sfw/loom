@@ -21,6 +21,14 @@ from loom.events.types import (
     TASK_EXECUTING,
     TASK_FAILED,
     TASK_PLANNING,
+    TASK_RUN_HEARTBEAT,
+    TELEMETRY_DIAGNOSTIC,
+    TOKEN_STREAMED,
+)
+from loom.events.verbosity import (
+    normalize_telemetry_mode,
+    should_deliver_operator,
+    should_persist_compliance,
 )
 
 
@@ -99,7 +107,7 @@ class TestEventBus:
     def test_recent_events(self):
         bus = EventBus()
         for i in range(5):
-            bus.emit(Event(event_type="test", task_id=f"t{i}"))
+            bus.emit(Event(event_type=TASK_COMPLETED, task_id=f"t{i}"))
 
         recent = bus.recent_events(limit=3)
         assert len(recent) == 3
@@ -109,7 +117,7 @@ class TestEventBus:
     def test_recent_events_default_limit(self):
         bus = EventBus()
         for i in range(10):
-            bus.emit(Event(event_type="test", task_id=f"t{i}"))
+            bus.emit(Event(event_type=TASK_COMPLETED, task_id=f"t{i}"))
 
         recent = bus.recent_events()
         assert len(recent) == 10
@@ -118,7 +126,7 @@ class TestEventBus:
         bus = EventBus()
         bus._max_history = 5
         for i in range(10):
-            bus.emit(Event(event_type="test", task_id=f"t{i}"))
+            bus.emit(Event(event_type=TASK_COMPLETED, task_id=f"t{i}"))
 
         assert len(bus._history) == 5
         assert bus._history[0].task_id == "t5"
@@ -164,6 +172,21 @@ class TestEventBus:
     def test_catalog_lifecycle_covers_all_declared_events(self):
         assert set(EVENT_NAME_TO_TYPE.values()) == set(EVENT_LIFECYCLE.keys())
         assert TASK_CREATED in ACTIVE_EVENT_TYPES
+
+    def test_normalize_telemetry_mode_alias(self):
+        resolved = normalize_telemetry_mode("internal_only")
+        assert resolved.mode == "all_typed"
+        assert resolved.warning_code == "telemetry_mode_alias_normalized"
+
+    def test_should_deliver_operator_preserves_passthrough_in_off_mode(self):
+        assert should_deliver_operator(TASK_RUN_HEARTBEAT, "off") is True
+        assert should_deliver_operator(TOKEN_STREAMED, "off") is False
+        assert should_deliver_operator(TOKEN_STREAMED, "all_typed") is True
+        assert should_deliver_operator(TELEMETRY_DIAGNOSTIC, "all_typed") is False
+        assert should_deliver_operator(TELEMETRY_DIAGNOSTIC, "debug") is True
+
+    def test_should_persist_compliance_keeps_unknown_events(self):
+        assert should_persist_compliance("mystery_event") is True
 
     def test_emit_enriches_payload_with_audit_fields(self):
         bus = EventBus()
@@ -316,6 +339,60 @@ class TestEventBus:
         errors = validate_payload_shape(SUBTASK_BLOCKED, {"subtask_id": "s1"})
         assert "missing required key: reasons" in errors
 
+    def test_unknown_event_type_emits_rate_limited_diagnostic(self):
+        bus = EventBus()
+        bus.emit(Event(event_type="unknown_event", task_id="task-1", data={"x": 1}))
+        history_types = [evt.event_type for evt in bus.recent_events(limit=4)]
+        assert "unknown_event" in history_types
+        assert TELEMETRY_DIAGNOSTIC in history_types
+        diagnostic = [
+            evt for evt in bus.recent_events(limit=4)
+            if evt.event_type == TELEMETRY_DIAGNOSTIC
+        ][-1]
+        assert diagnostic.data.get("diagnostic_type") == "unknown_event_type"
+
+    def test_payload_contract_violation_emits_diagnostic(self):
+        bus = EventBus()
+        bus.emit(Event(event_type=TASK_CREATED, task_id="task-2", data={}))
+        diagnostic = [
+            evt for evt in bus.recent_events(limit=6)
+            if evt.event_type == TELEMETRY_DIAGNOSTIC
+        ][-1]
+        assert diagnostic.data.get("diagnostic_type") == "payload_contract_violation"
+        assert "missing required key: goal" in str(diagnostic.data.get("errors", ""))
+
+    def test_diagnostic_rate_limit_suppresses_excess_events(self):
+        bus = EventBus(
+            debug_diagnostics_rate_per_minute=1,
+            debug_diagnostics_burst=1,
+        )
+        for idx in range(3):
+            bus.emit(Event(event_type=f"unknown_event_{idx}", task_id="task-rate"))
+        diagnostics = [
+            evt
+            for evt in bus.recent_events(limit=12)
+            if evt.event_type == TELEMETRY_DIAGNOSTIC
+        ]
+        assert len(diagnostics) == 1
+        assert diagnostics[0].data.get("diagnostic_type") == "unknown_event_type"
+
+    def test_telemetry_diagnostic_event_does_not_recurse(self):
+        bus = EventBus()
+        bus.emit(
+            Event(
+                event_type=TELEMETRY_DIAGNOSTIC,
+                task_id="task-diag",
+                data={"diagnostic_type": "manual"},
+            ),
+        )
+        diagnostics = [
+            evt
+            for evt in bus.recent_events(limit=4)
+            if evt.event_type == TELEMETRY_DIAGNOSTIC
+        ]
+        assert len(diagnostics) == 1
+        assert diagnostics[0].data.get("diagnostic_type") == "manual"
+
     def test_event_persister_tracks_failed_persistence_attempts(self):
         class FailingDB:
             async def insert_event(self, **kwargs):  # type: ignore[no-untyped-def]
@@ -330,3 +407,25 @@ class TestEventBus:
 
         asyncio.run(run())
         assert persister._failed_persist_count == 2
+
+    def test_event_persister_emits_persistence_failure_diagnostic(self):
+        class FailingDB:
+            async def insert_event(self, **kwargs):  # type: ignore[no-untyped-def]
+                raise RuntimeError("db unavailable")
+
+        bus = EventBus()
+        persister = EventPersister(FailingDB())
+        persister.attach(bus)
+        event = Event(event_type=TASK_CREATED, task_id="task-fail", data={"goal": "x"})
+
+        async def run():
+            await persister.handle(event)
+
+        asyncio.run(run())
+        diagnostics = [
+            evt
+            for evt in bus.recent_events(limit=4)
+            if evt.event_type == TELEMETRY_DIAGNOSTIC
+        ]
+        assert diagnostics
+        assert diagnostics[-1].data.get("diagnostic_type") == "persistence_failure_count_snapshot"

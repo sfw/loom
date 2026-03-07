@@ -39,6 +39,7 @@ from loom.events.types import (
     ASK_USER_REQUESTED,
     CLAIMS_PRUNED,
     COMPACTION_POLICY_DECISION,
+    FORBIDDEN_CANONICAL_WRITE_BLOCKED,
     ITERATION_COMPLETED,
     ITERATION_RETRYING,
     OVERFLOW_FALLBACK_APPLIED,
@@ -49,6 +50,8 @@ from loom.events.types import (
     REMEDIATION_RESOLVED,
     RUN_VALIDITY_SCORECARD,
     SUBTASK_BLOCKED,
+    SUBTASK_OUTPUT_CONFLICT_DEFERRED,
+    SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING,
     SUBTASK_POLICY_RECONCILED,
     SYNTHESIS_INPUT_GATE_DECISION,
     TASK_CANCEL_REQUESTED,
@@ -78,6 +81,7 @@ from loom.processes.schema import (
     IterationBudget,
     IterationGate,
     IterationPolicy,
+    OutputCoordination,
     PhaseTemplate,
     ProcessDefinition,
     VerificationRemediationContract,
@@ -391,6 +395,10 @@ class TestOrchestratorPlan:
         assert summary_event.data["compaction_policy_decisions"] == 4
         assert summary_event.data["overflow_fallback_count"] == 1
         assert summary_event.data["compactor_warning_count"] == 2
+        assert "output_conflict_counts" in summary_event.data
+        assert summary_event.data["output_conflict_counts"][
+            "forbidden_canonical_write_blocked"
+        ] == 0
         assert "run_id" in summary_event.data
         assert "budget_snapshot" in summary_event.data
 
@@ -1261,10 +1269,991 @@ class TestOrchestratorExecution:
 
         _, kwargs = orch._runner.run.await_args
         assert kwargs["expected_deliverables"] == ["analysis.md"]
+        assert kwargs["forbidden_deliverables"] == []
         assert kwargs["enforce_deliverable_paths"] is True
         assert kwargs["edit_existing_only"] is True
         assert kwargs["retry_strategy"] == RetryStrategy.UNCONFIRMED_DATA.value
         assert "CANONICAL DELIVERABLE FILES FOR THIS SUBTASK" in kwargs["retry_context"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_retry_maps_deliverables_from_phase_hint(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "phase-a", "description": "Analyze"}]
+        })
+        process = ProcessDefinition(
+            name="test-process",
+            description="Test",
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze telecom funding programs",
+                    deliverables=["analysis.md"],
+                ),
+                PhaseTemplate(
+                    id="phase-b",
+                    description="Synthesize report",
+                    deliverables=["report.md"],
+                ),
+            ],
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="research-bell-media-crave-funding",
+            description="Research Bell and Crave funding pathways",
+            phase_id="phase-a",
+        )
+        task.plan.subtasks = [subtask]
+
+        successful_call = ToolCallRecord(
+            tool="write_file",
+            args={"path": "analysis.md"},
+            result=ToolResult.ok("ok", files_changed=["analysis.md"]),
+        )
+        attempts = {
+            "research-bell-media-crave-funding": [
+                AttemptRecord(
+                    attempt=1,
+                    tier=1,
+                    feedback="Retry with fixes",
+                    retry_strategy=RetryStrategy.UNCONFIRMED_DATA,
+                    successful_tool_calls=[successful_call],
+                ),
+            ],
+        }
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="ok"),
+            VerificationResult(tier=1, passed=True),
+        ))
+
+        await orch._dispatch_subtask(task, subtask, attempts)
+
+        _, kwargs = orch._runner.run.await_args
+        assert kwargs["expected_deliverables"] == ["analysis.md"]
+        assert kwargs["forbidden_deliverables"] == []
+        assert kwargs["enforce_deliverable_paths"] is True
+        assert kwargs["edit_existing_only"] is True
+        assert "CANONICAL DELIVERABLE FILES FOR THIS SUBTASK" in kwargs["retry_context"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_fan_in_worker_blocks_canonical_outputs(self, tmp_path):
+        process = ProcessDefinition(
+            name="fan-in-process",
+            description="Test",
+            output_coordination=OutputCoordination(strategy="fan_in"),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="phase-a-worker",
+            description="Collect artifacts",
+            phase_id="phase-a",
+        )
+        task.plan.subtasks = [subtask]
+        attempts = {
+            subtask.id: [
+                AttemptRecord(
+                    attempt=1,
+                    tier=1,
+                    feedback="Retry with fixes",
+                    retry_strategy=RetryStrategy.UNCONFIRMED_DATA,
+                ),
+            ],
+        }
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="ok"),
+            VerificationResult(tier=1, passed=True),
+        ))
+
+        await orch._dispatch_subtask(task, subtask, attempts)
+
+        _, kwargs = orch._runner.run.await_args
+        assert kwargs["expected_deliverables"] == []
+        assert kwargs["forbidden_deliverables"] == ["analysis.md"]
+        assert kwargs["allowed_output_prefixes"] == [
+            "loom/phase-artifacts/phase-a/phase-a-worker",
+        ]
+        assert kwargs["enforce_deliverable_paths"] is False
+        assert kwargs["edit_existing_only"] is False
+        assert "OUTPUT COORDINATION MODE: FAN-IN WORKER" in kwargs["retry_context"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_fan_in_finalizer_owns_canonical_outputs(self, tmp_path):
+        process = ProcessDefinition(
+            name="fan-in-process",
+            description="Test",
+            output_coordination=OutputCoordination(strategy="fan_in"),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id=ProcessDefinition.phase_finalizer_id("phase-a"),
+            description="Finalize outputs",
+            phase_id="phase-a",
+            output_role="phase_finalizer",
+            output_strategy="fan_in",
+        )
+        task.plan.subtasks = [subtask]
+        attempts = {
+            subtask.id: [
+                AttemptRecord(
+                    attempt=1,
+                    tier=1,
+                    feedback="Retry with fixes",
+                    retry_strategy=RetryStrategy.UNCONFIRMED_DATA,
+                ),
+            ],
+        }
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="ok"),
+            VerificationResult(tier=1, passed=True),
+        ))
+
+        await orch._dispatch_subtask(task, subtask, attempts)
+
+        _, kwargs = orch._runner.run.await_args
+        assert kwargs["expected_deliverables"] == ["analysis.md"]
+        assert kwargs["forbidden_deliverables"] == []
+        assert kwargs["allowed_output_prefixes"] == []
+        assert kwargs["enforce_deliverable_paths"] is True
+        assert kwargs["edit_existing_only"] is True
+        assert "OUTPUT COORDINATION MODE: FAN-IN PHASE FINALIZER" in kwargs["retry_context"]
+
+    def test_prepare_plan_injects_fan_in_finalizer_and_remaps_downstream_dependencies(
+        self,
+        tmp_path,
+    ):
+        process = ProcessDefinition(
+            name="fan-in-plan-alignment",
+            description="Test",
+            output_coordination=OutputCoordination(strategy="fan_in"),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    depends_on=[],
+                    deliverables=["analysis.md"],
+                ),
+                PhaseTemplate(
+                    id="phase-b",
+                    description="Synthesize",
+                    depends_on=["phase-a"],
+                    deliverables=["report.md"],
+                ),
+            ],
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task()
+        plan = Plan(
+            subtasks=[
+                Subtask(id="phase-a", description="Analyze", depends_on=[], phase_id="phase-a"),
+                Subtask(
+                    id="phase-b",
+                    description="Synthesize",
+                    depends_on=["phase-a"],
+                    phase_id="phase-b",
+                ),
+            ],
+            version=1,
+        )
+
+        prepared = orch._prepare_plan_for_execution(
+            task=task,
+            plan=plan,
+            context="planner",
+        )
+
+        finalizer_id = ProcessDefinition.phase_finalizer_id("phase-a")
+        finalizer = next((s for s in prepared.subtasks if s.id == finalizer_id), None)
+        assert finalizer is not None
+        assert finalizer.phase_id == "phase-a"
+        assert finalizer.output_role == "phase_finalizer"
+        assert finalizer.output_strategy == "fan_in"
+        assert "phase-a" in finalizer.depends_on
+        phase_b = next((s for s in prepared.subtasks if s.id == "phase-b"), None)
+        assert phase_b is not None
+        assert phase_b.depends_on == [finalizer_id]
+
+    @pytest.mark.asyncio
+    async def test_output_conflict_guard_serializes_same_deliverable_writers(self, tmp_path):
+        process = ProcessDefinition(
+            name="output-conflict-process",
+            description="Test",
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=20,
+            max_parallel_subtasks=3,
+            auto_approve_confidence_threshold=0.8,
+            enable_streaming=False,
+        ))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text="{}"),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=cfg,
+            process=process,
+        )
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(id="s1", description="worker 1", phase_id="phase-a"),
+                Subtask(id="s2", description="worker 2", phase_id="phase-a"),
+                Subtask(id="s3", description="worker 3", phase_id="phase-a"),
+            ],
+            version=1,
+        )
+
+        active = 0
+        max_active = 0
+
+        async def dispatch_side_effect(_task, subtask, _attempts):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return (
+                subtask,
+                SubtaskResult(status="success", summary="ok"),
+                VerificationResult(tier=1, passed=True),
+            )
+
+        orch._dispatch_subtask = AsyncMock(side_effect=dispatch_side_effect)
+
+        result = await orch.execute_task(task, reuse_existing_plan=True)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert max_active == 1
+
+    @pytest.mark.asyncio
+    async def test_output_conflict_guard_preserves_parallelism_for_disjoint_deliverables(
+        self,
+        tmp_path,
+    ):
+        process = ProcessDefinition(
+            name="disjoint-deliverables-process",
+            description="Test",
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+                PhaseTemplate(
+                    id="phase-b",
+                    description="Synthesize",
+                    deliverables=["report.md"],
+                ),
+            ],
+        )
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=20,
+            max_parallel_subtasks=2,
+            auto_approve_confidence_threshold=0.8,
+            enable_streaming=False,
+        ))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text="{}"),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=cfg,
+            process=process,
+        )
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(id="s1", description="worker 1", phase_id="phase-a"),
+                Subtask(id="s2", description="worker 2", phase_id="phase-b"),
+            ],
+            version=1,
+        )
+
+        active = 0
+        max_active = 0
+
+        async def dispatch_side_effect(_task, subtask, _attempts):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return (
+                subtask,
+                SubtaskResult(status="success", summary="ok"),
+                VerificationResult(tier=1, passed=True),
+            )
+
+        orch._dispatch_subtask = AsyncMock(side_effect=dispatch_side_effect)
+
+        result = await orch.execute_task(task, reuse_existing_plan=True)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert max_active == 2
+
+    @pytest.mark.asyncio
+    async def test_output_conflict_deferral_emits_deferred_and_starvation_events(
+        self,
+        tmp_path,
+    ):
+        process = ProcessDefinition(
+            name="output-conflict-events-process",
+            description="Test",
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=20,
+            max_parallel_subtasks=2,
+            auto_approve_confidence_threshold=0.8,
+            enable_streaming=False,
+        ))
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda e: events.append(e))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text="{}"),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=cfg,
+            process=process,
+        )
+        orch._output_conflict_starvation_threshold = 1
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(id="s1", description="worker 1", phase_id="phase-a"),
+                Subtask(id="s2", description="worker 2", phase_id="phase-a"),
+            ],
+            version=1,
+        )
+
+        async def dispatch_side_effect(_task, subtask, _attempts):
+            await asyncio.sleep(0.01)
+            return (
+                subtask,
+                SubtaskResult(status="success", summary="ok"),
+                VerificationResult(tier=1, passed=True),
+            )
+
+        orch._dispatch_subtask = AsyncMock(side_effect=dispatch_side_effect)
+
+        result = await orch.execute_task(task, reuse_existing_plan=True)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert any(e.event_type == SUBTASK_OUTPUT_CONFLICT_DEFERRED for e in events)
+        assert any(
+            e.event_type == SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING
+            for e in events
+        )
+
+    @pytest.mark.asyncio
+    async def test_output_conflict_guard_can_be_disabled(self, tmp_path):
+        process = ProcessDefinition(
+            name="output-conflict-disabled-process",
+            description="Test",
+            output_coordination=OutputCoordination(enforce_single_writer=False),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=20,
+            max_parallel_subtasks=2,
+            auto_approve_confidence_threshold=0.8,
+            enable_streaming=False,
+        ))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text="{}"),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=cfg,
+            process=process,
+        )
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(id="s1", description="worker 1", phase_id="phase-a"),
+                Subtask(id="s2", description="worker 2", phase_id="phase-a"),
+            ],
+            version=1,
+        )
+        active = 0
+        max_active = 0
+
+        async def dispatch_side_effect(_task, subtask, _attempts):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return (
+                subtask,
+                SubtaskResult(status="success", summary="ok"),
+                VerificationResult(tier=1, passed=True),
+            )
+
+        orch._dispatch_subtask = AsyncMock(side_effect=dispatch_side_effect)
+        result = await orch.execute_task(task, reuse_existing_plan=True)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert max_active == 2
+
+    @pytest.mark.asyncio
+    async def test_output_conflict_fail_fast_policy_aborts_run(self, tmp_path):
+        process = ProcessDefinition(
+            name="output-conflict-fail-fast-process",
+            description="Test",
+            output_coordination=OutputCoordination(conflict_policy="fail_fast"),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=20,
+            max_parallel_subtasks=2,
+            auto_approve_confidence_threshold=0.8,
+            enable_streaming=False,
+        ))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text="{}"),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=cfg,
+            process=process,
+        )
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(id="s1", description="worker 1", phase_id="phase-a"),
+                Subtask(id="s2", description="worker 2", phase_id="phase-a"),
+            ],
+            version=1,
+        )
+        orch._dispatch_subtask = AsyncMock()
+
+        result = await orch.execute_task(task, reuse_existing_plan=True)
+
+        assert result.status == TaskStatus.FAILED
+        assert result.errors_encountered
+        assert "fail_fast" in result.errors_encountered[-1].error
+        orch._dispatch_subtask.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_transactional_finalizer_commit_missing_stage_fails_safe(
+        self,
+        tmp_path,
+    ):
+        process = ProcessDefinition(
+            name="fan-in-transactional-rollback",
+            description="Test",
+            output_coordination=OutputCoordination(strategy="fan_in", publish_mode="transactional"),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task(workspace=str(tmp_path))
+        task.metadata["run_id"] = "run-test"
+        (tmp_path / "analysis.md").write_text("before rollback", encoding="utf-8")
+        subtask = Subtask(
+            id=ProcessDefinition.phase_finalizer_id("phase-a"),
+            description="Finalize outputs",
+            phase_id="phase-a",
+            output_role="phase_finalizer",
+            output_strategy="fan_in",
+        )
+        task.plan.subtasks = [subtask]
+
+        async def run_side_effect(*_args, **_kwargs):
+            return (
+                SubtaskResult(status=SubtaskResultStatus.SUCCESS, summary="prepared stage"),
+                VerificationResult(tier=1, passed=True, feedback="ok"),
+            )
+
+        orch._runner.run = AsyncMock(side_effect=run_side_effect)
+
+        _, result, verification = await orch._dispatch_subtask(
+            task,
+            subtask,
+            attempts_by_subtask={},
+        )
+
+        assert result.status == SubtaskResultStatus.FAILED
+        assert not verification.passed
+        assert verification.reason_code == "output_publish_commit_failed"
+        assert (tmp_path / "analysis.md").read_text(encoding="utf-8") == "before rollback"
+        assert "Transactional publish failed: missing staged output" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_transactional_finalizer_stage_commit_success_updates_seals(
+        self,
+        tmp_path,
+    ):
+        process = ProcessDefinition(
+            name="fan-in-transactional-commit",
+            description="Test",
+            output_coordination=OutputCoordination(strategy="fan_in", publish_mode="transactional"),
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task(workspace=str(tmp_path))
+        task.metadata["run_id"] = "run-test"
+        (tmp_path / "analysis.md").write_text("before", encoding="utf-8")
+        subtask = Subtask(
+            id=ProcessDefinition.phase_finalizer_id("phase-a"),
+            description="Finalize outputs",
+            phase_id="phase-a",
+            output_role="phase_finalizer",
+            output_strategy="fan_in",
+        )
+        task.plan.subtasks = [subtask]
+
+        async def run_side_effect(*_args, **kwargs):
+            stage_targets = list(kwargs.get("expected_deliverables", []))
+            assert stage_targets
+            for stage_target in stage_targets:
+                target_path = tmp_path / stage_target
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text("after", encoding="utf-8")
+            return (
+                SubtaskResult(status=SubtaskResultStatus.SUCCESS, summary="ready"),
+                VerificationResult(tier=1, passed=True, feedback="ok"),
+            )
+
+        orch._runner.run = AsyncMock(side_effect=run_side_effect)
+
+        _, result, verification = await orch._dispatch_subtask(
+            task,
+            subtask,
+            attempts_by_subtask={},
+        )
+
+        assert result.status == SubtaskResultStatus.SUCCESS
+        assert verification.passed
+        assert (tmp_path / "analysis.md").read_text(encoding="utf-8") == "after"
+        seals = task.metadata.get("artifact_seals", {})
+        assert "analysis.md" in seals
+        assert seals["analysis.md"]["tool"] == "fan_in_commit"
+        assert not any(
+            path.startswith(".loom/phase-artifacts/")
+            or path.startswith("loom/phase-artifacts/")
+            for path in seals
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_finalizer_require_all_workers_blocks_when_missing_manifest(
+        self,
+        tmp_path,
+    ):
+        process = ProcessDefinition(
+            name="fan-in-finalizer-require-all",
+            description="Test",
+            output_coordination=OutputCoordination(strategy="fan_in"),
+            phases=[
+                PhaseTemplate(id="phase-a", description="Collect", deliverables=["analysis.md"]),
+            ],
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task(workspace=str(tmp_path))
+        task.metadata["run_id"] = "run-test"
+        worker = Subtask(
+            id="phase-a-worker",
+            description="Worker",
+            phase_id="phase-a",
+            output_role="worker",
+            output_strategy="fan_in",
+        )
+        finalizer = Subtask(
+            id=ProcessDefinition.phase_finalizer_id("phase-a"),
+            description="Finalize",
+            phase_id="phase-a",
+            output_role="phase_finalizer",
+            output_strategy="fan_in",
+        )
+        task.plan.subtasks = [worker, finalizer]
+        orch._runner.run = AsyncMock()
+
+        _, result, verification = await orch._dispatch_subtask(
+            task,
+            finalizer,
+            attempts_by_subtask={},
+        )
+
+        assert result.status == SubtaskResultStatus.FAILED
+        assert not verification.passed
+        assert verification.reason_code == "finalizer_missing_worker_artifacts"
+        orch._runner.run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_finalizer_allow_partial_does_not_block_missing_manifest(
+        self,
+        tmp_path,
+    ):
+        process = ProcessDefinition(
+            name="fan-in-finalizer-allow-partial",
+            description="Test",
+            output_coordination=OutputCoordination(
+                strategy="fan_in",
+                publish_mode="best_effort",
+                finalizer_input_policy="allow_partial",
+            ),
+            phases=[
+                PhaseTemplate(id="phase-a", description="Collect", deliverables=["analysis.md"]),
+            ],
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task(workspace=str(tmp_path))
+        task.metadata["run_id"] = "run-test"
+        worker = Subtask(
+            id="phase-a-worker",
+            description="Worker",
+            phase_id="phase-a",
+            output_role="worker",
+            output_strategy="fan_in",
+        )
+        finalizer = Subtask(
+            id=ProcessDefinition.phase_finalizer_id("phase-a"),
+            description="Finalize",
+            phase_id="phase-a",
+            output_role="phase_finalizer",
+            output_strategy="fan_in",
+        )
+        task.plan.subtasks = [worker, finalizer]
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status=SubtaskResultStatus.SUCCESS, summary="ok"),
+            VerificationResult(tier=1, passed=True, feedback="ok"),
+        ))
+
+        _, result, verification = await orch._dispatch_subtask(
+            task,
+            finalizer,
+            attempts_by_subtask={},
+        )
+
+        assert result.status == SubtaskResultStatus.SUCCESS
+        assert verification.passed
+        orch._runner.run.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_finalizer_manifest_only_read_violation_fails(
+        self,
+        tmp_path,
+    ):
+        process = ProcessDefinition(
+            name="fan-in-manifest-enforcement",
+            description="Test",
+            output_coordination=OutputCoordination(
+                strategy="fan_in",
+                publish_mode="best_effort",
+                finalizer_input_policy="allow_partial",
+            ),
+            phases=[
+                PhaseTemplate(id="phase-a", description="Collect", deliverables=["analysis.md"]),
+            ],
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task(workspace=str(tmp_path))
+        task.metadata["run_id"] = "run-test"
+        worker = Subtask(
+            id="phase-a-worker",
+            description="Worker",
+            phase_id="phase-a",
+            output_role="worker",
+            output_strategy="fan_in",
+        )
+        finalizer = Subtask(
+            id=ProcessDefinition.phase_finalizer_id("phase-a"),
+            description="Finalize",
+            phase_id="phase-a",
+            output_role="phase_finalizer",
+            output_strategy="fan_in",
+        )
+        task.plan.subtasks = [worker, finalizer]
+
+        allowed_path = (
+            ".loom/phase-artifacts/run-test/phase-a/phase-a-worker/notes.md"
+        )
+        disallowed_path = (
+            ".loom/phase-artifacts/run-test/phase-a/unexpected-worker/notes.md"
+        )
+        allowed_file = tmp_path / allowed_path
+        disallowed_file = tmp_path / disallowed_path
+        allowed_file.parent.mkdir(parents=True, exist_ok=True)
+        disallowed_file.parent.mkdir(parents=True, exist_ok=True)
+        allowed_file.write_text("allowed", encoding="utf-8")
+        disallowed_file.write_text("blocked", encoding="utf-8")
+
+        manifest_path = (
+            tmp_path
+            / ".loom/phase-artifacts/run-test/phase-a/manifest.jsonl"
+        )
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_entry = {
+            "schema_version": 1,
+            "task_id": task.id,
+            "run_id": "run-test",
+            "phase_id": "phase-a",
+            "subtask_id": "phase-a-worker",
+            "attempt": 1,
+            "generated_at": "2026-03-06T12:00:00",
+            "output_role": "worker",
+            "output_strategy": "fan_in",
+            "artifact_path": allowed_path,
+            "content_hash": "",
+        }
+        manifest_path.write_text(json.dumps(manifest_entry) + "\n", encoding="utf-8")
+
+        read_call = ToolCallRecord(
+            tool="read_file",
+            args={"path": disallowed_path},
+            result=ToolResult.ok("ok"),
+        )
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(
+                status=SubtaskResultStatus.SUCCESS,
+                summary="ok",
+                tool_calls=[read_call],
+            ),
+            VerificationResult(tier=1, passed=True, feedback="ok"),
+        ))
+
+        _, result, verification = await orch._dispatch_subtask(
+            task,
+            finalizer,
+            attempts_by_subtask={},
+        )
+
+        assert result.status == SubtaskResultStatus.FAILED
+        assert not verification.passed
+        assert verification.reason_code == "manifest_input_policy_violation"
+        assert "outside latest worker manifest entries" in (verification.feedback or "")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_subtask_emits_forbidden_canonical_write_blocked_event(
+        self,
+        tmp_path,
+    ):
+        plan_json = json.dumps({
+            "subtasks": [{"id": "phase-a", "description": "Analyze"}]
+        })
+        process = ProcessDefinition(
+            name="forbidden-write-process",
+            description="Test",
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Analyze",
+                    deliverables=["analysis.md"],
+                ),
+            ],
+        )
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda e: events.append(e))
+        tool_call = ToolCall(
+            id="call-1",
+            name="write_file",
+            arguments={"path": "scratch-notes.md", "content": "hello"},
+        )
+        executor_responses = [
+            ModelResponse(
+                text="",
+                tool_calls=[tool_call],
+                usage=TokenUsage(input_tokens=20, output_tokens=10, total_tokens=30),
+            ),
+            ModelResponse(
+                text=json.dumps({
+                    "status": "failed",
+                    "deliverables_touched": [],
+                    "verification_notes": "policy blocked write",
+                }),
+                usage=TokenUsage(input_tokens=20, output_tokens=10, total_tokens=30),
+            ),
+        ]
+        orch = Orchestrator(
+            model_router=_make_mock_router(
+                plan_response_text=plan_json,
+                executor_responses=executor_responses,
+            ),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task(workspace=str(tmp_path))
+        subtask = Subtask(id="phase-a", description="Analyze", phase_id="phase-a")
+        task.plan.subtasks = [subtask]
+        attempts = {
+            "phase-a": [
+                AttemptRecord(
+                    attempt=1,
+                    tier=1,
+                    feedback="Retry with fixes",
+                    retry_strategy=RetryStrategy.UNCONFIRMED_DATA,
+                ),
+            ],
+        }
+
+        _, result, verification = await orch._dispatch_subtask(task, subtask, attempts)
+
+        assert result.status == SubtaskResultStatus.FAILED
+        assert verification.reason_code in {"forbidden_output_path", "hard_invariant_failed"}
+        blocked = [
+            e for e in events if e.event_type == FORBIDDEN_CANONICAL_WRITE_BLOCKED
+        ]
+        assert blocked
+        payload = blocked[-1].data
+        assert payload.get("subtask_id") == "phase-a"
+        assert payload.get("tool") == "write_file"
+        assert "scratch-notes.md" in list(payload.get("attempted_paths", []))
 
     @pytest.mark.asyncio
     async def test_stalled_plan_emits_blocked_subtasks_on_failure(self, tmp_path):
@@ -4072,22 +5061,134 @@ class TestSubtaskRunnerContextBudget:
             tool_args={"path": "analysis-v2.md"},
             workspace=tmp_path,
             expected_deliverables=["analysis.md"],
+            forbidden_deliverables=[],
+            allowed_output_prefixes=[],
             enforce_deliverable_paths=False,
             edit_existing_only=False,
         )
         assert variant_error is not None
         assert "analysis.md" in variant_error
+        assert "reason_code=forbidden_output_path" in variant_error
 
         noncanonical_error = SubtaskRunner._validate_deliverable_write_policy(
             tool_name="write_file",
             tool_args={"path": "scratch-notes.md"},
             workspace=tmp_path,
             expected_deliverables=["analysis.md"],
+            forbidden_deliverables=[],
+            allowed_output_prefixes=[],
             enforce_deliverable_paths=True,
             edit_existing_only=True,
         )
         assert noncanonical_error is not None
         assert "Unexpected target(s)" in noncanonical_error
+        assert "reason_code=forbidden_output_path" in noncanonical_error
+
+    def test_deliverable_policy_blocks_forbidden_canonical_worker_writes(self, tmp_path):
+        from loom.engine.runner import SubtaskRunner
+
+        forbidden_error = SubtaskRunner._validate_deliverable_write_policy(
+            tool_name="write_file",
+            tool_args={"path": "analysis.md"},
+            workspace=tmp_path,
+            expected_deliverables=[],
+            forbidden_deliverables=["analysis.md"],
+            allowed_output_prefixes=[],
+            enforce_deliverable_paths=False,
+            edit_existing_only=False,
+        )
+        assert forbidden_error is not None
+        assert "reserved for a phase finalizer" in forbidden_error
+        assert "reason_code=forbidden_output_path" in forbidden_error
+
+    def test_deliverable_policy_enforces_worker_intermediate_prefix(self, tmp_path):
+        from loom.engine.runner import SubtaskRunner
+
+        violation = SubtaskRunner._validate_deliverable_write_policy(
+            tool_name="write_file",
+            tool_args={"path": "analysis.md"},
+            workspace=tmp_path,
+            expected_deliverables=[],
+            forbidden_deliverables=[],
+            allowed_output_prefixes=[".loom/phase-artifacts/run-1/phase-a/worker-a"],
+            enforce_deliverable_paths=False,
+            edit_existing_only=False,
+        )
+        assert violation is not None
+        assert "Fan-in worker output path violation" in violation
+        assert "reason_code=forbidden_output_path" in violation
+
+        allowed = SubtaskRunner._validate_deliverable_write_policy(
+            tool_name="write_file",
+            tool_args={"path": ".loom/phase-artifacts/run-1/phase-a/worker-a/out.md"},
+            workspace=tmp_path,
+            expected_deliverables=[],
+            forbidden_deliverables=[],
+            allowed_output_prefixes=[".loom/phase-artifacts/run-1/phase-a/worker-a"],
+            enforce_deliverable_paths=False,
+            edit_existing_only=False,
+        )
+        assert allowed is None
+
+        workspace_named_loom = tmp_path / "loom"
+        workspace_named_loom.mkdir()
+        allowed_when_workspace_name_matches_prefix = (
+            SubtaskRunner._validate_deliverable_write_policy(
+                tool_name="write_file",
+                tool_args={"path": ".loom/phase-artifacts/run-1/phase-a/worker-a/out.md"},
+                workspace=workspace_named_loom,
+                expected_deliverables=[],
+                forbidden_deliverables=[],
+                allowed_output_prefixes=["loom/phase-artifacts/run-1/phase-a/worker-a"],
+                enforce_deliverable_paths=False,
+                edit_existing_only=False,
+            )
+        )
+        assert allowed_when_workspace_name_matches_prefix is None
+
+    def test_completion_contract_mutation_mismatch_detection(self, tmp_path):
+        runner = self._make_runner_for_telemetry()
+
+        tool_calls = [
+            ToolCallRecord(
+                tool="write_file",
+                args={"path": "analysis.md"},
+                result=ToolResult.ok("ok", files_changed=["analysis.md"]),
+            ),
+        ]
+        mismatch = runner._completion_contract_mutation_mismatch(
+            response_text=json.dumps({
+                "status": "success",
+                "deliverables_touched": ["report.md"],
+                "verification_notes": "done",
+            }),
+            tool_calls=tool_calls,
+            workspace=tmp_path,
+        )
+        assert "Completion contract mismatch" in mismatch
+        assert "Declared: report.md" in mismatch
+        assert "Actual: analysis.md" in mismatch
+
+        no_mismatch = runner._completion_contract_mutation_mismatch(
+            response_text=json.dumps({
+                "status": "success",
+                "deliverables_touched": ["analysis.md"],
+                "verification_notes": "done",
+            }),
+            tool_calls=tool_calls,
+            workspace=tmp_path,
+        )
+        assert no_mismatch == ""
+
+    def test_forbidden_output_path_error_detector(self):
+        from loom.engine.runner import SubtaskRunner
+
+        assert SubtaskRunner._is_forbidden_output_path_error(
+            "reason_code=forbidden_output_path; Canonical deliverable policy violation.",
+        )
+        assert not SubtaskRunner._is_forbidden_output_path_error(
+            "Permission denied",
+        )
 
     def test_sealed_artifact_policy_blocks_edit_without_post_seal_evidence(self, tmp_path):
         from loom.engine.runner import SubtaskRunner
