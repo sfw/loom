@@ -1,0 +1,299 @@
+#content-stack {
+    height: 1fr;
+    width: 1fr;
+}
+#landing-surface {
+    height: 1fr;
+}
+#main-layout {
+    height: 1fr;
+}
+#main-layout.hidden {
+    display: none;
+}
+#main-area {
+    width: 1fr;
+}
+#bottom-stack {
+    dock: bottom;
+    height: 4;
+    background: $panel;
+}
+#bottom-stack.landing {
+    display: none;
+}
+#input-top-rule {
+    height: 1;
+    border: none;
+    border-top: solid $primary-darken-1;
+    border-left: solid $primary-darken-2;
+    border-right: solid $primary-darken-2;
+    background: $panel;
+}
+#input-row {
+    width: 100%;
+    height: 2;
+}
+#user-input {
+    width: 1fr;
+    margin: 0;
+    height: 2;
+    padding: 0 1;
+    background: $panel;
+    border: none;
+    border-left: solid $primary-darken-2;
+    border-right: none;
+    border-bottom: solid $primary-darken-1;
+    color: $text;
+}
+#user-input.no-chat-controls {
+    border-right: solid $primary-darken-2;
+}
+#user-input:focus {
+    border: none;
+    border-left: solid $primary-darken-1;
+    border-right: none;
+    border-bottom: solid $primary;
+    background: $surface;
+}
+#user-input.no-chat-controls:focus {
+    border-right: solid $primary-darken-1;
+}
+#chat-stop-btn {
+    display: none;
+    width: 5;
+    min-width: 5;
+    max-width: 5;
+    height: 2;
+    margin: 0;
+    padding: 0;
+    content-align: center middle;
+    border: none;
+    border-left: solid $primary-darken-2;
+    border-right: solid $primary-darken-2;
+    border-bottom: solid $primary-darken-1;
+    background: $panel;
+    color: $text-muted;
+}
+#chat-inject-btn,
+#chat-redirect-btn {
+    display: none;
+    width: 5;
+    min-width: 5;
+    max-width: 5;
+    height: 2;
+    margin: 0;
+    padding: 0;
+    content-align: center middle;
+    border: none;
+    border-left: solid $primary-darken-2;
+    border-right: none;
+    border-bottom: solid $primary-darken-1;
+    background: $panel;
+    color: $text-muted;
+}
+#chat-inject-btn:hover,
+#chat-redirect-btn:hover {
+    color: $text;
+    background: $surface-lighten-1;
+}
+#chat-inject-btn:focus,
+#chat-redirect-btn:focus {
+    color: $text;
+    border-left: solid $primary-darken-1;
+    border-bottom: solid $primary;
+    background: $surface-lighten-1;
+}
+#chat-inject-btn:disabled,
+#chat-redirect-btn:disabled {
+    color: $text-muted;
+    background: $panel;
+}
+#chat-redirect-btn {
+    background: #2d2b32;
+    border-right: solid $primary-darken-2;
+}
+#chat-redirect-btn:hover {
+    background: #37323a;
+}
+#chat-redirect-btn:focus {
+    border-bottom: solid $warning;
+    background: #37323a;
+}
+#chat-redirect-btn:disabled {
+    background: #2d2b32;
+}
+#chat-stop-btn:hover {
+    color: $text;
+    background: $surface-lighten-1;
+}
+#chat-stop-btn:focus {
+    color: $text;
+    border-left: solid $primary-darken-1;
+    border-right: solid $primary-darken-1;
+    border-bottom: solid $primary;
+    background: $surface-lighten-1;
+}
+#chat-stop-btn:disabled {
+    color: $text-muted;
+    background: $panel;
+}
+#status-bar {
+    display: none;
+}
+#app-header #header-activity-indicator {
+    dock: right;
+    offset: -10 0;
+    margin: 0;
+    height: 100%;
+}
+TabbedContent > ContentTabs {
+    background: $panel;
+    border-bottom: solid $surface-lighten-1;
+}
+TabbedContent > ContentTabs Tab {
+    background: $panel;
+    color: $text-muted;
+}
+TabbedContent > ContentTabs Tab:hover,
+TabbedContent > ContentTabs Tab:focus {
+    background: $panel;
+    color: $text;
+}
+TabbedContent > ContentTabs Tab.-active {
+    background: $panel;
+    color: $text;
+    text-style: bold underline;
+    border-bottom: none;
+}
+#footer-row {
+    width: 100%;
+    height: 1;
+}
+#app-footer {
+    width: 1fr;
+    dock: none;
+    height: 1;
+    border: none;
+}
+#footer-shortcuts {
+    width: auto;
+    height: 1;
+}
+#footer-shortcuts .footer-shortcut-divider {
+    width: auto;
+    height: 1;
+    color: $text-muted;
+    padding: 0 1;
+}
+#footer-shortcuts .footer-shortcut-btn {
+    width: auto;
+    min-width: 0;
+    height: 1;
+    margin: 0;
+    padding: 0 1;
+    border: none;
+    background: transparent;
+    color: $text-muted;
+}
+#footer-shortcuts .footer-shortcut-btn:hover {
+    color: $text;
+    background: $surface-lighten-1;
+}
+#footer-shortcuts .footer-shortcut-btn:focus {
+    color: $text;
+    background: $surface-lighten-1;
+    text-style: bold;
+}
+#slash-hint {
+    dock: bottom;
+    display: none;
+    margin: 0 0 4 0;
+    height: auto;
+    max-height: 14;
+    background: $panel;
+    overflow-y: scroll;
+    overflow-x: hidden;
+    scrollbar-size: 1 1;
+}
+#slash-hint-body {
+    width: 1fr;
+    min-height: 1;
+    padding: 0;
+    color: $text-muted;
+}
+#steer-queue-grid {
+    display: none;
+    width: 100%;
+    height: auto;
+    grid-size: 1 1;
+    grid-columns: 1fr;
+    grid-rows: auto;
+    grid-gutter: 0 0;
+    padding: 0;
+    border: none;
+}
+#steer-queue-grid.queue-mode {
+    border-top: solid #5f729d;
+    border-left: solid #5f729d;
+    border-right: solid #5f729d;
+    border-bottom: solid #5f729d;
+    background: #3a4465;
+}
+#steer-queue-list {
+    display: none;
+    width: 100%;
+    height: auto;
+}
+.steer-queue-item-row {
+    width: 100%;
+    height: 1;
+    padding: 0 1;
+    background: #3a4465;
+}
+.steer-queue-item-text {
+    width: 1fr;
+    height: 1;
+    content-align: left middle;
+}
+.steer-queue-item-btn {
+    width: 7;
+    min-width: 7;
+    max-width: 7;
+    height: 1;
+    margin: 0 0 0 1;
+    padding: 0;
+    content-align: center middle;
+    border: none;
+    background: #2f3a58;
+    color: #c7d5f0;
+}
+.steer-queue-item-btn.edit {
+    background: #304661;
+    color: #9dd2ff;
+}
+.steer-queue-item-btn.redirect {
+    background: #524634;
+    color: #f5cc9b;
+}
+.steer-queue-item-btn.dismiss {
+    background: #4f373d;
+    color: #f0b1bb;
+}
+.steer-queue-item-btn.edit:hover {
+    background: #3a5a7f;
+}
+.steer-queue-item-btn.redirect:hover {
+    background: #66563f;
+}
+.steer-queue-item-btn.dismiss:hover {
+    background: #64464e;
+}
+.steer-queue-item-btn:hover {
+    color: #ffffff;
+}
+.steer-queue-item-btn:focus {
+    color: #ffffff;
+    border: none;
+    text-style: bold;
+}
