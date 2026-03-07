@@ -1,0 +1,9 @@
+Usage: python -m loom process [OPTIONS] COMMAND [ARGS]...
+
+  Process subcommands.
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+  test  Run declared (or default) process test cases.

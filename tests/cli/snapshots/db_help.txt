@@ -1,0 +1,12 @@
+Usage: python -m loom db [OPTIONS] COMMAND [ARGS]...
+
+  Inspect and manage Loom SQLite migrations.
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+  backup   Create a timestamped backup copy of the Loom database.
+  doctor   Run migration and schema verification checks.
+  migrate  Apply pending migrations to the configured Loom database.
+  status   Show migration status for the configured Loom database.

@@ -261,7 +261,7 @@ class TestCLI:
 
     def test_launch_tui_does_not_inject_default_process(self, monkeypatch):
         """TUI launch should not inject process.default as active context."""
-        import loom.__main__ as main_mod
+        import loom.cli.commands.root as root_mod
 
         captured: dict[str, object] = {}
 
@@ -273,7 +273,7 @@ class TestCLI:
                 captured["run_kwargs"] = kwargs
                 return None
 
-        monkeypatch.setattr(main_mod, "_init_persistence", lambda _cfg, **_kwargs: (None, None))
+        monkeypatch.setattr(root_mod, "_init_persistence", lambda _cfg, **_kwargs: (None, None))
         monkeypatch.setattr(
             "loom.tools.create_default_registry",
             lambda _config=None, **_kwargs: MagicMock(),
@@ -281,7 +281,7 @@ class TestCLI:
         monkeypatch.setattr("loom.tui.app.LoomApp", DummyApp)
 
         cfg = Config(process=ProcessConfig(default="marketing-strategy"))
-        main_mod._launch_tui(
+        root_mod._launch_tui(
             config=cfg,
             workspace=None,
             model_name=None,
@@ -293,7 +293,7 @@ class TestCLI:
 
     def test_run_uses_default_process(self, tmp_path, monkeypatch):
         """`loom run` should send process.default when flag is omitted."""
-        import loom.__main__ as main_mod
+        import loom.cli.commands.root as root_mod
 
         captured: dict[str, object] = {}
 
@@ -321,8 +321,8 @@ class TestCLI:
             captured["process_name"] = process_name
             captured["metadata"] = metadata
 
-        monkeypatch.setattr(main_mod, "_prepare_server_run_payload", fake_prepare_run_payload)
-        monkeypatch.setattr(main_mod, "_run_task", fake_run_task)
+        monkeypatch.setattr(root_mod, "_prepare_server_run_payload", fake_prepare_run_payload)
+        monkeypatch.setattr(root_mod, "_run_task", fake_run_task)
 
         cfg_path = tmp_path / "loom.toml"
         cfg_path.write_text(
@@ -346,7 +346,7 @@ class TestCLI:
 
     def test_run_passes_auth_profile_metadata(self, tmp_path, monkeypatch):
         """`loom run --auth-profile` should send metadata to API payload."""
-        import loom.__main__ as main_mod
+        import loom.cli.commands.root as root_mod
 
         captured: dict[str, object] = {}
 
@@ -374,8 +374,8 @@ class TestCLI:
             captured["process_name"] = process_name
             captured["metadata"] = metadata
 
-        monkeypatch.setattr(main_mod, "_prepare_server_run_payload", fake_prepare_run_payload)
-        monkeypatch.setattr(main_mod, "_run_task", fake_run_task)
+        monkeypatch.setattr(root_mod, "_prepare_server_run_payload", fake_prepare_run_payload)
+        monkeypatch.setattr(root_mod, "_run_task", fake_run_task)
 
         cfg_path = tmp_path / "loom.toml"
         cfg_path.write_text(
@@ -461,7 +461,7 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         assert "[PASS] case=smoke mode=deterministic" in result.output
 
     def test_process_test_defaults_execution_workspace_to_tmp(self, tmp_path, monkeypatch):
-        import loom.__main__ as main_mod
+        import loom.cli.commands.process as process_mod
 
         captured: dict[str, object] = {}
         temp_workspace = tmp_path / "tmp-process-workspace"
@@ -484,7 +484,7 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
                 )
             ]
 
-        monkeypatch.setattr(main_mod.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(process_mod.tempfile, "mkdtemp", fake_mkdtemp)
         monkeypatch.setattr(
             "loom.processes.testing.run_process_tests",
             fake_run_process_tests,
@@ -1142,7 +1142,7 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         assert "[auth.profiles.notion_marketing]" in restored
 
     def test_auth_migrate_failure_auto_rolls_back(self, tmp_path, monkeypatch):
-        import loom.__main__ as main_mod
+        import loom.cli.commands.auth as auth_mod
 
         cfg = tmp_path / "loom.toml"
         cfg.write_text("[server]\nport = 9000\n")
@@ -1170,9 +1170,9 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         def _fake_restore(**_kwargs):
             restored["snapshot_path"] = _kwargs.get("snapshot_path")
 
-        monkeypatch.setattr(main_mod, "create_auth_snapshot", _fake_create_snapshot)
-        monkeypatch.setattr(main_mod, "migrate_legacy_auth", _fake_migrate)
-        monkeypatch.setattr(main_mod, "restore_auth_snapshot", _fake_restore)
+        monkeypatch.setattr(auth_mod, "create_auth_snapshot", _fake_create_snapshot)
+        monkeypatch.setattr(auth_mod, "migrate_legacy_auth", _fake_migrate)
+        monkeypatch.setattr(auth_mod, "restore_auth_snapshot", _fake_restore)
 
         runner = CliRunner()
         result = runner.invoke(

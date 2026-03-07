@@ -1,0 +1,23 @@
+Usage: python -m loom mcp [OPTIONS] COMMAND [ARGS]...
+
+  Manage external MCP server configuration.
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+  add           Add a new MCP server config entry.
+  auth          Manage OAuth tokens for remote MCP server aliases.
+  connect       Connect one MCP alias and refresh runtime health state.
+  debug-bundle  Export redacted MCP diagnostics for support triage.
+  disable       Disable an MCP server.
+  disconnect    Disconnect one MCP alias and close any persistent runtime...
+  edit          Edit an existing MCP server config entry.
+  enable        Enable an MCP server.
+  list          List merged MCP server configuration.
+  migrate       Move legacy `[mcp]` config from loom.toml into mcp.toml.
+  reconnect     Reconnect one MCP alias by forcing a disconnect then...
+  remove        Remove an MCP server config entry.
+  show          Show one merged MCP server configuration.
+  status        Show runtime MCP connection state and auth readiness.
+  test          Probe MCP server connectivity and tools/list behavior.

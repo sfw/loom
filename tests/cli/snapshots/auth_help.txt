@@ -1,0 +1,17 @@
+Usage: python -m loom auth [OPTIONS] COMMAND [ARGS]...
+
+  Manage auth profile configuration.
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+  audit    Audit auth resources, bindings, and legacy defaults.
+  check    Validate auth profile references and defaults.
+  list     List merged auth profiles and defaults.
+  migrate  Migrate legacy provider defaults to resource bindings/defaults.
+  profile  Manage auth profile definitions.
+  repair   Plan/apply deterministic auth dedupe and rebind repairs.
+  select   Set/clear workspace auth default selector mapping.
+  show     Show one auth profile.
+  sync     Discover required auth resources and auto-create missing drafts.

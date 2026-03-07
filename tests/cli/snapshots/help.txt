@@ -1,0 +1,38 @@
+Usage: python -m loom [OPTIONS] COMMAND [ARGS]...
+
+  Loom — Local model orchestration engine.
+
+  When invoked without a subcommand, launches the interactive TUI with full
+  session persistence, conversation recall, and task delegation.
+
+Options:
+  --version             Show the version and exit.
+  --config PATH         Path to loom.toml configuration file.
+  -w, --workspace PATH  Workspace directory. Defaults to current directory.
+  --mcp-config PATH     Path to mcp.toml (highest precedence MCP config
+                        layer).
+  --auth-config PATH    Path to auth.toml (overlays ~/.loom/auth.toml).
+  -m, --model TEXT      Model name from config to use.
+  --resume TEXT         Resume a previous session by ID.
+  --ephemeral           Allow startup without SQLite persistence when DB
+                        initialization fails.
+  --help                Show this message and exit.
+
+Commands:
+  auth            Manage auth profile configuration.
+  cancel          Cancel a running task.
+  cowork          Start an interactive cowork session (alias for default...
+  db              Inspect and manage Loom SQLite migrations.
+  install         Install a process package from a GitHub repo or local...
+  learned         Review learned patterns.
+  mcp             Manage external MCP server configuration.
+  mcp-serve       Start Loom as an MCP server (stdio transport).
+  models          List available models and their status.
+  process         Process subcommands.
+  processes       List available process definitions.
+  reset-learning  Clear all learned patterns from the database.
+  run             Submit a run goal and stream server-side process...
+  serve           Start the Loom API server.
+  setup           Run the interactive configuration wizard.
+  status          Check status of a task.
+  uninstall       Remove an installed process package by name.
