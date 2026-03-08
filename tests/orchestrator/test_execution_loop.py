@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from unittest.mock import ANY, AsyncMock, MagicMock
 
@@ -21,6 +22,7 @@ from loom.events.types import (
     PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED,
     PLACEHOLDER_PRUNED,
     PLACEHOLDER_REMEDIATION_UNRESOLVED,
+    SEALED_RESEAL_APPLIED,
     SUBTASK_BLOCKED,
     SUBTASK_OUTPUT_CONFLICT_DEFERRED,
     SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING,
@@ -1828,7 +1830,17 @@ class TestOrchestratorExecution:
         )
         task.plan.subtasks = [subtask]
         state_manager.create(task)
-        (tmp_path / "report.md").write_text("Evidence status: N/A\n", encoding="utf-8")
+        initial_report = "Evidence status: N/A\n"
+        (tmp_path / "report.md").write_text(initial_report, encoding="utf-8")
+        initial_sha = hashlib.sha256(initial_report.encode("utf-8")).hexdigest()
+        task.metadata["artifact_seals"] = {
+            "report.md": {
+                "path": "report.md",
+                "sha256": initial_sha,
+                "sealed_at": "2026-03-01T12:00:00",
+                "subtask_id": "seed",
+            },
+        }
 
         verification = VerificationResult(
             tier=1,
@@ -1892,6 +1904,15 @@ class TestOrchestratorExecution:
         assert pruned_events
         assert int(pruned_events[-1].data.get("applied_count", 0) or 0) >= 1
         assert pruned_events[-1].data.get("mode") == "deterministic_placeholder_prepass"
+        reseal_events = [event for event in events if event.event_type == SEALED_RESEAL_APPLIED]
+        assert reseal_events
+        assert int(reseal_events[-1].data.get("path_count", 0) or 0) >= 1
+        final_report = (tmp_path / "report.md").read_text(encoding="utf-8")
+        final_sha = hashlib.sha256(final_report.encode("utf-8")).hexdigest()
+        seal = task.metadata.get("artifact_seals", {}).get("report.md", {})
+        assert seal.get("sha256") == final_sha
+        assert seal.get("previous_sha256") == initial_sha
+        assert seal.get("tool") == "deterministic_placeholder_prepass"
 
     @pytest.mark.asyncio
     async def test_deterministic_placeholder_prune_emits_unresolved_when_no_mutation(
