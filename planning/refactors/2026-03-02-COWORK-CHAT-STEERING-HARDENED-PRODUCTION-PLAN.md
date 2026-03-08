@@ -243,8 +243,8 @@ Suggested fields:
 
 ### Workstream 1: Command Surface
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/tui/commands.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/tui/commands.py`
 
 Deliverables:
 1. Add `/pause`, `/inject`, `/redirect`, `/steer ...` handlers.
@@ -253,7 +253,7 @@ Deliverables:
 
 ### Workstream 2: Input Row Controls
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/tui/app.py`
 
 Deliverables:
 1. Add `Inject` and `Redirect` buttons in input row.
@@ -262,7 +262,7 @@ Deliverables:
 
 ### Workstream 3: Steering State + Queue Popup
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/tui/app.py`
 
 Deliverables:
 1. Ephemeral steering state model.
@@ -271,8 +271,8 @@ Deliverables:
 
 ### Workstream 4: Cowork Execution Integration
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/cowork/session.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/cowork/session.py`
 
 Deliverables:
 1. Safe-boundary inject application.
@@ -282,7 +282,7 @@ Deliverables:
 
 ### Workstream 5: Replay + Telemetry
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/tui/app.py`
 
 Deliverables:
 1. Steering replay events and hydration support.
@@ -290,8 +290,8 @@ Deliverables:
 
 ### Workstream 6: Tests
 Files:
-1. `/Users/sfw/Development/loom/tests/test_tui.py`
-2. `/Users/sfw/Development/loom/tests/test_cowork.py`
+1. `<repo-root>/tests/test_tui.py`
+2. `<repo-root>/tests/test_cowork.py`
 
 Deliverables:
 1. Button visibility matrix tests (busy/input combinations).

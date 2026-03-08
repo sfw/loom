@@ -221,8 +221,8 @@ Goal: file/chat/progress surfaces update promptly from both in-app and external 
 
 ### W1: Session Callback Plumbing (Phase 1 Foundation)
 Files:
-1. `/Users/sfw/Development/loom/src/loom/cowork/session.py`
-2. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/cowork/session.py`
+2. `<repo-root>/src/loom/tui/app.py`
 
 Deliverables:
 1. Optional delegate progress callback in `CoworkSession`.
@@ -233,7 +233,7 @@ Deliverables:
 
 ### W2: Sidebar Live Update Integration
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/tui/app.py`
 
 Deliverables:
 1. Extract progress-state update helper(s) from `_on_process_progress_event`.
@@ -242,10 +242,10 @@ Deliverables:
 
 ### W3: Collapsed Chat Stream Widget
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/widgets/chat_log.py`
-2. `/Users/sfw/Development/loom/src/loom/tui/widgets/tool_call.py` (or new `delegate_progress.py`)
-3. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-4. `/Users/sfw/Development/loom/src/loom/cowork/session.py`
+1. `<repo-root>/src/loom/tui/widgets/chat_log.py`
+2. `<repo-root>/src/loom/tui/widgets/tool_call.py` (or new `delegate_progress.py`)
+3. `<repo-root>/src/loom/tui/app.py`
+4. `<repo-root>/src/loom/cowork/session.py`
 
 Deliverables:
 1. Mutable collapsible section keyed by `tool_call_id`.
@@ -256,10 +256,10 @@ Deliverables:
 
 ### W4: Test Coverage
 Files:
-1. `/Users/sfw/Development/loom/tests/test_cowork.py`
-2. `/Users/sfw/Development/loom/tests/test_tui.py`
-3. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-4. `/Users/sfw/Development/loom/tests/test_config.py`
+1. `<repo-root>/tests/test_cowork.py`
+2. `<repo-root>/tests/test_tui.py`
+3. `<repo-root>/tests/test_orchestrator.py`
+4. `<repo-root>/tests/test_config.py`
 5. Optional new widget-focused test module if needed.
 
 Deliverables:
@@ -276,7 +276,7 @@ Deliverables:
 
 ### W5: Docs and Changelog
 Files:
-1. `/Users/sfw/Development/loom/CHANGELOG.md`
+1. `<repo-root>/CHANGELOG.md`
 2. Relevant user-facing docs if cowork progress UX is documented elsewhere.
 
 Deliverables:
@@ -286,16 +286,16 @@ Deliverables:
 
 ### W6: Realtime Refresh Infrastructure
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/tui/widgets/sidebar.py`
-3. `/Users/sfw/Development/loom/src/loom/tui/widgets/chat_log.py`
-4. `/Users/sfw/Development/loom/src/loom/tui/widgets/file_panel.py`
-5. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-6. `/Users/sfw/Development/loom/src/loom/tools/delegate_task.py`
-7. `/Users/sfw/Development/loom/src/loom/config.py`
-8. `/Users/sfw/Development/loom/loom.toml.example`
-9. `/Users/sfw/Development/loom/docs/CONFIG.md`
-10. `/Users/sfw/Development/loom/pyproject.toml`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/tui/widgets/sidebar.py`
+3. `<repo-root>/src/loom/tui/widgets/chat_log.py`
+4. `<repo-root>/src/loom/tui/widgets/file_panel.py`
+5. `<repo-root>/src/loom/engine/runner.py`
+6. `<repo-root>/src/loom/tools/delegate_task.py`
+7. `<repo-root>/src/loom/config.py`
+8. `<repo-root>/loom.toml.example`
+9. `<repo-root>/docs/CONFIG.md`
+10. `<repo-root>/pyproject.toml`
 
 Deliverables:
 1. Debounced workspace refresh coordinator + unified call sites.

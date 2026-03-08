@@ -144,8 +144,8 @@ Do not emit directly from low-level handler classes to `.events.jsonl`.
 
 ### Workstream 1: Event Taxonomy + Schema Contract
 Files:
-1. `/Users/sfw/Development/loom/src/loom/events/types.py`
-2. `/Users/sfw/Development/loom/docs/CONFIG.md`
+1. `<repo-root>/src/loom/events/types.py`
+2. `<repo-root>/docs/CONFIG.md`
 
 Deliverables:
 1. New event constants.
@@ -156,8 +156,8 @@ Acceptance:
 
 ### Workstream 2: Artifact Ingest Telemetry
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/src/loom/tools/web.py`
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/src/loom/tools/web.py`
 
 Deliverables:
 1. Emit `artifact_ingest_classified` and `artifact_ingest_completed` for `web_fetch`/`web_fetch_html` artifact paths.
@@ -169,9 +169,9 @@ Acceptance:
 
 ### Workstream 3: Retention + Artifact Read Telemetry
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/src/loom/tools/read_artifact.py`
-3. `/Users/sfw/Development/loom/src/loom/ingest/artifacts.py`
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/src/loom/tools/read_artifact.py`
+3. `<repo-root>/src/loom/ingest/artifacts.py`
 
 Deliverables:
 1. Emit `artifact_retention_pruned` when cleanup deletes files.
@@ -183,7 +183,7 @@ Acceptance:
 
 ### Workstream 4: Compaction/Overflow Decision Telemetry
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
+1. `<repo-root>/src/loom/engine/runner.py`
 
 Deliverables:
 1. Emit `compaction_policy_decision` with reason codes.
@@ -194,7 +194,7 @@ Acceptance:
 
 ### Workstream 5: Delegate Log Forwarding Coverage
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tools/delegate_task.py`
+1. `<repo-root>/src/loom/tools/delegate_task.py`
 
 Deliverables:
 1. Include new event types in observed event forwarding set.
@@ -205,13 +205,13 @@ Acceptance:
 
 ### Workstream 6: Tests + Docs + Rollout Validation
 Files:
-1. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-2. `/Users/sfw/Development/loom/tests/test_web_tool.py`
-3. `/Users/sfw/Development/loom/tests/test_ingest_router.py`
-4. `/Users/sfw/Development/loom/tests/test_read_artifact_tool.py`
-5. `/Users/sfw/Development/loom/tests/test_config.py`
-6. `/Users/sfw/Development/loom/docs/CONFIG.md`
-7. `/Users/sfw/Development/loom/docs/tutorial.html`
+1. `<repo-root>/tests/test_orchestrator.py`
+2. `<repo-root>/tests/test_web_tool.py`
+3. `<repo-root>/tests/test_ingest_router.py`
+4. `<repo-root>/tests/test_read_artifact_tool.py`
+5. `<repo-root>/tests/test_config.py`
+6. `<repo-root>/docs/CONFIG.md`
+7. `<repo-root>/docs/tutorial.html`
 
 Deliverables:
 1. Event payload assertions for each new event type.

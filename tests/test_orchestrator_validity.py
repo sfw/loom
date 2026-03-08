@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from loom.engine.orchestrator import validity as orchestrator_validity
+from loom.engine.runner import ToolCallRecord
+from loom.tools.registry import ToolResult
 
 
 def test_normalize_validity_contract_clamps_defaults_and_modes() -> None:
@@ -114,3 +117,32 @@ def test_summarize_failure_resolution_metadata_prioritizes_known_keys() -> None:
     assert summary["remediation_required"] is True
     assert summary["missing_targets"] == ["report.md"]
     assert "deterministic_placeholder_scan" in summary
+
+
+def test_artifact_provenance_evidence_includes_generic_changed_files(tmp_path: Path) -> None:
+    relpath = "reports/competitor-pricing.csv"
+    artifact = tmp_path / relpath
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("name,price\nA,25\n", encoding="utf-8")
+    calls = [
+        ToolCallRecord(
+            tool="spreadsheet",
+            args={"operation": "create", "path": relpath},
+            result=ToolResult.ok("ok", files_changed=[relpath]),
+            call_id="call-1",
+        ),
+    ]
+
+    records = orchestrator_validity._artifact_provenance_evidence(
+        task_id="task-1",
+        subtask_id="subtask-1",
+        tool_calls=calls,
+        existing_ids=set(),
+        workspace=tmp_path,
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["artifact_workspace_relpath"] == relpath
+    assert record["artifact_sha256"] == hashlib.sha256(artifact.read_bytes()).hexdigest()
+    assert record["tool"] == "spreadsheet"

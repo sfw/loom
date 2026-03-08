@@ -23,6 +23,10 @@ def test_runner_settings_uses_runner_defaults_when_config_is_sparse() -> None:
         settings.executor_completion_contract_mode
         == SubtaskRunner.EXECUTOR_COMPLETION_CONTRACT_MODE
     )
+    assert (
+        settings.sealed_artifact_post_call_guard
+        == SubtaskRunner.SEALED_ARTIFACT_POST_CALL_GUARD
+    )
     assert settings.ask_user_policy == "block"
     assert settings.compactor_kwargs["max_chunk_chars"] > 0
 
@@ -38,6 +42,7 @@ def test_runner_settings_clamps_ratios_and_invalid_policy_values() -> None:
         ),
         execution=SimpleNamespace(
             executor_completion_contract_mode="invalid",
+            sealed_artifact_post_call_guard="invalid",
             ask_user_policy="invalid",
         ),
     )
@@ -50,5 +55,9 @@ def test_runner_settings_clamps_ratios_and_invalid_policy_values() -> None:
     assert (
         settings.executor_completion_contract_mode
         == SubtaskRunner.EXECUTOR_COMPLETION_CONTRACT_MODE
+    )
+    assert (
+        settings.sealed_artifact_post_call_guard
+        == SubtaskRunner.SEALED_ARTIFACT_POST_CALL_GUARD
     )
     assert settings.ask_user_policy == "block"

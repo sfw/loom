@@ -192,7 +192,7 @@ Claude Code (thinking): This is a complex multi-step task. I'll delegate to Loom
 
 Claude Code → MCP tool call → loom_execute_task:
   goal: "Migrate Express app from JavaScript to TypeScript"
-  workspace: "/Users/scott/projects/express-app"
+  workspace: "/path/to/express-app"
   approval_mode: "auto"
 
 Loom engine:

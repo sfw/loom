@@ -255,17 +255,17 @@ Output:
 ## Architecture and File Plan
 
 ### New files
-1. `/Users/sfw/Development/loom/src/loom/tools/agent_capabilities.py`
-2. `/Users/sfw/Development/loom/src/loom/tools/agent_run.py`
-3. `/Users/sfw/Development/loom/src/loom/tools/wp_cli.py`
-4. `/Users/sfw/Development/loom/src/loom/tools/wp_env.py` (Stage B)
-5. `/Users/sfw/Development/loom/src/loom/tools/wp_scaffold_block.py` (Stage B)
-6. `/Users/sfw/Development/loom/src/loom/tools/wp_quality_gate.py` (Stage B)
-7. `/Users/sfw/Development/loom/src/loom/tools/tooling_common/command_runner.py` (shared allowlisted subprocess helper)
-8. `/Users/sfw/Development/loom/src/loom/tools/tooling_common/version_matrix.py` (provider/version compatibility)
+1. `<repo-root>/src/loom/tools/agent_capabilities.py`
+2. `<repo-root>/src/loom/tools/agent_run.py`
+3. `<repo-root>/src/loom/tools/wp_cli.py`
+4. `<repo-root>/src/loom/tools/wp_env.py` (Stage B)
+5. `<repo-root>/src/loom/tools/wp_scaffold_block.py` (Stage B)
+6. `<repo-root>/src/loom/tools/wp_quality_gate.py` (Stage B)
+7. `<repo-root>/src/loom/tools/tooling_common/command_runner.py` (shared allowlisted subprocess helper)
+8. `<repo-root>/src/loom/tools/tooling_common/version_matrix.py` (provider/version compatibility)
 
 ### Existing files to update
-1. `/Users/sfw/Development/loom/src/loom/config.py`
+1. `<repo-root>/src/loom/config.py`
    - Add feature flags and policy settings:
      - `execution.enable_agent_tools`
      - `execution.enable_wp_tools`
@@ -273,11 +273,11 @@ Output:
      - `execution.agent_tools_allowed_providers`
      - `execution.agent_tools_max_timeout_seconds`
      - `execution.agent_tools_default_network_mode` (`on` by default, can be set to `off`)
-2. `/Users/sfw/Development/loom/docs/CONFIG.md`
+2. `<repo-root>/docs/CONFIG.md`
    - Document new config keys.
-3. `/Users/sfw/Development/loom/README.md`
+3. `<repo-root>/README.md`
    - Document new tool capabilities and limitations.
-4. `/Users/sfw/Development/loom/tests/test_new_tools.py`
+4. `<repo-root>/tests/test_new_tools.py`
    - Extend or split into dedicated test modules for new tools.
 
 ## Safety and Policy Hardening

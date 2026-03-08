@@ -120,15 +120,15 @@ Differentiate failure types:
 This refactor must ship with synchronized documentation updates. Treat docs as part of the feature, not follow-up work.
 
 Required updates:
-1. [README.md](/Users/sfw/Development/loom/README.md)
+1. [README.md](<repo-root>/README.md)
    1. Add "Database Upgrades" section describing automatic migrations, failure behavior, and recovery commands.
-2. [docs/CONFIG.md](/Users/sfw/Development/loom/docs/CONFIG.md)
+2. [docs/CONFIG.md](<repo-root>/docs/CONFIG.md)
    1. Document any new migration/fallback config flags and startup policy.
-3. [docs/agent-integration.md](/Users/sfw/Development/loom/docs/agent-integration.md)
+3. [docs/agent-integration.md](<repo-root>/docs/agent-integration.md)
    1. Document migration expectations for agent-driven workflows and non-interactive runs.
-4. [docs/2026-02-28-SYSTEM-TECHNICAL-DESIGN.md](/Users/sfw/Development/loom/docs/2026-02-28-SYSTEM-TECHNICAL-DESIGN.md)
+4. [docs/2026-02-28-SYSTEM-TECHNICAL-DESIGN.md](<repo-root>/docs/2026-02-28-SYSTEM-TECHNICAL-DESIGN.md)
    1. Update persistence architecture and startup lifecycle diagrams to include migration runner.
-5. [CHANGELOG.md](/Users/sfw/Development/loom/CHANGELOG.md)
+5. [CHANGELOG.md](<repo-root>/CHANGELOG.md)
    1. Add explicit upgrade notice and operational notes.
 6. New developer-focused guide:
    1. `docs/DB-MIGRATIONS.md` (or `docs/development/db-migrations.md`) describing authoring rules, testing, and rollback expectations.

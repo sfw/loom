@@ -152,6 +152,11 @@ class DelegateTaskTool(Tool):
         """Bind the orchestrator factory after construction."""
         self._factory = orchestrator_factory
 
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         if self._factory is None:
             return ToolResult.fail(

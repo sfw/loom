@@ -90,7 +90,7 @@ This directly addresses document-generation tasks where quality loss compounds d
 ## Proposed Implementation Workstreams
 ### Workstream 1: Runtime Lane Classifier and Candidate Graph
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
+1. `<repo-root>/src/loom/engine/runner.py`
 
 ### Changes
 1. Add lane classification (`instruction`, `active_write`, `source_evidence`, `tool_trace`, `historical_chat`).
@@ -103,7 +103,7 @@ This directly addresses document-generation tasks where quality loss compounds d
 
 ### Workstream 2: Utility + Feasibility Planner
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
+1. `<repo-root>/src/loom/engine/runner.py`
 
 ### Changes
 1. Add utility scoring function (small, runtime-only signal set).
@@ -116,8 +116,8 @@ This directly addresses document-generation tasks where quality loss compounds d
 
 ### Workstream 3: Advisory Ranker Integration
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/src/loom/config.py`
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/src/loom/config.py`
 
 ### Changes
 1. Add optional advisory mode flag and limits (`enabled`, `max_candidates`, `epsilon`).
@@ -130,7 +130,7 @@ This directly addresses document-generation tasks where quality loss compounds d
 
 ### Workstream 4: Incremental Checkpointing Instead of Full Stage-4 Merge
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
+1. `<repo-root>/src/loom/engine/runner.py`
 
 ### Changes
 1. Replace full "prior conversation context" recompression with incremental checkpoint updates.
@@ -143,9 +143,9 @@ This directly addresses document-generation tasks where quality loss compounds d
 
 ### Workstream 5: Compactor Runtime Guardrails
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/semantic_compactor.py`
-3. `/Users/sfw/Development/loom/src/loom/config.py`
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/src/loom/engine/semantic_compactor.py`
+3. `<repo-root>/src/loom/config.py`
 
 ### Changes
 1. Add per-iteration call budgets and per-label cooldown.
@@ -158,7 +158,7 @@ This directly addresses document-generation tasks where quality loss compounds d
 
 ### Workstream 6: Memory Extraction Alignment
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
+1. `<repo-root>/src/loom/engine/runner.py`
 
 ### Changes
 1. Apply same lane/utility principles to extractor prompt formation.
@@ -171,11 +171,11 @@ This directly addresses document-generation tasks where quality loss compounds d
 
 ### Workstream 7: Telemetry, Rollout, and Validation
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/src/loom/events/types.py` (only if needed)
-3. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-4. `/Users/sfw/Development/loom/tests/test_semantic_compactor.py`
-5. `/Users/sfw/Development/loom/tests/test_verification.py`
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/src/loom/events/types.py` (only if needed)
+3. `<repo-root>/tests/test_orchestrator.py`
+4. `<repo-root>/tests/test_semantic_compactor.py`
+5. `<repo-root>/tests/test_verification.py`
 
 ### Changes
 1. Add observability for lane decisions, feasibility skips, advisory usage, and budget exhaustion.

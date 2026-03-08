@@ -90,6 +90,11 @@ class HistoricalCurrencyNormalizerTool(Tool):
     def timeout_seconds(self) -> int:
         return 45
 
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         amount = _to_float(args.get("amount"))
         if amount is None:

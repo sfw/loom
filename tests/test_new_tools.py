@@ -816,6 +816,9 @@ class TestSpreadsheetMetadata:
     def test_description(self, sheet):
         assert "CSV" in sheet.description
 
+    def test_is_mutating(self, sheet):
+        assert sheet.is_mutating is True
+
     def test_parameters_schema(self, sheet):
         params = sheet.parameters
         assert params["type"] == "object"

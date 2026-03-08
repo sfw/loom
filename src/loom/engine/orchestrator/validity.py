@@ -1307,33 +1307,16 @@ def _artifact_provenance_evidence(
     subtask_id: str,
     tool_calls: list[ToolCallRecord] | None,
     existing_ids: set[str],
+    workspace: Path | None = None,
 ) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
-    for call in tool_calls or []:
-        tool = str(getattr(call, "tool", "") or "").strip().lower()
-        if tool not in {"write_file", "document_write"}:
-            continue
-        result = getattr(call, "result", None)
-        if result is None or not bool(getattr(result, "success", False)):
-            continue
-        args = getattr(call, "args", {})
-        if not isinstance(args, dict):
-            args = {}
-        data = getattr(result, "data", {})
-        if not isinstance(data, dict):
-            data = {}
-        relpath = str(
-            args.get("path")
-            or args.get("file_path")
-            or data.get("path")
-            or "",
-        ).strip()
-        if not relpath:
-            continue
-        content = ""
-        if tool == "write_file":
-            content = str(args.get("content", "") or "")
-        else:
+    def _fallback_artifact_content(
+        tool_name: str,
+        args: dict[str, object],
+        data: dict[str, object],
+    ) -> str:
+        if tool_name == "write_file":
+            return str(args.get("content", "") or "")
+        if tool_name == "document_write":
             parts: list[str] = []
             title = str(args.get("title", "") or "").strip()
             if title:
@@ -1352,38 +1335,99 @@ def _artifact_provenance_evidence(
                     section_body = str(section.get("body", "") or "")
                     if section_body:
                         parts.append(section_body)
-            content = "\n\n".join(parts)
-        payload = f"{tool}|{subtask_id}|{relpath}|{content[:200]}"
-        evidence_id = "EV-WRITE-" + hashlib.sha1(
-            payload.encode("utf-8", errors="replace"),
-        ).hexdigest().upper()[:10]
-        if evidence_id in existing_ids:
+            if parts:
+                return "\n\n".join(parts)
+            return str(data.get("content", "") or "")
+        return ""
+
+    def _read_artifact_bytes(workspace_path: Path | None, relpath: str) -> bytes:
+        if workspace_path is None:
+            return b""
+        normalized = normalize_workspace_relpath(workspace_path, relpath)
+        if not normalized:
+            return b""
+        try:
+            artifact_path = (workspace_path / normalized).resolve()
+            artifact_path.relative_to(workspace_path)
+        except Exception:
+            return b""
+        if not artifact_path.exists() or not artifact_path.is_file():
+            return b""
+        try:
+            return artifact_path.read_bytes()
+        except Exception:
+            return b""
+
+    records: list[dict[str, object]] = []
+    workspace_path = workspace if isinstance(workspace, Path) else None
+    for call in tool_calls or []:
+        tool = str(getattr(call, "tool", "") or "").strip().lower()
+        result = getattr(call, "result", None)
+        if result is None or not bool(getattr(result, "success", False)):
             continue
-        existing_ids.add(evidence_id)
-        sha256 = ""
-        size_bytes = 0
-        if content:
-            encoded = content.encode("utf-8", errors="replace")
-            size_bytes = len(encoded)
-            sha256 = hashlib.sha256(encoded).hexdigest()
-        records.append({
-            "evidence_id": evidence_id,
-            "task_id": task_id,
-            "subtask_id": subtask_id,
-            "tool": tool,
-            "evidence_kind": "artifact",
-            "tool_call_id": str(getattr(call, "call_id", "") or ""),
-            "query": relpath,
-            "source_url": "",
-            "facets": {"artifact_path": relpath[:120]},
-            "artifact_workspace_relpath": relpath,
-            "artifact_sha256": sha256,
-            "artifact_size_bytes": int(size_bytes),
-            "snippet": f"{tool}:{relpath}",
-            "context_text": f"{tool} wrote {relpath}",
-            "quality": 1.0,
-            "created_at": str(getattr(call, "timestamp", "") or datetime.now().isoformat()),
-        })
+        args = getattr(call, "args", {})
+        if not isinstance(args, dict):
+            args = {}
+        data = getattr(result, "data", {})
+        if not isinstance(data, dict):
+            data = {}
+        relpaths: list[str] = []
+        seen_paths: set[str] = set()
+        for raw in list(getattr(result, "files_changed", []) or []):
+            relpath = str(raw or "").strip()
+            if not relpath:
+                continue
+            if workspace_path is not None:
+                normalized = normalize_workspace_relpath(workspace_path, relpath)
+                if normalized:
+                    relpath = normalized
+            if relpath in seen_paths:
+                continue
+            seen_paths.add(relpath)
+            relpaths.append(relpath)
+        if not relpaths:
+            fallback = str(
+                args.get("path")
+                or args.get("file_path")
+                or data.get("path")
+                or "",
+            ).strip()
+            if fallback:
+                relpaths = [fallback]
+        if not relpaths:
+            continue
+        fallback_content = _fallback_artifact_content(tool, args, data)
+        for relpath in relpaths:
+            payload_bytes = _read_artifact_bytes(workspace_path, relpath)
+            if not payload_bytes and fallback_content and len(relpaths) == 1:
+                payload_bytes = fallback_content.encode("utf-8", errors="replace")
+            sha256 = hashlib.sha256(payload_bytes).hexdigest() if payload_bytes else ""
+            size_bytes = len(payload_bytes)
+            payload = f"{tool}|{subtask_id}|{relpath}|{sha256 or fallback_content[:120]}"
+            evidence_id = "EV-ART-" + hashlib.sha1(
+                payload.encode("utf-8", errors="replace"),
+            ).hexdigest().upper()[:10]
+            if evidence_id in existing_ids:
+                continue
+            existing_ids.add(evidence_id)
+            records.append({
+                "evidence_id": evidence_id,
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "tool": tool,
+                "evidence_kind": "artifact",
+                "tool_call_id": str(getattr(call, "call_id", "") or ""),
+                "query": relpath,
+                "source_url": "",
+                "facets": {"artifact_path": relpath[:120]},
+                "artifact_workspace_relpath": relpath,
+                "artifact_sha256": sha256,
+                "artifact_size_bytes": int(size_bytes),
+                "snippet": f"{tool}:{relpath}",
+                "context_text": f"{tool} mutated {relpath}",
+                "quality": 1.0,
+                "created_at": str(getattr(call, "timestamp", "") or datetime.now().isoformat()),
+            })
     return records
 
 def _claim_evidence_links(
@@ -1484,11 +1528,18 @@ async def _persist_claim_validity_artifacts(
         for item in normalized_evidence
         if str(item.get("evidence_id", "") or "").strip()
     }
+    workspace_path: Path | None = None
+    if task.workspace:
+        try:
+            workspace_path = Path(task.workspace).expanduser().resolve()
+        except Exception:
+            workspace_path = None
     provenance_records = self._artifact_provenance_evidence(
         task_id=task.id,
         subtask_id=subtask.id,
         tool_calls=tool_calls,
         existing_ids=existing_ids,
+        workspace=workspace_path,
     )
     if provenance_records:
         normalized_evidence = merge_evidence_records(

@@ -19,6 +19,42 @@ from loom.tools.registry import ToolResult
 
 from .types import ToolCallRecord
 
+_DEFAULT_MUTATION_PATH_KEYS = frozenset({
+    "path",
+    "destination",
+    "destination_path",
+    "source",
+    "file",
+    "file_path",
+    "filepath",
+    "target",
+    "target_path",
+    "target_file",
+    "dest_path",
+    "output_path",
+    "output_file",
+    "output_json_path",
+    "searchable_output_path",
+    "save_path",
+    "export_path",
+    "report_path",
+})
+_OUTPUT_MUTATION_PATH_KEYS = frozenset({
+    "output_path",
+    "output_file",
+    "output_json_path",
+    "searchable_output_path",
+    "save_path",
+    "export_path",
+    "report_path",
+    "destination",
+    "destination_path",
+    "dest_path",
+    "target",
+    "target_path",
+    "target_file",
+})
+
 
 def normalize_path_for_policy(path_text: str, workspace: Path | None) -> str:
     return shared_normalize_path_for_policy(path_text, workspace)
@@ -39,11 +75,12 @@ def is_mutating_file_tool(
     *,
     tool_name: str,
     tool_args: dict,
+    is_mutating_tool: bool = False,
     write_mutating_tools: set[str] | frozenset[str],
     spreadsheet_write_operations: set[str] | frozenset[str],
 ) -> bool:
     name = str(tool_name or "").strip().lower()
-    if name not in write_mutating_tools:
+    if not bool(is_mutating_tool) and name not in write_mutating_tools:
         return False
     if name != "spreadsheet":
         return True
@@ -51,22 +88,95 @@ def is_mutating_file_tool(
     return operation in spreadsheet_write_operations
 
 
+def _coerce_mutation_target_arg_keys(
+    mutation_target_arg_keys: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None,
+) -> tuple[str, ...]:
+    if not mutation_target_arg_keys:
+        return tuple()
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in mutation_target_arg_keys:
+        key = str(item or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    return tuple(normalized)
+
+
+def _collect_path_candidates(
+    value: Any,
+    *,
+    candidate_keys: set[str],
+    found: list[tuple[str, str]],
+) -> None:
+    if isinstance(value, dict):
+        for raw_key, raw_value in value.items():
+            key = str(raw_key or "").strip().lower()
+            if key in candidate_keys:
+                if isinstance(raw_value, str):
+                    text = raw_value.strip()
+                    if text:
+                        found.append((key, text))
+                elif isinstance(raw_value, (list, tuple, set)):
+                    for item in raw_value:
+                        text = str(item or "").strip()
+                        if text:
+                            found.append((key, text))
+            _collect_path_candidates(
+                raw_value,
+                candidate_keys=candidate_keys,
+                found=found,
+            )
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _collect_path_candidates(
+                item,
+                candidate_keys=candidate_keys,
+                found=found,
+            )
+
+
 def target_paths_for_policy(
     *,
     tool_name: str,
     tool_args: dict,
     workspace: Path | None,
+    is_mutating_tool: bool = False,
+    mutation_target_arg_keys: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None = None,
     is_mutating_file_tool_fn: Any,
 ) -> list[str]:
-    if not is_mutating_file_tool_fn(tool_name, tool_args):
+    try:
+        is_mutating = is_mutating_file_tool_fn(
+            tool_name,
+            tool_args,
+            is_mutating_tool=is_mutating_tool,
+        )
+    except TypeError:
+        is_mutating = is_mutating_file_tool_fn(tool_name, tool_args)
+    if not is_mutating:
         return []
-    keys = ("path", "destination", "source", "file", "file_path", "filepath")
+
+    explicit_keys = _coerce_mutation_target_arg_keys(mutation_target_arg_keys)
+    candidate_keys = set(explicit_keys) if explicit_keys else set(_DEFAULT_MUTATION_PATH_KEYS)
+    found: list[tuple[str, str]] = []
+    _collect_path_candidates(
+        tool_args,
+        candidate_keys=candidate_keys,
+        found=found,
+    )
+    if not found:
+        return []
+
+    # When output-oriented keys are present, treat generic `path` values as likely
+    # read inputs unless the tool explicitly declared otherwise.
+    if any(key in _OUTPUT_MUTATION_PATH_KEYS for key, _ in found):
+        found = [(key, value) for key, value in found if key in _OUTPUT_MUTATION_PATH_KEYS]
+
     result: list[str] = []
     seen: set[str] = set()
-    for key in keys:
-        raw = tool_args.get(key)
-        if raw is None:
-            continue
+    for _key, raw in found:
         value = normalize_path_for_policy(str(raw), workspace)
         if not value or value in seen:
             continue
@@ -125,6 +235,8 @@ def validate_deliverable_write_policy(
     tool_name: str,
     tool_args: dict,
     workspace: Path | None,
+    is_mutating_tool: bool = False,
+    mutation_target_arg_keys: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None = None,
     expected_deliverables: list[str],
     forbidden_deliverables: list[str],
     allowed_output_prefixes: list[str],
@@ -146,6 +258,8 @@ def validate_deliverable_write_policy(
         tool_name=tool_name,
         tool_args=tool_args,
         workspace=workspace,
+        is_mutating_tool=is_mutating_tool,
+        mutation_target_arg_keys=mutation_target_arg_keys,
     )
     if not paths:
         return None
@@ -213,6 +327,8 @@ def validate_sealed_artifact_mutation_policy(
     tool_name: str,
     tool_args: dict,
     workspace: Path | None,
+    is_mutating_tool: bool = False,
+    mutation_target_arg_keys: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None = None,
     prior_successful_tool_calls: list[ToolCallRecord],
     current_tool_calls: list[ToolCallRecord],
     target_paths_for_policy: Any,
@@ -225,6 +341,8 @@ def validate_sealed_artifact_mutation_policy(
         tool_name=tool_name,
         tool_args=tool_args,
         workspace=workspace,
+        is_mutating_tool=is_mutating_tool,
+        mutation_target_arg_keys=mutation_target_arg_keys,
     )
     if not paths:
         return None
@@ -264,18 +382,131 @@ def validate_sealed_artifact_mutation_policy(
         path_preview = f"{path_preview}, ..."
     if latest_seal:
         return (
-            "Sealed artifact edit blocked: target is sealed and verified "
+            "Sealed artifact mutation blocked: target is sealed and verified "
             f"({path_preview}) but no confirmation evidence was recorded "
             f"after seal time {latest_seal}. "
-            "Gather evidence first (for example: read_file, web_search/web_fetch, "
-            "or fact_checker), then retry the edit."
+            "Gather evidence first (for example: read_file, spreadsheet read/summary, "
+            "web_search/web_fetch, or fact_checker), then retry."
         )
     return (
-        "Sealed artifact edit blocked: target is sealed and verified "
+        "Sealed artifact mutation blocked: target is sealed and verified "
         f"({path_preview}) but no confirmation evidence is recorded in this subtask. "
-        "Gather evidence first (for example: read_file, web_search/web_fetch, "
-        "or fact_checker), then retry the edit."
+        "Gather evidence first (for example: read_file, spreadsheet read/summary, "
+        "web_search/web_fetch, or fact_checker), then retry."
     )
+
+
+def snapshot_tracked_artifact_hashes(
+    *,
+    task: Task,
+    workspace: Path | None,
+    artifact_seal_registry: Any,
+) -> dict[str, str]:
+    if workspace is None:
+        return {}
+    seals = artifact_seal_registry(task)
+    if not isinstance(seals, dict) or not seals:
+        return {}
+    try:
+        workspace_resolved = workspace.resolve()
+    except Exception:
+        return {}
+    snapshot: dict[str, str] = {}
+    for relpath, seal in seals.items():
+        if not isinstance(seal, dict):
+            continue
+        if not str(seal.get("sha256", "") or "").strip():
+            continue
+        try:
+            artifact_path = (workspace_resolved / str(relpath)).resolve()
+            artifact_path.relative_to(workspace_resolved)
+        except Exception:
+            continue
+        if not artifact_path.exists() or not artifact_path.is_file():
+            snapshot[str(relpath)] = ""
+            continue
+        try:
+            payload = artifact_path.read_bytes()
+        except Exception:
+            continue
+        snapshot[str(relpath)] = hashlib.sha256(payload).hexdigest()
+    return snapshot
+
+
+def unexpected_sealed_mutation_paths(
+    *,
+    task: Task,
+    workspace: Path | None,
+    tool_name: str,
+    tool_args: dict,
+    tool_result: ToolResult,
+    is_mutating_tool: bool,
+    mutation_target_arg_keys: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None,
+    pre_call_hashes: dict[str, str],
+    artifact_seal_registry: Any,
+    mutation_paths_for_reseal: Any,
+    normalize_path_for_policy: Any,
+) -> list[str]:
+    if workspace is None or not is_mutating_tool:
+        return []
+    if tool_result is None or not tool_result.success:
+        return []
+    if not pre_call_hashes:
+        return []
+
+    seals = artifact_seal_registry(task)
+    if not isinstance(seals, dict) or not seals:
+        return []
+    try:
+        workspace_resolved = workspace.resolve()
+    except Exception:
+        return []
+
+    expected = mutation_paths_for_reseal(
+        tool_name=tool_name,
+        tool_args=tool_args,
+        workspace=workspace,
+        tool_result=tool_result,
+        is_mutating_tool=is_mutating_tool,
+        mutation_target_arg_keys=mutation_target_arg_keys,
+    )
+    expected_set: set[str] = set()
+    for path in expected:
+        normalized = normalize_path_for_policy(str(path), workspace)
+        if normalized:
+            expected_set.add(normalized)
+
+    unexpected: list[str] = []
+    seen: set[str] = set()
+    for relpath, seal in seals.items():
+        rel = str(relpath or "").strip()
+        if not rel or rel in seen:
+            continue
+        if not isinstance(seal, dict):
+            continue
+        if not str(seal.get("sha256", "") or "").strip():
+            continue
+        try:
+            artifact_path = (workspace_resolved / rel).resolve()
+            artifact_path.relative_to(workspace_resolved)
+        except Exception:
+            continue
+        if artifact_path.exists() and artifact_path.is_file():
+            try:
+                payload = artifact_path.read_bytes()
+            except Exception:
+                continue
+            current_hash = hashlib.sha256(payload).hexdigest()
+        else:
+            current_hash = ""
+        previous_hash = str(pre_call_hashes.get(rel, ""))
+        if current_hash == previous_hash:
+            continue
+        normalized_rel = normalize_path_for_policy(rel, workspace)
+        if normalized_rel and normalized_rel not in expected_set:
+            seen.add(rel)
+            unexpected.append(normalized_rel)
+    return unexpected
 
 
 def reseal_tracked_artifacts_after_mutation(
@@ -285,6 +516,8 @@ def reseal_tracked_artifacts_after_mutation(
     tool_name: str,
     tool_args: dict,
     tool_result: ToolResult,
+    is_mutating_tool: bool,
+    mutation_target_arg_keys: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None,
     subtask_id: str,
     tool_call_id: str,
     artifact_seal_registry: Any,
@@ -304,6 +537,8 @@ def reseal_tracked_artifacts_after_mutation(
         tool_args=tool_args,
         workspace=workspace,
         tool_result=tool_result,
+        is_mutating_tool=is_mutating_tool,
+        mutation_target_arg_keys=mutation_target_arg_keys,
     )
     if not affected_paths:
         return 0

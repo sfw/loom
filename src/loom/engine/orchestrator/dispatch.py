@@ -469,6 +469,7 @@ async def handle_failure(
         subtask.id,
         result.evidence_records,
         tool_calls=result.tool_calls,
+        workspace=task.workspace,
     )
     attempt_list = attempts_by_subtask.setdefault(subtask.id, [])
     strategy, missing_targets = orchestrator._retry.classify_failure(
@@ -855,6 +856,7 @@ async def handle_success(
         subtask.id,
         result.evidence_records,
         tool_calls=result.tool_calls,
+        workspace=task.workspace,
     )
     try:
         orchestrator._record_fan_in_worker_artifacts(

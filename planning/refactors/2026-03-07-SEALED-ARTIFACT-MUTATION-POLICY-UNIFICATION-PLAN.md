@@ -13,8 +13,8 @@ This plan unifies mutation policy, resealing, and provenance under one productio
 Primary anchor:
 1. Run: `cowork-2cd782fe`
 2. Logs:
-   - `/Users/sfw/.loom/logs/20260306-201007-cowork-2cd782fe.events.jsonl`
-   - `/Users/sfw/.loom/logs/20260307-004143-cowork-2cd782fe.events.jsonl`
+   - `~/.loom/logs/<timestamp>-cowork-<id>.events.jsonl`
+   - `~/.loom/logs/<timestamp>-cowork-<id>.events.jsonl`
 3. Sequence:
    - `332`: `write_file` wrote `competitor-pricing.csv` (sealed baseline).
    - `1377`: `spreadsheet create` overwrote `competitor-pricing.csv`.
@@ -26,6 +26,34 @@ Primary anchor:
 Related recurring pattern:
 1. Other runs show the same final-stage `artifact_seal_mismatch` family.
 2. Risk is systemic across tools writing through `output_path`.
+
+## Codebase Structure Alignment (Current)
+This plan is aligned to the current split architecture in `src/loom/engine` and `src/loom/state`:
+1. Runner split:
+   - orchestration of tool loop in `src/loom/engine/runner/execution.py`
+   - mutation/policy primitives in `src/loom/engine/runner/policy.py`
+   - shared runner wiring/constants in `src/loom/engine/runner/core.py`
+   - event emission helpers in `src/loom/engine/runner/telemetry.py`
+2. Orchestrator split:
+   - subtask dispatch/gates in `src/loom/engine/orchestrator/dispatch.py`
+   - artifact seals and validation in `src/loom/engine/orchestrator/evidence.py`
+   - validity/provenance synthesis in `src/loom/engine/orchestrator/validity.py`
+   - event forwarding in `src/loom/engine/orchestrator/telemetry.py`
+3. State split:
+   - evidence extraction/normalization in `src/loom/state/evidence.py`
+   - task persistence in `src/loom/state/task_state.py`
+4. Tool layer:
+   - mutability declarations and `files_changed` emission in `src/loom/tools/*.py`
+
+## Scope Inventory (Workspace-Writing Tool Families)
+The rollout covers these families in the current codebase:
+1. Core file tools:
+   - `write_file`, `edit_file`, `move_file`, `delete_file`, `document_write`, `spreadsheet`
+2. Optional report/output tools writing via `output_path` or equivalent:
+   - citation, fact-checking, financial analyzers, OCR/export, timeline/network/correspondence generators, and similar utilities under `src/loom/tools/`
+3. Wrapper/delegation surfaces that may expose downstream file mutations:
+   - `run_tool`
+   - `delegate_task` (coordination and telemetry expectations, no direct seal ownership transfer)
 
 ## Goals
 1. Enforce sealed-artifact policy uniformly for all workspace-mutating tools.
@@ -59,6 +87,8 @@ Related recurring pattern:
 4. Path targeting for policy is partly allowlist-driven:
    - `src/loom/engine/runner/core.py`
    - `src/loom/engine/runner/policy.py`
+5. Current behavior is strongest for `edit_file` but not normalized across full tool suite:
+   - this plan makes that behavior the default baseline.
 
 ## Target Architecture
 
@@ -129,6 +159,7 @@ Tools mutating external systems (`wp_cli`, provider agent tools, etc.):
 Deliverables:
 1. audit report artifact (tool name, paths, call counts)
 2. risk-ranked migration list
+3. locked migration checklist keyed by tool family and owner
 
 ### Phase 1: Mutating Semantics Normalization
 1. Set `is_mutating=True` on all workspace-writing tools.
@@ -136,8 +167,14 @@ Deliverables:
 3. Add static lint/test preventing future workspace-writing tools from omitting mutating flag.
 
 Files:
-1. `src/loom/tools/*.py` (targeted tool classes)
-2. new test/lint helper in `tests/` and optional script in `scripts/`
+1. targeted tool classes under `src/loom/tools/`
+2. `src/loom/tools/registry.py` (if tool metadata exposure needs augmentation)
+3. new test/lint helper in `tests/` and optional script in `scripts/`
+
+Validation tests:
+1. `tests/test_tools.py`
+2. `tests/test_new_tools.py`
+3. `tests/test_tool_auth_inventory.py` (metadata consistency, if impacted)
 
 ### Phase 2: Policy Target Path Unification
 1. Replace hardcoded mutation-name branches with contract-driven logic.
@@ -147,6 +184,12 @@ Files:
 Files:
 1. `src/loom/engine/runner/core.py`
 2. `src/loom/engine/runner/policy.py`
+3. `src/loom/engine/runner/execution.py` (preflight call-site integration)
+
+Validation tests:
+1. `tests/test_runner_policy.py`
+2. `tests/test_runner_execution.py`
+3. `tests/test_runner_session.py` (if policy context plumbing changes)
 
 ### Phase 3: Provenance and Seal Backfill Generalization
 1. Refactor artifact provenance extraction to use generic changed-file bytes.
@@ -157,6 +200,13 @@ Files:
 1. `src/loom/state/evidence.py`
 2. `src/loom/engine/orchestrator/evidence.py`
 3. `src/loom/engine/orchestrator/validity.py`
+4. `src/loom/engine/orchestrator/dispatch.py` (metadata propagation touchpoints if needed)
+
+Validation tests:
+1. `tests/test_orchestrator_evidence.py`
+2. `tests/test_orchestrator_validity.py`
+3. `tests/test_orchestrator_output.py`
+4. `tests/test_verification_events.py` (if event payloads shift)
 
 ### Phase 4: Post-Call Guard (Strict Mode)
 1. Compare pre/post seal hashes for tracked paths touched during call execution.
@@ -166,7 +216,15 @@ Files:
 
 Files:
 1. `src/loom/engine/runner/execution.py`
-2. config plumbing in `src/loom/config.py` and setup docs
+2. `src/loom/engine/runner/settings.py` (flag materialization)
+3. config plumbing in `src/loom/config.py` and setup docs
+4. `src/loom/engine/runner/telemetry.py` (guard event emission helpers)
+
+Validation tests:
+1. `tests/test_runner_settings.py`
+2. `tests/test_runner_execution.py`
+3. `tests/test_runner_telemetry.py`
+4. `tests/test_config.py`
 
 ### Phase 5: Telemetry and Operator UX
 1. Add events:
@@ -180,8 +238,14 @@ Files:
 
 Files:
 1. `src/loom/events/types.py`
-2. orchestrator/runner telemetry emission paths
-3. TUI messaging surfaces for actionable error text
+2. `src/loom/engine/runner/telemetry.py`
+3. `src/loom/engine/orchestrator/telemetry.py`
+4. TUI messaging surfaces for actionable error text
+
+Validation tests:
+1. `tests/test_orchestrator_telemetry.py`
+2. `tests/test_runner_telemetry.py`
+3. `tests/test_tui_commands.py` and/or `tests/tui/*` where event rendering is covered
 
 ## Test Strategy (Production Gate)
 
@@ -195,6 +259,11 @@ Files:
    - any successful mutating tool updates tracked seal hash when path changed.
 4. Provenance tests:
    - changed-file artifacts produce hash/path records regardless of tool name.
+
+Module mapping:
+1. runner policy/execution tests under `tests/test_runner_*.py`
+2. orchestrator validity/evidence tests under `tests/test_orchestrator_*.py`
+3. verification contract tests under `tests/test_verification*.py`
 
 ### Integration Tests
 1. Reproduce anchor sequence with `spreadsheet create`:
@@ -234,6 +303,7 @@ Files:
 3. Full test suite passes with new mutation contract checks.
 4. Telemetry shows reseal events for non-`write_file`/`document_write` tools.
 5. Operator-facing errors remain clear and actionable.
+6. Plan references and ownership map match the split runner/orchestrator/state module layout.
 
 ## Open Decisions
 1. Should strict post-call rollback be enabled by default or only for high-rigor profiles?

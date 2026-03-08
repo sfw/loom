@@ -42,6 +42,7 @@ class RunnerSettings:
     ingest_artifact_retention_max_age_days: int
     ingest_artifact_retention_max_files_per_scope: int
     ingest_artifact_retention_max_bytes_per_scope: int
+    sealed_artifact_post_call_guard: str
     executor_completion_contract_mode: str
     enable_mutation_idempotency: bool
     ask_user_v2_enabled: bool
@@ -329,6 +330,15 @@ class RunnerSettings:
         )
 
         execution_cfg = getattr(config, "execution", None)
+        sealed_artifact_post_call_guard = str(
+            getattr(
+                execution_cfg,
+                "sealed_artifact_post_call_guard",
+                runner_defaults.SEALED_ARTIFACT_POST_CALL_GUARD,
+            ),
+        ).strip().lower()
+        if sealed_artifact_post_call_guard not in {"off", "warn", "enforce"}:
+            sealed_artifact_post_call_guard = runner_defaults.SEALED_ARTIFACT_POST_CALL_GUARD
         completion_mode = str(
             getattr(
                 execution_cfg,
@@ -514,6 +524,7 @@ class RunnerSettings:
             ingest_artifact_retention_max_age_days=ingest_artifact_retention_max_age_days,
             ingest_artifact_retention_max_files_per_scope=ingest_artifact_retention_max_files_per_scope,
             ingest_artifact_retention_max_bytes_per_scope=ingest_artifact_retention_max_bytes_per_scope,
+            sealed_artifact_post_call_guard=sealed_artifact_post_call_guard,
             executor_completion_contract_mode=executor_completion_contract_mode,
             enable_mutation_idempotency=enable_mutation_idempotency,
             ask_user_v2_enabled=ask_user_v2_enabled,

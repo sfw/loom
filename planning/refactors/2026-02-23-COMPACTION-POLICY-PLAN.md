@@ -16,15 +16,15 @@ Define and implement deterministic rules for when to compact and when not to com
 
 ## Scope
 Runtime:
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/semantic_compactor.py`
-3. `/Users/sfw/Development/loom/src/loom/config.py`
-4. `/Users/sfw/Development/loom/src/loom/events/types.py` (only if new explicit events are added)
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/src/loom/engine/semantic_compactor.py`
+3. `<repo-root>/src/loom/config.py`
+4. `<repo-root>/src/loom/events/types.py` (only if new explicit events are added)
 
 Tests:
-1. `/Users/sfw/Development/loom/tests/test_orchestrator.py` (SubtaskRunner compaction behavior tests currently live here)
-2. `/Users/sfw/Development/loom/tests/test_semantic_compactor.py`
-3. `/Users/sfw/Development/loom/tests/test_verification.py` (for cross-component consistency around oversize outputs)
+1. `<repo-root>/tests/test_orchestrator.py` (SubtaskRunner compaction behavior tests currently live here)
+2. `<repo-root>/tests/test_semantic_compactor.py`
+3. `<repo-root>/tests/test_verification.py` (for cross-component consistency around oversize outputs)
 
 ## Non-Negotiable Policy Rules
 1. Do not add deterministic hard truncation for runner model-context compaction.

@@ -92,6 +92,11 @@ class CorrespondenceAnalysisTool(Tool):
     def timeout_seconds(self) -> int:
         return 45
 
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         try:
             loaded = _load_table(args=args, tool=self, ctx=ctx)

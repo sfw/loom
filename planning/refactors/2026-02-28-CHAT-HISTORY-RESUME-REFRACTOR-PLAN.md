@@ -141,9 +141,9 @@ Standardize behavior:
 
 ### W1: Data Layer and Schema
 Files:
-1. `/Users/sfw/Development/loom/src/loom/state/schema.sql`
-2. `/Users/sfw/Development/loom/src/loom/state/conversation_store.py`
-3. `/Users/sfw/Development/loom/tests/test_conversation_store.py`
+1. `<repo-root>/src/loom/state/schema.sql`
+2. `<repo-root>/src/loom/state/conversation_store.py`
+3. `<repo-root>/tests/test_conversation_store.py`
 
 Deliverables:
 1. `cowork_chat_events` schema.
@@ -153,9 +153,9 @@ Deliverables:
 
 ### W2: Cowork/TUI Emission Pipeline
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/cowork/session.py` (only if event metadata plumbing is needed)
-3. `/Users/sfw/Development/loom/tests/test_tui.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/cowork/session.py` (only if event metadata plumbing is needed)
+3. `<repo-root>/tests/test_tui.py`
 
 Deliverables:
 1. Event journal writes at each UI-visible row boundary.
@@ -164,9 +164,9 @@ Deliverables:
 
 ### W3: Hydration + Pagination + Rendering Caps
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/tui/widgets/chat_log.py`
-3. `/Users/sfw/Development/loom/tests/test_tui.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/tui/widgets/chat_log.py`
+3. `<repo-root>/tests/test_tui.py`
 
 Deliverables:
 1. Startup and `/resume` chat hydration path.
@@ -176,10 +176,10 @@ Deliverables:
 
 ### W4: Config and Docs
 Files:
-1. `/Users/sfw/Development/loom/src/loom/config.py`
-2. `/Users/sfw/Development/loom/loom.toml.example`
-3. `/Users/sfw/Development/loom/docs/CONFIG.md`
-4. `/Users/sfw/Development/loom/CHANGELOG.md`
+1. `<repo-root>/src/loom/config.py`
+2. `<repo-root>/loom.toml.example`
+3. `<repo-root>/docs/CONFIG.md`
+4. `<repo-root>/CHANGELOG.md`
 
 Proposed config knobs:
 1. `[tui].chat_resume_page_size = 250`

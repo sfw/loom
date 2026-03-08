@@ -2,7 +2,7 @@
 
 ## Scope
 Execution checklist for:
-- [2026-02-27-AUTH-RESOURCE-LIFECYCLE-AUTODISCOVERY-PLAN.md](/Users/sfw/Development/loom/planning/refactors/2026-02-27-AUTH-RESOURCE-LIFECYCLE-AUTODISCOVERY-PLAN.md)
+- [2026-02-27-AUTH-RESOURCE-LIFECYCLE-AUTODISCOVERY-PLAN.md](<repo-root>/planning/refactors/2026-02-27-AUTH-RESOURCE-LIFECYCLE-AUTODISCOVERY-PLAN.md)
 
 Status:
 1. Implementation has not started.

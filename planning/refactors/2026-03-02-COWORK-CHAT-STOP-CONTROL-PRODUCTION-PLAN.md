@@ -21,7 +21,7 @@ The basic "cancel the worker" concept is directionally correct but insufficientl
 1. Cowork turn execution:
    - `on_user_submit` blocks new non-slash submissions when `_chat_busy` is true.
    - `_run_turn` drives `_run_interaction`, which iterates `self._session.send_streaming(...)`.
-   - File: `/Users/sfw/Development/loom/src/loom/tui/app.py`
+   - File: `<repo-root>/src/loom/tui/app.py`
 2. No stop surface today:
    - No `/stop` in `_SLASH_COMMANDS`.
    - No input-row Stop button.
@@ -29,10 +29,10 @@ The basic "cancel the worker" concept is directionally correct but insufficientl
    - `Ctrl+C` triggers app quit flow (`request_quit`) and must remain unchanged.
 4. Existing cancellation precedent:
    - `/run` has hardened cancel semantics (request/ack/wait/timeout/fallback).
-   - File: `/Users/sfw/Development/loom/src/loom/tui/app.py`
+   - File: `<repo-root>/src/loom/tui/app.py`
 5. Existing steering plan:
    - Prior plan already called for active chat worker tracking and interrupt path.
-   - File: `/Users/sfw/Development/loom/planning/refactors/2026-02-25-CHAT-STEERING-IMPLEMENTATION-PLAN.md`
+   - File: `<repo-root>/planning/refactors/2026-02-25-CHAT-STEERING-IMPLEMENTATION-PLAN.md`
 
 ## Scope
 
@@ -184,8 +184,8 @@ SLO targets:
 
 ### Workstream 1: UI and Command Surface
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/tui/commands.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/tui/commands.py`
 
 Deliverables:
 1. Input-row Stop button.
@@ -194,8 +194,8 @@ Deliverables:
 
 ### Workstream 2: Turn Worker Lifecycle
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/cowork/session.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/cowork/session.py`
 
 Deliverables:
 1. Active chat worker reference tracking.
@@ -206,7 +206,7 @@ Deliverables:
 
 ### Workstream 3: Replay/Event Semantics
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/tui/app.py`
 
 Deliverables:
 1. Interrupted-turn replay event(s).
@@ -215,7 +215,7 @@ Deliverables:
 
 ### Workstream 4: Telemetry
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/tui/app.py`
 2. Optional config/docs files if new tunables are introduced.
 
 Deliverables:
@@ -224,8 +224,8 @@ Deliverables:
 
 ### Workstream 5: Tests
 Files:
-1. `/Users/sfw/Development/loom/tests/test_tui.py`
-2. Optional: `/Users/sfw/Development/loom/tests/test_cowork.py` for session-level semantics.
+1. `<repo-root>/tests/test_tui.py`
+2. Optional: `<repo-root>/tests/test_cowork.py` for session-level semantics.
 
 Deliverables:
 1. Stop button visibility toggles with cowork activity.

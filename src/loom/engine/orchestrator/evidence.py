@@ -88,6 +88,7 @@ def _persist_subtask_evidence(
     evidence_records: list[dict] | None,
     *,
     tool_calls: list[ToolCallRecord] | None = None,
+    workspace: str | Path | None = None,
 ) -> None:
     """Persist newly captured evidence records."""
     scoped: list[dict] = []
@@ -104,11 +105,18 @@ def _persist_subtask_evidence(
         for item in scoped
         if isinstance(item, dict) and str(item.get("evidence_id", "") or "").strip()
     }
+    workspace_path: Path | None = None
+    if workspace:
+        try:
+            workspace_path = Path(str(workspace)).expanduser().resolve()
+        except Exception:
+            workspace_path = None
     provenance_records = self._artifact_provenance_evidence(
         task_id=task_id,
         subtask_id=subtask_id,
         tool_calls=tool_calls,
         existing_ids=existing_ids,
+        workspace=workspace_path,
     )
     if provenance_records:
         scoped = merge_evidence_records(scoped, provenance_records)
@@ -161,6 +169,23 @@ def _artifact_seal_registry(self, task: Task) -> dict[str, dict[str, object]]:
     task.metadata = metadata
     return registry
 
+
+def _changed_workspace_paths_for_call(call: ToolCallRecord) -> list[str]:
+    result = getattr(call, "result", None)
+    if result is None or not bool(getattr(result, "success", False)):
+        return []
+    changed = list(getattr(result, "files_changed", []) or [])
+    relpaths: list[str] = []
+    seen: set[str] = set()
+    for raw in changed:
+        relpath = str(raw or "").strip()
+        if not relpath or relpath in seen:
+            continue
+        seen.add(relpath)
+        relpaths.append(relpath)
+    return relpaths
+
+
 def _record_artifact_seals(
     self,
     *,
@@ -184,10 +209,11 @@ def _record_artifact_seals(
     updated = 0
     for call in tool_calls:
         tool_name = str(getattr(call, "tool", "") or "").strip().lower()
-        if tool_name not in {"write_file", "document_write"}:
-            continue
         result = getattr(call, "result", None)
         if result is None or not bool(getattr(result, "success", False)):
+            continue
+        relpaths = _changed_workspace_paths_for_call(call)
+        if not relpaths:
             continue
         args = getattr(call, "args", {})
         if not isinstance(args, dict):
@@ -195,63 +221,51 @@ def _record_artifact_seals(
         result_data = getattr(result, "data", {})
         if not isinstance(result_data, dict):
             result_data = {}
-        raw_path = str(
-            args.get("path")
-            or args.get("file_path")
-            or result_data.get("path")
-            or "",
-        ).strip()
-        if not raw_path:
-            continue
-
-        candidate = Path(raw_path)
-        if candidate.is_absolute():
+        fallback_content = self._artifact_content_for_call(tool_name, args, result_data)
+        for relpath in relpaths:
             try:
-                resolved = candidate.expanduser().resolve()
-                relpath = resolved.relative_to(workspace).as_posix()
+                normalized = normalize_path_for_policy(relpath, workspace)
             except Exception:
+                normalized = relpath
+            if not normalized:
                 continue
-        else:
-            relpath = candidate.as_posix()
+            if self._is_intermediate_artifact_path(task=task, relpath=normalized):
+                # Intermediate fan-in artifacts are not part of the canonical seal set.
+                continue
             try:
-                resolved = (workspace / relpath).resolve()
+                resolved = (workspace / normalized).resolve()
                 resolved.relative_to(workspace)
             except Exception:
                 continue
-        if self._is_intermediate_artifact_path(task=task, relpath=relpath):
-            # Intermediate fan-in artifacts are not part of the canonical seal set.
-            continue
 
-        sha256 = ""
-        size_bytes = 0
-        if resolved.exists() and resolved.is_file():
-            try:
-                payload = resolved.read_bytes()
-            except Exception:
-                payload = b""
-            if payload:
+            sha256 = ""
+            size_bytes = 0
+            if resolved.exists() and resolved.is_file():
+                try:
+                    payload = resolved.read_bytes()
+                except Exception:
+                    payload = b""
+                if payload:
+                    size_bytes = len(payload)
+                    sha256 = hashlib.sha256(payload).hexdigest()
+            if not sha256 and fallback_content and len(relpaths) == 1:
+                payload = fallback_content.encode("utf-8", errors="replace")
                 size_bytes = len(payload)
                 sha256 = hashlib.sha256(payload).hexdigest()
-        if not sha256:
-            content = self._artifact_content_for_call(tool_name, args, result_data)
-            if content:
-                payload = content.encode("utf-8", errors="replace")
-                size_bytes = len(payload)
-                sha256 = hashlib.sha256(payload).hexdigest()
-        if not sha256:
-            continue
+            if not sha256:
+                continue
 
-        seals[relpath] = {
-            "path": relpath,
-            "sha256": sha256,
-            "size_bytes": int(size_bytes),
-            "tool": tool_name,
-            "tool_call_id": str(getattr(call, "call_id", "") or ""),
-            "subtask_id": subtask_id,
-            "run_id": self._task_run_id(task),
-            "sealed_at": datetime.now().isoformat(),
-        }
-        updated += 1
+            seals[normalized] = {
+                "path": normalized,
+                "sha256": sha256,
+                "size_bytes": int(size_bytes),
+                "tool": tool_name,
+                "tool_call_id": str(getattr(call, "call_id", "") or ""),
+                "subtask_id": subtask_id,
+                "run_id": self._task_run_id(task),
+                "sealed_at": datetime.now().isoformat(),
+            }
+            updated += 1
 
     if updated > 0:
         task.metadata["artifact_seals"] = seals
@@ -348,9 +362,6 @@ def _backfill_artifact_seals_from_evidence(self, task: Task) -> int:
     latest_by_path: dict[str, dict[str, object]] = {}
     for record in records:
         if not isinstance(record, dict):
-            continue
-        tool = str(record.get("tool", "") or "").strip().lower()
-        if tool not in {"write_file", "document_write"}:
             continue
         relpath = str(record.get("artifact_workspace_relpath", "") or "").strip()
         sha256 = str(record.get("artifact_sha256", "") or "").strip()

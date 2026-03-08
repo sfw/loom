@@ -23,17 +23,17 @@ This plan covers three linked goals:
 
 ## Scope
 Code areas this plan targets:
-- `/Users/sfw/Development/loom/src/loom/processes/schema.py`
-- `/Users/sfw/Development/loom/src/loom/processes/installer.py`
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-- `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-- `/Users/sfw/Development/loom/src/loom/tools/__init__.py`
-- `/Users/sfw/Development/loom/src/loom/tools/registry.py`
-- `/Users/sfw/Development/loom/src/loom/tools/web.py`
-- `/Users/sfw/Development/loom/src/loom/tools/web_search.py`
-- `/Users/sfw/Development/loom/src/loom/processes/builtin/*.yaml`
-- `/Users/sfw/Development/loom/tests/`
-- `/Users/sfw/Development/loom/.github/workflows/`
+- `<repo-root>/src/loom/processes/schema.py`
+- `<repo-root>/src/loom/processes/installer.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/engine/verification.py`
+- `<repo-root>/src/loom/tools/__init__.py`
+- `<repo-root>/src/loom/tools/registry.py`
+- `<repo-root>/src/loom/tools/web.py`
+- `<repo-root>/src/loom/tools/web_search.py`
+- `<repo-root>/src/loom/processes/builtin/*.yaml`
+- `<repo-root>/tests/`
+- `<repo-root>/.github/workflows/`
 
 ## Research Findings (External)
 

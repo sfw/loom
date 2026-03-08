@@ -132,6 +132,11 @@ class ShortInterestAnalyzerTool(Tool):
     def timeout_seconds(self) -> int:
         return 75
 
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         operation = str(args.get("operation", "")).strip().lower()
         if operation not in _OPERATIONS:

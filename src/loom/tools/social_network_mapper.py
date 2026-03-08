@@ -108,6 +108,11 @@ class SocialNetworkMapperTool(Tool):
     def timeout_seconds(self) -> int:
         return 45
 
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         directed = bool(args.get("directed", False))
         formats = _normalize_formats(args.get("output_formats"))

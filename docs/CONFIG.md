@@ -88,6 +88,7 @@ Recommended two-model split:
 | `enable_sqlite_remediation_queue` | `bool` | `false` | Dual-write remediation queue and retry lineage to SQLite tables. |
 | `enable_durable_task_runner` | `bool` | `false` | Enables durable queued/running task run leasing and recovery. |
 | `enable_mutation_idempotency` | `bool` | `false` | Enables mutating-tool idempotency ledger dedupe. |
+| `sealed_artifact_post_call_guard` | `string` | `"warn"` | Defense-in-depth sealed-artifact post-call mutation guard (`off`, `warn`, `enforce`). |
 | `enable_slo_metrics` | `bool` | `false` | Enables `/slo` snapshot endpoint. |
 | `delegate_task_timeout_seconds` | `int` | `3600` | Timeout for delegated orchestration calls (`/run`, `delegate_task`). |
 | `model_call_max_attempts` | `int` | `5` | Max retry attempts for model invocation retry policy. |
@@ -248,6 +249,9 @@ For the full active/internals lifecycle catalog, see `docs/telemetry-catalog.md`
 - `task_budget_exhausted`
 - `task_plan_degraded`
 - `tool_call_deduplicated`
+- `sealed_policy_preflight_blocked`
+- `sealed_reseal_applied`
+- `sealed_unexpected_mutation_detected`
 - `task_run_acquired`
 - `task_run_heartbeat`
 - `task_run_recovered`

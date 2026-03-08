@@ -97,6 +97,11 @@ class SpreadsheetTool(Tool):
             "required": ["operation", "path"],
         }
 
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         if ctx.workspace is None:
             return ToolResult.fail("No workspace set")

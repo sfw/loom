@@ -113,7 +113,7 @@ Notes:
 
 ### Workstream A: Introspection Payload + Redaction Helpers
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/tui/app.py`
 
 Deliverables:
 1. Add helper methods for:
@@ -131,8 +131,8 @@ Acceptance:
 
 ### Workstream B: Slash Command and Palette Wiring
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/tui/commands.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/tui/commands.py`
 
 Deliverables:
 1. Add `/models` to `_SLASH_COMMANDS` and priority order.
@@ -148,8 +148,8 @@ Acceptance:
 
 ### Workstream C: Test Hardening
 Files:
-1. `/Users/sfw/Development/loom/tests/test_tui.py`
-2. `/Users/sfw/Development/loom/tests/test_tui_commands.py` (if palette entry added)
+1. `<repo-root>/tests/test_tui.py`
+2. `<repo-root>/tests/test_tui_commands.py` (if palette entry added)
 
 Deliverables:
 1. `/model` detailed output test includes provider/protocol/endpoint/model_id fields.
@@ -167,8 +167,8 @@ Acceptance:
 
 ### Workstream D: Docs and Operator Notes
 Files:
-1. `/Users/sfw/Development/loom/CHANGELOG.md`
-2. `/Users/sfw/Development/loom/README.md` (if slash command docs mention `/model`)
+1. `<repo-root>/CHANGELOG.md`
+2. `<repo-root>/README.md` (if slash command docs mention `/model`)
 
 Deliverables:
 1. Changelog entry for richer model introspection and new `/models`.

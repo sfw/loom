@@ -76,6 +76,7 @@ planner_degraded_mode = "allow" # allow | require_approval | deny
 enable_sqlite_remediation_queue = false
 enable_durable_task_runner = false
 enable_mutation_idempotency = false
+sealed_artifact_post_call_guard = "warn" # off | warn | enforce
 enable_slo_metrics = false
 cowork_tool_exposure_mode = "adaptive" # full | adaptive | hybrid
 cowork_memory_index_enabled = true

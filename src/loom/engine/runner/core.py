@@ -56,6 +56,7 @@ from .types import (
 from .types import SubtaskResultStatus as SubtaskResultStatus
 
 logger = logging.getLogger(__name__)
+MutationTargetArgKeys = tuple[str, ...] | list[str] | set[str] | frozenset[str] | None
 
 
 def _resolve_build_run_auth_context():
@@ -114,6 +115,7 @@ class SubtaskRunner:
     ENABLE_MODEL_OVERFLOW_FALLBACK = True
     EXECUTOR_COMPLETION_CONTRACT_MODE = "off"
     ENABLE_MUTATION_IDEMPOTENCY = False
+    SEALED_ARTIFACT_POST_CALL_GUARD = "warn"
     OVERFLOW_FALLBACK_TOOL_MESSAGE_MIN_CHARS = 4_000
     OVERFLOW_FALLBACK_TOOL_OUTPUT_EXCERPT_CHARS = 1_200
     _OVERFLOW_BINARY_CONTENT_KINDS = frozenset({
@@ -231,6 +233,7 @@ class SubtaskRunner:
             settings.artifact_telemetry_max_metadata_chars
         )
         self._enable_model_overflow_fallback = settings.enable_model_overflow_fallback
+        self._sealed_artifact_post_call_guard = settings.sealed_artifact_post_call_guard
         self._ingest_artifact_retention_max_age_days = (
             settings.ingest_artifact_retention_max_age_days
         )
@@ -630,6 +633,62 @@ class SubtaskRunner:
             data=data,
             counter_key=counter_key,
             counter_amount=counter_amount,
+        )
+
+    def _emit_sealed_policy_preflight_blocked(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        tool_name: str,
+        attempted_paths: list[str],
+        policy_error: str,
+    ) -> None:
+        runner_telemetry.emit_sealed_policy_preflight_blocked(
+            self,
+            task_id=task_id,
+            subtask_id=subtask_id,
+            tool_name=tool_name,
+            attempted_paths=attempted_paths,
+            policy_error=policy_error,
+        )
+
+    def _emit_sealed_reseal_applied(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        tool_name: str,
+        tool_call_id: str,
+        path_count: int,
+    ) -> None:
+        runner_telemetry.emit_sealed_reseal_applied(
+            self,
+            task_id=task_id,
+            subtask_id=subtask_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            path_count=path_count,
+        )
+
+    def _emit_sealed_unexpected_mutation_detected(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        tool_name: str,
+        tool_call_id: str,
+        mode: str,
+        unexpected_paths: list[str],
+    ) -> None:
+        runner_telemetry.emit_sealed_unexpected_mutation_detected(
+            self,
+            task_id=task_id,
+            subtask_id=subtask_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            mode=mode,
+            unexpected_paths=unexpected_paths,
         )
 
     @staticmethod
@@ -1074,6 +1133,11 @@ class SubtaskRunner:
         text = str(error or "").strip().lower()
         return "reason_code=forbidden_output_path" in text
 
+    @staticmethod
+    def _is_sealed_artifact_mutation_policy_error(error: str | None) -> bool:
+        text = str(error or "").strip().lower()
+        return text.startswith("sealed artifact mutation blocked:")
+
     def _emit_compactor_model_event(self, payload: dict) -> None:
         """Bridge semantic-compactor model events into task model_invocation events."""
         context = _COMPACTOR_EVENT_CONTEXT.get()
@@ -1166,10 +1230,17 @@ class SubtaskRunner:
         )
 
     @classmethod
-    def _is_mutating_file_tool(cls, tool_name: str, tool_args: dict) -> bool:
+    def _is_mutating_file_tool(
+        cls,
+        tool_name: str,
+        tool_args: dict,
+        *,
+        is_mutating_tool: bool = False,
+    ) -> bool:
         return runner_policy.is_mutating_file_tool(
             tool_name=tool_name,
             tool_args=tool_args,
+            is_mutating_tool=is_mutating_tool,
             write_mutating_tools=cls._WRITE_MUTATING_TOOLS,
             spreadsheet_write_operations=cls._SPREADSHEET_WRITE_OPERATIONS,
         )
@@ -1181,11 +1252,15 @@ class SubtaskRunner:
         tool_name: str,
         tool_args: dict,
         workspace: Path | None,
+        is_mutating_tool: bool = False,
+        mutation_target_arg_keys: MutationTargetArgKeys = None,
     ) -> list[str]:
         return runner_policy.target_paths_for_policy(
             tool_name=tool_name,
             tool_args=tool_args,
             workspace=workspace,
+            is_mutating_tool=is_mutating_tool,
+            mutation_target_arg_keys=mutation_target_arg_keys,
             is_mutating_file_tool_fn=cls._is_mutating_file_tool,
         )
 
@@ -1209,6 +1284,8 @@ class SubtaskRunner:
         tool_name: str,
         tool_args: dict,
         workspace: Path | None,
+        is_mutating_tool: bool = False,
+        mutation_target_arg_keys: MutationTargetArgKeys = None,
         expected_deliverables: list[str],
         forbidden_deliverables: list[str],
         allowed_output_prefixes: list[str],
@@ -1219,6 +1296,8 @@ class SubtaskRunner:
             tool_name=tool_name,
             tool_args=tool_args,
             workspace=workspace,
+            is_mutating_tool=is_mutating_tool,
+            mutation_target_arg_keys=mutation_target_arg_keys,
             expected_deliverables=expected_deliverables,
             forbidden_deliverables=forbidden_deliverables,
             allowed_output_prefixes=allowed_output_prefixes,
@@ -1350,6 +1429,8 @@ class SubtaskRunner:
         tool_name: str,
         tool_args: dict,
         workspace: Path | None,
+        is_mutating_tool: bool = False,
+        mutation_target_arg_keys: MutationTargetArgKeys = None,
         prior_successful_tool_calls: list[ToolCallRecord],
         current_tool_calls: list[ToolCallRecord],
     ) -> str | None:
@@ -1358,6 +1439,8 @@ class SubtaskRunner:
             tool_name=tool_name,
             tool_args=tool_args,
             workspace=workspace,
+            is_mutating_tool=is_mutating_tool,
+            mutation_target_arg_keys=mutation_target_arg_keys,
             prior_successful_tool_calls=prior_successful_tool_calls,
             current_tool_calls=current_tool_calls,
             target_paths_for_policy=cls._target_paths_for_policy,
@@ -1375,11 +1458,15 @@ class SubtaskRunner:
         tool_args: dict,
         workspace: Path | None,
         tool_result: ToolResult,
+        is_mutating_tool: bool = False,
+        mutation_target_arg_keys: MutationTargetArgKeys = None,
     ) -> list[str]:
         paths = cls._target_paths_for_policy(
             tool_name=tool_name,
             tool_args=tool_args,
             workspace=workspace,
+            is_mutating_tool=is_mutating_tool,
+            mutation_target_arg_keys=mutation_target_arg_keys,
         )
         seen = set(paths)
         for raw in tool_result.files_changed:
@@ -1399,6 +1486,8 @@ class SubtaskRunner:
         tool_name: str,
         tool_args: dict,
         tool_result: ToolResult,
+        is_mutating_tool: bool = False,
+        mutation_target_arg_keys: MutationTargetArgKeys = None,
         subtask_id: str,
         tool_call_id: str,
     ) -> int:
@@ -1408,6 +1497,8 @@ class SubtaskRunner:
             tool_name=tool_name,
             tool_args=tool_args,
             tool_result=tool_result,
+            is_mutating_tool=is_mutating_tool,
+            mutation_target_arg_keys=mutation_target_arg_keys,
             subtask_id=subtask_id,
             tool_call_id=tool_call_id,
             artifact_seal_registry=cls._artifact_seal_registry,
@@ -1415,6 +1506,58 @@ class SubtaskRunner:
             normalize_path_for_policy=cls._normalize_path_for_policy,
             seal_origin_is_verified=cls._seal_origin_is_verified,
         )
+
+    @classmethod
+    def _snapshot_tracked_artifact_hashes(
+        cls,
+        *,
+        task: Task,
+        workspace: Path | None,
+    ) -> dict[str, str]:
+        return runner_policy.snapshot_tracked_artifact_hashes(
+            task=task,
+            workspace=workspace,
+            artifact_seal_registry=cls._artifact_seal_registry,
+        )
+
+    @classmethod
+    def _unexpected_sealed_mutation_paths(
+        cls,
+        *,
+        task: Task,
+        workspace: Path | None,
+        tool_name: str,
+        tool_args: dict,
+        tool_result: ToolResult,
+        is_mutating_tool: bool,
+        mutation_target_arg_keys: MutationTargetArgKeys,
+        pre_call_hashes: dict[str, str],
+    ) -> list[str]:
+        return runner_policy.unexpected_sealed_mutation_paths(
+            task=task,
+            workspace=workspace,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            tool_result=tool_result,
+            is_mutating_tool=is_mutating_tool,
+            mutation_target_arg_keys=mutation_target_arg_keys,
+            pre_call_hashes=pre_call_hashes,
+            artifact_seal_registry=cls._artifact_seal_registry,
+            mutation_paths_for_reseal=cls._mutation_paths_for_reseal,
+            normalize_path_for_policy=cls._normalize_path_for_policy,
+        )
+
+    def _sealed_artifact_post_call_guard_mode(self) -> str:
+        mode = str(
+            getattr(
+                self,
+                "_sealed_artifact_post_call_guard",
+                self.SEALED_ARTIFACT_POST_CALL_GUARD,
+            ),
+        ).strip().lower()
+        if mode not in {"off", "warn", "enforce"}:
+            return self.SEALED_ARTIFACT_POST_CALL_GUARD
+        return mode
 
     def _tool_output_limit(self, tool_name: str) -> int:
         heavy_limit = int(

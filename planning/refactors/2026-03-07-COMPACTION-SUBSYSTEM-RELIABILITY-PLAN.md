@@ -99,9 +99,9 @@ Protection rules:
 
 ### Workstream 1: Request-Budget Preflight And First-Turn Fit
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/src/loom/models/request_diagnostics.py`
-3. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/src/loom/models/request_diagnostics.py`
+3. `<repo-root>/tests/test_orchestrator.py`
 
 ### Changes
 1. Add request preflight budget computation before each model call, including first iteration.
@@ -114,10 +114,10 @@ Protection rules:
 
 ### Workstream 2: Prompt/Schema De-Duplication
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/prompts/assembler.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-3. `/Users/sfw/Development/loom/tests/test_prompts.py`
-4. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
+1. `<repo-root>/src/loom/prompts/assembler.py`
+2. `<repo-root>/src/loom/engine/runner.py`
+3. `<repo-root>/tests/test_prompts.py`
+4. `<repo-root>/tests/test_orchestrator.py`
 
 ### Changes
 1. Change executor prompt tool section to concise listing mode by default in `budgeted` mode.
@@ -130,8 +130,8 @@ Protection rules:
 
 ### Workstream 3: Lane Classifier And Candidate Graph
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/tests/test_orchestrator.py`
 
 ### Changes
 1. Implement lane assignment (`instruction`, `active_write`, `source_evidence`, `tool_trace`, `historical_chat`, `schema_overhead`).
@@ -144,8 +144,8 @@ Protection rules:
 
 ### Workstream 4: Budgeted Operation Planner
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/tests/test_orchestrator.py`
 
 ### Changes
 1. Replace fixed stage pipeline with deficit-driven operation planner.
@@ -158,11 +158,11 @@ Protection rules:
 
 ### Workstream 5: Semantic Compactor Guardrails
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/semantic_compactor.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-3. `/Users/sfw/Development/loom/src/loom/config.py`
-4. `/Users/sfw/Development/loom/tests/test_semantic_compactor.py`
-5. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
+1. `<repo-root>/src/loom/engine/semantic_compactor.py`
+2. `<repo-root>/src/loom/engine/runner.py`
+3. `<repo-root>/src/loom/config.py`
+4. `<repo-root>/tests/test_semantic_compactor.py`
+5. `<repo-root>/tests/test_orchestrator.py`
 
 ### Changes
 1. Add compactor feasibility checks and per-label cooldown integration.
@@ -176,8 +176,8 @@ Protection rules:
 
 ### Workstream 6: Overflow Fallback Integration
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/tests/test_orchestrator.py`
 
 ### Changes
 1. Move overflow rewrite from purely reactive mode to preflight-capable operation when deficit remains.
@@ -190,13 +190,13 @@ Protection rules:
 
 ### Workstream 7: Config, Telemetry, And Operator Visibility
 ### Files
-1. `/Users/sfw/Development/loom/src/loom/config.py`
-2. `/Users/sfw/Development/loom/docs/CONFIG.md`
-3. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-4. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-5. `/Users/sfw/Development/loom/tests/test_config.py`
-6. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-7. `/Users/sfw/Development/loom/CHANGELOG.md`
+1. `<repo-root>/src/loom/config.py`
+2. `<repo-root>/docs/CONFIG.md`
+3. `<repo-root>/src/loom/engine/runner.py`
+4. `<repo-root>/src/loom/engine/orchestrator.py`
+5. `<repo-root>/tests/test_config.py`
+6. `<repo-root>/tests/test_orchestrator.py`
+7. `<repo-root>/CHANGELOG.md`
 
 ### Changes
 1. Add `budgeted` mode and minimal supporting knobs.

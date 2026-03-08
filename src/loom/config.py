@@ -247,6 +247,7 @@ class ExecutionConfig:
     enable_sqlite_remediation_queue: bool = False
     enable_durable_task_runner: bool = False
     enable_mutation_idempotency: bool = False
+    sealed_artifact_post_call_guard: str = "warn"  # off | warn | enforce
     enable_slo_metrics: bool = False
     delegate_task_timeout_seconds: int = 3600
     ask_user_v2_enabled: bool = True
@@ -910,6 +911,12 @@ def load_config(path: Path | None = None) -> Config:
             "enable_mutation_idempotency",
             ExecutionConfig.enable_mutation_idempotency,
         ),
+        sealed_artifact_post_call_guard=str(
+            exec_data.get(
+                "sealed_artifact_post_call_guard",
+                ExecutionConfig.sealed_artifact_post_call_guard,
+            ),
+        ).strip().lower(),
         enable_slo_metrics=_bool_from(
             exec_data,
             "enable_slo_metrics",
@@ -1068,6 +1075,11 @@ def load_config(path: Path | None = None) -> Config:
     completion_mode = execution.executor_completion_contract_mode
     if completion_mode not in {"off", "warn", "enforce"}:
         completion_mode = ExecutionConfig.executor_completion_contract_mode
+    sealed_artifact_post_call_guard = str(
+        execution.sealed_artifact_post_call_guard or "",
+    ).strip().lower()
+    if sealed_artifact_post_call_guard not in {"off", "warn", "enforce"}:
+        sealed_artifact_post_call_guard = ExecutionConfig.sealed_artifact_post_call_guard
     planner_mode = execution.planner_degraded_mode
     if planner_mode not in {"allow", "require_approval", "deny"}:
         planner_mode = ExecutionConfig.planner_degraded_mode
@@ -1116,6 +1128,7 @@ def load_config(path: Path | None = None) -> Config:
         **{
             **execution.__dict__,
             "executor_completion_contract_mode": completion_mode,
+            "sealed_artifact_post_call_guard": sealed_artifact_post_call_guard,
             "planner_degraded_mode": planner_mode,
             "cowork_tool_exposure_mode": cowork_tool_exposure_mode,
             "cowork_memory_index_queue_max_batches": cowork_memory_index_queue_max_batches,

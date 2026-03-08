@@ -76,8 +76,8 @@ Event-specific payload remains allowed, but required common keys should be norma
 
 ## Workstream 1: Event Catalog Hardening
 Files:
-1. `/Users/sfw/Development/loom/src/loom/events/types.py`
-2. `/Users/sfw/Development/loom/docs/` (new telemetry catalog doc)
+1. `<repo-root>/src/loom/events/types.py`
+2. `<repo-root>/docs/` (new telemetry catalog doc)
 
 Tasks:
 1. Add lifecycle annotations for each event (`active`, `deprecated`, `internal_only` if needed).
@@ -90,10 +90,10 @@ Acceptance:
 
 ## Workstream 2: Runtime Gap Closure
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-3. `/Users/sfw/Development/loom/src/loom/recovery/` (and steering path)
-4. `/Users/sfw/Development/loom/src/loom/api/routes.py` (task creation path if needed)
+1. `<repo-root>/src/loom/engine/orchestrator.py`
+2. `<repo-root>/src/loom/engine/verification.py`
+3. `<repo-root>/src/loom/recovery/` (and steering path)
+4. `<repo-root>/src/loom/api/routes.py` (task creation path if needed)
 
 Tasks:
 1. Implement missing active lifecycle emissions (`TASK_CREATED`, `SUBTASK_BLOCKED`, verification lifecycle trio, steering).
@@ -106,9 +106,9 @@ Acceptance:
 
 ## Workstream 3: Payload Schema Validation
 Files:
-1. `/Users/sfw/Development/loom/src/loom/events/bus.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/*` emit helpers
-3. `/Users/sfw/Development/loom/tests/` schema tests
+1. `<repo-root>/src/loom/events/bus.py`
+2. `<repo-root>/src/loom/engine/*` emit helpers
+3. `<repo-root>/tests/` schema tests
 
 Tasks:
 1. Add lightweight event payload validation helper used by emit wrappers.
@@ -121,13 +121,13 @@ Acceptance:
 
 ## Workstream 4: Completeness Test Matrix
 Files:
-1. `/Users/sfw/Development/loom/tests/test_events.py`
-2. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-3. `/Users/sfw/Development/loom/tests/test_verification.py`
-4. `/Users/sfw/Development/loom/tests/test_approval.py`
-5. `/Users/sfw/Development/loom/tests/test_questions.py`
-6. `/Users/sfw/Development/loom/tests/test_api.py`
-7. `/Users/sfw/Development/loom/tests/test_tui.py` (as needed)
+1. `<repo-root>/tests/test_events.py`
+2. `<repo-root>/tests/test_orchestrator.py`
+3. `<repo-root>/tests/test_verification.py`
+4. `<repo-root>/tests/test_approval.py`
+5. `<repo-root>/tests/test_questions.py`
+6. `<repo-root>/tests/test_api.py`
+7. `<repo-root>/tests/test_tui.py` (as needed)
 
 Tasks:
 1. Add/expand tests so every active event type is asserted at least once.
@@ -140,8 +140,8 @@ Acceptance:
 
 ## Workstream 5: CI Guardrails and Drift Prevention
 Files:
-1. `/Users/sfw/Development/loom/scripts/` (new telemetry audit script)
-2. `/Users/sfw/Development/loom/.github/workflows/ci.yml`
+1. `<repo-root>/scripts/` (new telemetry audit script)
+2. `<repo-root>/.github/workflows/ci.yml`
 
 Tasks:
 1. Add script to compare:
@@ -157,9 +157,9 @@ Acceptance:
 
 ## Workstream 6: Audit-Focused Run Summaries
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-2. `/Users/sfw/Development/loom/src/loom/events/` summary utilities
-3. `/Users/sfw/Development/loom/docs/`
+1. `<repo-root>/src/loom/engine/orchestrator.py`
+2. `<repo-root>/src/loom/events/` summary utilities
+3. `<repo-root>/docs/`
 
 Tasks:
 1. Expand run-summary payloads to include:
@@ -175,10 +175,10 @@ Acceptance:
 
 ## Workstream 7: Transport and Persistence Integrity
 Files:
-1. `/Users/sfw/Development/loom/src/loom/events/bus.py`
-2. `/Users/sfw/Development/loom/src/loom/state/memory.py`
-3. `/Users/sfw/Development/loom/src/loom/state/schema.sql`
-4. `/Users/sfw/Development/loom/src/loom/api/engine.py`
+1. `<repo-root>/src/loom/events/bus.py`
+2. `<repo-root>/src/loom/state/memory.py`
+3. `<repo-root>/src/loom/state/schema.sql`
+4. `<repo-root>/src/loom/api/engine.py`
 
 Tasks:
 1. Persist emitted event timestamp (UTC) rather than generating a second persistence timestamp.
@@ -194,11 +194,11 @@ Acceptance:
 
 ## Workstream 8: Consumer Surface Parity
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tools/delegate_task.py`
-2. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-3. `/Users/sfw/Development/loom/docs/agent-integration.md`
-4. `/Users/sfw/Development/loom/docs/tutorial.html`
-5. `/Users/sfw/Development/loom/docs/CONFIG.md`
+1. `<repo-root>/src/loom/tools/delegate_task.py`
+2. `<repo-root>/src/loom/tui/app.py`
+3. `<repo-root>/docs/agent-integration.md`
+4. `<repo-root>/docs/tutorial.html`
+5. `<repo-root>/docs/CONFIG.md`
 
 Tasks:
 1. Expand delegate event subscription/forwarding coverage to include the active event catalog (or a documented subset policy).
@@ -213,11 +213,11 @@ Acceptance:
 
 ## Workstream 9: Control-Plane and Cowork Telemetry Normalization
 Files:
-1. `/Users/sfw/Development/loom/src/loom/events/types.py`
-2. `/Users/sfw/Development/loom/src/loom/api/routes.py`
-3. `/Users/sfw/Development/loom/src/loom/tools/delegate_task.py`
-4. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-5. `/Users/sfw/Development/loom/src/loom/state/conversation_store.py`
+1. `<repo-root>/src/loom/events/types.py`
+2. `<repo-root>/src/loom/api/routes.py`
+3. `<repo-root>/src/loom/tools/delegate_task.py`
+4. `<repo-root>/src/loom/tui/app.py`
+5. `<repo-root>/src/loom/state/conversation_store.py`
 
 Tasks:
 1. Decide canonical status for control events currently outside typed catalog (`task_paused`, `task_resumed`, `task_injected`, `task_cancel_requested`, `task_cancel_ack`, `task_cancel_timeout`, `steer_*`).
@@ -232,9 +232,9 @@ Acceptance:
 
 ## Workstream 10: Webhook Delivery Telemetry
 Files:
-1. `/Users/sfw/Development/loom/src/loom/events/webhook.py`
-2. `/Users/sfw/Development/loom/src/loom/events/types.py`
-3. `/Users/sfw/Development/loom/tests/test_webhook.py`
+1. `<repo-root>/src/loom/events/webhook.py`
+2. `<repo-root>/src/loom/events/types.py`
+3. `<repo-root>/tests/test_webhook.py`
 
 Tasks:
 1. Add webhook delivery lifecycle telemetry (`attempted`, `succeeded`, `failed`, `dropped/unregistered`) with bounded metadata.

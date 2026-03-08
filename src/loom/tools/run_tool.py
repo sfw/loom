@@ -79,6 +79,11 @@ class RunToolTool(Tool):
     ) -> None:
         self._dispatcher = dispatcher
 
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         if self._dispatcher is None:
             return ToolResult.fail("run_tool is unavailable (dispatcher not bound).")

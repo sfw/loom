@@ -263,7 +263,7 @@ Claude Code (thinking): Complex multi-step task — I'll delegate to Loom.
 
 → loom_execute_task(
     goal="Migrate Express app from JavaScript to TypeScript",
-    workspace="/Users/dev/express-app",
+    workspace="/path/to/express-app",
     approval_mode="auto"
   )
 

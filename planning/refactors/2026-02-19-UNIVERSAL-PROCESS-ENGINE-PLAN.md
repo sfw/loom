@@ -17,12 +17,12 @@ Hard requirement:
 5. Base prompt templates stay generic; process-specific instructions are injected from YAML.
 
 ## Current Violations to Eliminate
-1. Domain-specific evidence inference in core: `/Users/sfw/Development/loom/src/loom/state/evidence.py`
-2. Domain-specific evidence snapshot formatting and policy enforcement in verifier core: `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-3. Domain-specific retry targeting fields and parsing: `/Users/sfw/Development/loom/src/loom/recovery/retry.py`
-4. Hardcoded synthesis/remediation phrasing in orchestrator: `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-5. Domain-specific verifier template constraints: `/Users/sfw/Development/loom/src/loom/prompts/templates/verifier.yaml`
-6. Domain keyword heuristics for evidence contract activation: `/Users/sfw/Development/loom/src/loom/prompts/assembler.py`
+1. Domain-specific evidence inference in core: `<repo-root>/src/loom/state/evidence.py`
+2. Domain-specific evidence snapshot formatting and policy enforcement in verifier core: `<repo-root>/src/loom/engine/verification.py`
+3. Domain-specific retry targeting fields and parsing: `<repo-root>/src/loom/recovery/retry.py`
+4. Hardcoded synthesis/remediation phrasing in orchestrator: `<repo-root>/src/loom/engine/orchestrator.py`
+5. Domain-specific verifier template constraints: `<repo-root>/src/loom/prompts/templates/verifier.yaml`
+6. Domain keyword heuristics for evidence contract activation: `<repo-root>/src/loom/prompts/assembler.py`
 
 ## Target End State
 Core engine responsibilities:
@@ -92,8 +92,8 @@ Scope:
 3. Build process-driven extractor using YAML mappings and optional LLM assist.
 
 Files:
-1. `/Users/sfw/Development/loom/src/loom/state/evidence.py`
-2. `/Users/sfw/Development/loom/src/loom/processes/schema.py`
+1. `<repo-root>/src/loom/state/evidence.py`
+2. `<repo-root>/src/loom/processes/schema.py`
 
 Exit criteria:
 1. Core evidence code references no process-domain terms.
@@ -107,9 +107,9 @@ Scope:
 4. Preserve tiering/voting framework but make content policy YAML-driven.
 
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-2. `/Users/sfw/Development/loom/src/loom/prompts/templates/verifier.yaml`
-3. `/Users/sfw/Development/loom/src/loom/prompts/assembler.py`
+1. `<repo-root>/src/loom/engine/verification.py`
+2. `<repo-root>/src/loom/prompts/templates/verifier.yaml`
+3. `<repo-root>/src/loom/prompts/assembler.py`
 
 Exit criteria:
 1. No process-specific rule text in verifier core.
@@ -124,8 +124,8 @@ Scope:
 4. Process YAML defines strategy mapping.
 
 Files:
-1. `/Users/sfw/Development/loom/src/loom/recovery/retry.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
+1. `<repo-root>/src/loom/recovery/retry.py`
+2. `<repo-root>/src/loom/engine/orchestrator.py`
 
 Exit criteria:
 1. Retry manager has no domain-specific parsing patterns.
@@ -138,8 +138,8 @@ Scope:
 3. Remove keyword heuristics for evidence contract triggers; use explicit process flags/rules.
 
 Files:
-1. `/Users/sfw/Development/loom/src/loom/prompts/assembler.py`
-2. `/Users/sfw/Development/loom/src/loom/prompts/templates/verifier.yaml`
+1. `<repo-root>/src/loom/prompts/assembler.py`
+2. `<repo-root>/src/loom/prompts/templates/verifier.yaml`
 
 Exit criteria:
 1. Domain behavior in prompts comes exclusively from loaded process definition.
@@ -151,8 +151,8 @@ Scope:
 3. Provide compatibility adapter for legacy v1 process files.
 
 Files:
-1. `/Users/sfw/Development/loom/src/loom/processes/schema.py`
-2. `/Users/sfw/Development/loom/src/loom/config.py`
+1. `<repo-root>/src/loom/processes/schema.py`
+2. `<repo-root>/src/loom/config.py`
 
 Exit criteria:
 1. Invalid process contracts fail fast with actionable errors.
@@ -165,8 +165,8 @@ Scope:
 3. Encode prior behavior as data, not code.
 
 Files:
-1. `/Users/sfw/Development/loom/src/loom/processes/builtin/*.yaml`
-2. `/Users/sfw/Development/loom/src/loom/processes/schema.py` (compat adapter + migration validation)
+1. `<repo-root>/src/loom/processes/builtin/*.yaml`
+2. `<repo-root>/src/loom/processes/schema.py` (compat adapter + migration validation)
 
 Exit criteria:
 1. All built-ins run without relying on legacy hardcoded core semantics.
@@ -180,9 +180,9 @@ Scope:
 4. Update examples to show how process-specific behavior is declared in YAML (not core code).
 
 Files:
-1. `/Users/sfw/Development/loom/docs/creating-packages.md`
-2. `/Users/sfw/Development/loom/docs/agent-integration.md`
-3. `/Users/sfw/Development/loom/README.md`
+1. `<repo-root>/docs/creating-packages.md`
+2. `<repo-root>/docs/agent-integration.md`
+3. `<repo-root>/README.md`
 
 Exit criteria:
 1. Process author docs and examples match the shipped v2 schema.
@@ -252,11 +252,11 @@ Exit criteria:
 
 ### Regression/Guard Tests
 1. Add grep-based guard tests against domain hardcoding in core files:
-   - `/Users/sfw/Development/loom/src/loom/state/evidence.py`
-   - `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-   - `/Users/sfw/Development/loom/src/loom/recovery/retry.py`
-   - `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-   - `/Users/sfw/Development/loom/src/loom/prompts/templates/verifier.yaml`
+   - `<repo-root>/src/loom/state/evidence.py`
+   - `<repo-root>/src/loom/engine/verification.py`
+   - `<repo-root>/src/loom/recovery/retry.py`
+   - `<repo-root>/src/loom/engine/orchestrator.py`
+   - `<repo-root>/src/loom/prompts/templates/verifier.yaml`
 2. Golden tests for verification outcomes under v2 policies.
 3. Shadow-diff thresholds before cutover.
 
