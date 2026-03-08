@@ -20,13 +20,15 @@ It handles coding, research, document analysis (PDF, Word docs, PowerPoint decks
 
 Loom also exposes a REST API and an MCP server built for agentic systems. Orchestrators like OpenClaw can call Loom's REST endpoints -- or connect via the Model Context Protocol -- to offload complex multi-step tasks: decomposition, tool calling, verification, and memory. Instead of hoping a single LLM call handles a 15-step workflow, hand it to Loom and let the harness drive. The MCP integration also means any MCP-compatible agent or IDE can use Loom as a tool provider out of the box.
 
+![Loom Fruitflies](docs/images/loom3.png)
+
 ## Why Loom Exists
 
-LLMs are phenomenal at answering a single, well-formed question. Give them a bounded task, and they can produce remarkably strong results.
+LLMs are insanely powerful in small bursts, but they lack the framework to handle larger problems. They’re the fruit flies of the tech world: a 20-second memory with a 180 IQ. You get moments of brilliance, followed immediately by senility.
 
-But real work is rarely a single question. It is a chain of decisions, dependencies, checks, and revisions. In that setting, even strong models can drift: they skip steps, lose context, or confidently invent details. The problem is not intelligence. The problem is process.
+Context windows fill fast. They crush details to make room until they forget what they’re even working on. Eventually, they get so lost they’ll happily declare "DONE!" after finishing step one of a 100-step problem, simply because the other 99 steps were compacted away two cycles ago.
 
-Loom exists to provide that process.
+Loom weaves those flashes of brilliance together. It’s an engineering fix for the LLM’s biggest pain point, using a dedicated system of execution, verification, and replanning to actually see a task through to the end.
 
 Loom breaks complex work into smaller, solvable units, runs them in sequence, and verifies each result before moving forward. That lets you use model intelligence where it is strongest while reducing hallucinations, compounding errors, and dead-end reasoning.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -24,6 +25,7 @@ from loom.events.types import (
     REMEDIATION_RESOLVED,
     REMEDIATION_STARTED,
     REMEDIATION_TERMINAL,
+    SEALED_RESEAL_APPLIED,
     SUBTASK_RETRYING,
     UNCONFIRMED_DATA_QUEUED,
 )
@@ -1327,6 +1329,80 @@ def _summarize_placeholder_resolution_state(
         "scanned_file_count": int(scanned_file_count),
     }
 
+
+def _reseal_placeholder_prepass_mutations(
+    orchestrator,
+    *,
+    task: Task,
+    subtask: Subtask,
+    workspace: Path,
+    files_modified: list[str],
+) -> dict[str, object]:
+    if not files_modified:
+        return {"resealed_count": 0, "resealed_paths": []}
+
+    seals = orchestrator._artifact_seal_registry(task)
+    if not isinstance(seals, dict):
+        return {"resealed_count": 0, "resealed_paths": []}
+
+    run_id = ""
+    try:
+        run_id = str(orchestrator._task_run_id(task) or "")
+    except Exception:
+        run_id = ""
+    sealed_at = datetime.now().isoformat()
+    resealed_paths: list[str] = []
+    seen: set[str] = set()
+
+    for raw in files_modified:
+        rel_path = orchestrator_validity.normalize_workspace_relpath(
+            workspace,
+            str(raw or ""),
+        )
+        if not rel_path or rel_path in seen:
+            continue
+        seen.add(rel_path)
+        if orchestrator._is_intermediate_artifact_path(task=task, relpath=rel_path):
+            continue
+        path = (workspace / rel_path).resolve(strict=False)
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            continue
+        sha256 = hashlib.sha256(payload).hexdigest()
+        previous = seals.get(rel_path)
+        previous_dict = previous if isinstance(previous, dict) else {}
+        previous_sha = str(previous_dict.get("sha256", "") or "").strip()
+
+        next_seal = dict(previous_dict)
+        next_seal.update({
+            "path": rel_path,
+            "sha256": sha256,
+            "size_bytes": len(payload),
+            "tool": "deterministic_placeholder_prepass",
+            "tool_call_id": "",
+            "subtask_id": subtask.id,
+            "run_id": run_id,
+            "sealed_at": sealed_at,
+            "resealed_after_mutation": True,
+            "resealed_reason": "deterministic_placeholder_prepass",
+        })
+        if previous_sha and previous_sha != sha256:
+            next_seal["previous_sha256"] = previous_sha
+        else:
+            next_seal.pop("previous_sha256", None)
+        seals[rel_path] = next_seal
+        resealed_paths.append(rel_path)
+
+    if resealed_paths:
+        task.metadata["artifact_seals"] = seals
+    return {
+        "resealed_count": len(resealed_paths),
+        "resealed_paths": resealed_paths,
+    }
+
 async def _run_deterministic_placeholder_prepass(
     self,
     *,
@@ -1450,6 +1526,27 @@ async def _run_deterministic_placeholder_prepass(
         "files_modified": files_modified[:40],
         "actions": outcome.get("actions", [])[:120],
     }
+    if applied_count > 0 and files_modified:
+        reseal_result = _reseal_placeholder_prepass_mutations(
+            self,
+            task=task,
+            subtask=subtask,
+            workspace=workspace,
+            files_modified=files_modified,
+        )
+        resealed_count = int(reseal_result.get("resealed_count", 0) or 0)
+        resealed_paths = reseal_result.get("resealed_paths", [])
+        if not isinstance(resealed_paths, list):
+            resealed_paths = []
+        details["resealed_count"] = resealed_count
+        details["resealed_paths"] = resealed_paths[:40]
+        if resealed_count > 0:
+            self._emit(SEALED_RESEAL_APPLIED, task.id, {
+                "subtask_id": subtask.id,
+                "tool": "deterministic_placeholder_prepass",
+                "tool_call_id": "",
+                "path_count": resealed_count,
+            })
     if applied_count > 0:
         self._emit(PLACEHOLDER_PRUNED, task.id, {
             "subtask_id": subtask.id,
