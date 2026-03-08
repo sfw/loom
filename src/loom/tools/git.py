@@ -84,6 +84,10 @@ class GitCommandTool(Tool):
     def timeout_seconds(self) -> int:
         return 60
 
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         git_args: list[str] = args.get("args", [])
         if not git_args:

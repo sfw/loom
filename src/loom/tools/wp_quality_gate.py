@@ -48,6 +48,10 @@ class WpQualityGateTool(Tool):
         self._enabled = bool(enabled)
 
     @property
+    def is_mutating(self) -> bool:
+        return True
+
+    @property
     def timeout_seconds(self) -> int:
         return 600
 
