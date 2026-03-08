@@ -28,7 +28,7 @@ LLMs are insanely powerful in small bursts, but they lack the framework to handl
 
 Context windows fill fast. They crush details to make room until they forget what they’re even working on. Eventually, they get so lost they’ll happily declare "DONE!" after finishing step one of a 100-step problem, simply because the other 99 steps were compacted away two cycles ago.
 
-Loom uses those flashes of brilliance to build and drive a real plan. It’s an engineering fix for the LLM’s biggest pain point, using a dedicated system of execution, verification, and replanning to actually see a task through to the end.
+Loom weaves those flashes of brilliance together. It’s an engineering fix for the LLM’s biggest pain point, using a dedicated system of execution, verification, and replanning to actually see a task through to the end.
 
 Loom breaks complex work into smaller, solvable units, runs them in sequence, and verifies each result before moving forward. That lets you use model intelligence where it is strongest while reducing hallucinations, compounding errors, and dead-end reasoning.
 
