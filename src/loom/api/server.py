@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from loom import __version__
 from loom.config import Config
 
 
@@ -38,7 +39,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app = FastAPI(
         title="Loom",
         description="Local model orchestration engine",
-        version="0.1.0",
+        version=__version__,
         lifespan=lifespan,
     )
 

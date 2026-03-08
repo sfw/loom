@@ -42,6 +42,9 @@ jobs:
       - name: Check DB schema migration policy
         if: matrix.python-version == '3.12'
         run: uv run python scripts/check_db_migration_policy.py
+      - name: Check version consistency
+        if: matrix.python-version == '3.12'
+        run: uv run python scripts/check_version_consistency.py
       - name: Run tests
         run: uv run pytest -v --tb=short
       - name: Run tests with coverage
