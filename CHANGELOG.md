@@ -7,10 +7,13 @@ This changelog is generated directly from git commit history (non-merge commits)
 ## [Unreleased]
 
 - 2026-03-07 `7d66e79` Fix regressions from sealed artifact policy refactor
-- 2026-03-08 Normalize package version authority to `pyproject.toml` and bump to `0.2.0`
-- 2026-03-08 Replace hardcoded runtime version literals with shared `loom.__version__` usage
-- 2026-03-08 Add version consistency guardrails (`scripts/check_version_consistency.py`, CI check, and tests)
-- 2026-03-08 Update release-facing docs/examples for `0.2.0` (`README.md`, `INSTALL.md`, `docs/tutorial.html`)
+
+## [0.2.0] - 2026-03-08
+
+- Normalize package version authority to `pyproject.toml` and bump to `0.2.0`
+- Replace hardcoded runtime version literals with shared `loom.__version__` usage
+- Add version consistency guardrails (`scripts/check_version_consistency.py`, CI check, and tests)
+- Update release-facing docs/examples for `0.2.0` (`README.md`, `INSTALL.md`, `docs/tutorial.html`)
 
 ## [History]
 
