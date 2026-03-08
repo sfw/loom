@@ -2,308 +2,356 @@
 
 All notable changes to Loom are documented in this file.
 
+This changelog is generated directly from git commit history (non-merge commits) to keep entries accurate and auditable.
+
 ## [Unreleased]
 
-### Added
-- **Core engine split parity suites** (`tests/test_engine_import_contracts.py`, `tests/test_semantic_compactor_events.py`, `tests/test_orchestrator_remediation.py`, `tests/test_orchestrator_event_ordering.py`, `tests/test_runner_*`, `tests/test_verification_*`, `tests/test_orchestrator_*`) -- added focused import/smoke and subsystem parity coverage for module->package extraction work across semantic compactor, runner, verification, and orchestrator internals.
-- **Versioned SQLite schema migration subsystem + DB CLI** (`state/migrations/*`, `state/memory.py`, `__main__.py`, `scripts/check_db_migration_policy.py`, `.github/workflows/ci.yml`, `tests/test_memory.py`, `tests/test_cli.py`, `tests/test_tui.py`, `docs/DB-MIGRATIONS.md`) -- introduced ordered migration registry/runner with `schema_migrations` metadata, startup schema verification, explicit transaction locking/rollback during migration apply, migration diagnostics events, `loom db status|migrate|doctor|backup` operator commands (including SQLite online backup API), explicit `--ephemeral` opt-in fallback semantics, CI schema-policy enforcement checks, and legacy-upgrade regression tests.
-- **Durable ask-user clarification runtime for orchestrated runs** (`recovery/questions.py`, `state/schema.sql`, `state/memory.py`, `engine/runner.py`, `engine/orchestrator.py`, `api/engine.py`, `api/routes.py`, `api/schemas.py`, `events/types.py`, `tools/delegate_task.py`, `tui/app.py`, `tui/screens/ask_user.py`, `tests/test_questions.py`, `tests/test_api.py`, `tests/test_tui.py`) -- added persisted `task_questions` lifecycle state, `QuestionManager` wait/resolve flow, ask-user event lifecycle (`requested/answered/timeout/cancelled`), `/run` interactive question answering, and API question list/answer endpoints for TUI-surface tasks.
-- **Tool execution-surface declarations for runtime gating** (`tools/registry.py`, `tools/ask_user.py`, `tools/list_tools.py`, `cowork/session.py`, `api/routes.py`, `api/schemas.py`, `tests/test_tools.py`, `tests/test_hybrid_tools.py`, `tests/test_api.py`) -- tools can now declare valid execution surfaces (`tui`, `api`, `cli`) with schema exposure and runtime enforcement.
-- **Rich model introspection slash commands in TUI** (`tui/app.py`, `tui/commands.py`, `tests/test_tui.py`, `tests/test_tui_commands.py`) -- `/model` now renders detailed active model metadata (provider, protocol, endpoint, model ID, roles, tier, and capabilities) with secret-safe redaction, and new `/models` lists all configured model aliases with active-marker/ambiguity/runtime-only handling. Slash hints/completion and the command palette now include the model catalog action.
-- **Live cowork delegate progress surfaces + realtime refresh controls** (`tui/app.py`, `tui/widgets/chat_log.py`, `tui/widgets/tool_call.py`, `tui/widgets/sidebar.py`, `cowork/session.py`, `engine/runner.py`, `config.py`, `loom.toml.example`, `docs/CONFIG.md`, `tests/test_tui.py`, `tests/test_cowork.py`, `tests/test_orchestrator.py`, `tests/test_config.py`) -- cowork `delegate_task` calls now stream live progress into sidebar summaries and collapsed chat sections keyed by `tool_call_id`; tool-completion file changes now land immediately in the Files panel; workspace tree refresh is now debounced/polled for external edits; and new `[tui]` knobs control refresh cadence, stream flush interval, and bounded UI buffers.
-- **Resumable chat transcript replay in TUI sessions** (`state/schema.sql`, `state/conversation_store.py`, `tui/app.py`, `config.py`, `tests/test_conversation_store.py`, `tests/test_tui.py`) -- added persisted cowork chat event journal (`cowork_chat_events`) with legacy synthesis fallback from `conversation_turns`, wired startup/session-switch chat hydration, added `/history [older]` paging, and introduced `[tui]` config knobs for resume page size/render caps/journal fallback policy.
-- **Universal process contract v2 primitives** (`processes/schema.py`, `config.py`) -- added `schema_version: 2` support with explicit `verification.policy`, `verification.remediation`, `evidence`, and `prompt_contracts` blocks, plus optional strict config gate `process.require_v2_contract`.
-- **v1 compatibility sunset milestone** (`README.md`, `docs/creating-packages.md`, `docs/agent-integration.md`) -- documented the contract-v1 compatibility removal target date of June 30, 2026 so process authors can plan migration windows explicitly.
-- **Configurable delegated process timeout** (`config.py`, `tools/__init__.py`, `tools/delegate_task.py`) -- added `[execution].delegate_task_timeout_seconds` so `/run`/`delegate_task` timeout is configurable from `loom.toml` (with `LOOM_DELEGATE_TIMEOUT_SECONDS` retained as an env override).
-- **Setup/default config timeout parity + config reference docs** (`setup.py`, `loom.toml.example`, `README.md`, `INSTALL.md`, `docs/agent-integration.md`, `docs/tutorial.html`, `docs/CONFIG.md`) -- setup-generated config and primary docs/examples now include `delegate_task_timeout_seconds = 3600`; added full config reference documentation and synchronized timeout troubleshooting guidance.
-- **Generic evidence facet model** (`state/evidence.py`) -- evidence records now use `facets` as the primary schema surface, with process-driven hints/mappings and facet-oriented summaries.
-- **Universal core hardcoding guards + verification golden corpus** (`tests/test_universal_engine_guards.py`, `tests/test_verification_golden.py`) -- added regression guards for forbidden domain-specific strings in core runtime modules and replay tests for shadow-diff/retry-policy expectations under contract-v2 verification behavior.
-- **Tree-sitter code analysis** (`tools/treesitter.py`) -- optional syntax-tree-based backend for `analyze_code` and `edit_file` structural matching. Uses `tree-sitter-language-pack` when installed, falls back silently to regex extractors. Supports Python, JavaScript/TypeScript, Go, and Rust. Provides accurate class/function extraction including nested definitions, decorators, and doc-strings. Also used by `edit_file` to find structural candidates for fuzzy matching. Install with `uv sync --extra treesitter`.
-- **Adaptive Learning Memory (ALM)** (`learning/reflection.py`) -- behavioral pattern extraction via task completion gap analysis. Detects the gap between what the model delivered and what the user actually wanted. Extracts general behavioral rules ("run tests after writing code") from implicit follow-ups ("test and lint it") and explicit corrections ("no, use JSON"). Patterns are frequency-weighted and injected into future system prompts. No regex -- gaps are structural, not lexical.
-- **`loom learned` CLI command** (`__main__.py`) -- review, filter, and delete learned patterns from the terminal. Supports `--type` filtering, `--delete ID` for removal, and `--limit` for output control.
-- **`/learned` TUI slash command** (`tui/app.py`, `tui/screens/learned.py`) -- interactive modal for reviewing and deleting learned patterns. Shows pattern type, description, frequency, last seen date, and per-row delete buttons. Added to `/help` output.
-- **`LearningManager.delete_pattern()`** (`learning/manager.py`) -- delete individual learned patterns by ID. Enables selective curation of the learning database.
-- **`LearningManager.query_all()`** (`learning/manager.py`) -- query all patterns regardless of type, for use by review interfaces.
-- **Word and PowerPoint document support** (`tools/file_ops.py`, `content_utils.py`) -- `read_file` now extracts text from `.docx`/`.doc` and `.pptx`/`.ppt` files using `python-docx` and `python-pptx`. Returns a `DocumentBlock` with extracted text for all model providers. Both libraries are required dependencies (not optional).
-- **Process test harness and CLI runner** (`processes/testing.py`, `__main__.py`, `tests/test_process_testing.py`) -- added deterministic/live process case execution, default smoke-case generation, case filtering, acceptance checks, and `loom process test <name-or-path> [--live] [--case <id>]`.
-- **Built-in deterministic process contract suite** (`tests/test_process_contracts.py`) -- each shipped process now has deterministic contract coverage via `pytest` marker `process_contract`.
-- **Live process canary suite and workflow** (`tests/test_process_live.py`, `.github/workflows/process-canary.yml`) -- added opt-in live tests (`process_live`) plus nightly/manual artifacted workflow (JUnit, logs, per-process JSON summaries).
-- **MCP tool bridge for processes and runtime tools** (`integrations/mcp_tools.py`, `config.py`, `tools/__init__.py`, `tests/test_mcp_tools_bridge.py`) -- Loom now discovers external MCP tools from config and registers them as namespaced tools (`mcp.<server>.<tool>`), enabling process `tools.required` checks against MCP-backed capabilities.
-- **Dedicated MCP config manager** (`mcp/config.py`, `mcp/__init__.py`, `tests/test_mcp_config_manager.py`) -- added shared MCP load/merge/mutate backend with layered precedence (`--mcp-config` > workspace `./.loom/mcp.toml` > user `~/.loom/mcp.toml` > legacy `[mcp]`), atomic writes, redaction helpers, and legacy migration support.
-- **`loom mcp` command group** (`__main__.py`, `tests/test_cli.py`) -- new MCP lifecycle commands: `list`, `show`, `add`, `edit`, `remove`, `enable`, `disable`, `test`, and `migrate`.
-- **TUI `/mcp` command family** (`tui/app.py`, `tests/test_tui.py`) -- added MCP list/show/test/enable/disable/remove controls in-session, with immediate MCP tool refresh after successful mutations.
+- 2026-03-07 `7d66e79` Fix regressions from sealed artifact policy refactor
 
-### Changed
-- **Sealed-artifact mutation policy unification across workspace-writing tools** (`engine/runner/*`, `engine/orchestrator/*`, `state/evidence.py`, `tools/*.py`, `events/types.py`, `config.py`, `docs/CONFIG.md`, `loom.toml.example`, `tests/test_orchestrator_evidence.py`) -- preflight sealed-evidence gating now applies to the wider mutating tool suite (including `spreadsheet` and `output_path` writers), reseal/provenance capture is tool-agnostic for successful changed-file mutations, and defense-in-depth post-call guard mode is configurable via `execution.sealed_artifact_post_call_guard` (`off|warn|enforce`, default `warn`) with new telemetry events (`sealed_policy_preflight_blocked`, `sealed_reseal_applied`, `sealed_unexpected_mutation_detected`). Added a synthetic regression covering the `write_file -> spreadsheet overwrite -> synthesis seal mismatch` chain without external/private logs.
-- **Core engine modules converted to package layouts with import compatibility facades** (`src/loom/engine/semantic_compactor/__init__.py`, `src/loom/engine/runner/__init__.py`, `src/loom/engine/verification/__init__.py`, `src/loom/engine/orchestrator/__init__.py`) -- replaced monolithic engine modules with package-based layouts and sibling helper modules while keeping external import contracts stable for orchestrator/runner/verification/semantic-compactor public symbols.
-- **Process output-coordination contract parsing and validation** (`processes/schema.py`, `tests/test_processes.py`) -- added process-level `output_coordination` defaults/validation (`strategy`, `intermediate_root`, `publish_mode`, `conflict_policy`, `enforce_single_writer`, `finalizer_input_policy`), per-phase overrides for `output_strategy` and `finalizer_input_policy`, deterministic fan-in finalizer ID convention (`<phase_id>__finalize_output`), and collision checks that prevent reserved finalizer IDs from conflicting with declared phase IDs.
-- **Output coordination runtime enforcement and safety rails** (`engine/orchestrator.py`, `engine/runner.py`, `prompts/assembler.py`, `tests/test_orchestrator.py`) -- added conflict-guard controls honoring `enforce_single_writer`/`conflict_policy`, fan-in worker path-prefix enforcement, completion-contract mutation cross-check notes, strict manifest-only finalizer input checks with policy-aware worker artifact requirements, transactional fan-in stage+commit publish, and seal handling updates so intermediate artifacts are excluded from canonical seal validation.
-- **ask_user v2 schema + normalization hardening** (`tools/ask_user.py`, `tests/test_ask_user.py`, `prompts/templates/executor.yaml`, `tests/test_prompts.py`) -- `ask_user` now supports structured option objects, richer question metadata, legacy option normalization, and improved tolerance for malformed option payloads (aliases/map/string option sources) while keeping backward compatibility for legacy `options: list[str]`.
-- **Execution-surface propagation across run entrypoints** (`__main__.py`, `api/routes.py`, `tools/delegate_task.py`, `engine/runner.py`, `tests/test_cli.py`, `tests/test_api.py`) -- CLI/API/TUI task metadata now carries normalized execution-surface context, and API-created tasks are forced to `execution_surface="api"` to prevent interactive-tool elevation.
-- **Ask-user modal UX upgraded for option selection** (`tui/screens/ask_user.py`, `tests/test_tui.py`) -- choice prompts now support button-based single/multi selection with constraint validation, conditional custom-response input visibility, wrapped long text, and scrollable question/option content.
-- **Core runtime dehardcoded for universal process behavior** (`engine/verification.py`, `recovery/retry.py`, `engine/orchestrator.py`, `prompts/assembler.py`, `prompts/templates/verifier.yaml`) -- removed fixed domain acceptance/remediation logic, switched verifier protocol to generic `metadata`, and moved remediation/evidence activation to process contract data.
-- **Built-in processes migrated to contract v2** (`processes/builtin/*.yaml`) -- all shipped definitions now declare `schema_version: 2` and explicit verification/evidence/prompt/remediation blocks.
-- **Process loader wiring parity across CLI/API/TUI** (`__main__.py`, `api/routes.py`, `tui/app.py`) -- loader now consumes `require_v2_contract` alongside existing scope metadata strictness.
-- **Unified TUI as default interface** (`tui/app.py`, `__main__.py`) -- `loom` with no subcommand now launches the Textual TUI with full cowork backend: session persistence (SQLite), conversation recall, task delegation, process definitions, and session management. The separate plain-text REPL is removed. `loom cowork` is an alias for the default TUI. New slash commands: `/sessions`, `/new`, `/session`, `/resume <id>`.
-- **Setup wizard moved into TUI** (`tui/screens/setup.py`, `__main__.py`) -- first-run configuration now launches as a multi-step modal inside the TUI instead of CLI prompts. Five-step keyboard-driven flow: provider selection, model details, role assignment, optional utility model, and confirmation. Reconfigure anytime with the `/setup` slash command. The `loom setup` CLI command is retained as a headless fallback.
-- **Provider model selection now auto-discovers from endpoints** (`setup.py`, `tui/screens/setup.py`) -- setup no longer relies on hardcoded Anthropic model names. It probes provider APIs (`Anthropic /v1/models`, OpenAI-compatible `/models` with `/v1/models` fallback, Ollama `/api/tags`) and presents discovered options; if discovery fails, setup falls back to manual model entry.
-- **Setup wizard interaction/feedback polish** (`tui/screens/setup.py`) -- details step now enforces endpoint/auth-first discovery flow (URL + required key before discovery), caps rendered discovered models to avoid modal overflow, and adds explicit visual selection feedback plus clearer per-step keybinding confirmation (including save-step `Enter/Y/S` and `B/Esc`). Confirm summary is now scroll-bounded so hotkey hints stay visible.
-- **Quit flow now requires confirmation in TUI** (`tui/app.py`, `tui/screens/confirm_exit.py`) -- `Ctrl+C`, slash-command quit (`/quit`, `/exit`, `/q`), and command palette quit now route through a confirmation modal before exiting, preventing accidental session termination.
-- **Live slash-command autocomplete hints in TUI input** (`tui/app.py`) -- typing `/` now shows available slash commands, and each subsequent keypress incrementally filters matches in a dedicated hint panel below the input (`/res` -> `/resume`, etc.). Unmatched prefixes show an inline "Try /help" hint.
-- **Slash command registry refactor for consistency** (`tui/app.py`) -- slash autocomplete and `/help` output now derive from one shared command specification, preventing drift and missing entries. `/resume` now has explicit usage guidance (`/resume <session-id-prefix>`) when invoked without an argument.
-- **Process propagation in TUI session lifecycle** (`tui/app.py`) -- active process definitions now persist as app state and are reapplied when creating or switching sessions, so cowork system prompts consistently include domain persona/tool guidance across `/new` and `/resume`.
-- **Process-aware delegate orchestration in TUI** (`tui/app.py`) -- `delegate_task` factories created by the TUI now pass the active process definition into per-task orchestrators, aligning delegated execution with process rules in cowork mode.
-- **Process required-tool enforcement** (`engine/orchestrator.py`, `api/routes.py`, `tui/app.py`) -- process runs now validate `tools.required` against the active registry. Missing requirements fail fast in orchestrator creation, are rejected early via API task creation (HTTP 400), and are surfaced as explicit TUI warnings.
-- **`process.default` now applied across CLI and API entrypoints** (`__main__.py`, `api/routes.py`) -- when process is omitted, `loom`, `loom cowork`, `loom run`, and API task creation now use `config.process.default` if configured (explicit request process still wins).
-- **In-session process controls in TUI** (`tui/app.py`) -- added `/process` command family for live process management: `/process` (status/usage), `/process list`, `/process use <name-or-path>`, and `/process off`.
-- **Forced process execution slash command in TUI** (`tui/app.py`) -- added `/run <goal>` to execute the active process through `delegate_task` orchestration directly (instead of relying on cowork-mode inference). Includes usage guards when no process is active and appears in `/help` plus slash autocomplete/tab completion.
-- **Dynamic process slash commands in TUI** (`tui/app.py`, `tui/commands.py`) -- selectable process definitions now expose direct slash commands (`/<process-name> <goal>`) that run with per-run process scoping (no global active-process mutation). Slash autocomplete/help and the `Ctrl+P` palette now surface these commands dynamically.
-- **Concurrent process run tabs in TUI** (`tui/app.py`) -- `/run` now launches non-exclusive background workers with one dynamic tab per run, allowing cowork chat to remain interactive while process orchestrations execute. Run tabs show status indicators (`queued/running/completed/failed`) plus live elapsed timers and keep per-run progress/activity isolated instead of interleaving in the main chat panel.
-- **`/run` launch liveness and staged preflight UX** (`tui/app.py`, `config.py`, `loom.toml.example`, `docs/CONFIG.md`, `tests/test_tui.py`, `tests/test_config.py`) -- `/run` now opens a run tab immediately and performs process resolution/workspace provisioning/auth preflight asynchronously with explicit launch stages, non-blank stage checklists before subtask plans arrive, single stage heartbeat lines that update in place (dot animation + completion timer) instead of duplicating rows, immediate workspace refresh on run-folder creation, launch telemetry spans, and configurable launch heartbeat/timeout plus `run_preflight_async_enabled` rollback toggle.
-- **Process-run tab close controls in TUI** (`tui/app.py`, `tui/screens/process_run_close.py`, `tui/commands.py`) -- added confirmed close flow for dynamic process tabs via `Ctrl+W`, command palette action, and `/run close [run-id-prefix]`. Closing an active run now cancels it and marks it failed before removing the tab.
-- **Process progress visibility in TUI sidebar** (`tools/delegate_task.py`, `tui/app.py`, `tui/widgets/sidebar.py`) -- delegated process runs now publish structured subtask progress, and the sidebar Progress panel renders all process steps (including failed/skipped states) with a bounded, scrollable region.
-- **Process-run context handoff from cowork session** (`tui/app.py`) -- delegated `/run` executions now include compact cowork context (workspace, recent user/assistant messages, focus, and recent decisions) so process runs can incorporate immediate chat context like “using this information…”.
-- **Executor prompt now enforces exact process deliverable filenames** (`prompts/assembler.py`) -- when a process phase declares deliverables, the active subtask prompt now includes an explicit `REQUIRED OUTPUT FILES (EXACT FILENAMES)` section to reduce verification misses from renamed output files.
-- **Process actions in command palette** (`tui/commands.py`, `tui/app.py`) -- added `Ctrl+P` actions for process inspection and control (`Show process info`, `List processes`, `Disable process`).
-- **Process visibility in TUI status/session output** (`tui/widgets/status_bar.py`, `tui/app.py`) -- active process now appears in the bottom status bar (`process:<name>`) and `/session` output.
-- **Installer now preserves full package assets with artifact filtering** (`processes/installer.py`) -- package installation now copies full process directories (templates/examples/docs and other assets), while excluding VCS/cache/bytecode artifacts such as `.git/`, `__pycache__/`, and `*.pyc`.
-- **Installer isolated dependency mode** (`__main__.py`, `processes/installer.py`, `processes/schema.py`) -- added `loom install --isolated-deps`, which installs process dependencies into `<target>/.deps/<process-name>/` and activates those site-packages automatically when loading that process package.
-- **Strict process phase-mode enforcement in planning** (`engine/orchestrator.py`) -- when a process declares `phase_mode: strict`, planner output is now normalized to the declared phase blueprint (IDs/order/dependencies/tier/acceptance), preventing drift from required process DAG structure.
-- **Process runtime semantics tightened** (`engine/orchestrator.py`, `engine/scheduler.py`, `prompts/assembler.py`) -- `is_critical_path` phases now abort remaining pending work after retries are exhausted (instead of replanning), `is_synthesis` phases are held until all non-synthesis subtasks complete, and replanner prompts now include an explicit replan reason plus process `replanning.triggers` context.
-- **Bundled tool collision diagnostics** (`processes/schema.py`) -- process loader now detects bundled tool name collisions with already-registered tools, logs actionable warnings, and skips only the colliding bundled tools to keep registry creation stable.
-- **Google Analytics package install docs corrected** (`packages/google-analytics/README.md`) -- updated install example to a valid source format (`https://github.com/...`) accepted by `loom install`.
-- **README TUI docs updated for process controls** (`README.md`) -- interface section now documents in-session process commands (`/process list`, `/process use`, `/process off`).
-- **Process/package docs parity updates** (`README.md`, `docs/creating-packages.md`, `docs/agent-integration.md`) -- docs now reflect fail-fast `tools.required`, built-in phase modes, isolated dependency install mode, collision policy, and package troubleshooting/checklist guidance.
-- **Process/package system refactor plan documented** (`planning/refactors/2026-02-17-PROCESS-PACKAGE-SYSTEM-PLAN.md`) -- added a prioritized execution plan covering TUI/API parity, strictness enforcement, package hardening, and demo-readiness criteria.
-- **Web tool request resilience** (`tools/web.py`, `tools/web_search.py`) -- `web_fetch` and `web_search` now send explicit browser-compatible headers (with `LOOM_WEB_USER_AGENT` override), apply bounded retry/backoff for transient network/HTTP failures, and search now falls back across DuckDuckGo HTML endpoints before surfacing failure.
-- **Tool registry creation now config-aware** (`tools/__init__.py`, `__main__.py`, `api/engine.py`, `api/routes.py`, `tui/app.py`) -- default registry builders now accept config so MCP tools are consistently available in CLI, TUI, API task validation, and process test runs.
-- **CLI MCP layering and workspace-aware config resolution** (`__main__.py`) -- CLI startup now resolves active `loom.toml`, applies layered MCP config overlays (including `--mcp-config` and workspace override), and uses that merged config for `loom`, `cowork`, `run`, `serve`, and `mcp-serve`.
-- **Process package author docs updated for test manifests** (`docs/creating-packages.md`, `README.md`) -- docs now cover `tests:` in `process.yaml`, `loom process test`, and MCP server config snippets.
+## [0.2.0] - 2026-03-08
 
-### Fixed
-- **Non-interactive ask_user blocking regressions** (`engine/runner.py`, `tools/registry.py`, `api/routes.py`, `tests/test_questions.py`, `tests/test_tools.py`, `tests/test_api.py`) -- `ask_user` is now blocked on non-TUI surfaces with deterministic errors and no pending-question deadlock path; question endpoints reject non-TUI tasks with `409`.
-- **Ask-user modal clipping and option overflow in TUI** (`tui/screens/ask_user.py`, `tests/test_tui.py`) -- long question text and large option lists now wrap and scroll correctly, preventing hidden options at the bottom of the modal.
-- **Hardened running-tab cancellation flow for `Ctrl+W` in process panes** (`tui/app.py`, `tui/screens/process_run_close.py`, `tools/delegate_task.py`, `engine/orchestrator.py`, `config.py`, `loom.toml.example`, `docs/CONFIG.md`, `tests/test_tui.py`, `tests/test_orchestrator.py`, `tests/test_config.py`) -- closing an active run tab now requests orchestrator cancellation first (with worker fallback), shows explicit cancel-requested/timeout/force-close states, bounds close-modal waits, avoids global close-latch wedges, preserves event-log cancel lifecycle signals, and prevents `CancelledError` from being swallowed in orchestrator batch dispatch.
-- **Cowork delegate progress stream lifecycle hardening** (`tui/app.py`, `tests/test_tui.py`) -- late callback events are now ignored after delegate stream finalization (preventing reopened/reset sections), `token_streamed` events are filtered from cowork chat sections to reduce noise, and cowork-specific terminal progress text no longer reuses `/run` phrasing.
-- **Verifier template formatting regression** (`prompts/templates/verifier.yaml`) -- escaped nested JSON braces in the YAML template so prompt interpolation no longer raises `KeyError` during verifier prompt assembly.
-- **Process deliverable verification scoping** (`engine/verification.py`) -- deterministic deliverable checks are now phase-scoped to the active subtask ID instead of flattening all process deliverables into every subtask verification, preventing early-phase false negatives in strict workflows.
-- **TUI chat/process-list text clipping** (`tui/widgets/chat_log.py`, `tui/app.py`, `tests/test_tui.py`) -- chat/info/process-list rows now expand to available width and process descriptions are no longer hard-truncated to 80 characters, so long lines wrap instead of cutting off.
-- **Slash-command info readability hierarchy in TUI** (`tui/widgets/chat_log.py`, `tui/app.py`, `tests/test_tui.py`) -- process/session/tools/help outputs now render as structured blocks with styled headings, wrapped detail lines, and consistent usage formatting; info rows now use a dedicated muted style class instead of globally dim-wrapping entire payloads.
-- **Web tool verification brittleness** (`engine/verification.py`) -- deterministic verification now treats transient `web_fetch`/`web_search` failures (403/429/5xx/timeouts/connectivity) as advisory while still failing on safety/policy violations and malformed tool usage.
-- **API process cross-task leakage** (`api/routes.py`, `api/engine.py`) -- process-backed task execution now uses an isolated per-task orchestrator instead of mutating shared orchestrator internals (`_process`, `_prompts`). Prevents process collisions and state bleed between concurrent tasks.
-- **API process configuration parity** (`api/routes.py`) -- process loading now honors `config.process.search_paths`, matching TUI/CLI resolution behavior.
-- **TUI files panel session bleed** (`tui/app.py`) -- file-change history/diff view is now reset on `/new` session creation and `/resume` session switching.
-- **TUI streaming text crash on Textual API change** (`tui/widgets/chat_log.py`) -- streaming output no longer reads `Static.renderable` (missing in newer Textual). Chat log now tracks streamed text internally, preventing `AttributeError` during normal chat responses.
-- **Streaming HTTP error crash in model providers** (`models/openai_provider.py`, `models/ollama_provider.py`, `models/anthropic_provider.py`) -- providers no longer access `response.text` on streaming `HTTPStatusError` responses (which can raise `Attempted to access streaming response content...`). Stream error bodies are now read before stream teardown, then surfaced via `ModelConnectionError` (including Anthropic API message extraction when present).
-- **Slash autocomplete completeness in TUI** (`tui/app.py`) -- autocomplete now matches canonical commands and aliases consistently by prefix (and fallback substring), so prefixes like `/h`, `/n`, and `/l` reliably surface `/help`, `/new`, and `/learned`. The hint panel also allows more visible rows.
-- **Exit confirmation modal key-capture deadlock** (`tui/screens/confirm_exit.py`, `tui/app.py`) -- exit confirm now explicitly handles `Enter`, `Esc`, `Y/N`, and `Ctrl+C` at the modal level, disables inherited app bindings while open, and de-duplicates concurrent confirmation prompts to prevent stacked modals and apparent freezes.
-- **Quit binding modal deadlock** (`tui/app.py`) -- `Ctrl+C`, `/quit`, and command-palette quit now start the exit-confirm flow in a worker instead of awaiting it inline in the originating key/event handler, preventing message-loop stalls where the confirm modal appears but won't accept input.
-- **Slash hint off-by-one input lag** (`tui/app.py`) -- slash autocomplete now reads the live input widget value on each change instead of relying on event payloads, preventing one-keystroke-late matches (e.g., `/h` showing `/` suggestions). Hint panel now resets scroll each update, and its height is explicitly set from rendered line count (capped) to avoid clipping the final match row.
-- **Slash hint bottom-line clipping** (`tui/app.py`) -- while slash autocomplete is visible, both bottom bars (footer and status bar) are temporarily hidden so the hint panel is not occluded by docked widgets. This prevents the last suggestion row from disappearing (e.g., `/sessions`, `/tokens`) and fixes apparent blank single-match prefixes.
-- **Slash hint overlap while typing command arguments** (`tui/app.py`) -- slash autocomplete hints now hide once argument entry begins (after first whitespace), so command completion UI no longer obscures active input context.
-- **Tab-cycling slash autocomplete** (`tui/app.py`) -- when the chat input contains a slash command token, `Tab`/`Shift+Tab` now cycle matching commands (`/s` -> `/setup` -> `/session` -> `/sessions`). Outside slash autocomplete contexts, existing tab behavior is unchanged.
-- **Workspace reload hotkey + palette action in TUI** (`tui/app.py`, `tui/commands.py`) -- added `Ctrl+R` to manually reload the sidebar workspace tree, plus a matching `Reload workspace tree` command in the `Ctrl+P` palette for discoverability.
-- **Workspace tree refresh after writes** (`tui/app.py`, `tui/widgets/sidebar.py`) -- sidebar file tree now reloads after file-modifying tool calls and successful `/run` orchestrations so newly written files appear without restarting the TUI.
-- **Process slash-command collision guard** (`tui/app.py`) -- process names that collide with built-in slash commands (e.g. `run`, `help`) are now blocked in TUI command indexing and `/process use`, with explicit user-facing warnings at startup.
-- **Sidebar progress signal-to-noise for process runs** (`tui/app.py`) -- main HUD progress now renders concise summaries (one row per open process run plus a compact cowork-delegation summary) while detailed subtask/activity output remains inside each process tab.
-- **Workspace tree refresh on subtask completion during `/run`** (`tools/delegate_task.py`, `tui/app.py`) -- `/run` now subscribes to orchestrator subtask events and triggers workspace tree reload as subtasks complete/fail, so process-generated files show up before full orchestration completes.
-- **`/run` delegate binding regression in persisted TUI sessions** (`tui/app.py`) -- fixed tool-instance mismatch where auto-discovered `delegate_task` could remain unbound while TUI bound a different instance, causing `Task delegation is not available (no orchestrator configured)`.
-- **`/run` timeout failure surfacing in progress panel** (`tui/app.py`) -- failed process runs now write an explicit failed status row in sidebar progress; timeout failures include guidance to increase `LOOM_DELEGATE_TIMEOUT_SECONDS`.
-- **Process-run token/context blowups from accumulated tool outputs** (`engine/runner.py`, `tests/test_orchestrator.py`) -- subtask execution now serializes compact tool-result payloads for model context and applies rolling message compaction during long tool loops to keep requests under a bounded context budget while preserving tool-call ordering.
-- **Over-truncated subtask summaries causing false verifier failures** (`engine/runner.py`, `engine/verification.py`, `tests/test_orchestrator.py`, `tests/test_verification.py`) -- runner now keeps a short UI/state summary separate from a longer sentence-safe verification summary, and verifier now caps/compresses oversized result summaries before prompting. This prevents "result is truncated mid sentence" false negatives on rich subtasks.
-- **Tier-2 verifier exceptions during process runs** (`engine/verification.py`, `tests/test_verification.py`) -- verifier prompts now compact large tool-call argument payloads (especially `document_write` content), cap prompt size with compact summaries, and retry once with a stricter compact prompt before failing. Verifier failure feedback now includes the underlying exception snippet for easier diagnosis.
-- **Hard truncation removed from model-facing compaction paths** (`engine/semantic_compactor.py`, `engine/runner.py`, `engine/verification.py`, `prompts/assembler.py`, `state/task_state.py`) -- context/prompt compaction now uses chunked LLM semantic compression (with cached map/reduce compaction) instead of character-slice truncation. Prompt assembly no longer slices to budget, verifier/tool/message compaction is semantic, and task-state YAML keeps full subtask summaries for downstream semantic compaction.
-- **Hard truncation removed from cowork/learning/tool serialization paths** (`cowork/session.py`, `tools/registry.py`, `tools/conversation_recall.py`, `cowork/session_state.py`, `learning/reflection.py`, `learning/manager.py`, `tools/shell.py`, `tools/git.py`, `tools/ripgrep.py`, `tools/web.py`, `tools/code_analysis.py`, `tools/spreadsheet.py`) -- tool-result JSON now preserves full output/data at persistence boundaries, cowork injects semantically compacted tool payloads into model context, conversation recall and gap-learning paths no longer character-slice context, and shell/git/search/fetch/code-analysis/spreadsheet reads avoid mid-sentence hard clipping.
-- **`Ctrl+W` close-run handling when typing in chat input** (`tui/app.py`, `tests/test_tui.py`) -- key handling now explicitly captures `Ctrl+W` in `#user-input` (where word-delete shortcuts could consume it) so process tab close confirmation reliably triggers from the main entry field.
-- **Long-running `/run` orchestration timeout increased and configurable** (`tools/delegate_task.py`) -- `delegate_task` timeout now defaults to 3600s and supports `LOOM_DELEGATE_TIMEOUT_SECONDS` override for multi-hour workflows.
-- **Concurrent `/run` orchestrator isolation** (`tools/delegate_task.py`) -- `delegate_task` now creates a fresh orchestrator instance per execute call instead of reusing a cached singleton, preventing cross-run event/state coupling during parallel process runs.
-- **TUI import regression for process-run close modal** (`tui/screens/__init__.py`, `tui/screens/process_run_close.py`) -- added and exported `ProcessRunCloseScreen` so TUI startup/tests no longer fail with `ImportError`.
-- **Missing required tool args blocked before execution** (`models/router.py`, `prompts/templates/executor.yaml`) -- tool-call validation now enforces required schema fields (e.g. `document_write.path`, `spreadsheet.path`) and returns corrective guidance before dispatch; executor constraints now explicitly require path arguments for write/create tools.
-- **Slash hint now surfaces dynamic process commands** (`tui/app.py`, `tests/test_tui.py`) -- slash popup now refreshes process command discovery while typing and uses a taller hint cap so `/`, `/process`, `/run`, and dynamic `/<process-name> <goal>` entries are visible instead of being clipped.
-- **Workspace tree refresh on document tools** (`tui/app.py`, `tests/test_tui.py`) -- successful `document_write`/`document_create` tool completions now force a sidebar workspace tree refresh in chat and process-progress flows, so newly written docs appear immediately.
-- **Process run tab persistence and close discoverability in TUI** (`tui/app.py`, `cowork/session_state.py`, `tests/test_tui.py`, `tests/test_session_state.py`) -- process run tabs (status/checklist/activity/results) are now persisted in session UI state and restored on session resume, including active tab selection; interrupted in-flight runs are restored as failed with explicit annotation. Close controls are now clearer via visible `Ctrl+W` binding, help text updates, and in-pane close hints.
-- **OpenAI-compatible role/message normalization for tool loops** (`models/openai_provider.py`, `engine/runner.py`, `cowork/session.py`, `tests/test_error_handling.py`) -- normalized assistant/tool messages now enforce non-null content, fallback tool-call IDs, and repaired tool-call references for stricter providers. Subtask runner reminder injections now use a user-role follow-up instead of mid-loop system-role messages to avoid provider role-order HTTP 400s.
-- **OpenAI-compatible empty assistant-content guard** (`models/openai_provider.py`, `tests/test_error_handling.py`) -- outgoing assistant turns are now normalized to non-empty fallback content when providers emit empty/whitespace text during tool loops, preventing strict servers (including Kimi) from rejecting long process runs with `role 'assistant' must not be empty`.
-- **Web fetch large-response handling** (`tools/web.py`, `engine/verification.py`) -- `web_fetch` now performs bounded streaming reads (no unbounded body load), returns truncated content instead of hard-failing on large pages, and deterministic verification treats `Response too large` web failures as advisory to avoid derailing entire subtasks.
-- **Web fetch HTML token reduction** (`tools/web.py`, `tests/test_web_tool.py`) -- `web_fetch` now strips HTML markup whenever `extract_text=true` using both content-type and payload sniffing (for mislabelled pages). Extraction now removes comments/script/style/noscript/template-like blocks, normalizes block tags to readable line breaks, decodes HTML entities, and returns compact plain text for lower prompt/token overhead.
-- **Process-run progress checklist stability + output tracking in TUI** (`tui/app.py`, `tui/widgets/sidebar.py`, `tests/test_tui.py`) -- process run tabs now keep Progress rows anchored to the original phase labels instead of replacing them with long completion summaries. Added a dedicated Outputs section that lists phase deliverables as they progress, marking created files, pending outputs, and missing/failed deliverables with status icons.
-- **Learned-pattern UX noise in TUI/CLI** (`tui/app.py`, `tui/screens/learned.py`, `__main__.py`) -- `/learned` and `loom learned` now default to behavioral patterns used for prompt personalization; internal operational telemetry patterns remain available via `loom learned --all`.
-- **Setup and MCP config separation safety** (`tests/test_setup.py`) -- added regression coverage ensuring `loom setup` / `/setup` updates `loom.toml` without mutating a separate `mcp.toml`.
-- **Workspace file viewer modal in TUI** (`tui/app.py`, `tui/screens/file_viewer.py`) -- selecting a file in the workspace tree now opens a read-only preview modal with extension-based renderer dispatch. Added renderers for Markdown, code/text with syntax highlighting (including TypeScript/CSS), JSON formatting, CSV/TSV table previews, HTML text extraction, diff/patch, Word/PowerPoint text extraction, PDF text preview, and image metadata.
-- **Workspace file viewer backdrop dismissal** (`tui/screens/file_viewer.py`) -- clicking outside the centered file viewer dialog now closes the modal, matching expected modal behavior while preserving in-dialog interaction.
-- **Tree-sitter CI gate** (`.github/workflows/ci.yml`) -- added a dedicated workflow job that installs `--extra treesitter`, asserts backend availability, and runs `tests/test_treesitter.py` so tree-sitter regressions are not silently skipped.
-- **Test suite false-positive hardening** (`tests/test_tui.py`, `tests/test_setup.py`, `tests/test_installer.py`, `tests/test_integrations.py`, `tests/test_memory.py`, `tests/test_multimodal_integration.py`, `tests/test_processes.py`) -- replaced vacuous tests (attribute/assignment checks and no-op smoke cases) with behavior assertions that validate selectors, async setup invalidation, files-panel reset flows, dependency installer no-op behavior, event persistence error paths, idempotent DB initialization, runner no-bus emission, and bundled-tools no-op imports.
-- **Tool auto-discovery collision with dynamic MCP proxy classes** (`tools/registry.py`, `integrations/mcp_tools.py`) -- dynamic MCP proxy tools are now explicitly excluded from global built-in auto-discovery to prevent constructor crashes during registry bootstrap.
-- **Verifier JSON parse resilience in critical-path runs** (`models/router.py`, `engine/verification.py`, `tests/test_model_router.py`, `tests/test_verification.py`) -- JSON validation now extracts embedded JSON payloads from wrapped model output and prefers objects containing required keys (like `passed`) instead of failing on leading/trailing prose. Verifier feedback mapping now accepts `feedback` (prompt-native) with `suggestion` fallback, reducing inconclusive parse failures that previously aborted critical-path subtasks.
-- **Event persistence race in integration tests** (`events/bus.py`, `tests/test_integrations.py`, `tests/test_events.py`) -- `EventBus` now tracks in-flight async handler tasks and exposes `drain()` for deterministic completion in test/shutdown paths. Event persistence integration tests now await `bus.drain()` instead of timing-based sleeps, removing CI flakiness where only a subset of emitted events were persisted before assertions.
-- **Local cache ignore coverage** (`.gitignore`) -- added `.ruff_cache/` and `.uv-cache/` so local lint/cache artifacts are consistently excluded from version control.
+- Normalize package version authority to `pyproject.toml` and bump to `0.2.0`
+- Replace hardcoded runtime version literals with shared `loom.__version__` usage
+- Add version consistency guardrails (`scripts/check_version_consistency.py`, CI check, and tests)
+- Update release-facing docs/examples for `0.2.0` (`README.md`, `INSTALL.md`, `docs/tutorial.html`)
 
-### Added
-- **Process definition plugin architecture** (`processes/schema.py`) -- YAML-based domain specialization. Process definitions inject personas, phase blueprints, verification rules, tool guidance, and memory extraction types into the engine without code changes. Multi-path discovery (builtin → user-global → workspace-local), comprehensive validation with dependency cycle detection, and support for process packages that bundle tools.
-- **6 built-in process definitions** (`processes/builtin/`) -- `investment-analysis` (8-phase financial workflow), `marketing-strategy` (8-phase GTM workflow), `research-report` (6-phase research workflow), `competitive-intel` (6-phase competitive analysis), `consulting-engagement` (7-phase issue-tree consulting workflow), and `market-research` (8-phase geography/trend/competition/risk workflow).
-- **Process-aware verification** (`engine/verification.py`) -- DeterministicVerifier now runs process-specific regex rules and deliverables existence checks.
-- **`calculator` tool** (`tools/calculator.py`) -- safe AST-based math evaluation with financial functions (NPV, CAGR, WACC, PMT). Exponent limits prevent OOM.
-- **`spreadsheet` tool** (`tools/spreadsheet.py`) -- CSV operations: create, read, add rows/columns, update cells, summary. 5MB file size limit.
-- **`document_write` tool** (`tools/document_write.py`) -- structured Markdown generation with sections, frontmatter metadata, and append mode.
-- **`--process` CLI flag** (`__main__.py`) -- on `run` and `cowork` commands. Loads and applies a named process definition.
-- **`loom processes` command** (`__main__.py`) -- lists all available process definitions with metadata.
-- **`loom install` command** (`__main__.py`, `processes/installer.py`) -- install process packages from GitHub repos (`loom install user/repo`), URLs, or local paths. Validates structure, auto-installs Python dependencies (tries `uv` then `pip`), copies to `~/.loom/processes/` or workspace-local with `--workspace`.
-- **`loom uninstall` command** (`__main__.py`, `processes/installer.py`) -- remove installed process packages by name. Built-in processes cannot be removed.
-- **`dependencies` field in process.yaml** (`processes/schema.py`) -- declare pip packages that are auto-installed during `loom install`.
-- **`[process]` config section** (`config.py`) -- `default` process and `search_paths` for additional process directories.
-- **Session switching** (`__main__.py`) -- `/sessions`, `/new`, `/session` commands for mid-session switching between cowork sessions across workspaces.
-- **EventBus unsubscribe** (`events/bus.py`) -- `unsubscribe()` and `unsubscribe_all()` methods to prevent handler leaks on SSE disconnect.
+## [History]
 
-### Fixed
+### 2026-02-13
+- `675c4fe` Initial commit
+- `ae23f7c` Add project overview spec (00-PROJECT-OVERVIEW.md)
+- `17acd74` Add project structure spec (01-PROJECT-STRUCTURE.md)
+- `5f12e64` Add orchestrator loop spec (02-ORCHESTRATOR-LOOP.md)
+- `3286a68` Add task state/memory and model router specs (03, 04)
+- `a051fb0` Add tool system spec (05-TOOL-SYSTEM.md)
+- `03bb276` Add verification gates spec (06-VERIFICATION-GATES.md)
+- `bb5a7df` Add API server spec (07-API-SERVER.md)
+- `cb6ed66` Add event system spec (08-EVENT-SYSTEM.md)
+- `89b363d` Add TUI client and agent integration specs (09, 10)
+- `f9a0cf3` Add workspace and file management spec (11-WORKSPACE-FILES.md)
+- `ee7d15a` Add prompt architecture and error recovery specs (12, 13)
+- `0fd04f3` Add human-in-the-loop and learning system specs (14, 15)
+- `c7f4cc2` Scaffold project: pyproject.toml, CLI, config, CI, test infra
+- `b562cf1` Implement task state and memory layer (Spec 03)
+- `e433dd3` Implement prompt template system (Spec 12)
+- `53115f1` Implement model router with Ollama and OpenAI providers (Spec 04)
+- `90b2a95` Implement tool system with registry, file ops, shell, search (Spec 05)
+- `1741fae` Implement workspace and file management (Spec 11)
+- `f21b625` Implement orchestrator loop with event bus and scheduler (Spec 02)
+- `b1a670f` Implement API server with FastAPI endpoints and SSE streaming (Spec 07)
+- `b1f6e11` Add README, installation guide, and web-based tutorial
+- `39b008c` Fix runtime bugs: /config tier attribute and engine scratch_dir path
 
-#### Security
-- **SSRF via redirect** (`tools/web.py`) -- `follow_redirects=True` allowed redirects to private IPs, bypassing SSRF checks. Now validates each redirect target.
-- **Webhook SSRF** (`events/webhook.py`) -- callback URLs are now validated against private network blocklist before registration.
-- **Shell sandbox bypasses** (`tools/shell.py`) -- expanded blocked patterns to cover flag reordering (`rm -r -f /`), command substitution (`$(rm ...)`), and interpreter flags (`python -c`, `perl -e`).
-- **Git config removed** (`tools/git.py`) -- `config` subcommand removed to prevent arbitrary code execution via hooks/aliases.
-- **Approval gate defaults** (`cowork/approval.py`, `recovery/approval.py`) -- no-callback now denies by default; timeout denies instead of auto-approving.
-- **Delegate task approval** (`tools/delegate_task.py`) -- default changed from `"auto"` to `"confidence_threshold"`.
-- **Path traversal** (`tools/glob_find.py`, `tools/ripgrep.py`, `tools/workspace.py`) -- workspace containment checks, snapshot path validation.
-- **Prompt injection** (`prompts/assembler.py`) -- replaced `.format()` then `{→${` corruption with safe per-key replacement.
-- **Task ID validation** (`__main__.py`) -- regex validation prevents path traversal in URL interpolation.
+### 2026-02-14
+- `41845e8` Wire Phase 2 integrations: verification gates, changelog, memory extraction, event persistence, re-planning
+- `24da424` Update docs for Phase 2: verification gates, event persistence, re-planning
+- `1b4b3b0` Implement confidence scoring, approval gates, retry escalation, and webhook delivery (Specs 08, 13, 14)
+- `f97a5a5` Implement TUI client, MCP server, and learning system (Specs 09, 10, 15)
+- `09794d3` Fix CI: use --extra dev for optional dependency installation
+- `70ae27f` Update README and INSTALL docs for all implemented features
+- `f269e31` Update tutorial with TUI, approval gates, MCP, and learning sections
+- `5d1f29c` Add full end-to-end integration test and agent connection documentation
+- `5d8bc94` Add SubtaskRunner class for subtask execution encapsulation
+- `0d61a93` Refactor orchestrator: extract SubtaskRunner, add parallel dispatch
+- `396f524` Update docs and add CHANGELOG for SubtaskRunner and parallel dispatch
+- `c89ce04` Add implementation plan for bringing Loom up to snuff
+- `8630e8d` Implement phases 1, 2, and 5: new tools, streaming, error intelligence
+- `0597406` Implement phases 3, 4, and 6: TUI enhancements, smarter planning, conversation mode
+- `b15311d` Refactor tool registration to plugin auto-discovery model
+- `d7049c0` Update CHANGELOG with plugin auto-discovery entry
+- `f4dc27d` Add gap analysis: Loom vs Claude Code cowork model
+- `84b59fa` Implement cowork mode: conversation-first interactive execution
+- `620437d` Update CHANGELOG and README with cowork mode, new tools, and Anthropic provider
+- `926be5e` Add web_search tool using DuckDuckGo (no API key required)
+- `19cf277` Add per-tool-call approval system for cowork mode
+- `c0d9c9d` Add streaming, task tracker, PDF/image support; close all gaps
+- `cf9cb55` Rewrite TUI to use CoworkSession directly (no server required)
+- `112c73f` Update all docs and tutorials to reflect cowork features
+- `4a14ba3` Fix all ruff lint errors: unused imports, line length, naming conventions
+- `83c6343` Move PLUGIN_PLAN.md to planning/refactors/
+- `2b018d7` Add TUI refactor plan: multi-panel command center design
+- `55f99fb` Refactor TUI into multi-panel command center with dark theme
+- `ba37f64` Add comprehensive error handling across all system layers
+- `6982e1c` Clarify that cowork mode works with any model provider
+- `d5df627` Add conversation archive refactor plan for non-lossy cowork history
+- `2a152be` Add three-layer context awareness strategy to conversation archive plan
+- `64427b9` Add cowork-to-task delegation as core component of conversation archive plan
+- `ba64a59` Implement non-lossy conversation history + task delegation for cowork mode
+- `71bf5df` Add mid-session switching between cowork sessions
+- `0bbfb49` Fix 52 bugs, security flaws, and edge cases from comprehensive code review
+- `d3cf583` Fix 23 bugs from second comprehensive code review
+- `77d7f5b` Fix 11 bugs from rounds 3-5 code review + changelog + audit doc
 
-#### Critical Bugs
-- **SubtaskResult field mismatch** (`engine/orchestrator.py`) -- exception handler used non-existent `output`/`error` fields instead of `summary`. Would crash on any parallel subtask exception.
-- **VerificationResult empty instantiation** (`engine/orchestrator.py`) -- missing required `tier` and `passed` fields. Would crash on parallel exception handling.
-- **Attempt tracking off-by-one** (`engine/orchestrator.py`) -- stale variable caused wrong retry counts and escalation tier calculations.
-- **Iteration counter * batch size** (`engine/orchestrator.py`) -- `max_iterations` was effectively divided by parallelism.
-- **Verification gate bypass** (`engine/verification.py`) -- gates returned `passed=True` when disabled or verifier unavailable.
-- **Data loss in schema** (`state/schema.sql`) -- removed `UNIQUE(session_id, turn_number)` constraint that silently dropped messages.
-- **Text loss in send()** (`cowork/session.py`) -- only last iteration's text was kept in tool loop; now accumulates across iterations.
-- **Memory extractor format mismatch** (`engine/runner.py`) -- parser expected `{"entries": [...]}` but template asked for JSON arrays.
+### 2026-02-15
+- `8b6d5e4` Add comprehensive plan for general-purpose Loom expansion
+- `5a64836` Redesign expansion plan around declarative process definitions
+- `0d2c4d5` Add three rounds of critical review to process definition architecture
+- `5ca225d` Fix 15 lint errors: line length, unused imports, f-string and alias issues
+- `d34e4fd` Implement process definition plugin architecture with extensible tool system
+- `7f17236` Clean up built-in process definition YAML formatting
+- `6ada59a` Fix correctness bugs: type safety, double stat, unused --process flag
+- `6caa980` Harden safety: exponent limits, file size checks, error logging
+- `28cae9b` Fix type: ignore comments in spreadsheet tool with assertions
+- `9bfaa5e` Add tests for safety guards and edge cases
+- `70ecb71` Remove type: ignore in cycle detection with proper type narrowing
+- `70ed852` Minor YAML formatting cleanup in builtin process definitions
+- `cd40f19` Update all documentation for process definition plugin architecture
+- `1a2d639` Add process package installer with loom install/uninstall commands
+- `a3dad14` Add security review gate to process package installer
+- `1dc26b5` Round 1: Fix correctness bugs across verification, installer, schema, CLI
+- `d04a7cf` Round 2: Safety and edge case hardening
+- `20217aa` Round 3: API consistency fixes
+- `93b8742` Round 4: Improve test coverage for verification, schema, and tool fixes
+- `43403fb` Add Google Analytics process package
+- `e1de19b` Fix lint errors: import ordering and collections.abc
+- `ba2f17f` Add fuzzy matching, batch edits, and diff display to edit_file
+- `a36c757` Code review fixes: bug fixes, TUI diff support, expanded tests
+- `ea59164` Fix lint: line length violations in file_ops and tests
+- `7e0eda0` Rewrite README for clarity, accuracy, and the human reader
+- `bd5b344` Add multimodal content support: images, PDFs, thinking blocks
+- `b144a87` Wire multimodal content through TUI, API, and terminal display
+- `e66c3ff` Fix multimodal integration gaps: OpenAI provider, deserialization, events
+- `2e07188` Harden multimodal content: fix data loss, injection, leaks, validation
+- `0690100` Fix TUI rendering bugs: center modals, escape markup, style diffs
+- `47f4353` Unify TUI as the single interactive interface; `loom` launches it by default
+- `b7e4587` Update all docs and tutorial for unified TUI as default interface
+- `0be941d` Harden TUI: graceful DB fallback, broader error handling, ask_user in followups
+- `a7821ea` Add sad-path tests for TUI cowork integration
+- `376b051` Add first-run setup wizard and `loom setup` command
+- `fc59cd1` Move setup wizard into TUI as a modal screen
+- `e1d92e5` Fix TUI setup bugs, harden session logic, update docs
+- `3fdf077` Lint cleanup: remove unused imports and variables
+- `2064c25` Fix CI lint failures: remove f-string prefix and sort imports
+- `2be0121` Add process package authoring guide for AI and human authors
+- `eeb27a7` Broaden README to reflect Loom as a general-purpose agent engine
+- `9410b17` Expand default workspace analysis to scan for non-code documents
+- `20ee5b9` Add Word (.docx) and PowerPoint (.pptx) document support
+- `f866705` Fix lint error and update docs for office document support
+- `98afef2` Update model names in README tagline to Kimi, Minimax, GLM
+- `6e8b5d8` Replace remaining Qwen references with MiniMax in README
+- `8e42288` Fix MiniMax model identifiers in README config examples
+- `22a1c83` Use kimi-k2.5 as primary model in README config example
 
-#### High Severity
-- **MCP JSON parse crashes** (`integrations/mcp_server.py`) -- all `.json()` calls now wrapped in try-except; error handler fixed from `"request" in dir()` to proper local variable.
-- **Background task error loss** (`api/routes.py`) -- uncaught exceptions now logged and task marked failed instead of silently swallowed.
-- **SSE handler leak** (`api/routes.py`) -- event handlers now unsubscribed in `finally` blocks on client disconnect.
-- **Ripgrep process leak** (`tools/ripgrep.py`) -- subprocess now killed on timeout instead of left running.
-- **Shell output OOM** (`tools/shell.py`) -- bounded output buffer to 1MB to prevent memory exhaustion from `yes` etc.
-- **OpenAI/Ollama parsing** (`models/openai_provider.py`, `models/ollama_provider.py`) -- empty choices validated, `json.loads()` wrapped in try-except, defensive `.get()` for all dict access.
-- **Session lifecycle** (`__main__.py`) -- session marked inactive on `/quit` and Ctrl-C; `config.data_dir` replaced with `config.workspace.scratch_dir`.
-- **PromptAssembler init** (`__main__.py`) -- was passing `config` as `templates_dir`.
+### 2026-02-16
+- `da45203` Move PLAN.md into planning/refactors directory
+- `6af21c4` Add automatic behavioral reflection to ALM (Spec 16)
+- `13502e2` Add spec to drop regex from codebase in favor of structural alternatives
+- `1830758` Rewrite DROP-REGEX spec to scope only to learning/reflection.py
+- `8d3f0c6` Redesign ALM spec around task completion gap analysis
+- `83ec647` Replace regex reflection engine with task completion gap analysis
+- `832bf93` Add /learned command for reviewing and deleting learned patterns
+- `f50de9e` Update docs and specs for ALM and /learned command
+- `ab46d78` Update tutorial.html for ALM and /learned command
+- `faef639` Add help and quit to command palette; update README intro
+- `fc38c86` Redraft README intro sections: Claude cowork framing and MCP mention
+- `489e694` Add foundation refactor plan from full codebase audit
+- `f7be8ce` Add tree-sitter integration plan from design discussion
+- `03490ce` Implement 6-phase foundation refactor across 22 files
+- `71cca12` Fix linter errors: import ordering and line lengths
+- `ceeaa59` Fix duplicate tool registration crash on TUI startup
+- `e62c125` Rename loom.toml to loom.toml.example, gitignore loom.toml
+- `2316bd6` Fix setup wizard not accepting keystrokes
+- `edc7d2d` adding code review
+- `9fbe157` Add code review plan from main branch
+- `026b94f` tui fixes and review
+- `4d488ad` Fix 14 code review issues (P0-P2) with tests
+- `0894a4c` Add TUI review document from main branch
+- `9e6a8cf` Fix 8 TUI review findings (P0-P2) from 2026-02-16-TUI-REVIEW
+- `e1c694d` Update docs to reflect current codebase state
+- `0e727be` Add tree-sitter integration for code analysis and structural editing
+- `b80f32a` Fix review findings: byte/char offsets, nested defs, Rust impl, naming
 
-#### Medium Severity
-- **Fire-and-forget persist** (`cowork/session.py`) -- `asyncio.ensure_future` replaced with awaited async call to prevent data loss.
-- **Transactional batch insert** (`state/memory.py`) -- `store_many()` now runs in a single transaction.
-- **LIKE wildcard injection** (`state/memory.py`, `state/conversation_store.py`) -- `%` and `_` in search queries escaped.
-- **Web fetch memory** (`tools/web.py`) -- Content-Length checked before downloading to prevent OOM.
-- **Memory extraction logging** (`engine/runner.py`) -- silent failures now logged at DEBUG level.
-- **SQLite WAL mode** (`state/memory.py`) -- enabled for concurrent read/write safety.
-- **SessionState resilience** (`cowork/session_state.py`) -- handles malformed JSON and `files_touched` entries.
-- **TaskTracker locking** (`tools/task_tracker.py`) -- async lock for concurrent safety.
-- **Fallback plan** (`engine/orchestrator.py`) -- includes actual goal text instead of generic description.
+### 2026-02-17
+- `1f0f2ff` Update docs for tree-sitter integration and current stats
 
-#### Low Severity
-- **EditFileTool empty old_str** (`tools/file_ops.py`) -- rejected to prevent nonsensical replacements.
-- **WriteFileTool size limit** (`tools/file_ops.py`) -- 1MB content limit.
-- **_glob_match** (`tools/search.py`) -- replaced simplistic pattern with `fnmatch.fnmatch`.
-- **Anthropic unknown roles** (`models/anthropic_provider.py`) -- logged and preserved instead of silently dropped.
-- **Summary truncation** (`state/task_state.py`) -- increased from 100 to 200 chars with `...` indicator.
-- **Dead code removed** (`cowork/session.py`) -- unused `_is_safe_cut_point` method.
-- **Display bug** (`cowork/display.py`) -- operator precedence fix.
-- **Port 0 falsy** (`__main__.py`) -- `port if port is not None` instead of `port if port`.
-- **API key redaction** (`config.py`) -- `ModelConfig.__repr__` shows only last 4 chars.
-- **delegate_task files** (`tools/delegate_task.py`) -- reports change counts instead of returning timestamp as path.
+### 2026-02-16
+- `a44cdcf` Fix API process isolation, reset TUI file panel, and add tree-sitter CI gate
+- `770152d` Harden weak tests to reduce false positives
+- `6404dd6` code-review docs and uv.lock
+- `ab0de15` Harden TUI setup flow and add process/package refactor plan
+- `39750b4` Propagate active process through TUI sessions and delegation
+- `fdacb0b` Enforce process required tools in TUI and orchestrator
+- `35eb106` Honor process.default for run and TUI launch
+- `2256c7f` Add in-session /process controls and process status display
+- `c72f542` Copy full process package assets with safe installer filtering
+- `670f5b7` Enforce strict process phase blueprints in planning
+- `d37618d` Fix package install docs for Google Analytics process
+- `7c4894d` Add process controls to the TUI command palette
+- `d4377f4` Reject process tasks with missing required tools at API create
+- `3e1d2db` Document in-session process controls in README
+- `3c5e99b` Apply process.default in API task creation path
+- `4abb24c` Enforce process runtime semantics for critical and synthesis phases
+- `8eb1ae4` Close process/package plan: isolated deps, collisions, docs
+- `3226783` Harden web tools and scope process deliverable verification
 
-### Previously added
-- **Cowork mode** (`cowork/session.py`) -- conversation-first interactive execution. No planning phase, no subtask decomposition -- just a continuous tool-calling loop driven by natural conversation with the developer. Full conversation history maintained as context. Now the default `loom` interface via the unified TUI.
-- **`loom cowork` CLI command** -- interactive session with real-time tool call display and special commands (`/quit`, `/help`, `/sessions`, `/new`, `/resume`). Usage: `loom -w /path/to/project` (or `loom cowork -w /path/to/project`).
-- **`ask_user` tool** -- lets the model ask the developer questions mid-execution instead of guessing. Supports free-text and multiple-choice options. The cowork CLI intercepts these and prompts the user.
-- **`ripgrep_search` tool** -- fast content search that shells out to `rg` (ripgrep). Falls back to `grep`, then pure Python. Supports regex, file type filtering, context lines, case insensitivity, and files-only mode.
-- **`glob_find` tool** -- fast file discovery by glob pattern (`**/*.py`, `src/**/*.ts`). Results sorted by modification time, automatically skips `.git`, `node_modules`, `__pycache__`, etc.
-- **`web_search` tool** -- internet search via DuckDuckGo (no API key required). Returns titles, URLs, and snippets. Use to find docs, solutions, package info, etc.
-- **Anthropic/Claude model provider** (`models/anthropic_provider.py`) -- full Claude API support via the Messages API. Native tool use, message format conversion (OpenAI <-> Anthropic), and streaming via SSE. Configure with `provider = "anthropic"` in `loom.toml`.
-- **`api_key` and `tier` fields** in `ModelConfig` -- supports API-key-authenticated providers and explicit tier assignment.
-- **Gap analysis document** (`planning/gap-analysis-vs-claude-code.md`) -- 10-dimension comparison of Loom vs Claude Code's coworking model with prioritized implementation roadmap.
+### 2026-02-17
+- `f174ac0` feat: add process testing framework and MCP tooling improvements
+- `559ee89` fix: apply configured api keys in openai-compatible and ollama providers
+- `334f03e` refactor: broaden cowork system prompt beyond coding-only framing
+- `d7da827` Improve process orchestration UX, resiliency, and docs parity
+- `37e968e` Add rich TUI file viewer renderers and learned-pattern cleanup
+- `e273c04` Close file viewer modal on backdrop click
+- `663ebb3` Implement MCP config management across CLI, TUI, and runtime
+- `3fd3d8e` Refine MCP OAuth plan and fix TUI input/hint layout
+- `c0dd66b` Improve process run live feedback and process-use UX
+- `a66447e` Expand Ctrl+P palette coverage and command prefills
+- `85d1efb` Harden process runs, TUI UX, and provider message compatibility
+- `8d71f5d` Harden verifier JSON parsing for critical-path retries
+- `e858f11` Harden OpenAI payloads against empty assistant content
+- `92e4d4e` Add market-research process and harden TUI process UX
+- `c815333` Replace hard truncation with semantic compaction
 
-- **Per-tool-call approval** (`cowork/approval.py`) -- interactive approval system for cowork mode. Read-only tools (read_file, search, glob, web_search, etc.) auto-approved. Write/execute tools (shell, git, edit, delete) prompt with `[y]es / [n]o / [a]lways allow <tool>`. "Always" remembers per-tool for the session.
-- **`task_tracker` tool** -- in-memory progress tracking for multi-step tasks. Actions: add, update (pending/in_progress/completed), list, clear. Helps the model organize complex work and show progress.
-- **PDF/image/office file support** in `read_file` -- PDFs: extracts text page-by-page via `pypdf` (optional dep). Images: returns multimodal content blocks. Word (.docx) and PowerPoint (.pptx): extracts text via `python-docx` and `python-pptx` (required deps). All fall back gracefully to text.
+### 2026-02-18
+- `1a9841e` Harden process verification stack and tighten delegate logging
 
-### Changed
-- **TUI is the unified interactive interface** (`tui/app.py`) -- runs `CoworkSession` directly with full persistence, streaming text, tool approval modals, `ask_user` modals, conversation recall, and task delegation. Launched as the default `loom` command.
-- **Streaming by default** -- text tokens display incrementally as they arrive instead of waiting for the full response.
-- **Git tool** -- `push` and `remote` added to allowed subcommands (force push still blocked).
-- **Shell tool** -- timeout increased from 60s to 120s for longer-running commands.
-- **Tool output limit** -- increased from 10KB to 30KB for richer tool results.
-- **Model router** -- wired to support `"anthropic"` provider type alongside `"ollama"` and `"openai_compatible"`.
+### 2026-02-19
+- `e1dc880` massive processing refactor. v2 of process definition.
+- `84c5798` TUI hierarchy fixes
+- `ba3c7a4` Fixing some process issues, TUI issues, and more.
+- `bf26548` fixing a small bug in testing and reworked the process progress box in the TUI
+- `028b4e5` small ui bug
+- `21cfe1d` doc updates
 
----
+### 2026-02-20
+- `28b4caa` Fix TUI mouse interaction startup flag
+- `ec0c240` Simplify MCP/auth UX and prune routing complexity
 
-## [0.4.0] -- Plugin Auto-Discovery & Parallel Dispatch
+### 2026-02-22
+- `4f42efe` Tune compactor budgeting and docs defaults
+- `f1d80d2` Align CLI run process resolution with TUI flow
+- `c883f64` Stabilize event persistence assertions in integration tests
+- `2d28ae3` Harden replanning with version fencing and strict ID continuity
 
-### Added
-- **Plugin auto-discovery for tools** -- `Tool` base class now uses `__init_subclass__` to automatically collect concrete subclasses. New `discover_tools()` function scans all modules in `loom.tools` via `pkgutil.walk_packages`. Adding a new tool is now just: create a file, subclass `Tool`, done.
-- **SubtaskRunner** (`engine/runner.py`) -- isolated subtask execution class that owns the tool-calling loop, response validation, verification gates, and memory extraction. The orchestrator no longer touches raw prompts or messages.
-- **Parallel subtask dispatch** -- independent subtasks (no unmet `depends_on`) now execute concurrently via `asyncio.gather()`, up to `max_parallel_subtasks` (default 3). Sequential dependency chains are unaffected.
-- **Fire-and-forget memory extraction** -- memory entries are extracted as background tasks, no longer blocking the next subtask from starting.
-- **`max_parallel_subtasks` config** -- new `[execution]` setting to control concurrency (default 3, set to 1 for fully sequential behavior).
-- **`asyncio.Lock` for state saves** -- prevents race conditions when concurrent subtasks complete simultaneously.
-- **Full end-to-end integration test suite** (`tests/test_full_integration.py`) -- 11 tests exercising the entire orchestration pipeline with real components and a deterministic `FakeModelProvider`:
-  - Happy-path lifecycle (plan, execute, verify, memory, learn, complete)
-  - Multi-subtask dependency chains
-  - Verification failure with retry and escalation
-  - All retries exhausted leading to task failure
-  - Text-only subtasks (no tool calls)
-  - Hallucinated tool name handling
-  - Edit file with changelog tracking
-  - Event persistence roundtrip (SQLite)
-  - Memory extraction and retrieval roundtrip
-  - Parallel independent subtask execution
-  - `max_parallel_subtasks=1` sequential fallback
-- **Agent connection documentation** (`docs/agent-integration.md`) -- comprehensive guide covering REST API (poll/SSE/webhook), MCP server (stdio/SSE), direct Python engine usage, custom model providers, custom tools, event subscriptions, approval modes, and configuration.
+### 2026-02-23
+- `1fe5202` docs: align model role split examples and revalidate dead-code plan
+- `ccb07fb` feat: add artifact ingest handling and telemetry transparency controls
+- `b92d1b6` Implement telemetry transparency events and default-on rollout
+- `d88f5f2` Harden contradiction scan coverage gating
+- `4fba048` Avoid hard import dependency for contradiction event type
+- `d082fdc` Implement keyless research tool suite
+- `a2d66d2` doc updates, process updates, retry architecutre changes
+- `c177ba6` adding potential web frontend
+- `1f7f7e9` Export evidence ledger CSV during wrap-up
 
-### Changed
-- **`create_default_registry()` refactored** -- no longer manually lists every tool. Now calls `discover_tools()` which auto-imports tool modules and instantiates discovered classes. Public API unchanged.
-- **Orchestrator refactored** -- reduced from ~714 lines handling 15+ responsibilities to ~586 lines focused on lifecycle management, scheduling, retry/replan decisions, approval gating, and event emission. Subtask execution delegated to `SubtaskRunner`.
-- **Architecture diagram** updated in README to reflect parallel dispatch and runner separation.
-- **Documentation updated** -- README, tutorial.html, agent-integration.md, and 05-TOOL-SYSTEM.md now list all 11 built-in tools and describe the plugin discovery mechanism.
+### 2026-02-24
+- `79295b3` Harden economic provider JSON payload parsing
+- `9aa8371` Honor read_roots for spreadsheet read operations
+- `63eaa9c` Add /run goal-file input support and docs
+- `291437f` Add humanize_writing tool with deterministic scoring and tests
+- `6e43efe` Make map-competition non-blocking for unverified competitor entries
 
----
+### 2026-02-25
+- `3318acd` Add keyless investment tool suite and FRED economic provider support
+- `1d5524a` Add TUI input history navigation with resume restore
+- `3b24715` Fix portfolio optimizer event-loop freeze in TUI runs
+- `a0e495f` Add keyless market-signal tool suite
+- `6914233` Fix synthesis deadlocks and add stalled-run safeguards
+- `d2dd913` Fix deterministic synthesis contract responses
+- `84e95f5` docs: align tutorial intro with harness positioning
+- `0e22f88` Make missing-data remediation non-fatal in marketing strategy
 
-## [0.3.0] -- Phase 2 Complete
+### 2026-02-26
+- `c5880f7` docs: use uv run loom in README commands
+- `3ebb559` adding technical design doc
+- `e088aa9` Implement reliability hardening and refresh technical design
 
-### Added
-- **TUI client** (`tui/app.py`) -- Textual-based terminal dashboard with live SSE streaming, task detail views, approval/rejection modals, and steering input.
-- **MCP server** (`integrations/mcp_server.py`) -- Model Context Protocol server exposing `loom_execute_task`, `loom_task_status`, and `loom_list_tasks` tools via stdio or SSE transport.
-- **Learning system** (`learning/manager.py`) -- pattern extraction from execution history: subtask success patterns, retry patterns, model failure patterns, and task templates. Queryable by type.
-- **Confidence scoring** (`recovery/confidence.py`) -- weighted scoring (verification 40%, tool success 30%, model quality 15%, complexity 15%) with band classification (high/medium/low/zero).
-- **Approval gates** (`recovery/approval.py`) -- auto, manual, and confidence-threshold modes. Always-gate for destructive operations (`rm -rf`, `sudo`, `.env` writes).
-- **Retry escalation** (`recovery/retry.py`) -- automatic tier escalation ladder (same tier -> next tier -> highest tier -> human flag).
-- **Webhook delivery** (`events/webhook.py`) -- callback URL notification on task completion/failure with exponential backoff retry.
-- **Event persistence** (`events/bus.py`) -- `EventPersister` subscribes to all events and writes to SQLite for audit and replay.
+### 2026-02-27
+- `8fb9b59` docs: update README.md
+- `551670d` docs: add README screenshot
+- `0de3623` Implement resource-first auth lifecycle, migration tooling, and UX hardening
+- `d133ef2` Harden process prompts and shell safety for segmentation runs
+- `f3747a4` Improve cowork turn telemetry and render chat as Markdown
+- `e98d3d5` Reduce startup and interaction latency via async MCP warmup
+- `d1dfa4f` Add hybrid tool entrypoints and follow-up config/auth updates
+- `338f427` Harden auth profile selection and tool inventory coverage
 
-### Changed
-- Orchestrator wired with verification gates, changelog tracking, memory extraction, and re-planning.
+### 2026-02-28
+- `dc3afe9` cowork: compact context via recall index and add turn telemetry
+- `55156ee` Improve hybrid list_tools flow and enforce scoped schema lookup
+- `b94f013` Fix cowork prompt JSON examples in f-string
+- `c2e61ff` Repair dangling tool-call chains in cowork context
+- `4536fb3` Add model-planned failure remediation with bounded metadata context
+- `8ef408a` Add cowork tool-loop convergence guard and context-window fix
+- `f1b3064` Add structured match and file counts to ripgrep_search
+- `f23d72d` Implement chat history replay refactor for TUI session resume
+- `3a743cf` Harden slash command hints with full scrollable catalog
+- `e994e59` Fix duplicate chat panel rows during live turns
+- `0883857` Implement cowork delegate progress UX and realtime TUI refresh
+- `44db5b9` Fix lint line-length in delegate progress widget
+- `1184a00` Harden /run launch liveness and in-place stage heartbeat UX
+- `2edf67e` Harden process-run cancel flow and fix queued Ctrl+W hangs
+- `b5df6ce` Move technical design doc to docs with updated date
+- `5cda3c2` changing image
+- `1a139bf` Add live GA4 API retrieval with auth to google-analytics package
+- `1e59c87` Fix ga_live_api tests leaking global tool registrations
+- `ab377f5` Move GA live API tests into package-local test directory
 
----
+### 2026-03-01
+- `c4630d8` Improve auth discovery scope and preserve selected mode in /auth
+- `d6e05ef` tui: remove /process mode and simplify /run palette flows
+- `38f57c9` mcp: add oauth token runtime and manager support
+- `486a6b6` Harden MCP/Auth management and tab UX
+- `c876a05` Add header activity indicator and refine active animation
+- `0ad619a` Add rich /model details and new /models TUI command
+- `1738235` Refine header activity indicator rendering behavior
+- `17d9b20` Align outputs with replans via phase IDs; remove deprecated auth-path noise
+- `48bda35` tui: align sidebar progress icons in dedicated column
+- `9d1a0f4` Fix MCP stale alias reload and auth-check explicit scoping
+- `e0d72f6` Implement hybrid cowork chat stop control and hardening
+- `227c1e7` Implement cowork steering queue controls and execution fixes
+- `fa6035e` Fix remote MCP OAuth and streamable MCP tool discovery
+- `9c20a61` Enable clickable markdown links with URL tooltip in cowork chat
+- `7c236df` auth: harden mcp oauth boundary and reuse compatible drafts
+- `72bb236` tui: make auth manager sync explicit and refresh read-only
+- `951db4c` Retheme cowork markdown to replace magenta defaults
+- `e3e2ad4` auth: classify audit history separately from active orphan findings
+- `c9fbfc1` auth: add /auth oauth lifecycle commands and tui actions
 
-## [0.2.0] -- Phase 1 Complete
+### 2026-03-02
+- `241e47c` Complete auth cleanup phases: OAuth parity, TUI mode UX, and token handling
+- `e8a2d6b` docs: sync endpoint count and current project stats
+- `5dac6ba` changing image
+- `e2dba38` tests: remove credential-style URI fixture
+- `ae69a68` ci: keep live canary config out of uploaded artifacts
+- `7416521` Improve tooling UX and provider-specific coding agent integrations
+- `385c66a` Guard on_key screen lookup when no screen stack is mounted
 
-### Added
-- **Orchestrator loop** (`engine/orchestrator.py`) -- core agentic loop: plan -> execute subtasks -> verify -> finalize. The harness drives work, not the model.
-- **API server** (`api/server.py`, `api/routes.py`) -- FastAPI REST endpoints for task CRUD, SSE streaming, steer/approve/feedback. Interactive docs at `/docs`.
-- **Task state management** (`state/task_state.py`) -- YAML-based task state with atomic file writes. Compact prompt injection format.
-- **Memory layer** (`state/memory.py`) -- SQLite archive with task/subtask/type/tag queries and full-text search.
-- **Prompt templates** (`prompts/assembler.py`, `prompts/templates/`) -- 7-section prompt assembly from YAML templates: role, task state, subtask, memory, tools, output format, constraints.
-- **Model router** (`models/router.py`) -- role + tier model selection with Ollama and OpenAI-compatible providers.
-- **Tool system** (`tools/`) -- registry with timeout, file read/write/edit, shell execution (with safety blocklist), file search, directory listing.
-- **Workspace management** (`tools/workspace.py`) -- changelog with before-snapshots, diff generation, revert at file/subtask/task level. Path traversal prevention.
-- **Scheduler** (`engine/scheduler.py`) -- dependency graph resolution for subtask ordering.
-- **Verification gates** (`engine/verification.py`) -- three-tier verification: deterministic checks (syntax, file existence), independent LLM review, multi-vote verification.
-- **Event bus** (`events/bus.py`) -- in-process async pub/sub for real-time updates.
-- **CLI** (`__main__.py`) -- Click-based CLI with default TUI, serve, run, status, cancel, models, cowork, mcp-serve commands.
+### 2026-03-03
+- `ed92c32` Add phase-level iteration loop runtime, gates, persistence, and docs
+- `42b5e08` Improve process run controls, auth preflight, and workspace selection
+- `a30398d` Fix chat scroll lock and tighten activity pane spacing
+- `5c36ed6` feat(cowork): harden long-session context recall and indexing
 
----
+### 2026-03-04
+- `3456125` Harden ask_user runtime flow and execution-surface gating
+- `ed2a6bc` Align delegate_task TUI approval default with /run
+- `f3c68ca` docs: remove stale LOC remark from README
+- `1ce7cca` adding trufflehog precommit hook
 
-## [0.1.0] -- Project Scaffold
+### 2026-03-05
+- `0813474` Improve command palette, landing flow, and close-tab safety
+- `031a631` Add loom2 hero image to README
+- `3dd0b07` feat(validity): enforce claim-level synthesis gates and evidence lineage
+- `6b72edf` Enforce evidence-backed edits for sealed verified artifacts
+- `bfdd915` Enable ask_user interactive defaults
+- `935e21d` Default process test execution to temp workspace
 
-### Added
-- Project structure: `pyproject.toml`, CI configuration, test infrastructure.
-- 15 specification documents covering all system components.
-- `loom.toml` configuration loader with sensible defaults.
+### 2026-03-06
+- `ca97094` Refine ask_user UX and raise per-subtask cap default
+- `b75d87a` Split placeholder prepass from confirm-or-prune resolution
+- `fecb07a` Harden SQLite migrations and startup persistence semantics
+- `8aaefc4` Implement telemetry coverage and auditability hardening
+- `03a16be` adding refactor plans and updates to technical doc
+- `c42ebbd` Relink migration diagnostics to event type constants
+- `0d77f06` Fix verification guard wording and token redaction
+- `d8df362` Harden fan-in output coordination and transactional publish flows
+- `0d70627` Implement runtime telemetry verbosity modes and controls
+
+### 2026-03-07
+- `a7fef18` Refactor core engine modules into package-based subsystems
+- `48ad5ec` refactor(tui): split app into package modules with css file
+- `cc90b6a` refactor(cli): split __main__ into modular cli package
+- `8ac0558` docs(plan): update main entrypoint split plan
+- `0c86629` Split monolithic TUI tests into tests/tui modules
+- `ab1647b` Split orchestrator tests into package and add legacy path guard
+- `d8ab27d` Unify sealed artifact mutation policy and sanitize docs paths

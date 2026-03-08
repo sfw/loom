@@ -15,6 +15,7 @@ from urllib.parse import parse_qs
 
 from click.testing import CliRunner
 
+from loom import __version__
 from loom.__main__ import cli
 from loom.config import Config, ProcessConfig
 from loom.processes.testing import ProcessCaseResult
@@ -70,7 +71,7 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(cli, ["--version"])
         assert result.exit_code == 0
-        assert "0.1.0" in result.output
+        assert __version__ in result.output
 
     def test_serve_help(self):
         runner = CliRunner()

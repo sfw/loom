@@ -12,6 +12,8 @@ Bring Kimi, Minimax, GLM, Claude, or any OpenAI-compatible model and Loom suppli
 
 It handles coding, research, document analysis (PDF, Word docs, PowerPoint decks), report generation, and multi-step business workflows.
 
+> Release: **v0.2.0** is now available. See [CHANGELOG](CHANGELOG.md) for details.
+
 ![Loom screenshot](docs/images/loom.png)
 
 **Claude-class cowork UX, local-ready.** Tools like Claude Code and Claude cowork deliver strong agentic experiences, and Claude Code can be paired with local model stacks depending on your setup. Loom's focus is different: a model-agnostic harness designed to keep local and mixed local/cloud execution reliable with structured planning, tool safety, independent verification, and persistent memory. Loom is also cross-platform, while Claude cowork is currently macOS + Claude-model oriented. The result is an agentic workflow that stays robust on your own hardware without locking you to one provider.

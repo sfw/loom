@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from loom import __version__
+
 from ..models import AdhocProcessCacheEntry
 
 if TYPE_CHECKING:
@@ -2130,7 +2132,7 @@ def serialize_process_for_package(process_defn: ProcessDefinition) -> dict[str, 
     payload: dict[str, Any] = {
         "name": process_defn.name,
         "schema_version": int(process_defn.schema_version or 1),
-        "version": "0.1.0",
+        "version": __version__,
         "description": process_defn.description,
         "persona": process_defn.persona,
         "tool_guidance": process_defn.tool_guidance,

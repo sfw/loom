@@ -21,6 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from loom import __version__
 from loom.config import (
     MCP_DEFAULT_DISCOVERY_TIMEOUT_SECONDS,
     MCP_DEFAULT_TIMEOUT_SECONDS,
@@ -562,7 +563,7 @@ class _MCPStdioClient:
                             params={
                                 "protocolVersion": "2025-11-05",
                                 "capabilities": {"tools": {"listChanged": True}},
-                                "clientInfo": {"name": "loom", "version": "0.1.0"},
+                                "clientInfo": {"name": "loom", "version": __version__},
                             },
                         )
                         try:
@@ -898,7 +899,7 @@ class _MCPRemoteHTTPClient:
             params={
                 "protocolVersion": "2025-11-05",
                 "capabilities": {"tools": {"listChanged": True}},
-                "clientInfo": {"name": "loom", "version": "0.1.0"},
+                "clientInfo": {"name": "loom", "version": __version__},
             },
             env_overrides=env_overrides,
             timeout=timeout,
