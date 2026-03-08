@@ -808,7 +808,7 @@ class TestOrchestratorValidityPolicy:
                     ToolCallRecord(
                         tool="write_file",
                         args={"path": "analysis.md", "content": "Evidence-backed analysis"},
-                        result=ToolResult.ok("ok"),
+                        result=ToolResult.ok("ok", files_changed=["analysis.md"]),
                     ),
                 ],
                 evidence_records=[],
@@ -842,7 +842,7 @@ class TestOrchestratorValidityPolicy:
         links = memory.insert_claim_evidence_links.await_args.kwargs["links"]
         assert links
         assert links[0]["claim_id"] == "CLM-001"
-        assert str(links[0]["evidence_id"]).startswith("EV-WRITE-")
+        assert str(links[0]["evidence_id"]).startswith("EV-ART-")
 
     def test_persist_subtask_evidence_captures_write_path_provenance(self, tmp_path):
         state_manager = _make_state_manager(tmp_path)
@@ -861,7 +861,7 @@ class TestOrchestratorValidityPolicy:
         tool_call = ToolCallRecord(
             tool="write_file",
             args={"path": "reports/final.md", "content": content},
-            result=ToolResult.ok("wrote reports/final.md"),
+            result=ToolResult.ok("wrote reports/final.md", files_changed=["reports/final.md"]),
             timestamp="2026-03-05T12:00:00",
         )
 
@@ -1032,7 +1032,7 @@ class TestOrchestratorValidityPolicy:
                 ToolCallRecord(
                     tool="write_file",
                     args={"path": "reports/final.md", "content": "final output"},
-                    result=ToolResult.ok("ok"),
+                    result=ToolResult.ok("ok", files_changed=["reports/final.md"]),
                 ),
             ],
             evidence_records=[],

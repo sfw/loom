@@ -1486,8 +1486,8 @@ class SubtaskRunner:
         tool_name: str,
         tool_args: dict,
         tool_result: ToolResult,
-        is_mutating_tool: bool,
-        mutation_target_arg_keys: MutationTargetArgKeys,
+        is_mutating_tool: bool = False,
+        mutation_target_arg_keys: MutationTargetArgKeys = None,
         subtask_id: str,
         tool_call_id: str,
     ) -> int:
