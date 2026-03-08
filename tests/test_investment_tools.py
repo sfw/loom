@@ -272,6 +272,45 @@ class TestValuationEngineTool:
         assert result.success
         assert result.data["per_share_value"]["base"] > 0
 
+    async def test_precedent_transaction_range(self, ctx: ToolContext):
+        tool = ValuationEngineTool()
+        result = await tool.execute(
+            {
+                "operation": "precedent_transaction_range",
+                "metric_basis": "ev_revenue",
+                "target_metric": 1200000000,
+                "shares_outstanding": 120000000,
+                "net_debt": 150000000,
+                "market_price": 8.5,
+                "transactions": [
+                    {"name": "Deal A", "multiple": 4.0, "premium_pct": 20, "weight": 0.5},
+                    {"name": "Deal B", "multiple": 3.6, "premium_pct": 10, "weight": 0.3},
+                    {"name": "Deal C", "multiple": 4.8, "premium_pct": 5, "weight": 0.2},
+                ],
+            },
+            ctx,
+        )
+        assert result.success
+        assert result.data["operation"] == "precedent_transaction_range"
+        assert result.data["per_share_range"]["expected"] > 0
+        assert len(result.data["transactions"]) == 3
+        assert result.data["multiple_range"]["high"] >= result.data["multiple_range"]["low"]
+
+    async def test_precedent_transaction_range_requires_transactions(self, ctx: ToolContext):
+        tool = ValuationEngineTool()
+        result = await tool.execute(
+            {
+                "operation": "precedent_transaction_range",
+                "metric_basis": "ev_revenue",
+                "target_metric": 1000000000,
+                "shares_outstanding": 100000000,
+                "transactions": [],
+            },
+            ctx,
+        )
+        assert not result.success
+        assert "transactions is required" in result.error
+
 
 class TestOpportunityRankerTool:
     async def test_rank_candidates(self, ctx: ToolContext):

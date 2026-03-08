@@ -1,4 +1,4 @@
-"""Valuation toolkit (DCF, implied growth, scenarios)."""
+"""Valuation toolkit (DCF, implied growth, scenarios, precedent comps)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,12 @@ from typing import Any
 from loom.research.finance import clamp
 from loom.tools.registry import Tool, ToolContext, ToolResult
 
-_OPERATIONS = {"intrinsic_value_range", "implied_growth", "scenario_valuation"}
+_OPERATIONS = {
+    "intrinsic_value_range",
+    "implied_growth",
+    "scenario_valuation",
+    "precedent_transaction_range",
+}
 
 
 class ValuationEngineTool(Tool):
@@ -22,7 +27,7 @@ class ValuationEngineTool(Tool):
     def description(self) -> str:
         return (
             "Run lightweight valuation models (DCF range, implied growth, "
-            "probability-weighted scenarios)."
+            "probability-weighted scenarios, precedent transaction ranges)."
         )
 
     @property
@@ -32,7 +37,12 @@ class ValuationEngineTool(Tool):
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["intrinsic_value_range", "implied_growth", "scenario_valuation"],
+                    "enum": [
+                        "intrinsic_value_range",
+                        "implied_growth",
+                        "scenario_valuation",
+                        "precedent_transaction_range",
+                    ],
                 },
                 "free_cash_flow": {"type": "number"},
                 "discount_rate": {"type": "number"},
@@ -52,6 +62,19 @@ class ValuationEngineTool(Tool):
                         "value_per_share}."
                     ),
                 },
+                "transactions": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        "Precedent transaction rows: {name, multiple, premium_pct, weight, "
+                        "date, acquirer, target}."
+                    ),
+                },
+                "target_metric": {"type": "number"},
+                "metric_basis": {
+                    "type": "string",
+                    "description": "Basis for target_metric, e.g. ev_revenue or ev_ebitda.",
+                },
                 "output_path": {"type": "string"},
             },
             "required": ["operation"],
@@ -66,7 +89,8 @@ class ValuationEngineTool(Tool):
         operation = str(args.get("operation", "")).strip().lower()
         if operation not in _OPERATIONS:
             return ToolResult.fail(
-                "operation must be intrinsic_value_range/implied_growth/scenario_valuation"
+                "operation must be intrinsic_value_range/implied_growth/"
+                "scenario_valuation/precedent_transaction_range"
             )
 
         try:
@@ -74,8 +98,10 @@ class ValuationEngineTool(Tool):
                 payload = _intrinsic_value_range(args)
             elif operation == "implied_growth":
                 payload = _implied_growth(args)
-            else:
+            elif operation == "scenario_valuation":
                 payload = _scenario_valuation(args)
+            else:
+                payload = _precedent_transaction_range(args)
         except Exception as e:
             return ToolResult.fail(str(e))
 
@@ -318,6 +344,131 @@ def _scenario_valuation(args: dict[str, Any]) -> dict[str, Any]:
         "value_range": {"low": low, "high": high},
         "confidence": clamp(0.4 + 0.07 * len(scenarios), 0.35, 0.9),
         "keyless": True,
+    }
+
+
+def _precedent_transaction_range(args: dict[str, Any]) -> dict[str, Any]:
+    raw = args.get("transactions", [])
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("transactions is required")
+
+    target_metric = _to_float(args.get("target_metric"))
+    shares = _to_float(args.get("shares_outstanding"))
+    if target_metric is None or target_metric <= 0:
+        raise ValueError("target_metric must be > 0")
+    if shares in (None, 0):
+        raise ValueError("shares_outstanding is required")
+
+    market_price = _to_float(args.get("market_price"))
+    net_debt = _to_float(args.get("net_debt"), 0.0) or 0.0
+    metric_basis = str(args.get("metric_basis", "")).strip().lower() or "ev_metric"
+
+    rows: list[dict[str, Any]] = []
+    weighted_multiple_sum = 0.0
+    weighted_value_sum = 0.0
+    total_weight = 0.0
+
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        multiple = _to_float(item.get("multiple"))
+        if multiple is None or multiple <= 0:
+            continue
+
+        weight = _to_float(item.get("weight"), 1.0) or 1.0
+        if weight <= 0:
+            continue
+        premium_pct = _to_float(item.get("premium_pct"), 0.0) or 0.0
+        adjusted_multiple = multiple * (1.0 + (premium_pct / 100.0))
+        implied_enterprise = target_metric * adjusted_multiple
+        implied_equity = implied_enterprise - net_debt
+        implied_per_share = implied_equity / shares
+
+        weighted_multiple_sum += adjusted_multiple * weight
+        weighted_value_sum += implied_per_share * weight
+        total_weight += weight
+
+        rows.append({
+            "name": str(
+                item.get("name")
+                or item.get("target")
+                or item.get("acquirer")
+                or f"transaction-{index}",
+            ).strip(),
+            "date": str(item.get("date", "") or "").strip(),
+            "target": str(item.get("target", "") or "").strip(),
+            "acquirer": str(item.get("acquirer", "") or "").strip(),
+            "multiple": multiple,
+            "premium_pct": premium_pct,
+            "weight": weight,
+            "adjusted_multiple": adjusted_multiple,
+            "implied_enterprise_value": implied_enterprise,
+            "implied_equity_value": implied_equity,
+            "implied_per_share": implied_per_share,
+        })
+
+    if not rows:
+        raise ValueError("No valid transactions parsed")
+
+    normalized_total = total_weight if total_weight > 0 else float(len(rows))
+    expected_multiple = weighted_multiple_sum / normalized_total
+    expected_per_share = weighted_value_sum / normalized_total
+
+    multiples = [float(row["adjusted_multiple"]) for row in rows]
+    per_share_values = [float(row["implied_per_share"]) for row in rows]
+    low_multiple = min(multiples)
+    high_multiple = max(multiples)
+    low_per_share = min(per_share_values)
+    high_per_share = max(per_share_values)
+
+    for row in rows:
+        row["normalized_weight"] = float(row["weight"]) / normalized_total
+
+    expected_enterprise = target_metric * expected_multiple
+    expected_equity = expected_enterprise - net_debt
+    margin_of_safety_pct = None
+    if market_price not in (None, 0):
+        margin_of_safety_pct = ((expected_per_share - market_price) / market_price) * 100.0
+
+    warnings: list[str] = []
+    if len(rows) < 3:
+        warnings.append("Fewer than 3 precedent transactions; range confidence is limited.")
+
+    return {
+        "operation": "precedent_transaction_range",
+        "assumptions": {
+            "metric_basis": metric_basis,
+            "target_metric": target_metric,
+            "shares_outstanding": shares,
+            "net_debt": net_debt,
+            "market_price": market_price,
+        },
+        "transactions": rows,
+        "multiple_range": {
+            "low": low_multiple,
+            "expected": expected_multiple,
+            "high": high_multiple,
+        },
+        "per_share_range": {
+            "low": low_per_share,
+            "expected": expected_per_share,
+            "high": high_per_share,
+        },
+        "enterprise_value_range": {
+            "low": target_metric * low_multiple,
+            "expected": expected_enterprise,
+            "high": target_metric * high_multiple,
+        },
+        "equity_value_range": {
+            "low": (target_metric * low_multiple) - net_debt,
+            "expected": expected_equity,
+            "high": (target_metric * high_multiple) - net_debt,
+        },
+        "margin_of_safety_pct": margin_of_safety_pct,
+        "confidence": clamp(0.45 + 0.05 * len(rows), 0.45, 0.85),
+        "keyless": True,
+        "warnings": warnings,
+        "recommended_anchor": expected_per_share,
     }
 
 

@@ -381,6 +381,39 @@ class TestDeterministicVerifier:
         result = await v.verify(_make_subtask(), "output", [tc], tmp_path)
         assert not result.passed
 
+    @pytest.mark.asyncio
+    async def test_csv_syntax_check_passes_with_consistent_row_width(self, tmp_path):
+        test_file = tmp_path / "good.csv"
+        test_file.write_text("a,b,c\n1,2,3\n4,5,6\n", encoding="utf-8")
+
+        v = DeterministicVerifier()
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "good.csv"},
+            result=ToolResult.ok("ok", files_changed=["good.csv"]),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], tmp_path)
+        assert result.passed
+
+    @pytest.mark.asyncio
+    async def test_csv_syntax_check_fails_on_row_width_mismatch(self, tmp_path):
+        test_file = tmp_path / "bad.csv"
+        test_file.write_text("a,b,c\n1,2,3\n4,5\n", encoding="utf-8")
+
+        v = DeterministicVerifier()
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "bad.csv"},
+            result=ToolResult.ok("ok", files_changed=["bad.csv"]),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], tmp_path)
+        assert not result.passed
+        assert result.reason_code == "csv_schema_mismatch"
+        assert any(
+            (c.detail or "").find("reason_code=csv_schema_mismatch") >= 0
+            for c in result.checks
+        )
+
 
 # --- LLMVerifier ---
 

@@ -237,6 +237,8 @@ class RetryManager:
             "unsupported_entries_remain",
             "partial_evidence_coverage",
             "unverified_entries_remaining",
+            "missing_precedent_transactions",
+            "csv_schema_mismatch",
         }
 
         # Prefer structured verification contract when available.

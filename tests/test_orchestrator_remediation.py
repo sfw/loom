@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -95,6 +95,35 @@ def test_bounded_remediation_backoff_caps_growth() -> None:
         max_backoff_seconds=5.0,
         attempt_count=4,
     ) == 5.0
+
+
+def test_build_remediation_retry_context_includes_reason_specific_guidance(tmp_path: Path) -> None:
+    events: list = []
+    orch, _ = _make_orchestrator(tmp_path=tmp_path, events=events)
+    text = orch._build_remediation_retry_context(
+        strategy=RetryStrategy.UNCONFIRMED_DATA,
+        reason_code="missing_precedent_transactions",
+    )
+    assert "structured precedent transaction evidence" in text
+
+
+def test_build_remediation_retry_context_prefers_reason_specific_process_instructions(
+    tmp_path: Path,
+) -> None:
+    events: list = []
+    orch, _ = _make_orchestrator(tmp_path=tmp_path, events=events)
+    process = MagicMock()
+    process.prompt_remediation_instructions = MagicMock(return_value="Fix precedent rows first.")
+    orch._process = process
+
+    text = orch._build_remediation_retry_context(
+        strategy=RetryStrategy.UNCONFIRMED_DATA,
+        reason_code="missing_precedent_transactions",
+    )
+    assert "Fix precedent rows first." in text
+    process.prompt_remediation_instructions.assert_has_calls([
+        call("missing_precedent_transactions"),
+    ])
 
 
 @pytest.mark.asyncio

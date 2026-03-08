@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import re
@@ -690,6 +691,36 @@ class DeterministicVerifier:
                     detail=f"YAML syntax error: {e}",
                 )
 
+        elif ext == ".csv":
+            try:
+                with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+                    reader = csv.reader(handle)
+                    expected_columns: int | None = None
+                    for row_number, row in enumerate(reader, start=1):
+                        if not row:
+                            continue
+                        if expected_columns is None:
+                            expected_columns = len(row)
+                            continue
+                        actual_columns = len(row)
+                        if actual_columns != expected_columns:
+                            return Check(
+                                name=f"syntax_{path.name}",
+                                passed=False,
+                                detail=(
+                                    "reason_code=csv_schema_mismatch; "
+                                    f"CSV row {row_number} has {actual_columns} columns "
+                                    f"(expected {expected_columns})."
+                                ),
+                            )
+                return Check(name=f"syntax_{path.name}", passed=True)
+            except Exception as e:
+                return Check(
+                    name=f"syntax_{path.name}",
+                    passed=False,
+                    detail=f"CSV syntax error: {e}",
+                )
+
         return None
 
     @staticmethod
@@ -1004,5 +1035,4 @@ class DeterministicVerifier:
         if len(lines) == 1:
             return None
         return "\n".join(lines)
-
 

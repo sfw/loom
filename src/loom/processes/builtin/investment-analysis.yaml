@@ -125,10 +125,13 @@ phases:
     acceptance_criteria: >
       Model includes assumptions, scenario ranges, and sensitivity table.
       Scenario probabilities sum to 100%. Output includes expected value and
-      annualized return framing for the defined horizon.
+      annualized return framing for the defined horizon. When precedent
+      transaction methodology is used, include structured precedent evidence
+      (transaction rows with deal identifiers, multiple basis, and implied
+      valuation bridge) in canonical deliverables.
     deliverables:
       - "valuation-model.csv — assumptions, scenarios, and sensitivity table"
-      - "comparable-multiples.csv — peer or transaction multiples reference"
+      - "comparable-multiples.csv — peer/transaction multiples with structured precedent rows when precedent method is used"
       - "return-distribution.csv — scenario probabilities and expected return math"
       - "valuation-summary.md — valuation range, key drivers, and caveats"
 
@@ -279,6 +282,18 @@ verification:
       type: llm
       applies_to_phases: [valuation-model, investment-memo]
 
+    - name: precedent-transaction-evidence
+      description: "Precedent transaction analysis must be structured when used"
+      check: >
+        When the output claims precedent transaction modeling/analysis, verify
+        structured precedent evidence exists in canonical deliverables (for
+        example transaction rows in comparable-multiples.csv with deal
+        identifiers, date context, multiple basis, and implied valuation
+        bridge). Narrative mention without structured evidence is insufficient.
+      severity: error
+      type: llm
+      applies_to_phases: [valuation-model, investment-memo]
+
     - name: capital-structure-risk
       description: "Balance-sheet and dilution risks must be assessed"
       check: >
@@ -337,10 +352,20 @@ prompt_contracts:
   verifier_constraints: |
     Evaluate acceptance criteria and process verification rules without assuming
     a fixed output schema. Use metadata keys only when inferable.
+    If precedent transaction modeling is required but structured evidence is
+    missing, prefer reason_code=missing_precedent_transactions.
   remediation_instructions:
     default: |
       Perform targeted remediation only for failing checks. Preserve validated
       work, add missing evidence links, and avoid broad reruns.
+    missing_precedent_transactions: |
+      Add structured precedent transaction evidence in canonical deliverables.
+      Include deal identifiers, date context, multiple basis, and implied
+      valuation bridge, then align summary claims to that evidence.
+    csv_schema_mismatch: |
+      Repair CSV structure before any semantic edits: ensure each non-empty row
+      has the same field count as the header and preserve canonical delimiter/
+      quoting conventions.
 
 memory:
   extract_types:

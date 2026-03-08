@@ -650,6 +650,7 @@ async def run_confirm_or_prune_remediation(
         remediation_context = (
             orchestrator._build_remediation_retry_context(
                 strategy=RetryStrategy.UNCONFIRMED_DATA,
+                reason_code=placeholder_reason_code,
             )
         )
         output_policy = orchestrator._output_write_policy_for_subtask(subtask=subtask)
@@ -1895,7 +1896,12 @@ async def _plan_failure_resolution(
     })
     return self._format_failure_resolution_plan(response)
 
-def _build_remediation_retry_context(self, *, strategy: RetryStrategy) -> str:
+def _build_remediation_retry_context(
+    self,
+    *,
+    strategy: RetryStrategy,
+    reason_code: str = "",
+) -> str:
     lines = [
         "TARGETED REMEDIATION:",
         "- Keep already validated work; avoid redoing solved sections.",
@@ -1904,9 +1910,29 @@ def _build_remediation_retry_context(self, *, strategy: RetryStrategy) -> str:
         "or remove unsupported claims per process policy.",
         "- Make the smallest safe edits needed to satisfy acceptance criteria.",
     ]
+    normalized_reason = str(reason_code or "").strip().lower()
+    if normalized_reason == "missing_precedent_transactions":
+        lines.extend([
+            "REASON-SPECIFIC REMEDIATION:",
+            "- Add explicit structured precedent transaction evidence in canonical "
+            "deliverables.",
+            "- Include deal identifiers, multiple basis, assumptions, and implied "
+            "valuation bridge.",
+            "- Ensure precedent evidence is not only narrative prose.",
+        ])
+    elif normalized_reason == "csv_schema_mismatch":
+        lines.extend([
+            "REASON-SPECIFIC REMEDIATION:",
+            "- Repair CSV row-width mismatches so every non-empty row matches the header.",
+            "- Re-check appended rows and delimiter/quoting consistency before retry.",
+        ])
     process = self._process
     if process is not None:
-        instructions = process.prompt_remediation_instructions(strategy.value)
+        instructions = ""
+        if normalized_reason:
+            instructions = process.prompt_remediation_instructions(normalized_reason)
+        if not instructions:
+            instructions = process.prompt_remediation_instructions(strategy.value)
         if instructions:
             lines.append("PROCESS REMEDIATION INSTRUCTIONS:")
             lines.append(instructions)
