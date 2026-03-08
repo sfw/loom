@@ -34,33 +34,33 @@ Verification and remediation become contract-driven, observable, and resilient:
 
 ## Scope
 Core runtime:
-- `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-- `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-- `/Users/sfw/Development/loom/src/loom/recovery/retry.py`
-- `/Users/sfw/Development/loom/src/loom/recovery/errors.py`
-- `/Users/sfw/Development/loom/src/loom/state/task_state.py`
-- `/Users/sfw/Development/loom/src/loom/state/evidence.py`
-- `/Users/sfw/Development/loom/src/loom/events/types.py`
-- `/Users/sfw/Development/loom/src/loom/tui/app.py`
-- `/Users/sfw/Development/loom/src/loom/cowork/session.py`
+- `<repo-root>/src/loom/engine/verification.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/engine/runner.py`
+- `<repo-root>/src/loom/recovery/retry.py`
+- `<repo-root>/src/loom/recovery/errors.py`
+- `<repo-root>/src/loom/state/task_state.py`
+- `<repo-root>/src/loom/state/evidence.py`
+- `<repo-root>/src/loom/events/types.py`
+- `<repo-root>/src/loom/tui/app.py`
+- `<repo-root>/src/loom/cowork/session.py`
 
 Process/schema governance:
-- `/Users/sfw/Development/loom/src/loom/processes/schema.py`
-- `/Users/sfw/Development/loom/src/loom/processes/builtin/*.yaml`
-- `/Users/sfw/Development/loom/packages/*/process.yaml`
+- `<repo-root>/src/loom/processes/schema.py`
+- `<repo-root>/src/loom/processes/builtin/*.yaml`
+- `<repo-root>/packages/*/process.yaml`
 
 Prompting:
-- `/Users/sfw/Development/loom/src/loom/prompts/templates/verifier.yaml`
+- `<repo-root>/src/loom/prompts/templates/verifier.yaml`
 
 Tests and fixtures:
-- `/Users/sfw/Development/loom/tests/test_verification.py`
-- `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-- `/Users/sfw/Development/loom/tests/test_retry.py`
-- `/Users/sfw/Development/loom/tests/test_processes.py`
-- `/Users/sfw/Development/loom/tests/test_tui.py`
-- `/Users/sfw/Development/loom/tests/test_workspace.py`
-- `/Users/sfw/Development/loom/tests/golden/verification/*`
+- `<repo-root>/tests/test_verification.py`
+- `<repo-root>/tests/test_orchestrator.py`
+- `<repo-root>/tests/test_retry.py`
+- `<repo-root>/tests/test_processes.py`
+- `<repo-root>/tests/test_tui.py`
+- `<repo-root>/tests/test_workspace.py`
+- `<repo-root>/tests/golden/verification/*`
 
 ## Workstreams
 

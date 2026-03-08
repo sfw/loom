@@ -20,14 +20,14 @@ This plan introduces a control plane that preserves current reliability while en
 
 ## Baseline (Repo-Accurate)
 1. Input handling:
-- `/Users/sfw/Development/loom/src/loom/tui/app.py` (`on_user_submit`) clears input, handles slash commands, then returns early when `_chat_busy` is true.
+- `<repo-root>/src/loom/tui/app.py` (`on_user_submit`) clears input, handles slash commands, then returns early when `_chat_busy` is true.
 2. Slash command catalog:
-- `/Users/sfw/Development/loom/src/loom/tui/app.py` `_SLASH_COMMANDS` has no `/steer` command today.
+- `<repo-root>/src/loom/tui/app.py` `_SLASH_COMMANDS` has no `/steer` command today.
 3. Turn execution:
 - `_run_turn(...)` and `_run_interaction(...)` execute one streaming loop at a time with no external mutation hook.
 4. Session/model interface:
-- `/Users/sfw/Development/loom/src/loom/cowork/session.py` has `send_streaming(...)` but no queued steer queue or control ingress.
-- `/Users/sfw/Development/loom/src/loom/models/base.py` has no provider capability/contract for live stream steering.
+- `<repo-root>/src/loom/cowork/session.py` has `send_streaming(...)` but no queued steer queue or control ingress.
+- `<repo-root>/src/loom/models/base.py` has no provider capability/contract for live stream steering.
 
 ## Product Behavior Contract
 
@@ -115,8 +115,8 @@ Add palette entries for:
 
 ### Workstream 1: UX Contract + Command Surface
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/tui/commands.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/tui/commands.py`
 
 Deliverables:
 1. `/steer` command parsing and usage docs in help text/autocomplete.
@@ -129,8 +129,8 @@ Acceptance:
 
 ### Workstream 2: Chat Queue + Editable Pending State
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/cowork/session_state.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/cowork/session_state.py`
 
 Deliverables:
 1. In-memory queue model with stable ids.
@@ -143,8 +143,8 @@ Acceptance:
 
 ### Workstream 3: Interrupt-and-Steer Fallback Path (Option 2)
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/src/loom/cowork/session.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/src/loom/cowork/session.py`
 
 Deliverables:
 1. Active turn cancellation path tied to steer-now command.
@@ -158,11 +158,11 @@ Acceptance:
 
 ### Workstream 4: Provider Capability + Native Steer Interface (Option 3)
 Files:
-1. `/Users/sfw/Development/loom/src/loom/config.py`
-2. `/Users/sfw/Development/loom/src/loom/models/base.py`
-3. `/Users/sfw/Development/loom/src/loom/models/openai_provider.py`
-4. `/Users/sfw/Development/loom/src/loom/models/anthropic_provider.py`
-5. `/Users/sfw/Development/loom/src/loom/models/ollama_provider.py`
+1. `<repo-root>/src/loom/config.py`
+2. `<repo-root>/src/loom/models/base.py`
+3. `<repo-root>/src/loom/models/openai_provider.py`
+4. `<repo-root>/src/loom/models/anthropic_provider.py`
+5. `<repo-root>/src/loom/models/ollama_provider.py`
 
 Deliverables:
 1. Capability flag(s) for live steer support.
@@ -175,8 +175,8 @@ Acceptance:
 
 ### Workstream 5: Session Control Plane + Strategy Router
 Files:
-1. `/Users/sfw/Development/loom/src/loom/cowork/session.py`
-2. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/cowork/session.py`
+2. `<repo-root>/src/loom/tui/app.py`
 
 Deliverables:
 1. Strategy selection logic (`native_live_steer` vs `interrupt_and_steer`).
@@ -189,10 +189,10 @@ Acceptance:
 
 ### Workstream 6: Tests
 Files:
-1. `/Users/sfw/Development/loom/tests/test_tui.py`
-2. `/Users/sfw/Development/loom/tests/test_streaming.py`
-3. `/Users/sfw/Development/loom/tests/test_model_router.py`
-4. `/Users/sfw/Development/loom/tests/test_config.py`
+1. `<repo-root>/tests/test_tui.py`
+2. `<repo-root>/tests/test_streaming.py`
+3. `<repo-root>/tests/test_model_router.py`
+4. `<repo-root>/tests/test_config.py`
 
 Deliverables:
 1. Busy-input queue tests (no dropped text).
@@ -207,9 +207,9 @@ Acceptance:
 
 ### Workstream 7: Docs and Tutorial Updates
 Files:
-1. `/Users/sfw/Development/loom/README.md`
-2. `/Users/sfw/Development/loom/docs/tutorial.html`
-3. `/Users/sfw/Development/loom/docs/agent-integration.md` (if API parity notes are added)
+1. `<repo-root>/README.md`
+2. `<repo-root>/docs/tutorial.html`
+3. `<repo-root>/docs/agent-integration.md` (if API parity notes are added)
 
 Deliverables:
 1. New `/steer` command docs.

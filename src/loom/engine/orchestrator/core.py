@@ -752,12 +752,14 @@ class Orchestrator:
         subtask_id: str,
         tool_calls: list[ToolCallRecord] | None,
         existing_ids: set[str],
+        workspace: Path | None = None,
     ) -> list[dict[str, object]]:
         return orchestrator_validity._artifact_provenance_evidence(
             task_id=task_id,
             subtask_id=subtask_id,
             tool_calls=tool_calls,
             existing_ids=existing_ids,
+            workspace=workspace,
         )
 
     @staticmethod
@@ -2240,6 +2242,7 @@ class Orchestrator:
         evidence_records: list[dict] | None,
         *,
         tool_calls: list[ToolCallRecord] | None = None,
+        workspace: str | Path | None = None,
     ) -> None:
         return orchestrator_evidence._persist_subtask_evidence(
             self,
@@ -2247,6 +2250,7 @@ class Orchestrator:
             subtask_id,
             evidence_records,
             tool_calls=tool_calls,
+            workspace=workspace,
         )
 
     @staticmethod

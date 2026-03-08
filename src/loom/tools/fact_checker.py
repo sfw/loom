@@ -89,6 +89,11 @@ class FactCheckerTool(Tool):
     def timeout_seconds(self) -> int:
         return 45
 
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         claims = _load_claims(args.get("claims"), args.get("claims_path"), self, ctx)
         if not claims:

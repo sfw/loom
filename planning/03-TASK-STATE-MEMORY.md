@@ -38,7 +38,7 @@ task:
   id: "a1b2c3d4"
   goal: "Migrate database from MySQL to PostgreSQL"
   status: executing
-  workspace: "/Users/scott/projects/myapp"
+  workspace: "/path/to/myapp"
 
 plan:
   version: 3

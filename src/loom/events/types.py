@@ -46,6 +46,9 @@ TOOL_CALL_STARTED = "tool_call_started"
 TOOL_CALL_COMPLETED = "tool_call_completed"
 TOOL_CALL_DEDUPLICATED = "tool_call_deduplicated"
 FORBIDDEN_CANONICAL_WRITE_BLOCKED = "forbidden_canonical_write_blocked"
+SEALED_POLICY_PREFLIGHT_BLOCKED = "sealed_policy_preflight_blocked"
+SEALED_RESEAL_APPLIED = "sealed_reseal_applied"
+SEALED_UNEXPECTED_MUTATION_DETECTED = "sealed_unexpected_mutation_detected"
 ARTIFACT_CONFINEMENT_VIOLATION = "artifact_confinement_violation"
 ARTIFACT_INGEST_CLASSIFIED = "artifact_ingest_classified"
 ARTIFACT_INGEST_COMPLETED = "artifact_ingest_completed"
@@ -192,6 +195,9 @@ EVENT_LIFECYCLE: dict[str, EventLifecycle] = {
     TOOL_CALL_COMPLETED: "active",
     TOOL_CALL_DEDUPLICATED: "active",
     FORBIDDEN_CANONICAL_WRITE_BLOCKED: "active",
+    SEALED_POLICY_PREFLIGHT_BLOCKED: "active",
+    SEALED_RESEAL_APPLIED: "active",
+    SEALED_UNEXPECTED_MUTATION_DETECTED: "active",
     ARTIFACT_CONFINEMENT_VIOLATION: "active",
     ARTIFACT_INGEST_CLASSIFIED: "active",
     ARTIFACT_INGEST_COMPLETED: "active",

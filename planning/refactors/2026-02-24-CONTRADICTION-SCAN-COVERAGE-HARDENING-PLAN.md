@@ -21,17 +21,17 @@ Current contradiction guard behavior can downgrade some placeholder failures to 
 
 ## Scope
 Primary:
-1. `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-2. `/Users/sfw/Development/loom/src/loom/config.py`
-3. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py` (only if additional verifier context plumbing is needed)
-4. `/Users/sfw/Development/loom/src/loom/events/types.py`
-5. `/Users/sfw/Development/loom/tests/test_verification.py`
-6. `/Users/sfw/Development/loom/tests/test_orchestrator.py` (if context propagation changes)
-7. `/Users/sfw/Development/loom/tests/test_config.py`
+1. `<repo-root>/src/loom/engine/verification.py`
+2. `<repo-root>/src/loom/config.py`
+3. `<repo-root>/src/loom/engine/orchestrator.py` (only if additional verifier context plumbing is needed)
+4. `<repo-root>/src/loom/events/types.py`
+5. `<repo-root>/tests/test_verification.py`
+6. `<repo-root>/tests/test_orchestrator.py` (if context propagation changes)
+7. `<repo-root>/tests/test_config.py`
 
 Potential secondary touchpoints (only if needed):
-1. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-2. `/Users/sfw/Development/loom/src/loom/state/task_state.py` (avoid unless metadata persistence contract needs extension)
+1. `<repo-root>/src/loom/engine/runner.py`
+2. `<repo-root>/src/loom/state/task_state.py` (avoid unless metadata persistence contract needs extension)
 
 ## Current Gap
 The contradiction scan currently emphasizes canonical/current-phase artifacts and immediate changed files. That is directionally correct, but coverage can be insufficient when:

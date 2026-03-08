@@ -39,6 +39,7 @@ class TestDefaultConfig:
         assert config.execution.max_task_replans == 0
         assert config.execution.max_task_remediation_attempts == 0
         assert config.execution.executor_completion_contract_mode == "off"
+        assert config.execution.sealed_artifact_post_call_guard == "warn"
         assert config.execution.planner_degraded_mode == "allow"
         assert config.execution.enable_sqlite_remediation_queue is False
         assert config.execution.enable_durable_task_runner is False
@@ -358,6 +359,7 @@ planner_degraded_mode = "require_approval"
 enable_sqlite_remediation_queue = true
 enable_durable_task_runner = true
 enable_mutation_idempotency = true
+sealed_artifact_post_call_guard = "enforce"
 enable_slo_metrics = true
 ask_user_v2_enabled = true
 ask_user_runtime_blocking_enabled = true
@@ -393,6 +395,7 @@ cowork_recall_index_max_chars = 1900
         assert config.execution.enable_sqlite_remediation_queue is True
         assert config.execution.enable_durable_task_runner is True
         assert config.execution.enable_mutation_idempotency is True
+        assert config.execution.sealed_artifact_post_call_guard == "enforce"
         assert config.execution.enable_slo_metrics is True
         assert config.execution.ask_user_v2_enabled is True
         assert config.execution.ask_user_runtime_blocking_enabled is True
@@ -437,6 +440,15 @@ ask_user_min_seconds_between_questions = -5
         assert config.execution.ask_user_max_pending_per_task == 1
         assert config.execution.ask_user_max_questions_per_subtask == 1
         assert config.execution.ask_user_min_seconds_between_questions == 0
+
+    def test_execution_sealed_post_call_guard_invalid_falls_back(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[execution]
+sealed_artifact_post_call_guard = "mystery"
+""")
+        config = load_config(toml_file)
+        assert config.execution.sealed_artifact_post_call_guard == "warn"
 
     def test_execution_software_tools_flags_loaded(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

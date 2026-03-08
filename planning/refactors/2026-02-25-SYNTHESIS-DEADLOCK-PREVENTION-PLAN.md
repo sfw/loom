@@ -18,9 +18,9 @@ Root-cause shape:
 4. This creates a deterministic deadlock with pending work and zero runnable subtasks.
 
 Relevant code paths:
-- `/Users/sfw/Development/loom/src/loom/engine/scheduler.py`
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-- `/Users/sfw/Development/loom/src/loom/prompts/templates/planner.yaml`
+- `<repo-root>/src/loom/engine/scheduler.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/prompts/templates/planner.yaml`
 
 ## Design Principles
 1. `is_synthesis` must mean terminal integration, not "important" or "late-stage".
@@ -42,23 +42,23 @@ Relevant code paths:
 
 ## Scope
 Core runtime:
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-- `/Users/sfw/Development/loom/src/loom/engine/scheduler.py`
-- `/Users/sfw/Development/loom/src/loom/events/types.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/engine/scheduler.py`
+- `<repo-root>/src/loom/events/types.py`
 
 Planning contract:
-- `/Users/sfw/Development/loom/src/loom/prompts/templates/planner.yaml`
-- `/Users/sfw/Development/loom/src/loom/prompts/templates/replanner.yaml`
+- `<repo-root>/src/loom/prompts/templates/planner.yaml`
+- `<repo-root>/src/loom/prompts/templates/replanner.yaml`
 
 Verification and UX transparency:
-- `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-- `/Users/sfw/Development/loom/src/loom/tui/app.py`
+- `<repo-root>/src/loom/engine/verification.py`
+- `<repo-root>/src/loom/tui/app.py`
 
 Tests:
-- `/Users/sfw/Development/loom/tests/test_scheduler.py`
-- `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-- `/Users/sfw/Development/loom/tests/test_prompts.py`
-- `/Users/sfw/Development/loom/tests/test_verification.py`
+- `<repo-root>/tests/test_scheduler.py`
+- `<repo-root>/tests/test_orchestrator.py`
+- `<repo-root>/tests/test_prompts.py`
+- `<repo-root>/tests/test_verification.py`
 
 ## Design
 
@@ -131,8 +131,8 @@ TUI behavior:
 
 ### W1: Plan-Shape Validator and Normalizer
 Files:
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-- `/Users/sfw/Development/loom/src/loom/engine/scheduler.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/engine/scheduler.py`
 
 Tasks:
 1. Add helper to compute dependents/out-degree and validate synthesis rules.
@@ -141,7 +141,7 @@ Tasks:
 
 ### W2: Scheduler Gate Refinement
 Files:
-- `/Users/sfw/Development/loom/src/loom/engine/scheduler.py`
+- `<repo-root>/src/loom/engine/scheduler.py`
 
 Tasks:
 1. Gate only sink synthesis nodes with global non-synthesis completion rule.
@@ -149,8 +149,8 @@ Tasks:
 
 ### W3: Deadlock Recovery Path
 Files:
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-- `/Users/sfw/Development/loom/src/loom/events/types.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/events/types.py`
 
 Tasks:
 1. Add blocked-reason computation.
@@ -159,8 +159,8 @@ Tasks:
 
 ### W4: Planner Contract Update
 Files:
-- `/Users/sfw/Development/loom/src/loom/prompts/templates/planner.yaml`
-- `/Users/sfw/Development/loom/src/loom/prompts/templates/replanner.yaml`
+- `<repo-root>/src/loom/prompts/templates/planner.yaml`
+- `<repo-root>/src/loom/prompts/templates/replanner.yaml`
 
 Tasks:
 1. Tighten `is_synthesis` guidance to terminal-only semantics.
@@ -168,7 +168,7 @@ Tasks:
 
 ### W5: Synthesis Input Integrity Verification
 Files:
-- `/Users/sfw/Development/loom/src/loom/engine/verification.py`
+- `<repo-root>/src/loom/engine/verification.py`
 
 Tasks:
 1. Add/extend check for terminal synthesis coverage of upstream outputs.
@@ -176,7 +176,7 @@ Tasks:
 
 ### W6: TUI Transparency
 Files:
-- `/Users/sfw/Development/loom/src/loom/tui/app.py`
+- `<repo-root>/src/loom/tui/app.py`
 
 Tasks:
 1. Render stalled/recovery events in activity pane.

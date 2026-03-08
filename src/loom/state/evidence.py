@@ -193,6 +193,19 @@ def _record_payload(call: Any) -> tuple[str, dict[str, Any], Any]:
     return tool, args, result
 
 
+def _files_changed(result: Any) -> list[str]:
+    changed = list(getattr(result, "files_changed", []) or [])
+    relpaths: list[str] = []
+    seen: set[str] = set()
+    for raw in changed:
+        relpath = _normalize_text(raw)
+        if not relpath or relpath in seen:
+            continue
+        seen.add(relpath)
+        relpaths.append(relpath)
+    return relpaths
+
+
 def _coerce_scalar_facet(value: object) -> str:
     if isinstance(value, (str, int, float, bool)):
         return _normalize_text(value)
@@ -308,7 +321,8 @@ def extract_evidence_records(
         tool, args, result = _record_payload(call)
         if result is None or not getattr(result, "success", False):
             continue
-        if not _should_capture_tool_evidence(tool, args):
+        changed_files = _files_changed(result)
+        if not _should_capture_tool_evidence(tool, args) and not changed_files:
             continue
 
         result_data = getattr(result, "data", None)
@@ -325,6 +339,7 @@ def extract_evidence_records(
             args.get("query")
             or args.get("q")
             or args.get("search_query")
+            or (changed_files[0] if changed_files else "")
             or args.get("path")
             or args.get("file_path")
             or result_data.get("path")
@@ -352,7 +367,11 @@ def extract_evidence_records(
             facet_mappings=facet_mappings,
         )
         artifact_path = _normalize_text(
-            args.get("path")
+            (changed_files[0] if changed_files else "")
+            or args.get("output_path")
+            or args.get("output_json_path")
+            or args.get("searchable_output_path")
+            or args.get("path")
             or args.get("file_path")
             or result_data.get("path")
             or ""
@@ -381,7 +400,7 @@ def extract_evidence_records(
             "task_id": task_id,
             "subtask_id": subtask_id,
             "tool": tool,
-            "evidence_kind": _evidence_kind(tool),
+            "evidence_kind": "artifact" if changed_files else _evidence_kind(tool),
             "tool_call_id": _normalize_text(getattr(call, "call_id", "")),
             "source_url": source_url,
             "query": query_text,

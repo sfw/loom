@@ -56,6 +56,9 @@ def new_telemetry_rollup() -> dict[str, int]:
         "compaction_policy_decisions": 0,
         "overflow_fallback_count": 0,
         "compactor_warning_count": 0,
+        "sealed_policy_preflight_blocked": 0,
+        "sealed_reseal_applied": 0,
+        "sealed_unexpected_mutation_detected": 0,
     }
 
 
@@ -78,6 +81,9 @@ def accumulate_subtask_telemetry(orchestrator, result: SubtaskResult) -> None:
         "compaction_policy_decisions",
         "overflow_fallback_count",
         "compactor_warning_count",
+        "sealed_policy_preflight_blocked",
+        "sealed_reseal_applied",
+        "sealed_unexpected_mutation_detected",
     ):
         try:
             increment = int(counters.get(key, 0))
@@ -197,6 +203,13 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
         "compaction_policy_decisions": int(rollup.get("compaction_policy_decisions", 0)),
         "overflow_fallback_count": int(rollup.get("overflow_fallback_count", 0)),
         "compactor_warning_count": int(rollup.get("compactor_warning_count", 0)),
+        "sealed_policy_preflight_blocked": int(
+            rollup.get("sealed_policy_preflight_blocked", 0),
+        ),
+        "sealed_reseal_applied": int(rollup.get("sealed_reseal_applied", 0)),
+        "sealed_unexpected_mutation_detected": int(
+            rollup.get("sealed_unexpected_mutation_detected", 0),
+        ),
         "verification_lifecycle_counts": verification_lifecycle_counts,
         "verification_reason_counts": verification_reason_counts,
         "remediation_lifecycle_counts": remediation_lifecycle_counts,

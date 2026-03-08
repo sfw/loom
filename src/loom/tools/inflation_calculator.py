@@ -66,6 +66,11 @@ class InflationCalculatorTool(Tool):
             "required": ["amount", "from_year", "to_year"],
         }
 
+
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         region = str(args.get("region", "US")).strip().upper() or "US"
         if region != "US":

@@ -13,6 +13,7 @@ from loom.auth.runtime import AuthResolutionError, build_run_auth_context
 from loom.engine.verification import Check, VerificationResult
 from loom.events.types import (
     FORBIDDEN_CANONICAL_WRITE_BLOCKED,
+    SEALED_UNEXPECTED_MUTATION_DETECTED,
     TOOL_CALL_COMPLETED,
     TOOL_CALL_DEDUPLICATED,
     TOOL_CALL_STARTED,
@@ -381,8 +382,12 @@ async def run_subtask(
                         TOOL_CALL_STARTED, task.id, subtask.id,
                         tc.name, tc.arguments,
                     )
+                    tool_call_id = str(getattr(tc, "id", "") or "")
                     tool_obj = runner._tools.get(tc.name)
                     is_mutating_tool = bool(getattr(tool_obj, "is_mutating", False))
+                    mutation_target_arg_keys = tuple(
+                        getattr(tool_obj, "mutation_target_arg_keys", ()) or (),
+                    )
                     runner._increment_subtask_counter("tool_calls")
                     if is_mutating_tool:
                         runner._increment_subtask_counter("mutating_tool_calls")
@@ -390,6 +395,8 @@ async def run_subtask(
                         tool_name=tc.name,
                         tool_args=tc.arguments,
                         workspace=workspace,
+                        is_mutating_tool=is_mutating_tool,
+                        mutation_target_arg_keys=mutation_target_arg_keys,
                         expected_deliverables=canonical_deliverables,
                         forbidden_deliverables=canonical_forbidden_deliverables,
                         allowed_output_prefixes=normalized_allowed_output_prefixes,
@@ -402,16 +409,20 @@ async def run_subtask(
                             tool_name=tc.name,
                             tool_args=tc.arguments,
                             workspace=workspace,
+                            is_mutating_tool=is_mutating_tool,
+                            mutation_target_arg_keys=mutation_target_arg_keys,
                             prior_successful_tool_calls=historical_successful_tool_calls,
                             current_tool_calls=tool_calls_record,
                         )
                     if policy_error:
+                        blocked_paths = runner._target_paths_for_policy(
+                            tool_name=tc.name,
+                            tool_args=tc.arguments,
+                            workspace=workspace,
+                            is_mutating_tool=is_mutating_tool,
+                            mutation_target_arg_keys=mutation_target_arg_keys,
+                        )
                         if runner._is_forbidden_output_path_error(policy_error):
-                            blocked_paths = runner._target_paths_for_policy(
-                                tool_name=tc.name,
-                                tool_args=tc.arguments,
-                                workspace=workspace,
-                            )
                             runner._emit_telemetry_event(
                                 event_type=FORBIDDEN_CANONICAL_WRITE_BLOCKED,
                                 task_id=task.id,
@@ -429,11 +440,21 @@ async def run_subtask(
                                     "policy_error": policy_error,
                                 },
                             )
+                        elif runner._is_sealed_artifact_mutation_policy_error(policy_error):
+                            runner._emit_sealed_policy_preflight_blocked(
+                                task_id=task.id,
+                                subtask_id=subtask.id,
+                                tool_name=tc.name,
+                                attempted_paths=blocked_paths,
+                                policy_error=policy_error,
+                            )
                         tool_result = ToolResult.fail(policy_error)
                     else:
                         deduped = False
                         idempotency_key = ""
                         args_hash = ""
+                        guard_mode = runner._sealed_artifact_post_call_guard_mode()
+                        pre_call_seal_hashes: dict[str, str] = {}
                         if runner._enable_mutation_idempotency and is_mutating_tool:
                             idempotency_key, args_hash = runner._mutation_idempotency_key(
                                 task=task,
@@ -462,11 +483,20 @@ async def run_subtask(
                                     data={
                                         "subtask_id": subtask.id,
                                         "tool": tc.name,
-                                        "tool_call_id": str(getattr(tc, "id", "") or ""),
+                                        "tool_call_id": tool_call_id,
                                         "idempotency_key": idempotency_key,
                                         "run_id": runner._normalize_run_id(task),
                                     },
                                 )
+                        if (
+                            is_mutating_tool
+                            and not deduped
+                            and guard_mode != "off"
+                        ):
+                            pre_call_seal_hashes = runner._snapshot_tracked_artifact_hashes(
+                                task=task,
+                                workspace=workspace,
+                            )
                         execute_args = dict(tc.arguments)
                         if (
                             tc.name == "ask_user"
@@ -654,15 +684,85 @@ async def run_subtask(
                             and not deduped
                             and tool_result.success
                         ):
-                            runner._reseal_tracked_artifacts_after_mutation(
+                            unexpected_paths: list[str] = []
+                            if guard_mode != "off":
+                                unexpected_paths = runner._unexpected_sealed_mutation_paths(
+                                    task=task,
+                                    workspace=workspace,
+                                    tool_name=tc.name,
+                                    tool_args=tc.arguments,
+                                    tool_result=tool_result,
+                                    is_mutating_tool=is_mutating_tool,
+                                    mutation_target_arg_keys=mutation_target_arg_keys,
+                                    pre_call_hashes=pre_call_seal_hashes,
+                                )
+                            if unexpected_paths:
+                                runner._emit_sealed_unexpected_mutation_detected(
+                                    task_id=task.id,
+                                    subtask_id=subtask.id,
+                                    tool_name=tc.name,
+                                    tool_call_id=tool_call_id,
+                                    mode=guard_mode,
+                                    unexpected_paths=unexpected_paths,
+                                )
+                                merged_files = list(tool_result.files_changed)
+                                seen_files = set(merged_files)
+                                for relpath in unexpected_paths:
+                                    if relpath in seen_files:
+                                        continue
+                                    seen_files.add(relpath)
+                                    merged_files.append(relpath)
+                                if merged_files != list(tool_result.files_changed):
+                                    tool_result = ToolResult(
+                                        success=tool_result.success,
+                                        output=tool_result.output,
+                                        content_blocks=tool_result.content_blocks,
+                                        data=tool_result.data,
+                                        files_changed=merged_files,
+                                        error=tool_result.error,
+                                    )
+                            resealed_count = runner._reseal_tracked_artifacts_after_mutation(
                                 task=task,
                                 workspace=workspace,
                                 tool_name=tc.name,
                                 tool_args=tc.arguments,
                                 tool_result=tool_result,
+                                is_mutating_tool=is_mutating_tool,
+                                mutation_target_arg_keys=mutation_target_arg_keys,
                                 subtask_id=subtask.id,
-                                tool_call_id=str(getattr(tc, "id", "") or ""),
+                                tool_call_id=tool_call_id,
                             )
+                            if resealed_count > 0:
+                                runner._emit_sealed_reseal_applied(
+                                    task_id=task.id,
+                                    subtask_id=subtask.id,
+                                    tool_name=tc.name,
+                                    tool_call_id=tool_call_id,
+                                    path_count=resealed_count,
+                                )
+                            if unexpected_paths and guard_mode == "enforce":
+                                guard_data = (
+                                    dict(tool_result.data)
+                                    if isinstance(tool_result.data, dict)
+                                    else {}
+                                )
+                                guard_data.update({
+                                    "sealed_unexpected_mutation_detected": True,
+                                    "unexpected_paths": list(unexpected_paths),
+                                    "guard_mode": guard_mode,
+                                    "event_type": SEALED_UNEXPECTED_MUTATION_DETECTED,
+                                })
+                                tool_result = ToolResult(
+                                    success=False,
+                                    output="",
+                                    error=(
+                                        "Post-call sealed artifact guard blocked this mutation: "
+                                        "tool changed sealed path(s) outside declared/returned "
+                                        f"targets: {', '.join(unexpected_paths)}."
+                                    ),
+                                    data=guard_data,
+                                    files_changed=list(tool_result.files_changed),
+                                )
                         if (
                             runner._enable_mutation_idempotency
                             and is_mutating_tool

@@ -15,6 +15,9 @@ def test_new_telemetry_rollup_has_expected_keys() -> None:
     assert rollup["model_invocations"] == 0
     assert rollup["tool_calls"] == 0
     assert rollup["compactor_warning_count"] == 0
+    assert rollup["sealed_policy_preflight_blocked"] == 0
+    assert rollup["sealed_reseal_applied"] == 0
+    assert rollup["sealed_unexpected_mutation_detected"] == 0
 
 
 def test_accumulate_subtask_telemetry_updates_rollup() -> None:
@@ -25,6 +28,7 @@ def test_accumulate_subtask_telemetry_updates_rollup() -> None:
             "tool_calls": 3,
             "mutating_tool_calls": 1,
             "compactor_warning_count": 4,
+            "sealed_reseal_applied": 2,
         },
     )
 
@@ -36,6 +40,7 @@ def test_accumulate_subtask_telemetry_updates_rollup() -> None:
     assert orchestrator._telemetry_rollup["model_invocations"] == 2
     assert orchestrator._telemetry_rollup["tool_calls"] == 3
     assert orchestrator._telemetry_rollup["compactor_warning_count"] == 4
+    assert orchestrator._telemetry_rollup["sealed_reseal_applied"] == 2
 
 
 def test_task_event_counts_and_verification_reason_counts() -> None:

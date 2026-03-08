@@ -20,16 +20,16 @@ Current behavior already has retries and replanning, but not a declarative proce
 
 ## Existing Capabilities We Should Reuse
 1. Subtask retry loop and failure handling:
-   - `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py` (`_handle_failure`).
+   - `<repo-root>/src/loom/engine/orchestrator.py` (`_handle_failure`).
 2. Global run budget and budget exhaustion safeguards:
-   - `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py` (`_enforce_global_budget`).
-   - `/Users/sfw/Development/loom/src/loom/config.py` (`ExecutionConfig` limits).
+   - `<repo-root>/src/loom/engine/orchestrator.py` (`_enforce_global_budget`).
+   - `<repo-root>/src/loom/config.py` (`ExecutionConfig` limits).
 3. Tool loop iteration budget:
-   - `/Users/sfw/Development/loom/src/loom/engine/runner.py`.
+   - `<repo-root>/src/loom/engine/runner.py`.
 4. Verification contracts and reason codes:
-   - `/Users/sfw/Development/loom/src/loom/engine/verification.py`.
+   - `<repo-root>/src/loom/engine/verification.py`.
 5. Existing scoring signals for writing:
-   - `/Users/sfw/Development/loom/src/loom/tools/humanize_writing.py`.
+   - `<repo-root>/src/loom/tools/humanize_writing.py`.
 
 ## Core Problem
 Process spec has no explicit loop semantics (what to repeat, when to stop, how to detect convergence). We currently rely on generic retry/replan behavior, which is:
@@ -154,9 +154,9 @@ Source of truth and reconciliation:
 
 ### W0: SQLite Schema and Migration (MVP Foundation)
 Files:
-1. `/Users/sfw/Development/loom/src/loom/state/schema.sql`
-2. `/Users/sfw/Development/loom/src/loom/state/memory.py`
-3. `/Users/sfw/Development/loom/src/loom/config.py`
+1. `<repo-root>/src/loom/state/schema.sql`
+2. `<repo-root>/src/loom/state/memory.py`
+3. `<repo-root>/src/loom/config.py`
 
 Tasks:
 1. Add `iteration_runs`, `iteration_attempts`, and `iteration_gate_results` tables.
@@ -166,7 +166,7 @@ Tasks:
 
 ### W1: Schema and Validation
 Files:
-1. `/Users/sfw/Development/loom/src/loom/processes/schema.py`
+1. `<repo-root>/src/loom/processes/schema.py`
 
 Tasks:
 1. Add dataclasses for `IterationPolicy` and `IterationGate`.
@@ -179,8 +179,8 @@ Tasks:
 
 ### W2: Orchestrator Loop Integration
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-2. `/Users/sfw/Development/loom/src/loom/state/task_state.py`
+1. `<repo-root>/src/loom/engine/orchestrator.py`
+2. `<repo-root>/src/loom/state/task_state.py`
 
 Tasks:
 1. Attach loop state to subtask attempts.
@@ -192,7 +192,7 @@ Tasks:
 
 ### W3: Gate Evaluator
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/verification.py` (or new module `engine/iteration_gates.py`)
+1. `<repo-root>/src/loom/engine/verification.py` (or new module `engine/iteration_gates.py`)
 
 Tasks:
 1. Implement deterministic evaluators (`tool_metric`, `command_exit`, `artifact_regex`).
@@ -206,8 +206,8 @@ Tasks:
 
 ### W4: Retry Context and Convergence
 Files:
-1. `/Users/sfw/Development/loom/src/loom/recovery/retry.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
+1. `<repo-root>/src/loom/recovery/retry.py`
+2. `<repo-root>/src/loom/engine/orchestrator.py`
 
 Tasks:
 1. Encode failed-gate summary in retry context.
@@ -219,9 +219,9 @@ Tasks:
 
 ### W5: Observability and UX
 Files:
-1. `/Users/sfw/Development/loom/src/loom/events/types.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-3. `/Users/sfw/Development/loom/src/loom/tui/*` (display path)
+1. `<repo-root>/src/loom/events/types.py`
+2. `<repo-root>/src/loom/engine/orchestrator.py`
+3. `<repo-root>/src/loom/tui/*` (display path)
 
 Tasks:
 1. Emit `iteration_started`, `iteration_gate_failed`, `iteration_retrying`, `iteration_completed`, `iteration_terminal`.
@@ -233,11 +233,11 @@ Tasks:
 
 ### W6: Tests and Docs
 Files:
-1. `/Users/sfw/Development/loom/tests/test_processes.py`
-2. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-3. `/Users/sfw/Development/loom/tests/test_verification.py`
-4. `/Users/sfw/Development/loom/docs/creating-packages.md`
-5. `/Users/sfw/Development/loom/docs/CONFIG.md`
+1. `<repo-root>/tests/test_processes.py`
+2. `<repo-root>/tests/test_orchestrator.py`
+3. `<repo-root>/tests/test_verification.py`
+4. `<repo-root>/docs/creating-packages.md`
+5. `<repo-root>/docs/CONFIG.md`
 
 Tasks:
 1. Add loop convergence tests for writing and coding examples.

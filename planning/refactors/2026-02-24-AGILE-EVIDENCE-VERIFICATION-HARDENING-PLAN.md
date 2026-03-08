@@ -25,25 +25,25 @@ Observed in `marketing-strategy` run `#200963`:
 
 ## Scope
 Core runtime:
-1. `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-3. `/Users/sfw/Development/loom/src/loom/recovery/retry.py`
-4. `/Users/sfw/Development/loom/src/loom/config.py`
+1. `<repo-root>/src/loom/engine/verification.py`
+2. `<repo-root>/src/loom/engine/orchestrator.py`
+3. `<repo-root>/src/loom/recovery/retry.py`
+4. `<repo-root>/src/loom/config.py`
 
 Process/schema and prompts:
-1. `/Users/sfw/Development/loom/src/loom/processes/schema.py`
-2. `/Users/sfw/Development/loom/src/loom/prompts/templates/verifier.yaml`
-3. `/Users/sfw/Development/loom/src/loom/processes/builtin/marketing-strategy.yaml`
+1. `<repo-root>/src/loom/processes/schema.py`
+2. `<repo-root>/src/loom/prompts/templates/verifier.yaml`
+3. `<repo-root>/src/loom/processes/builtin/marketing-strategy.yaml`
 
 State/evidence context:
-1. `/Users/sfw/Development/loom/src/loom/state/task_state.py`
-2. `/Users/sfw/Development/loom/src/loom/state/evidence.py`
+1. `<repo-root>/src/loom/state/task_state.py`
+2. `<repo-root>/src/loom/state/evidence.py`
 
 Tests:
-1. `/Users/sfw/Development/loom/tests/test_verification.py`
-2. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-3. `/Users/sfw/Development/loom/tests/test_retry.py`
-4. `/Users/sfw/Development/loom/tests/test_processes.py`
+1. `<repo-root>/tests/test_verification.py`
+2. `<repo-root>/tests/test_orchestrator.py`
+3. `<repo-root>/tests/test_retry.py`
+4. `<repo-root>/tests/test_processes.py`
 
 ## Workstreams
 

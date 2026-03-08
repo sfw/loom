@@ -2,7 +2,7 @@
 
 ## 1. Purpose and Scope
 
-This document is a code-level technical deep dive for the Loom system in `/Users/sfw/Development/loom`.
+This document is a code-level technical deep dive for the Loom system in `<repo-root>`.
 
 It explains:
 - All major subsystems and their responsibilities.
@@ -18,6 +18,8 @@ Implementation refresh status (2026-02-28):
 - Reliability hardening workstreams `#1,#2,#3,#4,#5,#6,#10` remain implemented behind execution flags.
 - Additional Feb 27-28 coverage includes cowork hybrid-tool exposure, chat replay journaling, delegated-progress streaming, `/run` launch liveness staging, and cancel-first process-tab close semantics.
 - Validation snapshot (2026-02-28): `uv run ruff check` passed; `uv run pytest` passed (`2000 passed, 50 skipped, 2 warnings`).
+- Engine core package split status (2026-03-07): `semantic_compactor`, `runner`, `verification`, and `orchestrator` are now package layouts with compatibility facades and focused helper modules.
+- Validation snapshot (2026-03-07): `uv run pytest` passed (`2636 passed, 50 skipped`).
 - Default posture remains conservative: hardening controls are mostly opt-in via config.
 
 ## 2. High-Level Architecture
@@ -107,7 +109,7 @@ flowchart LR
 
 ### 3.1.1 Planning phase
 
-Primary implementation: `engine/orchestrator.py`.
+Primary implementation: `engine/orchestrator/__init__.py` plus sibling modules in `engine/orchestrator/`.
 
 Behavior:
 - If `reuse_existing_plan=True` and task already has subtasks, reuse existing plan.
@@ -163,7 +165,7 @@ On global budget breach:
 
 ### 3.1.3 Subtask runner loop
 
-Primary implementation: `engine/runner.py` (`SubtaskRunner.run`).
+Primary implementation: `engine/runner/__init__.py` (`SubtaskRunner.run`) plus helper modules in `engine/runner/`.
 
 Per subtask:
 - Set a wall-clock deadline (`max_subtask_wall_clock_seconds`).
@@ -196,7 +198,7 @@ Interruption paths produce failure result:
 
 ### 3.1.4 Verification flow
 
-Primary implementation: `engine/verification.py`.
+Primary implementation: `engine/verification/__init__.py` plus helper modules in `engine/verification/`.
 
 Verification tiers:
 - Tier 1 deterministic checks.

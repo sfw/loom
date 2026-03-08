@@ -16,7 +16,7 @@ Hard requirements:
 
 ## Relationship to Existing MCP Plan
 This plan is Track C and complements:
-`/Users/sfw/Development/loom/planning/refactors/2026-02-17-MCP-CONFIG-MANAGEMENT-PLAN.md`
+`<repo-root>/planning/refactors/2026-02-17-MCP-CONFIG-MANAGEMENT-PLAN.md`
 
 Track B (MCP transport + OAuth) stays intact and becomes a dependency for hosted MCP support. Track C generalizes credential handling for all tools, not only MCP.
 

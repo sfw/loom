@@ -100,7 +100,7 @@ Current behavior is functionally useful but operationally brittle for larger com
 
 ### W1: Hint Container Refactor
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/tui/app.py`
 
 Deliverables:
 1. Scrollable hint container implementation.
@@ -109,7 +109,7 @@ Deliverables:
 
 ### W2: Catalog Completeness
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
+1. `<repo-root>/src/loom/tui/app.py`
 
 Deliverables:
 1. Remove `/process use` top-N truncation.
@@ -117,8 +117,8 @@ Deliverables:
 
 ### W3: Ordering and Ranking
 Files:
-1. `/Users/sfw/Development/loom/src/loom/tui/app.py`
-2. `/Users/sfw/Development/loom/tests/test_tui.py`
+1. `<repo-root>/src/loom/tui/app.py`
+2. `<repo-root>/tests/test_tui.py`
 
 Deliverables:
 1. Explicit ordering/grouping policy.
@@ -127,7 +127,7 @@ Deliverables:
 
 ### W4: Tests and Regression Coverage
 Files:
-1. `/Users/sfw/Development/loom/tests/test_tui.py`
+1. `<repo-root>/tests/test_tui.py`
 
 Deliverables:
 1. Coverage for complete rendering with large command/process lists.

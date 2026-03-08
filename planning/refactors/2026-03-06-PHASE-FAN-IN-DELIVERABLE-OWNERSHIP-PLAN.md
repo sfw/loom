@@ -179,8 +179,8 @@ Finalizer injection rule:
 
 ## W0: Guardrail (No Process Format Change Required)
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-2. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
+1. `<repo-root>/src/loom/engine/orchestrator.py`
+2. `<repo-root>/tests/test_orchestrator.py`
 
 Tasks:
 1. Add batch-level canonical deliverable conflict detection.
@@ -190,8 +190,8 @@ Tasks:
 
 ## W1: Schema + Loader + Validation
 Files:
-1. `/Users/sfw/Development/loom/src/loom/processes/schema.py`
-2. `/Users/sfw/Development/loom/tests/` (schema loader validation tests)
+1. `<repo-root>/src/loom/processes/schema.py`
+2. `<repo-root>/tests/` (schema loader validation tests)
 3. docs/changelog updates
 
 Tasks:
@@ -202,9 +202,9 @@ Tasks:
 
 ## W2: Fan-In Runtime
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-2. `/Users/sfw/Development/loom/src/loom/prompts/assembler.py`
-3. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
+1. `<repo-root>/src/loom/engine/orchestrator.py`
+2. `<repo-root>/src/loom/prompts/assembler.py`
+3. `<repo-root>/src/loom/engine/runner.py`
 4. tests for runner/path guards and fan-in lifecycle
 
 Tasks:
@@ -219,8 +219,8 @@ Tasks:
 
 ## W3: Verification/Gates Alignment
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-2. `/Users/sfw/Development/loom/src/loom/engine/iteration_gates.py`
+1. `<repo-root>/src/loom/engine/verification.py`
+2. `<repo-root>/src/loom/engine/iteration_gates.py`
 3. tests for per-role verification behavior
 
 Tasks:
@@ -232,7 +232,7 @@ Tasks:
 
 ## W4: Process Rollout
 Files:
-1. Builtin process YAMLs under `/Users/sfw/Development/loom/src/loom/processes/builtin/`
+1. Builtin process YAMLs under `<repo-root>/src/loom/processes/builtin/`
 2. docs/changelog
 
 Tasks:
@@ -245,9 +245,9 @@ Tasks:
 
 ## W5: Operational Hardening
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-2. `/Users/sfw/Development/loom/src/loom/tools/workspace.py`
-3. `/Users/sfw/Development/loom/tests/` (fault-injection and recovery suites)
+1. `<repo-root>/src/loom/engine/orchestrator.py`
+2. `<repo-root>/src/loom/tools/workspace.py`
+3. `<repo-root>/tests/` (fault-injection and recovery suites)
 
 Tasks:
 1. Add restart/recovery handling so interrupted runs do not publish partial finalizer outputs.
@@ -310,8 +310,8 @@ Default-flip go/no-go gates:
 
 ## Unstaged Changes Review (Current Workspace)
 Observed unstaged files:
-1. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-2. `/Users/sfw/Development/loom/tests/test_orchestrator.py`
+1. `<repo-root>/src/loom/engine/orchestrator.py`
+2. `<repo-root>/tests/test_orchestrator.py`
 
 Assessment:
 1. These implement and test phase-hint deliverable mapping in retry/remediation path.

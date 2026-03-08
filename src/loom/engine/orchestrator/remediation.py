@@ -836,6 +836,7 @@ async def run_confirm_or_prune_remediation(
             subtask.id,
             remediation_result.evidence_records,
             tool_calls=remediation_result.tool_calls,
+            workspace=task.workspace,
         )
 
         if remediation_verification.passed:

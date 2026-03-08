@@ -350,7 +350,7 @@ class TestSlashCommandHints:
         app = LoomApp(
             model=SimpleNamespace(name="test-model"),
             tools=MagicMock(),
-            workspace=Path("/Users/sfw/Development/loom"),
+            workspace=Path("/tmp"),
         )
         app._initialize_session = AsyncMock()
 

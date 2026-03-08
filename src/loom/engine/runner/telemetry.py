@@ -13,6 +13,9 @@ from loom.events.types import (
     ARTIFACT_RETENTION_PRUNED,
     COMPACTION_POLICY_DECISION,
     OVERFLOW_FALLBACK_APPLIED,
+    SEALED_POLICY_PREFLIGHT_BLOCKED,
+    SEALED_RESEAL_APPLIED,
+    SEALED_UNEXPECTED_MUTATION_DETECTED,
 )
 from loom.tools.registry import ToolResult
 
@@ -28,6 +31,9 @@ def new_subtask_telemetry_counters() -> dict[str, int]:
         "compaction_policy_decisions": 0,
         "overflow_fallback_count": 0,
         "compactor_warning_count": 0,
+        "sealed_policy_preflight_blocked": 0,
+        "sealed_reseal_applied": 0,
+        "sealed_unexpected_mutation_detected": 0,
     }
 
 
@@ -481,4 +487,82 @@ def emit_overflow_fallback_telemetry(
         task_id=task_id,
         data=payload,
         counter_key="overflow_fallback_count",
+    )
+
+
+def emit_sealed_policy_preflight_blocked(
+    runner: Any,
+    *,
+    task_id: str,
+    subtask_id: str,
+    tool_name: str,
+    attempted_paths: list[str],
+    policy_error: str,
+) -> None:
+    if not telemetry_events_enabled(runner) or not runner._event_bus:
+        return
+    emit_telemetry_event(
+        runner,
+        event_type=SEALED_POLICY_PREFLIGHT_BLOCKED,
+        task_id=task_id,
+        data={
+            "subtask_id": subtask_id,
+            "tool": str(tool_name or ""),
+            "attempted_paths": list(attempted_paths),
+            "policy_error": str(policy_error or ""),
+        },
+        counter_key="sealed_policy_preflight_blocked",
+    )
+
+
+def emit_sealed_reseal_applied(
+    runner: Any,
+    *,
+    task_id: str,
+    subtask_id: str,
+    tool_name: str,
+    tool_call_id: str,
+    path_count: int,
+) -> None:
+    if not telemetry_events_enabled(runner) or not runner._event_bus:
+        return
+    emit_telemetry_event(
+        runner,
+        event_type=SEALED_RESEAL_APPLIED,
+        task_id=task_id,
+        data={
+            "subtask_id": subtask_id,
+            "tool": str(tool_name or ""),
+            "tool_call_id": str(tool_call_id or ""),
+            "path_count": max(0, safe_int(path_count)),
+        },
+        counter_key="sealed_reseal_applied",
+    )
+
+
+def emit_sealed_unexpected_mutation_detected(
+    runner: Any,
+    *,
+    task_id: str,
+    subtask_id: str,
+    tool_name: str,
+    tool_call_id: str,
+    mode: str,
+    unexpected_paths: list[str],
+) -> None:
+    if not telemetry_events_enabled(runner) or not runner._event_bus:
+        return
+    emit_telemetry_event(
+        runner,
+        event_type=SEALED_UNEXPECTED_MUTATION_DETECTED,
+        task_id=task_id,
+        data={
+            "subtask_id": subtask_id,
+            "tool": str(tool_name or ""),
+            "tool_call_id": str(tool_call_id or ""),
+            "guard_mode": str(mode or ""),
+            "unexpected_paths": list(unexpected_paths),
+            "path_count": len(list(unexpected_paths)),
+        },
+        counter_key="sealed_unexpected_mutation_detected",
     )

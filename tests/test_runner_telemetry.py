@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from loom.engine.runner import telemetry as runner_telemetry
 from loom.events.bus import EventBus
-from loom.events.types import COMPACTION_POLICY_DECISION, OVERFLOW_FALLBACK_APPLIED
+from loom.events.types import (
+    COMPACTION_POLICY_DECISION,
+    OVERFLOW_FALLBACK_APPLIED,
+    SEALED_POLICY_PREFLIGHT_BLOCKED,
+    SEALED_RESEAL_APPLIED,
+    SEALED_UNEXPECTED_MUTATION_DETECTED,
+)
 
 
 class _TelemetryRunnerStub:
@@ -85,3 +91,67 @@ def test_emit_overflow_fallback_telemetry_emits_dual_events() -> None:
     assert overflow_payload["rewritten_messages"] == 2
     assert overflow_payload["chars_reduced"] == 4000
     assert runner._active_subtask_telemetry_counters["overflow_fallback_count"] == 1
+
+
+def test_emit_sealed_policy_preflight_blocked_emits_event() -> None:
+    runner = _TelemetryRunnerStub()
+    events = []
+    runner._event_bus.subscribe_all(lambda event: events.append(event))
+
+    runner_telemetry.emit_sealed_policy_preflight_blocked(
+        runner,
+        task_id="task-1",
+        subtask_id="subtask-1",
+        tool_name="spreadsheet",
+        attempted_paths=["reports/pricing.csv"],
+        policy_error="Sealed artifact mutation blocked",
+    )
+
+    blocked = [event for event in events if event.event_type == SEALED_POLICY_PREFLIGHT_BLOCKED]
+    assert len(blocked) == 1
+    assert blocked[0].data["tool"] == "spreadsheet"
+    assert runner._active_subtask_telemetry_counters["sealed_policy_preflight_blocked"] == 1
+
+
+def test_emit_sealed_reseal_applied_emits_event() -> None:
+    runner = _TelemetryRunnerStub()
+    events = []
+    runner._event_bus.subscribe_all(lambda event: events.append(event))
+
+    runner_telemetry.emit_sealed_reseal_applied(
+        runner,
+        task_id="task-1",
+        subtask_id="subtask-1",
+        tool_name="spreadsheet",
+        tool_call_id="call-1",
+        path_count=2,
+    )
+
+    reseal = [event for event in events if event.event_type == SEALED_RESEAL_APPLIED]
+    assert len(reseal) == 1
+    assert reseal[0].data["path_count"] == 2
+    assert runner._active_subtask_telemetry_counters["sealed_reseal_applied"] == 1
+
+
+def test_emit_sealed_unexpected_mutation_detected_emits_event() -> None:
+    runner = _TelemetryRunnerStub()
+    events = []
+    runner._event_bus.subscribe_all(lambda event: events.append(event))
+
+    runner_telemetry.emit_sealed_unexpected_mutation_detected(
+        runner,
+        task_id="task-1",
+        subtask_id="subtask-1",
+        tool_name="run_tool",
+        tool_call_id="call-2",
+        mode="warn",
+        unexpected_paths=["reports/competitor-pricing.csv"],
+    )
+
+    detected = [
+        event for event in events
+        if event.event_type == SEALED_UNEXPECTED_MUTATION_DETECTED
+    ]
+    assert len(detected) == 1
+    assert detected[0].data["guard_mode"] == "warn"
+    assert runner._active_subtask_telemetry_counters["sealed_unexpected_mutation_detected"] == 1

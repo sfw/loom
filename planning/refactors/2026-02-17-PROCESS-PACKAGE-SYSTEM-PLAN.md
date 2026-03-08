@@ -13,14 +13,14 @@ Final pass included:
 
 ## Scope
 Reviewed the process and package stack end to end:
-- Process schema/loader: `/Users/sfw/Development/loom/src/loom/processes/schema.py`
-- Package install/uninstall: `/Users/sfw/Development/loom/src/loom/processes/installer.py`
-- Built-in process definitions: `/Users/sfw/Development/loom/src/loom/processes/builtin/*.yaml`
-- Orchestrator integration: `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-- Prompt integration: `/Users/sfw/Development/loom/src/loom/prompts/assembler.py`
-- API integration: `/Users/sfw/Development/loom/src/loom/api/routes.py`, `/Users/sfw/Development/loom/src/loom/api/engine.py`
-- TUI integration: `/Users/sfw/Development/loom/src/loom/tui/app.py`, `/Users/sfw/Development/loom/src/loom/tui/commands.py`
-- Delegate bridge: `/Users/sfw/Development/loom/src/loom/tools/delegate_task.py`
+- Process schema/loader: `<repo-root>/src/loom/processes/schema.py`
+- Package install/uninstall: `<repo-root>/src/loom/processes/installer.py`
+- Built-in process definitions: `<repo-root>/src/loom/processes/builtin/*.yaml`
+- Orchestrator integration: `<repo-root>/src/loom/engine/orchestrator.py`
+- Prompt integration: `<repo-root>/src/loom/prompts/assembler.py`
+- API integration: `<repo-root>/src/loom/api/routes.py`, `<repo-root>/src/loom/api/engine.py`
+- TUI integration: `<repo-root>/src/loom/tui/app.py`, `<repo-root>/src/loom/tui/commands.py`
+- Delegate bridge: `<repo-root>/src/loom/tools/delegate_task.py`
 - Config and docs/tests alignment.
 
 ## Executive Summary
@@ -35,10 +35,10 @@ The process system is strong in `loom run` / API task execution, but only partia
 
 ### P0: Process behavior is inconsistent between modes
 1. TUI process loading is partial.
-- In `/Users/sfw/Development/loom/src/loom/tui/app.py`, process load adds persona/tool guidance and excludes tools, but does not inject full process behavior via process-aware orchestrator/prompt stack.
+- In `<repo-root>/src/loom/tui/app.py`, process load adds persona/tool guidance and excludes tools, but does not inject full process behavior via process-aware orchestrator/prompt stack.
 
 2. `delegate_task` in TUI is not process-aware.
-- In `/Users/sfw/Development/loom/src/loom/tui/app.py`, `_bind_session_tools` builds `Orchestrator(...)` without `process=...`.
+- In `<repo-root>/src/loom/tui/app.py`, `_bind_session_tools` builds `Orchestrator(...)` without `process=...`.
 - Result: delegated complex work in cowork mode ignores active process phases/rules.
 
 3. Session operations in TUI drop process context.
@@ -58,7 +58,7 @@ The process system is strong in `loom run` / API task execution, but only partia
 
 ### P1: Package lifecycle and runtime gaps
 1. Installer copies only a subset of package files.
-- `/Users/sfw/Development/loom/src/loom/processes/installer.py` copies `process.yaml`, `tools/`, and limited optional files.
+- `<repo-root>/src/loom/processes/installer.py` copies `process.yaml`, `tools/`, and limited optional files.
 - Any additional package assets are dropped.
 
 2. Tool-name collision risk for bundled tools.
@@ -70,7 +70,7 @@ The process system is strong in `loom run` / API task execution, but only partia
 - No per-package isolation option exists.
 
 4. Source format/documentation drift.
-- Package README example in `/Users/sfw/Development/loom/packages/google-analytics/README.md` uses `loom install github.com/...`, which is not accepted by current shorthand parser.
+- Package README example in `<repo-root>/packages/google-analytics/README.md` uses `loom install github.com/...`, which is not accepted by current shorthand parser.
 
 ### P2: Configuration and UX drift
 1. `config.process.default` appears unused.

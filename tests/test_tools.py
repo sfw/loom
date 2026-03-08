@@ -34,6 +34,44 @@ from loom.tools.shell import (
     high_risk_command_metadata,
 )
 
+WORKSPACE_WRITING_TOOLS = sorted({
+    "citation_manager",
+    "correspondence_analysis",
+    "delegate_task",
+    "document_write",
+    "earnings_surprise_predictor",
+    "economic_data_api",
+    "edit_file",
+    "fact_checker",
+    "factor_exposure_engine",
+    "filing_event_parser",
+    "historical_currency_normalizer",
+    "humanize_writing",
+    "inflation_calculator",
+    "insider_trading_tracker",
+    "macro_regime_engine",
+    "market_data_api",
+    "move_file",
+    "opportunity_ranker",
+    "options_flow_analyzer",
+    "peer_review_simulator",
+    "portfolio_evaluator",
+    "portfolio_optimizer",
+    "portfolio_recommender",
+    "primary_source_ocr",
+    "run_tool",
+    "sec_fundamentals_api",
+    "sentiment_feeds_api",
+    "short_interest_analyzer",
+    "social_network_mapper",
+    "spreadsheet",
+    "symbol_universe_api",
+    "timeline_visualizer",
+    "valuation_engine",
+    "write_file",
+    "delete_file",
+})
+
 
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
@@ -138,6 +176,16 @@ class TestRegistry:
         a = [cls.__name__ for cls in discover_tools()]
         b = [cls.__name__ for cls in discover_tools()]
         assert a == b
+
+    @pytest.mark.parametrize("tool_name", WORKSPACE_WRITING_TOOLS)
+    def test_workspace_writing_tools_are_marked_mutating(
+        self,
+        registry: ToolRegistry,
+        tool_name: str,
+    ) -> None:
+        tool = registry.get(tool_name)
+        assert tool is not None
+        assert bool(getattr(tool, "is_mutating", False)) is True
 
     def test_delegate_task_tool_uses_configured_timeout(self, monkeypatch):
         monkeypatch.delenv("LOOM_DELEGATE_TIMEOUT_SECONDS", raising=False)

@@ -9,7 +9,7 @@ import pytest
 
 import loom.engine.runner as runner_module
 from loom.auth.runtime import AuthResolutionError
-from loom.config import Config
+from loom.config import Config, ExecutionConfig
 from loom.engine.runner import SubtaskResultStatus, SubtaskRunner
 from loom.engine.verification import VerificationResult
 from loom.models.base import ModelResponse, TokenUsage
@@ -30,8 +30,9 @@ def _make_runner(
     *,
     memory_query: AsyncMock,
     model_complete: AsyncMock | None = None,
+    config: Config | None = None,
 ) -> SubtaskRunner:
-    config = Config()
+    resolved_config = config or Config()
     router = MagicMock()
     executor_model = MagicMock()
     executor_model.name = "mock-executor"
@@ -64,7 +65,7 @@ def _make_runner(
         prompt_assembler=prompt_assembler,
         state_manager=MagicMock(),
         verification=verification,
-        config=config,
+        config=resolved_config,
     )
     runner._spawn_memory_extraction = MagicMock()
     return runner
@@ -131,3 +132,13 @@ async def test_run_cleans_session_state_on_unhandled_exception(
 
     assert runner._subtask_deadline_monotonic is None
     assert runner._active_subtask_telemetry_counters is None
+
+
+def test_runner_resolves_post_call_guard_mode_from_config() -> None:
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        config=Config(
+            execution=ExecutionConfig(sealed_artifact_post_call_guard="warn"),
+        ),
+    )
+    assert runner._sealed_artifact_post_call_guard_mode() == "warn"

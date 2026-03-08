@@ -64,25 +64,25 @@ Path-specific handling:
 
 ## Scope
 Core runtime:
-- `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-- `/Users/sfw/Development/loom/src/loom/engine/runner.py`
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-- `/Users/sfw/Development/loom/src/loom/recovery/retry.py`
-- `/Users/sfw/Development/loom/src/loom/models/router.py`
+- `<repo-root>/src/loom/engine/verification.py`
+- `<repo-root>/src/loom/engine/runner.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/recovery/retry.py`
+- `<repo-root>/src/loom/models/router.py`
 
 Process schema/config:
-- `/Users/sfw/Development/loom/src/loom/processes/schema.py`
-- `/Users/sfw/Development/loom/src/loom/config.py`
-- `/Users/sfw/Development/loom/src/loom/prompts/templates/verifier.yaml`
-- `/Users/sfw/Development/loom/src/loom/processes/builtin/*.yaml`
-- `/Users/sfw/Development/loom/packages/google-analytics/process.yaml`
+- `<repo-root>/src/loom/processes/schema.py`
+- `<repo-root>/src/loom/config.py`
+- `<repo-root>/src/loom/prompts/templates/verifier.yaml`
+- `<repo-root>/src/loom/processes/builtin/*.yaml`
+- `<repo-root>/packages/google-analytics/process.yaml`
 
 Tests:
-- `/Users/sfw/Development/loom/tests/test_verification.py`
-- `/Users/sfw/Development/loom/tests/test_processes.py`
-- `/Users/sfw/Development/loom/tests/test_process_testing.py`
-- `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-- `/Users/sfw/Development/loom/tests/test_retry.py`
+- `<repo-root>/tests/test_verification.py`
+- `<repo-root>/tests/test_processes.py`
+- `<repo-root>/tests/test_process_testing.py`
+- `<repo-root>/tests/test_orchestrator.py`
+- `<repo-root>/tests/test_retry.py`
 
 ## Phase Plan
 
@@ -308,10 +308,10 @@ Rollback:
 ## Implementation Backlog (PR Sequence)
 ### PR-1: Instrumentation + Reason Codes
 - Files:
-`/Users/sfw/Development/loom/src/loom/engine/verification.py`
-`/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-`/Users/sfw/Development/loom/src/loom/events/types.py`
-`/Users/sfw/Development/loom/tests/test_verification.py`
+`<repo-root>/src/loom/engine/verification.py`
+`<repo-root>/src/loom/engine/orchestrator.py`
+`<repo-root>/src/loom/events/types.py`
+`<repo-root>/tests/test_verification.py`
 - Must ship:
 - Structured fail reason code attached to all non-pass outcomes.
 - Event emission for reason code and enforcement type.
@@ -320,9 +320,9 @@ Rollback:
 
 ### PR-2: Verification Policy Engine
 - Files:
-`/Users/sfw/Development/loom/src/loom/engine/verification.py`
-`/Users/sfw/Development/loom/src/loom/config.py`
-`/Users/sfw/Development/loom/tests/test_verification.py`
+`<repo-root>/src/loom/engine/verification.py`
+`<repo-root>/src/loom/config.py`
+`<repo-root>/tests/test_verification.py`
 - Must ship:
 - `hard` vs `advisory` aggregation in one policy layer.
 - Config flag `verification.policy_engine_enabled`.
@@ -331,10 +331,10 @@ Rollback:
 
 ### PR-3: Verifier Output Protocol Hardening
 - Files:
-`/Users/sfw/Development/loom/src/loom/engine/verification.py`
-`/Users/sfw/Development/loom/src/loom/models/router.py`
-`/Users/sfw/Development/loom/src/loom/prompts/templates/verifier.yaml`
-`/Users/sfw/Development/loom/tests/test_verification.py`
+`<repo-root>/src/loom/engine/verification.py`
+`<repo-root>/src/loom/models/router.py`
+`<repo-root>/src/loom/prompts/templates/verifier.yaml`
+`<repo-root>/tests/test_verification.py`
 - Must ship:
 - Multi-step parse recovery pipeline.
 - Alternate-model verifier retry fallback.
@@ -343,10 +343,10 @@ Rollback:
 
 ### PR-4: Retry Routing (Verification-only for Parse/Infra)
 - Files:
-`/Users/sfw/Development/loom/src/loom/recovery/retry.py`
-`/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-`/Users/sfw/Development/loom/tests/test_orchestrator.py`
-`/Users/sfw/Development/loom/tests/test_retry.py`
+`<repo-root>/src/loom/recovery/retry.py`
+`<repo-root>/src/loom/engine/orchestrator.py`
+`<repo-root>/tests/test_orchestrator.py`
+`<repo-root>/tests/test_retry.py`
 - Must ship:
 - Parse/transport verifier failures never rerun execution path.
 - Merge gate:
@@ -354,8 +354,8 @@ Rollback:
 
 ### PR-5: Process Rule Schema Evolution
 - Files:
-`/Users/sfw/Development/loom/src/loom/processes/schema.py`
-`/Users/sfw/Development/loom/tests/test_processes.py`
+`<repo-root>/src/loom/processes/schema.py`
+`<repo-root>/tests/test_processes.py`
 - Must ship:
 - Rule-level enforcement metadata (`hard`/`advisory`).
 - Rule applicability metadata (`applies_to_phases` / scope).
@@ -365,10 +365,10 @@ Rollback:
 
 ### PR-5A: Phase-Scoped Rule Injection
 - Files:
-`/Users/sfw/Development/loom/src/loom/prompts/assembler.py`
-`/Users/sfw/Development/loom/src/loom/engine/verification.py`
-`/Users/sfw/Development/loom/src/loom/config.py`
-`/Users/sfw/Development/loom/tests/test_verification.py`
+`<repo-root>/src/loom/prompts/assembler.py`
+`<repo-root>/src/loom/engine/verification.py`
+`<repo-root>/src/loom/config.py`
+`<repo-root>/tests/test_verification.py`
 - Must ship:
 - Only current-phase + global rules are injected for verifier.
 - Compatibility flag for legacy global injection mode.
@@ -378,10 +378,10 @@ Rollback:
 
 ### PR-6: Built-in Process Rule Migration
 - Files:
-`/Users/sfw/Development/loom/src/loom/processes/builtin/*.yaml`
-`/Users/sfw/Development/loom/packages/google-analytics/process.yaml`
-`/Users/sfw/Development/loom/tests/test_processes.py`
-`/Users/sfw/Development/loom/tests/test_process_testing.py`
+`<repo-root>/src/loom/processes/builtin/*.yaml`
+`<repo-root>/packages/google-analytics/process.yaml`
+`<repo-root>/tests/test_processes.py`
+`<repo-root>/tests/test_process_testing.py`
 - Must ship:
 - Placeholder regex converted to advisory behavior by policy.
 - Hard requirements encoded in semantic rules.
@@ -391,12 +391,12 @@ Rollback:
 
 ### PR-6A: Unconfirmed Data Policy + Synthesis Partitioning
 - Files:
-`/Users/sfw/Development/loom/src/loom/engine/verification.py`
-`/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-`/Users/sfw/Development/loom/src/loom/processes/schema.py`
-`/Users/sfw/Development/loom/src/loom/prompts/templates/verifier.yaml`
-`/Users/sfw/Development/loom/tests/test_orchestrator.py`
-`/Users/sfw/Development/loom/tests/test_verification.py`
+`<repo-root>/src/loom/engine/verification.py`
+`<repo-root>/src/loom/engine/orchestrator.py`
+`<repo-root>/src/loom/processes/schema.py`
+`<repo-root>/src/loom/prompts/templates/verifier.yaml`
+`<repo-root>/tests/test_orchestrator.py`
+`<repo-root>/tests/test_verification.py`
 - Must ship:
 - Outcome model supports `pass_with_warnings` and `partial_verified`.
 - Recommendation section hard-check enforces 0 unconfirmed claims.
@@ -406,11 +406,11 @@ Rollback:
 
 ### PR-6B: Confirm-or-Prune Remediation Flow
 - Files:
-`/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-`/Users/sfw/Development/loom/src/loom/recovery/retry.py`
-`/Users/sfw/Development/loom/src/loom/processes/builtin/*.yaml`
-`/Users/sfw/Development/loom/tests/test_retry.py`
-`/Users/sfw/Development/loom/tests/test_orchestrator.py`
+`<repo-root>/src/loom/engine/orchestrator.py`
+`<repo-root>/src/loom/recovery/retry.py`
+`<repo-root>/src/loom/processes/builtin/*.yaml`
+`<repo-root>/tests/test_retry.py`
+`<repo-root>/tests/test_orchestrator.py`
 - Must ship:
 - Critical-path unconfirmed failures trigger targeted remediation subtask before terminal abort.
 - Non-critical unconfirmed failures create queued remediation work item without blocking completion.
@@ -419,10 +419,10 @@ Rollback:
 
 ### PR-7: Deterministic Layer Tightening
 - Files:
-`/Users/sfw/Development/loom/src/loom/engine/verification.py`
-`/Users/sfw/Development/loom/src/loom/engine/runner.py`
-`/Users/sfw/Development/loom/src/loom/state/evidence.py`
-`/Users/sfw/Development/loom/tests/test_verification.py`
+`<repo-root>/src/loom/engine/verification.py`
+`<repo-root>/src/loom/engine/runner.py`
+`<repo-root>/src/loom/state/evidence.py`
+`<repo-root>/tests/test_verification.py`
 - Must ship:
 - Deterministic checks limited to hard invariants.
 - Non-uniform data-shape handling degrades to advisory, never crash.
@@ -431,9 +431,9 @@ Rollback:
 
 ### PR-8: Shadow Compare + Cutover Controls
 - Files:
-`/Users/sfw/Development/loom/src/loom/engine/verification.py`
-`/Users/sfw/Development/loom/src/loom/config.py`
-`/Users/sfw/Development/loom/tests/test_verification.py`
+`<repo-root>/src/loom/engine/verification.py`
+`<repo-root>/src/loom/config.py`
+`<repo-root>/tests/test_verification.py`
 - Must ship:
 - Dual-run comparison mode (old/new) with diff classification.
 - Default-on new engine behind rollback toggle.

@@ -776,6 +776,54 @@ class MyDomainTool(Tool):
 5. **Return `ToolResult.ok(output)`** on success, **`ToolResult.fail(error)`** on failure
 6. **File names** in `tools/` must not start with `_` (those are skipped)
 7. **One class per file** is conventional but not required — all `Tool` subclasses in the module are registered
+8. **Workspace-writing tools must declare `is_mutating = True`** so mutation policy is enforced preflight
+9. **Workspace-writing tools must return accurate `files_changed`** (workspace-relative paths) on success
+10. **If write targets use non-standard arg keys, expose `mutation_target_arg_keys`** so path policy can find them (for example `output_path`, `output_json_path`)
+
+Mutation policy note:
+- Sealed artifact protection is enforced before mutating tool execution.
+- Successful mutations on tracked sealed files trigger reseal/provenance updates.
+- If a writing tool omits mutating metadata or `files_changed`, runtime safety and synthesis seal checks can drift.
+
+### Upgrading existing bundled tools
+
+If your package already has tools that write files, upgrade them to the
+current mutation contract before release:
+
+1. Add `is_mutating` and return `True` for every workspace-writing tool.
+2. Ensure every successful write returns accurate workspace-relative
+   `files_changed` paths.
+3. If writes target keys other than `path`, expose
+   `mutation_target_arg_keys` (for example `output_path`,
+   `output_json_path`).
+4. Keep write targets inside `ctx.workspace` and use `_resolve_path(...)`
+   for normalization/safety.
+5. Add/refresh package tests so each writer confirms `is_mutating` and
+   `files_changed` behavior for success paths.
+
+Minimal before/after migration example:
+
+```python
+# Before
+async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+    out = str(args.get("output_path", "")).strip()
+    # ...writes file...
+    return ToolResult.ok("done")
+
+# After
+@property
+def is_mutating(self) -> bool:
+    return True
+
+@property
+def mutation_target_arg_keys(self) -> tuple[str, ...]:
+    return ("output_path",)
+
+async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+    out = str(args.get("output_path", "")).strip()
+    # ...writes file...
+    return ToolResult.ok("done", files_changed=[out])
+```
 
 ### Tool execution surfaces
 
@@ -875,6 +923,26 @@ Use `workspace` to resolve file paths. Use `_resolve_path(raw, workspace)` for s
 | `ToolResult.ok(output, data={...})` | Success. `output` is the text shown to the model. `data` is optional structured data. |
 | `ToolResult.fail(error)` | Failure. `error` describes what went wrong. |
 | `ToolResult.multimodal(output, blocks)` | Success with rich content (images, etc). |
+
+For workspace-writing tools, include `files_changed` on success:
+
+```python
+@property
+def is_mutating(self) -> bool:
+    return True
+
+@property
+def mutation_target_arg_keys(self) -> tuple[str, ...]:
+    return ("output_path",)
+
+async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+    relpath = str(args.get("output_path", "")).strip()
+    # ...write file under ctx.workspace...
+    return ToolResult.ok(
+        f"Wrote {relpath}",
+        files_changed=[relpath],
+    )
+```
 
 ## Installation and distribution
 
@@ -1079,6 +1147,7 @@ to satisfy this checklist before returning YAML:
 8. Never emit blocking `verifier_field` gates.
 9. For `command_exit`, use allowlisted prefixes only and tokenized argv lists.
 10. Keep deliverable filenames canonical and stable across phases.
+11. If you define bundled workspace-writing tools, set `is_mutating: true` behavior in code and return accurate `files_changed` for every successful write.
 
 ### Migration guide: previous definition -> current schema
 
@@ -1172,6 +1241,7 @@ Before publishing a package:
 - [ ] 2-3 planner examples with realistic goals
 - [ ] `replanning` section describes when to adapt
 - [ ] Bundled tools (if any) handle errors gracefully and return `ToolResult.fail`
+- [ ] Bundled workspace-writing tools set `is_mutating = True` and return accurate `files_changed`
 - [ ] Bundled tool names are unique (no collisions with built-ins or other packages)
 - [ ] Dependencies are version-pinned
 - [ ] `loom install /path/to/package` succeeds

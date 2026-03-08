@@ -6,7 +6,7 @@ Prevent context blowups caused by binary/large document fetches by moving type h
 ## Why This Is Needed
 Recent failures are dominated by oversized tool payload accumulation, not normal reasoning growth:
 
-- Run log: `/Users/sfw/.loom/logs/20260223-141254-cowork-1c7df8e9.events.jsonl`
+- Run log: `~/.loom/logs/<timestamp>-cowork-<id>.events.jsonl`
 - `web_fetch` on large PDFs occurs immediately before failure (`seq 2119`, `seq 2123`)
 - Request envelopes then exceed provider hard limits:
   - total message size exceeded 4MB hard cap
@@ -302,11 +302,11 @@ Acceptance:
 
 ### 6) Validation
 - [ ] `uv run pytest -q`
-- [ ] `uv run pytest /Users/sfw/Development/loom/tests/test_orchestrator.py -q`
-- [ ] `uv run pytest /Users/sfw/Development/loom/tests/test_web_tool.py -q`
-- [ ] `uv run pytest /Users/sfw/Development/loom/tests/test_semantic_compactor.py -q`
-- [ ] `uv run pytest /Users/sfw/Development/loom/tests/test_verification.py -q`
-- [ ] `uv run ruff check /Users/sfw/Development/loom/src /Users/sfw/Development/loom/tests`
+- [ ] `uv run pytest <repo-root>/tests/test_orchestrator.py -q`
+- [ ] `uv run pytest <repo-root>/tests/test_web_tool.py -q`
+- [ ] `uv run pytest <repo-root>/tests/test_semantic_compactor.py -q`
+- [ ] `uv run pytest <repo-root>/tests/test_verification.py -q`
+- [ ] `uv run ruff check <repo-root>/src <repo-root>/tests`
 
 ## Definition of Done
 1. Large fetched PDFs/binaries no longer inflate prompt context with decoded garbage text.

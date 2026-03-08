@@ -11,7 +11,7 @@ When a task is created, the user mounts a working directory. Loom reads from and
 ```python
 POST /tasks {
     "goal": "Add comprehensive test coverage",
-    "workspace": "/Users/scott/projects/myapp",
+    "workspace": "/path/to/myapp",
     ...
 }
 ```
@@ -24,7 +24,7 @@ The engine validates:
 ### Workspace Structure
 
 ```
-/Users/scott/projects/myapp/          ← user's project (mounted read-write)
+/path/to/myapp/                       ← user's project (mounted read-write)
 
 ~/.loom/tasks/{task_id}/
     ├── state.yaml                    ← Layer 1 task state (Spec 03)
@@ -46,7 +46,7 @@ Every file-modifying operation records an entry before the modification happens.
 ```json
 {
   "task_id": "a1b2c3d4",
-  "workspace": "/Users/scott/projects/myapp",
+  "workspace": "/path/to/myapp",
   "entries": [
     {
       "id": 1,
@@ -54,7 +54,7 @@ Every file-modifying operation records an entry before the modification happens.
       "subtask_id": "install-deps",
       "operation": "modify",
       "path": "package.json",
-      "before_snapshot": "/Users/scott/.loom/tasks/a1b2c3d4/snapshots/1_package.json",
+      "before_snapshot": "~/.loom/tasks/a1b2c3d4/snapshots/1_package.json",
       "after_hash": "sha256:abc123..."
     },
     {
@@ -81,7 +81,7 @@ Every file-modifying operation records an entry before the modification happens.
       "subtask_id": "add-types",
       "operation": "modify",
       "path": "src/app.ts",
-      "before_snapshot": "/Users/scott/.loom/tasks/a1b2c3d4/snapshots/4_app.ts",
+      "before_snapshot": "~/.loom/tasks/a1b2c3d4/snapshots/4_app.ts",
       "after_hash": "sha256:ghi789..."
     }
   ]

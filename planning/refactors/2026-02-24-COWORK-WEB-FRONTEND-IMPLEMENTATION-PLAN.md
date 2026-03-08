@@ -143,10 +143,10 @@ Do not persist:
 
 ### W1: Cowork API Foundation
 Files:
-1. `/Users/sfw/Development/loom/src/loom/api/engine.py`
-2. `/Users/sfw/Development/loom/src/loom/api/schemas.py`
-3. `/Users/sfw/Development/loom/src/loom/api/routes.py` (or split cowork routes into a new module)
-4. `/Users/sfw/Development/loom/src/loom/state/conversation_store.py`
+1. `<repo-root>/src/loom/api/engine.py`
+2. `<repo-root>/src/loom/api/schemas.py`
+3. `<repo-root>/src/loom/api/routes.py` (or split cowork routes into a new module)
+4. `<repo-root>/src/loom/state/conversation_store.py`
 
 Deliverables:
 1. Session lifecycle endpoints.
@@ -158,8 +158,8 @@ Acceptance:
 
 ### W2: Live Streaming Transport
 Files:
-1. `/Users/sfw/Development/loom/src/loom/api/routes.py` (or new cowork routes module)
-2. `/Users/sfw/Development/loom/src/loom/cowork/session.py` (if minimal adapters needed)
+1. `<repo-root>/src/loom/api/routes.py` (or new cowork routes module)
+2. `<repo-root>/src/loom/cowork/session.py` (if minimal adapters needed)
 
 Deliverables:
 1. WebSocket endpoint bridging `send_streaming(...)` events to typed JSON frames.
@@ -170,9 +170,9 @@ Acceptance:
 
 ### W3: Workspace Upload Endpoint
 Files:
-1. `/Users/sfw/Development/loom/src/loom/api/routes.py` (or new cowork routes module)
-2. `/Users/sfw/Development/loom/src/loom/config.py`
-3. `/Users/sfw/Development/loom/pyproject.toml`
+1. `<repo-root>/src/loom/api/routes.py` (or new cowork routes module)
+2. `<repo-root>/src/loom/config.py`
+3. `<repo-root>/pyproject.toml`
 
 Deliverables:
 1. Multipart upload endpoint with safe path resolution.
@@ -185,9 +185,9 @@ Acceptance:
 
 ### W4: Cowork Log Persistence + Query
 Files:
-1. `/Users/sfw/Development/loom/src/loom/state/schema.sql`
-2. `/Users/sfw/Development/loom/src/loom/state/conversation_store.py`
-3. `/Users/sfw/Development/loom/src/loom/api/routes.py` (or new cowork routes module)
+1. `<repo-root>/src/loom/state/schema.sql`
+2. `<repo-root>/src/loom/state/conversation_store.py`
+3. `<repo-root>/src/loom/api/routes.py` (or new cowork routes module)
 
 Deliverables:
 1. `cowork_events` table and store methods.
@@ -199,7 +199,7 @@ Acceptance:
 
 ### W5: Web Frontend MVP
 Files (new app, proposed):
-1. `/Users/sfw/Development/loom/web/cowork/` (or agreed frontend location)
+1. `<repo-root>/web/cowork/` (or agreed frontend location)
 
 Deliverables:
 1. Session picker/create flow.
@@ -212,8 +212,8 @@ Acceptance:
 
 ### W6: Staff Access Hardening
 Files:
-1. `/Users/sfw/Development/loom/src/loom/api/server.py`
-2. `/Users/sfw/Development/loom/docs/CONFIG.md`
+1. `<repo-root>/src/loom/api/server.py`
+2. `<repo-root>/docs/CONFIG.md`
 3. Deployment docs (new or existing ops docs)
 
 Deliverables:
@@ -225,8 +225,8 @@ Acceptance:
 
 ### W7: Test Coverage
 Files:
-1. `/Users/sfw/Development/loom/tests/test_api.py` (or split cowork API tests)
-2. `/Users/sfw/Development/loom/tests/test_conversation_store.py`
+1. `<repo-root>/tests/test_api.py` (or split cowork API tests)
+2. `<repo-root>/tests/test_conversation_store.py`
 3. New frontend tests under web app.
 
 Deliverables:
@@ -240,9 +240,9 @@ Acceptance:
 
 ### W8: Docs + Rollout
 Files:
-1. `/Users/sfw/Development/loom/docs/agent-integration.md`
-2. `/Users/sfw/Development/loom/docs/tutorial.html`
-3. `/Users/sfw/Development/loom/docs/CONFIG.md`
+1. `<repo-root>/docs/agent-integration.md`
+2. `<repo-root>/docs/tutorial.html`
+3. `<repo-root>/docs/CONFIG.md`
 
 Deliverables:
 1. Cowork web API contract docs.

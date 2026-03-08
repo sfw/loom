@@ -246,12 +246,12 @@ Implementation notes:
 ## Architecture Changes
 
 ### A1) Tool Discovery and Registration
-No registry redesign required: new classes under `/Users/sfw/Development/loom/src/loom/tools/` are auto-discovered.
+No registry redesign required: new classes under `<repo-root>/src/loom/tools/` are auto-discovered.
 
 Primary files:
-1. `/Users/sfw/Development/loom/src/loom/tools/__init__.py`
-2. `/Users/sfw/Development/loom/src/loom/tools/registry.py`
-3. New modules under `/Users/sfw/Development/loom/src/loom/tools/`
+1. `<repo-root>/src/loom/tools/__init__.py`
+2. `<repo-root>/src/loom/tools/registry.py`
+3. New modules under `<repo-root>/src/loom/tools/`
 
 ### A2) Shared Research Data Models
 Add normalized dataclasses (or typed dicts) for:
@@ -261,37 +261,37 @@ Add normalized dataclasses (or typed dicts) for:
 4. `FigureRegion` / `TableRegion`
 
 Proposed location:
-1. `/Users/sfw/Development/loom/src/loom/research/models.py`
+1. `<repo-root>/src/loom/research/models.py`
 
 ### A3) Provider Adapters
 Add provider abstraction with retry/rate-limit policy consistent with current web tools.
 
 Proposed location:
-1. `/Users/sfw/Development/loom/src/loom/research/providers/`
+1. `<repo-root>/src/loom/research/providers/`
 
 ### A4) Multimodal Bridge for PDFs
 Reuse existing `DocumentBlock`/`ImageBlock` pipeline and add PDF visual extraction path so chart pages can be analyzed as images when text extraction is insufficient.
 
 Primary files:
-1. `/Users/sfw/Development/loom/src/loom/content.py`
-2. `/Users/sfw/Development/loom/src/loom/tools/file_ops.py`
-3. `/Users/sfw/Development/loom/src/loom/engine/runner.py`
+1. `<repo-root>/src/loom/content.py`
+2. `<repo-root>/src/loom/tools/file_ops.py`
+3. `<repo-root>/src/loom/engine/runner.py`
 
 ### A5) Process Integration
 Update built-in process definitions so research processes can require these tools explicitly.
 
 Primary files:
-1. `/Users/sfw/Development/loom/src/loom/processes/builtin/research-report.yaml`
-2. `/Users/sfw/Development/loom/src/loom/processes/builtin/market-research.yaml`
-3. `/Users/sfw/Development/loom/src/loom/processes/schema.py`
+1. `<repo-root>/src/loom/processes/builtin/research-report.yaml`
+2. `<repo-root>/src/loom/processes/builtin/market-research.yaml`
+3. `<repo-root>/src/loom/processes/schema.py`
 
 ### A6) Research Data Packs and Cache
 Add local data/cache support for deterministic computations and reproducible archive references.
 
 Primary files:
-1. `/Users/sfw/Development/loom/src/loom/research/data/cpi_us.csv`
-2. `/Users/sfw/Development/loom/src/loom/research/cache.py`
-3. `/Users/sfw/Development/loom/src/loom/research/snapshots.py`
+1. `<repo-root>/src/loom/research/data/cpi_us.csv`
+2. `<repo-root>/src/loom/research/cache.py`
+3. `<repo-root>/src/loom/research/snapshots.py`
 
 ## Workstreams and PR Sequence
 
@@ -335,7 +335,7 @@ Primary files:
 ## Test Plan
 
 ### Unit Tests
-1. Add tool-level tests to `/Users/sfw/Development/loom/tests/test_new_tools.py` and `/Users/sfw/Development/loom/tests/test_tools.py`.
+1. Add tool-level tests to `<repo-root>/tests/test_new_tools.py` and `<repo-root>/tests/test_tools.py`.
 2. Add search-provider normalization tests and error/retry tests.
 3. Add citation dedupe/format/validation matrix tests.
 4. Add fact-check verdict consistency tests with deterministic fixtures.
@@ -345,7 +345,7 @@ Primary files:
 8. Add peer-review schema stability tests (required fields, score ranges).
 
 ### Integration Tests
-1. Process-level tests in `/Users/sfw/Development/loom/tests/test_processes.py` verifying required tools and deliverables.
+1. Process-level tests in `<repo-root>/tests/test_processes.py` verifying required tools and deliverables.
 2. End-to-end research run that produces:
    - source log
    - bibliography

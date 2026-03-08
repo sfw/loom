@@ -13,13 +13,13 @@ Primary outcomes:
 
 ## Incident Anchor
 Run: `cowork-ab1006f1`  
-Log: `/Users/sfw/.loom/logs/20260306-002558-cowork-ab1006f1.events.jsonl`
+Log: `~/.loom/logs/<timestamp>-cowork-<id>.events.jsonl`
 
 Observed behavior:
 1. `no-placeholders` rule is hard and includes `N/A`.
 2. Deliverables contained `N/A` in evidence/status columns:
-   - `/private/tmp/ws6/prd-software-design-education-delivery-platform/test-strategy.md:266`
-   - `/private/tmp/ws6/prd-software-design-education-delivery-platform/security-and-compliance-plan.md:104`
+   - `/path/to/workspace/test-strategy.md:266`
+   - `/path/to/workspace/security-and-compliance-plan.md:104`
 3. Tier-1 set `reason_code=hard_invariant_failed`, causing retry strategy to become `generic`.
 4. `failure_resolution_plan` ran multiple times, but remediation attempts remained `0` and run terminated on critical path.
 
@@ -162,9 +162,9 @@ When placeholder class fires, metadata must include:
 
 ## W0: Classification and Metadata Wiring
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-2. `/Users/sfw/Development/loom/src/loom/recovery/retry.py`
-3. `/Users/sfw/Development/loom/src/loom/processes/schema.py`
+1. `<repo-root>/src/loom/engine/verification.py`
+2. `<repo-root>/src/loom/recovery/retry.py`
+3. `<repo-root>/src/loom/processes/schema.py`
 
 Tasks:
 1. Emit recoverable placeholder reason codes instead of `hard_invariant_failed` when configured.
@@ -173,8 +173,8 @@ Tasks:
 
 ## W1: Deterministic Placeholder Scanner and Findings
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/verification.py`
-2. New module: `/Users/sfw/Development/loom/src/loom/engine/placeholder_remediation.py`
+1. `<repo-root>/src/loom/engine/verification.py`
+2. New module: `<repo-root>/src/loom/engine/placeholder_remediation.py`
 
 Tasks:
 1. Build tokenizer/matcher with file+line localization.
@@ -183,8 +183,8 @@ Tasks:
 
 ## W2: Confirm-or-Prune Executor
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-2. New module: `/Users/sfw/Development/loom/src/loom/engine/placeholder_remediation.py`
+1. `<repo-root>/src/loom/engine/orchestrator.py`
+2. New module: `<repo-root>/src/loom/engine/placeholder_remediation.py`
 
 Tasks:
 1. Execute deterministic fill-or-prune before model retry for placeholder-unconfirmed failures.
@@ -193,8 +193,8 @@ Tasks:
 
 ## W3: Critical-Path Behavior by Failure Class
 Files:
-1. `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-2. `/Users/sfw/Development/loom/src/loom/processes/schema.py`
+1. `<repo-root>/src/loom/engine/orchestrator.py`
+2. `<repo-root>/src/loom/processes/schema.py`
 3. Process YAMLs using strict placeholder rules.
 
 Tasks:

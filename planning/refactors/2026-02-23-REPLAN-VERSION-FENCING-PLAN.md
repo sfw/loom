@@ -25,10 +25,10 @@ Observed failure sequence:
 5. Orchestrator converts this into fatal task failure.
 
 Relevant code paths:
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py:223`
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py:577`
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py:1827`
-- `/Users/sfw/Development/loom/src/loom/state/task_state.py:122`
+- `<repo-root>/src/loom/engine/orchestrator.py:223`
+- `<repo-root>/src/loom/engine/orchestrator.py:577`
+- `<repo-root>/src/loom/engine/orchestrator.py:1827`
+- `<repo-root>/src/loom/state/task_state.py:122`
 
 ## Target End State
 1. Replan cannot occur mid-outcome-processing for a batch.
@@ -39,13 +39,13 @@ Relevant code paths:
 
 ## Scope
 Core runtime:
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-- `/Users/sfw/Development/loom/src/loom/state/task_state.py`
-- `/Users/sfw/Development/loom/src/loom/events/types.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/state/task_state.py`
+- `<repo-root>/src/loom/events/types.py`
 
 Tests:
-- `/Users/sfw/Development/loom/tests/test_orchestrator.py`
-- `/Users/sfw/Development/loom/tests/test_task_state.py`
+- `<repo-root>/tests/test_orchestrator.py`
+- `<repo-root>/tests/test_task_state.py`
 
 ## Design
 
@@ -139,7 +139,7 @@ Suggested payload fields:
 
 ### W1: Action-Driven Failure Handling
 Files:
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
 
 Tasks:
 1. Define `FailureAction` dataclass/typed dict.
@@ -149,7 +149,7 @@ Tasks:
 
 ### W2: Outcome Envelope + Version Fence
 Files:
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
 
 Tasks:
 1. Update dispatch return shape to include `dispatch_plan_version`.
@@ -158,7 +158,7 @@ Tasks:
 
 ### W3: Replan Contract Validator
 Files:
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/engine/orchestrator.py`
 
 Tasks:
 1. Add `_validate_replan_contract(old_plan, new_plan)`.
@@ -167,8 +167,8 @@ Tasks:
 
 ### W4: Safe Update Helper
 Files:
-- `/Users/sfw/Development/loom/src/loom/engine/orchestrator.py`
-- `/Users/sfw/Development/loom/src/loom/state/task_state.py` (if helper centralized there)
+- `<repo-root>/src/loom/engine/orchestrator.py`
+- `<repo-root>/src/loom/state/task_state.py` (if helper centralized there)
 
 Tasks:
 1. Add orchestrator-scoped safe update helper.
@@ -177,8 +177,8 @@ Tasks:
 
 ### W5: Events and TUI Surfacing
 Files:
-- `/Users/sfw/Development/loom/src/loom/events/types.py`
-- `/Users/sfw/Development/loom/src/loom/tui/app.py`
+- `<repo-root>/src/loom/events/types.py`
+- `<repo-root>/src/loom/tui/app.py`
 
 Tasks:
 1. Add new event constants.
