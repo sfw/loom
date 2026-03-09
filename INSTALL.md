@@ -238,7 +238,7 @@ roles = ["planner", "executor", "extractor", "verifier"]
 
 ```bash
 loom --version
-# loom, version 0.2.0
+# loom, version 0.2.1
 
 loom models
 # Should list your configured models
@@ -273,7 +273,7 @@ loom serve
 ```bash
 # In another terminal
 curl http://localhost:9000/health
-# {"status":"ok","version":"0.2.0"}
+# {"status":"ok","version":"0.2.1"}
 ```
 
 ---
