@@ -1337,6 +1337,11 @@ class LLMVerifier:
             outcome="fail",
             reason_code="parse_inconclusive",
             severity_class="inconclusive",
+            metadata={
+                "failure_class": "semantic_inconclusive",
+                "remediation_mode": "remediate_and_retry",
+                "missing_targets": [],
+            },
         )
 
     def _parse_verifier_response(self, response) -> VerificationResult | None:
@@ -1813,4 +1818,9 @@ class LLMVerifier:
                     outcome="fail",
                     reason_code="infra_verifier_error",
                     severity_class="infra",
+                    metadata={
+                        "failure_class": "infra_verifier_error",
+                        "remediation_mode": "remediate_and_retry",
+                        "missing_targets": [],
+                    },
                 )

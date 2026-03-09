@@ -6,7 +6,7 @@ import hashlib
 import re
 
 from . import events as verification_events
-from .types import VerificationResult
+from .types import AssertionEnvelope, VerificationResult
 
 
 def normalize_claim_type(text: str) -> str:
@@ -144,6 +144,83 @@ def claim_counts(claims: list[dict[str, object]]) -> dict[str, int]:
     return counts
 
 
+def assertion_verdict_from_claim_status(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized == "supported":
+        return "supported"
+    if normalized == "partially_supported":
+        return "partially_supported"
+    if normalized == "contradicted":
+        return "contradicted"
+    if normalized == "stale":
+        return "failed_contract"
+    if normalized in {"insufficient_evidence", "extracted", "pruned"}:
+        return "inconclusive"
+    return "inconclusive"
+
+
+def assertions_from_claim_lifecycle(
+    claims: list[dict[str, object]],
+) -> list[AssertionEnvelope]:
+    assertions: list[AssertionEnvelope] = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        text = str(claim.get("text", "") or "").strip()
+        if not text:
+            continue
+        status = str(claim.get("status", "") or "").strip().lower()
+        evidence_refs = claim.get("evidence_refs", [])
+        if isinstance(evidence_refs, str):
+            evidence_refs = [evidence_refs]
+        if not isinstance(evidence_refs, list):
+            evidence_refs = []
+        assertion = AssertionEnvelope(
+            assertion_id=str(claim.get("claim_id", "") or claim_id(text)).strip(),
+            assertion_type="fact",
+            verdict=assertion_verdict_from_claim_status(status),
+            confidence=(
+                0.9 if status == "supported"
+                else 0.7 if status == "partially_supported"
+                else 0.2 if status in {"contradicted", "stale"}
+                else 0.35
+            ),
+            reason_code=str(claim.get("reason_code", "") or "").strip().lower(),
+            evidence_refs=[
+                str(ref or "").strip()
+                for ref in evidence_refs
+                if str(ref or "").strip()
+            ],
+            remediation_hint=(
+                "Collect additional source evidence."
+                if status in {"insufficient_evidence", "extracted"}
+                else "Correct contradictory or stale claim text."
+                if status in {"contradicted", "stale"}
+                else ""
+            ),
+            source="fact_checker",
+        )
+        assertions.append(assertion)
+    return assertions
+
+
+def assertion_counts(assertions: list[AssertionEnvelope]) -> dict[str, int]:
+    counts = {
+        "total": 0,
+        "supported": 0,
+        "partially_supported": 0,
+        "contradicted": 0,
+        "inconclusive": 0,
+        "failed_contract": 0,
+    }
+    for assertion in assertions:
+        counts["total"] += 1
+        verdict = str(assertion.verdict or "").strip().lower()
+        if verdict in counts:
+            counts[verdict] += 1
+    return counts
+
+
 def attach_claim_lifecycle(
     gates,
     *,
@@ -161,8 +238,12 @@ def attach_claim_lifecycle(
         validity_contract=validity_contract,
     )
     counts = claim_counts(claims)
+    assertions = assertions_from_claim_lifecycle(claims)
+    assertion_count_summary = assertion_counts(assertions)
     metadata["claim_lifecycle"] = claims
     metadata["claim_status_counts"] = counts
+    metadata["assertion_envelope"] = [item.to_dict() for item in assertions]
+    metadata["assertion_counts"] = assertion_count_summary
     metadata["claim_reason_codes"] = sorted({
         str(item.get("reason_code", "") or "").strip().lower()
         for item in claims

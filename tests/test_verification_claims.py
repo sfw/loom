@@ -127,3 +127,48 @@ def test_extract_claim_lifecycle_preserves_partial_and_inconclusive() -> None:
     assert claims[1]["status"] == "insufficient_evidence"
     assert claims[1]["reason_code"] == "claim_inconclusive"
     assert counts["partially_supported"] == 1
+
+
+def test_attach_claim_lifecycle_populates_assertion_envelope() -> None:
+    gates = SimpleNamespace(_event_bus=EventBus())
+    tool_calls = [
+        SimpleNamespace(
+            tool="fact_checker",
+            result=ToolResult.ok(
+                "ok",
+                data={
+                    "verdicts": [
+                        {
+                            "claim": "Housing affordability remained a top concern",
+                            "verdict": "partially_supported",
+                        },
+                        {
+                            "claim": "Signal quality was low",
+                            "verdict": "unverifiable",
+                            "reason_code": "semantic_inconclusive",
+                        },
+                    ],
+                },
+            ),
+        ),
+    ]
+    base = VerificationResult(
+        tier=2,
+        passed=True,
+        outcome="pass_with_warnings",
+    )
+    enriched = verification_claims.attach_claim_lifecycle(
+        gates,
+        task_id="task-assertions",
+        subtask_id="analysis",
+        result=base,
+        tool_calls=tool_calls,
+        validity_contract={},
+    )
+    assertion_counts = enriched.metadata.get("assertion_counts", {})
+    assertions = enriched.metadata.get("assertion_envelope", [])
+    assert assertion_counts["total"] == 2
+    assert assertion_counts["partially_supported"] == 1
+    assert assertion_counts["inconclusive"] == 1
+    assert isinstance(assertions, list)
+    assert assertions[0]["assertion_type"] == "fact"

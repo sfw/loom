@@ -12,6 +12,7 @@ from pathlib import Path
 from loom.engine.iteration_gates import IterationEvaluation
 from loom.engine.runner import SubtaskResult, SubtaskResultStatus, ToolCallRecord
 from loom.engine.verification import VerificationResult
+from loom.engine.verification.policy import normalize_profile, resolve_policy_decision
 from loom.events.types import (
     ARTIFACT_SEAL_VALIDATION,
     ITERATION_COMPLETED,
@@ -86,6 +87,26 @@ async def dispatch_subtask(
     """
     contract = orchestrator._validity_contract_for_subtask(subtask)
     required_verification_tier = orchestrator._synthesis_verification_floor(subtask)
+    profile_resolution = orchestrator._resolve_verification_profile(
+        task=task,
+        subtask=subtask,
+        tool_calls=None,
+    )
+    profile_confidence_threshold = float(
+        getattr(
+            orchestrator._config.verification,
+            "resilience_profile_confidence_threshold",
+            0.65,
+        ) or 0.65,
+    )
+    effective_profile = normalize_profile(
+        profile_resolution.profile
+        if profile_resolution.confidence >= profile_confidence_threshold
+        else profile_resolution.fallback_profile,
+    )
+    policy_mode = str(
+        getattr(orchestrator._config.verification, "resilience_policy_mode", "enforce"),
+    ).strip().lower()
 
     # Mark running and emit event (under lock for parallel safety)
     async with orchestrator._state_lock:
@@ -274,11 +295,13 @@ async def dispatch_subtask(
             orchestrator._verified_context_for_synthesis(
                 task=task,
                 subtask=subtask,
+                verification_profile=effective_profile,
             )
         )
         claim_graph = orchestrator._claim_graph_state(task)
         supported_total = 0
         unresolved_total = 0
+        unresolved_hard_total = 0
         supported_by_subtask = claim_graph.get("supported_by_subtask", {})
         if isinstance(supported_by_subtask, dict):
             supported_total = sum(
@@ -291,12 +314,45 @@ async def dispatch_subtask(
                 len(value) for value in unresolved_by_subtask.values()
                 if isinstance(value, list)
             )
+            for values in unresolved_by_subtask.values():
+                if not isinstance(values, list):
+                    continue
+                for item in values:
+                    if not isinstance(item, dict):
+                        continue
+                    status = str(item.get("status", "") or "").strip().lower()
+                    if status in {"contradicted", "stale"}:
+                        unresolved_hard_total += 1
+        gate_decision = resolve_policy_decision(
+            severity_class="semantic",
+            reason_code=(
+                "claim_contradicted"
+                if unresolved_hard_total > 0
+                else "coverage_below_threshold"
+            ),
+            profile=effective_profile,
+            mode=policy_mode,
+            contradiction_detected=bool(unresolved_hard_total > 0),
+            profile_confidence=profile_resolution.confidence,
+        )
+        if not gate_passed and gate_decision.action == "pass_with_warnings":
+            gate_passed = True
+            gate_error = (
+                "Synthesis gate warning: proceeding under profile-aware policy "
+                "despite inconclusive claim coverage."
+            )
         orchestrator._emit(SYNTHESIS_INPUT_GATE_DECISION, task.id, {
             "subtask_id": subtask.id,
             "phase_id": subtask.phase_id,
             "passed": bool(gate_passed),
             "supported_claim_count": int(supported_total),
             "unresolved_claim_count": int(unresolved_total),
+            "unresolved_hard_count": int(unresolved_hard_total),
+            "verification_profile": effective_profile,
+            "verification_profile_confidence": float(profile_resolution.confidence),
+            "policy_action": gate_decision.action,
+            "policy_mode": gate_decision.mode,
+            "policy_shadow_diff": gate_decision.shadow_diff,
             "reason": (
                 gate_error
                 if gate_error
@@ -322,6 +378,13 @@ async def dispatch_subtask(
                 severity_class="semantic",
                 metadata={
                     "synthesis_input_gate_blocked": True,
+                    "verification_profile": effective_profile,
+                    "verification_profile_confidence": float(
+                        profile_resolution.confidence,
+                    ),
+                    "policy_action": gate_decision.action,
+                    "policy_mode": gate_decision.mode,
+                    "policy_shadow_diff": gate_decision.shadow_diff,
                 },
             )
             return subtask, blocked, blocked_verification
@@ -397,6 +460,38 @@ async def dispatch_subtask(
                 },
             )
 
+    profile_resolution = orchestrator._resolve_verification_profile(
+        task=task,
+        subtask=subtask,
+        tool_calls=result.tool_calls,
+    )
+    effective_profile = normalize_profile(
+        profile_resolution.profile
+        if profile_resolution.confidence >= profile_confidence_threshold
+        else profile_resolution.fallback_profile,
+    )
+    verification_metadata = (
+        dict(verification.metadata)
+        if isinstance(verification.metadata, dict)
+        else {}
+    )
+    verification_metadata["verification_profile"] = effective_profile
+    verification_metadata["verification_profile_confidence"] = float(
+        profile_resolution.confidence,
+    )
+    verification_metadata["verification_profile_reasons"] = list(
+        profile_resolution.reason_codes,
+    )
+    verification = orchestrator._verification_with_metadata(
+        verification,
+        metadata=verification_metadata,
+    )
+    verification = orchestrator._attach_runtime_assertions(
+        subtask=subtask,
+        verification=verification,
+        tool_calls=result.tool_calls,
+    )
+
     verification = orchestrator._enforce_required_fact_checker(
         subtask=subtask,
         result=result,
@@ -427,7 +522,58 @@ async def dispatch_subtask(
                 contract=contract,
             )
         if not verification.passed:
-            result.status = SubtaskResultStatus.FAILED
+            metadata = (
+                dict(verification.metadata)
+                if isinstance(verification.metadata, dict)
+                else {}
+            )
+            policy_decision = resolve_policy_decision(
+                severity_class=str(verification.severity_class or ""),
+                reason_code=str(verification.reason_code or ""),
+                profile=effective_profile,
+                mode=policy_mode,
+                contradiction_detected=bool(
+                    metadata.get("contradiction_detected", False),
+                ),
+                profile_confidence=profile_resolution.confidence,
+            )
+            metadata["policy_action"] = policy_decision.action
+            metadata["policy_mode"] = policy_decision.mode
+            metadata["policy_shadow_diff"] = policy_decision.shadow_diff
+            verification = orchestrator._verification_with_metadata(
+                verification,
+                metadata=metadata,
+            )
+            if policy_decision.action == "pass_with_warnings" and subtask.is_synthesis:
+                result.status = SubtaskResultStatus.SUCCESS
+                warning_note = (
+                    "Verification remained inconclusive, but profile-aware policy "
+                    "allowed completion with warnings."
+                )
+                verification = orchestrator._verification_with_metadata(
+                    verification,
+                    metadata=metadata,
+                    passed=True,
+                    outcome=(
+                        "partial_verified"
+                        if orchestrator._config.verification.allow_partial_verified
+                        else "pass_with_warnings"
+                    ),
+                    feedback="\n".join(
+                        part
+                        for part in [verification.feedback or "", warning_note]
+                        if part
+                    ),
+                    severity_class=(
+                        "inconclusive"
+                        if str(verification.severity_class or "").strip().lower()
+                        in {"inconclusive", "infra"}
+                        else "semantic"
+                    ),
+                    confidence=min(0.7, max(0.35, float(verification.confidence or 0.5))),
+                )
+            else:
+                result.status = SubtaskResultStatus.FAILED
     orchestrator._update_claim_graph_from_verification(
         task=task,
         subtask=subtask,
@@ -487,13 +633,50 @@ async def handle_failure(
         workspace=task.workspace,
     )
     attempt_list = attempts_by_subtask.setdefault(subtask.id, [])
+    verification_metadata = (
+        dict(verification.metadata)
+        if isinstance(verification.metadata, dict)
+        else {}
+    )
+    profile = normalize_profile(
+        verification_metadata.get("verification_profile", "hybrid"),
+    )
+    try:
+        profile_confidence = float(
+            verification_metadata.get("verification_profile_confidence", 0.0),
+        )
+    except (TypeError, ValueError):
+        profile_confidence = 0.0
+    policy_mode = str(
+        getattr(orchestrator._config.verification, "resilience_policy_mode", "enforce"),
+    ).strip().lower()
+    policy_decision = resolve_policy_decision(
+        severity_class=str(verification.severity_class or ""),
+        reason_code=str(verification.reason_code or ""),
+        profile=profile,
+        mode=policy_mode,
+        contradiction_detected=bool(
+            verification_metadata.get("contradiction_detected", False),
+        ),
+        profile_confidence=profile_confidence,
+    )
     strategy, missing_targets = orchestrator._retry.classify_failure(
         verification_feedback=verification.feedback,
         execution_error=result.summary,
         verification=verification,
+        profile=profile,
+        policy_mode=policy_mode,
+        profile_confidence=profile_confidence,
     )
     combined_error = " | ".join(
         part for part in [verification.feedback, result.summary] if part
+    )
+    progress_signature = orchestrator._retry.progress_signature(
+        verification_feedback=verification.feedback,
+        execution_error=result.summary,
+        reason_code=str(verification.reason_code or ""),
+        strategy=strategy,
+        missing_targets=missing_targets,
     )
     attempt_record = AttemptRecord(
         attempt=len(attempt_list) + 1,
@@ -512,6 +695,10 @@ async def handle_failure(
         ],
         retry_strategy=strategy,
         missing_targets=missing_targets,
+        reason_code=str(verification.reason_code or "").strip().lower(),
+        severity_class=str(verification.severity_class or "").strip().lower(),
+        policy_action=policy_decision.action,
+        progress_signature=progress_signature,
     )
     attempt_list.append(attempt_record)
     await orchestrator._persist_subtask_attempt_record(
@@ -652,6 +839,27 @@ async def handle_failure(
             metadata["deterministic_placeholder_prepass"] = deterministic_details
             verification.metadata = metadata
 
+    no_progress_exhausted = orchestrator._retry.should_stop_for_no_progress(
+        attempt_list,
+        max_stalled_attempts=int(
+            getattr(
+                orchestrator._config.verification,
+                "resilience_no_progress_attempts",
+                2,
+            ) or 2,
+        ),
+    )
+    if no_progress_exhausted:
+        no_progress_note = (
+            "Retry policy stopped additional attempts due to no-progress "
+            "signatures across consecutive retries."
+        )
+        verification.feedback = (
+            f"{verification.feedback}\n{no_progress_note}".strip()
+            if verification.feedback
+            else no_progress_note
+        )
+
     runner_cap_exhausted = False
     iteration_policy = orchestrator._phase_iteration_policy(subtask)
     iteration_budget_reason = ""
@@ -670,7 +878,8 @@ async def handle_failure(
         )
 
     if (
-        not runner_cap_exhausted
+        not no_progress_exhausted
+        and not runner_cap_exhausted
         and not iteration_budget_reason
         and subtask.retry_count < subtask.max_retries
     ):
