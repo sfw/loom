@@ -6,7 +6,20 @@ This changelog is generated directly from git commit history (non-merge commits)
 
 ## [Unreleased]
 
-- 2026-03-07 `7d66e79` Fix regressions from sealed artifact policy refactor
+## [0.2.1] - 2026-03-09
+
+- 2026-03-08 `f0c95f7` Align tier1 syntax hard-fail scope with retry-writable outputs
+- 2026-03-08 `0fa78e1` fix: enforce resilience kill-switch paths and parse retry routing
+- 2026-03-08 `2147e47` telemetry: add verification resilience reliability metrics
+- 2026-03-08 `a4dae41` refactor: add assertion envelope and profile-aware synthesis resilience
+- 2026-03-08 `a91ae16` refactor: add resilience decision matrix and profile classification
+- 2026-03-08 `73e3b43` Harden verification reliability and add resilience implementation plan
+- 2026-03-08 `388087d` Mark command-wrapper tools as mutating for seal guard coverage
+- 2026-03-08 `9cdf44e` Improve valuation verification reliability for precedent evidence
+- 2026-03-08 `9864f4b` modified readme
+- 2026-03-08 `e03fd94` modified readme
+- 2026-03-08 `62ff36d` Reseal artifacts after placeholder prepass mutations
+- 2026-03-07 `965099c` Changelog: mark version standardization as 0.2.0 release
 
 ## [0.2.0] - 2026-03-08
 

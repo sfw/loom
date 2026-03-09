@@ -1,6 +1,6 @@
 [project]
 name = "loom"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local-first LLM execution harness — decomposition, verified execution, and routing"
 requires-python = ">=3.11"
 dependencies = [
