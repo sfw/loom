@@ -90,19 +90,38 @@ def test_emit_telemetry_run_summary_includes_reliability_metrics() -> None:
         _events=bus,
         _task_run_id=lambda task: "run-1",
         _new_telemetry_rollup=orchestrator_telemetry.new_telemetry_rollup,
-        _task_event_counts=lambda task_id: orchestrator_telemetry.task_event_counts(bus, task_id),
-        _verification_reason_counts=lambda task_id: orchestrator_telemetry.verification_reason_counts(
-            event_bus=bus,
-            task_id=task_id,
-            verification_outcome_event_type=VERIFICATION_OUTCOME,
+        _task_event_counts=lambda task_id: orchestrator_telemetry.task_event_counts(
+            bus,
+            task_id,
+        ),
+        _verification_reason_counts=(
+            lambda task_id: orchestrator_telemetry.verification_reason_counts(
+                event_bus=bus,
+                task_id=task_id,
+                verification_outcome_event_type=VERIFICATION_OUTCOME,
+            )
         ),
         _run_budget=SimpleNamespace(snapshot=lambda: {}),
-        _emit=lambda event_type, task_id, data: bus.emit(Event(event_type=event_type, task_id=task_id, data=data)),
+        _emit=lambda event_type, task_id, data: bus.emit(
+            Event(event_type=event_type, task_id=task_id, data=data),
+        ),
     )
     task = SimpleNamespace(id="t-run", metadata={})
-    bus.emit(Event(event_type=VERIFICATION_OUTCOME, task_id="t-run", data={"reason_code": "parse_inconclusive"}))
-    bus.emit(Event(event_type=VERIFICATION_OUTCOME, task_id="t-run", data={"reason_code": "hard_invariant_failed"}))
-    bus.emit(Event(event_type=VERIFICATION_OUTCOME, task_id="t-run", data={"reason_code": "claim_inconclusive"}))
+    bus.emit(Event(
+        event_type=VERIFICATION_OUTCOME,
+        task_id="t-run",
+        data={"reason_code": "parse_inconclusive"},
+    ))
+    bus.emit(Event(
+        event_type=VERIFICATION_OUTCOME,
+        task_id="t-run",
+        data={"reason_code": "hard_invariant_failed"},
+    ))
+    bus.emit(Event(
+        event_type=VERIFICATION_OUTCOME,
+        task_id="t-run",
+        data={"reason_code": "claim_inconclusive"},
+    ))
     bus.emit(Event(event_type="verification_failed", task_id="t-run", data={}))
     bus.emit(Event(event_type="verification_failed", task_id="t-run", data={}))
     bus.emit(Event(event_type="verification_started", task_id="t-run", data={}))

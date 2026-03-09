@@ -585,6 +585,116 @@ class TestOrchestratorValidityPolicy:
         assert gated.reason_code == "claim_inconclusive"
 
     @pytest.mark.asyncio
+    async def test_synthesis_claim_gate_shadow_mode_disables_behavior_soft_pass(
+        self,
+        tmp_path,
+    ):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=Config(
+                verification=VerificationConfig(resilience_policy_mode="shadow"),
+            ),
+        )
+        subtask = Subtask(
+            id="synth",
+            description="Synthesize coding results",
+            is_synthesis=True,
+            verification_tier=2,
+        )
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="coverage_below_threshold",
+            severity_class="semantic",
+            metadata={
+                "verification_profile": "coding",
+                "assertion_envelope": [
+                    {
+                        "assertion_id": "ASRT-1",
+                        "assertion_type": "behavior",
+                        "verdict": "supported",
+                        "confidence": 0.9,
+                        "reason_code": "tool_execution_success",
+                        "evidence_refs": ["pytest.log"],
+                        "remediation_hint": "",
+                        "source": "tool:pytest",
+                    },
+                ],
+            },
+        )
+
+        gated = orch._enforce_synthesis_claim_gate(
+            subtask=subtask,
+            verification=verification,
+            contract={},
+        )
+
+        assert gated.passed is False
+        assert gated.outcome == "fail"
+        assert gated.reason_code == "coverage_below_threshold"
+
+    @pytest.mark.asyncio
+    async def test_synthesis_claim_gate_off_mode_disables_behavior_soft_pass(
+        self,
+        tmp_path,
+    ):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=Config(
+                verification=VerificationConfig(resilience_policy_mode="off"),
+            ),
+        )
+        subtask = Subtask(
+            id="synth",
+            description="Synthesize coding results",
+            is_synthesis=True,
+            verification_tier=2,
+        )
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="coverage_below_threshold",
+            severity_class="semantic",
+            metadata={
+                "verification_profile": "coding",
+                "assertion_envelope": [
+                    {
+                        "assertion_id": "ASRT-1",
+                        "assertion_type": "behavior",
+                        "verdict": "supported",
+                        "confidence": 0.9,
+                        "reason_code": "tool_execution_success",
+                        "evidence_refs": ["pytest.log"],
+                        "remediation_hint": "",
+                        "source": "tool:pytest",
+                    },
+                ],
+            },
+        )
+
+        gated = orch._enforce_synthesis_claim_gate(
+            subtask=subtask,
+            verification=verification,
+            contract={},
+        )
+
+        assert gated.passed is False
+        assert gated.outcome == "fail"
+        assert gated.reason_code == "coverage_below_threshold"
+
+    @pytest.mark.asyncio
     async def test_synthesis_input_gate_injects_supported_claims_only(self, tmp_path):
         orch = Orchestrator(
             model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),

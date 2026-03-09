@@ -117,6 +117,14 @@ def resolve_failure_action(
     if reason in _TARGETED_RETRY_REASON_CODES:
         return "retry_targeted"
     if reason in _INCONCLUSIVE_REASON_CODES:
+        if reason in {
+            "parse_inconclusive",
+            "infra_verifier_error",
+            "verifier_parse_inconclusive",
+            "verifier_unavailable",
+            "semantic_inconclusive",
+        }:
+            return "retry_semantic"
         if effective_lane == "research":
             return "retry_semantic"
         return "pass_with_warnings"

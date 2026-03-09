@@ -1368,6 +1368,10 @@ def _enforce_synthesis_claim_gate(
 ) -> VerificationResult:
     if not subtask.is_synthesis:
         return verification
+    policy_mode = str(
+        getattr(self._config.verification, "resilience_policy_mode", "enforce"),
+    ).strip().lower()
+    enforce_profile_resilience = policy_mode == "enforce"
     metadata = dict(verification.metadata) if isinstance(verification.metadata, dict) else {}
     verification_profile = normalize_profile(
         metadata.get("verification_profile", "hybrid"),
@@ -1380,7 +1384,8 @@ def _enforce_synthesis_claim_gate(
     claims = self._claims_from_verification(verification)
     if not claims:
         if (
-            verification_profile in {"coding", "data_ops", "hybrid"}
+            enforce_profile_resilience
+            and verification_profile in {"coding", "data_ops", "hybrid"}
             and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
         ):
             note = (
@@ -1399,6 +1404,11 @@ def _enforce_synthesis_claim_gate(
                 severity_class="inconclusive",
                 confidence=min(0.75, max(0.35, float(verification.confidence or 0.5))),
             )
+        if (
+            verification_profile in {"coding", "data_ops", "hybrid"}
+            and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
+        ):
+            metadata["synthesis_gate_profile_resilience_skipped"] = True
         return verification
 
     counts = self._claim_counts(claims)
@@ -1511,9 +1521,11 @@ def _enforce_synthesis_claim_gate(
             "Synthesis claim gate is inconclusive: no claims reached supported status, "
             "but unresolved claims were marked inconclusive rather than contradicted."
         )
-        if verification_profile in {"coding", "data_ops", "hybrid"} and int(
-            assertion_counts.get("behavior_supported", 0) or 0
-        ) > 0:
+        if (
+            enforce_profile_resilience
+            and verification_profile in {"coding", "data_ops", "hybrid"}
+            and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
+        ):
             note = (
                 f"{note} Non-research profile {verification_profile} retained "
                 "behavioral verification support."
@@ -1531,7 +1543,8 @@ def _enforce_synthesis_claim_gate(
             confidence=min(float(verification.confidence or 0.5), 0.4),
         )
     if (
-        verification_profile in {"coding", "data_ops", "hybrid"}
+        enforce_profile_resilience
+        and verification_profile in {"coding", "data_ops", "hybrid"}
         and counts["contradicted"] == 0
         and counts["stale"] == 0
         and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
@@ -1900,6 +1913,10 @@ def _verified_context_for_synthesis(
     subtask: Subtask,
     verification_profile: str = "hybrid",
 ) -> tuple[bool, str, str]:
+    policy_mode = str(
+        getattr(self._config.verification, "resilience_policy_mode", "enforce"),
+    ).strip().lower()
+    enforce_profile_resilience = policy_mode == "enforce"
     contract = self._validity_contract_for_subtask(subtask)
     claim_extraction = contract.get("claim_extraction", {})
     claim_extraction_enabled = isinstance(claim_extraction, dict) and self._to_bool(
@@ -1960,7 +1977,11 @@ def _verified_context_for_synthesis(
         return True, "", ""
     if total_supported <= 0:
         profile = normalize_profile(verification_profile)
-        if profile in {"coding", "data_ops", "hybrid"} and behavior_supported > 0:
+        if (
+            enforce_profile_resilience
+            and profile in {"coding", "data_ops", "hybrid"}
+            and behavior_supported > 0
+        ):
             return (
                 True,
                 "",
