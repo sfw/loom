@@ -346,3 +346,68 @@ class TestRetryManager:
         context = mgr.build_retry_context(attempts)
         assert "TARGETED RETRY PLAN" in context
         assert "canonical deliverable path policy" in context.lower()
+
+    def test_classify_failure_honors_profile_policy_warn_path(self):
+        strategy, targets = RetryManager.classify_failure(
+            verification_feedback="coverage below threshold",
+            execution_error="",
+            verification={
+                "reason_code": "coverage_below_threshold",
+                "severity_class": "semantic",
+            },
+            profile="coding",
+            policy_mode="enforce",
+            profile_confidence=0.9,
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert targets == []
+
+    def test_classify_failure_shadow_mode_uses_legacy_action(self):
+        strategy, targets = RetryManager.classify_failure(
+            verification_feedback="coverage below threshold",
+            execution_error="",
+            verification={
+                "reason_code": "coverage_below_threshold",
+                "severity_class": "semantic",
+            },
+            profile="coding",
+            policy_mode="shadow",
+            profile_confidence=0.9,
+        )
+        assert strategy == RetryStrategy.GENERIC
+        assert targets == []
+
+    def test_progress_signature_collapses_numeric_deltas(self):
+        signature_a = RetryManager.progress_signature(
+            verification_feedback="extracted=150 supported=0",
+            execution_error="attempt 1",
+            reason_code="coverage_below_threshold",
+            strategy=RetryStrategy.VERIFIER_PARSE,
+            missing_targets=[],
+        )
+        signature_b = RetryManager.progress_signature(
+            verification_feedback="extracted=151 supported=0",
+            execution_error="attempt 2",
+            reason_code="coverage_below_threshold",
+            strategy=RetryStrategy.VERIFIER_PARSE,
+            missing_targets=[],
+        )
+        assert signature_a == signature_b
+
+    def test_should_stop_for_no_progress_when_signatures_repeat(self):
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=1,
+                progress_signature="sig-a",
+                retry_strategy=RetryStrategy.VERIFIER_PARSE,
+            ),
+            AttemptRecord(
+                attempt=2,
+                tier=1,
+                progress_signature="sig-a",
+                retry_strategy=RetryStrategy.VERIFIER_PARSE,
+            ),
+        ]
+        assert mgr.should_stop_for_no_progress(attempts, max_stalled_attempts=2) is True

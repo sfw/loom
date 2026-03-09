@@ -137,6 +137,8 @@ class FactCheckVerdict:
     rationale: str
     source: str = ""
     source_excerpt: str = ""
+    reason_code: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -146,4 +148,6 @@ class FactCheckVerdict:
             "rationale": self.rationale,
             "source": self.source,
             "source_excerpt": self.source_excerpt,
+            "reason_code": self.reason_code,
+            "evidence_refs": list(self.evidence_refs),
         }

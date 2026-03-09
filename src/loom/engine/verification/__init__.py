@@ -12,9 +12,10 @@ from __future__ import annotations
 from .gates import VerificationGates, VotingVerifier
 from .tier1 import DeterministicVerifier
 from .tier2 import LLMVerifier
-from .types import Check, VerificationResult
+from .types import AssertionEnvelope, Check, VerificationResult
 
 __all__ = [
+    "AssertionEnvelope",
     "Check",
     "DeterministicVerifier",
     "LLMVerifier",

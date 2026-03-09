@@ -10,7 +10,8 @@ from datetime import datetime
 from pathlib import Path
 
 from loom.engine.runner import SubtaskResult, SubtaskResultStatus, ToolCallRecord
-from loom.engine.verification import VerificationResult
+from loom.engine.verification import AssertionEnvelope, VerificationResult
+from loom.engine.verification.policy import normalize_profile
 from loom.events.types import CLAIMS_PRUNED
 from loom.state.evidence import merge_evidence_records
 from loom.state.task_state import Subtask, Task
@@ -20,11 +21,13 @@ logger = logging.getLogger(__name__)
 _CLAIM_TERMINAL_UNRESOLVED = frozenset({
     "contradicted",
     "insufficient_evidence",
+    "partially_supported",
     "extracted",
     "stale",
 })
 _CLAIM_REASON_CODES = {
     "supported": "claim_supported",
+    "partially_supported": "claim_partially_supported",
     "contradicted": "claim_contradicted",
     "insufficient_evidence": "claim_insufficient_evidence",
     "stale": "claim_stale_source",
@@ -37,6 +40,7 @@ _CLAIM_RECOVERABLE_FAILURE_CODES = frozenset({
     "claim_insufficient_evidence",
     "claim_contradicted",
     "claim_stale_source",
+    "claim_inconclusive",
     "coverage_below_threshold",
 })
 
@@ -524,6 +528,14 @@ def _claim_graph_state(self, task: Task) -> dict[str, object]:
     if not isinstance(unresolved, dict):
         unresolved = {}
     graph["unresolved_by_subtask"] = unresolved
+    supported_assertions = graph.get("supported_assertions_by_subtask")
+    if not isinstance(supported_assertions, dict):
+        supported_assertions = {}
+    graph["supported_assertions_by_subtask"] = supported_assertions
+    unresolved_assertions = graph.get("unresolved_assertions_by_subtask")
+    if not isinstance(unresolved_assertions, dict):
+        unresolved_assertions = {}
+    graph["unresolved_assertions_by_subtask"] = unresolved_assertions
     metadata["claim_graph"] = graph
     task.metadata = metadata
     return graph
@@ -542,9 +554,13 @@ def _update_claim_graph_from_verification(
     graph = self._claim_graph_state(task)
     supported_by_subtask = graph.get("supported_by_subtask")
     unresolved_by_subtask = graph.get("unresolved_by_subtask")
+    supported_assertions_by_subtask = graph.get("supported_assertions_by_subtask")
+    unresolved_assertions_by_subtask = graph.get("unresolved_assertions_by_subtask")
     if (
         not isinstance(supported_by_subtask, dict)
         or not isinstance(unresolved_by_subtask, dict)
+        or not isinstance(supported_assertions_by_subtask, dict)
+        or not isinstance(unresolved_assertions_by_subtask, dict)
     ):
         return
     supported_claims: list[dict[str, object]] = []
@@ -559,6 +575,18 @@ def _update_claim_graph_from_verification(
             unresolved_claims.append(dict(claim))
     supported_by_subtask[subtask.id] = supported_claims
     unresolved_by_subtask[subtask.id] = unresolved_claims
+    assertions = self._assertions_from_verification(verification)
+    supported_assertions: list[dict[str, object]] = []
+    unresolved_assertions: list[dict[str, object]] = []
+    for assertion in assertions:
+        payload = assertion.to_dict()
+        verdict = str(assertion.verdict or "").strip().lower()
+        if verdict in {"supported", "partially_supported"}:
+            supported_assertions.append(payload)
+        elif verdict in {"inconclusive", "failed_contract", "contradicted"}:
+            unresolved_assertions.append(payload)
+    supported_assertions_by_subtask[subtask.id] = supported_assertions
+    unresolved_assertions_by_subtask[subtask.id] = unresolved_assertions
 
 def _claims_from_verification(verification: VerificationResult) -> list[dict[str, object]]:
     metadata = verification.metadata if isinstance(verification.metadata, dict) else {}
@@ -626,6 +654,7 @@ def _claim_counts(claims: list[dict[str, object]]) -> dict[str, int]:
     counts = {
         "extracted": len(claims),
         "supported": 0,
+        "partially_supported": 0,
         "contradicted": 0,
         "insufficient_evidence": 0,
         "stale": 0,
@@ -664,6 +693,161 @@ def _claim_ratios(counts: dict[str, int]) -> dict[str, float]:
             float(critical_supported) / float(critical_total)
         ) if critical_total > 0 else 1.0,
     }
+
+
+def _assertions_from_verification(verification: VerificationResult) -> list[AssertionEnvelope]:
+    metadata = verification.metadata if isinstance(verification.metadata, dict) else {}
+    raw_assertions = metadata.get("assertion_envelope", [])
+    if not isinstance(raw_assertions, list):
+        return []
+    assertions: list[AssertionEnvelope] = []
+    for item in raw_assertions:
+        if not isinstance(item, dict):
+            continue
+        assertion_id = str(item.get("assertion_id", "") or "").strip()
+        if not assertion_id:
+            continue
+        assertions.append(AssertionEnvelope(
+            assertion_id=assertion_id,
+            assertion_type=str(item.get("assertion_type", "fact") or "fact"),
+            verdict=str(item.get("verdict", "inconclusive") or "inconclusive"),
+            confidence=float(item.get("confidence", 0.5) or 0.5),
+            reason_code=str(item.get("reason_code", "") or ""),
+            evidence_refs=item.get("evidence_refs", []),
+            remediation_hint=str(item.get("remediation_hint", "") or ""),
+            source=str(item.get("source", "") or ""),
+        ))
+    return assertions
+
+
+def _runtime_assertions_from_tool_calls(
+    *,
+    subtask: Subtask,
+    tool_calls: list[ToolCallRecord] | None,
+) -> list[AssertionEnvelope]:
+    assertions: list[AssertionEnvelope] = []
+    if not isinstance(tool_calls, list):
+        return assertions
+    for index, call in enumerate(tool_calls, start=1):
+        tool_name = str(getattr(call, "tool", "") or "").strip().lower()
+        if not tool_name:
+            continue
+        result = getattr(call, "result", None)
+        success = bool(result is not None and getattr(result, "success", False))
+        files_changed = []
+        if result is not None:
+            raw_files = getattr(result, "files_changed", [])
+            if isinstance(raw_files, list):
+                files_changed = [
+                    str(path or "").strip()
+                    for path in raw_files
+                    if str(path or "").strip()
+                ]
+        assertion_type = "behavior"
+        if any(token in tool_name for token in ("schema", "sql", "csv", "table")):
+            assertion_type = "policy"
+        elif any(token in tool_name for token in ("lint", "test", "build")):
+            assertion_type = "behavior"
+        elif any(token in tool_name for token in ("write", "document")):
+            assertion_type = "format"
+        verdict = "supported" if success else "failed_contract"
+        reason_code = "tool_execution_success" if success else "tool_execution_failed"
+        remediation_hint = "" if success else "Re-run failed checks and fix diagnostics."
+        assertion_key = "|".join([
+            subtask.id,
+            tool_name,
+            str(index),
+            verdict,
+            ",".join(files_changed[:8]),
+        ])
+        assertion_id = "ASRT-" + hashlib.sha1(
+            assertion_key.encode("utf-8", errors="replace"),
+        ).hexdigest()[:12].upper()
+        assertions.append(AssertionEnvelope(
+            assertion_id=assertion_id,
+            assertion_type=assertion_type,
+            verdict=verdict,
+            confidence=0.75 if success else 0.25,
+            reason_code=reason_code,
+            evidence_refs=files_changed,
+            remediation_hint=remediation_hint,
+            source=f"tool:{tool_name}",
+        ))
+    return assertions
+
+
+def _assertion_counts(assertions: list[AssertionEnvelope]) -> dict[str, int]:
+    counts = {
+        "total": 0,
+        "supported": 0,
+        "partially_supported": 0,
+        "contradicted": 0,
+        "inconclusive": 0,
+        "failed_contract": 0,
+        "behavior_supported": 0,
+        "behavior_total": 0,
+    }
+    for assertion in assertions:
+        counts["total"] += 1
+        verdict = str(assertion.verdict or "").strip().lower()
+        if verdict in counts:
+            counts[verdict] += 1
+        assertion_type = str(assertion.assertion_type or "").strip().lower()
+        if assertion_type in {"behavior", "policy", "format"}:
+            counts["behavior_total"] += 1
+            if verdict in {"supported", "partially_supported"}:
+                counts["behavior_supported"] += 1
+    return counts
+
+
+def _attach_runtime_assertions(
+    self,
+    *,
+    subtask: Subtask,
+    verification: VerificationResult,
+    tool_calls: list[ToolCallRecord] | None,
+) -> VerificationResult:
+    existing = self._assertions_from_verification(verification)
+    runtime = self._runtime_assertions_from_tool_calls(
+        subtask=subtask,
+        tool_calls=tool_calls,
+    )
+    merged_by_id: dict[str, AssertionEnvelope] = {}
+    for item in [*existing, *runtime]:
+        merged_by_id[item.assertion_id] = item
+    merged = list(merged_by_id.values())
+    metadata = dict(verification.metadata) if isinstance(verification.metadata, dict) else {}
+    metadata["assertion_envelope"] = [item.to_dict() for item in merged]
+    metadata["assertion_counts"] = self._assertion_counts(merged)
+    return self._verification_with_metadata(
+        verification,
+        metadata=metadata,
+    )
+
+
+def _claims_only_inconclusive_unresolved(claims: list[dict[str, object]]) -> bool:
+    if not claims:
+        return False
+    soft_statuses = {"insufficient_evidence", "partially_supported", "extracted"}
+    soft_reasons = {
+        "claim_inconclusive",
+        "semantic_inconclusive",
+        "verifier_unavailable",
+        "verifier_parse_inconclusive",
+    }
+    for claim in claims:
+        status = str(claim.get("status", "") or "").strip().lower()
+        reason = str(claim.get("reason_code", "") or "").strip().lower()
+        if status in {"contradicted", "stale"}:
+            return False
+        if status in soft_statuses:
+            if reason not in soft_reasons:
+                return False
+            continue
+        if status == "supported":
+            return False
+        return False
+    return True
 
 def _verification_with_metadata(
     verification: VerificationResult,
@@ -1184,8 +1368,47 @@ def _enforce_synthesis_claim_gate(
 ) -> VerificationResult:
     if not subtask.is_synthesis:
         return verification
+    policy_mode = str(
+        getattr(self._config.verification, "resilience_policy_mode", "enforce"),
+    ).strip().lower()
+    enforce_profile_resilience = policy_mode == "enforce"
+    metadata = dict(verification.metadata) if isinstance(verification.metadata, dict) else {}
+    verification_profile = normalize_profile(
+        metadata.get("verification_profile", "hybrid"),
+    )
+    assertions = self._assertions_from_verification(verification)
+    assertion_counts = self._assertion_counts(assertions)
+    metadata["assertion_counts"] = assertion_counts
+    metadata["verification_profile"] = verification_profile
+
     claims = self._claims_from_verification(verification)
     if not claims:
+        if (
+            enforce_profile_resilience
+            and verification_profile in {"coding", "data_ops", "hybrid"}
+            and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
+        ):
+            note = (
+                "Synthesis claim gate accepted behavior assertions for non-research "
+                "profile despite sparse claim extraction."
+            )
+            return self._verification_with_metadata(
+                verification,
+                metadata=metadata,
+                passed=True,
+                outcome="pass_with_warnings",
+                reason_code="claim_inconclusive",
+                feedback="\n".join(
+                    part for part in [verification.feedback or "", note] if part
+                ),
+                severity_class="inconclusive",
+                confidence=min(0.75, max(0.35, float(verification.confidence or 0.5))),
+            )
+        if (
+            verification_profile in {"coding", "data_ops", "hybrid"}
+            and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
+        ):
+            metadata["synthesis_gate_profile_resilience_skipped"] = True
         return verification
 
     counts = self._claim_counts(claims)
@@ -1271,7 +1494,6 @@ def _enforce_synthesis_claim_gate(
         if not reason_code:
             reason_code = "claim_insufficient_evidence"
 
-    metadata = dict(verification.metadata) if isinstance(verification.metadata, dict) else {}
     metadata["claim_status_counts"] = counts
     metadata["supported_ratio"] = ratios["supported_ratio"]
     metadata["unverified_ratio"] = ratios["unverified_ratio"]
@@ -1287,6 +1509,67 @@ def _enforce_synthesis_claim_gate(
 
     if not fail_reasons:
         return self._verification_with_metadata(verification, metadata=metadata)
+    if (
+        counts["supported"] == 0
+        and counts["contradicted"] == 0
+        and counts["stale"] == 0
+        and counts["unresolved"] == counts["extracted"]
+        and _claims_only_inconclusive_unresolved(claims)
+    ):
+        metadata["synthesis_gate_inconclusive"] = True
+        note = (
+            "Synthesis claim gate is inconclusive: no claims reached supported status, "
+            "but unresolved claims were marked inconclusive rather than contradicted."
+        )
+        if (
+            enforce_profile_resilience
+            and verification_profile in {"coding", "data_ops", "hybrid"}
+            and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
+        ):
+            note = (
+                f"{note} Non-research profile {verification_profile} retained "
+                "behavioral verification support."
+            )
+        return self._verification_with_metadata(
+            verification,
+            metadata=metadata,
+            passed=True,
+            outcome="pass_with_warnings",
+            reason_code="claim_inconclusive",
+            feedback="\n".join(
+                part for part in [verification.feedback or "", note] if part
+            ),
+            severity_class="inconclusive",
+            confidence=min(float(verification.confidence or 0.5), 0.4),
+        )
+    if (
+        enforce_profile_resilience
+        and verification_profile in {"coding", "data_ops", "hybrid"}
+        and counts["contradicted"] == 0
+        and counts["stale"] == 0
+        and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
+    ):
+        metadata["synthesis_gate_profile_downgraded"] = True
+        note = (
+            "Synthesis claim gate downgraded to warning for non-research profile "
+            "because behavior assertions remained supported."
+        )
+        return self._verification_with_metadata(
+            verification,
+            metadata=metadata,
+            passed=True,
+            outcome="pass_with_warnings",
+            reason_code="coverage_below_threshold",
+            feedback="\n".join(
+                [
+                    *(part for part in [verification.feedback or ""] if part),
+                    *fail_reasons,
+                    note,
+                ],
+            ),
+            severity_class="inconclusive",
+            confidence=min(float(verification.confidence or 0.5), 0.45),
+        )
     return self._verification_with_metadata(
         verification,
         metadata=metadata,
@@ -1628,7 +1911,12 @@ def _verified_context_for_synthesis(
     *,
     task: Task,
     subtask: Subtask,
+    verification_profile: str = "hybrid",
 ) -> tuple[bool, str, str]:
+    policy_mode = str(
+        getattr(self._config.verification, "resilience_policy_mode", "enforce"),
+    ).strip().lower()
+    enforce_profile_resilience = policy_mode == "enforce"
     contract = self._validity_contract_for_subtask(subtask)
     claim_extraction = contract.get("claim_extraction", {})
     claim_extraction_enabled = isinstance(claim_extraction, dict) and self._to_bool(
@@ -1650,6 +1938,9 @@ def _verified_context_for_synthesis(
     unresolved_by_subtask = graph.get("unresolved_by_subtask", {})
     if not isinstance(unresolved_by_subtask, dict):
         unresolved_by_subtask = {}
+    supported_assertions_by_subtask = graph.get("supported_assertions_by_subtask", {})
+    if not isinstance(supported_assertions_by_subtask, dict):
+        supported_assertions_by_subtask = {}
 
     lines: list[str] = []
     total_supported = 0
@@ -1664,14 +1955,72 @@ def _verified_context_for_synthesis(
                 continue
             total_supported += 1
             lines.append(f"- [{subtask_id}] {text}")
-    total_unresolved = sum(
-        len(claims)
-        for claims in unresolved_by_subtask.values()
-        if isinstance(claims, list)
-    )
+    unresolved_claims: list[dict[str, object]] = []
+    for claims in unresolved_by_subtask.values():
+        if not isinstance(claims, list):
+            continue
+        for claim in claims:
+            if isinstance(claim, dict):
+                unresolved_claims.append(claim)
+    total_unresolved = len(unresolved_claims)
+    behavior_supported = 0
+    for assertions in supported_assertions_by_subtask.values():
+        if not isinstance(assertions, list):
+            continue
+        for assertion in assertions:
+            if not isinstance(assertion, dict):
+                continue
+            assertion_type = str(assertion.get("assertion_type", "") or "").strip().lower()
+            if assertion_type in {"behavior", "policy", "format"}:
+                behavior_supported += 1
     if total_supported <= 0 and total_unresolved <= 0:
         return True, "", ""
     if total_supported <= 0:
+        profile = normalize_profile(verification_profile)
+        if (
+            enforce_profile_resilience
+            and profile in {"coding", "data_ops", "hybrid"}
+            and behavior_supported > 0
+        ):
+            return (
+                True,
+                "",
+                (
+                    "Synthesis gate warning: no supported claims were available, "
+                    "but supported behavior assertions allowed profile-aware "
+                    "continuation."
+                ),
+            )
+        soft_reasons = {
+            "claim_inconclusive",
+            "semantic_inconclusive",
+            "verifier_unavailable",
+            "verifier_parse_inconclusive",
+        }
+        hard_statuses = {"contradicted", "stale"}
+        all_soft_inconclusive = bool(unresolved_claims)
+        for claim in unresolved_claims:
+            status = str(claim.get("status", "") or "").strip().lower()
+            reason = str(claim.get("reason_code", "") or "").strip().lower()
+            if status in hard_statuses:
+                all_soft_inconclusive = False
+                break
+            if status not in {"insufficient_evidence", "partially_supported", "extracted"}:
+                all_soft_inconclusive = False
+                break
+            if reason not in soft_reasons:
+                all_soft_inconclusive = False
+                break
+        if all_soft_inconclusive:
+            return (
+                True,
+                "",
+                (
+                    "Synthesis gate warning: no supported claims were available, "
+                    "but unresolved claim verification was inconclusive; proceeding "
+                    "without a verified-context bundle."
+                ),
+            )
         return (
             False,
             "",

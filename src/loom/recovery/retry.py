@@ -14,6 +14,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
+from loom.engine.verification.policy import (
+    VerificationProfile,
+    resolve_policy_decision,
+)
 from loom.recovery.errors import ErrorCategory, categorize_error
 
 
@@ -40,6 +44,10 @@ class AttemptRecord:
     resolution_plan: str = ""
     error_category: ErrorCategory | None = None
     timestamp: str = ""
+    reason_code: str = ""
+    severity_class: str = ""
+    policy_action: str = ""
+    progress_signature: str = ""
 
     def __post_init__(self):
         if not self.timestamp:
@@ -211,6 +219,9 @@ class RetryManager:
         verification_feedback: str | None,
         execution_error: str | None,
         verification: object | None = None,
+        profile: VerificationProfile = "hybrid",
+        policy_mode: str = "enforce",
+        profile_confidence: float = 1.0,
     ) -> tuple[RetryStrategy, list[str]]:
         """Classify failure type and extract optional targeting details."""
         feedback = str(verification_feedback or "")
@@ -220,6 +231,9 @@ class RetryManager:
         remediation_mode = RetryManager._extract_remediation_mode(verification)
         failure_class = RetryManager._extract_failure_class(verification)
         severity_class = RetryManager._extract_severity_class(verification)
+        contradiction_detected = RetryManager._extract_contradiction_detected(
+            verification,
+        )
         has_placeholder_findings = RetryManager._has_placeholder_findings(verification)
         missing_targets = RetryManager._extract_missing_targets_from_verification(
             verification,
@@ -242,6 +256,44 @@ class RetryManager:
         }
 
         # Prefer structured verification contract when available.
+        policy_decision = resolve_policy_decision(
+            severity_class=severity_class,
+            reason_code=reason_code,
+            profile=profile,
+            mode=policy_mode,
+            contradiction_detected=contradiction_detected,
+            profile_confidence=profile_confidence,
+        )
+        if policy_decision.action == "block":
+            if reason_code == "hard_invariant_failed":
+                if (
+                    has_placeholder_findings
+                    and (
+                        failure_class == "recoverable_placeholder"
+                        or remediation_mode == "confirm_or_prune"
+                    )
+                ):
+                    return RetryStrategy.UNCONFIRMED_DATA, missing_targets
+            return RetryStrategy.GENERIC, []
+        if policy_decision.action == "pass_with_warnings":
+            return RetryStrategy.UNCONFIRMED_DATA, missing_targets
+        if policy_decision.action == "retry_targeted":
+            if reason_code in unconfirmed_reason_codes:
+                return RetryStrategy.UNCONFIRMED_DATA, missing_targets
+            if reason_code in {
+                "evidence_gap",
+                "missing_evidence",
+                "insufficient_evidence_targets",
+            }:
+                return RetryStrategy.EVIDENCE_GAP, missing_targets
+            if reason_code in {
+                "policy_remediation_required",
+                "unconfirmed_claims",
+                "pending_remediation",
+            }:
+                return RetryStrategy.UNCONFIRMED_DATA, missing_targets
+            return RetryStrategy.GENERIC, missing_targets
+
         if reason_code == "hard_invariant_failed":
             if (
                 has_placeholder_findings
@@ -331,6 +383,70 @@ class RetryManager:
             )
 
         return RetryStrategy.GENERIC, []
+
+    @staticmethod
+    def _extract_contradiction_detected(verification: object | None) -> bool:
+        if verification is None:
+            return False
+        metadata = {}
+        if isinstance(verification, dict):
+            candidate = verification.get("metadata", {})
+            if isinstance(candidate, dict):
+                metadata = candidate
+        else:
+            candidate = getattr(verification, "metadata", {})
+            if isinstance(candidate, dict):
+                metadata = candidate
+        return bool(metadata.get("contradiction_detected", False))
+
+    @staticmethod
+    def progress_signature(
+        *,
+        verification_feedback: str | None,
+        execution_error: str | None,
+        reason_code: str,
+        strategy: RetryStrategy,
+        missing_targets: list[str] | None = None,
+    ) -> str:
+        """Build a compact no-progress signature for retry stop conditions."""
+        feedback = str(verification_feedback or "").strip().lower()
+        error = str(execution_error or "").strip().lower()
+        normalized_feedback = re.sub(r"\s+", " ", feedback)
+        normalized_error = re.sub(r"\s+", " ", error)
+        normalized_feedback = re.sub(r"\d+", "#", normalized_feedback)
+        normalized_error = re.sub(r"\d+", "#", normalized_error)
+        targets = sorted({
+            str(item or "").strip().lower()
+            for item in (missing_targets or [])
+            if str(item or "").strip()
+        })
+        return "|".join([
+            str(strategy.value),
+            str(reason_code or "").strip().lower(),
+            ",".join(targets),
+            normalized_feedback[:180],
+            normalized_error[:180],
+        ])
+
+    def should_stop_for_no_progress(
+        self,
+        attempts: list[AttemptRecord],
+        *,
+        max_stalled_attempts: int = 2,
+    ) -> bool:
+        """Return True when consecutive attempts show no meaningful progress."""
+        window = max(2, int(max_stalled_attempts or 2))
+        if len(attempts) < window:
+            return False
+        recent = attempts[-window:]
+        signatures = [
+            str(getattr(item, "progress_signature", "") or "").strip()
+            for item in recent
+        ]
+        signatures = [sig for sig in signatures if sig]
+        if len(signatures) < window:
+            return False
+        return len(set(signatures)) == 1
 
     @staticmethod
     def _extract_reason_code(verification: object | None) -> str:

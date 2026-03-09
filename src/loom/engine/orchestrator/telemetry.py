@@ -35,8 +35,10 @@ from loom.events.types import (
     TASK_STALLED,
     TELEMETRY_RUN_SUMMARY,
     VERIFICATION_FAILED,
+    VERIFICATION_FALSE_NEGATIVE_CANDIDATE,
     VERIFICATION_OUTCOME,
     VERIFICATION_PASSED,
+    VERIFICATION_SHADOW_DIFF,
     VERIFICATION_STARTED,
 )
 from loom.state.task_state import Task
@@ -192,6 +194,50 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
             event_counts.get(FORBIDDEN_CANONICAL_WRITE_BLOCKED, 0),
         ),
     }
+    total_verification_outcomes = max(
+        1,
+        int(verification_lifecycle_counts.get("outcome", 0)),
+    )
+    verifier_terminal_failures = int(
+        verification_lifecycle_counts.get("failed", 0),
+    )
+    inconclusive_outcomes = int(
+        verification_reason_counts.get("parse_inconclusive", 0)
+        + verification_reason_counts.get("claim_inconclusive", 0)
+        + verification_reason_counts.get("infra_verifier_error", 0),
+    )
+    remediation_resolved = int(remediation_lifecycle_counts.get("resolved", 0))
+    remediation_attempted = int(remediation_lifecycle_counts.get("attempt", 0))
+    remediation_total_terminal = max(
+        1,
+        remediation_resolved
+        + int(remediation_lifecycle_counts.get("failed", 0))
+        + int(remediation_lifecycle_counts.get("expired", 0)),
+    )
+    shadow_events = int(event_counts.get(VERIFICATION_SHADOW_DIFF, 0))
+    reliability_metrics = {
+        "verifier_terminal_failure_rate": round(
+            float(verifier_terminal_failures) / float(total_verification_outcomes),
+            4,
+        ),
+        "inconclusive_outcome_rate": round(
+            float(inconclusive_outcomes) / float(total_verification_outcomes),
+            4,
+        ),
+        "inconclusive_rescue_rate": round(
+            float(remediation_resolved) / float(max(1, remediation_attempted)),
+            4,
+        ),
+        "false_block_audit_rate": round(
+            float(event_counts.get(VERIFICATION_FALSE_NEGATIVE_CANDIDATE, 0))
+            / float(max(1, shadow_events)),
+            4,
+        ),
+        "remediation_terminal_resolution_rate": round(
+            float(remediation_resolved) / float(remediation_total_terminal),
+            4,
+        ),
+    }
     self._emit(TELEMETRY_RUN_SUMMARY, task.id, {
         "run_id": self._task_run_id(task),
         "model_invocations": int(rollup.get("model_invocations", 0)),
@@ -220,6 +266,7 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
         "degraded_indicator": bool(event_counts.get(TASK_PLAN_DEGRADED, 0) > 0),
         "replanned_count": int(event_counts.get(TASK_REPLANNING, 0)),
         "stalled_count": int(event_counts.get(TASK_STALLED, 0)),
+        "reliability_metrics": reliability_metrics,
         "budget_snapshot": self._run_budget.snapshot(),
         "validity_summary": validity_summary,
     })

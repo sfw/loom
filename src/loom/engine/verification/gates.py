@@ -453,6 +453,7 @@ class VerificationGates:
         workspace: Path | None,
         evidence_tool_calls: list | None = None,
         evidence_records: list[dict] | None = None,
+        retry_writable_deliverables: list[str] | None = None,
         validity_contract: dict[str, object] | None = None,
         tier: int = 1,
         task_id: str = "",
@@ -501,6 +502,7 @@ class VerificationGates:
                 evidence_tool_calls=evidence_tool_calls,
                 evidence_records=evidence_records,
                 workspace=workspace,
+                retry_writable_deliverables=retry_writable_deliverables,
             )
             results.append(t1)
             self._emit_placeholder_findings_event(

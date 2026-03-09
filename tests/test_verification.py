@@ -414,6 +414,94 @@ class TestDeterministicVerifier:
             for c in result.checks
         )
 
+    @pytest.mark.asyncio
+    async def test_noncanonical_csv_mismatch_is_advisory_when_process_deliverables_defined(
+        self,
+        tmp_path,
+    ):
+        (tmp_path / "report.csv").write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+        (tmp_path / "evidence_ledger.csv").write_text(
+            "a,b,c\n1,2,3\n4,5\n",
+            encoding="utf-8",
+        )
+
+        process = _make_process(deliverables={"phase-a": ["report.csv"]})
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "evidence_ledger.csv"},
+            result=ToolResult.ok(
+                "ok",
+                files_changed=["report.csv", "evidence_ledger.csv"],
+            ),
+        )
+        result = await v.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "output",
+            [tc],
+            tmp_path,
+        )
+
+        assert result.passed
+        assert result.outcome == "pass_with_warnings"
+        assert result.reason_code == ""
+        assert any(
+            c.name == "syntax_evidence_ledger.csv_advisory" and c.passed
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_canonical_csv_mismatch_still_fails_when_process_deliverables_defined(
+        self,
+        tmp_path,
+    ):
+        (tmp_path / "report.csv").write_text("a,b,c\n1,2,3\n4,5\n", encoding="utf-8")
+
+        process = _make_process(deliverables={"phase-a": ["report.csv"]})
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "report.csv"},
+            result=ToolResult.ok("ok", files_changed=["report.csv"]),
+        )
+        result = await v.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "output",
+            [tc],
+            tmp_path,
+        )
+
+        assert not result.passed
+        assert result.reason_code == "csv_schema_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_retry_writable_deliverables_override_syntax_scope(self, tmp_path):
+        (tmp_path / "report.csv").write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+        stage_dir = tmp_path / "stage"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        (stage_dir / "report.stage.csv").write_text(
+            "a,b,c\n1,2,3\n4,5\n",
+            encoding="utf-8",
+        )
+
+        process = _make_process(deliverables={"phase-a": ["report.csv"]})
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "stage/report.stage.csv"},
+            result=ToolResult.ok("ok", files_changed=["stage/report.stage.csv"]),
+        )
+        result = await v.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "output",
+            [tc],
+            tmp_path,
+            retry_writable_deliverables=["stage/report.stage.csv"],
+        )
+
+        assert not result.passed
+        assert result.reason_code == "csv_schema_mismatch"
+
 
 # --- LLMVerifier ---
 
@@ -1419,6 +1507,56 @@ class TestVerificationGates:
         assert findings
         assert findings[0].get("file_path") == "report.md"
         assert findings[0].get("token") == "N/A"
+
+    @pytest.mark.asyncio
+    async def test_tier1_deliverable_regex_ignores_auxiliary_changed_files(self, tmp_path):
+        config = VerificationConfig(tier1_enabled=True, tier2_enabled=False)
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        process = _make_process(
+            deliverables={"phase-a": ["report.md"]},
+            regex_rules=[{
+                "name": "no-placeholders",
+                "description": "No unresolved placeholders in deliverables",
+                "check": r"\bN/A\b",
+                "severity": "error",
+                "type": "regex",
+                "target": "deliverables",
+                "enforcement": "hard",
+            }],
+        )
+        gates = VerificationGates(router, prompts, config, process=process)
+        (tmp_path / "report.md").write_text(
+            "Final report without placeholder markers.",
+            encoding="utf-8",
+        )
+        (tmp_path / "fact-check-report.md").write_text(
+            "| Source | Value |\n| N/A | pending |\n",
+            encoding="utf-8",
+        )
+
+        tool_calls = [
+            MockToolCallRecord(
+                tool="write_file",
+                args={"path": "report.md"},
+                result=ToolResult.ok("ok", files_changed=["report.md"]),
+            ),
+            MockToolCallRecord(
+                tool="write_file",
+                args={"path": "fact-check-report.md"},
+                result=ToolResult.ok("ok", files_changed=["fact-check-report.md"]),
+            ),
+        ]
+        result = await gates.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "Updated report and auxiliary notes",
+            tool_calls,
+            tmp_path,
+            tier=1,
+            task_id="task-placeholder-aux-ignore",
+        )
+
+        assert result.passed
 
     @pytest.mark.asyncio
     async def test_tier1_failure_blocks_tier2(self, tmp_path):

@@ -37,6 +37,16 @@ def jaccard_similarity(a: set[str], b: set[str]) -> float:
     return intersection / union
 
 
+def token_overlap_ratio(needles: set[str], haystack: set[str]) -> float:
+    """Return fraction of needle tokens covered by haystack tokens."""
+    if not needles:
+        return 0.0
+    if not haystack:
+        return 0.0
+    overlap = len(needles & haystack)
+    return overlap / max(1, len(needles))
+
+
 def coerce_int(value: object, default: int | None = None) -> int | None:
     """Best-effort parse integer value."""
     try:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 _VALID_OUTCOMES = {
     "pass",
@@ -16,6 +16,20 @@ _VALID_SEVERITY_CLASSES = {
     "semantic",
     "inconclusive",
     "infra",
+}
+_VALID_ASSERTION_TYPES = {
+    "fact",
+    "behavior",
+    "format",
+    "safety",
+    "policy",
+}
+_VALID_ASSERTION_VERDICTS = {
+    "supported",
+    "partially_supported",
+    "contradicted",
+    "inconclusive",
+    "failed_contract",
 }
 
 _REASON_CODE_SEVERITY: dict[str, str] = {
@@ -79,3 +93,49 @@ class VerificationResult:
         if not passed and outcome == "fail":
             return "semantic"
         return "semantic"
+
+
+@dataclass
+class AssertionEnvelope:
+    """Typed verification assertion for cross-task policy consumption."""
+
+    assertion_id: str
+    assertion_type: str
+    verdict: str
+    confidence: float = 0.5
+    reason_code: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+    remediation_hint: str = ""
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        assertion_type = str(self.assertion_type or "").strip().lower()
+        if assertion_type not in _VALID_ASSERTION_TYPES:
+            assertion_type = "fact"
+        self.assertion_type = assertion_type
+
+        verdict = str(self.verdict or "").strip().lower()
+        if verdict not in _VALID_ASSERTION_VERDICTS:
+            verdict = "inconclusive"
+        self.verdict = verdict
+
+        confidence = float(self.confidence or 0.0)
+        self.confidence = max(0.0, min(1.0, confidence))
+        self.reason_code = str(self.reason_code or "").strip().lower()
+
+        refs = self.evidence_refs
+        if isinstance(refs, str):
+            refs = [refs]
+        if not isinstance(refs, list):
+            refs = []
+        normalized_refs: list[str] = []
+        for item in refs:
+            text = str(item or "").strip()
+            if text and text not in normalized_refs:
+                normalized_refs.append(text)
+        self.evidence_refs = normalized_refs
+        self.remediation_hint = str(self.remediation_hint or "").strip()
+        self.source = str(self.source or "").strip().lower()
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)

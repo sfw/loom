@@ -96,6 +96,7 @@ def emit_claim_verification_summary(
             "subtask_id": subtask_id,
             "extracted": int(counts.get("extracted", 0)),
             "supported": int(counts.get("supported", 0)),
+            "partially_supported": int(counts.get("partially_supported", 0)),
             "contradicted": int(counts.get("contradicted", 0)),
             "insufficient_evidence": int(counts.get("insufficient_evidence", 0)),
             "pruned": int(counts.get("pruned", 0)),

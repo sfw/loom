@@ -69,6 +69,7 @@ from . import dispatch as orchestrator_dispatch
 from . import evidence as orchestrator_evidence
 from . import output as orchestrator_output
 from . import planning as orchestrator_planning
+from . import profile as orchestrator_profile
 from . import remediation as orchestrator_remediation
 from . import runtime as orchestrator_runtime
 from . import task_factory as orchestrator_task_factory
@@ -661,6 +662,43 @@ class Orchestrator:
         return orchestrator_validity._claim_ratios(counts)
 
     @staticmethod
+    def _assertions_from_verification(
+        verification: VerificationResult,
+    ) -> list[orchestrator_validity.AssertionEnvelope]:
+        return orchestrator_validity._assertions_from_verification(verification)
+
+    @staticmethod
+    def _runtime_assertions_from_tool_calls(
+        *,
+        subtask: Subtask,
+        tool_calls: list[ToolCallRecord] | None,
+    ) -> list[orchestrator_validity.AssertionEnvelope]:
+        return orchestrator_validity._runtime_assertions_from_tool_calls(
+            subtask=subtask,
+            tool_calls=tool_calls,
+        )
+
+    @staticmethod
+    def _assertion_counts(
+        assertions: list[orchestrator_validity.AssertionEnvelope],
+    ) -> dict[str, int]:
+        return orchestrator_validity._assertion_counts(assertions)
+
+    def _attach_runtime_assertions(
+        self,
+        *,
+        subtask: Subtask,
+        verification: VerificationResult,
+        tool_calls: list[ToolCallRecord] | None,
+    ) -> VerificationResult:
+        return orchestrator_validity._attach_runtime_assertions(
+            self,
+            subtask=subtask,
+            verification=verification,
+            tool_calls=tool_calls,
+        )
+
+    @staticmethod
     def _verification_with_metadata(
         verification: VerificationResult,
         *,
@@ -796,11 +834,27 @@ class Orchestrator:
         *,
         task: Task,
         subtask: Subtask,
+        verification_profile: str = "hybrid",
     ) -> tuple[bool, str, str]:
         return orchestrator_validity._verified_context_for_synthesis(
             self,
             task=task,
             subtask=subtask,
+            verification_profile=verification_profile,
+        )
+
+    def _resolve_verification_profile(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        tool_calls: list | None = None,
+    ) -> orchestrator_profile.VerificationProfileResolution:
+        return orchestrator_profile.resolve_verification_profile(
+            task=task,
+            subtask=subtask,
+            process=self._process,
+            tool_calls=tool_calls,
         )
 
     def _enforce_required_fact_checker(
