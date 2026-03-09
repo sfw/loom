@@ -178,6 +178,8 @@ class TestRetryManager:
         "unsupported_claims_and_incomplete_evidence",
         "insufficient_evidence",
         "recommendation_unconfirmed",
+        "missing_precedent_transactions",
+        "csv_schema_mismatch",
     ])
     def test_classify_failure_routes_semantic_reason_codes_to_unconfirmed_data(
         self,

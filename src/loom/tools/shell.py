@@ -111,6 +111,10 @@ class ShellExecuteTool(Tool):
     def timeout_seconds(self) -> int:
         return 120
 
+    @property
+    def is_mutating(self) -> bool:
+        return True
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         command = args.get("command", "")
         if not command.strip():

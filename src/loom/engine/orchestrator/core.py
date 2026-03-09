@@ -1518,8 +1518,17 @@ class Orchestrator:
             prior_attempts=prior_attempts,
         )
 
-    def _build_remediation_retry_context(self, *, strategy: RetryStrategy) -> str:
-        return orchestrator_remediation._build_remediation_retry_context(self, strategy=strategy)
+    def _build_remediation_retry_context(
+        self,
+        *,
+        strategy: RetryStrategy,
+        reason_code: str = "",
+    ) -> str:
+        return orchestrator_remediation._build_remediation_retry_context(
+            self,
+            strategy=strategy,
+            reason_code=reason_code,
+        )
 
     async def _run_confirm_or_prune_remediation(
         self,
