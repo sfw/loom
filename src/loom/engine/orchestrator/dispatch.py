@@ -297,7 +297,15 @@ async def dispatch_subtask(
             "passed": bool(gate_passed),
             "supported_claim_count": int(supported_total),
             "unresolved_claim_count": int(unresolved_total),
-            "reason": gate_error if not gate_passed else "verified_context_bundle_ready",
+            "reason": (
+                gate_error
+                if gate_error
+                else (
+                    "verified_context_bundle_ready"
+                    if verified_context_bundle
+                    else "verified_context_bundle_unavailable"
+                )
+            ),
         })
         if not gate_passed:
             blocked = SubtaskResult(
@@ -324,6 +332,13 @@ async def dispatch_subtask(
                 f"{verified_context_bundle}\n"
                 "Use this verified bundle as the primary basis for final synthesis. "
                 "Do not reintroduce unresolved claims."
+            ).strip()
+        elif gate_error:
+            retry_context = (
+                f"{retry_context}\n\n"
+                f"{gate_error}\n"
+                "If claims remain uncertain, keep uncertainty explicit and avoid "
+                "stating unverified assertions as facts."
             ).strip()
 
     changelog = orchestrator._get_changelog(task)

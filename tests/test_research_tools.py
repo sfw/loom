@@ -212,8 +212,63 @@ class TestFactCheckerTool:
         )
         assert result.success
         assert result.data["counts"]["supported"] >= 1
+        assert not (workspace / "fact-check-report.md").exists()
+        assert not (workspace / "fact-check-report.csv").exists()
+
+    async def test_fact_checker_write_reports_is_opt_in(self, ctx: ToolContext, workspace: Path):
+        source = workspace / "source.txt"
+        source.write_text(
+            "The city population in 1900 was 12000 according to the census.",
+            encoding="utf-8",
+        )
+
+        tool = FactCheckerTool()
+        result = await tool.execute(
+            {
+                "claims": ["The city population in 1900 was 12000"],
+                "sources": ["source.txt"],
+                "strictness": "standard",
+                "write_reports": True,
+            },
+            ctx,
+        )
+        assert result.success
         assert (workspace / "fact-check-report.md").exists()
         assert (workspace / "fact-check-report.csv").exists()
+
+    async def test_fact_checker_paraphrase_claim_not_trivially_unverifiable(
+        self,
+        ctx: ToolContext,
+        workspace: Path,
+    ):
+        source = workspace / "source.txt"
+        source.write_text(
+            (
+                "In 2025, Alberta online discourse ranked housing affordability as a top issue, "
+                "alongside migration and healthcare concerns."
+            ),
+            encoding="utf-8",
+        )
+
+        tool = FactCheckerTool()
+        result = await tool.execute(
+            {
+                "claims": [
+                    (
+                        "Alberta's online conversation in 2025 focused heavily "
+                        "on housing affordability."
+                    ),
+                ],
+                "sources": ["source.txt"],
+                "strictness": "lenient",
+                "semantic_verification": "deterministic",
+            },
+            ctx,
+        )
+        assert result.success
+        verdicts = result.data.get("verdicts", [])
+        assert len(verdicts) == 1
+        assert verdicts[0].get("verdict") in {"supported", "partially_supported"}
 
 
 class TestPeerReviewSimulatorTool:

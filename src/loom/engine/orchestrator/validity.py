@@ -20,11 +20,13 @@ logger = logging.getLogger(__name__)
 _CLAIM_TERMINAL_UNRESOLVED = frozenset({
     "contradicted",
     "insufficient_evidence",
+    "partially_supported",
     "extracted",
     "stale",
 })
 _CLAIM_REASON_CODES = {
     "supported": "claim_supported",
+    "partially_supported": "claim_partially_supported",
     "contradicted": "claim_contradicted",
     "insufficient_evidence": "claim_insufficient_evidence",
     "stale": "claim_stale_source",
@@ -37,6 +39,7 @@ _CLAIM_RECOVERABLE_FAILURE_CODES = frozenset({
     "claim_insufficient_evidence",
     "claim_contradicted",
     "claim_stale_source",
+    "claim_inconclusive",
     "coverage_below_threshold",
 })
 
@@ -626,6 +629,7 @@ def _claim_counts(claims: list[dict[str, object]]) -> dict[str, int]:
     counts = {
         "extracted": len(claims),
         "supported": 0,
+        "partially_supported": 0,
         "contradicted": 0,
         "insufficient_evidence": 0,
         "stale": 0,
@@ -664,6 +668,31 @@ def _claim_ratios(counts: dict[str, int]) -> dict[str, float]:
             float(critical_supported) / float(critical_total)
         ) if critical_total > 0 else 1.0,
     }
+
+
+def _claims_only_inconclusive_unresolved(claims: list[dict[str, object]]) -> bool:
+    if not claims:
+        return False
+    soft_statuses = {"insufficient_evidence", "partially_supported", "extracted"}
+    soft_reasons = {
+        "claim_inconclusive",
+        "semantic_inconclusive",
+        "verifier_unavailable",
+        "verifier_parse_inconclusive",
+    }
+    for claim in claims:
+        status = str(claim.get("status", "") or "").strip().lower()
+        reason = str(claim.get("reason_code", "") or "").strip().lower()
+        if status in {"contradicted", "stale"}:
+            return False
+        if status in soft_statuses:
+            if reason not in soft_reasons:
+                return False
+            continue
+        if status == "supported":
+            return False
+        return False
+    return True
 
 def _verification_with_metadata(
     verification: VerificationResult,
@@ -1287,6 +1316,30 @@ def _enforce_synthesis_claim_gate(
 
     if not fail_reasons:
         return self._verification_with_metadata(verification, metadata=metadata)
+    if (
+        counts["supported"] == 0
+        and counts["contradicted"] == 0
+        and counts["stale"] == 0
+        and counts["unresolved"] == counts["extracted"]
+        and _claims_only_inconclusive_unresolved(claims)
+    ):
+        metadata["synthesis_gate_inconclusive"] = True
+        note = (
+            "Synthesis claim gate is inconclusive: no claims reached supported status, "
+            "but unresolved claims were marked inconclusive rather than contradicted."
+        )
+        return self._verification_with_metadata(
+            verification,
+            metadata=metadata,
+            passed=True,
+            outcome="pass_with_warnings",
+            reason_code="claim_inconclusive",
+            feedback="\n".join(
+                part for part in [verification.feedback or "", note] if part
+            ),
+            severity_class="inconclusive",
+            confidence=min(float(verification.confidence or 0.5), 0.4),
+        )
     return self._verification_with_metadata(
         verification,
         metadata=metadata,
@@ -1664,14 +1717,47 @@ def _verified_context_for_synthesis(
                 continue
             total_supported += 1
             lines.append(f"- [{subtask_id}] {text}")
-    total_unresolved = sum(
-        len(claims)
-        for claims in unresolved_by_subtask.values()
-        if isinstance(claims, list)
-    )
+    unresolved_claims: list[dict[str, object]] = []
+    for claims in unresolved_by_subtask.values():
+        if not isinstance(claims, list):
+            continue
+        for claim in claims:
+            if isinstance(claim, dict):
+                unresolved_claims.append(claim)
+    total_unresolved = len(unresolved_claims)
     if total_supported <= 0 and total_unresolved <= 0:
         return True, "", ""
     if total_supported <= 0:
+        soft_reasons = {
+            "claim_inconclusive",
+            "semantic_inconclusive",
+            "verifier_unavailable",
+            "verifier_parse_inconclusive",
+        }
+        hard_statuses = {"contradicted", "stale"}
+        all_soft_inconclusive = bool(unresolved_claims)
+        for claim in unresolved_claims:
+            status = str(claim.get("status", "") or "").strip().lower()
+            reason = str(claim.get("reason_code", "") or "").strip().lower()
+            if status in hard_statuses:
+                all_soft_inconclusive = False
+                break
+            if status not in {"insufficient_evidence", "partially_supported", "extracted"}:
+                all_soft_inconclusive = False
+                break
+            if reason not in soft_reasons:
+                all_soft_inconclusive = False
+                break
+        if all_soft_inconclusive:
+            return (
+                True,
+                "",
+                (
+                    "Synthesis gate warning: no supported claims were available, "
+                    "but unresolved claim verification was inconclusive; proceeding "
+                    "without a verified-context bundle."
+                ),
+            )
         return (
             False,
             "",

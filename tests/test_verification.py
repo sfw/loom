@@ -1421,6 +1421,56 @@ class TestVerificationGates:
         assert findings[0].get("token") == "N/A"
 
     @pytest.mark.asyncio
+    async def test_tier1_deliverable_regex_ignores_auxiliary_changed_files(self, tmp_path):
+        config = VerificationConfig(tier1_enabled=True, tier2_enabled=False)
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        process = _make_process(
+            deliverables={"phase-a": ["report.md"]},
+            regex_rules=[{
+                "name": "no-placeholders",
+                "description": "No unresolved placeholders in deliverables",
+                "check": r"\bN/A\b",
+                "severity": "error",
+                "type": "regex",
+                "target": "deliverables",
+                "enforcement": "hard",
+            }],
+        )
+        gates = VerificationGates(router, prompts, config, process=process)
+        (tmp_path / "report.md").write_text(
+            "Final report without placeholder markers.",
+            encoding="utf-8",
+        )
+        (tmp_path / "fact-check-report.md").write_text(
+            "| Source | Value |\n| N/A | pending |\n",
+            encoding="utf-8",
+        )
+
+        tool_calls = [
+            MockToolCallRecord(
+                tool="write_file",
+                args={"path": "report.md"},
+                result=ToolResult.ok("ok", files_changed=["report.md"]),
+            ),
+            MockToolCallRecord(
+                tool="write_file",
+                args={"path": "fact-check-report.md"},
+                result=ToolResult.ok("ok", files_changed=["fact-check-report.md"]),
+            ),
+        ]
+        result = await gates.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "Updated report and auxiliary notes",
+            tool_calls,
+            tmp_path,
+            tier=1,
+            task_id="task-placeholder-aux-ignore",
+        )
+
+        assert result.passed
+
+    @pytest.mark.asyncio
     async def test_tier1_failure_blocks_tier2(self, tmp_path):
         config = VerificationConfig(tier1_enabled=True, tier2_enabled=True)
         router = MagicMock(spec=ModelRouter)

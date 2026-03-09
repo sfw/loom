@@ -30,14 +30,23 @@ def claim_id(text: str) -> str:
     return f"CLM-{digest[:10]}"
 
 
-def claim_status_from_fact_verdict(verdict: str) -> tuple[str, str]:
+def claim_status_from_fact_verdict(verdict: str, reason_hint: str = "") -> tuple[str, str]:
     normalized = str(verdict or "").strip().lower()
     if normalized == "supported":
         return "supported", "claim_supported"
+    if normalized == "partially_supported":
+        return "partially_supported", "claim_partially_supported"
     if normalized == "contradicted":
         return "contradicted", "claim_contradicted"
     if normalized == "stale":
         return "stale", "claim_stale_source"
+    normalized_reason = str(reason_hint or "").strip().lower()
+    if normalized_reason in {
+        "semantic_inconclusive",
+        "verifier_unavailable",
+        "verifier_parse_inconclusive",
+    }:
+        return "insufficient_evidence", "claim_inconclusive"
     return "insufficient_evidence", "claim_insufficient_evidence"
 
 
@@ -84,6 +93,7 @@ def extract_claim_lifecycle(
                 continue
             status, reason = claim_status_from_fact_verdict(
                 str(verdict.get("verdict", "") or ""),
+                str(verdict.get("reason_code", "") or ""),
             )
             claim_type = normalize_claim_type(text)
             source_hint = str(verdict.get("source", "") or "").strip()
@@ -121,6 +131,7 @@ def claim_counts(claims: list[dict[str, object]]) -> dict[str, int]:
     counts = {
         "extracted": len(claims),
         "supported": 0,
+        "partially_supported": 0,
         "contradicted": 0,
         "insufficient_evidence": 0,
         "stale": 0,

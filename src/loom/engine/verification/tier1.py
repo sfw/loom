@@ -186,7 +186,9 @@ class DeterministicVerifier:
                 if rule.target == "deliverables" and workspace:
                     # Check against deliverable file contents
                     target_text = self._read_deliverable_text(
-                        workspace, tool_calls,
+                        workspace,
+                        tool_calls,
+                        expected_deliverables=expected_deliverables,
                     )
                 try:
                     found = bool(re.search(rule.check, target_text))
@@ -497,20 +499,21 @@ class DeterministicVerifier:
                     continue
                 seen_candidates.add(normalized)
                 candidates.append(normalized)
-            for call in tool_calls:
-                result = getattr(call, "result", None)
-                changed = getattr(result, "files_changed", [])
-                if not isinstance(changed, list):
-                    continue
-                for rel_path in changed:
-                    normalized = self._normalize_workspace_relpath(
-                        workspace,
-                        str(rel_path or ""),
-                    )
-                    if not normalized or normalized in seen_candidates:
+            if not candidates:
+                for call in tool_calls:
+                    result = getattr(call, "result", None)
+                    changed = getattr(result, "files_changed", [])
+                    if not isinstance(changed, list):
                         continue
-                    seen_candidates.add(normalized)
-                    candidates.append(normalized)
+                    for rel_path in changed:
+                        normalized = self._normalize_workspace_relpath(
+                            workspace,
+                            str(rel_path or ""),
+                        )
+                        if not normalized or normalized in seen_candidates:
+                            continue
+                        seen_candidates.add(normalized)
+                        candidates.append(normalized)
 
             for rel_path in candidates:
                 file_path = workspace / rel_path
@@ -725,22 +728,47 @@ class DeterministicVerifier:
 
     @staticmethod
     def _read_deliverable_text(
-        workspace: Path, tool_calls: list,
+        workspace: Path,
+        tool_calls: list,
+        *,
+        expected_deliverables: list[str] | None = None,
     ) -> str:
         """Read text content from all deliverable files."""
         texts = []
-        for tc in tool_calls:
-            for f in tc.result.files_changed:
-                fpath = workspace / f
-                if fpath.exists() and fpath.stat().st_size < 1024 * 1024:
-                    try:
-                        texts.append(
-                            fpath.read_text(encoding="utf-8", errors="replace"),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to read deliverable %s: %s", f, e,
-                        )
+        candidate_paths: list[str] = []
+        seen: set[str] = set()
+
+        for expected in expected_deliverables or []:
+            normalized = DeterministicVerifier._normalize_workspace_relpath(workspace, expected)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            candidate_paths.append(normalized)
+
+        if not candidate_paths:
+            for tc in tool_calls:
+                for f in tc.result.files_changed:
+                    normalized = DeterministicVerifier._normalize_workspace_relpath(
+                        workspace,
+                        str(f or ""),
+                    )
+                    if not normalized or normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    candidate_paths.append(normalized)
+
+        for relpath in candidate_paths:
+            fpath = workspace / relpath
+            if not fpath.exists() or fpath.stat().st_size >= 1024 * 1024:
+                continue
+            try:
+                texts.append(
+                    fpath.read_text(encoding="utf-8", errors="replace"),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to read deliverable %s: %s", relpath, e,
+                )
         return "\n".join(texts)
 
     def _expected_deliverables_for_subtask(
@@ -1035,4 +1063,3 @@ class DeterministicVerifier:
         if len(lines) == 1:
             return None
         return "\n".join(lines)
-

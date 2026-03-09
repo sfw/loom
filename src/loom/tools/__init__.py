@@ -319,4 +319,7 @@ def _instantiate_tool(tool_cls: type[Tool], config: Config | None) -> Tool | Non
             enabled=_software_dev_family_enabled(config, family="wordpress"),
         )
 
+    if class_name == "FactCheckerTool":
+        return tool_cls(config=config)
+
     return tool_cls()

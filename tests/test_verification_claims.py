@@ -86,3 +86,44 @@ def test_attach_claim_lifecycle_adds_metadata_and_emits_summary_event() -> None:
     ]
     assert len(summary_events) == 1
     assert summary_events[0].data["subtask_id"] == "phase-a"
+
+
+def test_extract_claim_lifecycle_preserves_partial_and_inconclusive() -> None:
+    gates = SimpleNamespace()
+    tool_calls = [
+        SimpleNamespace(
+            tool="fact_checker",
+            result=ToolResult.ok(
+                "ok",
+                data={
+                    "verdicts": [
+                        {
+                            "claim": "Housing pressure remained elevated",
+                            "verdict": "partially_supported",
+                        },
+                        {
+                            "claim": "Signal quality was low",
+                            "verdict": "unverifiable",
+                            "reason_code": "semantic_inconclusive",
+                        },
+                    ],
+                },
+            ),
+        ),
+    ]
+    result = VerificationResult(tier=1, passed=True)
+
+    claims = verification_claims.extract_claim_lifecycle(
+        gates,
+        tool_calls=tool_calls,
+        result=result,
+        validity_contract={},
+    )
+    counts = verification_claims.claim_counts(claims)
+
+    assert len(claims) == 2
+    assert claims[0]["status"] == "partially_supported"
+    assert claims[0]["reason_code"] == "claim_partially_supported"
+    assert claims[1]["status"] == "insufficient_evidence"
+    assert claims[1]["reason_code"] == "claim_inconclusive"
+    assert counts["partially_supported"] == 1

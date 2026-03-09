@@ -275,6 +275,68 @@ class TestOrchestratorValidityPolicy:
         assert gate_events[-1].data.get("passed") is False
 
     @pytest.mark.asyncio
+    async def test_synthesis_input_gate_allows_inconclusive_unresolved_claims(self, tmp_path):
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda event: events.append(event))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=_make_config(),
+        )
+        task = _make_task(goal="Gate inconclusive soft-pass")
+        task.metadata["claim_graph"] = {
+            "supported_by_subtask": {},
+            "unresolved_by_subtask": {
+                "analyze": [
+                    {
+                        "claim_id": "CLM-INC",
+                        "text": "Claim with inconclusive verification.",
+                        "status": "insufficient_evidence",
+                        "reason_code": "claim_inconclusive",
+                    },
+                ],
+            },
+        }
+        subtask = Subtask(
+            id="synth",
+            description="Synthesize",
+            is_synthesis=True,
+            verification_tier=1,
+            validity_contract_snapshot={
+                "enabled": True,
+                "claim_extraction": {"enabled": True},
+                "final_gate": {
+                    "enforce_verified_context_only": True,
+                    "synthesis_min_verification_tier": 2,
+                    "critical_claim_support_ratio": 1.0,
+                },
+            },
+        )
+        task.plan = Plan(subtasks=[subtask])
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="synthesis completed"),
+            VerificationResult(tier=2, passed=True, outcome="pass"),
+        ))
+
+        _, result, verification = await orch._dispatch_subtask(task, subtask, {})
+
+        assert result.status == SubtaskResultStatus.SUCCESS
+        assert verification.passed is True
+        orch._runner.run.assert_awaited_once()
+        gate_events = [
+            event for event in events
+            if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
+        ]
+        assert gate_events
+        assert gate_events[-1].data.get("passed") is True
+        assert "inconclusive" in str(gate_events[-1].data.get("reason", "")).lower()
+
+    @pytest.mark.asyncio
     async def test_synthesis_input_gate_injects_supported_claims_only(self, tmp_path):
         orch = Orchestrator(
             model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
@@ -560,6 +622,67 @@ class TestOrchestratorValidityPolicy:
         assert verification.passed is False
         assert verification.reason_code == "claim_stale_source"
         assert verification.metadata.get("temporal_consistency", {}).get("stale_claim_count") == 1
+
+    @pytest.mark.asyncio
+    async def test_synthesis_claim_gate_soft_passes_when_only_inconclusive_claims_exist(
+        self,
+        tmp_path,
+    ):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task(goal="Synthesis inconclusive soft pass")
+        subtask = Subtask(
+            id="synth",
+            description="Synthesize",
+            is_synthesis=True,
+            validity_contract_snapshot={
+                "enabled": True,
+                "claim_extraction": {"enabled": True},
+                "final_gate": {
+                    "enforce_verified_context_only": False,
+                    "synthesis_min_verification_tier": 2,
+                    "critical_claim_support_ratio": 1.0,
+                },
+            },
+        )
+        task.plan = Plan(subtasks=[subtask])
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="Synthesis draft"),
+            VerificationResult(
+                tier=2,
+                passed=True,
+                outcome="pass",
+                metadata={
+                    "claim_lifecycle": [
+                        {
+                            "claim_id": "CLM-INC-1",
+                            "text": "Source confidence is inconclusive.",
+                            "claim_type": "qualitative",
+                            "criticality": "important",
+                            "status": "insufficient_evidence",
+                            "reason_code": "claim_inconclusive",
+                            "evidence_refs": [],
+                            "lifecycle": ["extracted", "insufficient_evidence"],
+                        },
+                    ],
+                },
+            ),
+        ))
+
+        _, result, verification = await orch._dispatch_subtask(task, subtask, {})
+
+        assert result.status == SubtaskResultStatus.SUCCESS
+        assert verification.passed is True
+        assert verification.outcome == "pass_with_warnings"
+        assert verification.reason_code == "claim_inconclusive"
+        assert verification.metadata.get("synthesis_gate_inconclusive") is True
 
     @pytest.mark.asyncio
     async def test_synthesis_temporal_gate_rejects_as_of_conflicts(self, tmp_path):
