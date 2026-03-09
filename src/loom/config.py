@@ -334,6 +334,9 @@ class VerificationConfig:
     remediation_queue_max_attempts: int = 3
     remediation_queue_backoff_seconds: float = 2.0
     remediation_queue_max_backoff_seconds: float = 30.0
+    resilience_policy_mode: str = "enforce"  # enforce | shadow | off
+    resilience_profile_confidence_threshold: float = 0.65
+    resilience_no_progress_attempts: int = 2
 
 
 @dataclass(frozen=True)
@@ -1194,6 +1197,25 @@ def load_config(path: Path | None = None) -> Config:
         remediation_queue_backoff_seconds,
         remediation_queue_max_backoff_seconds,
     )
+    resilience_policy_mode = str(
+        verif_data.get("resilience_policy_mode", "enforce"),
+    ).strip().lower()
+    if resilience_policy_mode not in {"enforce", "shadow", "off"}:
+        resilience_policy_mode = "enforce"
+    resilience_profile_confidence_threshold = _float_from(
+        verif_data,
+        "resilience_profile_confidence_threshold",
+        VerificationConfig.resilience_profile_confidence_threshold,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    resilience_no_progress_attempts = _int_from(
+        verif_data,
+        "resilience_no_progress_attempts",
+        VerificationConfig.resilience_no_progress_attempts,
+        minimum=2,
+        maximum=8,
+    )
     contradiction_scan_max_files = _int_from(
         verif_data,
         "contradiction_scan_max_files",
@@ -1276,6 +1298,11 @@ def load_config(path: Path | None = None) -> Config:
         remediation_queue_max_attempts=remediation_queue_max_attempts,
         remediation_queue_backoff_seconds=remediation_queue_backoff_seconds,
         remediation_queue_max_backoff_seconds=remediation_queue_max_backoff_seconds,
+        resilience_policy_mode=resilience_policy_mode,
+        resilience_profile_confidence_threshold=(
+            resilience_profile_confidence_threshold
+        ),
+        resilience_no_progress_attempts=resilience_no_progress_attempts,
     )
 
     mem_data = raw.get("memory", {})

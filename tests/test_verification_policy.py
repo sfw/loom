@@ -6,7 +6,10 @@ from loom.engine.verification.policy import (
     aggregate_non_failing,
     classify_shadow_diff,
     fallback_from_tier1_for_inconclusive_tier2,
+    legacy_failure_action,
     legacy_result_from_tiers,
+    normalize_profile,
+    resolve_policy_decision,
 )
 from loom.engine.verification.types import Check, VerificationResult
 
@@ -110,3 +113,49 @@ def test_fallback_from_tier1_for_inconclusive_tier2_preserves_warning_metadata()
     assert fallback.outcome == "pass_with_warnings"
     assert fallback.reason_code == "infra_verifier_error"
     assert fallback.metadata["fallback"] == "tier1_due_to_tier2_parse_inconclusive"
+
+
+def test_decision_matrix_blocks_hard_invariant_for_research() -> None:
+    decision = resolve_policy_decision(
+        severity_class="hard_invariant",
+        reason_code="hard_invariant_failed",
+        profile="research",
+        mode="enforce",
+    )
+    assert decision.action == "block"
+    assert decision.reason == "hard_invariant_failed"
+
+
+def test_decision_matrix_warns_non_research_inconclusive_coverage() -> None:
+    decision = resolve_policy_decision(
+        severity_class="semantic",
+        reason_code="coverage_below_threshold",
+        profile="coding",
+        mode="enforce",
+    )
+    assert decision.action == "pass_with_warnings"
+
+
+def test_decision_matrix_shadow_mode_keeps_legacy_action() -> None:
+    decision = resolve_policy_decision(
+        severity_class="semantic",
+        reason_code="coverage_below_threshold",
+        profile="coding",
+        mode="shadow",
+    )
+    assert decision.action == legacy_failure_action(
+        severity_class="semantic",
+        reason_code="coverage_below_threshold",
+    )
+    assert decision.shadow_diff == "legacy_retry_semantic_new_pass_with_warnings"
+
+
+def test_decision_matrix_off_mode_uses_legacy_and_normalizes_profile() -> None:
+    decision = resolve_policy_decision(
+        severity_class="semantic",
+        reason_code="claim_inconclusive",
+        profile=normalize_profile("unknown"),
+        mode="off",
+    )
+    assert decision.profile == "hybrid"
+    assert decision.action == "retry_semantic"

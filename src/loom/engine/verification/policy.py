@@ -2,7 +2,191 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal
+
 from .types import Check, VerificationResult
+
+VerificationProfile = Literal["research", "coding", "data_ops", "hybrid"]
+VerificationAction = Literal[
+    "block",
+    "retry_targeted",
+    "retry_semantic",
+    "pass_with_warnings",
+]
+
+_VALID_RESILIENCE_POLICY_MODES = {"enforce", "shadow", "off"}
+_HARD_BLOCK_REASON_CODES = frozenset({
+    "artifact_seal_invalid",
+    "hard_invariant_failed",
+    "manifest_input_policy_violation",
+    "output_publish_commit_failed",
+    "required_verifier_missing",
+    "required_verifier_empty",
+    "temporal_conflict",
+})
+_CONTRADICTION_REASON_CODES = frozenset({
+    "claim_contradicted",
+    "contradiction_detected",
+})
+_TARGETED_RETRY_REASON_CODES = frozenset({
+    "csv_schema_mismatch",
+    "forbidden_output_path",
+    "output_path_policy_violation",
+    "missing_evidence",
+    "insufficient_evidence_targets",
+    "missing_precedent_transactions",
+})
+_INCONCLUSIVE_REASON_CODES = frozenset({
+    "claim_inconclusive",
+    "parse_inconclusive",
+    "infra_verifier_error",
+    "semantic_inconclusive",
+    "verifier_parse_inconclusive",
+    "verifier_unavailable",
+})
+
+
+@dataclass(frozen=True)
+class VerificationPolicyDecision:
+    """Resolved decision for verification handling with audit metadata."""
+
+    action: VerificationAction
+    reason: str
+    profile: VerificationProfile
+    mode: str
+    legacy_action: VerificationAction
+    shadow_diff: str
+
+
+def normalize_profile(value: object) -> VerificationProfile:
+    """Normalize profile values into one of the supported profile lanes."""
+    text = str(value or "").strip().lower()
+    if text in {"research", "coding", "data_ops", "hybrid"}:
+        return text  # type: ignore[return-value]
+    return "hybrid"
+
+
+def normalize_resilience_policy_mode(value: object) -> str:
+    """Normalize rollout mode for resilience decision routing."""
+    mode = str(value or "").strip().lower()
+    if mode in _VALID_RESILIENCE_POLICY_MODES:
+        return mode
+    return "enforce"
+
+
+def legacy_failure_action(
+    *,
+    severity_class: str,
+    reason_code: str,
+) -> VerificationAction:
+    """Approximate pre-refactor action routing for shadow comparisons."""
+    severity = str(severity_class or "").strip().lower()
+    reason = str(reason_code or "").strip().lower()
+    if severity == "hard_invariant" or reason in _HARD_BLOCK_REASON_CODES:
+        return "block"
+    if reason in _TARGETED_RETRY_REASON_CODES:
+        return "retry_targeted"
+    return "retry_semantic"
+
+
+def resolve_failure_action(
+    *,
+    severity_class: str,
+    reason_code: str,
+    profile: VerificationProfile,
+    contradiction_detected: bool = False,
+    profile_confidence: float = 1.0,
+) -> VerificationAction:
+    """Resolve policy action for a failed verification outcome."""
+    severity = str(severity_class or "").strip().lower()
+    reason = str(reason_code or "").strip().lower()
+    lane = normalize_profile(profile)
+    confidence = max(0.0, min(1.0, float(profile_confidence or 0.0)))
+    effective_lane: VerificationProfile = lane if confidence >= 0.5 else "hybrid"
+
+    if contradiction_detected or reason in _CONTRADICTION_REASON_CODES:
+        return "block"
+    if reason in _HARD_BLOCK_REASON_CODES:
+        return "block"
+    if severity == "hard_invariant":
+        if reason in _TARGETED_RETRY_REASON_CODES:
+            return "retry_targeted"
+        return "block"
+
+    if reason in _TARGETED_RETRY_REASON_CODES:
+        return "retry_targeted"
+    if reason in _INCONCLUSIVE_REASON_CODES:
+        if effective_lane == "research":
+            return "retry_semantic"
+        return "pass_with_warnings"
+    if reason == "coverage_below_threshold":
+        if effective_lane == "research":
+            return "retry_semantic"
+        return "pass_with_warnings"
+    if reason in {"claim_insufficient_evidence", "evidence_gap", "insufficient_evidence"}:
+        if effective_lane == "research":
+            return "retry_semantic"
+        return "retry_targeted"
+
+    if severity in {"infra", "inconclusive"}:
+        return "retry_semantic"
+    if severity == "semantic":
+        return "retry_semantic"
+    return "retry_semantic"
+
+
+def resolve_policy_decision(
+    *,
+    severity_class: str,
+    reason_code: str,
+    profile: VerificationProfile,
+    mode: str,
+    contradiction_detected: bool = False,
+    profile_confidence: float = 1.0,
+) -> VerificationPolicyDecision:
+    """Resolve enforced action with rollout mode and shadow diff metadata."""
+    normalized_mode = normalize_resilience_policy_mode(mode)
+    normalized_profile = normalize_profile(profile)
+    new_action = resolve_failure_action(
+        severity_class=severity_class,
+        reason_code=reason_code,
+        profile=normalized_profile,
+        contradiction_detected=contradiction_detected,
+        profile_confidence=profile_confidence,
+    )
+    legacy_action = legacy_failure_action(
+        severity_class=severity_class,
+        reason_code=reason_code,
+    )
+    if normalized_mode == "off":
+        selected = legacy_action
+    elif normalized_mode == "shadow":
+        selected = legacy_action
+    else:
+        selected = new_action
+
+    if legacy_action == new_action:
+        shadow_diff = "no_diff"
+    else:
+        shadow_diff = f"legacy_{legacy_action}_new_{new_action}"
+
+    reason = "policy_matrix"
+    if contradiction_detected:
+        reason = "contradiction_hard_block"
+    elif str(reason_code or "").strip():
+        reason = str(reason_code or "").strip().lower()
+    elif str(severity_class or "").strip():
+        reason = f"severity_{str(severity_class).strip().lower()}"
+
+    return VerificationPolicyDecision(
+        action=selected,
+        reason=reason,
+        profile=normalized_profile,
+        mode=normalized_mode,
+        legacy_action=legacy_action,
+        shadow_diff=shadow_diff,
+    )
 
 
 def classify_shadow_diff(

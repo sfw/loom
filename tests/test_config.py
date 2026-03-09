@@ -102,6 +102,9 @@ class TestDefaultConfig:
         assert config.verification.contradiction_scan_max_file_bytes == 300_000
         assert config.verification.contradiction_scan_min_files_for_sufficiency == 2
         assert ".md" in config.verification.contradiction_scan_allowed_suffixes
+        assert config.verification.resilience_policy_mode == "enforce"
+        assert config.verification.resilience_profile_confidence_threshold == 0.65
+        assert config.verification.resilience_no_progress_attempts == 2
 
     def test_default_telemetry(self):
         config = Config()
@@ -500,6 +503,9 @@ contradiction_scan_max_total_bytes = 3600000
 contradiction_scan_max_file_bytes = 240000
 contradiction_scan_allowed_suffixes = [".md", "txt", ".csv"]
 contradiction_scan_min_files_for_sufficiency = 4
+resilience_policy_mode = "shadow"
+resilience_profile_confidence_threshold = 0.72
+resilience_no_progress_attempts = 3
 """)
         config = load_config(toml_file)
         assert config.verification.policy_engine_enabled is False
@@ -522,6 +528,9 @@ contradiction_scan_min_files_for_sufficiency = 4
             ".csv",
         ]
         assert config.verification.contradiction_scan_min_files_for_sufficiency == 4
+        assert config.verification.resilience_policy_mode == "shadow"
+        assert config.verification.resilience_profile_confidence_threshold == 0.72
+        assert config.verification.resilience_no_progress_attempts == 3
 
     def test_verification_contradiction_scan_values_are_clamped_and_safe(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
@@ -533,6 +542,9 @@ contradiction_scan_max_total_bytes = "bad"
 contradiction_scan_max_file_bytes = 999999999
 contradiction_scan_allowed_suffixes = [123, "", ".MD", "txt"]
 contradiction_scan_min_files_for_sufficiency = 999
+resilience_policy_mode = "invalid"
+resilience_profile_confidence_threshold = 5
+resilience_no_progress_attempts = 1
 """)
         config = load_config(toml_file)
         assert config.verification.contradiction_guard_strict_coverage is True
@@ -545,6 +557,9 @@ contradiction_scan_min_files_for_sufficiency = 999
             ".txt",
         ]
         assert config.verification.contradiction_scan_min_files_for_sufficiency == 100
+        assert config.verification.resilience_policy_mode == "enforce"
+        assert config.verification.resilience_profile_confidence_threshold == 1.0
+        assert config.verification.resilience_no_progress_attempts == 2
 
     def test_process_flags_loaded(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
