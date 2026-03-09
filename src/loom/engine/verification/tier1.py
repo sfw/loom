@@ -121,11 +121,28 @@ class DeterministicVerifier:
         workspace: Path | None = None,
         evidence_tool_calls: list | None = None,
         evidence_records: list[dict] | None = None,
+        retry_writable_deliverables: list[str] | None = None,
     ) -> VerificationResult:
         checks: list[Check] = []
         expected_deliverables: list[str] = []
         recoverable_placeholder_check_names: set[str] = set()
         placeholder_findings: list[dict[str, object]] = []
+        expected_deliverable_paths: set[str] = set()
+        retry_writable_paths: set[str] = set()
+
+        if self._process:
+            expected_deliverables = self._expected_deliverables_for_subtask(subtask)
+        if workspace and expected_deliverables:
+            for expected in expected_deliverables:
+                normalized = self._normalize_workspace_relpath(workspace, expected)
+                if normalized:
+                    expected_deliverable_paths.add(normalized)
+        if workspace and retry_writable_deliverables:
+            for expected in retry_writable_deliverables:
+                normalized = self._normalize_workspace_relpath(workspace, expected)
+                if normalized:
+                    retry_writable_paths.add(normalized)
+        syntax_enforcement_paths = retry_writable_paths or expected_deliverable_paths
 
         # 1. Did tool calls succeed?
         for tc in tool_calls:
@@ -173,11 +190,35 @@ class DeterministicVerifier:
                     if fpath.exists():
                         syntax_check = await self._check_syntax(fpath)
                         if syntax_check:
+                            normalized = self._normalize_workspace_relpath(
+                                workspace,
+                                str(f or ""),
+                            )
+                            in_retry_writable_scope = (
+                                not syntax_enforcement_paths
+                                or (
+                                    bool(normalized)
+                                    and normalized in syntax_enforcement_paths
+                                )
+                            )
+                            if not in_retry_writable_scope:
+                                if not syntax_check.passed:
+                                    checks.append(Check(
+                                        name=f"syntax_{fpath.name}_advisory",
+                                        passed=True,
+                                        detail=(
+                                            "Advisory: non-canonical artifact "
+                                            f"'{normalized or str(f)}' has syntax issues "
+                                            f"({syntax_check.detail or 'syntax error'}). "
+                                            "Hard-fail checks are limited to retry-writable "
+                                            "deliverables."
+                                        ),
+                                    ))
+                                continue
                             checks.append(syntax_check)
 
         # 4. Process regex rules
         if self._process:
-            expected_deliverables = self._expected_deliverables_for_subtask(subtask)
             for rule in self._process.regex_rules_for_subtask(
                 subtask.id,
                 phase_scope_default=self._phase_scope_default,

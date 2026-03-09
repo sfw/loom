@@ -1002,6 +1002,7 @@ async def run_subtask(
             tool_calls=tool_calls_record,
             evidence_tool_calls=evidence_tool_calls,
             evidence_records=combined_evidence_records,
+            retry_writable_deliverables=list(canonical_deliverables),
             validity_contract=(
                 dict(subtask.validity_contract_snapshot)
                 if isinstance(subtask.validity_contract_snapshot, dict)

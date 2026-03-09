@@ -414,6 +414,94 @@ class TestDeterministicVerifier:
             for c in result.checks
         )
 
+    @pytest.mark.asyncio
+    async def test_noncanonical_csv_mismatch_is_advisory_when_process_deliverables_defined(
+        self,
+        tmp_path,
+    ):
+        (tmp_path / "report.csv").write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+        (tmp_path / "evidence_ledger.csv").write_text(
+            "a,b,c\n1,2,3\n4,5\n",
+            encoding="utf-8",
+        )
+
+        process = _make_process(deliverables={"phase-a": ["report.csv"]})
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "evidence_ledger.csv"},
+            result=ToolResult.ok(
+                "ok",
+                files_changed=["report.csv", "evidence_ledger.csv"],
+            ),
+        )
+        result = await v.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "output",
+            [tc],
+            tmp_path,
+        )
+
+        assert result.passed
+        assert result.outcome == "pass_with_warnings"
+        assert result.reason_code == ""
+        assert any(
+            c.name == "syntax_evidence_ledger.csv_advisory" and c.passed
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_canonical_csv_mismatch_still_fails_when_process_deliverables_defined(
+        self,
+        tmp_path,
+    ):
+        (tmp_path / "report.csv").write_text("a,b,c\n1,2,3\n4,5\n", encoding="utf-8")
+
+        process = _make_process(deliverables={"phase-a": ["report.csv"]})
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "report.csv"},
+            result=ToolResult.ok("ok", files_changed=["report.csv"]),
+        )
+        result = await v.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "output",
+            [tc],
+            tmp_path,
+        )
+
+        assert not result.passed
+        assert result.reason_code == "csv_schema_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_retry_writable_deliverables_override_syntax_scope(self, tmp_path):
+        (tmp_path / "report.csv").write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+        stage_dir = tmp_path / "stage"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        (stage_dir / "report.stage.csv").write_text(
+            "a,b,c\n1,2,3\n4,5\n",
+            encoding="utf-8",
+        )
+
+        process = _make_process(deliverables={"phase-a": ["report.csv"]})
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "stage/report.stage.csv"},
+            result=ToolResult.ok("ok", files_changed=["stage/report.stage.csv"]),
+        )
+        result = await v.verify(
+            _make_subtask(subtask_id="phase-a"),
+            "output",
+            [tc],
+            tmp_path,
+            retry_writable_deliverables=["stage/report.stage.csv"],
+        )
+
+        assert not result.passed
+        assert result.reason_code == "csv_schema_mismatch"
+
 
 # --- LLMVerifier ---
 
