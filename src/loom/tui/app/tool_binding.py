@@ -10,6 +10,30 @@ from loom.processes.schema import ProcessDefinition
 logger = logging.getLogger("loom.tui.app.core")
 
 
+def _install_runtime_tool_resolvers(self) -> None:
+    """Attach live config resolvers to tools that support them."""
+    delegate = self._tools.get("delegate_task")
+    if delegate is not None and hasattr(delegate, "set_timeout_resolver"):
+        delegate.set_timeout_resolver(
+            lambda: int(
+                self._config_runtime_store.effective_value(
+                    "execution.delegate_task_timeout_seconds",
+                ) or 3600,
+            ),
+        )
+
+    for tool_name in ("openai_codex", "claude_code", "opencode"):
+        tool = self._tools.get(tool_name)
+        if tool is not None and hasattr(tool, "set_max_timeout_seconds_resolver"):
+            tool.set_max_timeout_seconds_resolver(
+                lambda: int(
+                    self._config_runtime_store.effective_value(
+                        "execution.agent_tools_max_timeout_seconds",
+                    ) or 1800,
+                ),
+            )
+
+
 def ensure_persistence_tools(self) -> None:
     """Ensure recall/delegate tools are registered and tracked."""
     self._recall_tool = None
@@ -44,6 +68,7 @@ def ensure_persistence_tools(self) -> None:
         delegate = DelegateTaskTool()
         self._tools.register(delegate)
     self._delegate_tool = delegate
+    _install_runtime_tool_resolvers(self)
 
 
 def ensure_delegate_task_ready_for_run(self) -> tuple[bool, str]:
@@ -88,21 +113,19 @@ def bind_session_tools(self) -> None:
             from loom.state.task_state import TaskStateManager
             from loom.tools import create_default_registry as _create_tools
 
-            config = self._config
             db = self._db
-
-            if hasattr(config, "workspace"):
-                data_dir = Path(
-                    config.workspace.scratch_dir,
-                ).expanduser()
-            else:
-                data_dir = Path.home() / ".loom"
-
-            router = ModelRouter.from_config(config)
 
             async def _orchestrator_factory(
                 process_override: ProcessDefinition | None = None,
             ):
+                config = self._config
+                if hasattr(config, "workspace"):
+                    data_dir = Path(
+                        config.workspace.scratch_dir,
+                    ).expanduser()
+                else:
+                    data_dir = Path.home() / ".loom"
+                router = ModelRouter.from_config(config)
                 telemetry_cfg = getattr(config, "telemetry", None)
                 event_bus_kwargs = {
                     "debug_diagnostics_rate_per_minute": int(
@@ -133,5 +156,6 @@ def bind_session_tools(self) -> None:
                 )
 
             self._delegate_tool.bind(_orchestrator_factory)
+            _install_runtime_tool_resolvers(self)
         except Exception as e:
             logger.warning("Failed to bind delegate_task tool: %s", e)

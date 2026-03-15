@@ -179,6 +179,7 @@ class ProviderAgentTool(Tool):
         allowed_providers: list[str] | None = None,
         max_timeout_seconds: int = 1800,
         default_network_mode: str = "on",
+        max_timeout_resolver=None,
     ) -> None:
         self._enabled = bool(enabled)
         normalized_allowed: list[str] = []
@@ -188,6 +189,7 @@ class ProviderAgentTool(Tool):
                 normalized_allowed.append(provider)
         self._allowed_providers = normalized_allowed or list(PROVIDER_SPECS.keys())
         self._max_timeout_seconds = max(30, int(max_timeout_seconds or 1800))
+        self._max_timeout_resolver = max_timeout_resolver
         mode = str(default_network_mode or "on").strip().lower()
         self._default_network_mode = mode if mode in {"on", "off"} else "on"
 
@@ -198,7 +200,17 @@ class ProviderAgentTool(Tool):
     @property
     def timeout_seconds(self) -> int:
         # Per-call timeout parameter is additionally bounded by config.
-        return max(30, self._max_timeout_seconds)
+        timeout = self._max_timeout_seconds
+        if callable(self._max_timeout_resolver):
+            try:
+                timeout = int(self._max_timeout_resolver() or timeout)
+            except Exception:
+                timeout = self._max_timeout_seconds
+        return max(30, timeout)
+
+    def set_max_timeout_seconds_resolver(self, resolver) -> None:
+        """Install a runtime resolver for future agent-tool calls."""
+        self._max_timeout_resolver = resolver
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         started = time.monotonic()

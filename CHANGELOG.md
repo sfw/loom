@@ -6,6 +6,10 @@ This changelog is generated directly from git commit history (non-merge commits)
 
 ## [Unreleased]
 
+- Add generic TUI `/config` slash command with list/search/show/set/reset, runtime overrides, persisted scalar writes, and path/value autocomplete
+- Refactor TUI runtime config handling around a shared config registry/store with configured/runtime/effective value reporting
+- Allow `execution.delegate_task_timeout_seconds` changes to update active delegated runs mid-flight via live timeout monitoring
+
 ## [0.2.1] - 2026-03-09
 
 - 2026-03-08 `f0c95f7` Align tier1 syntax hard-fail scope with retry-writable outputs

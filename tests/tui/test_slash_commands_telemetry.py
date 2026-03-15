@@ -42,11 +42,12 @@ class TestTelemetrySlashCommands:
     @pytest.mark.asyncio
     async def test_telemetry_set_mode_normalizes_alias(self):
         from loom.config import Config, TelemetryConfig
+        from loom.tools.registry import ToolRegistry
         from loom.tui.app import LoomApp
 
         app = LoomApp(
             model=MagicMock(name="model"),
-            tools=MagicMock(),
+            tools=ToolRegistry(),
             workspace=Path("/tmp"),
             config=Config(
                 telemetry=TelemetryConfig(

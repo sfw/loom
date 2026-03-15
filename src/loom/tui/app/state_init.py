@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from loom.config_runtime.store import ConfigRuntimeStore
 from loom.cowork.approval import ApprovalDecision
 
 
@@ -25,6 +26,11 @@ def initialize_app_state(
     self._tools = tools
     self._workspace = workspace
     self._config = config
+    self._config_source_path = legacy_config_path
+    self._config_runtime_store = ConfigRuntimeStore(
+        config,
+        source_path=legacy_config_path,
+    )
     self._db = db
     self._store = store
     self._resume_session = resume_session

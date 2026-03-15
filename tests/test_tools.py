@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 
 from loom.config import Config, ExecutionConfig
 from loom.tools import create_default_registry, discover_tools
+from loom.tools.delegate_task import DelegateTaskTool
 from loom.tools.file_ops import (
     DeleteFileTool,
     EditFileTool,
@@ -386,6 +388,101 @@ class TestRegistry:
         result = await registry.execute("read_file", {"path": "README.md"}, workspace=workspace)
         assert result.success
 
+    async def test_execute_live_timeout_updates_extend_active_call(self):
+        class _SlowTool(Tool):
+            __loom_register__ = False
+
+            def __init__(self) -> None:
+                self.timeout_limit = 1
+
+            @property
+            def name(self) -> str:
+                return "slow_live_timeout"
+
+            @property
+            def description(self) -> str:
+                return "Slow tool"
+
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+
+            @property
+            def timeout_seconds(self) -> int:
+                return self.timeout_limit
+
+            @property
+            def supports_live_timeout_updates(self) -> bool:
+                return True
+
+            async def execute(self, _args: dict, _ctx: ToolContext) -> ToolResult:
+                await asyncio.sleep(1.2)
+                return ToolResult.ok("ok")
+
+        registry = ToolRegistry()
+        tool = _SlowTool()
+        registry.register(tool)
+
+        async def _extend_timeout() -> None:
+            await asyncio.sleep(0.2)
+            tool.timeout_limit = 2
+
+        extender = asyncio.create_task(_extend_timeout())
+        try:
+            result = await registry.execute("slow_live_timeout", {})
+        finally:
+            await extender
+
+        assert result.success
+
+    async def test_execute_live_timeout_updates_cancel_after_budget_reduction(self):
+        class _SlowTool(Tool):
+            __loom_register__ = False
+
+            def __init__(self) -> None:
+                self.timeout_limit = 3
+
+            @property
+            def name(self) -> str:
+                return "slow_live_timeout_reduce"
+
+            @property
+            def description(self) -> str:
+                return "Slow tool"
+
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+
+            @property
+            def timeout_seconds(self) -> int:
+                return self.timeout_limit
+
+            @property
+            def supports_live_timeout_updates(self) -> bool:
+                return True
+
+            async def execute(self, _args: dict, _ctx: ToolContext) -> ToolResult:
+                await asyncio.sleep(2.5)
+                return ToolResult.ok("ok")
+
+        registry = ToolRegistry()
+        tool = _SlowTool()
+        registry.register(tool)
+
+        async def _reduce_timeout() -> None:
+            await asyncio.sleep(0.2)
+            tool.timeout_limit = 1
+
+        reducer = asyncio.create_task(_reduce_timeout())
+        try:
+            result = await registry.execute("slow_live_timeout_reduce", {})
+        finally:
+            await reducer
+
+        assert result.success is False
+        assert "timed out after 1s" in str(result.error or "")
+
     async def test_execute_known_mcp_tool_skips_periodic_refresh(self, workspace: Path):
         class _EchoMCPTool(Tool):
             __loom_register__ = False
@@ -564,6 +661,14 @@ class TestReadFile:
         # If pypdf is not installed, we get a helpful message
         if "pypdf" in result.output.lower() or "install" in result.output.lower():
             assert "PDF file" in result.output
+
+
+def test_delegate_task_timeout_resolver_overrides_env(monkeypatch):
+    monkeypatch.setenv("LOOM_DELEGATE_TIMEOUT_SECONDS", "30")
+
+    tool = DelegateTaskTool(timeout_seconds=60, timeout_resolver=lambda: 90)
+
+    assert tool.timeout_seconds == 90
 
 
 # --- WriteFileTool ---

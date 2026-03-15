@@ -5,6 +5,7 @@ from __future__ import annotations
 from textual.app import ScreenStackError
 from textual.widgets import Input
 
+from . import config_command as slash_config_command
 from . import parsing as slash_parsing
 from . import registry as slash_registry
 
@@ -78,9 +79,12 @@ def apply_slash_tab_completion(
         self._reset_slash_tab_cycle()
         return False
 
-    tool_seed_candidates = self._tool_name_completion_candidates(raw_current)
-    if tool_seed_candidates is not None:
-        token, candidates = tool_seed_candidates
+    special_seed_candidates = (
+        self._tool_name_completion_candidates(raw_current)
+        or slash_config_command.completion_candidates(self, raw_current)
+    )
+    if special_seed_candidates is not None:
+        token, candidates = special_seed_candidates
         if not candidates:
             self._reset_slash_tab_cycle()
             return False
