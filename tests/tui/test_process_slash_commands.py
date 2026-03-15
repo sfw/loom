@@ -472,8 +472,8 @@ class TestSlashCommandHints:
         assert app._slash_completion_candidates("/t") == [
             "/tools",
             "/tool",
-            "/telemetry",
             "/tokens",
+            "/telemetry",
         ]
         assert app._slash_completion_candidates("/p") == ["/pause", "/processes"]
         assert app._slash_completion_candidates("/r") == ["/resume", "/run", "/redirect"]

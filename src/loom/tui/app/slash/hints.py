@@ -7,6 +7,7 @@ from textual.widgets import Static
 
 from ..constants import _SLASH_COMMAND_PRIORITY, _SLASH_COMMANDS
 from ..models import SlashCommandSpec
+from . import config_command as slash_config_command
 from . import registry as slash_registry
 
 
@@ -240,6 +241,9 @@ def render_slash_hint(self, raw_input: str) -> str:
     if raw_input.strip() == "/":
         self._refresh_process_command_index(background=True)
         return self._render_root_slash_hint()
+    config_hint = slash_config_command.render_config_hint(self, raw_input)
+    if config_hint is not None:
+        return config_hint
     tool_hint = self._render_tool_slash_hint(raw_input)
     if tool_hint is not None:
         return tool_hint

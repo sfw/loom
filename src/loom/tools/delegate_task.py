@@ -129,6 +129,7 @@ class DelegateTaskTool(Tool):
         self,
         orchestrator_factory: Callable[..., Awaitable[Orchestrator]] | None = None,
         timeout_seconds: int | None = None,
+        timeout_resolver: Callable[[], int] | None = None,
     ):
         self._factory = orchestrator_factory
         self._configured_timeout_seconds = _normalize_timeout_seconds(
@@ -139,11 +140,24 @@ class DelegateTaskTool(Tool):
             ),
             default=DEFAULT_DELEGATE_TIMEOUT_SECONDS,
         )
+        self._timeout_resolver = timeout_resolver
 
     @property
     def timeout_seconds(self) -> int:
         # Long-running orchestration can exceed simple tool time budgets.
+        if callable(self._timeout_resolver):
+            try:
+                return _normalize_timeout_seconds(
+                    self._timeout_resolver(),
+                    default=self._configured_timeout_seconds,
+                )
+            except Exception:
+                return self._configured_timeout_seconds
         return _delegate_timeout_seconds(self._configured_timeout_seconds)
+
+    @property
+    def supports_live_timeout_updates(self) -> bool:
+        return True
 
     def bind(
         self,
@@ -151,6 +165,10 @@ class DelegateTaskTool(Tool):
     ) -> None:
         """Bind the orchestrator factory after construction."""
         self._factory = orchestrator_factory
+
+    def set_timeout_resolver(self, timeout_resolver: Callable[[], int] | None) -> None:
+        """Install a runtime timeout resolver for future and active calls."""
+        self._timeout_resolver = timeout_resolver
 
 
     @property

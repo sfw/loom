@@ -7,6 +7,7 @@ and schema generation for model consumption.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -224,6 +225,11 @@ class Tool(ABC):
     @property
     def timeout_seconds(self) -> int:
         return 30
+
+    @property
+    def supports_live_timeout_updates(self) -> bool:
+        """Whether timeout should be recomputed while a call is in flight."""
+        return False
 
     @property
     def auth_requirements(self) -> list[dict[str, Any]]:
@@ -816,6 +822,41 @@ class ToolRegistry:
             return False
         return True
 
+    async def _execute_with_live_timeout_monitor(
+        self,
+        *,
+        tool: Tool,
+        name: str,
+        normalized_arguments: dict,
+        ctx: ToolContext,
+    ) -> ToolResult:
+        """Execute one tool while recomputing timeout against elapsed time."""
+        started_at = time.monotonic()
+        task = asyncio.create_task(tool.execute(normalized_arguments, ctx))
+        poll_interval_seconds = 0.25
+        try:
+            while True:
+                timeout_seconds = max(1.0, float(tool.timeout_seconds))
+                elapsed = max(0.0, time.monotonic() - started_at)
+                if elapsed >= timeout_seconds:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    raise TimeoutError
+                remaining = timeout_seconds - elapsed
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=max(0.05, min(poll_interval_seconds, remaining)),
+                    )
+                except TimeoutError:
+                    continue
+        finally:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
     async def execute(
         self,
         name: str,
@@ -910,10 +951,18 @@ class ToolRegistry:
         )
 
         try:
-            result = await asyncio.wait_for(
-                tool.execute(normalized_arguments, ctx),
-                timeout=tool.timeout_seconds,
-            )
+            if getattr(tool, "supports_live_timeout_updates", False):
+                result = await self._execute_with_live_timeout_monitor(
+                    tool=tool,
+                    name=name,
+                    normalized_arguments=normalized_arguments,
+                    ctx=ctx,
+                )
+            else:
+                result = await asyncio.wait_for(
+                    tool.execute(normalized_arguments, ctx),
+                    timeout=tool.timeout_seconds,
+                )
             return result
         except TimeoutError:
             return ToolResult.fail(

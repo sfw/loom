@@ -510,6 +510,62 @@ class SubtaskRunner:
                 subtask.id,
                 exc_info=True,
             )
+        self._record_task_clarification_decision(
+            task=task,
+            subtask=subtask,
+            request=request,
+            answer=answer,
+        )
+
+    @staticmethod
+    def _clip_clarification_text(text: str, *, limit: int = 140) -> str:
+        value = str(text or "").strip()
+        if len(value) <= limit:
+            return value
+        return f"{value[: max(0, limit - 1)].rstrip()}…"
+
+    def _record_task_clarification_decision(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        request: QuestionRequest,
+        answer: QuestionAnswer,
+    ) -> None:
+        question_text = self._clip_clarification_text(request.question, limit=120)
+        answer_text = self._clip_clarification_text(
+            answer.text_response.strip() or answer.response_type or "clarification received",
+            limit=120,
+        )
+        decision_text = (
+            f"Clarification ({str(subtask.id or '').strip()}): "
+            f"{question_text} -> {answer_text}"
+        )
+        task.add_decision(decision_text)
+
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        history = metadata.get("clarification_history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append({
+            "subtask_id": str(subtask.id or "").strip(),
+            "question": question_text,
+            "answer": answer_text,
+            "answered_at": str(answer.answered_at or datetime.now().isoformat()).strip(),
+        })
+        metadata["clarification_history"] = history[-20:]
+        task.metadata = metadata
+        try:
+            self._state.save(task)
+        except Exception:
+            logger.debug(
+                "Failed persisting clarification decision to task state for %s/%s",
+                task.id,
+                subtask.id,
+                exc_info=True,
+            )
 
     def _is_timeout_guard_active(self, remaining_seconds: float | None = None) -> bool:
         remaining = (

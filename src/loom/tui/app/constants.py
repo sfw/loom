@@ -52,6 +52,15 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec(canonical="/tools", description="list available tools"),
     SlashCommandSpec(canonical="/tokens", description="show session token usage"),
     SlashCommandSpec(
+        canonical="/config",
+        usage=(
+            "[list|search <query>|show <path>|set <path> <value> "
+            "[--scope runtime|persist|both]|reset <path> "
+            "[--scope runtime|persist|both]]"
+        ),
+        description="inspect/set runtime and persisted config values",
+    ),
+    SlashCommandSpec(
         canonical="/telemetry",
         usage="[status|off|active|all_typed|debug|internal_only]",
         description="show/set runtime telemetry mode (process-local)",
@@ -134,8 +143,9 @@ _SLASH_COMMAND_PRIORITY: dict[str, int] = {
     "/tool": 33,
     "/model": 40,
     "/models": 41,
+    "/config": 42,
     "/tokens": 42,
-    "/telemetry": 42,
+    "/telemetry": 43,
     "/setup": 43,
     "/learned": 44,
     "/help": 45,

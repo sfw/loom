@@ -360,6 +360,9 @@ Mutation security for `PATCH /settings/telemetry`:
 
 TUI runtime control:
 - Use `/telemetry` to view or set process-local operator mode (`/telemetry status`, `/telemetry debug`, etc.).
+- Use `/config` to list, search, inspect, set, and reset supported operator-editable config keys from the chat window.
+- `/config set execution.delegate_task_timeout_seconds <seconds>` updates the delegated `/run` timeout budget in the current TUI process, and runtime changes apply to in-flight delegate calls.
+- Add `--scope persist` (or `--scope both`) to write supported scalar values back to `loom.toml`.
 
 ### `[process]`
 

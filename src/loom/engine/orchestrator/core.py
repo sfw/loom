@@ -125,6 +125,12 @@ _CLAIM_RECOVERABLE_FAILURE_CODES = frozenset({
     "claim_stale_source",
     "coverage_below_threshold",
 })
+_SCOPE_ADAPTIVE_REPLAN_REASON_CODES = frozenset({
+    "insufficient_sample_size",
+    "insufficient_volume",
+    "cardinality_mismatch",
+    "incomplete_verification_pending_phase2",
+})
 _PLACEHOLDER_UNCONFIRMED_REASON_CODES = frozenset({
     "incomplete_deliverable_placeholder",
     "incomplete_deliverable_content",
@@ -310,14 +316,27 @@ class Orchestrator:
                     context="reused_plan",
                 )
                 task.plan = plan
+                reused_plan_replanned = False
+                if self._should_replan_resumed_existing_plan(task):
+                    self._run_budget.observe_replan()
+                    reused_plan_replanned = await self._replan_task(
+                        task,
+                        reason="resume_existing_plan_context_shift",
+                        verification_feedback=self._build_resume_existing_plan_feedback(
+                            task,
+                        ),
+                    )
+                    if reused_plan_replanned and task.plan and task.plan.subtasks:
+                        plan = task.plan
                 task.status = TaskStatus.EXECUTING
                 self._state.save(task)
-                self._emit(TASK_PLAN_READY, task.id, {
-                    "subtask_count": len(plan.subtasks),
-                    "subtask_ids": [s.id for s in plan.subtasks],
-                    "reused": True,
-                    "run_id": run_id,
-                })
+                if not reused_plan_replanned:
+                    self._emit(TASK_PLAN_READY, task.id, {
+                        "subtask_count": len(plan.subtasks),
+                        "subtask_ids": [s.id for s in plan.subtasks],
+                        "reused": True,
+                        "run_id": run_id,
+                    })
             else:
                 # 1. Planning phase
                 task.status = TaskStatus.PLANNING
@@ -2105,6 +2124,110 @@ class Orchestrator:
             f"Subtask '{subtask.id}' failed verification tier "
             f"{verification.tier}{suffix_text} with no feedback."
         )
+
+    def _should_replan_resumed_existing_plan(self, task: Task) -> bool:
+        """Replan once when resuming a failed task with pending work."""
+        decisions = [str(item or "").strip() for item in task.decisions_log]
+        if "Resumed execution from prior task state." not in decisions:
+            return False
+        if not task.errors_encountered:
+            return False
+        has_pending = any(
+            subtask.status in {SubtaskStatus.PENDING, SubtaskStatus.RUNNING}
+            for subtask in task.plan.subtasks
+        )
+        if not has_pending:
+            return False
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        prior_count = int(metadata.get("resume_preflight_replan_count", 0) or 0)
+        if prior_count >= 1:
+            return False
+        metadata["resume_preflight_replan_count"] = prior_count + 1
+        task.metadata = metadata
+        try:
+            self._state.save(task)
+        except Exception:
+            logger.debug(
+                "Failed persisting resume preflight replan marker for %s",
+                task.id,
+                exc_info=True,
+            )
+        return True
+
+    def _build_resume_existing_plan_feedback(self, task: Task) -> str:
+        """Compose targeted feedback for preflight replanning on resumed tasks."""
+        lines = [
+            "Task resumed from prior state with failed verification history.",
+            "Replan remaining subtasks to match clarified user intent and available data.",
+            "Avoid stale cardinality assumptions when the full live dataset is unavailable.",
+        ]
+        clarification_notes = [
+            str(item or "").strip()
+            for item in task.decisions_log
+            if "clarification (" in str(item or "").lower()
+        ]
+        if clarification_notes:
+            lines.append("Recent clarifications:")
+            for note in clarification_notes[-4:]:
+                lines.append(f"- {note}")
+        recent_errors = [
+            f"{str(item.subtask or '').strip()}: {str(item.error or '').strip()}"
+            for item in task.errors_encountered[-4:]
+            if str(item.error or "").strip()
+        ]
+        if recent_errors:
+            lines.append("Recent verification failures:")
+            for item in recent_errors:
+                lines.append(f"- {item}")
+        return "\n".join(lines)
+
+    def _should_auto_replan_critical_path_scope_failure(
+        self,
+        *,
+        task: Task,
+        subtask: Subtask,
+        verification: VerificationResult,
+        attempts: list[AttemptRecord],
+    ) -> bool:
+        """Allow one adaptive replan for critical-path scope/cardinality mismatches."""
+        reason_codes = {
+            str(getattr(verification, "reason_code", "") or "").strip().lower(),
+        }
+        reason_codes.update(
+            str(getattr(item, "reason_code", "") or "").strip().lower()
+            for item in attempts
+            if isinstance(item, AttemptRecord)
+        )
+        if not (reason_codes & _SCOPE_ADAPTIVE_REPLAN_REASON_CODES):
+            return False
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        tracker = metadata.get("critical_path_scope_replans", {})
+        if not isinstance(tracker, dict):
+            tracker = {}
+        tracker_key = (
+            f"{str(getattr(task.plan, 'version', 1) or 1)}:"
+            f"{str(getattr(subtask, 'id', '') or '')}"
+        )
+        prior_count = int(tracker.get(tracker_key, 0) or 0)
+        if prior_count >= 1:
+            return False
+        tracker[tracker_key] = prior_count + 1
+        metadata["critical_path_scope_replans"] = tracker
+        task.metadata = metadata
+        try:
+            self._state.save(task)
+        except Exception:
+            logger.debug(
+                "Failed persisting critical-path adaptive replan marker for %s/%s",
+                task.id,
+                subtask.id,
+                exc_info=True,
+            )
+        return True
 
     async def _retry_verification_only(
         self,

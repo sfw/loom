@@ -5,14 +5,13 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import replace
-from datetime import UTC, datetime
 from typing import Any
 
-from loom.events.verbosity import DEFAULT_TELEMETRY_MODE, normalize_telemetry_mode
 from loom.tui.screens import SetupScreen
 from loom.tui.widgets import ChatLog
 
 from ..constants import _RUN_GOAL_FILE_CONTENT_MAX_CHARS
+from . import config_command as slash_config_command
 
 
 async def handle_slash_command(app, text: str) -> bool:
@@ -517,6 +516,9 @@ async def handle_slash_command_core(self, text: str) -> bool:
     if token == "/tokens":
         chat.add_info(f"Session tokens: {self._total_tokens:,}")
         return True
+    if token == "/config":
+        chat.add_info(slash_config_command.handle_config_command(self, arg))
+        return True
     if token == "/telemetry":
         if not arg or arg.lower() in {"status", "show"}:
             chat.add_info(self._render_telemetry_mode_status())
@@ -534,20 +536,19 @@ async def handle_slash_command_core(self, text: str) -> bool:
                 ),
             )
             return True
-        resolution = normalize_telemetry_mode(
-            tokens[0],
-            default=DEFAULT_TELEMETRY_MODE,
+        entry, parsed, _snapshot = self._set_runtime_config_value(
+            path="telemetry.mode",
+            raw_value=tokens[0],
         )
-        self._telemetry_runtime_override_mode = resolution.mode
-        self._telemetry_mode_updated_at = datetime.now(UTC).isoformat()
+        self._refresh_runtime_config_bindings()
         lines = [
             "Telemetry mode updated.",
-            f"effective mode: [bold]{self._escape_markup(resolution.mode)}[/bold]",
+            f"effective mode: [bold]{self._escape_markup(parsed.display_value)}[/bold]",
         ]
-        if resolution.warning_code:
+        if parsed.warning_code:
             lines.append(
                 "[dim]Input normalized to canonical mode "
-                f"({self._escape_markup(resolution.warning_code)}).[/dim]"
+                f"({self._escape_markup(parsed.warning_code)}).[/dim]"
             )
         lines.append(self._render_telemetry_mode_status())
         chat.add_info("\n".join(lines))

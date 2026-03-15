@@ -274,6 +274,11 @@ async def finalize_setup(self) -> None:
     else:
         # Defensive fallback for mocked/non-standard config objects.
         self._config = loaded
+    self._config_runtime_store.set_config(
+        self._config,
+        source_path=self._config_source_path,
+    )
+    self._sync_effective_runtime_config()
     router = ModelRouter.from_config(self._config)
     try:
         self._model = router.select(role="executor")

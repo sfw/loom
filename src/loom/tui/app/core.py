@@ -1698,15 +1698,66 @@ class LoomApp(App):
     def _render_root_slash_hint(self) -> str:
         return slash_hints.render_root_slash_hint(self)
 
+    def _config_source_file(self) -> Path | None:
+        return getattr(self, "_config_source_path", None)
+
+    def _sync_effective_runtime_config(self) -> None:
+        self._config = self._config_runtime_store.effective_config()
+
+    def _refresh_runtime_config_bindings(self) -> None:
+        self._sync_effective_runtime_config()
+        self._ensure_persistence_tools()
+        if self._session is not None and self._db is not None:
+            self._bind_session_tools()
+
+    def _config_snapshot(self, path: str) -> dict[str, Any]:
+        return self._config_runtime_store.snapshot(path)
+
+    def _set_runtime_config_value(
+        self,
+        *,
+        path: str,
+        raw_value: object,
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        entry, parsed = self._config_runtime_store.set_runtime_value(path, raw_value)
+        self._sync_effective_runtime_config()
+        return entry, parsed, self._config_runtime_store.snapshot(entry.path)
+
+    def _persist_config_value(
+        self,
+        *,
+        path: str,
+        raw_value: object,
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        entry, parsed = self._config_runtime_store.persist_value(path, raw_value)
+        self._config_source_path = self._config_runtime_store.source_path()
+        self._sync_effective_runtime_config()
+        return entry, parsed, self._config_runtime_store.snapshot(entry.path)
+
+    def _clear_runtime_config_value(self, *, path: str) -> dict[str, Any]:
+        entry = self._config_runtime_store.clear_runtime_value(path)
+        self._sync_effective_runtime_config()
+        return self._config_runtime_store.snapshot(entry.path)
+
+    def _reset_persisted_config_value(self, *, path: str) -> dict[str, Any]:
+        entry = self._config_runtime_store.reset_persisted_value(path)
+        self._config_source_path = self._config_runtime_store.source_path()
+        self._sync_effective_runtime_config()
+        return self._config_runtime_store.snapshot(entry.path)
+
     def _configured_telemetry_mode(self) -> TelemetryMode:
-        telemetry_cfg = getattr(getattr(self, "_config", None), "telemetry", None)
-        return normalize_telemetry_mode(
-            getattr(telemetry_cfg, "mode", DEFAULT_TELEMETRY_MODE),
-            default=DEFAULT_TELEMETRY_MODE,
-        ).mode
+        try:
+            configured = self._config_runtime_store.snapshot("telemetry.mode")["configured"]
+        except Exception:
+            telemetry_cfg = getattr(getattr(self, "_config", None), "telemetry", None)
+            configured = getattr(telemetry_cfg, "mode", DEFAULT_TELEMETRY_MODE)
+        return normalize_telemetry_mode(configured, default=DEFAULT_TELEMETRY_MODE).mode
 
     def _runtime_telemetry_mode(self) -> TelemetryMode | None:
-        mode = self._telemetry_runtime_override_mode
+        try:
+            mode = self._config_runtime_store.snapshot("telemetry.mode")["runtime_override"]
+        except Exception:
+            mode = self._telemetry_runtime_override_mode
         if mode is None:
             return None
         return normalize_telemetry_mode(
@@ -1719,11 +1770,11 @@ class LoomApp(App):
         return runtime_mode or self._configured_telemetry_mode()
 
     def _render_telemetry_mode_status(self) -> str:
-        configured_mode = self._configured_telemetry_mode()
-        runtime_mode = self._runtime_telemetry_mode()
-        effective_mode = runtime_mode or configured_mode
-        runtime_display = runtime_mode or "(none)"
-        updated_at = str(self._telemetry_mode_updated_at or "").strip()
+        snapshot = self._config_runtime_store.snapshot("telemetry.mode")
+        configured_mode = snapshot["configured_display"]
+        runtime_display = snapshot["runtime_display"]
+        effective_mode = snapshot["effective_display"]
+        updated_at = str(snapshot["updated_at"] or "").strip()
         lines = [
             "[bold #7dcfff]Telemetry Mode[/]",
             f"configured: [bold]{self._escape_markup(configured_mode)}[/bold]",
