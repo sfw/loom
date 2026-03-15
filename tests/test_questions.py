@@ -525,6 +525,17 @@ class TestSubtaskRunnerAskUser:
         completed_task = state_manager.load(task.id)
         if isinstance(completed_task.metadata, dict):
             assert "awaiting_user_input" not in completed_task.metadata
+            history = completed_task.metadata.get("clarification_history", [])
+            assert isinstance(history, list)
+            assert history
+            assert "pick stack" in str(history[-1].get("question", "")).lower()
+            assert "python" in str(history[-1].get("answer", "")).lower()
+        assert any(
+            "clarification (" in str(item).lower()
+            and "pick stack" in str(item).lower()
+            and "python" in str(item).lower()
+            for item in completed_task.decisions_log
+        )
 
         instructions = await memory_manager.query(task.id, entry_type="user_instruction")
         decisions = await memory_manager.query(task.id, entry_type="decision")

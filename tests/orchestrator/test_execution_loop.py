@@ -1186,6 +1186,99 @@ class TestOrchestratorExecution:
         orch._replan_task.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_reused_resumed_plan_triggers_preflight_replan(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text="{}"),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        subtask = Subtask(id="post-migration-verification", description="Final QA")
+        task.plan = Plan(subtasks=[subtask], version=1)
+        task.add_decision("Resumed execution from prior task state.")
+        task.add_decision(
+            "Clarification (verify-export-integrity): run with a simulated sample dataset.",
+        )
+        task.add_error(
+            "post-migration-verification",
+            "Verification failed (tier 2): only 50 of 20,000 reconciled.",
+        )
+
+        orch._replan_task = AsyncMock(return_value=True)
+        orch._dispatch_subtask = AsyncMock(return_value=(
+            subtask,
+            SubtaskResult(status="success", summary="ok"),
+            VerificationResult(tier=1, passed=True),
+        ))
+
+        result = await orch.execute_task(task, reuse_existing_plan=True)
+
+        assert result.status == TaskStatus.COMPLETED
+        orch._replan_task.assert_awaited_once()
+        _, kwargs = orch._replan_task.await_args
+        assert kwargs["reason"] == "resume_existing_plan_context_shift"
+        feedback = str(kwargs.get("verification_feedback", "") or "").lower()
+        assert "clarification" in feedback
+        assert "failed verification" in feedback
+
+    @pytest.mark.asyncio
+    async def test_critical_path_scope_mismatch_requests_replan(self, tmp_path):
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_loop_iterations=20,
+            max_parallel_subtasks=1,
+            auto_approve_confidence_threshold=0.8,
+            enable_streaming=False,
+        ))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text="{}"),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=cfg,
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="post-migration-verification",
+            description="Final QA",
+            is_critical_path=True,
+            max_retries=0,
+        )
+        task.plan = Plan(subtasks=[subtask], version=1)
+
+        result = SubtaskResult(status=SubtaskResultStatus.FAILED, summary="failed")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            feedback="Only 50 of 20,000 publications reconciled.",
+            outcome="fail",
+            reason_code="insufficient_sample_size",
+            severity_class="semantic",
+        )
+        attempts: dict[str, list[AttemptRecord]] = {}
+        orch._plan_failure_resolution = AsyncMock(return_value="")
+        orch._abort_on_critical_path_failure = AsyncMock()
+
+        replan_request = await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts,
+        )
+
+        assert isinstance(replan_request, dict)
+        assert replan_request.get("failed_subtask_id") == subtask.id
+        assert "critical_path_scope_adaptation" in str(replan_request.get("reason", ""))
+        orch._abort_on_critical_path_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_single_subtask_exception_retries_instead_of_fatal_abort(self, tmp_path):
         plan_json = json.dumps({
             "subtasks": [{"id": "s1", "description": "First"}]

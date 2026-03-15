@@ -993,6 +993,26 @@ async def handle_failure(
         # All retries exhausted.
         # Critical-path failures abort the remaining plan.
         if subtask.is_critical_path:
+            if orchestrator._should_auto_replan_critical_path_scope_failure(
+                task=task,
+                subtask=subtask,
+                verification=verification,
+                attempts=attempt_list,
+            ):
+                verification_feedback = verification.feedback
+                if resolution_plan:
+                    details = (
+                        f"{verification_feedback}\n\n"
+                        "MODEL-PLANNED RESOLUTION:\n"
+                        f"{resolution_plan}"
+                    )
+                    verification_feedback = details.strip()
+                return {
+                    "reason": "critical_path_scope_adaptation: "
+                    + orchestrator._build_replan_reason(subtask, verification),
+                    "failed_subtask_id": subtask.id,
+                    "verification_feedback": verification_feedback,
+                }
             if (
                 strategy == RetryStrategy.UNCONFIRMED_DATA
                 and not hard_invariant_failure
