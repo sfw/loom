@@ -213,9 +213,9 @@ class WorkspaceConfig:
 class ExecutionConfig:
     max_subtask_retries: int = 3
     max_loop_iterations: int = 50
-    max_parallel_subtasks: int = 3
+    max_parallel_subtasks: int = 5
     auto_approve_confidence_threshold: float = 0.8
-    enable_streaming: bool = False
+    enable_streaming: bool = True
     enable_global_run_budget: bool = False
     max_task_wall_clock_seconds: int = 0
     max_task_total_tokens: int = 0
@@ -224,7 +224,7 @@ class ExecutionConfig:
     max_task_mutating_tool_calls: int = 0
     max_task_replans: int = 0
     max_task_remediation_attempts: int = 0
-    enable_process_iteration_loops: bool = False
+    enable_process_iteration_loops: bool = True
     enable_iteration_command_exit_gate: bool = False
     max_iteration_replans_after_exhaustion: int = 2
     iteration_command_exit_allowlisted_prefixes: list[str] = field(
@@ -249,7 +249,7 @@ class ExecutionConfig:
     enable_mutation_idempotency: bool = False
     sealed_artifact_post_call_guard: str = "warn"  # off | warn | enforce
     enable_slo_metrics: bool = False
-    delegate_task_timeout_seconds: int = 3600
+    delegate_task_timeout_seconds: int = 14_400
     ask_user_v2_enabled: bool = True
     ask_user_runtime_blocking_enabled: bool = True
     ask_user_durable_state_enabled: bool = True
@@ -264,7 +264,7 @@ class ExecutionConfig:
     model_call_retry_base_delay_seconds: float = 0.5
     model_call_retry_max_delay_seconds: float = 8.0
     model_call_retry_jitter_seconds: float = 0.25
-    cowork_tool_exposure_mode: str = "adaptive"  # full | adaptive | hybrid
+    cowork_tool_exposure_mode: str = "hybrid"  # full | adaptive | hybrid
     cowork_memory_index_enabled: bool = True
     cowork_memory_index_v2_actions_enabled: bool = True
     cowork_memory_index_force_fts: bool = False
@@ -274,8 +274,8 @@ class ExecutionConfig:
     cowork_memory_index_section_limit: int = 4
     cowork_recall_index_max_chars: int = 1200
     enable_software_dev_tools: bool = False
-    enable_agent_tools: bool = False
-    enable_wp_tools: bool = False
+    enable_agent_tools: bool = True
+    enable_wp_tools: bool = True
     wp_high_risk_requires_confirmation: bool = True
     agent_tools_allowed_providers: list[str] = field(
         default_factory=lambda: ["codex", "claude_code", "opencode"],
@@ -410,16 +410,16 @@ class RunnerLimitsConfig:
     max_tool_iterations: int = 20
     max_subtask_wall_clock_seconds: int = 1200
     max_model_context_tokens: int = 24_000
-    max_state_summary_chars: int = 480
+    max_state_summary_chars: int = 640
     max_verification_summary_chars: int = 8000
-    default_tool_result_output_chars: int = 4000
-    heavy_tool_result_output_chars: int = 2000
-    compact_tool_result_output_chars: int = 500
-    compact_text_output_chars: int = 900
+    default_tool_result_output_chars: int = 2800
+    heavy_tool_result_output_chars: int = 3600
+    compact_tool_result_output_chars: int = 900
+    compact_text_output_chars: int = 1400
     minimal_text_output_chars: int = 260
-    tool_call_argument_context_chars: int = 500
-    compact_tool_call_argument_chars: int = 220
-    runner_compaction_policy_mode: str = "tiered"  # "legacy" | "tiered" | "off"
+    tool_call_argument_context_chars: int = 700
+    compact_tool_call_argument_chars: int = 1600
+    runner_compaction_policy_mode: str = "off"  # "legacy" | "tiered" | "off"
     enable_filetype_ingest_router: bool = True
     enable_artifact_telemetry_events: bool = True
     artifact_telemetry_max_metadata_chars: int = 1200
@@ -462,19 +462,19 @@ class VerifierLimitsConfig:
 class CompactorLimitsConfig:
     """Internal limits for semantic compactor chunking + response sizing."""
 
-    max_chunk_chars: int = 9000
-    max_chunks_per_round: int = 12
-    max_reduction_rounds: int = 4
-    min_compact_target_chars: int = 140
+    max_chunk_chars: int = 8000
+    max_chunks_per_round: int = 10
+    max_reduction_rounds: int = 2
+    min_compact_target_chars: int = 220
     response_tokens_floor: int = 256
-    response_tokens_ratio: float = 0.75
+    response_tokens_ratio: float = 0.55
     response_tokens_buffer: int = 256
-    json_headroom_chars_floor: int = 48
-    json_headroom_chars_ratio: float = 0.08
-    json_headroom_chars_cap: int = 320
-    chars_per_token_estimate: float = 3.6
-    token_headroom: int = 24
-    target_chars_ratio: float = 0.75
+    json_headroom_chars_floor: int = 128
+    json_headroom_chars_ratio: float = 0.30
+    json_headroom_chars_cap: int = 1024
+    chars_per_token_estimate: float = 2.8
+    token_headroom: int = 128
+    target_chars_ratio: float = 0.82
 
 
 @dataclass(frozen=True)
@@ -483,7 +483,7 @@ class LimitsConfig:
 
     planning_response_max_tokens: int = 16_384
     adhoc_repair_source_max_chars: int = 0  # 0 = no truncation
-    evidence_context_text_max_chars: int = 4000
+    evidence_context_text_max_chars: int = 8192
     runner: RunnerLimitsConfig = field(default_factory=RunnerLimitsConfig)
     verifier: VerifierLimitsConfig = field(default_factory=VerifierLimitsConfig)
     compactor: CompactorLimitsConfig = field(default_factory=CompactorLimitsConfig)
@@ -742,16 +742,25 @@ def load_config(path: Path | None = None) -> Config:
 
     workspace_data = raw.get("workspace", {})
     workspace = WorkspaceConfig(
-        default_path=workspace_data.get("default_path", "~/projects"),
-        scratch_dir=workspace_data.get("scratch_dir", "~/.loom/scratch"),
+        default_path=workspace_data.get(
+            "default_path",
+            WorkspaceConfig.default_path,
+        ),
+        scratch_dir=workspace_data.get(
+            "scratch_dir",
+            WorkspaceConfig.scratch_dir,
+        ),
     )
 
     exec_data = raw.get("execution", {})
-    delegate_timeout_raw = exec_data.get("delegate_task_timeout_seconds", 3600)
+    delegate_timeout_raw = exec_data.get(
+        "delegate_task_timeout_seconds",
+        ExecutionConfig.delegate_task_timeout_seconds,
+    )
     try:
         delegate_task_timeout_seconds = int(delegate_timeout_raw)
     except (TypeError, ValueError):
-        delegate_task_timeout_seconds = 3600
+        delegate_task_timeout_seconds = ExecutionConfig.delegate_task_timeout_seconds
     delegate_task_timeout_seconds = max(1, delegate_task_timeout_seconds)
 
     ask_user_timeout_default_raw = exec_data.get(
@@ -800,13 +809,26 @@ def load_config(path: Path | None = None) -> Config:
     model_call_retry_jitter_seconds = max(0.0, model_call_retry_jitter_seconds)
 
     execution = ExecutionConfig(
-        max_subtask_retries=exec_data.get("max_subtask_retries", 3),
-        max_loop_iterations=exec_data.get("max_loop_iterations", 50),
-        max_parallel_subtasks=exec_data.get("max_parallel_subtasks", 3),
-        auto_approve_confidence_threshold=exec_data.get(
-            "auto_approve_confidence_threshold", 0.8
+        max_subtask_retries=exec_data.get(
+            "max_subtask_retries",
+            ExecutionConfig.max_subtask_retries,
         ),
-        enable_streaming=exec_data.get("enable_streaming", False),
+        max_loop_iterations=exec_data.get(
+            "max_loop_iterations",
+            ExecutionConfig.max_loop_iterations,
+        ),
+        max_parallel_subtasks=exec_data.get(
+            "max_parallel_subtasks",
+            ExecutionConfig.max_parallel_subtasks,
+        ),
+        auto_approve_confidence_threshold=exec_data.get(
+            "auto_approve_confidence_threshold",
+            ExecutionConfig.auto_approve_confidence_threshold,
+        ),
+        enable_streaming=exec_data.get(
+            "enable_streaming",
+            ExecutionConfig.enable_streaming,
+        ),
         enable_global_run_budget=_bool_from(
             exec_data,
             "enable_global_run_budget",
@@ -1255,10 +1277,22 @@ def load_config(path: Path | None = None) -> Config:
     )
 
     verification = VerificationConfig(
-        tier1_enabled=verif_data.get("tier1_enabled", True),
-        tier2_enabled=verif_data.get("tier2_enabled", True),
-        tier3_enabled=verif_data.get("tier3_enabled", False),
-        tier3_vote_count=verif_data.get("tier3_vote_count", 3),
+        tier1_enabled=verif_data.get(
+            "tier1_enabled",
+            VerificationConfig.tier1_enabled,
+        ),
+        tier2_enabled=verif_data.get(
+            "tier2_enabled",
+            VerificationConfig.tier2_enabled,
+        ),
+        tier3_enabled=verif_data.get(
+            "tier3_enabled",
+            VerificationConfig.tier3_enabled,
+        ),
+        tier3_vote_count=verif_data.get(
+            "tier3_vote_count",
+            VerificationConfig.tier3_vote_count,
+        ),
         policy_engine_enabled=verif_data.get("policy_engine_enabled", True),
         regex_default_advisory=verif_data.get("regex_default_advisory", True),
         strict_output_protocol=verif_data.get("strict_output_protocol", True),
@@ -1307,13 +1341,16 @@ def load_config(path: Path | None = None) -> Config:
 
     mem_data = raw.get("memory", {})
     memory = MemoryConfig(
-        database_path=mem_data.get("database_path", "~/.loom/loom.db"),
+        database_path=mem_data.get("database_path", MemoryConfig.database_path),
     )
 
     log_data = raw.get("logging", {})
     logging_cfg = LoggingConfig(
-        level=log_data.get("level", "INFO"),
-        event_log_path=log_data.get("event_log_path", "~/.loom/logs"),
+        level=log_data.get("level", LoggingConfig.level),
+        event_log_path=log_data.get(
+            "event_log_path",
+            LoggingConfig.event_log_path,
+        ),
     )
 
     telemetry_data = raw.get("telemetry", {})

@@ -399,7 +399,7 @@ def _normalize_tool_exposure_mode(value: str) -> str:
     mode = str(value or "").strip().lower()
     if mode in _TOOL_EXPOSURE_MODES:
         return mode
-    return "adaptive"
+    return "hybrid"
 
 
 def _estimate_message_tokens(msg: dict) -> int:
@@ -505,7 +505,7 @@ class CoworkSession:
         max_context_tokens: int = _COMPACT_CONTEXT_TOKEN_CAP,
         reflection: GapAnalysisEngine | None = None,
         model_retry_policy: ModelRetryPolicy | None = None,
-        tool_exposure_mode: str = "adaptive",
+        tool_exposure_mode: str = "hybrid",
         auth_context: Any | None = None,
         enable_filetype_ingest_router: bool = True,
         ingest_artifact_retention_max_age_days: int = 14,

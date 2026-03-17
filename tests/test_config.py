@@ -29,7 +29,9 @@ class TestDefaultConfig:
         config = Config()
         assert config.execution.max_subtask_retries == 3
         assert config.execution.max_loop_iterations == 50
+        assert config.execution.max_parallel_subtasks == 5
         assert config.execution.auto_approve_confidence_threshold == 0.8
+        assert config.execution.enable_streaming is True
         assert config.execution.enable_global_run_budget is False
         assert config.execution.max_task_wall_clock_seconds == 0
         assert config.execution.max_task_total_tokens == 0
@@ -45,7 +47,7 @@ class TestDefaultConfig:
         assert config.execution.enable_durable_task_runner is False
         assert config.execution.enable_mutation_idempotency is False
         assert config.execution.enable_slo_metrics is False
-        assert config.execution.delegate_task_timeout_seconds == 3600
+        assert config.execution.delegate_task_timeout_seconds == 14400
         assert config.execution.ask_user_v2_enabled is True
         assert config.execution.ask_user_runtime_blocking_enabled is True
         assert config.execution.ask_user_durable_state_enabled is True
@@ -60,7 +62,7 @@ class TestDefaultConfig:
         assert config.execution.model_call_retry_base_delay_seconds == 0.5
         assert config.execution.model_call_retry_max_delay_seconds == 8.0
         assert config.execution.model_call_retry_jitter_seconds == 0.25
-        assert config.execution.cowork_tool_exposure_mode == "adaptive"
+        assert config.execution.cowork_tool_exposure_mode == "hybrid"
         assert config.execution.cowork_memory_index_enabled is True
         assert config.execution.cowork_memory_index_v2_actions_enabled is True
         assert config.execution.cowork_memory_index_force_fts is False
@@ -70,8 +72,8 @@ class TestDefaultConfig:
         assert config.execution.cowork_memory_index_section_limit == 4
         assert config.execution.cowork_recall_index_max_chars == 1200
         assert config.execution.enable_software_dev_tools is False
-        assert config.execution.enable_agent_tools is False
-        assert config.execution.enable_wp_tools is False
+        assert config.execution.enable_agent_tools is True
+        assert config.execution.enable_wp_tools is True
         assert config.execution.wp_high_risk_requires_confirmation is True
         assert config.execution.agent_tools_allowed_providers == [
             "codex",
@@ -150,9 +152,9 @@ class TestDefaultConfig:
         config = Config()
         assert config.limits.planning_response_max_tokens == 16384
         assert config.limits.adhoc_repair_source_max_chars == 0
-        assert config.limits.evidence_context_text_max_chars == 4000
-        assert config.limits.runner.default_tool_result_output_chars == 4000
-        assert config.limits.runner.runner_compaction_policy_mode == "tiered"
+        assert config.limits.evidence_context_text_max_chars == 8192
+        assert config.limits.runner.default_tool_result_output_chars == 2800
+        assert config.limits.runner.runner_compaction_policy_mode == "off"
         assert config.limits.runner.enable_filetype_ingest_router is True
         assert config.limits.runner.enable_artifact_telemetry_events is True
         assert config.limits.runner.artifact_telemetry_max_metadata_chars == 1200
@@ -162,13 +164,13 @@ class TestDefaultConfig:
         assert config.limits.runner.ingest_artifact_retention_max_bytes_per_scope == 268_435_456
         assert config.limits.runner.compaction_pressure_ratio_soft == 0.86
         assert config.limits.verifier.max_verifier_prompt_tokens == 12000
-        assert config.limits.compactor.response_tokens_ratio == 0.75
-        assert config.limits.compactor.json_headroom_chars_floor == 48
-        assert config.limits.compactor.json_headroom_chars_ratio == 0.08
-        assert config.limits.compactor.json_headroom_chars_cap == 320
-        assert config.limits.compactor.chars_per_token_estimate == 3.6
-        assert config.limits.compactor.token_headroom == 24
-        assert config.limits.compactor.target_chars_ratio == 0.75
+        assert config.limits.compactor.response_tokens_ratio == 0.55
+        assert config.limits.compactor.json_headroom_chars_floor == 128
+        assert config.limits.compactor.json_headroom_chars_ratio == 0.30
+        assert config.limits.compactor.json_headroom_chars_cap == 1024
+        assert config.limits.compactor.chars_per_token_estimate == 2.8
+        assert config.limits.compactor.token_headroom == 128
+        assert config.limits.compactor.target_chars_ratio == 0.82
 
     def test_database_path_expands_user(self):
         config = Config()
@@ -307,9 +309,9 @@ enable_streaming = true
         config = load_config(toml_file)
         assert config.execution.enable_streaming is True
 
-    def test_enable_streaming_default_false(self):
+    def test_enable_streaming_default_true(self):
         config = Config()
-        assert config.execution.enable_streaming is False
+        assert config.execution.enable_streaming is True
 
     def test_execution_model_retry_policy_loaded(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
@@ -427,7 +429,7 @@ cowork_recall_index_max_chars = 1900
 cowork_tool_exposure_mode = "wild-west"
 """)
         config = load_config(toml_file)
-        assert config.execution.cowork_tool_exposure_mode == "adaptive"
+        assert config.execution.cowork_tool_exposure_mode == "hybrid"
 
     def test_execution_ask_user_policy_invalid_falls_back(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
@@ -840,7 +842,7 @@ runner_compaction_policy_mode = "off"
 runner_compaction_policy_mode = "invalid-mode"
 """)
         config = load_config(toml_file)
-        assert config.limits.runner.runner_compaction_policy_mode == "tiered"
+        assert config.limits.runner.runner_compaction_policy_mode == "off"
 
     def test_can_disable_artifact_telemetry_events(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

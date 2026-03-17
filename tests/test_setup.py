@@ -120,8 +120,14 @@ class TestGenerateToml:
         parsed = tomllib.loads(toml)
         assert parsed["models"]["test"]["provider"] == "ollama"
         assert parsed["server"]["port"] == 9000
-        assert parsed["execution"]["delegate_task_timeout_seconds"] == 3600
-        assert parsed["execution"]["cowork_tool_exposure_mode"] == "adaptive"
+        assert parsed["execution"]["max_parallel_subtasks"] == 5
+        assert parsed["execution"]["enable_streaming"] is True
+        assert parsed["execution"]["delegate_task_timeout_seconds"] == 14400
+        assert parsed["execution"]["cowork_tool_exposure_mode"] == "hybrid"
+        assert parsed["execution"]["enable_agent_tools"] is True
+        assert parsed["execution"]["enable_wp_tools"] is True
+        assert parsed["execution"]["enable_process_iteration_loops"] is True
+        assert parsed["limits"]["runner"]["runner_compaction_policy_mode"] == "off"
         assert parsed["telemetry"]["mode"] == "active"
         assert parsed["telemetry"]["runtime_override_enabled"] is True
         assert parsed["telemetry"]["runtime_override_api_enabled"] is False
@@ -158,8 +164,14 @@ class TestGenerateToml:
         assert config.models["primary"].api_key == "sk-ant-fake"
         assert config.models["primary"].roles == ["planner", "executor"]
         assert config.server.port == 9000
-        assert config.execution.delegate_task_timeout_seconds == 3600
-        assert config.execution.cowork_tool_exposure_mode == "adaptive"
+        assert config.execution.max_parallel_subtasks == 5
+        assert config.execution.enable_streaming is True
+        assert config.execution.delegate_task_timeout_seconds == 14400
+        assert config.execution.cowork_tool_exposure_mode == "hybrid"
+        assert config.execution.enable_agent_tools is True
+        assert config.execution.enable_wp_tools is True
+        assert config.execution.enable_process_iteration_loops is True
+        assert config.limits.runner.runner_compaction_policy_mode == "off"
 
 
 class TestRunSetup:
@@ -201,8 +213,14 @@ class TestRunSetup:
         content = cfg_path.read_text()
         assert 'provider = "ollama"' in content
         assert 'model = "qwen3:14b"' in content
-        assert "delegate_task_timeout_seconds = 3600" in content
-        assert 'cowork_tool_exposure_mode = "adaptive"' in content
+        assert "max_parallel_subtasks = 5" in content
+        assert "enable_streaming = true" in content
+        assert "delegate_task_timeout_seconds = 14400" in content
+        assert 'cowork_tool_exposure_mode = "hybrid"' in content
+        assert "enable_agent_tools = true" in content
+        assert "enable_wp_tools = true" in content
+        assert "enable_process_iteration_loops = true" in content
+        assert 'runner_compaction_policy_mode = "off"' in content
         assert "[telemetry]" in content
         assert 'mode = "active"' in content
         assert "ingest_artifact_retention_max_age_days = 14" in content

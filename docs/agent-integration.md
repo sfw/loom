@@ -865,9 +865,9 @@ max_tokens = 8192
 [execution]
 max_subtask_retries = 3
 max_loop_iterations = 50
-max_parallel_subtasks = 3     # Independent subtasks run concurrently
+max_parallel_subtasks = 5     # Independent subtasks run concurrently
 auto_approve_confidence_threshold = 0.8
-delegate_task_timeout_seconds = 3600  # /run delegation timeout budget
+delegate_task_timeout_seconds = 14400  # /run delegation timeout budget
 
 [verification]
 tier1_enabled = true    # Deterministic checks (free, instant)
