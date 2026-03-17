@@ -440,6 +440,7 @@ class TestSubtaskRunnerAskUser:
 
         config = Config(
             execution=ExecutionConfig(
+                enable_streaming=False,
                 ask_user_v2_enabled=True,
                 ask_user_runtime_blocking_enabled=True,
                 ask_user_durable_state_enabled=True,
@@ -562,6 +563,7 @@ class TestSubtaskRunnerAskUser:
 
         config = Config(
             execution=ExecutionConfig(
+                enable_streaming=False,
                 ask_user_v2_enabled=True,
                 ask_user_runtime_blocking_enabled=True,
                 ask_user_durable_state_enabled=True,
@@ -665,6 +667,7 @@ class TestSubtaskRunnerAskUser:
 
         config = Config(
             execution=ExecutionConfig(
+                enable_streaming=False,
                 ask_user_v2_enabled=True,
                 ask_user_runtime_blocking_enabled=True,
                 ask_user_durable_state_enabled=True,

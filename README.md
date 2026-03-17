@@ -138,10 +138,14 @@ roles = ["extractor", "executor", "compactor"]
 [execution]
 max_subtask_retries = 3
 max_loop_iterations = 50
-max_parallel_subtasks = 3
-delegate_task_timeout_seconds = 3600
-enable_process_iteration_loops = false
+max_parallel_subtasks = 5
+enable_streaming = true
+delegate_task_timeout_seconds = 14400
+enable_process_iteration_loops = true
 enable_iteration_command_exit_gate = false
+cowork_tool_exposure_mode = "hybrid"
+enable_agent_tools = true
+enable_wp_tools = true
 
 [telemetry]
 mode = "active" # off | active | all_typed | debug
@@ -201,7 +205,7 @@ Use `--manual-token --access-token ...` only as a headless fallback.
 MCP OAuth alias tokens are stored separately in `~/.loom/mcp_oauth_tokens.json`.
 This store is intentionally separate from `/auth` profile token refs in
 `~/.loom/auth.toml`.
-`delegate_task` (used by `/run`) defaults to a 3600s timeout. Configure this in
+`delegate_task` (used by `/run`) defaults to a 14400s timeout. Configure this in
 `loom.toml` under `[execution].delegate_task_timeout_seconds`; env override
 `LOOM_DELEGATE_TIMEOUT_SECONDS` still applies when set.
 

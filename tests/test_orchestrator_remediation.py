@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from loom.config import Config
+from loom.config import Config, ExecutionConfig
 from loom.engine.orchestrator import Orchestrator, create_task
 from loom.events.bus import EventBus
 from loom.events.types import REMEDIATION_EXPIRED, REMEDIATION_TERMINAL
@@ -74,7 +74,7 @@ def _make_orchestrator(
         prompt_assembler=prompts,
         state_manager=state,
         event_bus=event_bus,
-        config=Config(),
+        config=Config(execution=ExecutionConfig(enable_streaming=False)),
     )
     return orch, state
 

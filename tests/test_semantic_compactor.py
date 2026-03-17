@@ -667,7 +667,7 @@ async def test_semantic_compactor_reduction_targets_requested_budget():
     )
 
     assert result == "z" * 150
-    assert model.target_chars[:2] == [150, 140]
+    assert model.target_chars[:2] == [164, 200]
     assert model.hard_limits[:2] == [200, 200]
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-from loom.config import Config
+from loom.config import Config, ExecutionConfig
 from loom.engine.orchestrator import create_task
 from loom.events.bus import EventBus
 from loom.models.base import ModelResponse, TokenUsage
@@ -20,7 +20,7 @@ from loom.tools.registry import ToolRegistry, ToolResult
 
 
 def _make_config() -> Config:
-    return Config()
+    return Config(execution=ExecutionConfig(enable_streaming=False))
 
 
 def _make_event_bus() -> EventBus:

@@ -53,4 +53,4 @@ def test_runtime_store_persist_and_reset_scalar_value(tmp_path: Path) -> None:
 
     assert reset_entry.path == entry.path
     assert "delegate_task_timeout_seconds" not in config_path.read_text(encoding="utf-8")
-    assert store.snapshot(entry.path)["configured"] == 3600
+    assert store.snapshot(entry.path)["configured"] == 14400

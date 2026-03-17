@@ -632,7 +632,9 @@
 <span class="key">[execution]</span>
 <span class="key">max_subtask_retries</span>  = <span class="val">3</span>
 <span class="key">max_loop_iterations</span> = <span class="val">50</span>
-<span class="key">delegate_task_timeout_seconds</span> = <span class="val">3600</span>
+<span class="key">max_parallel_subtasks</span> = <span class="val">5</span>
+<span class="key">enable_streaming</span> = <span class="val">true</span>
+<span class="key">delegate_task_timeout_seconds</span> = <span class="val">14400</span>
 
 <span class="cmt"># Runner ingest + overflow fallback controls</span>
 <span class="key">[limits.runner]</span>
@@ -1673,7 +1675,7 @@ source.addEventListener(<span class="str">'task_failed'</span>, (e) => {
     <tr><td><code>execution.max_parallel_subtasks</code></td><td><code>3</code></td><td>Max concurrent runnable subtasks</td></tr>
     <tr><td><code>execution.auto_approve_confidence_threshold</code></td><td><code>0.8</code></td><td>Auto-approve if confidence above this</td></tr>
     <tr><td><code>execution.enable_streaming</code></td><td><code>false</code></td><td>Enable streaming behavior where supported</td></tr>
-    <tr><td><code>execution.delegate_task_timeout_seconds</code></td><td><code>3600</code></td><td>Timeout budget for delegated orchestration (<code>/run</code>, <code>delegate_task</code>)</td></tr>
+    <tr><td><code>execution.delegate_task_timeout_seconds</code></td><td><code>14400</code></td><td>Timeout budget for delegated orchestration (<code>/run</code>, <code>delegate_task</code>)</td></tr>
     <tr><td><code>execution.model_call_max_attempts</code></td><td><code>5</code></td><td>Model-call retry attempt cap</td></tr>
     <tr><td><code>execution.model_call_retry_base_delay_seconds</code></td><td><code>0.5</code></td><td>Base backoff delay for model retries</td></tr>
     <tr><td><code>execution.model_call_retry_max_delay_seconds</code></td><td><code>8.0</code></td><td>Max backoff delay for model retries</td></tr>

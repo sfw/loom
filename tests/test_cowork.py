@@ -234,7 +234,12 @@ class TestCoworkSession:
         provider = MockProvider([
             ModelResponse(text="Hello!", usage=TokenUsage(total_tokens=3)),
         ])
-        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            tool_exposure_mode="adaptive",
+        )
 
         async for _ in session.send("hi"):
             pass

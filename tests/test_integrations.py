@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from loom.config import Config
+from loom.config import Config, ExecutionConfig
 from loom.engine.orchestrator import Orchestrator, create_task
 from loom.events.bus import Event, EventBus, EventPersister
 from loom.events.types import TASK_EXECUTING
@@ -274,7 +274,7 @@ class TestResponseValidation:
             prompt_assembler=prompts,
             state_manager=TaskStateManager(data_dir=tmp_path),
             event_bus=EventBus(),
-            config=Config(),
+            config=Config(execution=ExecutionConfig(enable_streaming=False)),
         )
 
         task = create_task("test")
@@ -333,7 +333,7 @@ class TestReplanning:
             prompt_assembler=prompts,
             state_manager=TaskStateManager(data_dir=tmp_path),
             event_bus=EventBus(),
-            config=Config(),
+            config=Config(execution=ExecutionConfig(enable_streaming=False)),
         )
 
         task = create_task("test")

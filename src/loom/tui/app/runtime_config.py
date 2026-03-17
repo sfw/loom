@@ -36,14 +36,14 @@ def model_retry_policy(self) -> ModelRetryPolicy:
 
 def cowork_tool_exposure_mode(self) -> str:
     if self._config is None:
-        return "adaptive"
+        return "hybrid"
     mode = str(
-        getattr(self._config.execution, "cowork_tool_exposure_mode", "adaptive")
-        or "adaptive",
+        getattr(self._config.execution, "cowork_tool_exposure_mode", "hybrid")
+        or "hybrid",
     ).strip().lower()
     if mode in {"full", "adaptive", "hybrid"}:
         return mode
-    return "adaptive"
+    return "hybrid"
 
 
 def cowork_memory_index_enabled(self) -> bool:

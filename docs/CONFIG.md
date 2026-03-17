@@ -68,9 +68,9 @@ Recommended two-model split:
 | --- | --- | --- | --- |
 | `max_subtask_retries` | `int` | `3` | Retry budget per subtask in orchestrated runs. |
 | `max_loop_iterations` | `int` | `50` | Loop/dispatch budget for orchestration progress. |
-| `max_parallel_subtasks` | `int` | `3` | Max concurrently runnable subtasks. |
+| `max_parallel_subtasks` | `int` | `5` | Max concurrently runnable subtasks. |
 | `auto_approve_confidence_threshold` | `float` | `0.8` | Auto-approval threshold in confidence-gated flows. |
-| `enable_streaming` | `bool` | `false` | Enables streaming behavior where supported. |
+| `enable_streaming` | `bool` | `true` | Enables streaming behavior where supported. |
 | `enable_global_run_budget` | `bool` | `false` | Enforces task-level global resource budgets when limits are configured. |
 | `max_task_wall_clock_seconds` | `int` | `0` | Task-level wall-clock cap (`0` disables). |
 | `max_task_total_tokens` | `int` | `0` | Task-level total model token cap (`0` disables). |
@@ -79,7 +79,7 @@ Recommended two-model split:
 | `max_task_mutating_tool_calls` | `int` | `0` | Task-level mutating tool call cap (`0` disables). |
 | `max_task_replans` | `int` | `0` | Task-level replan cap (`0` disables). |
 | `max_task_remediation_attempts` | `int` | `0` | Task-level remediation-attempt cap (`0` disables). |
-| `enable_process_iteration_loops` | `bool` | `false` | Enables phase-level process iteration loops (`phase.iteration`). |
+| `enable_process_iteration_loops` | `bool` | `true` | Enables phase-level process iteration loops (`phase.iteration`). |
 | `enable_iteration_command_exit_gate` | `bool` | `false` | Enables runtime execution for `command_exit` iteration gates. |
 | `max_iteration_replans_after_exhaustion` | `int` | `2` | Global cap for loop-triggered replans after gate exhaustion. |
 | `iteration_command_exit_allowlisted_prefixes` | `list[string]` | test/lint allowlist | Runtime allowlisted command prefixes for `command_exit` gates. |
@@ -90,14 +90,14 @@ Recommended two-model split:
 | `enable_mutation_idempotency` | `bool` | `false` | Enables mutating-tool idempotency ledger dedupe. |
 | `sealed_artifact_post_call_guard` | `string` | `"warn"` | Defense-in-depth sealed-artifact post-call mutation guard (`off`, `warn`, `enforce`). |
 | `enable_slo_metrics` | `bool` | `false` | Enables `/slo` snapshot endpoint. |
-| `delegate_task_timeout_seconds` | `int` | `3600` | Timeout for delegated orchestration calls (`/run`, `delegate_task`). |
+| `delegate_task_timeout_seconds` | `int` | `14400` | Timeout for delegated orchestration calls (`/run`, `delegate_task`). |
 | `model_call_max_attempts` | `int` | `5` | Max retry attempts for model invocation retry policy. |
 | `model_call_retry_base_delay_seconds` | `float` | `0.5` | Base exponential backoff delay. |
 | `model_call_retry_max_delay_seconds` | `float` | `8.0` | Max delay cap for retry backoff. |
 | `model_call_retry_jitter_seconds` | `float` | `0.25` | Added random jitter on retries. |
 | `enable_software_dev_tools` | `bool` | `false` | Enable both coding-agent and WordPress tool families with one flag. |
-| `enable_agent_tools` | `bool` | `false` | Enable external coding-agent tools (`openai_codex`, `claude_code`, `opencode`). |
-| `enable_wp_tools` | `bool` | `false` | Enable WordPress development tools (`wp_cli`, `wp_env`, scaffolding, quality gate). |
+| `enable_agent_tools` | `bool` | `true` | Enable external coding-agent tools (`openai_codex`, `claude_code`, `opencode`). |
+| `enable_wp_tools` | `bool` | `true` | Enable WordPress development tools (`wp_cli`, `wp_env`, scaffolding, quality gate). |
 | `wp_high_risk_requires_confirmation` | `bool` | `true` | Require explicit confirmation for high-risk WordPress operations. |
 | `agent_tools_allowed_providers` | `list[string]` | `["codex","claude_code","opencode"]` | Restrict which external agent providers are exposed. |
 | `agent_tools_max_timeout_seconds` | `int` | `1800` | Max allowed timeout for coding-agent tool calls. |
@@ -158,7 +158,7 @@ Default `contradiction_scan_allowed_suffixes`:
 | --- | --- | --- | --- |
 | `planning_response_max_tokens` | `int` | `16384` | Planner synthesis response budget. |
 | `adhoc_repair_source_max_chars` | `int` | `0` | Source truncation limit for ad hoc JSON repair (`0` means disabled). |
-| `evidence_context_text_max_chars` | `int` | `4000` | Evidence context cap fed into planning/verification prompts. |
+| `evidence_context_text_max_chars` | `int` | `8192` | Evidence context cap fed into planning/verification prompts. |
 
 ### `[limits.runner]`
 
@@ -167,16 +167,16 @@ Default `contradiction_scan_allowed_suffixes`:
 | `max_tool_iterations` | `int` | `20` | Max tool/model loop iterations per subtask execution pass. |
 | `max_subtask_wall_clock_seconds` | `int` | `1200` | Per-subtask wall-clock timeout budget. |
 | `max_model_context_tokens` | `int` | `24000` | Runner model-context budget hint. |
-| `max_state_summary_chars` | `int` | `480` | Target size for compacted state summaries. |
+| `max_state_summary_chars` | `int` | `640` | Target size for compacted state summaries. |
 | `max_verification_summary_chars` | `int` | `8000` | Target size for verification summary payloads. |
-| `default_tool_result_output_chars` | `int` | `4000` | Default tool output compaction target. |
-| `heavy_tool_result_output_chars` | `int` | `2000` | Output target for heavy tools. |
-| `compact_tool_result_output_chars` | `int` | `500` | Output target for aggressively compacted tool excerpts. |
-| `compact_text_output_chars` | `int` | `900` | Generic compacted text target. |
+| `default_tool_result_output_chars` | `int` | `2800` | Default tool output compaction target. |
+| `heavy_tool_result_output_chars` | `int` | `3600` | Output target for heavy tools. |
+| `compact_tool_result_output_chars` | `int` | `900` | Output target for aggressively compacted tool excerpts. |
+| `compact_text_output_chars` | `int` | `1400` | Generic compacted text target. |
 | `minimal_text_output_chars` | `int` | `260` | Tiny fallback compacted text target. |
-| `tool_call_argument_context_chars` | `int` | `500` | Argument context extraction target. |
-| `compact_tool_call_argument_chars` | `int` | `220` | Aggressive tool-argument compaction target. |
-| `runner_compaction_policy_mode` | `string` | `"tiered"` | Runner compaction policy (`legacy`, `tiered`, `off`). |
+| `tool_call_argument_context_chars` | `int` | `700` | Argument context extraction target. |
+| `compact_tool_call_argument_chars` | `int` | `1600` | Aggressive tool-argument compaction target. |
+| `runner_compaction_policy_mode` | `string` | `"off"` | Runner compaction policy (`legacy`, `tiered`, `off`). |
 | `enable_filetype_ingest_router` | `bool` | `true` | Routes fetched binary/doc payloads into artifact-backed summaries. |
 | `enable_artifact_telemetry_events` | `bool` | `true` | Emits artifact ingest/read/retention and compaction/overflow transparency events to run logs (set `false` to disable). |
 | `artifact_telemetry_max_metadata_chars` | `int` | `1200` | Max serialized chars allowed for `handler_metadata` telemetry payload fields. |
@@ -217,19 +217,19 @@ Default `contradiction_scan_allowed_suffixes`:
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `max_chunk_chars` | `int` | `9000` | Chunk size before hierarchical map/reduce compaction. |
-| `max_chunks_per_round` | `int` | `12` | Max chunks compacted per reduction round. |
-| `max_reduction_rounds` | `int` | `4` | Max full compaction reduction rounds per payload. |
-| `min_compact_target_chars` | `int` | `140` | Floor target when reducing per-attempt character budget. |
+| `max_chunk_chars` | `int` | `8000` | Chunk size before hierarchical map/reduce compaction. |
+| `max_chunks_per_round` | `int` | `10` | Max chunks compacted per reduction round. |
+| `max_reduction_rounds` | `int` | `2` | Max full compaction reduction rounds per payload. |
+| `min_compact_target_chars` | `int` | `220` | Floor target when reducing per-attempt character budget. |
 | `response_tokens_floor` | `int` | `256` | Minimum `max_tokens` sent to compactor model calls. |
-| `response_tokens_ratio` | `float` | `0.75` | Token-budget ratio derived from hard character limits. |
+| `response_tokens_ratio` | `float` | `0.55` | Token-budget ratio derived from hard character limits. |
 | `response_tokens_buffer` | `int` | `256` | Fixed token headroom added to compactor budget. |
-| `json_headroom_chars_floor` | `int` | `48` | Minimum extra characters reserved for JSON envelope overhead. |
-| `json_headroom_chars_ratio` | `float` | `0.08` | Ratio-based JSON envelope headroom. |
-| `json_headroom_chars_cap` | `int` | `320` | Upper cap for JSON envelope headroom. |
-| `chars_per_token_estimate` | `float` | `3.6` | Character/token estimator used for budget calculations. |
-| `token_headroom` | `int` | `24` | Extra tokens added after char/token conversion. |
-| `target_chars_ratio` | `float` | `0.75` | Attempt target ratio under hard limit. |
+| `json_headroom_chars_floor` | `int` | `128` | Minimum extra characters reserved for JSON envelope overhead. |
+| `json_headroom_chars_ratio` | `float` | `0.30` | Ratio-based JSON envelope headroom. |
+| `json_headroom_chars_cap` | `int` | `1024` | Upper cap for JSON envelope headroom. |
+| `chars_per_token_estimate` | `float` | `2.8` | Character/token estimator used for budget calculations. |
+| `token_headroom` | `int` | `128` | Extra tokens added after char/token conversion. |
+| `target_chars_ratio` | `float` | `0.82` | Attempt target ratio under hard limit. |
 
 Compactor validation warnings:
 - If final retry still exceeds target chars, Loom keeps the compacted output and emits warning telemetry fields (`compactor_warning`, `compactor_warning_reason`, `compactor_warning_delta_chars`, `compactor_warning_target_chars`, `compactor_warning_received_chars`) instead of truncating.
@@ -492,7 +492,7 @@ Operational OAuth notes:
 - `limits.runner.minimal_text_output_chars` is clamped to `40..10000`.
 - `limits.runner.tool_call_argument_context_chars` is clamped to `80..20000`.
 - `limits.runner.compact_tool_call_argument_chars` is clamped to `40..10000`.
-- Invalid `limits.runner.runner_compaction_policy_mode` falls back to `"tiered"`.
+- Invalid `limits.runner.runner_compaction_policy_mode` falls back to `"off"`.
 - `limits.runner.artifact_telemetry_max_metadata_chars` is clamped to `120..20000`.
 - `limits.runner.ingest_artifact_retention_max_age_days` is clamped to `0..3650`.
 - `limits.runner.ingest_artifact_retention_max_files_per_scope` is clamped to `1..200000`.

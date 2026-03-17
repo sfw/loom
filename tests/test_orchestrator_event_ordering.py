@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from loom.config import Config
+from loom.config import Config, ExecutionConfig
 from loom.engine.orchestrator import Orchestrator, SubtaskResult, SubtaskResultStatus, create_task
 from loom.engine.verification import VerificationResult
 from loom.events.bus import EventBus
@@ -80,7 +80,7 @@ def _make_orchestrator(
         prompt_assembler=prompts,
         state_manager=state,
         event_bus=event_bus,
-        config=Config(),
+        config=Config(execution=ExecutionConfig(enable_streaming=False)),
     )
     return orchestrator, state
 
