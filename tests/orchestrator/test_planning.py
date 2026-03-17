@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from loom.config import Config, LimitsConfig, RunnerLimitsConfig
+from loom.config import Config, ExecutionConfig, LimitsConfig, RunnerLimitsConfig
 from loom.engine.orchestrator import Orchestrator, SubtaskResult
 from loom.engine.verification import VerificationResult
 from loom.events.types import (
@@ -129,7 +129,10 @@ class TestOrchestratorPlan:
             prompt_assembler=_make_mock_prompts(),
             state_manager=_make_state_manager(tmp_path),
             event_bus=_make_event_bus(),
-            config=Config(limits=LimitsConfig(planning_response_max_tokens=16384)),
+            config=Config(
+                execution=ExecutionConfig(enable_streaming=False),
+                limits=LimitsConfig(planning_response_max_tokens=16384),
+            ),
         )
 
         task = _make_task()
@@ -156,6 +159,7 @@ class TestOrchestratorPlan:
             state_manager=_make_state_manager(tmp_path),
             event_bus=bus,
             config=Config(
+                execution=ExecutionConfig(enable_streaming=False),
                 limits=LimitsConfig(
                     runner=RunnerLimitsConfig(
                         enable_artifact_telemetry_events=True,
