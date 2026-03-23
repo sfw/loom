@@ -9,8 +9,6 @@ from pathlib import Path
 from loom.tui.screens import ProcessRunWorkspaceScreen
 from loom.tui.widgets import ChatLog
 
-from . import state as process_run_state
-
 logger = logging.getLogger(__name__)
 
 
@@ -179,9 +177,7 @@ async def prompt_process_run_workspace_choice(
             selected.append(str(value))
         done.set()
 
-    run = self._process_runs.get(run_id) if run_id else None
-    if run is not None and not run.closed:
-        process_run_state.begin_process_run_user_input_pause(run)
+    self._begin_process_run_user_input_pause(run_id)
     self.push_screen(
         ProcessRunWorkspaceScreen(
             process_name=process_name,
@@ -193,8 +189,7 @@ async def prompt_process_run_workspace_choice(
     try:
         await done.wait()
     finally:
-        if run is not None:
-            process_run_state.end_process_run_user_input_pause(run)
+        self._end_process_run_user_input_pause(run_id)
     return selected[0] if selected else None
 
 

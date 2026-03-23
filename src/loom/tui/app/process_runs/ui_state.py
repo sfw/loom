@@ -47,9 +47,97 @@ def _format_elapsed(seconds: float) -> str:
     """Format elapsed seconds as MM:SS or H:MM:SS."""
     return process_run_state.format_elapsed(seconds)
 
+def _process_run_user_input_paused_seconds(
+    self,
+    run_id: str,
+    *,
+    now: float | None = None,
+) -> float:
+    """Return app-tracked user-input pause time for a run."""
+    run_key = str(run_id or "").strip()
+    if not run_key:
+        return 0.0
+    end_now = float(now) if now is not None else time.monotonic()
+    total = max(
+        0.0,
+        float(
+            self._process_run_user_input_paused_accumulated_seconds.get(run_key, 0.0) or 0.0,
+        ),
+    )
+    started = float(self._process_run_user_input_pause_started_at.get(run_key, 0.0) or 0.0)
+    if started > 0.0:
+        total += max(0.0, end_now - started)
+    return max(0.0, total)
+
+def _begin_process_run_user_input_pause(
+    self,
+    run_id: str,
+    *,
+    now: float | None = None,
+) -> None:
+    """Start a nested user-input pause for one run."""
+    run_key = str(run_id or "").strip()
+    if not run_key:
+        return
+    now_value = float(now) if now is not None else time.monotonic()
+    depth = int(self._process_run_user_input_pause_depths.get(run_key, 0) or 0)
+    self._process_run_user_input_pause_depths[run_key] = depth + 1
+    if depth <= 0:
+        self._process_run_user_input_pause_started_at[run_key] = now_value
+    run = self._process_runs.get(run_key)
+    if run is not None and hasattr(run, "pane"):
+        self._update_process_run_visuals(run)
+        self._refresh_sidebar_progress_summary()
+
+def _end_process_run_user_input_pause(
+    self,
+    run_id: str,
+    *,
+    now: float | None = None,
+) -> None:
+    """End a nested user-input pause for one run."""
+    run_key = str(run_id or "").strip()
+    if not run_key:
+        return
+    depth = int(self._process_run_user_input_pause_depths.get(run_key, 0) or 0)
+    if depth <= 0:
+        return
+    if depth > 1:
+        self._process_run_user_input_pause_depths[run_key] = depth - 1
+        return
+    now_value = float(now) if now is not None else time.monotonic()
+    started = float(self._process_run_user_input_pause_started_at.get(run_key, 0.0) or 0.0)
+    total = float(
+        self._process_run_user_input_paused_accumulated_seconds.get(run_key, 0.0) or 0.0,
+    )
+    if started > 0.0:
+        total += max(0.0, now_value - started)
+    self._process_run_user_input_pause_depths.pop(run_key, None)
+    self._process_run_user_input_pause_started_at.pop(run_key, None)
+    self._process_run_user_input_paused_accumulated_seconds[run_key] = max(0.0, total)
+    run = self._process_runs.get(run_key)
+    if run is not None and hasattr(run, "pane"):
+        self._update_process_run_visuals(run)
+        self._refresh_sidebar_progress_summary()
+
+def _clear_process_run_user_input_pause(self, run_id: str) -> None:
+    """Clear transient user-input pause tracking for one run."""
+    run_key = str(run_id or "").strip()
+    if not run_key:
+        return
+    self._process_run_user_input_pause_depths.pop(run_key, None)
+    self._process_run_user_input_pause_started_at.pop(run_key, None)
+    self._process_run_user_input_paused_accumulated_seconds.pop(run_key, None)
+
 def _elapsed_seconds_for_run(self, run: ProcessRunState) -> float:
     """Return elapsed seconds for a run (live or finalized)."""
-    return process_run_state.elapsed_seconds_for_run(run)
+    now = time.monotonic()
+    elapsed = process_run_state.elapsed_seconds_for_run(run, now=now)
+    paused = self._process_run_user_input_paused_seconds(
+        str(getattr(run, "run_id", "") or ""),
+        now=now,
+    )
+    return max(0.0, elapsed - paused)
 
 def _is_process_run_busy_status(status: str) -> bool:
     """Return True while a run is actively consuming execution resources."""
@@ -352,6 +440,7 @@ def _fail_process_run_launch(self, run: ProcessRunState, message: str) -> None:
     if run.closed:
         return
     detail = self._one_line(message, 1200) or "Process run failed during launch."
+    self._clear_process_run_user_input_pause(run.run_id)
     self._set_process_run_status(run, "failed")
     run.ended_at = time.monotonic()
     run.launch_error = detail

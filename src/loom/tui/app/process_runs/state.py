@@ -41,6 +41,19 @@ def paused_seconds_for_run(run: Any, *, now: float | None = None) -> float:
     return max(0.0, paused_total + user_input_total)
 
 
+def status_paused_seconds_for_run(run: Any, *, now: float | None = None) -> float:
+    """Return paused seconds caused by run status transitions only."""
+    end_now = float(now) if now is not None else time.monotonic()
+    paused_total = max(
+        0.0,
+        float(getattr(run, "paused_accumulated_seconds", 0.0) or 0.0),
+    )
+    paused_started = float(getattr(run, "paused_started_at", 0.0) or 0.0)
+    if paused_started > 0.0:
+        paused_total += max(0.0, end_now - paused_started)
+    return max(0.0, paused_total)
+
+
 def elapsed_seconds_for_run(run: Any, *, now: float | None = None) -> float:
     """Return elapsed seconds for a run (live or finalized)."""
     end_now = float(now) if now is not None else time.monotonic()

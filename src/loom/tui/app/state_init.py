@@ -92,6 +92,9 @@ def initialize_app_state(
     self._process_run_question_locks = {}
     self._process_run_seen_questions = {}
     self._process_run_pending_inject = {}
+    self._process_run_user_input_pause_depths = {}
+    self._process_run_user_input_pause_started_at = {}
+    self._process_run_user_input_paused_accumulated_seconds = {}
     self._auto_resume_workspace_on_init = True
     self._run_auth_profile_overrides = {}
     self._chat_replay_events = []
