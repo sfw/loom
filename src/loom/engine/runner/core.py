@@ -339,6 +339,25 @@ class SubtaskRunner:
             )
         return max(0.0, float(deadline) - time.monotonic())
 
+    def _begin_subtask_timeout_pause(self) -> float:
+        """Return a pause token for temporarily excluding wait time from budget."""
+        deadline = getattr(self, "_subtask_deadline_monotonic", None)
+        if not isinstance(deadline, (float, int)) or deadline <= 0:
+            return 0.0
+        return time.monotonic()
+
+    def _end_subtask_timeout_pause(self, pause_started_at: float) -> None:
+        """Extend the active subtask deadline by the paused duration."""
+        if not isinstance(pause_started_at, (float, int)) or pause_started_at <= 0:
+            return
+        deadline = getattr(self, "_subtask_deadline_monotonic", None)
+        if not isinstance(deadline, (float, int)) or deadline <= 0:
+            return
+        self._subtask_deadline_monotonic = float(deadline) + max(
+            0.0,
+            time.monotonic() - float(pause_started_at),
+        )
+
     @staticmethod
     def _task_status_text(task: Task) -> str:
         """Normalize current task status to lowercase text."""

@@ -17,8 +17,10 @@ def test_elapsed_and_pause_bookkeeping() -> None:
         ended_at=70.0,
         paused_started_at=0.0,
         paused_accumulated_seconds=5.0,
+        user_input_pause_started_at=0.0,
+        user_input_paused_accumulated_seconds=3.0,
     )
-    assert state.elapsed_seconds_for_run(run) == 55.0
+    assert state.elapsed_seconds_for_run(run) == 52.0
 
     state.set_process_run_status(run, "paused", now=80.0)
     assert run.status == "paused"
@@ -28,6 +30,26 @@ def test_elapsed_and_pause_bookkeeping() -> None:
     assert run.status == "running"
     assert run.paused_started_at == 0.0
     assert run.paused_accumulated_seconds == 15.0
+
+
+def test_user_input_pause_bookkeeping() -> None:
+    run = SimpleNamespace(
+        status="running",
+        started_at=10.0,
+        ended_at=70.0,
+        paused_started_at=0.0,
+        paused_accumulated_seconds=0.0,
+        user_input_pause_started_at=0.0,
+        user_input_paused_accumulated_seconds=2.0,
+    )
+
+    state.begin_process_run_user_input_pause(run, now=80.0)
+    assert run.user_input_pause_started_at == 80.0
+    assert state.paused_seconds_for_run(run, now=85.0) == 7.0
+
+    state.end_process_run_user_input_pause(run, now=90.0)
+    assert run.user_input_pause_started_at == 0.0
+    assert run.user_input_paused_accumulated_seconds == 12.0
 
 
 def test_stage_rows_and_summary() -> None:

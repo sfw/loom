@@ -10,6 +10,8 @@ from loom.tools.ask_user import normalize_ask_user_args
 from loom.tui.screens import AskUserScreen
 from loom.tui.widgets import ChatLog
 
+from . import state as process_run_state
+
 
 async def _prompt_process_run_question(
     self,
@@ -57,7 +59,11 @@ async def _prompt_process_run_question(
             callback=handle_answer,
         )
 
-        await answer_event.wait()
+        process_run_state.begin_process_run_user_input_pause(run)
+        try:
+            await answer_event.wait()
+        finally:
+            process_run_state.end_process_run_user_input_pause(run)
         if not answer_holder:
             return
         answer_payload = dict(answer_holder[0])

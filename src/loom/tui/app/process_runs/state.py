@@ -17,20 +17,37 @@ def format_elapsed(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def elapsed_seconds_for_run(run: Any, *, now: float | None = None) -> float:
-    """Return elapsed seconds for a run (live or finalized)."""
+def paused_seconds_for_run(run: Any, *, now: float | None = None) -> float:
+    """Return total paused seconds for a run across status and user-input waits."""
     end_now = float(now) if now is not None else time.monotonic()
-    end = getattr(run, "ended_at", None)
-    end_value = end_now if end is None else float(end)
-    elapsed = max(0.0, end_value - float(getattr(run, "started_at", 0.0) or 0.0))
     paused_total = max(
         0.0,
         float(getattr(run, "paused_accumulated_seconds", 0.0) or 0.0),
     )
     paused_started = float(getattr(run, "paused_started_at", 0.0) or 0.0)
     if paused_started > 0.0:
-        paused_total += max(0.0, end_value - paused_started)
-    return max(0.0, elapsed - paused_total)
+        paused_total += max(0.0, end_now - paused_started)
+
+    user_input_total = max(
+        0.0,
+        float(getattr(run, "user_input_paused_accumulated_seconds", 0.0) or 0.0),
+    )
+    user_input_started = float(
+        getattr(run, "user_input_pause_started_at", 0.0) or 0.0,
+    )
+    if user_input_started > 0.0:
+        user_input_total += max(0.0, end_now - user_input_started)
+
+    return max(0.0, paused_total + user_input_total)
+
+
+def elapsed_seconds_for_run(run: Any, *, now: float | None = None) -> float:
+    """Return elapsed seconds for a run (live or finalized)."""
+    end_now = float(now) if now is not None else time.monotonic()
+    end = getattr(run, "ended_at", None)
+    end_value = end_now if end is None else float(end)
+    elapsed = max(0.0, end_value - float(getattr(run, "started_at", 0.0) or 0.0))
+    return max(0.0, elapsed - paused_seconds_for_run(run, now=end_value))
 
 
 def is_process_run_busy_status(status: str) -> bool:
@@ -59,6 +76,29 @@ def set_process_run_status(run: Any, status: str, *, now: float | None = None) -
     run.status = new_status
     run.paused_started_at = paused_started
     run.paused_accumulated_seconds = max(0.0, paused_accum)
+
+
+def begin_process_run_user_input_pause(run: Any, *, now: float | None = None) -> None:
+    """Start excluding user-input wait time from elapsed/timeout accounting."""
+    pause_started = float(getattr(run, "user_input_pause_started_at", 0.0) or 0.0)
+    if pause_started > 0.0:
+        return
+    now_value = float(now) if now is not None else time.monotonic()
+    run.user_input_pause_started_at = now_value
+
+
+def end_process_run_user_input_pause(run: Any, *, now: float | None = None) -> None:
+    """Stop excluding user-input wait time and accumulate its paused duration."""
+    pause_started = float(getattr(run, "user_input_pause_started_at", 0.0) or 0.0)
+    if pause_started <= 0.0:
+        return
+    now_value = float(now) if now is not None else time.monotonic()
+    paused_accum = float(
+        getattr(run, "user_input_paused_accumulated_seconds", 0.0) or 0.0,
+    )
+    paused_accum += max(0.0, now_value - pause_started)
+    run.user_input_pause_started_at = 0.0
+    run.user_input_paused_accumulated_seconds = max(0.0, paused_accum)
 
 
 def normalize_process_run_status(raw_status: object | None) -> str:

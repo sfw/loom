@@ -544,6 +544,99 @@ class TestSubtaskRunnerAskUser:
         assert any("python" in entry.detail.lower() for entry in decisions)
 
     @pytest.mark.asyncio
+    async def test_runner_pauses_subtask_wall_clock_while_waiting_for_answer(
+        self,
+        tmp_path: Path,
+        database: Database,
+        memory_manager: MemoryManager,
+        event_bus: EventBus,
+    ):
+        state_manager = TaskStateManager(tmp_path / "state")
+        task, subtask = self._make_task(tmp_path)
+        state_manager.create(task)
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path=task.workspace,
+            status=task.status.value,
+        )
+
+        config = Config(
+            execution=ExecutionConfig(
+                enable_streaming=False,
+                ask_user_v2_enabled=True,
+                ask_user_runtime_blocking_enabled=True,
+                ask_user_durable_state_enabled=True,
+                ask_user_policy="block",
+                ask_user_max_questions_per_subtask=3,
+                ask_user_min_seconds_between_questions=0,
+            ),
+        )
+        question_manager = QuestionManager(event_bus, memory_manager, poll_interval_seconds=0.01)
+
+        executor_model = AsyncMock()
+        executor_model.name = "mock-executor"
+        executor_model.complete = AsyncMock(side_effect=[
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="ask-1",
+                    name="ask_user",
+                    arguments={
+                        "question": "Pick stack",
+                        "options": ["Python", "Rust"],
+                    },
+                )],
+                usage=TokenUsage(total_tokens=40),
+            ),
+            ModelResponse(
+                text="Completed after clarification.",
+                tool_calls=None,
+                usage=TokenUsage(total_tokens=20),
+            ),
+        ])
+        router = MagicMock()
+        router.select = MagicMock(return_value=executor_model)
+
+        verification = MagicMock()
+        verification.verify = AsyncMock(return_value=VerificationResult(tier=1, passed=True))
+
+        runner = SubtaskRunner(
+            model_router=router,
+            tool_registry=create_default_registry(config),
+            memory_manager=memory_manager,
+            prompt_assembler=PromptAssembler(),
+            state_manager=state_manager,
+            verification=verification,
+            config=config,
+            event_bus=event_bus,
+            question_manager=question_manager,
+        )
+        runner._spawn_memory_extraction = MagicMock()
+        runner._max_subtask_wall_clock_seconds = 1
+
+        run_task = asyncio.create_task(runner.run(task, subtask))
+        question_id = ""
+        for _ in range(100):
+            pending = await question_manager.list_pending_questions(task.id)
+            if pending:
+                question_id = str(pending[0].get("question_id", "") or "").strip()
+                break
+            await asyncio.sleep(0.01)
+        assert question_id
+
+        await asyncio.sleep(1.2)
+        await question_manager.answer_question(
+            task_id=task.id,
+            question_id=question_id,
+            answer_payload={"selected_option_ids": ["python"], "source": "tui"},
+        )
+
+        result, verification_result = await asyncio.wait_for(run_task, timeout=3.0)
+        assert result.status == SubtaskResultStatus.SUCCESS
+        assert verification_result.passed is True
+
+    @pytest.mark.asyncio
     async def test_runner_enforces_question_cap_per_subtask(
         self,
         tmp_path: Path,

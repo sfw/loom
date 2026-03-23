@@ -1384,22 +1384,26 @@ class LoomApp(App):
     async def _prompt_process_run_workspace_choice(
         self,
         *,
+        run_id: str = "",
         process_name: str,
         suggested_folder: str,
     ) -> str | None:
         return await process_run_workspace.prompt_process_run_workspace_choice(
             self,
+            run_id=run_id,
             process_name=process_name,
             suggested_folder=suggested_folder,
         )
 
     async def _choose_process_run_workspace(
         self,
+        run_id: str,
         process_name: str,
         goal: str,
     ) -> Path | None:
         return await process_run_workspace.choose_process_run_workspace(
             self,
+            run_id,
             process_name,
             goal,
         )
@@ -1580,21 +1584,30 @@ class LoomApp(App):
     def _format_auth_profile_option(profile: Any) -> str:
         return process_run_auth.format_auth_profile_option(profile)
 
-    async def _prompt_auth_choice(self, question: str, options: list[str]) -> str:
+    async def _prompt_auth_choice(
+        self,
+        question: str,
+        options: list[str],
+        *,
+        run_id: str = "",
+    ) -> str:
         return await process_run_auth.prompt_auth_choice(
             self,
             question,
             options,
+            run_id=run_id,
         )
 
     async def _open_auth_manager_for_run_start(
         self,
         *,
         process_def: ProcessDefinition | None = None,
+        run_id: str = "",
     ) -> bool:
         return await process_run_auth.open_auth_manager_for_run_start(
             self,
             process_def=process_def,
+            run_id=run_id,
         )
 
     def _collect_required_auth_resources_for_process(
@@ -1611,11 +1624,13 @@ class LoomApp(App):
         *,
         process_defn: ProcessDefinition | None,
         base_overrides: dict[str, str],
+        run_id: str = "",
     ) -> tuple[dict[str, str] | None, list[dict[str, Any]]]:
         return await process_run_auth.resolve_auth_overrides_for_run_start(
             self,
             process_defn=process_defn,
             base_overrides=base_overrides,
+            run_id=run_id,
         )
 
     async def _start_process_run(

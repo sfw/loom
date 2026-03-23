@@ -9,6 +9,8 @@ from pathlib import Path
 from loom.tui.screens import ProcessRunWorkspaceScreen
 from loom.tui.widgets import ChatLog
 
+from . import state as process_run_state
+
 logger = logging.getLogger(__name__)
 
 
@@ -156,6 +158,7 @@ def materialize_process_run_workspace_selection(self, relative_path: str) -> Pat
 async def prompt_process_run_workspace_choice(
     self,
     *,
+    run_id: str = "",
     process_name: str,
     suggested_folder: str,
 ) -> str | None:
@@ -176,6 +179,9 @@ async def prompt_process_run_workspace_choice(
             selected.append(str(value))
         done.set()
 
+    run = self._process_runs.get(run_id) if run_id else None
+    if run is not None and not run.closed:
+        process_run_state.begin_process_run_user_input_pause(run)
     self.push_screen(
         ProcessRunWorkspaceScreen(
             process_name=process_name,
@@ -184,12 +190,17 @@ async def prompt_process_run_workspace_choice(
         ),
         callback=_handle,
     )
-    await done.wait()
+    try:
+        await done.wait()
+    finally:
+        if run is not None:
+            process_run_state.end_process_run_user_input_pause(run)
     return selected[0] if selected else None
 
 
 async def choose_process_run_workspace(
     self,
+    run_id: str,
     process_name: str,
     goal: str,
 ) -> Path | None:
@@ -206,6 +217,7 @@ async def choose_process_run_workspace(
     chat = self.query_one("#chat-log", ChatLog)
     while True:
         selection = await self._prompt_process_run_workspace_choice(
+            run_id=run_id,
             process_name=process_name,
             suggested_folder=suggested,
         )
