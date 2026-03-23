@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 from loom.tui.screens import AskUserScreen, AuthManagerModalScreen
 from loom.tui.widgets import ChatLog
 
+from . import state as process_run_state
+
 if TYPE_CHECKING:
     from loom.processes.schema import ProcessDefinition
 
@@ -25,7 +27,13 @@ def format_auth_profile_option(profile: Any) -> str:
     return " | ".join(parts)
 
 
-async def prompt_auth_choice(self, question: str, options: list[str]) -> str:
+async def prompt_auth_choice(
+    self,
+    question: str,
+    options: list[str],
+    *,
+    run_id: str = "",
+) -> str:
     """Prompt for one auth selection via modal and return chosen option text."""
     answer_event = asyncio.Event()
     selected: list[str] = []
@@ -34,8 +42,15 @@ async def prompt_auth_choice(self, question: str, options: list[str]) -> str:
         selected.append(str(answer or "").strip())
         answer_event.set()
 
+    run = self._process_runs.get(run_id) if run_id else None
+    if run is not None and not run.closed:
+        process_run_state.begin_process_run_user_input_pause(run)
     self.push_screen(AskUserScreen(question, options), callback=_handle)
-    await answer_event.wait()
+    try:
+        await answer_event.wait()
+    finally:
+        if run is not None:
+            process_run_state.end_process_run_user_input_pause(run)
     return selected[0] if selected else ""
 
 
@@ -43,6 +58,7 @@ async def open_auth_manager_for_run_start(
     self,
     *,
     process_def: ProcessDefinition | None = None,
+    run_id: str = "",
 ) -> bool:
     """Open auth manager during run-start flow and wait for completion."""
     done = asyncio.Event()
@@ -63,6 +79,9 @@ async def open_auth_manager_for_run_start(
             process_defs.append(process_def)
     if process_defs:
         self._refresh_tool_registry()
+    run = self._process_runs.get(run_id) if run_id else None
+    if run is not None and not run.closed:
+        process_run_state.begin_process_run_user_input_pause(run)
     self.push_screen(
         AuthManagerModalScreen(
             workspace=self._workspace,
@@ -74,7 +93,11 @@ async def open_auth_manager_for_run_start(
         ),
         callback=_handle,
     )
-    await done.wait()
+    try:
+        await done.wait()
+    finally:
+        if run is not None:
+            process_run_state.end_process_run_user_input_pause(run)
     return bool(changed["value"])
 
 
@@ -137,6 +160,7 @@ async def resolve_auth_overrides_for_run_start(
     *,
     process_defn: ProcessDefinition | None,
     base_overrides: dict[str, str],
+    run_id: str = "",
 ) -> tuple[dict[str, str] | None, list[dict[str, Any]]]:
     """Resolve run-start auth, prompting for ambiguous resources when needed."""
     from loom.auth.config import (
@@ -196,12 +220,14 @@ async def resolve_auth_overrides_for_run_start(
                 choice = await self._prompt_auth_choice(
                     "Open Auth Manager to fix auth and retry this run?",
                     ["Open Auth Manager", "Cancel run"],
+                    run_id=run_id,
                 )
                 if choice != "Open Auth Manager":
                     chat.add_info("Run cancelled: unresolved auth requirements.")
                     return None, required_resources
                 changed = await self._open_auth_manager_for_run_start(
                     process_def=process_defn,
+                    run_id=run_id,
                 )
                 if changed:
                     chat.add_info("Auth configuration updated. Retrying preflight.")
@@ -235,7 +261,11 @@ async def resolve_auth_overrides_for_run_start(
                     "Select auth profile for "
                     f"provider={item.provider} source={item.source}"
                 )
-                answer = await self._prompt_auth_choice(question, options)
+                answer = await self._prompt_auth_choice(
+                    question,
+                    options,
+                    run_id=run_id,
+                )
                 profile_id = option_to_profile.get(answer)
                 if not profile_id:
                     chat = self.query_one("#chat-log", ChatLog)
@@ -259,6 +289,7 @@ async def resolve_auth_overrides_for_run_start(
                         f"{selector}?"
                     ),
                     ["No", "Yes"],
+                    run_id=run_id,
                 )
                 if save_default == "Yes":
                     try:

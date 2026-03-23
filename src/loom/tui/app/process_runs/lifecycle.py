@@ -17,6 +17,7 @@ from loom.utils.latency import log_latency_event
 from ..constants import _MAX_CONCURRENT_PROCESS_RUNS
 from ..models import ProcessRunLaunchRequest, ProcessRunState
 from ..widgets import ProcessRunPane
+from . import state as process_run_state
 
 if TYPE_CHECKING:
     from loom.processes.schema import ProcessDefinition
@@ -212,13 +213,39 @@ async def prepare_process_run_with_timeout(
 ) -> bool:
     """Run preflight with timeout/error normalization."""
     launch_timeout = self._tui_run_launch_timeout_seconds()
+    launch_task = asyncio.create_task(
+        self._prepare_process_run_launch(run_id, launch_request),
+    )
+    launch_started_at = time.monotonic()
     try:
-        return bool(
-            await asyncio.wait_for(
-                self._prepare_process_run_launch(run_id, launch_request),
-                timeout=launch_timeout,
-            )
-        )
+        while not launch_task.done():
+            run = self._process_runs.get(run_id)
+            paused_seconds = 0.0
+            if run is not None:
+                paused_seconds = process_run_state.paused_seconds_for_run(
+                    run,
+                    now=time.monotonic(),
+                )
+            elapsed = max(0.0, time.monotonic() - launch_started_at - paused_seconds)
+            if elapsed >= launch_timeout:
+                launch_task.cancel()
+                try:
+                    await launch_task
+                except asyncio.CancelledError:
+                    pass
+                run = self._process_runs.get(run_id)
+                if run is not None:
+                    stage = self._process_run_launch_stage_label(run.launch_stage).lower()
+                    self._fail_process_run_launch(
+                        run,
+                        (
+                            f"Run launch timed out after {int(launch_timeout)}s "
+                            f"during {stage}."
+                        ),
+                    )
+                return False
+            await asyncio.sleep(min(0.05, max(0.01, launch_timeout - elapsed)))
+        return bool(await launch_task)
     except TimeoutError:
         run = self._process_runs.get(run_id)
         if run is not None:
@@ -229,9 +256,10 @@ async def prepare_process_run_with_timeout(
                     f"Run launch timed out after {int(launch_timeout)}s "
                     f"during {stage}."
                 ),
-            )
+        )
         return False
     except asyncio.CancelledError:
+        launch_task.cancel()
         raise
     except Exception as e:  # pragma: no cover - defensive guard
         run = self._process_runs.get(run_id)
@@ -390,7 +418,11 @@ async def prepare_process_run_launch(
     if launch_request.run_workspace_override is not None:
         run_workspace = Path(launch_request.run_workspace_override).expanduser()
     else:
-        run_workspace = await self._choose_process_run_workspace(process_name, run.goal)
+        run_workspace = await self._choose_process_run_workspace(
+            run.run_id,
+            process_name,
+            run.goal,
+        )
         if run_workspace is None:
             self._fail_process_run_launch(
                 run,
@@ -419,6 +451,7 @@ async def prepare_process_run_launch(
         await self._resolve_auth_overrides_for_run_start(
             process_defn=selected_process,
             base_overrides=run_auth_overrides,
+            run_id=run.run_id,
         )
     )
     if run.closed:

@@ -67,6 +67,8 @@ class ProcessRunState:
     progress_ui_last_refresh_at: float = 0.0
     paused_started_at: float = 0.0
     paused_accumulated_seconds: float = 0.0
+    user_input_pause_started_at: float = 0.0
+    user_input_paused_accumulated_seconds: float = 0.0
 
 
 @dataclass
