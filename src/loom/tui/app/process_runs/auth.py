@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING, Any
 from loom.tui.screens import AskUserScreen, AuthManagerModalScreen
 from loom.tui.widgets import ChatLog
 
-from . import state as process_run_state
-
 if TYPE_CHECKING:
     from loom.processes.schema import ProcessDefinition
 
@@ -42,15 +40,12 @@ async def prompt_auth_choice(
         selected.append(str(answer or "").strip())
         answer_event.set()
 
-    run = self._process_runs.get(run_id) if run_id else None
-    if run is not None and not run.closed:
-        process_run_state.begin_process_run_user_input_pause(run)
+    self._begin_process_run_user_input_pause(run_id)
     self.push_screen(AskUserScreen(question, options), callback=_handle)
     try:
         await answer_event.wait()
     finally:
-        if run is not None:
-            process_run_state.end_process_run_user_input_pause(run)
+        self._end_process_run_user_input_pause(run_id)
     return selected[0] if selected else ""
 
 
@@ -79,9 +74,7 @@ async def open_auth_manager_for_run_start(
             process_defs.append(process_def)
     if process_defs:
         self._refresh_tool_registry()
-    run = self._process_runs.get(run_id) if run_id else None
-    if run is not None and not run.closed:
-        process_run_state.begin_process_run_user_input_pause(run)
+    self._begin_process_run_user_input_pause(run_id)
     self.push_screen(
         AuthManagerModalScreen(
             workspace=self._workspace,
@@ -96,8 +89,7 @@ async def open_auth_manager_for_run_start(
     try:
         await done.wait()
     finally:
-        if run is not None:
-            process_run_state.end_process_run_user_input_pause(run)
+        self._end_process_run_user_input_pause(run_id)
     return bool(changed["value"])
 
 

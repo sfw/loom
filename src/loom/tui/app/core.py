@@ -1152,6 +1152,45 @@ class LoomApp(App):
     def _format_elapsed(seconds: float) -> str:
         return process_run_ui_state._format_elapsed(seconds)
 
+    def _process_run_user_input_paused_seconds(
+        self,
+        run_id: str,
+        *,
+        now: float | None = None,
+    ) -> float:
+        return process_run_ui_state._process_run_user_input_paused_seconds(
+            self,
+            run_id,
+            now=now,
+        )
+
+    def _begin_process_run_user_input_pause(
+        self,
+        run_id: str,
+        *,
+        now: float | None = None,
+    ) -> None:
+        process_run_ui_state._begin_process_run_user_input_pause(
+            self,
+            run_id,
+            now=now,
+        )
+
+    def _end_process_run_user_input_pause(
+        self,
+        run_id: str,
+        *,
+        now: float | None = None,
+    ) -> None:
+        process_run_ui_state._end_process_run_user_input_pause(
+            self,
+            run_id,
+            now=now,
+        )
+
+    def _clear_process_run_user_input_pause(self, run_id: str) -> None:
+        process_run_ui_state._clear_process_run_user_input_pause(self, run_id)
+
     def _elapsed_seconds_for_run(self, run: ProcessRunState) -> float:
         return process_run_ui_state._elapsed_seconds_for_run(self, run)
 

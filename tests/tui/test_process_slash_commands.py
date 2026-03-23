@@ -4351,7 +4351,6 @@ class TestProcessSlashCommands:
         monkeypatch,
     ):
         from loom.tui.app import LoomApp, ProcessRunLaunchRequest, ProcessRunState
-        from loom.tui.app.process_runs import state as process_run_state
 
         app = LoomApp(
             model=MagicMock(name="model"),
@@ -4379,15 +4378,15 @@ class TestProcessSlashCommands:
             lambda: clock["now"],
         )
         monkeypatch.setattr(
-            "loom.tui.app.process_runs.state.time.monotonic",
+            "loom.tui.app.process_runs.ui_state.time.monotonic",
             lambda: clock["now"],
         )
 
         async def _fake_prepare(_run_id, _launch_request):
-            process_run_state.begin_process_run_user_input_pause(run)
+            app._begin_process_run_user_input_pause("abc123")
             clock["now"] = 10.0
             await asyncio.sleep(0)
-            process_run_state.end_process_run_user_input_pause(run)
+            app._end_process_run_user_input_pause("abc123")
             clock["now"] = 10.1
             return True
 

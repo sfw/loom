@@ -219,14 +219,15 @@ async def prepare_process_run_with_timeout(
     launch_started_at = time.monotonic()
     try:
         while not launch_task.done():
+            now = time.monotonic()
             run = self._process_runs.get(run_id)
-            paused_seconds = 0.0
+            paused_seconds = self._process_run_user_input_paused_seconds(run_id, now=now)
             if run is not None:
-                paused_seconds = process_run_state.paused_seconds_for_run(
+                paused_seconds += process_run_state.status_paused_seconds_for_run(
                     run,
-                    now=time.monotonic(),
+                    now=now,
                 )
-            elapsed = max(0.0, time.monotonic() - launch_started_at - paused_seconds)
+            elapsed = max(0.0, now - launch_started_at - paused_seconds)
             if elapsed >= launch_timeout:
                 launch_task.cancel()
                 try:
@@ -504,6 +505,7 @@ async def execute_process_run(self, run_id: str) -> None:
     run.progress_ui_last_refresh_at = 0.0
     run.paused_started_at = 0.0
     run.paused_accumulated_seconds = 0.0
+    self._clear_process_run_user_input_pause(run_id)
     self._clear_process_run_cancel_handler(run_id)
     tab_created_at = float(getattr(run, "launch_tab_created_at", 0.0) or 0.0)
     if tab_created_at > 0:
