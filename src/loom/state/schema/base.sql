@@ -74,6 +74,32 @@ CREATE TABLE IF NOT EXISTS learned_patterns (
 CREATE INDEX IF NOT EXISTS idx_patterns_type ON learned_patterns(pattern_type);
 CREATE INDEX IF NOT EXISTS idx_patterns_key ON learned_patterns(pattern_key);
 
+-- Workspace registry and workspace-local metadata
+CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY,
+    canonical_path TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    workspace_type TEXT NOT NULL DEFAULT 'local',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    last_opened_at TEXT,
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    metadata TEXT NOT NULL DEFAULT '{}',          -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_path ON workspaces(canonical_path);
+CREATE INDEX IF NOT EXISTS idx_workspaces_archived_order
+    ON workspaces(is_archived, sort_order, display_name);
+
+CREATE TABLE IF NOT EXISTS workspace_settings (
+    workspace_id TEXT PRIMARY KEY,
+    settings_json TEXT NOT NULL DEFAULT '{}',     -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
+);
+
 -- Cowork sessions
 CREATE TABLE IF NOT EXISTS cowork_sessions (
     id TEXT PRIMARY KEY,
@@ -125,6 +151,20 @@ CREATE INDEX IF NOT EXISTS idx_cce_session_created
     ON cowork_chat_events(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_cce_session_id
     ON cowork_chat_events(session_id, id);
+
+CREATE TABLE IF NOT EXISTS conversation_run_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,                         -- phase-0/1 API run id (task id)
+    link_type TEXT NOT NULL DEFAULT 'origin',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES cowork_sessions(id),
+    FOREIGN KEY (run_id) REFERENCES tasks(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_crl_session_run_type
+    ON conversation_run_links(session_id, run_id, link_type);
+CREATE INDEX IF NOT EXISTS idx_crl_run ON conversation_run_links(run_id);
 
 -- Typed cowork memory index (marker-oriented conversation memory)
 CREATE TABLE IF NOT EXISTS cowork_memory_entries (

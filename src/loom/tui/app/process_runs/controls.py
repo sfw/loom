@@ -24,6 +24,29 @@ logger = logging.getLogger(__name__)
 def _now_str() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
+
+def _persist_process_run_conversation_link(self, run: ProcessRunState) -> None:
+    """Backlink a process run to the active conversation thread when possible."""
+    task_id = str(getattr(run, "task_id", "") or "").strip()
+    if not task_id:
+        return
+    store = getattr(self, "_store", None)
+    if store is None or not hasattr(store, "link_run"):
+        return
+    session_id = ""
+    active_session_id = getattr(self, "_active_session_id", None)
+    if callable(active_session_id):
+        session_id = str(active_session_id() or "").strip()
+    if not session_id:
+        return
+    self.run_worker(
+        store.link_run(session_id, task_id),
+        name=f"process-run-link-{run.run_id}",
+        group=f"process-run-link-{run.run_id}",
+        exclusive=False,
+    )
+
+
 def _current_process_run(self) -> ProcessRunState | None:
     """Return run associated with currently active tab, if any."""
     try:
@@ -238,6 +261,7 @@ def _register_process_run_cancel_handler(self, run_id: str, payload: object) -> 
     task_id = str(payload.get("task_id", "")).strip()
     if task_id:
         run.task_id = task_id
+        _persist_process_run_conversation_link(self, run)
         self._update_process_run_visuals(run)
     # Flush any queued inject directives once inject callback is available.
     if callable(inject_cb) and self._process_run_pending_inject.get(run_id):
@@ -1212,4 +1236,3 @@ async def _restart_process_run_in_place(
     )
     await self._persist_process_run_ui_state()
     return True
-

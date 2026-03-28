@@ -475,6 +475,7 @@ class OpenAICompatibleProvider(ModelProvider):
                                 choice = first
                         delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
                         text = delta.get("content") or ""
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
 
                         # Accumulate tool call deltas
                         if delta.get("tool_calls"):
@@ -512,9 +513,9 @@ class OpenAICompatibleProvider(ModelProvider):
                             )
                             latest_usage = usage
 
-                        if text or usage is not None:
+                        if text or reasoning or usage is not None:
                             yield StreamChunk(
-                                text=text, done=False, usage=usage,
+                                text=text, thinking=reasoning, done=False, usage=usage,
                             )
         except httpx.ConnectError as e:
             raise ModelConnectionError(

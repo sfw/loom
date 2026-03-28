@@ -1440,6 +1440,9 @@ class LoomApp(App):
     def _clear_process_run_cancel_handler(self, run_id: str) -> None:
         process_run_controls._clear_process_run_cancel_handler(self, run_id)
 
+    def _persist_process_run_conversation_link(self, run: ProcessRunState) -> None:
+        process_run_controls._persist_process_run_conversation_link(self, run)
+
     @staticmethod
     def _normalize_process_run_status(raw_status: object | None) -> str:
         return process_run_controls._normalize_process_run_status(raw_status)

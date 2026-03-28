@@ -1472,17 +1472,25 @@ class Database:
         task_id: str,
         event_type: str | None = None,
         limit: int = 100,
+        *,
+        after_id: int = 0,
+        ascending: bool = False,
     ) -> list[dict]:
         """Query events for a task."""
+        normalized_after_id = max(0, int(after_id))
+        order = "ASC" if ascending else "DESC"
         if event_type:
             return await self.query(
-                """SELECT * FROM events WHERE task_id=? AND event_type=?
-                   ORDER BY sequence DESC, id DESC LIMIT ?""",
-                (task_id, event_type, limit),
+                f"""SELECT * FROM events
+                    WHERE task_id=? AND event_type=? AND id>?
+                    ORDER BY sequence {order}, id {order} LIMIT ?""",
+                (task_id, event_type, normalized_after_id, limit),
             )
         return await self.query(
-            "SELECT * FROM events WHERE task_id=? ORDER BY sequence DESC, id DESC LIMIT ?",
-            (task_id, limit),
+            f"""SELECT * FROM events
+                WHERE task_id=? AND id>?
+                ORDER BY sequence {order}, id {order} LIMIT ?""",
+            (task_id, normalized_after_id, limit),
         )
 
     def _row_to_entry(self, row: dict) -> MemoryEntry:

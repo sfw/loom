@@ -22,6 +22,12 @@ behavior for upgrades.
 - Migration steps: `src/loom/state/migrations/steps/*.py`
 - Migration metadata table: `schema_migrations`
 
+Current desktop/workspace-first tables added through migrations include:
+
+- `workspaces`
+- `workspace_settings`
+- `conversation_run_links`
+
 `schema_migrations` stores:
 - `id`
 - `applied_at`

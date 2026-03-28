@@ -471,6 +471,10 @@ class TestDatabase:
         typed = await db.query_events("t1", event_type="task_started")
         assert len(typed) == 1
 
+        ascending = await db.query_events("t1", after_id=1, ascending=True)
+        assert len(ascending) == 1
+        assert ascending[0]["event_id"] == "evt-2"
+
     async def test_task_run_lifecycle(self, db: Database):
         await db.insert_task(task_id="t1", goal="Test")
         await db.insert_task_run(

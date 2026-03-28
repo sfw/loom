@@ -1061,6 +1061,8 @@ class CoworkSession:
                         1,
                         int((time.monotonic() - turn_started_at) * 1000),
                     )
+                if chunk.thinking:
+                    yield ("thinking", chunk.thinking)
                 if chunk.text:
                     iter_text_parts.append(chunk.text)
                     yield chunk.text
@@ -1264,8 +1266,14 @@ class CoworkSession:
 
         # Load recent turns into in-memory cache
         recent = await self._store.resume_session(session_id)
+        system_content = self._build_system_content()
+        system_prefix = (
+            [{"role": "system", "content": system_content}]
+            if system_content.strip()
+            else []
+        )
         self._messages = [
-            {"role": "system", "content": self._build_system_content()},
+            *system_prefix,
             *self._normalize_resumed_messages(recent),
         ]
         self._maybe_start_memory_indexer()

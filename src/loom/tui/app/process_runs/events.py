@@ -530,6 +530,7 @@ def on_process_progress_event(
         task_id = str(data.get("task_id", "")).strip()
         if task_id:
             run.task_id = task_id
+            self._persist_process_run_conversation_link(run)
 
         if event_type == "ask_user_requested":
             question_id = str(event_data.get("question_id", "")).strip()

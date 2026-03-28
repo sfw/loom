@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,6 +14,8 @@ from httpx import ASGITransport, AsyncClient
 
 from loom.api.engine import Engine
 from loom.config import Config, ExecutionConfig, ProcessConfig, TelemetryConfig
+from loom.config_runtime import ConfigRuntimeStore
+from loom.cowork.session import CoworkTurn, ToolCallEvent
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
@@ -28,8 +32,9 @@ from loom.events.webhook import WebhookDelivery
 from loom.learning.manager import LearningManager
 from loom.models.router import ModelRouter
 from loom.prompts.assembler import PromptAssembler
-from loom.recovery.approval import ApprovalManager
+from loom.recovery.approval import ApprovalManager, ApprovalRequest
 from loom.recovery.questions import QuestionManager
+from loom.state.conversation_store import ConversationStore
 from loom.state.memory import Database, MemoryManager
 from loom.state.task_state import (
     Plan,
@@ -39,7 +44,9 @@ from loom.state.task_state import (
     TaskStateManager,
     TaskStatus,
 )
+from loom.state.workspaces import WorkspaceRegistry
 from loom.tools import create_default_registry
+from loom.tools.registry import ToolResult
 
 # --- Test Fixtures ---
 
@@ -59,6 +66,16 @@ async def database(tmp_path):
 @pytest.fixture
 async def memory_manager(database):
     return MemoryManager(database)
+
+
+@pytest.fixture
+async def conversation_store(database):
+    return ConversationStore(database)
+
+
+@pytest.fixture
+async def workspace_registry(database):
+    return WorkspaceRegistry(database)
 
 
 @pytest.fixture
@@ -86,19 +103,24 @@ def engine(
     event_bus,
     database,
     memory_manager,
+    conversation_store,
     state_manager,
+    workspace_registry,
     tool_registry,
     mock_orchestrator,
+    tmp_path,
 ):
-    return Engine(
-        config=Config(
-            execution=ExecutionConfig(
-                ask_user_v2_enabled=True,
-                ask_user_runtime_blocking_enabled=True,
-                ask_user_durable_state_enabled=True,
-                ask_user_api_enabled=True,
-            ),
+    config = Config(
+        execution=ExecutionConfig(
+            ask_user_v2_enabled=True,
+            ask_user_runtime_blocking_enabled=True,
+            ask_user_durable_state_enabled=True,
+            ask_user_api_enabled=True,
         ),
+        source_path=str(tmp_path / "loom.toml"),
+    )
+    return Engine(
+        config=config,
         orchestrator=mock_orchestrator,
         event_bus=event_bus,
         model_router=ModelRouter(),
@@ -107,6 +129,9 @@ def engine(
         state_manager=state_manager,
         prompt_assembler=PromptAssembler(),
         database=database,
+        conversation_store=conversation_store,
+        workspace_registry=workspace_registry,
+        config_runtime_store=ConfigRuntimeStore(config),
         approval_manager=ApprovalManager(event_bus),
         question_manager=QuestionManager(event_bus, memory_manager),
         webhook_delivery=WebhookDelivery(),
@@ -181,6 +206,366 @@ def _make_task_with_plan(state_manager, task_id="test-1"):
     return task
 
 
+class TestInterruptedRunReconciliation:
+    @pytest.mark.asyncio
+    async def test_marks_non_durable_interrupted_runs_failed(
+        self,
+        event_bus,
+        database,
+        memory_manager,
+        conversation_store,
+        state_manager,
+        workspace_registry,
+        tool_registry,
+        mock_orchestrator,
+        tmp_path,
+    ):
+        config = Config(
+            execution=ExecutionConfig(
+                enable_durable_task_runner=False,
+                ask_user_v2_enabled=True,
+                ask_user_runtime_blocking_enabled=True,
+                ask_user_durable_state_enabled=True,
+                ask_user_api_enabled=True,
+            ),
+            source_path=str(tmp_path / "loom.toml"),
+        )
+        engine = Engine(
+            config=config,
+            orchestrator=mock_orchestrator,
+            event_bus=event_bus,
+            model_router=ModelRouter(),
+            tool_registry=tool_registry,
+            memory_manager=memory_manager,
+            state_manager=state_manager,
+            prompt_assembler=PromptAssembler(),
+            database=database,
+            conversation_store=conversation_store,
+            workspace_registry=workspace_registry,
+            config_runtime_store=ConfigRuntimeStore(config),
+            approval_manager=ApprovalManager(event_bus),
+            question_manager=QuestionManager(event_bus, memory_manager),
+            webhook_delivery=WebhookDelivery(),
+            learning_manager=LearningManager(database),
+        )
+        task = _make_task(
+            state_manager,
+            task_id="run-1",
+            goal="Interrupted run",
+            status=TaskStatus.EXECUTING,
+            metadata={"run_id": "exec-run-1"},
+        )
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path="/tmp/workspace",
+            status=TaskStatus.EXECUTING.value,
+            metadata=task.metadata,
+        )
+
+        reconciled = await engine.reconcile_interrupted_task_runs()
+
+        assert reconciled == 1
+        updated_row = await database.get_task(task.id)
+        assert updated_row is not None
+        assert updated_row["status"] == TaskStatus.FAILED.value
+        updated_task = state_manager.load(task.id)
+        assert updated_task.status == TaskStatus.FAILED
+        assert updated_task.errors_encountered
+        assert "marked failed" in updated_task.errors_encountered[-1].error
+
+    @pytest.mark.asyncio
+    async def test_marks_existing_task_run_failed_when_reconciling(
+        self,
+        event_bus,
+        database,
+        memory_manager,
+        conversation_store,
+        state_manager,
+        workspace_registry,
+        tool_registry,
+        mock_orchestrator,
+        tmp_path,
+    ):
+        config = Config(
+            execution=ExecutionConfig(
+                enable_durable_task_runner=False,
+                ask_user_v2_enabled=True,
+                ask_user_runtime_blocking_enabled=True,
+                ask_user_durable_state_enabled=True,
+                ask_user_api_enabled=True,
+            ),
+            source_path=str(tmp_path / "loom.toml"),
+        )
+        engine = Engine(
+            config=config,
+            orchestrator=mock_orchestrator,
+            event_bus=event_bus,
+            model_router=ModelRouter(),
+            tool_registry=tool_registry,
+            memory_manager=memory_manager,
+            state_manager=state_manager,
+            prompt_assembler=PromptAssembler(),
+            database=database,
+            conversation_store=conversation_store,
+            workspace_registry=workspace_registry,
+            config_runtime_store=ConfigRuntimeStore(config),
+            approval_manager=ApprovalManager(event_bus),
+            question_manager=QuestionManager(event_bus, memory_manager),
+            webhook_delivery=WebhookDelivery(),
+            learning_manager=LearningManager(database),
+        )
+        task = _make_task(
+            state_manager,
+            task_id="run-2",
+            goal="Interrupted durable-looking run",
+            status=TaskStatus.PLANNING,
+            metadata={"run_id": "exec-run-2"},
+        )
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path="/tmp/workspace",
+            status=TaskStatus.PLANNING.value,
+            metadata=task.metadata,
+        )
+        await database.insert_task_run(
+            run_id="exec-run-2",
+            task_id=task.id,
+            status="running",
+            process_name="seo-geo-review",
+        )
+
+        reconciled = await engine.reconcile_interrupted_task_runs()
+
+        assert reconciled == 1
+        task_run = await database.get_task_run("exec-run-2")
+        assert task_run is not None
+        assert task_run["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_skips_reconciliation_when_durable_runner_enabled(
+        self,
+        event_bus,
+        database,
+        memory_manager,
+        conversation_store,
+        state_manager,
+        workspace_registry,
+        tool_registry,
+        mock_orchestrator,
+        tmp_path,
+    ):
+        config = Config(
+            execution=ExecutionConfig(
+                enable_durable_task_runner=True,
+                ask_user_v2_enabled=True,
+                ask_user_runtime_blocking_enabled=True,
+                ask_user_durable_state_enabled=True,
+                ask_user_api_enabled=True,
+            ),
+            source_path=str(tmp_path / "loom.toml"),
+        )
+        durable_engine = Engine(
+            config=config,
+            orchestrator=mock_orchestrator,
+            event_bus=event_bus,
+            model_router=ModelRouter(),
+            tool_registry=tool_registry,
+            memory_manager=memory_manager,
+            state_manager=state_manager,
+            prompt_assembler=PromptAssembler(),
+            database=database,
+            conversation_store=conversation_store,
+            workspace_registry=workspace_registry,
+            config_runtime_store=ConfigRuntimeStore(config),
+            approval_manager=ApprovalManager(event_bus),
+            question_manager=QuestionManager(event_bus, memory_manager),
+            webhook_delivery=WebhookDelivery(),
+            learning_manager=LearningManager(database),
+        )
+        task = _make_task(
+            state_manager,
+            task_id="run-3",
+            goal="Recoverable run",
+            status=TaskStatus.EXECUTING,
+            metadata={"run_id": "exec-run-3"},
+        )
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path="/tmp/workspace",
+            status=TaskStatus.EXECUTING.value,
+            metadata=task.metadata,
+        )
+
+        reconciled = await durable_engine.reconcile_interrupted_task_runs()
+
+        assert reconciled == 0
+        row = await database.get_task(task.id)
+        assert row is not None
+        assert row["status"] == TaskStatus.EXECUTING.value
+
+    @pytest.mark.asyncio
+    async def test_shutdown_pause_marks_active_runs_paused_and_requeues(
+        self,
+        engine,
+        database,
+        state_manager,
+    ):
+        def _pause_task_side_effect(task):
+            if not isinstance(task.metadata, dict):
+                task.metadata = {}
+            task.metadata["paused_from_status"] = task.status.value
+            task.status = TaskStatus.PAUSED
+            state_manager.save(task)
+
+        engine.orchestrator.pause_task.side_effect = _pause_task_side_effect
+        task = _make_task(
+            state_manager,
+            task_id="run-shutdown-1",
+            goal="Shutdown pause run",
+            status=TaskStatus.EXECUTING,
+            metadata={"run_id": "exec-run-shutdown-1", "process": "seo-geo-review"},
+        )
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path="/tmp/workspace",
+            status=TaskStatus.EXECUTING.value,
+            metadata=task.metadata,
+        )
+        await database.insert_task_run(
+            run_id="exec-run-shutdown-1",
+            task_id=task.id,
+            status="running",
+            process_name="seo-geo-review",
+        )
+
+        paused = await engine.pause_active_task_runs_for_shutdown()
+
+        assert paused == 1
+        updated_task = state_manager.load(task.id)
+        assert updated_task.status == TaskStatus.PAUSED
+        assert updated_task.metadata["shutdown_paused"] is True
+        task_run = await database.get_task_run("exec-run-shutdown-1")
+        assert task_run is not None
+        assert task_run["status"] == "queued"
+
+    @pytest.mark.asyncio
+    async def test_durable_recovery_skips_paused_shutdown_runs(
+        self,
+        event_bus,
+        database,
+        memory_manager,
+        conversation_store,
+        state_manager,
+        workspace_registry,
+        tool_registry,
+        mock_orchestrator,
+        tmp_path,
+    ):
+        config = Config(
+            execution=ExecutionConfig(
+                enable_durable_task_runner=True,
+                ask_user_v2_enabled=True,
+                ask_user_runtime_blocking_enabled=True,
+                ask_user_durable_state_enabled=True,
+                ask_user_api_enabled=True,
+            ),
+            source_path=str(tmp_path / "loom.toml"),
+        )
+        durable_engine = Engine(
+            config=config,
+            orchestrator=mock_orchestrator,
+            event_bus=event_bus,
+            model_router=ModelRouter(),
+            tool_registry=tool_registry,
+            memory_manager=memory_manager,
+            state_manager=state_manager,
+            prompt_assembler=PromptAssembler(),
+            database=database,
+            conversation_store=conversation_store,
+            workspace_registry=workspace_registry,
+            config_runtime_store=ConfigRuntimeStore(config),
+            approval_manager=ApprovalManager(event_bus),
+            question_manager=QuestionManager(event_bus, memory_manager),
+            webhook_delivery=WebhookDelivery(),
+            learning_manager=LearningManager(database),
+        )
+        task = _make_task(
+            state_manager,
+            task_id="run-paused-1",
+            goal="Paused durable run",
+            status=TaskStatus.PAUSED,
+            metadata={"run_id": "exec-run-paused-1", "process": "seo-geo-review"},
+        )
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path="/tmp/workspace",
+            status=TaskStatus.PAUSED.value,
+            metadata=task.metadata,
+        )
+        await database.insert_task_run(
+            run_id="exec-run-paused-1",
+            task_id=task.id,
+            status="queued",
+            process_name="seo-geo-review",
+        )
+
+        recovered = await durable_engine.recover_pending_task_runs()
+
+        assert recovered == 0
+        mock_orchestrator.execute_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resume_run_spawns_paused_durable_worker(
+        self,
+        client,
+        engine,
+        database,
+        state_manager,
+    ):
+        def _resume_task_side_effect(task):
+            if task.status == TaskStatus.PAUSED:
+                task.status = TaskStatus.EXECUTING
+                state_manager.save(task)
+
+        engine.orchestrator.resume_task.side_effect = _resume_task_side_effect
+        task = _make_task(
+            state_manager,
+            task_id="run-resume-1",
+            goal="Resume durable run",
+            status=TaskStatus.PAUSED,
+            metadata={"run_id": "exec-run-resume-1", "process": "seo-geo-review"},
+        )
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path="/tmp/workspace",
+            status=TaskStatus.PAUSED.value,
+            metadata=task.metadata,
+        )
+        await database.insert_task_run(
+            run_id="exec-run-resume-1",
+            task_id=task.id,
+            status="queued",
+            process_name="seo-geo-review",
+        )
+        engine.submit_task = AsyncMock(return_value="exec-run-resume-1")  # type: ignore[method-assign]
+        engine._resolve_process_definition = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        response = await client.post("/runs/run-resume-1/resume")
+
+        assert response.status_code == 200
+        engine.submit_task.assert_awaited_once()
+        await_args = engine.submit_task.await_args.kwargs
+        assert await_args["run_id"] == "exec-run-resume-1"
+        assert await_args["process_name"] == "seo-geo-review"
+        assert await_args["recovered"] is False
+
+
 # --- Health & System ---
 
 
@@ -192,6 +577,17 @@ class TestSystemEndpoints:
         data = response.json()
         assert data["status"] == "ok"
         assert "version" in data
+        assert data["runtime_role"] == "api"
+
+    @pytest.mark.asyncio
+    async def test_runtime(self, client):
+        response = await client.get("/runtime")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["ready"] is True
+        assert data["runtime_role"] == "api"
+        assert "database_path" in data
 
     @pytest.mark.asyncio
     async def test_models(self, client):
@@ -229,6 +625,1993 @@ class TestSystemEndpoints:
         assert response.status_code == 200
         payload = response.json()
         assert payload["enabled"] is False
+
+
+class TestWorkspaceFirstEndpoints:
+    @pytest.mark.asyncio
+    async def test_list_workspaces_discovers_existing_tasks_and_sessions(
+        self,
+        client,
+        database,
+        conversation_store,
+    ):
+        await database.insert_task(
+            task_id="task-ws-1",
+            goal="Explore workspace",
+            workspace_path="/tmp/work-a",
+            status="executing",
+        )
+        await conversation_store.create_session(
+            workspace="/tmp/work-a",
+            model_name="test-model",
+        )
+
+        response = await client.get("/workspaces")
+        assert response.status_code == 200
+        rows = response.json()
+        assert len(rows) == 1
+        assert rows[0]["canonical_path"].endswith("/tmp/work-a")
+        assert rows[0]["run_count"] == 1
+        assert rows[0]["conversation_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_create_workspace_and_overview(
+        self,
+        client,
+        tmp_path,
+        database,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "desktop-ws"
+        workspace_path.mkdir()
+        create_response = await client.post(
+            "/workspaces",
+            json={"path": str(workspace_path), "display_name": "Desktop WS"},
+        )
+        assert create_response.status_code == 201
+        workspace = create_response.json()
+        assert workspace["display_name"] == "Desktop WS"
+        workspace_id = workspace["id"]
+
+        await database.insert_task(
+            task_id="task-ws-2",
+            goal="Ship feature",
+            workspace_path=str(workspace_path),
+            status="pending",
+        )
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="test-model",
+        )
+        await conversation_store.link_run(session_id, "task-ws-2")
+        synced = await workspace_registry.get(workspace_id)
+        assert synced is not None
+
+        overview_response = await client.get(f"/workspaces/{workspace_id}/overview")
+        assert overview_response.status_code == 200
+        payload = overview_response.json()
+        assert payload["workspace"]["id"] == workspace_id
+        assert payload["counts"]["runs"] == 1
+        assert payload["counts"]["conversations"] == 1
+        assert payload["recent_conversations"][0]["linked_run_ids"] == ["task-ws-2"]
+
+    @pytest.mark.asyncio
+    async def test_unified_approvals_list_and_reply(
+        self,
+        client,
+        engine,
+        tmp_path,
+        database,
+        memory_manager,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "approval-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Approval WS",
+        )
+        assert workspace is not None
+
+        await database.insert_task(
+            task_id="task-approval-1",
+            goal="Review deployment change",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+        await memory_manager.upsert_pending_task_question(
+            question_id="q_approval_1",
+            task_id="task-approval-1",
+            subtask_id="subtask-question",
+            request_payload={
+                "question": "Proceed with production deploy?",
+                "question_type": "single_choice",
+                "options": [
+                    {"id": "yes", "label": "Yes"},
+                    {"id": "no", "label": "No"},
+                ],
+                "context_note": "Waiting on operator approval.",
+            },
+        )
+        approval_waiter = asyncio.create_task(
+            engine.approval_manager.request_approval(
+                ApprovalRequest(
+                    task_id="task-approval-1",
+                    subtask_id="subtask-approve",
+                    reason="Touches deployment settings",
+                    proposed_action="Apply production config update",
+                    risk_level="high",
+                ),
+            ),
+        )
+        await asyncio.sleep(0.05)
+
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="approval-model",
+        )
+        engine.begin_conversation_approval(
+            session_id,
+            tool_name="shell_execute",
+            args={"command": "rm -rf build"},
+        )
+
+        list_response = await client.get(f"/approvals?workspace_id={workspace['id']}")
+        assert list_response.status_code == 200
+        rows = list_response.json()
+        kinds = {row["kind"] for row in rows}
+        assert {"task_approval", "task_question", "conversation_approval"} <= kinds
+
+        task_item = next(row for row in rows if row["kind"] == "task_approval")
+        question_item = next(row for row in rows if row["kind"] == "task_question")
+        conversation_item = next(row for row in rows if row["kind"] == "conversation_approval")
+
+        task_reply = await client.post(
+            f"/approvals/{task_item['id']}/reply",
+            json={"decision": "approve", "reason": "Looks safe."},
+        )
+        assert task_reply.status_code == 200
+        assert await approval_waiter is True
+
+        question_reply = await client.post(
+            f"/approvals/{question_item['id']}/reply",
+            json={
+                "decision": "answer",
+                "response_type": "answered",
+                "selected_option_ids": ["yes"],
+                "selected_labels": ["Yes"],
+                "custom_response": "Yes",
+            },
+        )
+        assert question_reply.status_code == 200
+        assert question_reply.json()["status"] == "answered"
+
+        conversation_reply = await client.post(
+            f"/approvals/{conversation_item['id']}/reply",
+            json={"decision": "approve_all"},
+        )
+        assert conversation_reply.status_code == 200
+
+        refreshed = await client.get(f"/approvals?workspace_id={workspace['id']}")
+        assert refreshed.status_code == 200
+        assert refreshed.json() == []
+
+    @pytest.mark.asyncio
+    async def test_workspace_overview_counts_pending_conversation_approvals(
+        self,
+        client,
+        engine,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "pending-overview-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Pending Overview WS",
+        )
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="overview-model",
+        )
+        engine.begin_conversation_approval(
+            session_id,
+            tool_name="write_file",
+            args={"path": "README.md"},
+        )
+
+        response = await client.get(f"/workspaces/{workspace['id']}/overview")
+        assert response.status_code == 200
+        assert response.json()["pending_approvals_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_workspace_inventory_includes_processes_tools_and_mcp(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "inventory-ws"
+        workspace_path.mkdir()
+        process_dir = workspace_path / "loom-processes"
+        process_dir.mkdir()
+        (process_dir / "custom-inventory.yaml").write_text(
+            "\n".join([
+                "name: custom-inventory",
+                "version: 1.0.0",
+                "description: Custom workspace process",
+                "author: Loom Test",
+            ]),
+            encoding="utf-8",
+        )
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Inventory WS",
+        )
+        assert workspace is not None
+
+        response = await client.get(f"/workspaces/{workspace['id']}/inventory")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["workspace"]["id"] == workspace["id"]
+        assert payload["counts"]["tools"] > 0
+        assert payload["counts"]["processes"] > 0
+        assert payload["mcp_servers"] == []
+        assert any(row["name"] == "custom-inventory" for row in payload["processes"])
+        assert any(row["name"] == "ask_user" for row in payload["tools"])
+
+    @pytest.mark.asyncio
+    async def test_workspace_search_queries_real_workspace_surfaces(
+        self,
+        client,
+        tmp_path,
+        database,
+        conversation_store,
+        workspace_registry,
+        memory_manager,
+        state_manager,
+    ):
+        workspace_path = tmp_path / "search-ws"
+        workspace_path.mkdir()
+        process_dir = workspace_path / "loom-processes"
+        process_dir.mkdir()
+        (process_dir / "auth-audit.yaml").write_text(
+            "\n".join([
+                "name: auth-audit",
+                "version: 1.0.0",
+                "description: Authentication auditing process",
+            ]),
+            encoding="utf-8",
+        )
+        artifact_path = workspace_path / "auth-report.md"
+        artifact_text = "Authentication audit notes"
+        artifact_path.write_text(artifact_text, encoding="utf-8")
+        artifact_sha = hashlib.sha256(artifact_text.encode("utf-8")).hexdigest()
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Search WS",
+        )
+        assert workspace is not None
+
+        await database.insert_task(
+            task_id="task-search-1",
+            goal="Audit auth boundary",
+            workspace_path=str(workspace_path),
+            status="executing",
+            metadata={
+                "artifact_seals": {
+                    "auth-report.md": {
+                        "path": "auth-report.md",
+                        "sha256": artifact_sha,
+                        "size_bytes": len(artifact_text.encode("utf-8")),
+                        "tool": "document_write",
+                        "subtask_id": "audit",
+                        "sealed_at": "2026-03-23T10:30:00",
+                    },
+                },
+                "process": "auth-audit",
+            },
+        )
+        await database.insert_event(
+            task_id="task-search-1",
+            correlation_id="corr-auth",
+            run_id="exec-auth-1",
+            event_type="task_executing",
+            data={"message": "Investigating auth flows"},
+            sequence=1,
+        )
+        state_manager.save_evidence_records(
+            "task-search-1",
+            [{
+                "evidence_id": "EV-AUTH-1",
+                "task_id": "task-search-1",
+                "subtask_id": "audit",
+                "phase_id": "phase-auth",
+                "tool": "document_write",
+                "evidence_kind": "artifact",
+                "artifact_workspace_relpath": "auth-report.md",
+                "artifact_sha256": artifact_sha,
+                "artifact_size_bytes": len(artifact_text.encode("utf-8")),
+                "facets": {"category": "deliverable", "target": "authentication"},
+                "created_at": "2026-03-23T10:31:00",
+            }],
+        )
+
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="auth-model",
+        )
+        await conversation_store.update_session(
+            session_id,
+            session_state={"title": "Authentication thread"},
+        )
+        await conversation_store.append_turn(
+            session_id,
+            1,
+            "assistant",
+            "We should review the authentication boundary first.",
+        )
+
+        await memory_manager.upsert_pending_task_question(
+            question_id="q-search-1",
+            task_id="task-search-1",
+            subtask_id="audit",
+            request_payload={
+                "question": "Proceed with auth migration?",
+                "question_type": "single_choice",
+                "options": [{"id": "yes", "label": "Yes"}],
+            },
+        )
+
+        response = await client.get(
+            f"/workspaces/{workspace['id']}/search?q=auth&limit_per_group=3",
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["query"] == "auth"
+        assert payload["total_results"] >= 5
+        assert payload["conversations"][0]["conversation_id"] == session_id
+        assert payload["runs"][0]["run_id"] == "task-search-1"
+        assert payload["approvals"][0]["approval_item_id"].startswith("question:")
+        assert payload["artifacts"][0]["path"] == "auth-report.md"
+        assert payload["files"][0]["path"] == "auth-report.md"
+        assert payload["processes"][0]["title"] == "auth-audit"
+        assert payload["tools"]
+
+    @pytest.mark.asyncio
+    async def test_workspace_files_list_and_preview(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "workspace-files-ws"
+        docs_path = workspace_path / "docs"
+        docs_path.mkdir(parents=True)
+        readme_path = workspace_path / "README.md"
+        readme_path.write_text("# Hello\n\nWorkspace preview text.\n", encoding="utf-8")
+        table_path = docs_path / "notes.csv"
+        table_path.write_text("name,status\nalpha,done\nbeta,pending\n", encoding="utf-8")
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Workspace Files WS",
+        )
+        assert workspace is not None
+
+        root_response = await client.get(f"/workspaces/{workspace['id']}/files")
+        assert root_response.status_code == 200
+        root_rows = root_response.json()
+        assert root_rows[0]["is_dir"] is True
+        assert root_rows[0]["path"] == "docs"
+        assert root_rows[1]["path"] == "README.md"
+
+        nested_response = await client.get(
+            f"/workspaces/{workspace['id']}/files",
+            params={"directory": "docs"},
+        )
+        assert nested_response.status_code == 200
+        nested_rows = nested_response.json()
+        assert nested_rows[0]["path"] == "docs/notes.csv"
+
+        text_preview = await client.get(
+            f"/workspaces/{workspace['id']}/files/preview",
+            params={"path": "README.md"},
+        )
+        assert text_preview.status_code == 200
+        text_payload = text_preview.json()
+        assert text_payload["preview_kind"] == "text"
+        assert "Workspace preview text." in text_payload["text_content"]
+
+        table_preview = await client.get(
+            f"/workspaces/{workspace['id']}/files/preview",
+            params={"path": "docs/notes.csv"},
+        )
+        assert table_preview.status_code == 200
+        table_payload = table_preview.json()
+        assert table_payload["preview_kind"] == "table"
+        assert table_payload["table"]["columns"] == ["name", "status"]
+        assert table_payload["table"]["rows"][0] == ["alpha", "done"]
+
+    @pytest.mark.asyncio
+    async def test_workspace_file_preview_rejects_escape_path(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "workspace-files-escape-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+
+        response = await client.get(
+            f"/workspaces/{workspace['id']}/files/preview",
+            params={"path": "../secret.txt"},
+        )
+        assert response.status_code == 400
+
+
+    @pytest.mark.asyncio
+    async def test_conversation_endpoints(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Chat WS",
+        )
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        await conversation_store.append_turn(session_id, 1, "user", "hello")
+        await conversation_store.append_turn(session_id, 2, "assistant", "hi")
+        await conversation_store.append_chat_event(session_id, "message", {"text": "hello"})
+
+        list_response = await client.get(f"/workspaces/{workspace['id']}/conversations")
+        assert list_response.status_code == 200
+        rows = list_response.json()
+        assert len(rows) == 1
+        assert rows[0]["id"] == session_id
+
+        detail_response = await client.get(f"/conversations/{session_id}")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert detail["workspace"]["id"] == workspace["id"]
+
+        messages_response = await client.get(f"/conversations/{session_id}/messages")
+        assert messages_response.status_code == 200
+        messages = messages_response.json()
+        assert len(messages) == 2
+        assert messages[0]["content"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_post_conversation_message_starts_background_turn(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "chat-send-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Chat Send WS",
+        )
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        engine.model_router.add_provider(
+            "chat-model",
+            SimpleNamespace(name="chat-model", roles=["executor"], tier=1),
+        )
+
+        class FakeCoworkSession:
+            def __init__(self, *args, store=None, session_id="", **kwargs):
+                self._store = store
+                self._session_id = session_id
+
+            async def resume(self, session_id: str) -> None:
+                self._session_id = session_id
+
+            async def send_streaming(self, user_message: str):
+                turn_count = await self._store.get_turn_count(self._session_id)
+                await self._store.append_turn(
+                    self._session_id,
+                    turn_count + 1,
+                    "user",
+                    user_message,
+                )
+                await self._store.append_turn(
+                    self._session_id,
+                    turn_count + 2,
+                    "assistant",
+                    "Background reply",
+                )
+                yield CoworkTurn(
+                    text="Background reply",
+                    tool_calls=[],
+                    tokens_used=12,
+                    model="chat-model",
+                    latency_ms=10,
+                    total_time_ms=20,
+                    tokens_per_second=1.2,
+                    context_tokens=0,
+                    context_messages=0,
+                    omitted_messages=0,
+                    recall_index_used=False,
+                )
+
+        monkeypatch.setattr("loom.api.routes._cowork_session_cls", lambda: FakeCoworkSession)
+
+        response = await client.post(
+            f"/conversations/{session_id}/messages",
+            json={"message": "Hello from desktop", "role": "user"},
+        )
+        assert response.status_code == 202
+
+        for _ in range(20):
+            turns = await conversation_store.get_turns(session_id, limit=10)
+            if len(turns) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("background conversation turn did not persist expected turns")
+
+        assert turns[-2]["content"] == "Hello from desktop"
+        assert turns[-1]["content"] == "Background reply"
+        events = await conversation_store.get_chat_events(session_id)
+        event_types = [row["event_type"] for row in events]
+        assert "user_message" in event_types
+        assert "assistant_text" in event_types
+
+    @pytest.mark.asyncio
+    async def test_conversation_events_and_stop_status_endpoints(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "chat-stop-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        await conversation_store.append_chat_event(
+            session_id,
+            "assistant_text",
+            {"text": "hello replay"},
+        )
+
+        events_response = await client.get(f"/conversations/{session_id}/events")
+        assert events_response.status_code == 200
+        events_payload = events_response.json()
+        assert events_payload[0]["event_type"] == "assistant_text"
+
+        engine.model_router.add_provider(
+            "chat-model",
+            SimpleNamespace(name="chat-model", roles=["executor"], tier=1),
+        )
+
+        stop_flag = asyncio.Event()
+
+        class StoppableCoworkSession:
+            def __init__(self, *args, **kwargs):
+                self._stop_requested = False
+
+            @property
+            def stop_requested(self) -> bool:
+                return self._stop_requested
+
+            def request_stop(self, reason: str = "user_requested") -> None:
+                self._stop_requested = True
+                stop_flag.set()
+
+            async def resume(self, session_id: str) -> None:
+                return None
+
+            async def send_streaming(self, user_message: str):
+                await stop_flag.wait()
+                return
+                yield  # pragma: no cover
+
+        monkeypatch.setattr("loom.api.routes._cowork_session_cls", lambda: StoppableCoworkSession)
+
+        start_response = await client.post(
+            f"/conversations/{session_id}/messages",
+            json={"message": "Please start", "role": "user"},
+        )
+        assert start_response.status_code == 202
+
+        for _ in range(20):
+            status_response = await client.get(f"/conversations/{session_id}/status")
+            assert status_response.status_code == 200
+            if status_response.json()["processing"] is True:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("conversation never reported processing state")
+
+        stop_response = await client.post(f"/conversations/{session_id}/stop")
+        assert stop_response.status_code == 200
+
+        for _ in range(20):
+            status_response = await client.get(f"/conversations/{session_id}/status")
+            payload = status_response.json()
+            if payload["processing"] is False:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("conversation stop did not clear processing state")
+
+    @pytest.mark.asyncio
+    async def test_conversation_stream_uses_stable_chat_event_name(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-stream-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        await conversation_store.append_chat_event(
+            session_id,
+            "assistant_text",
+            {"text": "hello from stream"},
+        )
+
+        async with client.stream(
+            "GET",
+            f"/conversations/{session_id}/stream?follow=false",
+        ) as response:
+            current_event = ""
+            current_id = ""
+            async for line in response.aiter_lines():
+                if not line.strip() or line.startswith(":"):
+                    continue
+                if line.startswith("event: "):
+                    current_event = line.removeprefix("event: ").strip()
+                    continue
+                if line.startswith("id: "):
+                    current_id = line.removeprefix("id: ").strip()
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                payload = json.loads(line.removeprefix("data: "))
+                assert current_event == "chat_event"
+                assert current_id == str(payload["seq"])
+                assert payload["event_type"] == "assistant_text"
+                assert payload["payload"]["text"] == "hello from stream"
+                break
+
+    @pytest.mark.asyncio
+    async def test_conversation_stream_respects_last_event_id_cursor(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-stream-cursor-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        seq1 = await conversation_store.append_chat_event(
+            session_id,
+            "assistant_text",
+            {"text": "first"},
+        )
+        seq2 = await conversation_store.append_chat_event(
+            session_id,
+            "assistant_text",
+            {"text": "second"},
+        )
+
+        async with client.stream(
+            "GET",
+            f"/conversations/{session_id}/stream?follow=false",
+            headers={"last-event-id": str(seq1)},
+        ) as response:
+            seen_payloads: list[dict[str, object]] = []
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                seen_payloads.append(json.loads(line.removeprefix("data: ")))
+
+        assert [payload["seq"] for payload in seen_payloads] == [seq2]
+
+    @pytest.mark.asyncio
+    async def test_conversation_messages_support_latest_and_before_turn(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-messages-page-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        for turn_number in range(1, 251):
+            role = "assistant" if turn_number % 2 == 0 else "user"
+            await conversation_store.append_turn(
+                session_id,
+                turn_number,
+                role,
+                f"message {turn_number}",
+            )
+
+        latest_response = await client.get(
+            f"/conversations/{session_id}/messages?latest=true&limit=100",
+        )
+        assert latest_response.status_code == 200
+        latest_rows = latest_response.json()
+        assert latest_rows[0]["turn_number"] == 151
+        assert latest_rows[-1]["turn_number"] == 250
+
+        older_response = await client.get(
+            f"/conversations/{session_id}/messages?before_turn=151&limit=100",
+        )
+        assert older_response.status_code == 200
+        older_rows = older_response.json()
+        assert older_rows[0]["turn_number"] == 51
+        assert older_rows[-1]["turn_number"] == 150
+
+    @pytest.mark.asyncio
+    async def test_conversation_events_pagination_stitches_with_stream_cursor(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-events-page-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        for event_type, payload in [
+            ("user_message", {"text": "hello"}),
+            ("assistant_thinking", {"text": "thinking 1"}),
+            ("assistant_text", {"text": "reply 1"}),
+            ("tool_call_started", {"tool_name": "read_file", "tool_call_id": "call-1"}),
+            (
+                "tool_call_completed",
+                {
+                    "tool_name": "read_file",
+                    "tool_call_id": "call-1",
+                    "success": True,
+                },
+            ),
+            ("turn_separator", {"tokens": 12, "tool_count": 1}),
+            ("user_message", {"text": "follow-up"}),
+            ("assistant_thinking", {"text": "thinking 2"}),
+            ("assistant_text", {"text": "reply 2"}),
+        ]:
+            await conversation_store.append_chat_event(session_id, event_type, payload)
+
+        latest_response = await client.get(
+            f"/conversations/{session_id}/events?limit=4",
+        )
+        assert latest_response.status_code == 200
+        latest_rows = latest_response.json()
+        assert [row["seq"] for row in latest_rows] == [6, 7, 8, 9]
+
+        older_response = await client.get(
+            f"/conversations/{session_id}/events?before_seq=6&limit=5",
+        )
+        assert older_response.status_code == 200
+        older_rows = older_response.json()
+        assert [row["seq"] for row in older_rows] == [1, 2, 3, 4, 5]
+
+        stitched = [*older_rows, *latest_rows]
+        assert [row["seq"] for row in stitched] == list(range(1, 10))
+
+        async with client.stream(
+            "GET",
+            f"/conversations/{session_id}/stream?follow=false&after_seq=5",
+        ) as response:
+            streamed_payloads: list[dict[str, object]] = []
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                streamed_payloads.append(json.loads(line.removeprefix("data: ")))
+
+        assert [payload["seq"] for payload in streamed_payloads] == [6, 7, 8, 9]
+        assert [payload["event_type"] for payload in streamed_payloads] == [
+            "turn_separator",
+            "user_message",
+            "assistant_thinking",
+            "assistant_text",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_conversation_status_reports_pending_ask_user_prompt(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-question-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        await conversation_store.append_chat_event(
+            session_id,
+            "tool_call_completed",
+            {
+                "tool_name": "ask_user",
+                "tool_call_id": "ask-1",
+                "success": True,
+                "data": {
+                    "question": "Which language should we use?",
+                    "question_type": "single_choice",
+                    "options_v2": [
+                        {"id": "python", "label": "Python", "description": "Fastest path"},
+                        {"id": "rust", "label": "Rust", "description": "Higher control"},
+                    ],
+                    "allow_custom_response": False,
+                    "awaiting_input": True,
+                },
+            },
+        )
+
+        response = await client.get(f"/conversations/{session_id}/status")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["awaiting_user_input"] is True
+        assert payload["pending_prompt"]["question"] == "Which language should we use?"
+        assert payload["pending_prompt"]["options"][0]["label"] == "Python"
+
+        await conversation_store.append_chat_event(
+            session_id,
+            "user_message",
+            {"text": "Use Python."},
+        )
+        response = await client.get(f"/conversations/{session_id}/status")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["awaiting_user_input"] is False
+        assert payload["pending_prompt"] is None
+
+    @pytest.mark.asyncio
+    async def test_conversation_status_synthesizes_pending_prompt_from_turns(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-question-turns-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        await conversation_store.append_turn(session_id, 1, "user", "Help me choose a stack.")
+        await conversation_store.append_turn(
+            session_id,
+            2,
+            "assistant",
+            "",
+            tool_calls=[{
+                "id": "ask-turn-1",
+                "function": {
+                    "name": "ask_user",
+                    "arguments": json.dumps({
+                        "question": "Which stack do you prefer?",
+                        "question_type": "single_choice",
+                        "options": ["Python", "Rust"],
+                        "allow_custom_response": False,
+                    }),
+                },
+            }],
+        )
+        await conversation_store.append_turn(
+            session_id,
+            3,
+            "tool",
+            ToolResult(
+                success=True,
+                output="QUESTION: Which stack do you prefer?",
+                data={
+                    "question": "Which stack do you prefer?",
+                    "question_type": "single_choice",
+                    "options": ["Python", "Rust"],
+                    "allow_custom_response": False,
+                    "awaiting_input": True,
+                },
+            ).to_json(),
+            tool_call_id="ask-turn-1",
+            tool_name="ask_user",
+        )
+
+        response = await client.get(f"/conversations/{session_id}/status")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["awaiting_user_input"] is True
+        assert payload["pending_prompt"]["question"] == "Which stack do you prefer?"
+        assert [option["label"] for option in payload["pending_prompt"]["options"]] == [
+            "Python",
+            "Rust",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_conversation_approval_resolution_endpoints(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "chat-approval-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        engine.model_router.add_provider(
+            "chat-model",
+            SimpleNamespace(name="chat-model", roles=["executor"], tier=1),
+        )
+        observed: dict[str, str] = {}
+
+        class ApprovalCoworkSession:
+            def __init__(self, *args, approver=None, **kwargs):
+                self._approver = approver
+                self._stop_requested = False
+
+            @property
+            def stop_requested(self) -> bool:
+                return self._stop_requested
+
+            def request_stop(self, reason: str = "user_requested") -> None:
+                self._stop_requested = True
+
+            async def resume(self, session_id: str) -> None:
+                return None
+
+            async def send_streaming(self, user_message: str):
+                start = ToolCallEvent(
+                    name="shell_execute",
+                    args={"command": "touch risky.txt"},
+                    tool_call_id="tc-approval",
+                )
+                yield start
+                decision = await self._approver.check(
+                    "shell_execute",
+                    {"command": "touch risky.txt"},
+                )
+                observed["decision"] = decision.value
+                completed = ToolCallEvent(
+                    name="shell_execute",
+                    args={"command": "touch risky.txt"},
+                    tool_call_id="tc-approval",
+                )
+                if decision.value == "deny":
+                    completed.result = ToolResult.fail("Tool call 'shell_execute' denied by user.")
+                else:
+                    completed.result = ToolResult.ok("Approved.")
+                completed.elapsed_ms = 1
+                yield completed
+                if not self._stop_requested:
+                    yield CoworkTurn(
+                        text="Approved and continued",
+                        tool_calls=[],
+                        tokens_used=8,
+                        model="chat-model",
+                        latency_ms=4,
+                        total_time_ms=8,
+                        tokens_per_second=1.0,
+                        context_tokens=0,
+                        context_messages=0,
+                        omitted_messages=0,
+                        recall_index_used=False,
+                    )
+
+        monkeypatch.setattr("loom.api.routes._cowork_session_cls", lambda: ApprovalCoworkSession)
+
+        response = await client.post(
+            f"/conversations/{session_id}/messages",
+            json={"message": "Run the risky command", "role": "user"},
+        )
+        assert response.status_code == 202
+
+        approval_id = ""
+        for _ in range(30):
+            status_response = await client.get(f"/conversations/{session_id}/status")
+            assert status_response.status_code == 200
+            payload = status_response.json()
+            if payload["awaiting_approval"] is True:
+                approval_id = payload["pending_approval"]["approval_id"]
+                assert payload["pending_approval"]["tool_name"] == "shell_execute"
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("conversation never reported pending approval")
+
+        resolve_response = await client.post(
+            f"/conversations/{session_id}/approvals/{approval_id}",
+            json={"decision": "approve"},
+        )
+        assert resolve_response.status_code == 200
+
+        for _ in range(30):
+            status_response = await client.get(f"/conversations/{session_id}/status")
+            payload = status_response.json()
+            if payload["processing"] is False:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("conversation approval resolution did not finish the turn")
+
+        assert observed["decision"] == "approve"
+        events = await conversation_store.get_chat_events(session_id)
+        event_types = [row["event_type"] for row in events]
+        assert "approval_requested" in event_types
+        assert "approval_resolved" in event_types
+
+    @pytest.mark.asyncio
+    async def test_conversation_stop_unblocks_pending_approval(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "chat-approval-stop-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        engine.model_router.add_provider(
+            "chat-model",
+            SimpleNamespace(name="chat-model", roles=["executor"], tier=1),
+        )
+        observed: dict[str, str] = {}
+
+        class ApprovalStopCoworkSession:
+            def __init__(self, *args, approver=None, **kwargs):
+                self._approver = approver
+                self._stop_requested = False
+
+            @property
+            def stop_requested(self) -> bool:
+                return self._stop_requested
+
+            def request_stop(self, reason: str = "user_requested") -> None:
+                self._stop_requested = True
+
+            async def resume(self, session_id: str) -> None:
+                return None
+
+            async def send_streaming(self, user_message: str):
+                start = ToolCallEvent(
+                    name="shell_execute",
+                    args={"command": "rm -rf not-actually"},
+                    tool_call_id="tc-stop",
+                )
+                yield start
+                decision = await self._approver.check(
+                    "shell_execute",
+                    {"command": "rm -rf not-actually"},
+                )
+                observed["decision"] = decision.value
+                completed = ToolCallEvent(
+                    name="shell_execute",
+                    args={"command": "rm -rf not-actually"},
+                    tool_call_id="tc-stop",
+                )
+                completed.result = ToolResult.fail("Tool call 'shell_execute' denied by user.")
+                completed.elapsed_ms = 1
+                yield completed
+                return
+                yield  # pragma: no cover
+
+        monkeypatch.setattr(
+            "loom.api.routes._cowork_session_cls",
+            lambda: ApprovalStopCoworkSession,
+        )
+
+        response = await client.post(
+            f"/conversations/{session_id}/messages",
+            json={"message": "Do the dangerous thing", "role": "user"},
+        )
+        assert response.status_code == 202
+
+        for _ in range(30):
+            status_response = await client.get(f"/conversations/{session_id}/status")
+            assert status_response.status_code == 200
+            payload = status_response.json()
+            if payload["awaiting_approval"] is True:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("conversation never reported pending approval for stop path")
+
+        stop_response = await client.post(f"/conversations/{session_id}/stop")
+        assert stop_response.status_code == 200
+
+        for _ in range(30):
+            status_response = await client.get(f"/conversations/{session_id}/status")
+            payload = status_response.json()
+            if payload["processing"] is False:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("conversation stop did not unblock pending approval")
+
+        assert observed["decision"] == "deny"
+
+    @pytest.mark.asyncio
+    async def test_conversation_inject_instruction_queues_for_active_turn(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "chat-inject-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        engine.model_router.add_provider(
+            "chat-model",
+            SimpleNamespace(name="chat-model", roles=["executor"], tier=1),
+        )
+        observed: dict[str, str] = {}
+        injected = asyncio.Event()
+
+        class InjectableCoworkSession:
+            def __init__(self, *args, **kwargs):
+                self._pending: list[str] = []
+                self._stop_requested = False
+
+            @property
+            def stop_requested(self) -> bool:
+                return self._stop_requested
+
+            @property
+            def pending_inject_instruction_count(self) -> int:
+                return len(self._pending)
+
+            def request_stop(self, reason: str = "user_requested") -> None:
+                self._stop_requested = True
+
+            def queue_inject_instruction(self, text: str) -> None:
+                self._pending.append(str(text))
+                injected.set()
+
+            async def resume(self, session_id: str) -> None:
+                return None
+
+            async def send_streaming(self, user_message: str):
+                await injected.wait()
+                observed["instruction"] = self._pending.pop(0)
+                yield CoworkTurn(
+                    text="Instruction applied",
+                    tool_calls=[],
+                    tokens_used=6,
+                    model="chat-model",
+                    latency_ms=4,
+                    total_time_ms=8,
+                    tokens_per_second=1.0,
+                    context_tokens=0,
+                    context_messages=0,
+                    omitted_messages=0,
+                    recall_index_used=False,
+                )
+
+        monkeypatch.setattr("loom.api.routes._cowork_session_cls", lambda: InjectableCoworkSession)
+
+        start_response = await client.post(
+            f"/conversations/{session_id}/messages",
+            json={"message": "Start the turn", "role": "user"},
+        )
+        assert start_response.status_code == 202
+
+        for _ in range(30):
+            status_response = await client.get(f"/conversations/{session_id}/status")
+            assert status_response.status_code == 200
+            if status_response.json()["processing"] is True:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("conversation never reported processing state for inject path")
+
+        inject_response = await client.post(
+            f"/conversations/{session_id}/inject",
+            json={"instruction": "Focus on the failing tests first."},
+        )
+        assert inject_response.status_code == 200
+        inject_payload = inject_response.json()
+        assert inject_payload["pending_inject_count"] >= 1
+
+        for _ in range(30):
+            status_response = await client.get(f"/conversations/{session_id}/status")
+            payload = status_response.json()
+            if payload["processing"] is False:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("conversation inject did not finish the turn")
+
+        assert observed["instruction"] == "Focus on the failing tests first."
+        events = await conversation_store.get_chat_events(session_id)
+        event_types = [row["event_type"] for row in events]
+        assert "steering_instruction" in event_types
+
+    @pytest.mark.asyncio
+    async def test_conversation_inject_requires_active_turn(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-inject-idle-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        response = await client.post(
+            f"/conversations/{session_id}/inject",
+            json={"instruction": "Please pivot."},
+        )
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_run_endpoints_and_workspace_settings(
+        self,
+        client,
+        tmp_path,
+        database,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Run WS",
+        )
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-run-1",
+            goal="Run task",
+            workspace_path=str(workspace_path),
+            status="executing",
+            metadata={"process": "ship-it"},
+        )
+        await database.insert_task_run(
+            run_id="exec-run-1",
+            task_id="task-run-1",
+            status="running",
+            process_name="ship-it",
+        )
+        await database.insert_event(
+            task_id="task-run-1",
+            correlation_id="corr-1",
+            run_id="exec-run-1",
+            event_type="task_executing",
+            data={"message": "started"},
+            sequence=1,
+        )
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        await conversation_store.link_run(session_id, "task-run-1")
+
+        list_response = await client.get(f"/workspaces/{workspace['id']}/runs")
+        assert list_response.status_code == 200
+        runs = list_response.json()
+        assert runs[0]["id"] == "task-run-1"
+        assert runs[0]["execution_run_id"] == "exec-run-1"
+        assert runs[0]["linked_conversation_ids"] == [session_id]
+
+        detail_response = await client.get("/runs/task-run-1")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert detail["task_run"]["run_id"] == "exec-run-1"
+
+        timeline_response = await client.get("/runs/task-run-1/timeline")
+        assert timeline_response.status_code == 200
+        timeline = timeline_response.json()
+        assert timeline[0]["event_type"] == "task_executing"
+        assert timeline[0]["data"]["message"] == "started"
+
+        settings_get = await client.get("/settings")
+        assert settings_get.status_code == 200
+        settings_payload = settings_get.json()
+        assert settings_payload["basic"]
+        assert settings_payload["advanced"]
+
+        settings_patch = await client.patch(
+            "/settings",
+            json={"values": {"execution.ask_user_policy": "fail_closed"}},
+        )
+        assert settings_patch.status_code == 200
+        patched = settings_patch.json()
+        basic_paths = {row["path"]: row["effective"] for row in patched["basic"]}
+        assert basic_paths["execution.ask_user_policy"] == "fail_closed"
+
+        workspace_settings_patch = await client.patch(
+            f"/workspaces/{workspace['id']}/settings",
+            json={"overrides": {"layout": {"rail": "expanded"}}},
+        )
+        assert workspace_settings_patch.status_code == 200
+        assert workspace_settings_patch.json()["overrides"]["layout"]["rail"] == "expanded"
+
+    @pytest.mark.asyncio
+    async def test_auto_subfolder_run_stays_grouped_under_parent_workspace(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "desktop-launch-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Desktop Launch WS",
+        )
+        assert workspace is not None
+
+        response = await client.post(
+            "/tasks",
+            json={
+                "goal": "Review the site",
+                "workspace": str(workspace_path),
+                "approval_mode": "auto",
+                "auto_subfolder": True,
+            },
+        )
+        assert response.status_code == 201
+        payload = response.json()
+
+        task_row = await database.get_task(payload["task_id"])
+        assert task_row is not None
+        task_workspace = Path(str(task_row["workspace_path"]))
+        assert task_workspace.parent == workspace_path.resolve()
+        assert task_workspace.is_dir()
+
+        metadata = json.loads(str(task_row.get("metadata") or "{}"))
+        assert metadata["source_workspace_root"] == str(workspace_path)
+        assert metadata["run_workspace_mode"] == "scoped_subfolder"
+        assert metadata["run_workspace_relative"] == task_workspace.name
+
+        overview = await client.get(f"/workspaces/{workspace['id']}/overview")
+        assert overview.status_code == 200
+        recent_runs = overview.json()["recent_runs"]
+        assert any(row["id"] == payload["task_id"] for row in recent_runs)
+
+        workspace_list = await client.get("/workspaces")
+        assert workspace_list.status_code == 200
+        canonical_paths = {row["canonical_path"] for row in workspace_list.json()}
+        assert str(workspace_path.resolve()) in canonical_paths
+        assert str(task_workspace) not in canonical_paths
+
+    @pytest.mark.asyncio
+    async def test_auto_subfolder_process_launch_loads_process_from_parent_workspace(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "process-launch-ws"
+        workspace_path.mkdir()
+        process_dir = workspace_path / "loom-processes"
+        process_dir.mkdir()
+        (process_dir / "custom-process.yaml").write_text(
+            "\n".join([
+                "name: custom-process",
+                "version: 1.0.0",
+                "description: Custom process from parent workspace",
+            ]),
+            encoding="utf-8",
+        )
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Process Launch WS",
+        )
+        assert workspace is not None
+
+        response = await client.post(
+            "/tasks",
+            json={
+                "goal": "Audit the workspace",
+                "workspace": str(workspace_path),
+                "process": "custom-process",
+                "approval_mode": "auto",
+                "auto_subfolder": True,
+            },
+        )
+        assert response.status_code == 201
+        payload = response.json()
+
+        task_row = await database.get_task(payload["task_id"])
+        assert task_row is not None
+        metadata = json.loads(str(task_row.get("metadata") or "{}"))
+        assert metadata["process"] == "custom-process"
+        assert metadata["source_workspace_root"] == str(workspace_path)
+        assert Path(str(task_row["workspace_path"])).parent == workspace_path.resolve()
+
+    @pytest.mark.asyncio
+    async def test_scoped_run_artifacts_are_rebased_to_parent_workspace_paths(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "scoped-artifacts-ws"
+        workspace_path.mkdir()
+        run_workspace = workspace_path / "review-the-site"
+        run_workspace.mkdir()
+        artifact_relpath = ".loom_artifacts/fetched/subtask-a/reference.pdf"
+        artifact_path = run_workspace / artifact_relpath
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_bytes = b"%PDF-1.4 scoped artifact\n"
+        artifact_path.write_bytes(artifact_bytes)
+        artifact_sha = hashlib.sha256(artifact_bytes).hexdigest()
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Scoped Artifacts WS",
+        )
+        assert workspace is not None
+
+        await database.insert_task(
+            task_id="task-scoped-artifacts-1",
+            goal="Review the site",
+            workspace_path=str(run_workspace),
+            status="completed",
+            metadata={
+                "source_workspace_root": str(workspace_path),
+                "run_workspace_relative": run_workspace.name,
+                "run_workspace_mode": "scoped_subfolder",
+                "artifact_seals": {
+                    artifact_relpath: {
+                        "path": artifact_relpath,
+                        "sha256": artifact_sha,
+                        "size_bytes": len(artifact_bytes),
+                        "tool": "web_fetch",
+                        "subtask_id": "fetch-reference",
+                        "sealed_at": "2026-03-27T18:00:00",
+                    },
+                },
+            },
+        )
+        state_manager.save_evidence_records(
+            "task-scoped-artifacts-1",
+            [
+                {
+                    "evidence_id": "EV-SCOPED-ARTIFACT-1",
+                    "task_id": "task-scoped-artifacts-1",
+                    "subtask_id": "fetch-reference",
+                    "phase_id": "research",
+                    "tool": "web_fetch",
+                    "evidence_kind": "artifact",
+                    "artifact_workspace_relpath": artifact_relpath,
+                    "artifact_sha256": artifact_sha,
+                    "artifact_size_bytes": len(artifact_bytes),
+                    "facets": {"category": "fetched_artifact"},
+                    "created_at": "2026-03-27T18:00:01",
+                },
+            ],
+        )
+
+        run_artifacts = await client.get("/runs/task-scoped-artifacts-1/artifacts")
+        assert run_artifacts.status_code == 200
+        run_payload = run_artifacts.json()
+        assert run_payload == [
+            {
+                "path": f"{run_workspace.name}/{artifact_relpath}",
+                "category": "fetched_artifact",
+                "source": "seal+evidence",
+                "sha256": artifact_sha,
+                "size_bytes": len(artifact_bytes),
+                "exists_on_disk": True,
+                "is_intermediate": False,
+                "created_at": "2026-03-27T18:00:01",
+                "tool_name": "web_fetch",
+                "subtask_ids": ["fetch-reference"],
+                "phase_ids": ["research"],
+                "facets": {"category": "fetched_artifact"},
+            },
+        ]
+
+        workspace_artifacts = await client.get(f"/workspaces/{workspace['id']}/artifacts")
+        assert workspace_artifacts.status_code == 200
+        workspace_payload = workspace_artifacts.json()
+        assert len(workspace_payload) == 1
+        assert workspace_payload[0]["path"] == f"{run_workspace.name}/{artifact_relpath}"
+        assert workspace_payload[0]["latest_run_id"] == "task-scoped-artifacts-1"
+        assert workspace_payload[0]["run_ids"] == ["task-scoped-artifacts-1"]
+        assert workspace_payload[0]["run_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_run_artifacts_merge_task_seals_and_evidence(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-artifacts-ws"
+        workspace_path.mkdir()
+        report_path = workspace_path / "report.md"
+        report_text = "# Ship Report\n\nEverything passed.\n"
+        report_path.write_text(report_text, encoding="utf-8")
+        report_sha = hashlib.sha256(report_text.encode("utf-8")).hexdigest()
+
+        intermediate_path = (
+            workspace_path
+            / ".loom"
+            / "phase-artifacts"
+            / "run-a"
+            / "phase-a"
+            / "worker-a"
+            / "notes.md"
+        )
+        intermediate_path.parent.mkdir(parents=True, exist_ok=True)
+        intermediate_text = "Worker notes"
+        intermediate_path.write_text(intermediate_text, encoding="utf-8")
+        intermediate_sha = hashlib.sha256(intermediate_text.encode("utf-8")).hexdigest()
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Artifacts WS",
+        )
+        assert workspace is not None
+
+        await database.insert_task(
+            task_id="task-run-artifacts-1",
+            goal="Generate deliverables",
+            workspace_path=str(workspace_path),
+            status="completed",
+            metadata={
+                "artifact_seals": {
+                    "report.md": {
+                        "path": "report.md",
+                        "sha256": report_sha,
+                        "size_bytes": len(report_text.encode("utf-8")),
+                        "tool": "document_write",
+                        "subtask_id": "finalize-report",
+                        "sealed_at": "2026-03-23T10:00:00",
+                    },
+                },
+            },
+        )
+        state_manager.save_evidence_records(
+            "task-run-artifacts-1",
+            [
+                {
+                    "evidence_id": "EV-REPORT-1",
+                    "task_id": "task-run-artifacts-1",
+                    "subtask_id": "finalize-report",
+                    "phase_id": "final",
+                    "tool": "document_write",
+                    "evidence_kind": "artifact",
+                    "artifact_workspace_relpath": "report.md",
+                    "artifact_sha256": report_sha,
+                    "artifact_size_bytes": len(report_text.encode("utf-8")),
+                    "facets": {"category": "deliverable", "target": "report"},
+                    "created_at": "2026-03-23T10:01:00",
+                },
+                {
+                    "evidence_id": "EV-PHASE-1",
+                    "task_id": "task-run-artifacts-1",
+                    "subtask_id": "phase-a-worker",
+                    "phase_id": "phase-a",
+                    "tool": "write_file",
+                    "evidence_kind": "artifact",
+                    "artifact_workspace_relpath": (
+                        ".loom/phase-artifacts/run-a/phase-a/worker-a/notes.md"
+                    ),
+                    "artifact_sha256": intermediate_sha,
+                    "artifact_size_bytes": len(intermediate_text.encode("utf-8")),
+                    "facets": {"category": "worker_notes"},
+                    "created_at": "2026-03-23T09:00:00",
+                },
+            ],
+        )
+
+        response = await client.get("/runs/task-run-artifacts-1/artifacts")
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 2
+
+        report = next(item for item in payload if item["path"] == "report.md")
+        assert report["source"] == "seal+evidence"
+        assert report["category"] == "deliverable"
+        assert report["exists_on_disk"] is True
+        assert report["is_intermediate"] is False
+        assert report["tool_name"] == "document_write"
+        assert report["phase_ids"] == ["final"]
+        assert report["subtask_ids"] == ["finalize-report"]
+        assert report["facets"]["target"] == "report"
+
+        intermediate = next(
+            item
+            for item in payload
+            if item["path"] == ".loom/phase-artifacts/run-a/phase-a/worker-a/notes.md"
+        )
+        assert intermediate["source"] == "evidence"
+        assert intermediate["category"] == "intermediate"
+        assert intermediate["exists_on_disk"] is True
+        assert intermediate["is_intermediate"] is True
+        assert intermediate["phase_ids"] == ["phase-a"]
+
+    @pytest.mark.asyncio
+    async def test_workspace_artifacts_aggregate_across_runs(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "workspace-artifacts-ws"
+        workspace_path.mkdir()
+        shared_path = workspace_path / "report.md"
+        shared_text = "Latest report"
+        shared_path.write_text(shared_text, encoding="utf-8")
+        shared_sha = hashlib.sha256(shared_text.encode("utf-8")).hexdigest()
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Workspace Artifacts WS",
+        )
+        assert workspace is not None
+
+        await database.insert_task(
+            task_id="task-run-artifacts-a",
+            goal="First artifact run",
+            workspace_path=str(workspace_path),
+            status="completed",
+        )
+        await database.insert_task(
+            task_id="task-run-artifacts-b",
+            goal="Second artifact run",
+            workspace_path=str(workspace_path),
+            status="completed",
+        )
+        state_manager.save_evidence_records(
+            "task-run-artifacts-a",
+            [{
+                "evidence_id": "EV-WS-1",
+                "task_id": "task-run-artifacts-a",
+                "subtask_id": "draft",
+                "phase_id": "phase-a",
+                "tool": "write_file",
+                "evidence_kind": "artifact",
+                "artifact_workspace_relpath": "report.md",
+                "artifact_sha256": shared_sha,
+                "artifact_size_bytes": len(shared_text.encode("utf-8")),
+                "created_at": "2026-03-23T08:00:00",
+            }],
+        )
+        state_manager.save_evidence_records(
+            "task-run-artifacts-b",
+            [{
+                "evidence_id": "EV-WS-2",
+                "task_id": "task-run-artifacts-b",
+                "subtask_id": "finalize",
+                "phase_id": "phase-b",
+                "tool": "document_write",
+                "evidence_kind": "artifact",
+                "artifact_workspace_relpath": "report.md",
+                "artifact_sha256": shared_sha,
+                "artifact_size_bytes": len(shared_text.encode("utf-8")),
+                "facets": {"category": "deliverable"},
+                "created_at": "2026-03-23T09:30:00",
+            }],
+        )
+
+        response = await client.get(f"/workspaces/{workspace['id']}/artifacts")
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 1
+        artifact = payload[0]
+        assert artifact["path"] == "report.md"
+        assert artifact["run_count"] == 2
+        assert artifact["latest_run_id"] == "task-run-artifacts-b"
+        assert set(artifact["run_ids"]) == {"task-run-artifacts-a", "task-run-artifacts-b"}
+        assert artifact["category"] == "deliverable"
+        assert set(artifact["phase_ids"]) == {"phase-a", "phase-b"}
+        assert artifact["exists_on_disk"] is True
+
+    @pytest.mark.asyncio
+    async def test_run_control_and_message_endpoints(
+        self,
+        client,
+        database,
+        state_manager,
+        mock_orchestrator,
+        memory_manager,
+    ):
+        await database.insert_task(
+            task_id="task-run-control-1",
+            goal="Control task",
+            workspace_path="/tmp/run-control",
+            status="executing",
+        )
+        _make_task(
+            state_manager,
+            task_id="task-run-control-1",
+            goal="Control task",
+            status=TaskStatus.EXECUTING,
+        )
+
+        pause_response = await client.post("/runs/task-run-control-1/pause")
+        assert pause_response.status_code == 200
+        mock_orchestrator.pause_task.assert_called_once()
+
+        resume_response = await client.post("/runs/task-run-control-1/resume")
+        assert resume_response.status_code == 200
+        mock_orchestrator.resume_task.assert_called_once()
+
+        message_response = await client.post(
+            "/runs/task-run-control-1/message",
+            json={"message": "Need a quick progress update", "role": "user"},
+        )
+        assert message_response.status_code == 200
+        entries = await memory_manager.query(
+            task_id="task-run-control-1",
+            entry_type="user_instruction",
+        )
+        assert any("quick progress update" in str(entry.detail or "") for entry in entries)
+
+        cancel_response = await client.post("/runs/task-run-control-1/cancel")
+        assert cancel_response.status_code == 200
+        mock_orchestrator.cancel_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_stream_uses_workspace_first_event_shape(self, client, database):
+        await database.insert_task(
+            task_id="task-run-stream-1",
+            goal="Run stream task",
+            workspace_path="/tmp/run-stream",
+            status="executing",
+        )
+        await database.insert_event(
+            task_id="task-run-stream-1",
+            correlation_id="corr-1",
+            run_id="exec-run-1",
+            event_type=TASK_RUN_HEARTBEAT,
+            data={"run_id": "exec-run-1", "status": "executing"},
+            sequence=1,
+        )
+        await database.insert_event(
+            task_id="task-run-stream-1",
+            correlation_id="corr-1",
+            run_id="exec-run-1",
+            event_type=TASK_COMPLETED,
+            data={"status": "completed"},
+            sequence=2,
+        )
+
+        seen: list[dict[str, object]] = []
+        async with client.stream(
+            "GET",
+            "/runs/task-run-stream-1/stream?follow=false",
+        ) as response:
+            current_event = ""
+            current_id = ""
+            async for line in response.aiter_lines():
+                if not line.strip() or line.startswith(":"):
+                    continue
+                if line.startswith("event: "):
+                    current_event = line.removeprefix("event: ").strip()
+                    continue
+                if line.startswith("id: "):
+                    current_id = line.removeprefix("id: ").strip()
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                payload = json.loads(line.removeprefix("data: "))
+                if current_event == "run_event":
+                    seen.append(payload)
+                    assert current_id.isdigit()
+                if payload.get("terminal") is True:
+                    break
+
+        assert seen
+        assert seen[0]["event_type"] == TASK_RUN_HEARTBEAT
+        assert seen[-1]["event_type"] == TASK_COMPLETED
+        assert seen[-1]["terminal"] is True
+
+    @pytest.mark.asyncio
+    async def test_run_stream_respects_last_event_id_cursor(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-stream-cursor-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-run-stream-cursor-1",
+            goal="Run stream cursor task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+        first_id = await database.insert_event(
+            task_id="task-run-stream-cursor-1",
+            correlation_id="corr-1",
+            run_id="exec-run-1",
+            event_type="task_executing",
+            data={"message": "started", "status": "executing"},
+            sequence=1,
+        )
+        second_id = await database.insert_event(
+            task_id="task-run-stream-cursor-1",
+            correlation_id="corr-1",
+            run_id="exec-run-1",
+            event_type="task_paused",
+            data={"message": "paused", "status": "paused"},
+            sequence=2,
+        )
+
+        async with client.stream(
+            "GET",
+            "/runs/task-run-stream-cursor-1/stream?follow=false",
+            headers={"last-event-id": str(first_id)},
+        ) as response:
+            seen_ids: list[int] = []
+            seen_payloads: list[dict[str, object]] = []
+            async for line in response.aiter_lines():
+                if not line.strip() or line.startswith(":"):
+                    continue
+                if line.startswith("id: "):
+                    seen_ids.append(int(line.removeprefix("id: ").strip()))
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                seen_payloads.append(json.loads(line.removeprefix("data: ")))
+
+        assert seen_ids == [second_id]
+        assert [payload["event_type"] for payload in seen_payloads] == ["task_paused"]
+        assert seen_payloads[0]["status"] == "paused"
+        assert seen_payloads[0]["streaming"] is False
+
+    @pytest.mark.asyncio
+    async def test_notification_stream_respects_last_event_id_cursor(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "notification-stream-cursor-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-notification-stream-1",
+            goal="Notification stream task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+        first_id = await database.insert_event(
+            task_id="task-notification-stream-1",
+            correlation_id="corr-1",
+            run_id="exec-run-1",
+            event_type="approval_requested",
+            data={"summary": "Need approval"},
+            sequence=1,
+        )
+        second_id = await database.insert_event(
+            task_id="task-notification-stream-1",
+            correlation_id="corr-1",
+            run_id="exec-run-1",
+            event_type="approval_received",
+            data={"summary": "Approved"},
+            sequence=2,
+        )
+
+        async with client.stream(
+            "GET",
+            f"/notifications/stream?workspace_id={workspace['id']}&follow=false",
+            headers={"last-event-id": str(first_id)},
+        ) as response:
+            seen_ids: list[int] = []
+            seen_payloads: list[dict[str, object]] = []
+            async for line in response.aiter_lines():
+                if not line.strip() or line.startswith(":"):
+                    continue
+                if line.startswith("id: "):
+                    seen_ids.append(int(line.removeprefix("id: ").strip()))
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                seen_payloads.append(json.loads(line.removeprefix("data: ")))
+
+        assert seen_ids == [second_id]
+        assert [payload["event_type"] for payload in seen_payloads] == ["approval_received"]
+        assert seen_payloads[0]["workspace_id"] == workspace["id"]
+        assert seen_payloads[0]["stream_id"] == second_id
 
 
 class TestTelemetrySettings:

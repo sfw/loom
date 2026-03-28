@@ -6,6 +6,11 @@ This changelog is generated directly from git commit history (non-merge commits)
 
 ## [Unreleased]
 
+- Add `loomd` sidecar entrypoint and runtime status contract for workspace-first desktop bootstrapping
+- Add workspace registry, workspace settings, and conversation/run link schema with migration coverage
+- Add workspace-first API surfaces: `/runtime`, `/workspaces`, `/conversations`, `/runs`, and grouped `/settings`
+- Scaffold `apps/desktop` monorepo workspace with Tauri 2 + React + Vite overview shell
+
 ## [0.2.2] - 2026-03-16
 
 - 2026-03-16 `24a6ea4` Fix tests for new streaming and cowork defaults

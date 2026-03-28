@@ -245,7 +245,7 @@ class ExecutionConfig:
     executor_completion_contract_mode: str = "off"  # off | warn | enforce
     planner_degraded_mode: str = "allow"  # allow | require_approval | deny
     enable_sqlite_remediation_queue: bool = False
-    enable_durable_task_runner: bool = False
+    enable_durable_task_runner: bool = True
     enable_mutation_idempotency: bool = False
     sealed_artifact_post_call_guard: str = "warn"  # off | warn | enforce
     enable_slo_metrics: bool = False

@@ -205,6 +205,26 @@ class TestConversationStore:
         await store.append_turn(sid, 2, "assistant", "Hi")
         assert await store.get_turn_count(sid) == 2
 
+    async def test_link_run_round_trip(self, store: ConversationStore, db: Database):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await db.insert_task(
+            task_id="task-1",
+            goal="Run task",
+            workspace_path="/tmp",
+            status="pending",
+        )
+
+        await store.link_run(sid, "task-1")
+        await store.link_run(sid, "task-1")
+
+        linked_runs = await store.list_linked_runs(sid)
+        assert len(linked_runs) == 1
+        assert linked_runs[0]["run_id"] == "task-1"
+
+        linked_conversations = await store.list_linked_conversations("task-1")
+        assert len(linked_conversations) == 1
+        assert linked_conversations[0]["session_id"] == sid
+
     async def test_update_session(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")
 
@@ -304,6 +324,25 @@ class TestConversationStore:
         page = await store.get_chat_events(sid, before_seq=5, limit=2)
         assert len(page) == 2
         assert [row["seq"] for row in page] == [3, 4]
+
+    async def test_get_chat_events_between_after_and_before_seq(
+        self, store: ConversationStore,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        for index in range(1, 9):
+            await store.append_chat_event(
+                sid,
+                "info",
+                {"text": f"line {index}"},
+            )
+
+        page = await store.get_chat_events(
+            sid,
+            after_seq=3,
+            before_seq=7,
+            limit=10,
+        )
+        assert [row["seq"] for row in page] == [4, 5, 6]
 
     async def test_get_chat_events_payload_parse_failure_non_fatal(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")

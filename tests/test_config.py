@@ -44,7 +44,7 @@ class TestDefaultConfig:
         assert config.execution.sealed_artifact_post_call_guard == "warn"
         assert config.execution.planner_degraded_mode == "allow"
         assert config.execution.enable_sqlite_remediation_queue is False
-        assert config.execution.enable_durable_task_runner is False
+        assert config.execution.enable_durable_task_runner is True
         assert config.execution.enable_mutation_idempotency is False
         assert config.execution.enable_slo_metrics is False
         assert config.execution.delegate_task_timeout_seconds == 14400

@@ -1,0 +1,437 @@
+import {
+  startTransition,
+  type FormEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+
+import {
+  fetchWorkspaceSearch,
+  type WorkspaceOverview,
+  type WorkspaceSearchResponse,
+} from "../api";
+import {
+  buildCommandOptions,
+  buildCommandPaletteEntries,
+  buildPaletteEntries,
+  buildPaletteSections,
+  buildPinnedPaletteEntries,
+  buildResultPaletteEntries,
+  isPaletteEntry,
+  rememberPaletteEntry as nextRecentPaletteEntries,
+  RECENT_PALETTE_STORAGE_KEY,
+  type CommandOption,
+  type PaletteEntry,
+} from "../shell";
+import type { ViewTab } from "../utils";
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+export interface CommandPaletteState {
+  commandDraft: string;
+  commandPaletteOpen: boolean;
+  activeCommandIndex: number;
+  commandSearchResults: WorkspaceSearchResponse | null;
+  searchingCommandPalette: boolean;
+  recentPaletteEntries: PaletteEntry[];
+
+  // Computed
+  trimmedCommandDraft: string;
+  normalizedCommandDraft: string;
+  commandSearchTerm: string;
+  commandOptions: CommandOption[];
+  pinnedPaletteEntries: PaletteEntry[];
+  commandPaletteEntries: PaletteEntry[];
+  resultPaletteEntries: PaletteEntry[];
+  paletteEntries: PaletteEntry[];
+  paletteSections: Array<{ label: string; entries: PaletteEntry[] }>;
+
+  // Refs
+  commandInputRef: React.RefObject<HTMLInputElement | null>;
+}
+
+export interface CommandPaletteActions {
+  setCommandDraft: React.Dispatch<React.SetStateAction<string>>;
+  setCommandPaletteOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  setActiveCommandIndex: React.Dispatch<React.SetStateAction<number>>;
+  focusCommandBar: () => void;
+  handleCommandAction: (rawCommand: string) => void;
+  executeCommandOption: (option: CommandOption) => void;
+  executePaletteEntry: (entry: PaletteEntry) => void;
+  handleCommandInputKeyDown: (event: React.KeyboardEvent<HTMLInputElement>) => void;
+  handleCommandSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  rememberPaletteEntry: (entry: PaletteEntry) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
+
+export function useCommandPalette(deps: {
+  selectedWorkspaceId: string;
+  overview: WorkspaceOverview | null;
+  setSelectedConversationId: React.Dispatch<React.SetStateAction<string>>;
+  setSelectedRunId: React.Dispatch<React.SetStateAction<string>>;
+  setWorkspaceSearchQuery: React.Dispatch<React.SetStateAction<string>>;
+  setActiveTab: React.Dispatch<React.SetStateAction<ViewTab>>;
+  setError: React.Dispatch<React.SetStateAction<string>>;
+  setNotice: React.Dispatch<React.SetStateAction<string>>;
+  focusSearch: () => void;
+  focusConversationComposer: () => void;
+  focusRunComposer: () => void;
+  handlePrefillStarterConversation: () => void;
+  handlePrefillStarterRun: () => void;
+  handleSearchResultSelection: (result: {
+    conversation_id?: string;
+    run_id?: string;
+    approval_item_id?: string;
+    path?: string;
+    kind?: string;
+  }) => void;
+}): CommandPaletteState & CommandPaletteActions {
+  const {
+    selectedWorkspaceId,
+    overview,
+    setSelectedConversationId,
+    setSelectedRunId,
+    setWorkspaceSearchQuery,
+    setActiveTab,
+    setError,
+    setNotice,
+    focusSearch,
+    focusConversationComposer,
+    focusRunComposer,
+    handlePrefillStarterConversation,
+    handlePrefillStarterRun,
+    handleSearchResultSelection,
+  } = deps;
+
+  // State
+  const [commandDraft, setCommandDraft] = useState("");
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [activeCommandIndex, setActiveCommandIndex] = useState(0);
+  const [commandSearchResults, setCommandSearchResults] =
+    useState<WorkspaceSearchResponse | null>(null);
+  const [searchingCommandPalette, setSearchingCommandPalette] = useState(false);
+  const [recentPaletteEntries, setRecentPaletteEntries] = useState<PaletteEntry[]>([]);
+
+  // Refs
+  const commandInputRef = useRef<HTMLInputElement | null>(null);
+  const commandBlurTimerRef = useRef<number | null>(null);
+  const commandSearchTimerRef = useRef<number | null>(null);
+
+  // ---------------------------------------------------------------------------
+  // Computed values
+  // ---------------------------------------------------------------------------
+
+  const trimmedCommandDraft = commandDraft.trim();
+  const normalizedCommandDraft = trimmedCommandDraft.toLowerCase();
+  const commandSearchTerm = normalizedCommandDraft.startsWith("search ")
+    ? trimmedCommandDraft.slice(7).trim()
+    : trimmedCommandDraft;
+  const commandOptions = buildCommandOptions(commandDraft);
+  const pinnedPaletteEntries = buildPinnedPaletteEntries();
+  const commandPaletteEntriesComputed = buildCommandPaletteEntries(commandOptions);
+  const resultPaletteEntries = buildResultPaletteEntries(commandSearchResults);
+  const paletteEntries = buildPaletteEntries(
+    commandDraft,
+    recentPaletteEntries,
+    commandPaletteEntriesComputed,
+    resultPaletteEntries,
+    pinnedPaletteEntries,
+  );
+  const paletteSections = buildPaletteSections(
+    commandDraft,
+    recentPaletteEntries,
+    commandPaletteEntriesComputed,
+    resultPaletteEntries,
+    pinnedPaletteEntries,
+  );
+
+  // ---------------------------------------------------------------------------
+  // Effects
+  // ---------------------------------------------------------------------------
+
+  // Cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      if (commandBlurTimerRef.current !== null) {
+        window.clearTimeout(commandBlurTimerRef.current);
+      }
+      if (commandSearchTimerRef.current !== null) {
+        window.clearTimeout(commandSearchTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Load recent palette entries from localStorage
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(RECENT_PALETTE_STORAGE_KEY);
+      if (!raw) {
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) {
+        return;
+      }
+      setRecentPaletteEntries(parsed.filter(isPaletteEntry).slice(0, 6));
+    } catch {
+      return;
+    }
+  }, []);
+
+  // Persist recent palette entries to localStorage
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        RECENT_PALETTE_STORAGE_KEY,
+        JSON.stringify(recentPaletteEntries.slice(0, 6)),
+      );
+    } catch {
+      return;
+    }
+  }, [recentPaletteEntries]);
+
+  // Keep palette index in bounds
+  useEffect(() => {
+    if (paletteEntries.length === 0) {
+      setActiveCommandIndex(0);
+      return;
+    }
+    setActiveCommandIndex((current) =>
+      Math.max(0, Math.min(paletteEntries.length - 1, current)),
+    );
+  }, [paletteEntries.length]);
+
+  // Debounced command palette search
+  useEffect(() => {
+    const query = commandSearchTerm.trim();
+    if (commandSearchTimerRef.current !== null) {
+      window.clearTimeout(commandSearchTimerRef.current);
+      commandSearchTimerRef.current = null;
+    }
+    if (!commandPaletteOpen || !selectedWorkspaceId || !query) {
+      setSearchingCommandPalette(false);
+      setCommandSearchResults(null);
+      return;
+    }
+    let cancelled = false;
+    setSearchingCommandPalette(true);
+    commandSearchTimerRef.current = window.setTimeout(() => {
+      commandSearchTimerRef.current = null;
+      void (async () => {
+        try {
+          const results = await fetchWorkspaceSearch(selectedWorkspaceId, query, 2);
+          if (!cancelled) {
+            setCommandSearchResults(results);
+          }
+        } catch {
+          if (!cancelled) {
+            setCommandSearchResults(null);
+          }
+        } finally {
+          if (!cancelled) {
+            setSearchingCommandPalette(false);
+          }
+        }
+      })();
+    }, 160);
+    return () => {
+      cancelled = true;
+      if (commandSearchTimerRef.current !== null) {
+        window.clearTimeout(commandSearchTimerRef.current);
+        commandSearchTimerRef.current = null;
+      }
+    };
+  }, [commandPaletteOpen, commandSearchTerm, selectedWorkspaceId]);
+
+  // ---------------------------------------------------------------------------
+  // Handlers
+  // ---------------------------------------------------------------------------
+
+  function focusCommandBar() {
+    if (commandBlurTimerRef.current !== null) {
+      window.clearTimeout(commandBlurTimerRef.current);
+      commandBlurTimerRef.current = null;
+    }
+    setCommandPaletteOpen(true);
+    commandInputRef.current?.focus();
+    commandInputRef.current?.select();
+  }
+
+  function handleCommandAction(rawCommand: string) {
+    const normalized = rawCommand.trim().toLowerCase();
+    if (!normalized) {
+      return;
+    }
+    if (normalized === "new conversation" || normalized === "thread") {
+      focusConversationComposer();
+      
+      return;
+    }
+    if (normalized === "new run" || normalized === "run") {
+      focusRunComposer();
+      
+      return;
+    }
+    if (normalized === "starter thread" || normalized === "starter conversation") {
+      handlePrefillStarterConversation();
+      focusConversationComposer();
+      return;
+    }
+    if (normalized === "starter run") {
+      handlePrefillStarterRun();
+      focusRunComposer();
+      return;
+    }
+    if (normalized === "latest conversation") {
+      const latestConversationId = overview?.recent_conversations[0]?.id || "";
+      if (!latestConversationId) {
+        setError("No conversation is available in this workspace.");
+        return;
+      }
+      startTransition(() => {
+        setSelectedConversationId(latestConversationId);
+      });
+      
+      return;
+    }
+    if (normalized === "latest run") {
+      const latestRunId = overview?.recent_runs[0]?.id || "";
+      if (!latestRunId) {
+        setError("No run is available in this workspace.");
+        return;
+      }
+      startTransition(() => {
+        setSelectedRunId(latestRunId);
+      });
+      
+      return;
+    }
+    if (normalized === "clear search") {
+      setWorkspaceSearchQuery("");
+      
+      return;
+    }
+    if (normalized.startsWith("search ")) {
+      setWorkspaceSearchQuery(rawCommand.trim().slice(7));
+      
+      focusSearch();
+      return;
+    }
+    setError(
+      "Unknown command. Try new conversation, new run, starter thread, starter run, latest conversation, latest run, or search <term>.",
+    );
+  }
+
+  function rememberPaletteEntry(entry: PaletteEntry) {
+    setRecentPaletteEntries((current) => nextRecentPaletteEntries(current, entry));
+  }
+
+  function executeCommandOption(option: CommandOption) {
+    rememberPaletteEntry({
+      id: `command-${option.id}`,
+      title: option.label,
+      description: option.description,
+      keyword: option.command,
+      kind: "command",
+      command: option,
+    });
+    setCommandDraft(option.command);
+    handleCommandAction(option.command);
+    setCommandPaletteOpen(false);
+    setActiveCommandIndex(0);
+    setCommandDraft("");
+  }
+
+  function executePaletteEntry(entry: PaletteEntry) {
+    if (entry.kind === "command" && entry.command) {
+      executeCommandOption(entry.command);
+      return;
+    }
+    if (entry.kind === "result" && entry.result) {
+      rememberPaletteEntry(entry);
+      handleSearchResultSelection(entry.result);
+      setCommandPaletteOpen(false);
+      setActiveCommandIndex(0);
+      setCommandDraft("");
+    }
+  }
+
+  function handleCommandInputKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (!commandPaletteOpen || paletteEntries.length === 0) {
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveCommandIndex((current) => (current + 1) % paletteEntries.length);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveCommandIndex((current) => (
+        (current - 1 + paletteEntries.length) % paletteEntries.length
+      ));
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setCommandPaletteOpen(false);
+      return;
+    }
+    if (event.key === "Enter" && paletteEntries.length > 0) {
+      event.preventDefault();
+      executePaletteEntry(paletteEntries[activeCommandIndex] || paletteEntries[0]);
+    }
+  }
+
+  function handleCommandSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setNotice("");
+    handleCommandAction(commandDraft);
+    setCommandPaletteOpen(false);
+    setActiveCommandIndex(0);
+    setCommandDraft("");
+  }
+
+  return {
+    // State
+    commandDraft,
+    commandPaletteOpen,
+    activeCommandIndex,
+    commandSearchResults,
+    searchingCommandPalette,
+    recentPaletteEntries,
+
+    // Computed
+    trimmedCommandDraft,
+    normalizedCommandDraft,
+    commandSearchTerm,
+    commandOptions,
+    pinnedPaletteEntries,
+    commandPaletteEntries: commandPaletteEntriesComputed,
+    resultPaletteEntries,
+    paletteEntries,
+    paletteSections,
+
+    // Refs
+    commandInputRef,
+
+    // Actions
+    setCommandDraft,
+    setCommandPaletteOpen,
+    setActiveCommandIndex,
+    focusCommandBar,
+    handleCommandAction,
+    executeCommandOption,
+    executePaletteEntry,
+    handleCommandInputKeyDown,
+    handleCommandSubmit,
+    rememberPaletteEntry,
+  };
+}

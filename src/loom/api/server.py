@@ -11,7 +11,7 @@ from loom import __version__
 from loom.config import Config
 
 
-def create_app(config: Config | None = None) -> FastAPI:
+def create_app(config: Config | None = None, *, runtime_role: str = "api") -> FastAPI:
     """Create and configure the FastAPI application.
 
     Two modes:
@@ -28,7 +28,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         logger = logging.getLogger("loom.server")
         try:
-            engine = await create_engine(resolved_config)
+            engine = await create_engine(resolved_config, runtime_role=runtime_role)
         except Exception as e:
             logger.error("Failed to initialize engine: %s", e)
             raise

@@ -89,6 +89,21 @@ class ConversationStore:
             tuple(params),
         )
 
+    async def delete_session(self, session_id: str) -> None:
+        """Delete a session and all related data."""
+        await self._db.execute(
+            "DELETE FROM cowork_chat_events WHERE session_id = ?", (session_id,),
+        )
+        await self._db.execute(
+            "DELETE FROM conversation_run_links WHERE session_id = ?", (session_id,),
+        )
+        await self._db.execute(
+            "DELETE FROM conversation_turns WHERE session_id = ?", (session_id,),
+        )
+        await self._db.execute(
+            "DELETE FROM cowork_sessions WHERE id = ?", (session_id,),
+        )
+
     async def update_session(
         self,
         session_id: str,
@@ -173,6 +188,24 @@ class ConversationStore:
             (session_id, limit, offset),
         )
 
+    async def get_turns_before(
+        self,
+        session_id: str,
+        *,
+        before_turn: int,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Get turns older than ``before_turn``, ordered by turn number."""
+        limit = min(limit, self.MAX_QUERY_LIMIT)
+        rows = await self._db.query(
+            """SELECT * FROM conversation_turns
+               WHERE session_id = ? AND turn_number < ?
+               ORDER BY turn_number DESC
+               LIMIT ?""",
+            (session_id, int(before_turn), limit),
+        )
+        return list(reversed(rows))
+
     async def get_recent_turns(
         self,
         session_id: str,
@@ -196,6 +229,54 @@ class ConversationStore:
             (session_id,),
         )
         return row["cnt"] if row else 0
+
+    async def link_run(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        link_type: str = "origin",
+    ) -> None:
+        """Persist a conversation-to-run linkage for workspace navigation."""
+        clean_session_id = str(session_id or "").strip()
+        clean_run_id = str(run_id or "").strip()
+        clean_link_type = str(link_type or "").strip() or "origin"
+        if not clean_session_id or not clean_run_id:
+            return
+        await self._db.execute(
+            """
+            INSERT INTO conversation_run_links (session_id, run_id, link_type, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(session_id, run_id, link_type) DO NOTHING
+            """,
+            (clean_session_id, clean_run_id, clean_link_type, datetime.now().isoformat()),
+        )
+
+    async def list_linked_runs(self, session_id: str) -> list[dict]:
+        """Return run links for a conversation/session."""
+        rows = await self._db.query(
+            """
+            SELECT *
+            FROM conversation_run_links
+            WHERE session_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (str(session_id or "").strip(),),
+        )
+        return [dict(row) for row in rows]
+
+    async def list_linked_conversations(self, run_id: str) -> list[dict]:
+        """Return conversation links for a run."""
+        rows = await self._db.query(
+            """
+            SELECT *
+            FROM conversation_run_links
+            WHERE run_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (str(run_id or "").strip(),),
+        )
+        return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Search / retrieval
@@ -868,55 +949,46 @@ class ConversationStore:
             role = str(row.get("role", "") or "").strip().lower()
             turn_number = int(row.get("turn_number", 0) or 0)
             created_at = row.get("created_at")
+            seq_base = turn_number * 100
+            seq_index = 0
 
-            if role == "user":
-                text = str(row.get("content", "") or "")
+            def _append(event_type: str, payload: dict[str, Any]) -> None:
+                nonlocal seq_index
                 events.append({
-                    "event_type": "user_message",
-                    "payload": {"text": text},
+                    "id": 0,
+                    "session_id": session_id,
+                    "seq": seq_base + seq_index,
+                    "event_type": event_type,
+                    "payload": payload,
+                    "payload_parse_error": False,
                     "turn_number": turn_number,
                     "created_at": created_at,
                 })
+                seq_index += 1
+
+            if role == "user":
+                text = str(row.get("content", "") or "")
+                _append("user_message", {"text": text})
                 continue
 
             if role == "assistant":
                 content = str(row.get("content", "") or "")
                 tool_calls = self._decode_tool_calls(row.get("tool_calls"))
                 if content:
-                    events.append({
-                        "event_type": "assistant_text",
-                        "payload": {"text": content, "markup": False},
-                        "turn_number": turn_number,
-                        "created_at": created_at,
-                    })
+                    _append("assistant_text", {"text": content, "markup": False})
                 for call in tool_calls:
                     payload = self._payload_for_tool_call_start(call)
                     if payload is None:
                         continue
-                    events.append({
-                        "event_type": "tool_call_started",
-                        "payload": payload,
-                        "turn_number": turn_number,
-                        "created_at": created_at,
-                    })
+                    _append("tool_call_started", payload)
                 continue
 
             if role == "tool":
                 payload = self._payload_for_tool_completion(row)
-                events.append({
-                    "event_type": "tool_call_completed",
-                    "payload": payload,
-                    "turn_number": turn_number,
-                    "created_at": created_at,
-                })
+                _append("tool_call_completed", payload)
                 blocks = payload.get("content_blocks")
                 if isinstance(blocks, list) and blocks:
-                    events.append({
-                        "event_type": "content_indicator",
-                        "payload": {"content_blocks": blocks},
-                        "turn_number": turn_number,
-                        "created_at": created_at,
-                    })
+                    _append("content_indicator", {"content_blocks": blocks})
                 continue
 
             # Skip most persisted system messages from model context hints.
@@ -968,6 +1040,26 @@ class ConversationStore:
         }
 
     @staticmethod
+    def _ask_user_question_payload(result: object) -> dict | None:
+        from loom.tools.ask_user import normalize_ask_user_args
+        from loom.tools.registry import ToolResult
+
+        if not isinstance(result, ToolResult):
+            return None
+        data = result.data
+        if not isinstance(data, dict):
+            return None
+        candidate = dict(data)
+        options_v2 = candidate.get("options_v2")
+        if isinstance(options_v2, list) and options_v2:
+            candidate["options"] = options_v2
+        normalized = normalize_ask_user_args(candidate)
+        question = str(normalized.get("question", "") or "").strip()
+        if not question:
+            return None
+        return normalized
+
+    @staticmethod
     def _payload_for_tool_completion(row: dict) -> dict:
         from loom.tools.registry import ToolResult
 
@@ -1001,6 +1093,12 @@ class ConversationStore:
             "output": output,
             "error": error,
         }
+        if isinstance(result.data, dict):
+            payload["data"] = dict(result.data)
+        if payload["tool_name"] == "ask_user":
+            question_payload = ConversationStore._ask_user_question_payload(result)
+            if question_payload is not None:
+                payload["question_payload"] = question_payload
         if blocks:
             payload["content_blocks"] = blocks
         return payload

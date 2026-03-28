@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from loom.events.bus import Event, EventBus
@@ -34,6 +35,7 @@ class ApprovalRequest:
     risk_level: str  # "low", "medium", "high", "critical"
     details: dict = field(default_factory=dict)
     auto_approve_timeout: int | None = None  # seconds, None = no auto
+    created_at: str = ""
 
 
 # Operations that always require approval regardless of confidence
@@ -72,6 +74,7 @@ class ApprovalManager:
         self._default_timeout = default_timeout
         self._pending_approvals: dict[str, asyncio.Event] = {}
         self._approval_results: dict[str, bool] = {}
+        self._approval_requests: dict[str, ApprovalRequest] = {}
 
     def check_approval(
         self,
@@ -125,7 +128,10 @@ class ApprovalManager:
         """
         key = f"{request.task_id}:{request.subtask_id}"
         event = asyncio.Event()
+        if not str(request.created_at or "").strip():
+            request.created_at = datetime.now(UTC).isoformat()
         self._pending_approvals[key] = event
+        self._approval_requests[key] = request
 
         # Emit event for API/TUI
         self._event_bus.emit(Event(
@@ -156,6 +162,7 @@ class ApprovalManager:
         finally:
             self._pending_approvals.pop(key, None)
             self._approval_results.pop(key, None)
+            self._approval_requests.pop(key, None)
 
     def resolve_approval(self, task_id: str, subtask_id: str, approved: bool) -> bool:
         """Called by API endpoint when human responds.
@@ -179,6 +186,17 @@ class ApprovalManager:
             },
         ))
         return True
+
+    def list_pending_approvals(self) -> list[ApprovalRequest]:
+        """Return pending approval requests that are still awaiting a decision."""
+        pending: list[ApprovalRequest] = []
+        for key, request in self._approval_requests.items():
+            event = self._pending_approvals.get(key)
+            if event is None or event.is_set():
+                continue
+            pending.append(request)
+        pending.sort(key=lambda item: str(item.created_at or ""), reverse=True)
+        return pending
 
     @staticmethod
     def _is_always_gated(result: object) -> bool:

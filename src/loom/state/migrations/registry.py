@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 
 from loom.state.migrations.runner import MigrationStep
-from loom.state.migrations.steps import events_v2, task_questions, validity_lineage
+from loom.state.migrations.steps import events_v2, task_questions, validity_lineage, workspaces_v1
 
 
 def _checksum(payload: str) -> str:
@@ -33,5 +33,12 @@ MIGRATIONS: tuple[MigrationStep, ...] = (
         checksum=_checksum("20260306_003_validity_lineage/validity_lineage"),
         apply=validity_lineage.apply,
         verify=validity_lineage.verify,
+    ),
+    MigrationStep(
+        id="20260323_004_workspaces_v1",
+        description="Add workspace registry/settings tables and conversation-run links.",
+        checksum=_checksum("20260323_004_workspaces_v1/workspaces_v1"),
+        apply=workspaces_v1.apply,
+        verify=workspaces_v1.verify,
     ),
 )

@@ -6,7 +6,7 @@
 
 **Local-ready LLM execution harness** for complex tasks.
 
-Loom decomposes goals, drives execution through verified steps, routes between thinking and acting models, and keeps work on track with structured state instead of chat history. Use it via TUI, CLI, API, or MCP with local or mixed local/cloud models.
+Loom decomposes goals, drives execution through verified steps, routes between thinking and acting models, and keeps work on track with structured state instead of chat history. Use it via TUI, CLI, API, or MCP with local, cloud, or mixed local/cloud models.
 
 Bring Kimi, Minimax, GLM, Claude, or any OpenAI-compatible model and Loom supplies the harness: tool calling, structured planning, parallel execution, independent verification, and persistent memory.
 
@@ -110,7 +110,39 @@ uv run loom run "Analyze Q3 financials and flag anomalies" -w /tmp/analysis
 
 # Start the API server (for programmatic access)
 uv run loom serve
+
+# Start the desktop sidecar runtime
+uv run loomd
 ```
+
+## Desktop Sidecar
+
+The workspace-first desktop direction uses a local `loomd` sidecar by default,
+not Docker. `loomd` reuses the existing Python engine and exposes a stable
+desktop bootstrap contract:
+
+- `GET /runtime`
+- `GET /workspaces`
+- `GET /workspaces/{id}/overview`
+- `GET /workspaces/{id}/conversations`
+- `GET /workspaces/{id}/runs`
+- `GET/PATCH /settings`
+
+`loomd` accepts runtime overrides for host, port, database path, scratch dir,
+and default workspace root:
+
+```bash
+uv run loomd \
+  --host 127.0.0.1 \
+  --port 9000 \
+  --database-path ~/.loom/loom.db \
+  --scratch-dir ~/.loom/scratch \
+  --workspace-default-path ~/projects
+```
+
+The Tauri desktop shell now starts `loomd` itself. It gives the sidecar a
+desktop-scoped SQLite DB, scratch dir, and log file under the app data
+directory, and picks an available loopback port starting at `127.0.0.1:9000`.
 
 ## Configuration
 
@@ -217,6 +249,9 @@ For operator-facing runtime telemetry verbosity, use `[telemetry].mode` (`off`, 
 `GET/PATCH /settings/telemetry` (loopback + admin token required when mutation is enabled,
 via `x-loom-admin-token` or `Authorization: Bearer ...`), or via TUI slash command
 `/telemetry`.
+For desktop-facing runtime controls, `GET /settings` returns grouped `basic` and
+`advanced` entries from the runtime config registry, and `PATCH /settings`
+applies runtime or persisted updates through the same registry.
 For large fetched binaries/documents (PDFs, Office files, archives), tune
 `[limits.runner]` retention keys to control cleanup pressure:
 `ingest_artifact_retention_max_age_days`,

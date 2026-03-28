@@ -53,6 +53,7 @@ treesitter = [
 
 [project.scripts]
 loom = "loom.__main__:cli"
+loomd = "loom.daemon.cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -19,6 +19,21 @@ MCP server config layers are resolved in this order:
 3. `~/.loom/mcp.toml`
 4. Legacy `[mcp]` section inside `loom.toml`
 
+## Desktop Settings API
+
+The workspace-first desktop shell uses the runtime config registry instead of a
+parallel settings system.
+
+- `GET /settings` returns entries grouped into `basic` and `advanced`
+- `PATCH /settings` applies runtime overrides or persisted writes
+- `GET /workspaces/{id}/settings` returns workspace-local JSON overrides
+- `PATCH /workspaces/{id}/settings` updates workspace-local JSON overrides
+
+The grouped `basic` section currently includes:
+
+- `execution.ask_user_policy`
+- `execution.cowork_tool_exposure_mode`
+
 ## `loom.toml` Reference
 
 ### `[server]`
@@ -27,6 +42,9 @@ MCP server config layers are resolved in this order:
 | --- | --- | --- | --- |
 | `host` | `string` | `"127.0.0.1"` | API bind host for `loom serve`. |
 | `port` | `int` | `9000` | API bind port for `loom serve`. |
+
+`loomd` uses the same `[server]` settings by default, but can override them at
+launch time with `--host` and `--port`.
 
 ### `[models.<name>]`
 
@@ -61,6 +79,15 @@ Recommended two-model split:
 | --- | --- | --- | --- |
 | `default_path` | `string` | `"~/projects"` | Default workspace root when none is supplied. |
 | `scratch_dir` | `string` | `"~/.loom/scratch"` | Scratch/temp storage path. |
+
+`loomd` can override both at launch time:
+
+- `--scratch-dir <path>`
+- `--workspace-default-path <path>`
+- `--database-path <path>`
+
+The Tauri desktop shell uses these overrides to keep desktop-owned runtime
+state separate from the default CLI/TUI database and scratch paths.
 
 ### `[execution]`
 

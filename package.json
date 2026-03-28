@@ -1,0 +1,12 @@
+{
+  "name": "loom-monorepo",
+  "private": true,
+  "packageManager": "pnpm@10.8.0",
+  "scripts": {
+    "desktop:dev": "pnpm --filter @loom/desktop dev",
+    "desktop:build": "pnpm --filter @loom/desktop build",
+    "desktop:test": "pnpm --filter @loom/desktop test",
+    "desktop:tauri:dev": "pnpm --filter @loom/desktop tauri:dev",
+    "desktop:tauri:build": "pnpm --filter @loom/desktop tauri:build"
+  }
+}

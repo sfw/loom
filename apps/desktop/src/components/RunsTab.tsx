@@ -1,0 +1,1597 @@
+import { useState, useMemo, useRef, useEffect, useCallback, lazy, Suspense, type FormEvent } from "react";
+
+const Markdown = lazy(() => import("react-markdown"));
+import {
+  Search,
+  Pause,
+  Play,
+  XCircle,
+  Send,
+  ChevronUp,
+  ChevronDown,
+  Zap,
+  FileText,
+  ArrowLeft,
+  Shield,
+  Loader2,
+  Clock,
+  CheckCircle2,
+  AlertTriangle,
+  Wrench,
+  FolderOpen,
+  Trash2,
+  RotateCcw,
+  RefreshCw,
+} from "lucide-react";
+import { useApp } from "@/context/AppContext";
+import { formatDate, formatBytes, highlightText } from "@/utils";
+import {
+  runTimelineTitle,
+  runTimelineDetail,
+  runTimelinePills,
+  runTimelineToolArgs,
+  runTimelineToolName,
+} from "../history";
+import { cn } from "@/lib/utils";
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const SAGE = {
+  button: "#6b7a5e",
+  buttonHover: "#8a9a7b",
+  border: "#8a9a7b",
+  text: "#a3b396",
+  textLight: "#bec8b4",
+} as const;
+
+const APPROVAL_MODES = [
+  { value: "auto", label: "Auto", desc: "Gate destructive ops" },
+  { value: "manual", label: "Manual", desc: "Gate every step" },
+  { value: "disabled", label: "Disabled", desc: "No gating" },
+] as const;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function eventTypeColor(eventType: string): string {
+  if (eventType === "tool_call_completed") return "bg-[#6b7a5e]/20 text-[#a3b396]";
+  if (eventType === "tool_call_started") return "bg-[#6b7a5e]/10 text-[#a3b396]/70";
+  if (eventType === "subtask_completed") return "bg-emerald-500/15 text-emerald-400";
+  if (eventType === "subtask_started") return "bg-sky-500/15 text-sky-400";
+  if (eventType === "subtask_failed" || eventType === "task_failed") return "bg-red-500/15 text-red-400";
+  if (eventType === "verification_passed") return "bg-emerald-500/10 text-emerald-400/80";
+  if (eventType === "verification_failed") return "bg-red-500/15 text-red-400";
+  if (eventType.startsWith("verification_")) return "bg-amber-500/10 text-amber-400/80";
+  if (eventType.includes("fail") || eventType.includes("error") || eventType.includes("stalled")) return "bg-red-500/15 text-red-400";
+  if (eventType === "task_completed") return "bg-emerald-500/15 text-emerald-300";
+  if (eventType.startsWith("approval_") || eventType.startsWith("ask_user_")) return "bg-violet-500/15 text-violet-400";
+  if (eventType === "model_invocation") return "bg-zinc-800/60 text-zinc-500";
+  if (eventType.startsWith("task_")) return "bg-zinc-700/50 text-zinc-400";
+  return "bg-zinc-800 text-zinc-500";
+}
+
+/** Extract structured highlights from event data — files, duration, key metrics. */
+function extractEventHighlights(event: { event_type: string; data: Record<string, unknown> }): {
+  files: string[];
+  duration: string;
+  metrics: string[];
+} {
+  const d = event.data;
+  const args = (typeof d.args === "object" && d.args !== null ? d.args : {}) as Record<string, unknown>;
+
+  // Files
+  const rawFiles = d.files_changed ?? d.files_changed_paths;
+  const files: string[] = Array.isArray(rawFiles)
+    ? rawFiles.filter((f): f is string => typeof f === "string" && f.trim() !== "")
+    : [];
+  // Also extract **filename.ext** and `filename.ext` patterns from markdown text
+  if (files.length === 0) {
+    const summary = String(d.summary || d.message || "");
+    // Match **file.ext** and `file.ext` patterns
+    const mdBold = summary.match(/\*\*([^*]+\.\w{1,6})\*\*/g);
+    const mdCode = summary.match(/`([^`]+\.\w{1,6})`/g);
+    const seen = new Set<string>();
+    for (const m of mdBold ?? []) {
+      const name = m.replace(/\*\*/g, "").trim();
+      if (name && !seen.has(name)) { seen.add(name); files.push(name); }
+    }
+    for (const m of mdCode ?? []) {
+      const name = m.replace(/`/g, "").trim();
+      if (name && !seen.has(name)) { seen.add(name); files.push(name); }
+    }
+  }
+  // Path from tool args or artifact path
+  if (files.length === 0) {
+    const p = String(d.path || d.artifact_path || args.path || "").trim();
+    if (p) files.push(p);
+  }
+
+  // Duration
+  const elapsed = typeof d.elapsed_ms === "number" ? d.elapsed_ms : (typeof d.duration === "number" ? d.duration * 1000 : 0);
+  const duration = elapsed >= 1000 ? `${(elapsed / 1000).toFixed(1)}s` : elapsed > 0 ? `${Math.round(elapsed)}ms` : "";
+
+  // Key metrics
+  const metrics: string[] = [];
+  if (typeof d.confidence === "number") metrics.push(`confidence ${Math.round(Number(d.confidence) * 100)}%`);
+  if (typeof d.tier === "number") metrics.push(`tier ${d.tier}`);
+  if (typeof d.extracted === "number") metrics.push(`${d.extracted} claims`);
+  if (typeof d.supported === "number") metrics.push(`${d.supported} supported`);
+  if (typeof d.contradicted === "number" && Number(d.contradicted) > 0) metrics.push(`${d.contradicted} contradicted`);
+  if (typeof d.score === "number") metrics.push(`score ${d.score}`);
+  const model = typeof d.model === "string" ? d.model.trim() : "";
+  if (model) metrics.push(model);
+  const tokens = typeof d.request_est_tokens === "number" ? `~${d.request_est_tokens} tok` : "";
+  if (tokens) metrics.push(tokens);
+
+  return { files, duration, metrics };
+}
+
+/** True if the detail text is long enough to warrant collapsing. */
+function isLongDetail(detail: string): boolean {
+  return detail.length > 120;
+}
+
+function eventTypeBadgeLabel(eventType: string): string {
+  switch (eventType) {
+    case "tool_call_started": return "TOOL";
+    case "tool_call_completed": return "TOOL";
+    case "subtask_started": return "STARTED";
+    case "subtask_completed": return "DONE";
+    case "subtask_failed": return "FAILED";
+    case "subtask_blocked": return "BLOCKED";
+    case "subtask_retrying": return "RETRY";
+    case "verification_started": return "VERIFY";
+    case "verification_passed": return "PASS";
+    case "verification_failed": return "FAIL";
+    case "verification_outcome": return "VERIFY";
+    case "verification_rule_applied": return "RULE";
+    case "verification_rule_skipped": return "SKIP";
+    case "model_invocation": return "MODEL";
+    case "task_completed": return "DONE";
+    case "task_failed": return "FAILED";
+    case "task_cancelled": return "CANCEL";
+    case "task_plan_ready": return "PLAN";
+    case "approval_requested": return "APPROVE";
+    case "approval_received": return "APPROVED";
+    case "ask_user_requested": return "INPUT";
+    case "run_validity_scorecard": return "SCORE";
+    default: {
+      const parts = eventType.replace(/_/g, " ").split(" ");
+      return parts.slice(0, 2).join(" ").toUpperCase().slice(0, 12);
+    }
+  }
+}
+
+function subtaskStatus(events: Array<{ event_type: string; data: Record<string, unknown> }>, subtaskId: string): "pending" | "running" | "completed" | "failed" {
+  const matching = events.filter(
+    (e) =>
+      (e.event_type.startsWith("subtask_") || e.event_type.startsWith("phase_")) &&
+      (e.data.subtask_id === subtaskId || e.data.phase_id === subtaskId),
+  );
+  if (matching.some((e) => e.event_type === "subtask_completed" || e.data.status === "completed")) return "completed";
+  if (matching.some((e) => e.event_type === "subtask_failed" || e.data.status === "failed")) return "failed";
+  if (matching.some((e) => e.event_type === "subtask_started" || e.data.status === "running")) return "running";
+  return "pending";
+}
+
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
+/** Scroll button with accelerating hold-to-scroll. */
+function ScrollButton({ direction, scrollRef }: { direction: "up" | "down"; scrollRef: React.RefObject<HTMLDivElement | null> }) {
+  const intervalRef = useRef<number | null>(null);
+  const speedRef = useRef(60);
+
+  const startScroll = useCallback(() => {
+    speedRef.current = 60;
+    const tick = () => {
+      const el = scrollRef.current;
+      if (!el) return;
+      el.scrollBy({ top: direction === "up" ? -speedRef.current : speedRef.current });
+      speedRef.current = Math.min(speedRef.current + 20, 400);
+      intervalRef.current = window.setTimeout(tick, 80);
+    };
+    tick();
+  }, [direction, scrollRef]);
+
+  const stopScroll = useCallback(() => {
+    if (intervalRef.current !== null) {
+      window.clearTimeout(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => stopScroll, [stopScroll]);
+
+  return (
+    <button
+      type="button"
+      onMouseDown={startScroll}
+      onMouseUp={stopScroll}
+      onMouseLeave={stopScroll}
+      className="rounded p-0.5 hover:bg-zinc-800 text-zinc-600 hover:text-zinc-400 transition-colors"
+    >
+      {direction === "up" ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+    </button>
+  );
+}
+
+function RunDot({ status }: { status: string }) {
+  const s = status.toLowerCase();
+  const active = s === "executing" || s === "planning" || s === "running";
+  return (
+    <span
+      className={cn(
+        "h-2 w-2 shrink-0 rounded-full",
+        active
+          ? "bg-emerald-400 animate-pulse"
+          : s === "failed"
+            ? "bg-red-400"
+            : s === "completed"
+              ? "bg-emerald-400"
+              : s === "paused"
+                ? "bg-amber-400"
+                : "bg-zinc-700",
+      )}
+    />
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const s = status.toLowerCase();
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+        s === "executing" || s === "planning" || s === "running"
+          ? "bg-emerald-500/15 text-emerald-400"
+          : s === "completed"
+            ? "bg-emerald-500/15 text-emerald-300"
+            : s === "failed"
+              ? "bg-red-500/15 text-red-400"
+              : s === "paused"
+                ? "bg-amber-500/15 text-amber-400"
+                : s === "cancelled"
+                  ? "bg-zinc-800 text-zinc-600"
+                  : "bg-zinc-800 text-zinc-500",
+      )}
+    >
+      <RunDot status={status} />
+      {status}
+    </span>
+  );
+}
+
+function SubtaskStatusIcon({
+  status,
+  animated = true,
+}: {
+  status: "pending" | "running" | "completed" | "failed";
+  animated?: boolean;
+}) {
+  switch (status) {
+    case "completed":
+      return <CheckCircle2 size={14} className="text-emerald-400" />;
+    case "failed":
+      return <AlertTriangle size={14} className="text-red-400" />;
+    case "running":
+      return <Loader2 size={14} className={cn("text-amber-400", animated && "animate-spin")} />;
+    default:
+      return <Clock size={14} className="text-zinc-600" />;
+  }
+}
+
+function normalizeProcessQuery(value: string): string {
+  return String(value || "").trim().toLowerCase();
+}
+
+function processPromptHint(process: {
+  name: string;
+  description?: string;
+} | null): string {
+  if (!process) {
+    return "Give me a challenge";
+  }
+
+  const name = normalizeProcessQuery(process.name);
+  const description = normalizeProcessQuery(process.description || "");
+  const haystack = `${name} ${description}`;
+
+  if (
+    haystack.includes("seo")
+    || haystack.includes("geo")
+    || haystack.includes("website")
+    || haystack.includes("url")
+    || haystack.includes("accessibility")
+  ) {
+    return "Paste the site URL and what you want reviewed";
+  }
+  if (
+    haystack.includes("investment")
+    || haystack.includes("portfolio")
+    || haystack.includes("equities")
+    || haystack.includes("valuation")
+  ) {
+    return "Describe the company, thesis, portfolio, or investor constraint to analyze";
+  }
+  if (
+    haystack.includes("competitive")
+    || haystack.includes("competitor")
+    || haystack.includes("market-gap")
+  ) {
+    return "Name the company, product, or market you want benchmarked";
+  }
+  if (
+    haystack.includes("research")
+    || haystack.includes("report")
+    || haystack.includes("consulting")
+  ) {
+    return "Describe the question, topic, or business problem you want investigated";
+  }
+  if (
+    haystack.includes("marketing")
+    || haystack.includes("campaign")
+    || haystack.includes("audience")
+    || haystack.includes("youtube")
+  ) {
+    return "Share the product, audience, and outcome you want this process to produce";
+  }
+  if (
+    haystack.includes("prd")
+    || haystack.includes("software")
+    || haystack.includes("design")
+  ) {
+    return "Describe the product idea, user problem, or feature you want designed";
+  }
+
+  return "Tell this process what to work on";
+}
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
+
+export default function RunsTab() {
+  const {
+    filteredRuns,
+    selectedRunId,
+    setSelectedRunId,
+    selectedRunSummary,
+    runDetail,
+    runTimeline,
+    runArtifacts,
+    runStreaming,
+    loadingRunDetail,
+    runLoadError,
+    runIsTerminal,
+    runCanPause,
+    runCanResume,
+    runCanMessage,
+    visibleRunTimeline,
+    visibleRunArtifacts,
+    runHistoryQuery,
+    setRunHistoryQuery,
+    activeRunMatchIndex,
+    totalRunMatches,
+    runGoal,
+    setRunGoal,
+    runProcess,
+    setRunProcess,
+    runApprovalMode,
+    setRunApprovalMode,
+    launchingRun,
+    runOperatorMessage,
+    setRunOperatorMessage,
+    sendingRunMessage,
+    runActionPending,
+    runMatchRefs,
+    handleLaunchRun,
+    handleRunControl,
+    handleDeleteRun,
+    handleRestartRun,
+    handleSendRunMessage,
+    refreshRun,
+    stepRunMatch,
+    selectedWorkspaceId,
+    workspaceSearchQuery,
+    overview,
+    inventory,
+    handleOpenWorkspaceFile,
+    setActiveTab,
+  } = useApp();
+
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [activitySearch, setActivitySearch] = useState("");
+  const [processQuery, setProcessQuery] = useState("");
+
+  const highlightQuery = runHistoryQuery || workspaceSearchQuery || "";
+  const processes = inventory?.processes || [];
+  const disabled = !selectedWorkspaceId || launchingRun;
+  const workspacePath = overview?.workspace?.canonical_path || "";
+  const selectedProcessInfo = useMemo(
+    () => processes.find((process) => process.name === runProcess) || null,
+    [processes, runProcess],
+  );
+  const normalizedProcessQuery = normalizeProcessQuery(processQuery);
+  const visibleProcesses = useMemo(() => {
+    const scored = processes
+      .map((process, index) => {
+        const name = normalizeProcessQuery(process.name);
+        const description = normalizeProcessQuery(process.description || "");
+        const author = normalizeProcessQuery(process.author || "");
+        const text = `${name} ${description} ${author}`;
+        const selected = process.name === runProcess;
+        const matches = !normalizedProcessQuery || text.includes(normalizedProcessQuery);
+        return { process, index, selected, matches };
+      })
+      .filter((entry) => entry.matches)
+      .sort((left, right) => {
+        if (left.selected !== right.selected) {
+          return left.selected ? -1 : 1;
+        }
+        return left.index - right.index;
+      });
+    return scored.map((entry) => entry.process);
+  }, [normalizedProcessQuery, processes, runProcess]);
+  const launchPlaceholder = processPromptHint(selectedProcessInfo);
+
+  // --- Mode routing ---
+  if (selectedRunId) {
+    if (runDetail) {
+      return (
+        <RunDetailView
+          runDetail={runDetail}
+          runTimeline={runTimeline}
+          runArtifacts={runArtifacts}
+          runStreaming={runStreaming}
+          runIsTerminal={runIsTerminal}
+          runCanPause={runCanPause}
+          runCanResume={runCanResume}
+          runCanMessage={runCanMessage}
+          visibleRunTimeline={visibleRunTimeline}
+          visibleRunArtifacts={visibleRunArtifacts}
+          runHistoryQuery={runHistoryQuery}
+          setRunHistoryQuery={setRunHistoryQuery}
+          activeRunMatchIndex={activeRunMatchIndex}
+          totalRunMatches={totalRunMatches}
+          runOperatorMessage={runOperatorMessage}
+          setRunOperatorMessage={setRunOperatorMessage}
+          sendingRunMessage={sendingRunMessage}
+          runActionPending={runActionPending}
+          runMatchRefs={runMatchRefs}
+          handleRunControl={handleRunControl}
+          handleDeleteRun={handleDeleteRun}
+          handleRestartRun={handleRestartRun}
+          handleSendRunMessage={handleSendRunMessage}
+          stepRunMatch={stepRunMatch}
+          setSelectedRunId={setSelectedRunId}
+          handleOpenWorkspaceFile={handleOpenWorkspaceFile}
+          setActiveTab={setActiveTab}
+          highlightQuery={highlightQuery}
+          activitySearch={activitySearch}
+          setActivitySearch={setActivitySearch}
+        />
+      );
+    }
+
+    return (
+      <RunLoadingView
+        runId={selectedRunId}
+        runGoal={selectedRunSummary?.goal || ""}
+        processName={selectedRunSummary?.process_name || ""}
+        loading={Boolean(loadingRunDetail) || !runLoadError}
+        error={runLoadError || ""}
+        onBack={() => setSelectedRunId("")}
+        onRetry={() => { void refreshRun(selectedRunId); }}
+      />
+    );
+  }
+
+  // =========================================================================
+  // Mode 1: Full-width launcher
+  // =========================================================================
+  return (
+    <div className="flex h-full flex-col overflow-y-auto bg-[#0f0f12]">
+      <div className="flex-1 flex flex-col items-center px-6 py-10 max-w-4xl mx-auto w-full">
+        {/* --- Title --- */}
+        <div className="text-center mb-8">
+          <div className="flex h-12 w-12 mx-auto items-center justify-center rounded-2xl bg-[#6b7a5e]/15 mb-3">
+            <Play className="h-6 w-6 text-[#a3b396]" />
+          </div>
+          <h2 className="text-xl font-bold text-zinc-100 mb-1">Launch a Run</h2>
+          {workspacePath && (
+            <p className="flex items-center justify-center gap-1.5 text-xs text-zinc-600">
+              <FolderOpen size={12} />
+              <span className="font-mono truncate max-w-md">{workspacePath}</span>
+            </p>
+          )}
+        </div>
+
+        {/* --- Process cards grid --- */}
+        {processes.length > 0 && (
+          <div className="w-full mb-6">
+            <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-600">
+                Processes ({processes.length})
+              </p>
+              <div className="relative w-full sm:max-w-xs">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-600" />
+                <input
+                  type="text"
+                  value={processQuery}
+                  onChange={(e) => setProcessQuery(e.target.value)}
+                  placeholder="Search processes..."
+                  className="w-full rounded-lg border border-zinc-800 bg-zinc-900/70 py-2 pl-8 pr-3 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:ring-1 focus:ring-[#8a9a7b]/50"
+                />
+              </div>
+            </div>
+            {normalizedProcessQuery && (
+              <p className="mb-2 text-[10px] text-zinc-600">
+                Showing {visibleProcesses.length} matching process{visibleProcesses.length === 1 ? "" : "es"}
+              </p>
+            )}
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {visibleProcesses.map((p) => {
+                const isSelected = runProcess === p.name;
+                return (
+                  <button
+                    key={p.name}
+                    type="button"
+                    onClick={() => {
+                      setRunProcess(isSelected ? "" : p.name);
+                    }}
+                    className={cn(
+                      "rounded-xl px-4 py-3 text-left transition-all border",
+                      isSelected
+                        ? "bg-[#6b7a5e]/15 border-[#8a9a7b]/50 ring-1 ring-[#8a9a7b]/25"
+                        : "bg-zinc-900/60 border-zinc-800 hover:border-zinc-700 hover:bg-zinc-800/50",
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-2 mb-1">
+                      <span
+                        className={cn(
+                          "text-sm font-semibold truncate",
+                          isSelected ? "text-[#bec8b4]" : "text-zinc-200",
+                        )}
+                      >
+                        {p.name}
+                      </span>
+                      {p.version && (
+                        <span className="text-[9px] text-zinc-600 shrink-0 font-mono">v{p.version}</span>
+                      )}
+                    </div>
+                    {p.description && (
+                      <p className="text-[11px] text-zinc-500 line-clamp-2 leading-relaxed">{p.description}</p>
+                    )}
+                    {p.author && (
+                      <p className="text-[10px] text-zinc-600 mt-1.5">by {p.author}</p>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            {visibleProcesses.length === 0 && (
+              <div className="rounded-xl border border-dashed border-zinc-800 px-4 py-6 text-center text-sm text-zinc-600">
+                No processes match that search yet.
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* --- Goal input --- */}
+        <form
+          onSubmit={(e: FormEvent<HTMLFormElement>) => handleLaunchRun(e)}
+          className="w-full space-y-3"
+        >
+          {runProcess && (
+            <div className="flex items-center gap-2 rounded-lg bg-[#6b7a5e]/10 border border-[#8a9a7b]/20 px-3 py-2">
+              <FileText className="h-3.5 w-3.5 text-[#a3b396] shrink-0" />
+              <span className="text-sm text-[#bec8b4] font-medium">{runProcess}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setRunProcess("");
+                }}
+                className="ml-auto text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+              >
+                clear
+              </button>
+            </div>
+          )}
+
+          <textarea
+            value={runGoal}
+            onChange={(e) => setRunGoal(e.target.value)}
+            placeholder={launchPlaceholder}
+            rows={3}
+            disabled={disabled}
+            className="w-full rounded-xl border border-zinc-700 bg-zinc-900/80 px-4 py-3 text-sm text-zinc-200 placeholder:text-zinc-600 resize-none focus:outline-none focus:ring-1 focus:ring-[#8a9a7b]/50 focus:border-[#8a9a7b]/50 disabled:opacity-40"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                e.currentTarget.form?.requestSubmit();
+              }
+            }}
+          />
+          {selectedProcessInfo?.description && (
+            <p className="text-[11px] leading-relaxed text-zinc-500">
+              {selectedProcessInfo.description}
+            </p>
+          )}
+
+          {/* --- Advanced options --- */}
+          <div>
+            <button
+              type="button"
+              onClick={() => setShowAdvanced(!showAdvanced)}
+              className="flex items-center gap-1 text-[11px] text-zinc-600 hover:text-zinc-400 transition-colors"
+            >
+              {showAdvanced ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+              Advanced options
+            </button>
+            {showAdvanced && (
+              <div className="mt-2 rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
+                <label className="flex items-center gap-1.5 text-[11px] font-medium text-zinc-500 mb-2">
+                  <Shield className="h-3 w-3" />
+                  Approval mode
+                </label>
+                <div className="flex gap-1.5">
+                  {APPROVAL_MODES.map((mode) => (
+                    <button
+                      key={mode.value}
+                      type="button"
+                      onClick={() => setRunApprovalMode(mode.value)}
+                      disabled={disabled}
+                      title={mode.desc}
+                      className={cn(
+                        "flex-1 rounded-lg px-2.5 py-2 text-[11px] font-medium transition-colors border",
+                        runApprovalMode === mode.value
+                          ? "bg-[#6b7a5e]/15 text-[#bec8b4] border-[#8a9a7b]/30"
+                          : "text-zinc-400 border-zinc-700 hover:bg-zinc-800",
+                        "disabled:opacity-40",
+                      )}
+                    >
+                      {mode.label}
+                      <span className="block text-[9px] text-zinc-600 font-normal mt-0.5">{mode.desc}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* --- Launch button --- */}
+          <button
+            type="submit"
+            disabled={disabled || (!runGoal.trim() && !runProcess)}
+            className={cn(
+              "flex w-full items-center justify-center gap-2 rounded-xl px-5 py-3 text-sm font-semibold transition-colors",
+              "bg-[#6b7a5e] text-white hover:bg-[#8a9a7b]",
+              "disabled:opacity-40 disabled:cursor-not-allowed",
+            )}
+          >
+            {launchingRun ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Launching...
+              </>
+            ) : (
+              <>
+                <Play className="h-4 w-4" />
+                {runProcess ? `Launch ${runProcess}` : "Launch run"}
+              </>
+            )}
+          </button>
+
+          <p className="text-center text-[10px] text-zinc-700">
+            {typeof navigator !== "undefined" && navigator.platform?.includes("Mac") ? "\u2318" : "Ctrl"}+Enter to launch
+          </p>
+        </form>
+
+        {/* --- Recent runs --- */}
+        {filteredRuns.length > 0 && (
+          <div className="w-full mt-10">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-600 mb-2">
+              Recent runs ({filteredRuns.length})
+            </p>
+            <div className="space-y-1">
+              {filteredRuns.map((run) => (
+                <button
+                  key={run.id}
+                  type="button"
+                  onClick={() => setSelectedRunId(run.id)}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors hover:bg-zinc-800/60 group"
+                >
+                  <RunDot status={run.status} />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-zinc-200 truncate group-hover:text-zinc-100">
+                      {highlightText(run.goal || "Untitled run", highlightQuery)}
+                    </p>
+                    <div className="flex items-center gap-2 mt-0.5">
+                      <StatusBadge status={run.status} />
+                      {run.process_name && (
+                        <span className="text-[10px] text-zinc-600 truncate">{run.process_name}</span>
+                      )}
+                    </div>
+                  </div>
+                  <span className="text-[10px] text-zinc-700 shrink-0 tabular-nums">
+                    {formatDate(run.updated_at)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* --- Empty state --- */}
+        {filteredRuns.length === 0 && processes.length === 0 && (
+          <div className="w-full mt-10 text-center py-8 border border-dashed border-zinc-800 rounded-xl">
+            <Zap className="h-8 w-8 text-zinc-700 mx-auto mb-2" />
+            <p className="text-sm text-zinc-500">No processes or runs yet</p>
+            <p className="text-xs text-zinc-700 mt-1">
+              Describe a goal above to launch an ad-hoc run
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RunLoadingView({
+  runId,
+  runGoal,
+  processName,
+  loading,
+  error,
+  onBack,
+  onRetry,
+}: {
+  runId: string;
+  runGoal: string;
+  processName: string;
+  loading: boolean;
+  error: string;
+  onBack: () => void;
+  onRetry: () => void;
+}) {
+  const title = runGoal || "Opening run";
+  return (
+    <div className="flex h-full flex-col bg-[#0f0f12]">
+      <div className="border-b border-zinc-800 px-5 py-4">
+        <button
+          type="button"
+          onClick={onBack}
+          className="mb-3 inline-flex items-center gap-1 text-xs text-zinc-500 transition-colors hover:text-zinc-300"
+        >
+          <ArrowLeft size={12} />
+          Back to launcher
+        </button>
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#6b7a5e]/15">
+            {loading ? <Loader2 className="h-5 w-5 animate-spin text-[#a3b396]" /> : <AlertTriangle className="h-5 w-5 text-amber-400" />}
+          </div>
+          <div className="min-w-0">
+            <h2 className="truncate text-lg font-semibold text-zinc-100">{title}</h2>
+            <p className="truncate text-xs text-zinc-500">
+              {processName ? `${processName} • ` : ""}{runId}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex flex-1 items-center justify-center px-6">
+        <div className="w-full max-w-lg rounded-2xl border border-zinc-800 bg-zinc-900/60 p-6 text-center">
+          {error ? (
+            <>
+              <AlertTriangle className="mx-auto mb-3 h-8 w-8 text-amber-400" />
+              <h3 className="mb-2 text-base font-semibold text-zinc-100">Run created, but the detail view did not finish loading</h3>
+              <p className="mb-4 text-sm text-zinc-500">{error}</p>
+              <button
+                type="button"
+                onClick={onRetry}
+                className="inline-flex items-center gap-2 rounded-lg bg-[#6b7a5e] px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-[#8a9a7b]"
+              >
+                <RefreshCw size={14} />
+                Retry load
+              </button>
+            </>
+          ) : (
+            <>
+              <Loader2 className="mx-auto mb-3 h-8 w-8 animate-spin text-[#a3b396]" />
+              <h3 className="mb-2 text-base font-semibold text-zinc-100">Opening run...</h3>
+              <p className="text-sm text-zinc-500">
+                We created the run and are loading its timeline now.
+              </p>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ===========================================================================
+// Mode 2: Run detail view
+// ===========================================================================
+
+interface RunDetailViewProps {
+  runDetail: NonNullable<ReturnType<typeof useApp>["runDetail"]>;
+  runTimeline: ReturnType<typeof useApp>["runTimeline"];
+  runArtifacts: ReturnType<typeof useApp>["runArtifacts"];
+  runStreaming: boolean;
+  runIsTerminal: boolean;
+  runCanPause: boolean;
+  runCanResume: boolean;
+  runCanMessage: boolean;
+  visibleRunTimeline: ReturnType<typeof useApp>["visibleRunTimeline"];
+  visibleRunArtifacts: ReturnType<typeof useApp>["visibleRunArtifacts"];
+  runHistoryQuery: string;
+  setRunHistoryQuery: (q: string) => void;
+  activeRunMatchIndex: number;
+  totalRunMatches: number;
+  runOperatorMessage: string;
+  setRunOperatorMessage: (m: string) => void;
+  sendingRunMessage: boolean;
+  runActionPending: string;
+  runMatchRefs: ReturnType<typeof useApp>["runMatchRefs"];
+  handleRunControl: (action: "pause" | "resume" | "cancel") => void;
+  handleDeleteRun: () => void;
+  handleRestartRun: () => void;
+  handleSendRunMessage: (e: FormEvent<HTMLFormElement>) => void;
+  stepRunMatch: (delta: number) => void;
+  setSelectedRunId: (id: string) => void;
+  handleOpenWorkspaceFile: ReturnType<typeof useApp>["handleOpenWorkspaceFile"];
+  setActiveTab: ReturnType<typeof useApp>["setActiveTab"];
+  highlightQuery: string;
+  activitySearch: string;
+  setActivitySearch: (q: string) => void;
+}
+
+function RunDetailView({
+  runDetail,
+  runTimeline,
+  runArtifacts,
+  runStreaming,
+  runIsTerminal,
+  runCanPause,
+  runCanResume,
+  runCanMessage,
+  visibleRunTimeline,
+  visibleRunArtifacts,
+  runHistoryQuery,
+  setRunHistoryQuery,
+  activeRunMatchIndex,
+  totalRunMatches,
+  runOperatorMessage,
+  setRunOperatorMessage,
+  sendingRunMessage,
+  runActionPending,
+  runMatchRefs,
+  handleRunControl,
+  handleDeleteRun,
+  handleRestartRun,
+  handleSendRunMessage,
+  stepRunMatch,
+  setSelectedRunId,
+  handleOpenWorkspaceFile,
+  setActiveTab,
+  highlightQuery,
+  activitySearch,
+  setActivitySearch,
+}: RunDetailViewProps) {
+  const runStatus = String(runDetail.status || "").trim().toLowerCase();
+  const liveAnimationsEnabled = runStatus === "executing" || runStatus === "planning" || runStatus === "running";
+  const displayableRunArtifacts = useMemo(
+    () => visibleRunArtifacts.filter((artifact) => isDisplayableArtifactPath(artifact.path)),
+    [visibleRunArtifacts],
+  );
+  // Build plan graph: prefer authoritative plan_subtasks from API, fall back to timeline extraction
+  const planNodes = useMemo(() => {
+    const apiPlan = runDetail.plan_subtasks;
+    if (Array.isArray(apiPlan) && apiPlan.length > 0) {
+      return apiPlan.map((s, i) => ({
+        id: s.id,
+        goal: s.description || s.id,
+        status: s.status as "pending" | "running" | "completed" | "failed",
+        depends_on: s.depends_on ?? [],
+        phase_id: s.phase_id || "",
+        is_critical_path: s.is_critical_path,
+        is_synthesis: s.is_synthesis,
+        order: i,
+      }));
+    }
+    // Fallback: extract from timeline events
+    const ids = new Map<string, { id: string; goal: string; order: number; depends_on: string[]; phase_id: string; is_critical_path: boolean; is_synthesis: boolean }>();
+    for (const event of runTimeline) {
+      const sid = event.data.subtask_id;
+      const pid = event.data.phase_id;
+      const key = typeof sid === "string" && sid.trim() ? sid.trim() : typeof pid === "string" && pid.trim() ? pid.trim() : null;
+      if (key && !ids.has(key)) {
+        const goal = typeof event.data.goal === "string" ? event.data.goal : typeof event.data.message === "string" ? event.data.message : key;
+        ids.set(key, { id: key, goal, order: ids.size, depends_on: [], phase_id: "", is_critical_path: false, is_synthesis: false });
+      }
+    }
+    return Array.from(ids.values()).sort((a, b) => a.order - b.order).map((n) => ({
+      ...n,
+      status: subtaskStatus(runTimeline, n.id),
+    }));
+  }, [runDetail, runTimeline]);
+
+  // --- Activity category filters ---
+  type ActivityCategory = "tool" | "subtask" | "verify" | "model" | "task" | "other";
+  const [hiddenCategories, setHiddenCategories] = useState<Set<ActivityCategory>>(
+    () => new Set<ActivityCategory>(),
+  );
+
+  function eventCategory(eventType: string): ActivityCategory {
+    if (eventType.startsWith("tool_call")) return "tool";
+    if (eventType.startsWith("subtask_") || eventType.startsWith("phase_")) return "subtask";
+    if (eventType.startsWith("verification_") || eventType === "claim_verification_summary" || eventType === "artifact_seal_validation") return "verify";
+    if (eventType === "model_invocation") return "model";
+    if (eventType.startsWith("task_") || eventType === "run_validity_scorecard") return "task";
+    return "other";
+  }
+
+  const categoryCounts = useMemo(() => {
+    const counts: Record<ActivityCategory, number> = { tool: 0, subtask: 0, verify: 0, model: 0, task: 0, other: 0 };
+    for (const e of visibleRunTimeline) {
+      counts[eventCategory(e.event_type)]++;
+    }
+    return counts;
+  }, [visibleRunTimeline]);
+
+  const toggleCategory = (cat: ActivityCategory) => {
+    setHiddenCategories((prev) => {
+      const next = new Set(prev);
+      if (next.has(cat)) next.delete(cat);
+      else next.add(cat);
+      return next;
+    });
+  };
+
+  // Filter activity by category toggles + local search
+  const filteredActivity = useMemo(() => {
+    let events = visibleRunTimeline.filter(
+      (e) => !hiddenCategories.has(eventCategory(e.event_type)),
+    );
+    if (activitySearch.trim()) {
+      const needle = activitySearch.toLowerCase();
+      events = events.filter((e) => {
+        const title = runTimelineTitle(e).toLowerCase();
+        const detail = runTimelineDetail(e).toLowerCase();
+        return title.includes(needle) || detail.includes(needle) || e.event_type.includes(needle);
+      });
+    }
+    return events;
+  }, [visibleRunTimeline, hiddenCategories, activitySearch]);
+
+  // --- Activity scroll: pin to bottom during streaming, unpin on user scroll up ---
+  const activityScrollRef = useRef<HTMLDivElement>(null);
+  const isPinnedRef = useRef(true);
+  const prevActivityLenRef = useRef(filteredActivity.length);
+
+  const handleActivityScroll = useCallback(() => {
+    const el = activityScrollRef.current;
+    if (!el) return;
+    // Pinned if scrolled within 40px of the bottom
+    isPinnedRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
+  }, []);
+
+  useEffect(() => {
+    const el = activityScrollRef.current;
+    if (!el) return;
+    // Auto-scroll to bottom when new events arrive and pinned
+    if (isPinnedRef.current && filteredActivity.length !== prevActivityLenRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+    prevActivityLenRef.current = filteredActivity.length;
+  }, [filteredActivity.length]);
+
+  // Initial pin on mount
+  useEffect(() => {
+    const el = activityScrollRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, []);
+
+  // Group artifacts by category
+  const artifactsByCategory = useMemo(() => {
+    const groups = new Map<string, typeof displayableRunArtifacts>();
+    for (const artifact of displayableRunArtifacts) {
+      const cat = artifact.category || "uncategorized";
+      if (!groups.has(cat)) groups.set(cat, []);
+      groups.get(cat)!.push(artifact);
+    }
+    return groups;
+  }, [displayableRunArtifacts]);
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden bg-[#0f0f12]">
+      {/* --- Header bar --- */}
+      <header className="flex items-center gap-3 border-b border-zinc-800/60 px-5 py-3 shrink-0 bg-zinc-900/50">
+        <button
+          type="button"
+          onClick={() => setSelectedRunId("")}
+          className="flex h-7 w-7 items-center justify-center rounded-lg text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 transition-colors"
+          title="Back to runs"
+        >
+          <ArrowLeft size={16} />
+        </button>
+
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-semibold text-zinc-100 truncate">
+            {runDetail.goal || "Untitled run"}
+          </p>
+          <div className="flex items-center gap-2 mt-0.5">
+            {runDetail.process_name && (
+              <span className="text-[11px] text-zinc-500 font-medium">{runDetail.process_name}</span>
+            )}
+            {!runDetail.process_name && (
+              <span className="text-[11px] text-zinc-600 italic">ad-hoc</span>
+            )}
+            <StatusBadge status={runDetail.status} />
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 shrink-0">
+          {runStreaming && liveAnimationsEnabled && (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2.5 py-0.5 text-[10px] font-semibold text-emerald-400">
+              <span className={cn("h-1.5 w-1.5 rounded-full bg-emerald-400", liveAnimationsEnabled && "animate-pulse")} />
+              Streaming
+            </span>
+          )}
+          {runCanPause && (
+            <button
+              type="button"
+              onClick={() => handleRunControl("pause")}
+              disabled={runActionPending !== ""}
+              className="flex items-center gap-1.5 rounded-lg bg-zinc-800 px-3 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-700 disabled:opacity-40 transition-colors border border-zinc-700"
+            >
+              <Pause size={12} /> Pause
+            </button>
+          )}
+          {runCanResume && (
+            <button
+              type="button"
+              onClick={() => handleRunControl("resume")}
+              disabled={runActionPending !== ""}
+              className="flex items-center gap-1.5 rounded-lg bg-[#6b7a5e] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#8a9a7b] disabled:opacity-40 transition-colors"
+            >
+              <Play size={12} /> Resume
+            </button>
+          )}
+          {!runIsTerminal && (
+            <button
+              type="button"
+              onClick={() => handleRunControl("cancel")}
+              disabled={runActionPending !== ""}
+              className="flex items-center gap-1.5 rounded-lg border border-red-500/20 px-3 py-1.5 text-xs font-medium text-red-400 hover:bg-red-500/10 disabled:opacity-40 transition-colors"
+            >
+              <XCircle size={12} /> Cancel
+            </button>
+          )}
+          {runIsTerminal && runDetail.status.toLowerCase() !== "completed" && (
+            <button
+              type="button"
+              onClick={() => {
+                handleRestartRun();
+              }}
+              disabled={runActionPending !== ""}
+              className="flex items-center gap-1.5 rounded-lg bg-[#6b7a5e] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#8a9a7b] disabled:opacity-40 transition-colors"
+            >
+              <RotateCcw size={12} /> Restart
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={async () => {
+              const msg = runIsTerminal
+                ? "Delete this run? This cannot be undone."
+                : "Force-delete this run? It may still be executing. This cannot be undone.";
+              try {
+                const { confirm } = await import("@tauri-apps/plugin-dialog");
+                const ok = await confirm(msg, { title: "Loom Desktop", kind: "warning" });
+                if (!ok) return;
+              } catch {
+                // Fallback for non-Tauri environments
+                if (!window.confirm(msg)) return;
+              }
+              handleDeleteRun();
+            }}
+            disabled={runActionPending !== ""}
+            className="flex items-center gap-1.5 rounded-lg border border-red-500/20 px-3 py-1.5 text-xs font-medium text-red-400 hover:bg-red-500/10 disabled:opacity-40 transition-colors"
+          >
+            <Trash2 size={12} /> Delete
+          </button>
+        </div>
+      </header>
+
+      {/* --- Scrollable body --- */}
+      <div className="flex-1 overflow-y-auto px-6 py-5 space-y-8">
+        {/* ============================================================= */}
+        {/* Section 1: Plan / Subtasks                                     */}
+        {/* ============================================================= */}
+        {planNodes.length > 0 && (
+          <section>
+            <div className="flex items-center gap-2 mb-3">
+              <Zap size={14} className="text-[#a3b396]" />
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+                Plan ({planNodes.length} subtasks)
+              </h3>
+            </div>
+            {/* Connected graph layout */}
+            <div className="relative flex flex-col gap-0">
+              {planNodes.map((node, idx) => {
+                const status = runDetail.plan_subtasks
+                  ? node.status
+                  : subtaskStatus(runTimeline, node.id);
+                const hasDeps = node.depends_on.length > 0;
+                const isLast = idx === planNodes.length - 1;
+                const statusColor =
+                  status === "completed"
+                    ? "border-emerald-500/40 bg-emerald-500/5"
+                    : status === "failed"
+                      ? "border-red-500/40 bg-red-500/5"
+                      : status === "running"
+                        ? "border-amber-500/40 bg-amber-500/5 ring-1 ring-amber-500/20"
+                        : "border-zinc-800 bg-zinc-900/40";
+                const lineColor =
+                  status === "completed"
+                    ? "bg-emerald-500/40"
+                    : status === "failed"
+                      ? "bg-red-500/30"
+                      : "bg-zinc-700/50";
+                return (
+                  <div key={node.id} className="relative flex items-stretch">
+                    {/* Vertical connector rail */}
+                    <div className="relative flex flex-col items-center w-8 shrink-0">
+                      {/* Line from previous node */}
+                      {idx > 0 && (
+                        <div className={cn("w-px flex-1 min-h-2", lineColor)} />
+                      )}
+                      {/* Node dot */}
+                      <div className="shrink-0 my-1">
+                        <SubtaskStatusIcon
+                          status={status as "pending" | "running" | "completed" | "failed"}
+                          animated={liveAnimationsEnabled}
+                        />
+                      </div>
+                      {/* Line to next node */}
+                      {!isLast && (
+                        <div className="w-px flex-1 min-h-2 bg-zinc-700/50" />
+                      )}
+                    </div>
+
+                    {/* Node card */}
+                    <div
+                      className={cn(
+                        "flex-1 rounded-lg border px-3 py-2 my-1 transition-colors min-w-0",
+                        statusColor,
+                      )}
+                    >
+                      <div className="flex items-center gap-2">
+                        <p className="text-xs font-semibold text-zinc-200 truncate">{node.id}</p>
+                        {node.is_critical_path && (
+                          <span className="rounded bg-amber-500/15 px-1 py-px text-[8px] font-semibold text-amber-400 shrink-0">
+                            CRITICAL
+                          </span>
+                        )}
+                        {node.is_synthesis && (
+                          <span className="rounded bg-violet-500/15 px-1 py-px text-[8px] font-semibold text-violet-400 shrink-0">
+                            SYNTHESIS
+                          </span>
+                        )}
+                        {node.phase_id && node.phase_id !== node.id && (
+                          <span className="rounded bg-zinc-800 px-1 py-px text-[8px] text-zinc-500 shrink-0">
+                            {node.phase_id}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-zinc-400 line-clamp-2 mt-0.5">{node.goal}</p>
+                      {hasDeps && (
+                        <div className="flex items-center gap-1 mt-1.5">
+                          <span className="text-[9px] text-zinc-600">depends on:</span>
+                          {node.depends_on.map((dep) => (
+                            <span key={dep} className="rounded bg-zinc-800 px-1 py-px text-[9px] text-zinc-500 font-mono">
+                              {dep}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* ============================================================= */}
+        {/* Section 2: Files & Artifacts                                   */}
+        {/* ============================================================= */}
+        {displayableRunArtifacts.length > 0 && (
+          <section>
+            <div className="flex items-center gap-2 mb-3">
+              <FileText size={14} className="text-[#a3b396]" />
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+                Files ({displayableRunArtifacts.length})
+              </h3>
+            </div>
+
+            {artifactsByCategory.size > 1 ? (
+              // Grouped by category
+              Array.from(artifactsByCategory.entries()).map(([category, artifacts]) => (
+                <div key={category} className="mb-4">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-700 mb-1.5 pl-1">
+                    {category}
+                  </p>
+                  <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                    {artifacts.map((artifact, i) => {
+                      const globalIndex = displayableRunArtifacts.indexOf(artifact);
+                      return (
+                        <ArtifactCard
+                          key={artifact.path}
+                          artifact={artifact}
+                          index={globalIndex}
+                          highlightQuery={highlightQuery}
+                          activeMatchIndex={activeRunMatchIndex}
+                          runHistoryQuery={runHistoryQuery}
+                          runMatchRefs={runMatchRefs}
+                          onNavigate={() => {
+                            void handleOpenWorkspaceFile(artifact.path);
+                            setActiveTab("files");
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                </div>
+              ))
+            ) : (
+              // Flat grid
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {displayableRunArtifacts.map((artifact, index) => (
+                  <ArtifactCard
+                    key={artifact.path}
+                    artifact={artifact}
+                    index={index}
+                    highlightQuery={highlightQuery}
+                    activeMatchIndex={activeRunMatchIndex}
+                    runHistoryQuery={runHistoryQuery}
+                    runMatchRefs={runMatchRefs}
+                    onNavigate={() => {
+                      void handleOpenWorkspaceFile(artifact.path);
+                      setActiveTab("files");
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* ============================================================= */}
+        {/* Section 3: Live Activity                                       */}
+        {/* ============================================================= */}
+        <section>
+          <div className="flex items-center gap-2 mb-3">
+            <Wrench size={14} className="text-[#a3b396]" />
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+              Live Activity ({filteredActivity.length})
+            </h3>
+          </div>
+
+          {/* Category filter chips */}
+          <div className="flex flex-wrap items-center gap-1.5 mb-3">
+            {(
+              [
+                { key: "tool" as ActivityCategory, label: "Tools", color: "bg-[#6b7a5e]/20 text-[#a3b396]" },
+                { key: "subtask" as ActivityCategory, label: "Subtasks", color: "bg-sky-500/15 text-sky-400" },
+                { key: "verify" as ActivityCategory, label: "Verification", color: "bg-amber-500/15 text-amber-400" },
+                { key: "task" as ActivityCategory, label: "Task", color: "bg-zinc-700/50 text-zinc-400" },
+                { key: "other" as ActivityCategory, label: "Other", color: "bg-zinc-800 text-zinc-500" },
+              ] as const
+            )
+              .filter((cat) => categoryCounts[cat.key] > 0)
+              .map((cat) => {
+                const active = !hiddenCategories.has(cat.key);
+                return (
+                  <button
+                    key={cat.key}
+                    type="button"
+                    onClick={() => toggleCategory(cat.key)}
+                    className={cn(
+                      "rounded-full px-2.5 py-1 text-[10px] font-semibold transition-all border",
+                      active
+                        ? cn(cat.color, "border-transparent")
+                        : "bg-transparent text-zinc-700 border-zinc-800 line-through",
+                    )}
+                  >
+                    {cat.label} ({categoryCounts[cat.key]})
+                  </button>
+                );
+              })}
+          </div>
+
+          {/* Operator message input */}
+          {runCanMessage && (
+            <form
+              onSubmit={(e: FormEvent<HTMLFormElement>) => handleSendRunMessage(e)}
+              className="flex items-center gap-2 mb-3"
+            >
+              <input
+                type="text"
+                value={runOperatorMessage}
+                onChange={(e) => setRunOperatorMessage(e.target.value)}
+                placeholder="Send an operator message..."
+                disabled={sendingRunMessage}
+                className="flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:ring-1 focus:ring-[#8a9a7b] disabled:opacity-40"
+              />
+              <button
+                type="submit"
+                disabled={sendingRunMessage || !runOperatorMessage.trim()}
+                className="rounded-lg bg-[#6b7a5e] p-2 text-white hover:bg-[#8a9a7b] disabled:opacity-40 transition-colors"
+              >
+                {sendingRunMessage ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+              </button>
+            </form>
+          )}
+
+          {/* Search + scroll controls */}
+          <div className="flex items-center gap-2 mb-3">
+            <div className="relative flex-1">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-zinc-600" />
+              <input
+                type="text"
+                value={runHistoryQuery}
+                onChange={(e) => setRunHistoryQuery(e.target.value)}
+                placeholder="Search timeline and artifacts..."
+                className="w-full rounded-lg border border-zinc-800 bg-zinc-900/50 py-2 pl-8 pr-3 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:ring-1 focus:ring-[#8a9a7b]"
+              />
+            </div>
+            <div className="flex items-center gap-1 text-[10px] text-zinc-500 shrink-0">
+              <span className="tabular-nums">{filteredActivity.length}</span>
+              <ScrollButton direction="up" scrollRef={activityScrollRef} />
+              <ScrollButton direction="down" scrollRef={activityScrollRef} />
+            </div>
+          </div>
+
+          {/* Timeline events — scrollable container pinned to bottom during streaming */}
+          {filteredActivity.length === 0 ? (
+            <div className="text-center py-8 border border-dashed border-zinc-800 rounded-xl">
+              <Clock className="h-6 w-6 text-zinc-700 mx-auto mb-2" />
+              <p className="text-xs text-zinc-600">No timeline events yet</p>
+            </div>
+          ) : (
+            <div
+              ref={activityScrollRef}
+              onScroll={handleActivityScroll}
+              className="space-y-1.5 max-h-[60vh] overflow-y-auto rounded-lg scroll-smooth"
+            >
+              {filteredActivity.map((event, index) => {
+                const title = runTimelineTitle(event);
+                const detail = runTimelineDetail(event);
+                const { files, duration, metrics } = extractEventHighlights(event);
+                const refIndex = displayableRunArtifacts.length + index;
+                const hasStructured = files.length > 0 || duration || metrics.length > 0;
+                const longContent = detail && detail !== title && isLongDetail(detail);
+                const shortDetail = detail && detail !== title && !longContent;
+                return (
+                  <div
+                    key={event.id}
+                    ref={(node) => {
+                      runMatchRefs.current[refIndex] = node;
+                    }}
+                    className={cn(
+                      "flex items-start gap-3 rounded-lg border border-zinc-800/60 bg-zinc-900/40 px-4 py-2.5 transition-colors hover:bg-zinc-800/30",
+                      runHistoryQuery.trim() && activeRunMatchIndex === refIndex && "ring-1 ring-[#8a9a7b] border-[#8a9a7b]/30",
+                    )}
+                  >
+                    {/* Type badge */}
+                    <span
+                      className={cn(
+                        "shrink-0 mt-0.5 rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
+                        eventTypeColor(event.event_type),
+                      )}
+                    >
+                      {eventTypeBadgeLabel(event.event_type)}
+                    </span>
+
+                    {/* Content */}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <p className="text-xs font-medium text-zinc-300">
+                          {highlightText(title, highlightQuery)}
+                        </p>
+                        {runTimelineToolName(event) && (
+                          <span className="shrink-0 rounded bg-zinc-800 px-1.5 py-px text-[9px] font-mono text-zinc-400">
+                            {runTimelineToolName(event)}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Short detail (shown inline when not long) */}
+                      {shortDetail && (
+                        <p className="text-[11px] text-zinc-500 mt-0.5">
+                          {highlightText(detail, highlightQuery)}
+                        </p>
+                      )}
+
+                      {/* Structured highlights: files, duration, metrics */}
+                      {hasStructured && (
+                        <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                          {files.map((f) => (
+                            <button
+                              key={f}
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleOpenWorkspaceFile(f);
+                                setActiveTab("files");
+                              }}
+                              className="inline-flex items-center gap-1 rounded bg-[#6b7a5e]/15 px-1.5 py-px text-[10px] font-mono text-[#a3b396] hover:bg-[#6b7a5e]/30 hover:text-[#bec8b4] transition-colors cursor-pointer"
+                            >
+                              <FileText size={9} className="shrink-0" />
+                              {f}
+                            </button>
+                          ))}
+                          {duration && (
+                            <span className="rounded bg-zinc-800 px-1.5 py-px text-[9px] text-zinc-500 tabular-nums">
+                              {duration}
+                            </span>
+                          )}
+                          {metrics.map((m) => (
+                            <span key={m} className="rounded bg-zinc-800 px-1.5 py-px text-[9px] text-zinc-500">
+                              {m}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Long content: collapsible with rendered markdown */}
+                      {longContent && (
+                        <details className="mt-1.5">
+                          <summary className="text-[10px] text-zinc-600 cursor-pointer hover:text-zinc-400 transition-colors select-none">
+                            Show details
+                          </summary>
+                          <div className="mt-1 border-l-2 border-zinc-800 pl-2.5 text-[11px] text-zinc-400 leading-relaxed prose-invert prose-xs [&_strong]:text-zinc-300 [&_em]:text-zinc-400 [&_code]:text-[#a3b396] [&_code]:bg-zinc-800/60 [&_code]:px-1 [&_code]:py-px [&_code]:rounded [&_code]:text-[10px] [&_ul]:list-disc [&_ul]:pl-4 [&_ul]:my-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_ol]:my-1 [&_li]:my-0.5 [&_p]:my-1 [&_h1]:text-xs [&_h1]:font-semibold [&_h1]:text-zinc-300 [&_h2]:text-xs [&_h2]:font-semibold [&_h2]:text-zinc-300 [&_h3]:text-[11px] [&_h3]:font-semibold [&_h3]:text-zinc-300">
+                            <Suspense fallback={<p className="text-zinc-600">Loading...</p>}>
+                              <Markdown>{detail}</Markdown>
+                            </Suspense>
+                          </div>
+                        </details>
+                      )}
+
+                      {/* Tool call args: collapsible */}
+                      {runTimelineToolArgs(event) && (
+                        <details className="mt-1.5">
+                          <summary className="text-[10px] text-zinc-600 cursor-pointer hover:text-zinc-400 transition-colors select-none">
+                            Show tool call
+                          </summary>
+                          <pre className="mt-1 border-l-2 border-zinc-800 pl-2.5 text-[10px] text-zinc-500 font-mono leading-relaxed overflow-x-auto whitespace-pre-wrap break-all max-h-60 overflow-y-auto">
+                            {runTimelineToolArgs(event)}
+                          </pre>
+                        </details>
+                      )}
+                    </div>
+
+                    {/* Timestamp */}
+                    <span className="text-[10px] text-zinc-700 shrink-0 tabular-nums whitespace-nowrap">
+                      {formatDate(event.timestamp)}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Artifact card sub-component
+// ---------------------------------------------------------------------------
+
+interface ArtifactCardProps {
+  artifact: {
+    path: string;
+    category: string;
+    size_bytes: number;
+    exists_on_disk: boolean;
+  };
+  index: number;
+  highlightQuery: string;
+  activeMatchIndex: number;
+  runHistoryQuery: string;
+  runMatchRefs: React.MutableRefObject<Array<HTMLElement | null>>;
+  onNavigate: () => void;
+}
+
+function artifactDisplayName(path: string): string {
+  const normalized = String(path || "").trim().replace(/\\/g, "/");
+  if (!normalized || normalized === ".") {
+    return normalized || "(untitled)";
+  }
+  const parts = normalized.split("/").filter(Boolean);
+  return parts[parts.length - 1] || normalized;
+}
+
+function artifactDisplayDirectory(path: string): string {
+  const normalized = String(path || "").trim().replace(/\\/g, "/");
+  if (!normalized || normalized === ".") {
+    return "";
+  }
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length <= 1) {
+    return "";
+  }
+  return parts.slice(0, -1).join("/");
+}
+
+function isDisplayableArtifactPath(path: string): boolean {
+  const normalized = String(path || "").trim().replace(/\\/g, "/");
+  return normalized !== "" && normalized !== "." && normalized !== "./";
+}
+
+function ArtifactCard({
+  artifact,
+  index,
+  highlightQuery,
+  activeMatchIndex,
+  runHistoryQuery,
+  runMatchRefs,
+  onNavigate,
+}: ArtifactCardProps) {
+  const displayName = artifactDisplayName(artifact.path);
+  const displayDirectory = artifactDisplayDirectory(artifact.path);
+  return (
+    <button
+      type="button"
+      onClick={onNavigate}
+      ref={(node) => {
+        runMatchRefs.current[index] = node;
+      }}
+      className={cn(
+        "rounded-lg border bg-zinc-900/50 px-3 py-2.5 text-left transition-colors hover:bg-zinc-800/50 hover:border-zinc-700",
+        runHistoryQuery.trim() && activeMatchIndex === index
+          ? "ring-1 ring-[#8a9a7b] border-[#8a9a7b]/30"
+          : "border-zinc-800",
+      )}
+    >
+      <p className="text-xs font-medium text-zinc-300 truncate font-mono">
+        {highlightText(displayName, highlightQuery)}
+      </p>
+      {displayDirectory && (
+        <p className="mt-1 truncate text-[10px] text-zinc-600 font-mono">
+          {highlightText(displayDirectory, highlightQuery)}
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+        <span
+          className={cn(
+            "rounded px-1.5 py-px text-[9px] font-medium",
+            artifact.exists_on_disk
+              ? "bg-emerald-500/15 text-emerald-400"
+              : "bg-red-500/15 text-red-400",
+          )}
+        >
+          {artifact.exists_on_disk ? "on disk" : "missing"}
+        </span>
+        <span className="rounded bg-zinc-800 px-1.5 py-px text-[9px] text-zinc-500">
+          {artifact.category}
+        </span>
+        {artifact.size_bytes > 0 && (
+          <span className="text-[9px] text-zinc-600">{formatBytes(artifact.size_bytes)}</span>
+        )}
+      </div>
+    </button>
+  );
+}
