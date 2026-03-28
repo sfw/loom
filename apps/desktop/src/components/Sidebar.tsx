@@ -65,14 +65,8 @@ function runStatusLabel(status: string): string {
 
 function runStatusBadgeClass(status: string): string {
   const normalized = normalizeRunStatus(status);
-  if (normalized === "executing") {
-    return "bg-emerald-500/15 text-emerald-400";
-  }
-  if (normalized === "planning") {
+  if (normalized === "executing" || normalized === "planning" || normalized === "running") {
     return "bg-sky-500/15 text-sky-400";
-  }
-  if (normalized === "running") {
-    return "bg-cyan-500/15 text-cyan-400";
   }
   if (normalized === "paused") {
     return "bg-amber-500/15 text-amber-400";
@@ -81,7 +75,7 @@ function runStatusBadgeClass(status: string): string {
     return "bg-red-500/15 text-red-400";
   }
   if (normalized === "completed") {
-    return "bg-blue-500/15 text-blue-300";
+    return "bg-emerald-500/15 text-emerald-300";
   }
   if (normalized === "cancelled") {
     return "bg-zinc-800 text-zinc-500";
@@ -91,14 +85,8 @@ function runStatusBadgeClass(status: string): string {
 
 function runStatusDotClass(status: string): string {
   const normalized = normalizeRunStatus(status);
-  if (normalized === "executing") {
-    return "fill-emerald-400 text-emerald-400 animate-pulse";
-  }
-  if (normalized === "planning") {
+  if (normalized === "executing" || normalized === "planning" || normalized === "running") {
     return "fill-sky-400 text-sky-400 animate-pulse";
-  }
-  if (normalized === "running") {
-    return "fill-cyan-400 text-cyan-400 animate-pulse";
   }
   if (normalized === "paused") {
     return "fill-amber-400 text-amber-400";
@@ -107,7 +95,7 @@ function runStatusDotClass(status: string): string {
     return "fill-red-400 text-red-400";
   }
   if (normalized === "completed") {
-    return "fill-blue-300 text-blue-300";
+    return "fill-emerald-400 text-emerald-400";
   }
   return "fill-zinc-500 text-zinc-500";
 }
@@ -166,14 +154,7 @@ export default function Sidebar() {
 
   // Auto-expand when selected workspace changes
   useEffect(() => {
-    if (selectedWorkspaceId) {
-      setExpandedWorkspaces((prev) => {
-        if (prev.has(selectedWorkspaceId)) return prev;
-        const next = new Set(prev);
-        next.add(selectedWorkspaceId);
-        return next;
-      });
-    }
+    setExpandedWorkspaces(new Set(selectedWorkspaceId ? [selectedWorkspaceId] : []));
   }, [selectedWorkspaceId]);
 
   const toggleWorkspace = useCallback((id: string) => {
@@ -464,6 +445,7 @@ export default function Sidebar() {
                   {/* Workspace row */}
                   <button
                     type="button"
+                    aria-expanded={isExpanded}
                     onClick={() => {
                       handleSelectWorkspace(ws.id);
                       toggleWorkspace(ws.id);
@@ -486,7 +468,7 @@ export default function Sidebar() {
                       <ChevronRight size={12} className="shrink-0 text-zinc-600" />
                     )}
                     {ws.active_run_count > 0 ? (
-                      <Circle size={7} className="shrink-0 fill-emerald-400 text-emerald-400" />
+                      <Circle size={7} className="shrink-0 fill-sky-400 text-sky-400" />
                     ) : (
                       <Circle
                         size={7}
@@ -681,7 +663,7 @@ export default function Sidebar() {
                                 {conv.id === selectedConversationId && conversationIsProcessing ? (
                                   <Circle
                                     size={5}
-                                    className="shrink-0 fill-[#a3b396] text-[#a3b396] animate-pulse ml-auto"
+                                    className="shrink-0 fill-sky-400 text-sky-400 animate-pulse ml-auto"
                                   />
                                 ) : conv.is_active && (
                                   <Circle

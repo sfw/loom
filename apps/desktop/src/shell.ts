@@ -21,11 +21,29 @@ export type PaletteEntry = {
 
 export const RECENT_PALETTE_STORAGE_KEY = "loom.desktop.palette.recents.v1";
 
+const RESULT_GROUPS: Array<{
+  key: keyof Pick<
+    WorkspaceSearchResponse,
+    "workspaces" | "conversations" | "runs" | "approvals" | "artifacts" | "files" | "processes" | "mcp_servers" | "tools"
+  >;
+  label: string;
+}> = [
+  { key: "workspaces", label: "Workspaces" },
+  { key: "conversations", label: "Threads" },
+  { key: "runs", label: "Runs" },
+  { key: "approvals", label: "Approvals" },
+  { key: "artifacts", label: "Artifacts" },
+  { key: "files", label: "Files" },
+  { key: "processes", label: "Processes" },
+  { key: "mcp_servers", label: "MCP Servers" },
+  { key: "tools", label: "Tools" },
+];
+
 export const BASE_COMMAND_OPTIONS: CommandOption[] = [
   {
     id: "new-conversation",
-    label: "New conversation",
-    command: "new conversation",
+    label: "New thread",
+    command: "new thread",
     description: "Focus the thread composer for the selected workspace.",
     keywords: ["conversation", "thread", "chat", "new"],
   },
@@ -52,8 +70,8 @@ export const BASE_COMMAND_OPTIONS: CommandOption[] = [
   },
   {
     id: "latest-conversation",
-    label: "Latest conversation",
-    command: "latest conversation",
+    label: "Latest thread",
+    command: "latest thread",
     description: "Open the most recent thread in this workspace.",
     keywords: ["latest", "recent", "conversation", "thread"],
   },
@@ -79,6 +97,15 @@ const PINNED_COMMAND_IDS = new Set([
   "latest-conversation",
   "latest-run",
 ]);
+
+function paletteResultEntryId(item: WorkspaceSearchItem): string {
+  return [
+    "result",
+    item.kind,
+    item.workspace_id || "global",
+    item.item_id || item.title,
+  ].join("-");
+}
 
 export function isPaletteEntry(value: unknown): value is PaletteEntry {
   if (!value || typeof value !== "object") {
@@ -110,29 +137,13 @@ function matchesCommandOption(option: CommandOption, query: string): boolean {
 export function buildCommandOptions(commandDraft: string): CommandOption[] {
   const trimmedCommandDraft = commandDraft.trim();
   const normalizedCommandDraft = trimmedCommandDraft.toLowerCase();
-  const commandSearchTerm = normalizedCommandDraft.startsWith("search ")
-    ? trimmedCommandDraft.slice(7).trim()
-    : trimmedCommandDraft;
 
-  return [
-    ...BASE_COMMAND_OPTIONS.filter((option) => {
-      if (!normalizedCommandDraft) {
-        return true;
-      }
-      return matchesCommandOption(option, normalizedCommandDraft);
-    }),
-    ...(commandSearchTerm
-      ? [{
-          id: `search-${commandSearchTerm.toLowerCase()}`,
-          label: `Search workspace for "${commandSearchTerm}"`,
-          command: `search ${commandSearchTerm}`,
-          description: "Run the workspace-wide search from the command palette.",
-          keywords: ["search", "workspace", commandSearchTerm.toLowerCase()],
-        } satisfies CommandOption]
-      : []),
-  ].filter((option, index, rows) =>
-    rows.findIndex((candidate) => candidate.command === option.command) === index,
-  );
+  return BASE_COMMAND_OPTIONS.filter((option) => {
+    if (!normalizedCommandDraft) {
+      return true;
+    }
+    return matchesCommandOption(option, normalizedCommandDraft);
+  });
 }
 
 export function buildPinnedPaletteEntries(): PaletteEntry[] {
@@ -150,7 +161,7 @@ export function buildPinnedPaletteEntries(): PaletteEntry[] {
 }
 
 export function buildCommandPaletteEntries(options: CommandOption[]): PaletteEntry[] {
-  return options.slice(0, 6).map((option) => ({
+  return options.slice(0, 4).map((option) => ({
     id: `command-${option.id}`,
     title: option.label,
     description: option.description,
@@ -166,23 +177,25 @@ export function buildResultPaletteEntries(
   if (!results) {
     return [];
   }
-  return [
-    ...results.conversations,
-    ...results.runs,
-    ...results.approvals,
-    ...results.artifacts,
-    ...results.files,
-  ]
-    .slice(0, 6)
-    .map((item) => ({
-      id: `result-${item.kind}-${item.item_id || item.title}`,
-      title: item.title,
-      description: item.subtitle || item.snippet || item.kind,
-      keyword: item.kind.replace(/_/g, " "),
-      kind: "result" as const,
-      badge: "Result",
-      result: item,
-    }));
+  return RESULT_GROUPS.flatMap(({ key }) => results[key] || [])
+    .map((item) => {
+      const details = item.kind === "workspace"
+        ? [item.workspace_path || item.subtitle, item.snippet]
+        : [
+            item.workspace_display_name,
+            item.subtitle,
+            item.snippet,
+          ];
+      return {
+        id: paletteResultEntryId(item),
+        title: item.title,
+        description: details.filter(Boolean).join(" · "),
+        keyword: item.badges[0] || item.kind.replace(/_/g, " "),
+        kind: "result" as const,
+        badge: item.kind === "workspace" ? "Workspace" : undefined,
+        result: item,
+      };
+    });
 }
 
 export function rememberPaletteEntry(
@@ -216,19 +229,35 @@ export function buildPaletteSections(
   commandEntries: PaletteEntry[],
   resultEntries: PaletteEntry[],
   pinnedEntries: PaletteEntry[],
+  results?: WorkspaceSearchResponse | null,
 ): Array<{ label: string; entries: PaletteEntry[] }> {
-  return commandDraft.trim()
-    ? [
-        { label: "Actions", entries: commandEntries.slice(0, 4) },
-        { label: "Results", entries: resultEntries.slice(0, 4) },
-      ]
-    : [
-        { label: "Recent", entries: recentEntries.slice(0, 4) },
-        {
-          label: "Pinned",
-          entries: pinnedEntries
-            .filter((entry) => !recentEntries.some((recent) => recent.id === entry.id))
-            .slice(0, 4),
-        },
-      ];
+  if (!commandDraft.trim()) {
+    return [
+      { label: "Recent", entries: recentEntries.slice(0, 4) },
+      {
+        label: "Pinned",
+        entries: pinnedEntries
+          .filter((entry) => !recentEntries.some((recent) => recent.id === entry.id))
+          .slice(0, 4),
+      },
+    ];
+  }
+
+  const sections: Array<{ label: string; entries: PaletteEntry[] }> = [];
+  if (commandEntries.length > 0) {
+    sections.push({ label: "Actions", entries: commandEntries.slice(0, 3) });
+  }
+  if (!results) {
+    return sections;
+  }
+  const resultEntryMap = new Map(resultEntries.map((entry) => [entry.id, entry]));
+  for (const { key, label } of RESULT_GROUPS) {
+    const rows = (results[key] || []).map((item) =>
+      resultEntryMap.get(paletteResultEntryId(item)),
+    ).filter((entry): entry is PaletteEntry => Boolean(entry));
+    if (rows.length > 0) {
+      sections.push({ label, entries: rows.slice(0, 6) });
+    }
+  }
+  return sections;
 }

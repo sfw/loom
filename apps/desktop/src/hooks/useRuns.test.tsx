@@ -104,6 +104,7 @@ describe("useRuns", () => {
       workspace: "/tmp/workspace",
       process: "seo-geo-review",
       approval_mode: "auto",
+      context: undefined,
       auto_subfolder: true,
     });
     expect(setSelectedRunId).toHaveBeenCalledWith("task-123");
@@ -365,5 +366,61 @@ describe("useRuns", () => {
     });
 
     expect(result.current.runTimeline.map((row) => row.id)).toEqual([238, 239, 240]);
+  });
+
+  it("forwards attached workspace context when launching a run", async () => {
+    apiMocks.createTask.mockResolvedValue({
+      task_id: "task-456",
+      run_id: "run-def",
+      status: "executing",
+      message: "Task created and execution started.",
+    });
+
+    const { result } = renderHook(() =>
+      useRuns({
+        selectedRunId: "",
+        setSelectedRunId: vi.fn(),
+        selectedWorkspaceId: "workspace-1",
+        overview: {
+          workspace: {
+            canonical_path: "/tmp/workspace",
+          },
+          recent_runs: [],
+        } as any,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        setActiveTab: vi.fn(),
+        refreshWorkspaceSurface: vi.fn(async () => {}),
+      }),
+    );
+
+    act(() => {
+      result.current.setRunGoal("Synthesize the existing research");
+      result.current.setRunProcess("gap-analysis");
+    });
+
+    await act(async () => {
+      await result.current.handleLaunchRun(
+        { preventDefault() {} } as any,
+        {
+          workspace_paths: ["research/output.md", "research"],
+          workspace_files: ["research/output.md"],
+          workspace_directories: ["research"],
+        },
+      );
+    });
+
+    expect(apiMocks.createTask).toHaveBeenCalledWith({
+      goal: "Synthesize the existing research",
+      workspace: "/tmp/workspace",
+      process: "gap-analysis",
+      approval_mode: "auto",
+      context: {
+        workspace_paths: ["research/output.md", "research"],
+        workspace_files: ["research/output.md"],
+        workspace_directories: ["research"],
+      },
+      auto_subfolder: true,
+    });
   });
 });

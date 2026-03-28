@@ -130,6 +130,8 @@ export interface WorkspaceActions {
 
 export function useWorkspace(deps: {
   selectedWorkspaceId: string;
+  selectedConversationId: string;
+  selectedRunId: string;
   setSelectedWorkspaceId: React.Dispatch<React.SetStateAction<string>>;
   showArchivedWorkspaces: boolean;
   setShowArchivedWorkspaces: React.Dispatch<React.SetStateAction<boolean>>;
@@ -147,6 +149,8 @@ export function useWorkspace(deps: {
 }): WorkspaceState & WorkspaceActions {
   const {
     selectedWorkspaceId,
+    selectedConversationId,
+    selectedRunId,
     setSelectedWorkspaceId,
     showArchivedWorkspaces,
     setShowArchivedWorkspaces,
@@ -192,6 +196,10 @@ export function useWorkspace(deps: {
   const workspaceSearchTimerRef = useRef<number | null>(null);
   const notificationRefreshTimerRef = useRef<number | null>(null);
   const lastSeenNotificationStreamIdRef = useRef(0);
+  const previousWorkspaceIdRef = useRef("");
+  const selectedWorkspaceIdRef = useRef(selectedWorkspaceId);
+  const previousSelectedConversationIdRef = useRef(selectedConversationId);
+  const previousSelectedRunIdRef = useRef(selectedRunId);
 
   // ---------------------------------------------------------------------------
   // useEffectEvent handlers
@@ -228,6 +236,11 @@ export function useWorkspace(deps: {
       fetchWorkspaceInventory(workspaceId),
       fetchWorkspaceArtifacts(workspaceId),
     ]);
+    const isCurrentWorkspace = selectedWorkspaceIdRef.current === workspaceId;
+    if (!isCurrentWorkspace) {
+      setWorkspaces((current) => mergeWorkspaceSummary(current, overviewPayload.workspace));
+      return;
+    }
     setOverview(overviewPayload);
     setWorkspaceSettings(workspaceSettingsPayload);
     setApprovalInbox(approvalPayload);
@@ -296,6 +309,10 @@ export function useWorkspace(deps: {
 
   // Load workspace overview on selection change
   useEffect(() => {
+    selectedWorkspaceIdRef.current = selectedWorkspaceId;
+  }, [selectedWorkspaceId]);
+
+  useEffect(() => {
     if (!selectedWorkspaceId) {
       setOverview(null);
       setApprovalInbox([]);
@@ -305,12 +322,40 @@ export function useWorkspace(deps: {
       setWorkspaceSearchResults(null);
       setWorkspaceSettings(null);
       lastSeenNotificationStreamIdRef.current = 0;
+      previousWorkspaceIdRef.current = "";
       return;
     }
     let cancelled = false;
     setLoadingOverview(true);
     setError("");
+    setOverview(null);
+    setApprovalInbox([]);
+    setNotifications([]);
+    setInventory(null);
+    setWorkspaceArtifacts([]);
+    setWorkspaceSearchResults(null);
+    setWorkspaceSettings(null);
     lastSeenNotificationStreamIdRef.current = 0;
+    if (
+      previousWorkspaceIdRef.current
+      && previousWorkspaceIdRef.current !== selectedWorkspaceId
+    ) {
+      const shouldClearConversation =
+        !selectedConversationId
+        || selectedConversationId === previousSelectedConversationIdRef.current;
+      const shouldClearRun =
+        !selectedRunId
+        || selectedRunId === previousSelectedRunIdRef.current;
+      startTransition(() => {
+        if (shouldClearConversation) {
+          setSelectedConversationId("");
+        }
+        if (shouldClearRun) {
+          setSelectedRunId("");
+        }
+      });
+    }
+    previousWorkspaceIdRef.current = selectedWorkspaceId;
 
     void (async () => {
       try {
@@ -342,16 +387,10 @@ export function useWorkspace(deps: {
 
         startTransition(() => {
           setSelectedConversationId((current) => {
-            const stillValid = overviewPayload.recent_conversations.some(
-              (conversation) => conversation.id === current,
-            );
-            return stillValid ? current : firstConversationId;
+            return current || firstConversationId;
           });
           setSelectedRunId((current) => {
-            const stillValid = overviewPayload.recent_runs.some(
-              (run) => run.id === current,
-            );
-            return stillValid ? current : firstRunId;
+            return current || firstRunId;
           });
         });
       } catch (err) {
@@ -373,6 +412,14 @@ export function useWorkspace(deps: {
       cancelled = true;
     };
   }, [selectedWorkspaceId]);
+
+  useEffect(() => {
+    previousSelectedConversationIdRef.current = selectedConversationId;
+  }, [selectedConversationId, selectedWorkspaceId]);
+
+  useEffect(() => {
+    previousSelectedRunIdRef.current = selectedRunId;
+  }, [selectedRunId, selectedWorkspaceId]);
 
   // Debounced workspace search
   useEffect(() => {

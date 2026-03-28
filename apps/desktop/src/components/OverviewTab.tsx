@@ -27,6 +27,7 @@ export default function OverviewTab() {
     recentWorkspaceArtifacts,
     approvalInbox,
     setActiveTab,
+    handleOpenWorkspaceFile,
     focusConversationComposer,
     focusRunComposer,
     handlePrefillStarterWorkspace,
@@ -34,6 +35,12 @@ export default function OverviewTab() {
     setSelectedRunId,
     setShowNewWorkspace,
   } = useApp();
+
+  const openRunLauncher = () => {
+    setSelectedRunId("");
+    setActiveTab("runs");
+    focusRunComposer();
+  };
 
   // ---------------------------------------------------------------------------
   // Loading
@@ -112,7 +119,7 @@ export default function OverviewTab() {
             </button>
             <button
               type="button"
-              onClick={() => { setActiveTab("runs"); focusRunComposer(); }}
+              onClick={openRunLauncher}
               className="inline-flex items-center gap-2 rounded-lg bg-[#6b7a5e] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#8a9a7b] transition-colors"
             >
               <Play size={15} />
@@ -192,7 +199,7 @@ export default function OverviewTab() {
           <ActionBtn
             icon={<Play size={14} />}
             label="Launch run"
-            onClick={() => { setActiveTab("runs"); focusRunComposer(); }}
+            onClick={openRunLauncher}
             primary
           />
         </div>
@@ -311,17 +318,22 @@ export default function OverviewTab() {
               action={{ label: "Files tab", onClick: () => setActiveTab("files") }}
             />
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-              {recentWorkspaceArtifacts.slice(0, 6).map((a) => (
-                <div
+              {recentWorkspaceArtifacts.slice(0, 9).map((a) => (
+                <button
                   key={`${a.path}-${a.sha256}`}
-                  className="rounded-lg border border-zinc-800/60 bg-zinc-900/30 px-3 py-2.5"
+                  type="button"
+                  onClick={() => {
+                    void handleOpenWorkspaceFile(a.path);
+                    setActiveTab("files");
+                  }}
+                  className="rounded-lg border border-zinc-800/60 bg-zinc-900/30 px-3 py-2.5 text-left transition-colors hover:border-zinc-700 hover:bg-zinc-800/40"
                 >
                   <p className="text-[12px] text-zinc-300 truncate font-mono">{a.path}</p>
                   <p className="text-[10.5px] text-zinc-600 mt-0.5">
                     {a.category}
                     {a.run_count > 0 && ` · ${a.run_count} run${a.run_count !== 1 ? "s" : ""}`}
                   </p>
-                </div>
+                </button>
               ))}
             </div>
           </section>
@@ -355,7 +367,7 @@ function Metric({
         warn
           ? "border-amber-500/20 bg-amber-500/5"
           : accent
-            ? "border-emerald-500/20 bg-emerald-500/5"
+            ? "border-sky-500/20 bg-sky-500/5"
             : "border-zinc-800/60 bg-zinc-900/30",
       )}
     >
@@ -363,15 +375,15 @@ function Metric({
         className={cn(
           "text-zinc-500",
           warn && "text-amber-500",
-          accent && "text-emerald-500",
+          accent && "text-sky-500",
         )}
       >
         {icon}
       </span>
       <span
         className={cn(
-          "text-sm font-bold tabular-nums",
-          warn ? "text-amber-400" : accent ? "text-emerald-400" : "text-zinc-200",
+        "text-sm font-bold tabular-nums",
+          warn ? "text-amber-400" : accent ? "text-sky-400" : "text-zinc-200",
         )}
       >
         {value}
@@ -458,7 +470,7 @@ function RunDot({ status }: { status: string }) {
       className={cn(
         "shrink-0",
         s === "executing" || s === "planning" || s === "running"
-          ? "fill-emerald-400 text-emerald-400 animate-pulse"
+          ? "fill-sky-400 text-sky-400 animate-pulse"
           : s === "failed"
             ? "fill-red-400 text-red-400"
             : s === "completed"
@@ -480,7 +492,7 @@ function StatusPill({ status }: { status: string }) {
       className={cn(
         "rounded px-1.5 py-px text-[10px] font-medium",
         s === "executing" || s === "planning" || s === "running"
-          ? "bg-emerald-500/15 text-emerald-400"
+          ? "bg-sky-500/15 text-sky-400"
           : s === "completed"
             ? "bg-emerald-500/15 text-emerald-300"
             : s === "failed"

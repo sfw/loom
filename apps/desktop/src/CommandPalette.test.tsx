@@ -54,7 +54,7 @@ describe("CommandPalette", () => {
     );
 
     expect(
-      screen.getByText("Type to search or use a command."),
+      screen.getByText("Type to search workspaces, threads, runs, and files."),
     ).toBeInTheDocument();
   });
 
@@ -73,7 +73,7 @@ describe("CommandPalette", () => {
     const paletteEntries = [actionEntry, resultEntry];
     const paletteSections: CommandPaletteSection[] = [
       { label: "Actions", entries: [actionEntry] },
-      { label: "Results", entries: [resultEntry] },
+      { label: "Runs", entries: [resultEntry] },
     ];
 
     render(
@@ -91,7 +91,7 @@ describe("CommandPalette", () => {
 
     expect(screen.getByText("Searching...")).toBeInTheDocument();
     expect(screen.getByText("Actions")).toBeInTheDocument();
-    expect(screen.getByText("Results")).toBeInTheDocument();
+    expect(screen.getByText("Runs")).toBeInTheDocument();
 
     // The second button (index 1) should have the active highlight class
     const buttons = screen.getAllByRole("button");

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -154,5 +154,69 @@ describe("Sidebar", () => {
     expect(screen.getByText("Active SEO run")).toBeInTheDocument();
     expect(screen.getByText("Executing")).toBeInTheDocument();
     expect(screen.getByText("Paused")).toBeInTheDocument();
+  });
+
+  it("uses a blue workspace activity dot when runs are active", () => {
+    mockApp.workspaces[0].active_run_count = 1;
+    mockApp.overview.workspace.active_run_count = 1;
+
+    const { container } = render(<Sidebar />);
+
+    const workspaceButton = screen.getAllByRole("button", { name: /Workspace/i }).find((button) =>
+      button.getAttribute("aria-expanded") !== null,
+    );
+    expect(workspaceButton).toBeDefined();
+    const workspaceHeader = workspaceButton.closest("div");
+    expect(workspaceHeader).not.toBeNull();
+
+    const activeDot = (workspaceHeader as HTMLElement).querySelector("svg.lucide-circle");
+    expect(activeDot).not.toBeNull();
+    expect(activeDot).toHaveClass("fill-sky-400", "text-sky-400");
+    expect(container.querySelector(".fill-emerald-400.text-emerald-400")).toBeNull();
+  });
+
+  it("updates workspace chevrons when the selected workspace changes", () => {
+    mockApp.workspaces = [
+      {
+        ...mockApp.workspaces[0],
+        id: "workspace-1",
+        display_name: "Workspace One",
+      },
+      {
+        ...mockApp.workspaces[0],
+        id: "workspace-2",
+        display_name: "Workspace Two",
+      },
+    ];
+
+    const { rerender } = render(<Sidebar />);
+
+    expect(
+      screen.getByRole("button", { name: /Workspace One/i }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", { name: /Workspace Two/i }),
+    ).toHaveAttribute("aria-expanded", "false");
+
+    mockApp.selectedWorkspaceId = "workspace-2";
+    mockApp.overview = {
+      ...mockApp.overview,
+      workspace: {
+        ...mockApp.overview.workspace,
+        id: "workspace-2",
+        display_name: "Workspace Two",
+      },
+      recent_conversations: [],
+      recent_runs: [],
+    };
+
+    rerender(<Sidebar />);
+
+    expect(
+      screen.getByRole("button", { name: /Workspace One/i }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.getByRole("button", { name: /Workspace Two/i }),
+    ).toHaveAttribute("aria-expanded", "true");
   });
 });

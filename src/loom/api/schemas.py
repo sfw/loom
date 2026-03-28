@@ -327,6 +327,9 @@ class WorkspaceSearchItemResponse(BaseModel):
     subtitle: str = ""
     snippet: str = ""
     badges: list[str] = Field(default_factory=list)
+    workspace_id: str = ""
+    workspace_display_name: str = ""
+    workspace_path: str = ""
     conversation_id: str = ""
     run_id: str = ""
     approval_item_id: str = ""
@@ -335,9 +338,10 @@ class WorkspaceSearchItemResponse(BaseModel):
 
 
 class WorkspaceSearchResponse(BaseModel):
-    workspace: WorkspaceSummaryResponse
+    workspace: WorkspaceSummaryResponse | None = None
     query: str
     total_results: int = 0
+    workspaces: list[WorkspaceSearchItemResponse] = Field(default_factory=list)
     conversations: list[WorkspaceSearchItemResponse] = Field(default_factory=list)
     runs: list[WorkspaceSearchItemResponse] = Field(default_factory=list)
     approvals: list[WorkspaceSearchItemResponse] = Field(default_factory=list)

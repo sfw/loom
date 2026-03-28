@@ -13,25 +13,27 @@ import {
 } from "./shell";
 
 const workspaceSearchResponse: WorkspaceSearchResponse = {
-  workspace: {
-    id: "ws-1",
-    canonical_path: "/tmp/workspace",
-    display_name: "Workspace One",
-    workspace_type: "local",
-    is_archived: false,
-    sort_order: 0,
-    last_opened_at: "2026-03-24T10:00:00",
-    created_at: "2026-03-24T10:00:00",
-    updated_at: "2026-03-24T10:00:00",
-    metadata: {},
-    exists_on_disk: true,
-    conversation_count: 1,
-    run_count: 1,
-    active_run_count: 0,
-    last_activity_at: "2026-03-24T10:00:00",
-  },
+  workspace: null,
   query: "auth",
-  total_results: 2,
+  total_results: 3,
+  workspaces: [
+    {
+      kind: "workspace",
+      item_id: "ws-1",
+      title: "Workspace One",
+      subtitle: "/tmp/workspace",
+      snippet: "Primary workspace",
+      badges: ["1 thread", "1 run"],
+      workspace_id: "ws-1",
+      workspace_display_name: "Workspace One",
+      workspace_path: "/tmp/workspace",
+      conversation_id: "",
+      run_id: "",
+      approval_item_id: "",
+      path: "",
+      metadata: {},
+    },
+  ],
   conversations: [
     {
       kind: "conversation",
@@ -40,6 +42,9 @@ const workspaceSearchResponse: WorkspaceSearchResponse = {
       subtitle: "gpt-test",
       snippet: "Authentication findings",
       badges: ["conversation"],
+      workspace_id: "ws-1",
+      workspace_display_name: "Workspace One",
+      workspace_path: "/tmp/workspace",
       conversation_id: "conv-1",
       run_id: "",
       approval_item_id: "",
@@ -55,6 +60,9 @@ const workspaceSearchResponse: WorkspaceSearchResponse = {
       subtitle: "running",
       snippet: "Investigating auth failures",
       badges: ["run"],
+      workspace_id: "ws-2",
+      workspace_display_name: "Workspace Two",
+      workspace_path: "/tmp/workspace-two",
       conversation_id: "",
       run_id: "run-1",
       approval_item_id: "",
@@ -89,14 +97,7 @@ describe("shell command palette helpers", () => {
 
     expect(baseOptions.some((option) => option.id === "new-run")).toBe(true);
     expect(options.some((option) => option.id === "new-run")).toBe(false);
-    expect(options).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          command: "search auth",
-          label: 'Search workspace for "auth"',
-        }),
-      ]),
-    );
+    expect(options).toEqual([]);
   });
 
   it("builds pinned command entries", () => {
@@ -130,14 +131,20 @@ describe("shell command palette helpers", () => {
   it("turns workspace search results into palette result entries", () => {
     const entries = buildResultPaletteEntries(workspaceSearchResponse);
 
-    expect(entries).toHaveLength(2);
+    expect(entries).toHaveLength(3);
     expect(entries[0]).toEqual(
       expect.objectContaining({
         kind: "result",
-        badge: "Result",
+        badge: "Workspace",
       }),
     );
-    expect(entries.map((entry) => entry.title)).toEqual(["Auth thread", "Auth run"]);
+    expect(entries.map((entry) => entry.title)).toEqual([
+      "Workspace One",
+      "Auth thread",
+      "Auth run",
+    ]);
+    expect(entries[1]?.description).toContain("Workspace One");
+    expect(entries[2]?.description).toContain("Workspace Two");
   });
 
   it("shows recent and pinned sections when the command draft is empty", () => {
@@ -166,7 +173,7 @@ describe("shell command palette helpers", () => {
     expect(sections[1]?.entries.some((entry) => entry.id === "command-new-run")).toBe(false);
   });
 
-  it("shows action and result sections when the command draft is populated", () => {
+  it("shows grouped result sections when the command draft is populated", () => {
     const commandEntries = buildCommandPaletteEntries(buildCommandOptions("auth"));
     const resultEntries = buildResultPaletteEntries(workspaceSearchResponse);
     const pinnedEntries = buildPinnedPaletteEntries();
@@ -184,10 +191,10 @@ describe("shell command palette helpers", () => {
       commandEntries,
       resultEntries,
       pinnedEntries,
+      workspaceSearchResponse,
     );
 
-    expect(entries.some((entry) => entry.kind === "command")).toBe(true);
     expect(entries.some((entry) => entry.kind === "result")).toBe(true);
-    expect(sections.map((section) => section.label)).toEqual(["Actions", "Results"]);
+    expect(sections.map((section) => section.label)).toEqual(["Workspaces", "Threads", "Runs"]);
   });
 });

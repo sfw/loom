@@ -2,7 +2,13 @@ import React, { useState, useEffect, useRef, useCallback, useMemo, type FormEven
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useApp } from "@/context/AppContext";
-import { deleteConversation, type ConversationApproval, type ConversationStreamEvent } from "@/api";
+import {
+  deleteConversation,
+  type ConversationApproval,
+  type ConversationDetail,
+  type ConversationMessage,
+  type ConversationStreamEvent,
+} from "@/api";
 import { cn } from "@/lib/utils";
 import { formatDate, highlightText } from "@/utils";
 import {
@@ -30,6 +36,7 @@ import {
   Trash2,
   Clock,
   Copy,
+  MessageSquare,
 } from "lucide-react";
 
 /** Animated thinking indicator with live or persisted reasoning content. */
@@ -233,6 +240,32 @@ function buildTimelineItems(events: ConversationStreamEvent[]): TimelineItem[] {
   return items;
 }
 
+function conversationInputHistory(
+  detail: ConversationDetail | null,
+  messages: ConversationMessage[],
+): string[] {
+  const uiState = (detail?.session_state as { ui_state?: { input_history?: unknown } } | undefined)?.ui_state;
+  const payload = uiState?.input_history;
+  const sessionItems = Array.isArray(payload)
+    ? payload
+    : payload && typeof payload === "object" && Array.isArray((payload as { items?: unknown }).items)
+      ? (payload as { items: unknown[] }).items
+      : null;
+
+  if (sessionItems) {
+    return sessionItems
+      .map((item) => String(item || "").trim())
+      .filter((item) => item.length > 0)
+      .slice(-50);
+  }
+
+  return messages
+    .filter((message) => String(message.role || "").toLowerCase() === "user")
+    .map((message) => String(message.content || "").trim())
+    .filter((message) => message.length > 0)
+    .slice(-50);
+}
+
 export default function ThreadsTab() {
   const {
     selectedConversationId,
@@ -270,6 +303,7 @@ export default function ThreadsTab() {
     cancelQueuedMessage,
     setSelectedConversationId,
     selectedWorkspaceId,
+    overview,
     refreshWorkspaceSurface,
     setSelectedWorkspaceFilePath,
     setActiveTab,
@@ -334,6 +368,10 @@ export default function ThreadsTab() {
   const messageHistoryRef = useRef<string[]>([]);
   const historyIndexRef = useRef(-1);
   const draftRef = useRef("");
+  const hydratedInputHistory = useMemo(
+    () => conversationInputHistory(conversationDetail, visibleConversationMessages),
+    [conversationDetail, visibleConversationMessages],
+  );
 
   // Auto-scroll with pin/unpin — pinned to bottom unless user scrolls up
   const isPinnedRef = useRef(true);
@@ -422,9 +460,17 @@ export default function ThreadsTab() {
     isPinnedRef.current = true;
     userScrollingRef.current = false;
     setInjectedMessages([]);
+    messageHistoryRef.current = hydratedInputHistory;
+    historyIndexRef.current = -1;
+    draftRef.current = "";
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [selectedConversationId]);
+  }, [hydratedInputHistory, selectedConversationId]);
+
+  useEffect(() => {
+    if (historyIndexRef.current !== -1) return;
+    messageHistoryRef.current = hydratedInputHistory;
+  }, [hydratedInputHistory]);
 
   // Reset composer action and clear inject bubbles when processing ends
   useEffect(() => {
@@ -433,6 +479,37 @@ export default function ThreadsTab() {
       setInjectedMessages([]);
     }
   }, [conversationIsProcessing]);
+
+  const workspaceConversations = overview?.recent_conversations ?? [];
+  const selectedConversationBelongsToWorkspace = !selectedConversationId
+    ? true
+    : workspaceConversations.some((conversation) => conversation.id === selectedConversationId)
+      || (
+        conversationDetail != null
+        && String((conversationDetail as { workspace_id?: string }).workspace_id || "") === selectedWorkspaceId
+      );
+
+  useEffect(() => {
+    if (
+      selectedConversationId
+      && selectedWorkspaceId
+      && !selectedConversationBelongsToWorkspace
+    ) {
+      setSelectedConversationId("");
+    }
+  }, [
+    conversationDetail,
+    selectedConversationBelongsToWorkspace,
+    selectedConversationId,
+    selectedWorkspaceId,
+    setSelectedConversationId,
+  ]);
+
+  useEffect(() => {
+    if (!selectedConversationId && workspaceConversations.length === 1) {
+      setSelectedConversationId(workspaceConversations[0]!.id);
+    }
+  }, [selectedConversationId, setSelectedConversationId, workspaceConversations]);
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -445,15 +522,77 @@ export default function ThreadsTab() {
     return () => document.removeEventListener("mousedown", handleClick);
   }, []);
 
-  /* ---- Empty state ---- */
-  if (!selectedConversationId || !conversationDetail) {
+  /* ---- Empty / chooser state ---- */
+  if (!selectedConversationId || !selectedConversationBelongsToWorkspace) {
+    if (workspaceConversations.length === 1) {
+      return (
+        <div className="flex flex-col items-center justify-center h-full text-zinc-500 select-none">
+          <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-8 py-10 text-center max-w-sm">
+            <Loader2 size={18} className="mx-auto mb-3 animate-spin text-[#a3b396]" />
+            <p className="text-sm font-medium text-zinc-300">Opening thread...</p>
+          </div>
+        </div>
+      );
+    }
+
+    if (workspaceConversations.length > 1) {
+      return (
+        <div className="h-full overflow-y-auto px-6 py-6">
+          <div className="mx-auto max-w-3xl">
+            <div className="mb-5">
+              <p className="text-lg font-semibold text-zinc-100">Threads</p>
+              <p className="mt-1 text-sm text-zinc-500">
+                Pick a thread to continue in this workspace.
+              </p>
+            </div>
+            <div className="space-y-2">
+              {workspaceConversations.map((conversation) => (
+                <button
+                  key={conversation.id}
+                  type="button"
+                  onClick={() => setSelectedConversationId(conversation.id)}
+                  className="flex w-full items-start gap-3 rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3 text-left transition-colors hover:border-zinc-700 hover:bg-zinc-800/40"
+                >
+                  <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-zinc-800/80 text-zinc-500">
+                    <MessageSquare size={14} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-zinc-200">
+                      {conversation.title || "Untitled thread"}
+                    </p>
+                    <p className="mt-1 text-xs text-zinc-500">
+                      {conversation.model_name} · {conversation.turn_count} turn{conversation.turn_count === 1 ? "" : "s"}
+                    </p>
+                  </div>
+                  <span className="shrink-0 text-[11px] text-zinc-600">
+                    {formatDate(conversation.last_active_at)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="flex flex-col items-center justify-center h-full text-zinc-500 select-none">
         <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-8 py-10 text-center max-w-sm">
-          <p className="text-sm font-medium text-zinc-400">No thread open</p>
+          <p className="text-sm font-medium text-zinc-400">No threads yet</p>
           <p className="text-xs mt-2 text-zinc-600 leading-relaxed">
-            Select a thread from the sidebar, or create a new one with the + button.
+            Start a new thread from the sidebar to begin working in this workspace.
           </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!conversationDetail) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-zinc-500 select-none">
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-8 py-10 text-center max-w-sm">
+          <Loader2 size={18} className="mx-auto mb-3 animate-spin text-[#a3b396]" />
+          <p className="text-sm font-medium text-zinc-300">Opening thread...</p>
         </div>
       </div>
     );
@@ -464,16 +603,16 @@ export default function ThreadsTab() {
     if (!conversationStatus) return null;
     if (conversationIsProcessing && conversationStreaming) {
       return (
-        <span className="inline-flex items-center gap-1 rounded-full bg-green-500/20 px-2 py-0.5 text-xs font-medium text-green-400">
-          <span className="h-1.5 w-1.5 rounded-full bg-green-400 animate-pulse" />
+        <span className="inline-flex items-center gap-1 rounded-full bg-sky-500/20 px-2 py-0.5 text-xs font-medium text-sky-400">
+          <span className="h-1.5 w-1.5 rounded-full bg-sky-400 animate-pulse" />
           Streaming
         </span>
       );
     }
     if (conversationIsProcessing) {
       return (
-        <span className="inline-flex items-center gap-1 rounded-full bg-[#8a9a7b]/20 px-2 py-0.5 text-xs font-medium text-[#a3b396]">
-          <span className="h-1.5 w-1.5 rounded-full bg-[#a3b396] animate-pulse" />
+        <span className="inline-flex items-center gap-1 rounded-full bg-sky-500/20 px-2 py-0.5 text-xs font-medium text-sky-400">
+          <span className="h-1.5 w-1.5 rounded-full bg-sky-400 animate-pulse" />
           Processing
         </span>
       );
@@ -909,7 +1048,7 @@ export default function ThreadsTab() {
         {/* Processing indicator above composer */}
         {conversationIsProcessing && (
           <div className="flex items-center gap-2 mb-2">
-            <span className="h-1.5 w-1.5 rounded-full bg-[#a3b396] animate-pulse" />
+            <span className="h-1.5 w-1.5 rounded-full bg-sky-400 animate-pulse" />
             <span className="text-[11px] text-zinc-500">
               {conversationPhaseLabel || "Processing..."}
             </span>

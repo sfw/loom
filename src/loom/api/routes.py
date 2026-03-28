@@ -412,6 +412,25 @@ def _trim_snippet(value: object, *, limit: int = 220) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def _recent_conversation_search_text(
+    turns: list[dict[str, Any]],
+    *,
+    limit: int = 1200,
+) -> str:
+    blocks: list[str] = []
+    for turn in turns:
+        content = str(turn.get("content", "") or "").strip()
+        if not content:
+            continue
+        role = str(turn.get("role", "") or "").strip().lower()
+        if role:
+            blocks.append(f"{role}: {content}")
+        else:
+            blocks.append(content)
+    text = " ".join(blocks)
+    return text[:limit]
+
+
 def _artifact_is_intermediate(relpath: object) -> bool:
     text = str(relpath or "").strip()
     return bool(
@@ -1162,23 +1181,42 @@ async def _build_workspace_search_response(
 ) -> WorkspaceSearchResponse:
     summary = await _build_workspace_summary(engine, workspace)
     workspace_id = str(workspace.get("id", "") or "")
+    workspace_display_name = str(summary.display_name or "")
+    workspace_path = str(summary.canonical_path or "")
     clean_query = str(query or "").strip()
     limit = max(1, min(int(limit_per_group or 5), 10))
+
+    def make_search_item(**kwargs: Any) -> WorkspaceSearchItemResponse:
+        return WorkspaceSearchItemResponse(
+            workspace_id=workspace_id,
+            workspace_display_name=workspace_display_name,
+            workspace_path=workspace_path,
+            **kwargs,
+        )
 
     tasks = await _workspace_tasks(engine, workspace)
     sessions = await _workspace_sessions(engine, workspace)
     approvals = await _list_pending_approval_items(engine, workspace_id=workspace_id)
     artifacts = await _build_workspace_artifacts(engine, workspace)
-    file_items = _search_workspace_files(
+    file_rows = _search_workspace_files(
         workspace,
         query=clean_query,
         limit=limit,
     )
+    file_items = [
+        row.model_copy(update={
+            "workspace_id": workspace_id,
+            "workspace_display_name": workspace_display_name,
+            "workspace_path": workspace_path,
+        })
+        for row in file_rows
+    ]
 
     conversation_items: list[WorkspaceSearchItemResponse] = []
     for session in sessions[:25]:
         conversation = await _build_conversation_summary(engine, workspace_id, session)
-        recent_turns = await engine.conversation_store.get_recent_turns(conversation.id, limit=12)
+        recent_turns = await engine.conversation_store.get_recent_turns(conversation.id, limit=40)
+        conversation_search_text = _recent_conversation_search_text(list(reversed(recent_turns)))
         snippet = ""
         for turn in reversed(recent_turns):
             content = str(turn.get("content", "") or "").strip()
@@ -1190,11 +1228,12 @@ async def _build_workspace_search_response(
             conversation.title,
             conversation.model_name,
             snippet,
+            conversation_search_text,
             " ".join(conversation.linked_run_ids),
         ):
             continue
         conversation_items.append(
-            WorkspaceSearchItemResponse(
+            make_search_item(
                 kind="conversation",
                 item_id=conversation.id,
                 title=conversation.title,
@@ -1241,7 +1280,7 @@ async def _build_workspace_search_response(
         ):
             continue
         run_items.append(
-            WorkspaceSearchItemResponse(
+            make_search_item(
                 kind="run",
                 item_id=run.id,
                 title=run.goal,
@@ -1274,7 +1313,7 @@ async def _build_workspace_search_response(
         ):
             continue
         approval_items.append(
-            WorkspaceSearchItemResponse(
+            make_search_item(
                 kind="approval",
                 item_id=item.id,
                 title=item.title,
@@ -1308,7 +1347,7 @@ async def _build_workspace_search_response(
         ):
             continue
         artifact_items.append(
-            WorkspaceSearchItemResponse(
+            make_search_item(
                 kind="artifact",
                 item_id=artifact.path,
                 title=artifact.path,
@@ -1354,7 +1393,7 @@ async def _build_workspace_search_response(
         if not _text_matches_query(clean_query, name, description, author, path):
             continue
         process_items.append(
-            WorkspaceSearchItemResponse(
+            make_search_item(
                 kind="process",
                 item_id=name,
                 title=name,
@@ -1380,7 +1419,7 @@ async def _build_workspace_search_response(
         ):
             continue
         mcp_items.append(
-            WorkspaceSearchItemResponse(
+            make_search_item(
                 kind="mcp_server",
                 item_id=title,
                 title=title,
@@ -1410,7 +1449,7 @@ async def _build_workspace_search_response(
         ):
             continue
         tool_items.append(
-            WorkspaceSearchItemResponse(
+            make_search_item(
                 kind="tool",
                 item_id=tool.name,
                 title=tool.name,
@@ -1432,6 +1471,7 @@ async def _build_workspace_search_response(
     total_results = sum(
         len(group)
         for group in [
+            [],
             conversation_items,
             run_items,
             approval_items,
@@ -1446,6 +1486,7 @@ async def _build_workspace_search_response(
         workspace=summary,
         query=clean_query,
         total_results=total_results,
+        workspaces=[],
         conversations=conversation_items,
         runs=run_items,
         approvals=approval_items,
@@ -1454,6 +1495,150 @@ async def _build_workspace_search_response(
         processes=process_items,
         mcp_servers=mcp_items,
         tools=tool_items,
+    )
+
+
+def _search_item_sort_key(
+    item: WorkspaceSearchItemResponse,
+    query: str,
+) -> tuple[int, int, int, int, int, str]:
+    clean_query = str(query or "").strip().lower()
+    title = str(item.title or "").lower()
+    subtitle = str(item.subtitle or "").lower()
+    snippet = str(item.snippet or "").lower()
+    workspace_label = str(item.workspace_display_name or "").lower()
+    exact = 0 if title == clean_query and clean_query else 1
+    title_prefix = 0 if clean_query and title.startswith(clean_query) else 1
+    title_contains = 0 if clean_query and clean_query in title else 1
+    subtitle_contains = 0 if clean_query and clean_query in subtitle else 1
+    secondary_contains = 0 if clean_query and (
+        clean_query in snippet
+        or clean_query in workspace_label
+    ) else 1
+    return (
+        exact,
+        title_prefix,
+        title_contains,
+        subtitle_contains,
+        secondary_contains,
+        title,
+    )
+
+
+async def _build_global_search_response(
+    engine: Engine,
+    *,
+    query: str,
+    limit_per_group: int,
+) -> WorkspaceSearchResponse:
+    clean_query = str(query or "").strip()
+    limit = max(1, min(int(limit_per_group or 5), 10))
+    workspaces = await engine.workspace_registry.list(include_archived=False)
+
+    workspace_items: list[WorkspaceSearchItemResponse] = []
+    per_workspace_payloads: list[WorkspaceSearchResponse] = []
+
+    for workspace in workspaces:
+        payload = await _build_workspace_search_response(
+            engine,
+            workspace,
+            query=clean_query,
+            limit_per_group=limit,
+        )
+        per_workspace_payloads.append(payload)
+
+        summary = payload.workspace
+        if summary and _text_matches_query(
+            clean_query,
+            summary.display_name,
+            summary.canonical_path,
+            summary.workspace_type,
+            summary.metadata,
+        ):
+            workspace_items.append(
+                WorkspaceSearchItemResponse(
+                    kind="workspace",
+                    item_id=summary.id,
+                    title=summary.display_name,
+                    subtitle=summary.canonical_path,
+                    snippet=_trim_snippet(summary.metadata),
+                    badges=[
+                        badge
+                        for badge in [
+                            (
+                                f"{summary.conversation_count} threads"
+                                if summary.conversation_count
+                                else ""
+                            ),
+                            (
+                                f"{summary.run_count} runs"
+                                if summary.run_count
+                                else ""
+                            ),
+                            "archived" if summary.is_archived else "",
+                        ]
+                        if badge
+                    ],
+                    workspace_id=summary.id,
+                    workspace_display_name=summary.display_name,
+                    workspace_path=summary.canonical_path,
+                ),
+            )
+
+    def combined(group_name: str) -> list[WorkspaceSearchItemResponse]:
+        rows: list[WorkspaceSearchItemResponse] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+        for payload in per_workspace_payloads:
+            for item in list(getattr(payload, group_name, []) or []):
+                if item.kind in {"tool", "mcp_server"}:
+                    dedupe_key = (item.kind, item.item_id, "")
+                else:
+                    dedupe_key = (item.kind, item.item_id, item.workspace_id)
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+                rows.append(item)
+        rows.sort(key=lambda item: _search_item_sort_key(item, clean_query))
+        return rows[:limit]
+
+    conversations = combined("conversations")
+    runs = combined("runs")
+    approvals = combined("approvals")
+    artifacts = combined("artifacts")
+    files = combined("files")
+    processes = combined("processes")
+    mcp_servers = combined("mcp_servers")
+    tools = combined("tools")
+    workspace_items.sort(key=lambda item: _search_item_sort_key(item, clean_query))
+    workspace_items = workspace_items[:limit]
+
+    total_results = sum(
+        len(group)
+        for group in [
+            workspace_items,
+            conversations,
+            runs,
+            approvals,
+            artifacts,
+            files,
+            processes,
+            mcp_servers,
+            tools,
+        ]
+    )
+    return WorkspaceSearchResponse(
+        workspace=None,
+        query=clean_query,
+        total_results=total_results,
+        workspaces=workspace_items,
+        conversations=conversations,
+        runs=runs,
+        approvals=approvals,
+        artifacts=artifacts,
+        files=files,
+        processes=processes,
+        mcp_servers=mcp_servers,
+        tools=tools,
     )
 
 
@@ -3392,6 +3577,21 @@ async def search_workspace(
     return await _build_workspace_search_response(
         engine,
         workspace,
+        query=q,
+        limit_per_group=limit_per_group,
+    )
+
+
+@router.get("/search", response_model=WorkspaceSearchResponse)
+async def search_all_workspaces(
+    request: Request,
+    q: str,
+    limit_per_group: int = 5,
+):
+    """Search across all registered workspaces for desktop global search."""
+    engine = _get_engine(request)
+    return await _build_global_search_response(
+        engine,
         query=q,
         limit_per_group=limit_per_group,
     )

@@ -35,9 +35,12 @@ export interface InboxActions {
   ) => Promise<void>;
   handleSelectApprovalContext: (item: ApprovalFeedItem) => void;
   handleSearchResultSelection: (result: {
+    workspace_id?: string;
     conversation_id?: string;
     run_id?: string;
     approval_item_id?: string;
+    item_id?: string;
+    title?: string;
     path?: string;
     kind?: string;
   }) => void;
@@ -51,31 +54,37 @@ export function useInbox(deps: {
   selectedWorkspaceId: string;
   selectedConversationId: string;
   selectedRunId: string;
+  setSelectedWorkspaceId: React.Dispatch<React.SetStateAction<string>>;
   setSelectedConversationId: React.Dispatch<React.SetStateAction<string>>;
   setSelectedRunId: React.Dispatch<React.SetStateAction<string>>;
   setActiveTab: React.Dispatch<React.SetStateAction<ViewTab>>;
+  setRunProcess: React.Dispatch<React.SetStateAction<string>>;
   setError: React.Dispatch<React.SetStateAction<string>>;
   setNotice: React.Dispatch<React.SetStateAction<string>>;
   refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
   refreshApprovalInbox: (workspaceId: string) => Promise<void>;
   refreshConversation: (conversationId: string) => Promise<void>;
   refreshRun: (runId: string) => Promise<void>;
-  handleOpenWorkspaceFile: (path: string) => Promise<void>;
+  queueWorkspaceFileOpen: (workspaceId: string, path: string) => void;
+  focusRunComposer: () => void;
 }): InboxState & InboxActions {
   const {
     selectedWorkspaceId,
     selectedConversationId,
     selectedRunId,
+    setSelectedWorkspaceId,
     setSelectedConversationId,
     setSelectedRunId,
     setActiveTab,
+    setRunProcess,
     setError,
     setNotice,
     refreshWorkspaceSurface,
     refreshApprovalInbox,
     refreshConversation,
     refreshRun,
-    handleOpenWorkspaceFile,
+    queueWorkspaceFileOpen,
+    focusRunComposer,
   } = deps;
 
   // State
@@ -143,34 +152,81 @@ export function useInbox(deps: {
   }
 
   function handleSearchResultSelection(result: {
+    workspace_id?: string;
     conversation_id?: string;
     run_id?: string;
     approval_item_id?: string;
+    item_id?: string;
+    title?: string;
     path?: string;
     kind?: string;
   }) {
-    if (result.conversation_id) {
+    const targetWorkspaceId = String(result.workspace_id || "").trim();
+    if (result.kind === "workspace" && targetWorkspaceId) {
       startTransition(() => {
-        setSelectedConversationId(result.conversation_id || "");
-        setActiveTab("threads");
+        setSelectedWorkspaceId(targetWorkspaceId);
+        setSelectedConversationId("");
+        setSelectedRunId("");
+        setActiveTab("overview");
       });
+      return;
     }
-    if (result.run_id) {
+    if (result.kind === "process") {
       startTransition(() => {
-        setSelectedRunId(result.run_id || "");
+        if (targetWorkspaceId) {
+          setSelectedWorkspaceId(targetWorkspaceId);
+        }
+        setSelectedConversationId("");
+        setSelectedRunId("");
         setActiveTab("runs");
+        setRunProcess(String(result.item_id || result.title || "").trim());
       });
+      focusRunComposer();
+      return;
     }
     if ((result.kind === "artifact" || result.kind === "file") && result.path) {
-      if (result.kind === "file") {
+      startTransition(() => {
+        if (targetWorkspaceId) {
+          setSelectedWorkspaceId(targetWorkspaceId);
+        }
+        setSelectedConversationId("");
+        if (result.run_id) {
+          setSelectedRunId(result.run_id);
+        } else {
+          setSelectedRunId("");
+        }
         setActiveTab("files");
+      });
+      if (targetWorkspaceId) {
+        queueWorkspaceFileOpen(targetWorkspaceId, result.path);
       }
-      void handleOpenWorkspaceFile(result.path);
       setNotice(
         result.kind === "file"
           ? `Opened file ${result.path}.`
           : `Opened context for artifact ${result.path}.`,
       );
+      return;
+    }
+    if (result.conversation_id) {
+      startTransition(() => {
+        if (targetWorkspaceId) {
+          setSelectedWorkspaceId(targetWorkspaceId);
+        }
+        setSelectedRunId("");
+        setSelectedConversationId(result.conversation_id || "");
+        setActiveTab("threads");
+      });
+      return;
+    }
+    if (result.run_id) {
+      startTransition(() => {
+        if (targetWorkspaceId) {
+          setSelectedWorkspaceId(targetWorkspaceId);
+        }
+        setSelectedConversationId("");
+        setSelectedRunId(result.run_id || "");
+        setActiveTab("runs");
+      });
     }
   }
 

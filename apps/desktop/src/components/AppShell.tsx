@@ -208,7 +208,7 @@ export default function AppShell() {
                 {/* Workspace stats pills */}
                 <div className="hidden md:flex items-center gap-1.5">
                   {activeRuns > 0 && (
-                    <span className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-400">
+                    <span className="inline-flex items-center gap-1 rounded-md bg-sky-500/10 px-2 py-0.5 text-[10px] font-semibold text-sky-400">
                       <Circle size={5} className="fill-current animate-pulse" />
                       {activeRuns} running
                     </span>
@@ -283,7 +283,7 @@ export default function AppShell() {
                 value={commandDraft}
                 onChange={(e) => setCommandDraft(e.target.value)}
                 onKeyDown={handleCommandInputKeyDown}
-                placeholder="Search or type a command..."
+                placeholder="Search workspaces, threads, runs, files..."
                 className="w-full bg-transparent px-4 py-3 text-sm text-zinc-100 placeholder-zinc-600 outline-none"
               />
             </form>

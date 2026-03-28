@@ -74,6 +74,7 @@ export interface FilesActions {
   setWorkspaceFileEditorDirty: React.Dispatch<React.SetStateAction<boolean>>;
   setWorkspaceFileFilterQuery: React.Dispatch<React.SetStateAction<string>>;
   handleOpenWorkspaceFile: (path: string) => Promise<void>;
+  queueWorkspaceFileOpen: (workspaceId: string, path: string) => void;
   handleOpenWorkspaceFileExternally: () => Promise<void>;
   handleRevealWorkspaceFile: () => Promise<void>;
   handleSaveWorkspaceFile: () => Promise<void>;
@@ -136,6 +137,10 @@ export function useFiles(deps: {
   const [savingWorkspaceFile, setSavingWorkspaceFile] = useState(false);
   const [workspaceFileFilterQuery, setWorkspaceFileFilterQuery] = useState("");
   const [importingWorkspaceFiles, setImportingWorkspaceFiles] = useState(false);
+  const [pendingWorkspaceFileOpen, setPendingWorkspaceFileOpen] = useState<{
+    workspaceId: string;
+    path: string;
+  } | null>(null);
 
   // Refs
   const workspaceFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -316,6 +321,23 @@ export function useFiles(deps: {
     }
   }, [selectedWorkspaceId]);
 
+  useEffect(() => {
+    if (!pendingWorkspaceFileOpen) {
+      return;
+    }
+    if (pendingWorkspaceFileOpen.workspaceId !== selectedWorkspaceId) {
+      return;
+    }
+    void handleOpenWorkspaceFile(pendingWorkspaceFileOpen.path).finally(() => {
+      setPendingWorkspaceFileOpen((current) =>
+        current?.workspaceId === pendingWorkspaceFileOpen.workspaceId
+        && current?.path === pendingWorkspaceFileOpen.path
+          ? null
+          : current,
+      );
+    });
+  }, [pendingWorkspaceFileOpen, selectedWorkspaceId]);
+
   // Load file preview when selection changes
   useEffect(() => {
     if (!selectedWorkspaceId || !selectedWorkspaceFilePath) {
@@ -410,6 +432,22 @@ export function useFiles(deps: {
       }
     }
     setSelectedWorkspaceFilePath(path);
+  }
+
+  function queueWorkspaceFileOpen(workspaceId: string, path: string) {
+    const cleanWorkspaceId = String(workspaceId || "").trim();
+    const cleanPath = String(path || "").trim();
+    if (!cleanWorkspaceId || !cleanPath) {
+      return;
+    }
+    if (cleanWorkspaceId === selectedWorkspaceId) {
+      void handleOpenWorkspaceFile(cleanPath);
+      return;
+    }
+    setPendingWorkspaceFileOpen({
+      workspaceId: cleanWorkspaceId,
+      path: cleanPath,
+    });
   }
 
   async function handleOpenWorkspaceFileExternally() {
@@ -659,6 +697,7 @@ export function useFiles(deps: {
     setWorkspaceFileEditorDirty,
     setWorkspaceFileFilterQuery,
     handleOpenWorkspaceFile,
+    queueWorkspaceFileOpen,
     handleOpenWorkspaceFileExternally,
     handleRevealWorkspaceFile,
     handleSaveWorkspaceFile,

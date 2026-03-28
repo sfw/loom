@@ -984,6 +984,195 @@ class TestWorkspaceFirstEndpoints:
         assert payload["tools"]
 
     @pytest.mark.asyncio
+    async def test_global_search_queries_across_workspaces(
+        self,
+        client,
+        tmp_path,
+        database,
+        conversation_store,
+        workspace_registry,
+    ):
+        alpha_path = tmp_path / "coach-alpha"
+        beta_path = tmp_path / "coach-beta"
+        alpha_path.mkdir()
+        beta_path.mkdir()
+        (beta_path / "coach-notes.md").write_text(
+            "Coach outreach notes for Edmonton clubs.",
+            encoding="utf-8",
+        )
+
+        alpha_workspace = await workspace_registry.ensure_workspace(
+            str(alpha_path),
+            display_name="Coach Alpha",
+        )
+        beta_workspace = await workspace_registry.ensure_workspace(
+            str(beta_path),
+            display_name="Coach Beta",
+        )
+        assert alpha_workspace is not None
+        assert beta_workspace is not None
+
+        alpha_session_id = await conversation_store.create_session(
+            workspace=str(alpha_path),
+            model_name="kimi-k2.5",
+        )
+        await conversation_store.update_session(
+            alpha_session_id,
+            session_state={"title": "Coach scouting thread"},
+        )
+        await conversation_store.append_turn(
+            alpha_session_id,
+            1,
+            "assistant",
+            "Coach shortlist for Alberta and Edmonton.",
+        )
+
+        await database.insert_task(
+            task_id="task-coach-1",
+            goal="Coach outreach plan",
+            workspace_path=str(beta_path),
+            status="completed",
+            metadata={},
+        )
+        await database.insert_event(
+            task_id="task-coach-1",
+            correlation_id="corr-coach-1",
+            run_id="exec-coach-1",
+            event_type="task_completed",
+            data={"summary": "Coach outreach report completed"},
+            sequence=1,
+        )
+
+        response = await client.get("/search?q=coach&limit_per_group=5")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["workspace"] is None
+        assert payload["query"] == "coach"
+        assert {row["workspace_id"] for row in payload["workspaces"]} == {
+            alpha_workspace["id"],
+            beta_workspace["id"],
+        }
+        assert any(
+            row["conversation_id"] == alpha_session_id
+            and row["workspace_display_name"] == "Coach Alpha"
+            for row in payload["conversations"]
+        )
+        assert any(
+            row["run_id"] == "task-coach-1"
+            and row["workspace_display_name"] == "Coach Beta"
+            for row in payload["runs"]
+        )
+        assert any(
+            row["path"] == "coach-notes.md"
+            and row["workspace_display_name"] == "Coach Beta"
+            for row in payload["files"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_workspace_search_matches_conversation_older_turn_content(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "conversation-search-ws"
+        workspace_path.mkdir()
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Conversation Search WS",
+        )
+        assert workspace is not None
+
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="kimi-k2.5",
+        )
+        await conversation_store.update_session(
+            session_id,
+            session_state={"title": "Tennis improvements"},
+        )
+        await conversation_store.append_turn(
+            session_id,
+            1,
+            "user",
+            "I need help fixing my serve toss consistency.",
+        )
+        await conversation_store.append_turn(
+            session_id,
+            2,
+            "assistant",
+            "Let's break the problem into toss drills and timing.",
+        )
+        await conversation_store.append_turn(
+            session_id,
+            3,
+            "assistant",
+            "We can also talk through a weekly practice plan.",
+        )
+
+        response = await client.get(
+            f"/workspaces/{workspace['id']}/search?q=serve&limit_per_group=5",
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert any(
+            row["conversation_id"] == session_id
+            for row in payload["conversations"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_workspace_search_matches_conversation_content_beyond_last_twelve_turns(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "conversation-search-deep-ws"
+        workspace_path.mkdir()
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Conversation Search Deep WS",
+        )
+        assert workspace is not None
+
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="kimi-k2.5",
+        )
+        await conversation_store.update_session(
+            session_id,
+            session_state={"title": "SEO follow-up"},
+        )
+
+        await conversation_store.append_turn(
+            session_id,
+            1,
+            "user",
+            "Please help me diagnose canonicalization drift for this site.",
+        )
+        for turn_number in range(2, 16):
+            await conversation_store.append_turn(
+                session_id,
+                turn_number,
+                "assistant",
+                f"Filler turn {turn_number}",
+            )
+
+        response = await client.get(
+            f"/workspaces/{workspace['id']}/search?q=canonicalization&limit_per_group=5",
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert any(
+            row["conversation_id"] == session_id
+            for row in payload["conversations"]
+        )
+
+    @pytest.mark.asyncio
     async def test_workspace_files_list_and_preview(
         self,
         client,

@@ -154,6 +154,9 @@ export interface WorkspaceSearchItem {
   subtitle: string;
   snippet: string;
   badges: string[];
+  workspace_id: string;
+  workspace_display_name: string;
+  workspace_path: string;
   conversation_id: string;
   run_id: string;
   approval_item_id: string;
@@ -162,9 +165,10 @@ export interface WorkspaceSearchItem {
 }
 
 export interface WorkspaceSearchResponse {
-  workspace: WorkspaceSummary;
+  workspace: WorkspaceSummary | null;
   query: string;
   total_results: number;
+  workspaces: WorkspaceSearchItem[];
   conversations: WorkspaceSearchItem[];
   runs: WorkspaceSearchItem[];
   approvals: WorkspaceSearchItem[];
@@ -626,6 +630,19 @@ export function fetchWorkspaceSearch(
   });
   return requestJson<WorkspaceSearchResponse>(
     `/workspaces/${encodeURIComponent(workspaceId)}/search?${params.toString()}`,
+  );
+}
+
+export function fetchGlobalSearch(
+  query: string,
+  limitPerGroup = 5,
+): Promise<WorkspaceSearchResponse> {
+  const params = new URLSearchParams({
+    q: query,
+    limit_per_group: String(limitPerGroup),
+  });
+  return requestJson<WorkspaceSearchResponse>(
+    `/search?${params.toString()}`,
   );
 }
 

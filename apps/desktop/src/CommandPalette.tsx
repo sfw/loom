@@ -41,8 +41,8 @@ export default function CommandPalette({
       {paletteEntries.length === 0 ? (
         <p className="px-4 py-6 text-center text-sm text-zinc-600">
           {commandDraft.trim()
-            ? "No matching commands or results."
-            : "Type to search or use a command."}
+            ? "No matches across your workspaces."
+            : "Type to search workspaces, threads, runs, and files."}
         </p>
       ) : (
         paletteSections.map((section) =>

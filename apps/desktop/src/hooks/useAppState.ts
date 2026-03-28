@@ -331,7 +331,10 @@ export interface AppActions {
   handlePrefillStarterConversation: () => void;
   handlePrefillStarterRun: () => void;
   handleCreateConversation: (event: import("react").FormEvent<HTMLFormElement>) => Promise<void>;
-  handleLaunchRun: (event: import("react").FormEvent<HTMLFormElement>) => Promise<void>;
+  handleLaunchRun: (
+    event: import("react").FormEvent<HTMLFormElement>,
+    extraContext?: Record<string, unknown>,
+  ) => Promise<void>;
   handleRunControl: (action: "pause" | "resume" | "cancel") => Promise<void>;
   handleDeleteRun: () => Promise<void>;
   handleRestartRun: () => Promise<void>;
@@ -429,6 +432,8 @@ export function useAppState(): AppState & AppActions {
   // -----------------------------------------------------------------------
   const workspace = useWorkspace({
     selectedWorkspaceId,
+    selectedConversationId,
+    selectedRunId,
     setSelectedWorkspaceId,
     showArchivedWorkspaces,
     setShowArchivedWorkspaces,
@@ -500,16 +505,19 @@ export function useAppState(): AppState & AppActions {
     selectedWorkspaceId,
     selectedConversationId,
     selectedRunId,
+    setSelectedWorkspaceId,
     setSelectedConversationId,
     setSelectedRunId,
     setActiveTab,
+    setRunProcess: runs.setRunProcess,
     setError,
     setNotice,
     refreshWorkspaceSurface: workspace.refreshWorkspaceSurface,
     refreshApprovalInbox: workspace.refreshApprovalInbox,
     refreshConversation: conversation.refreshConversation,
     refreshRun: runs.refreshRun,
-    handleOpenWorkspaceFile: files.handleOpenWorkspaceFile,
+    queueWorkspaceFileOpen: files.queueWorkspaceFileOpen,
+    focusRunComposer: runs.focusRunComposer,
   });
 
   // -----------------------------------------------------------------------

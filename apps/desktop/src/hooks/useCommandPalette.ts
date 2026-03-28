@@ -7,7 +7,7 @@ import {
 } from "react";
 
 import {
-  fetchWorkspaceSearch,
+  fetchGlobalSearch,
   type WorkspaceOverview,
   type WorkspaceSearchResponse,
 } from "../api";
@@ -85,9 +85,12 @@ export function useCommandPalette(deps: {
   handlePrefillStarterConversation: () => void;
   handlePrefillStarterRun: () => void;
   handleSearchResultSelection: (result: {
+    workspace_id?: string;
     conversation_id?: string;
     run_id?: string;
     approval_item_id?: string;
+    item_id?: string;
+    title?: string;
     path?: string;
     kind?: string;
   }) => void;
@@ -149,6 +152,7 @@ export function useCommandPalette(deps: {
     commandPaletteEntriesComputed,
     resultPaletteEntries,
     pinnedPaletteEntries,
+    commandSearchResults,
   );
 
   // ---------------------------------------------------------------------------
@@ -214,7 +218,7 @@ export function useCommandPalette(deps: {
       window.clearTimeout(commandSearchTimerRef.current);
       commandSearchTimerRef.current = null;
     }
-    if (!commandPaletteOpen || !selectedWorkspaceId || !query) {
+    if (!commandPaletteOpen || !query) {
       setSearchingCommandPalette(false);
       setCommandSearchResults(null);
       return;
@@ -225,7 +229,7 @@ export function useCommandPalette(deps: {
       commandSearchTimerRef.current = null;
       void (async () => {
         try {
-          const results = await fetchWorkspaceSearch(selectedWorkspaceId, query, 2);
+          const results = await fetchGlobalSearch(query, 5);
           if (!cancelled) {
             setCommandSearchResults(results);
           }
@@ -247,7 +251,7 @@ export function useCommandPalette(deps: {
         commandSearchTimerRef.current = null;
       }
     };
-  }, [commandPaletteOpen, commandSearchTerm, selectedWorkspaceId]);
+  }, [commandPaletteOpen, commandSearchTerm]);
 
   // ---------------------------------------------------------------------------
   // Handlers
@@ -268,63 +272,83 @@ export function useCommandPalette(deps: {
     if (!normalized) {
       return;
     }
-    if (normalized === "new conversation" || normalized === "thread") {
+    if (normalized === "new conversation" || normalized === "new thread" || normalized === "thread") {
+      startTransition(() => {
+        setSelectedRunId("");
+        setSelectedConversationId("");
+        setActiveTab("threads");
+      });
       focusConversationComposer();
-      
       return;
     }
     if (normalized === "new run" || normalized === "run") {
+      startTransition(() => {
+        setSelectedConversationId("");
+        setSelectedRunId("");
+        setActiveTab("runs");
+      });
       focusRunComposer();
-      
       return;
     }
     if (normalized === "starter thread" || normalized === "starter conversation") {
+      startTransition(() => {
+        setSelectedRunId("");
+        setSelectedConversationId("");
+        setActiveTab("threads");
+      });
       handlePrefillStarterConversation();
       focusConversationComposer();
       return;
     }
     if (normalized === "starter run") {
+      startTransition(() => {
+        setSelectedConversationId("");
+        setSelectedRunId("");
+        setActiveTab("runs");
+      });
       handlePrefillStarterRun();
       focusRunComposer();
       return;
     }
-    if (normalized === "latest conversation") {
-      const latestConversationId = overview?.recent_conversations[0]?.id || "";
+    if (normalized === "latest conversation" || normalized === "latest thread") {
+      const latestConversationId = [...(overview?.recent_conversations || [])]
+        .sort((a, b) => String(b.last_active_at || "").localeCompare(String(a.last_active_at || "")))[0]?.id || "";
       if (!latestConversationId) {
-        setError("No conversation is available in this workspace.");
+        setError("No thread is available in this workspace.");
         return;
       }
       startTransition(() => {
+        setSelectedRunId("");
         setSelectedConversationId(latestConversationId);
+        setActiveTab("threads");
       });
-      
       return;
     }
     if (normalized === "latest run") {
-      const latestRunId = overview?.recent_runs[0]?.id || "";
+      const latestRunId = [...(overview?.recent_runs || [])]
+        .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")))[0]?.id || "";
       if (!latestRunId) {
         setError("No run is available in this workspace.");
         return;
       }
       startTransition(() => {
+        setSelectedConversationId("");
         setSelectedRunId(latestRunId);
+        setActiveTab("runs");
       });
-      
       return;
     }
     if (normalized === "clear search") {
       setWorkspaceSearchQuery("");
-      
       return;
     }
     if (normalized.startsWith("search ")) {
       setWorkspaceSearchQuery(rawCommand.trim().slice(7));
-      
       focusSearch();
       return;
     }
     setError(
-      "Unknown command. Try new conversation, new run, starter thread, starter run, latest conversation, latest run, or search <term>.",
+      "Unknown command. Try new thread, new run, starter thread, starter run, latest thread, latest run, or search <term>.",
     );
   }
 

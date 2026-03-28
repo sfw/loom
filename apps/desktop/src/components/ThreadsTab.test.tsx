@@ -26,6 +26,19 @@ describe("ThreadsTab", () => {
   beforeEach(() => {
     mockApp = {
       selectedConversationId: "conversation-1",
+      overview: {
+        recent_conversations: [
+          {
+            id: "conversation-1",
+            title: "Thread Title",
+            model_name: "kimi-k2.5",
+            turn_count: 2,
+            last_active_at: "2026-03-27T00:00:00Z",
+            started_at: "2026-03-27T00:00:00Z",
+            linked_run_ids: [],
+          },
+        ],
+      },
       conversationDetail: {
         id: "conversation-1",
         title: "Thread Title",
@@ -97,6 +110,79 @@ describe("ThreadsTab", () => {
       setError: vi.fn(),
       setNotice: vi.fn(),
     };
+  });
+
+  it("auto-opens the only thread in a workspace", async () => {
+    mockApp.selectedConversationId = "";
+    mockApp.conversationDetail = null;
+
+    render(<ThreadsTab />);
+
+    await waitFor(() => {
+      expect(mockApp.setSelectedConversationId).toHaveBeenCalledWith("conversation-1");
+    });
+    expect(screen.getByText("Opening thread...")).toBeInTheDocument();
+  });
+
+  it("shows a thread chooser when the workspace has multiple threads", async () => {
+    const user = userEvent.setup();
+    mockApp.selectedConversationId = "";
+    mockApp.conversationDetail = null;
+    mockApp.overview = {
+      recent_conversations: [
+        {
+          id: "conversation-1",
+          title: "Tennis plan",
+          model_name: "kimi-k2.5",
+          turn_count: 3,
+          last_active_at: "2026-03-27T00:00:00Z",
+          started_at: "2026-03-27T00:00:00Z",
+          linked_run_ids: [],
+        },
+        {
+          id: "conversation-2",
+          title: "Coach outreach",
+          model_name: "kimi-k2.5",
+          turn_count: 7,
+          last_active_at: "2026-03-27T01:00:00Z",
+          started_at: "2026-03-27T01:00:00Z",
+          linked_run_ids: [],
+        },
+      ],
+    };
+
+    render(<ThreadsTab />);
+
+    expect(screen.getByText("Pick a thread to continue in this workspace.")).toBeInTheDocument();
+    expect(screen.getByText("Tennis plan")).toBeInTheDocument();
+    expect(screen.getByText("Coach outreach")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /Coach outreach/i }));
+
+    expect(mockApp.setSelectedConversationId).toHaveBeenCalledWith("conversation-2");
+  });
+
+  it("clears and hides a stale thread when it does not belong to the active workspace", async () => {
+    mockApp.selectedWorkspaceId = "workspace-2";
+    mockApp.selectedConversationId = "conversation-1";
+    mockApp.overview = {
+      recent_conversations: [],
+    };
+    mockApp.conversationDetail = {
+      id: "conversation-1",
+      workspace_id: "workspace-1",
+      title: "Thread Title",
+      model_name: "kimi-k2.5",
+      started_at: "2026-03-27T00:00:00Z",
+    };
+
+    render(<ThreadsTab />);
+
+    await waitFor(() => {
+      expect(mockApp.setSelectedConversationId).toHaveBeenCalledWith("");
+    });
+    expect(screen.getByText("No threads yet")).toBeInTheDocument();
+    expect(screen.queryByText("Thread Title")).not.toBeInTheDocument();
   });
 
   it("renders replay events as the canonical thread transcript, including persisted reasoning", async () => {
@@ -228,6 +314,28 @@ describe("ThreadsTab", () => {
     expect(screen.getByText("Input Requested")).toBeInTheDocument();
     expect(screen.getAllByText("Which direction should I take?")).toHaveLength(2);
     expect(screen.getByRole("button", { name: "Option A" })).toBeInTheDocument();
+  });
+
+  it("hydrates arrow-key prompt history from persisted thread input history", async () => {
+    const user = userEvent.setup();
+    mockApp.conversationDetail = {
+      ...mockApp.conversationDetail,
+      session_state: {
+        ui_state: {
+          input_history: {
+            items: ["first prompt", "second prompt", "third prompt"],
+          },
+        },
+      },
+    };
+
+    render(<ThreadsTab />);
+
+    const composer = screen.getByPlaceholderText("Send a message...");
+    await user.click(composer);
+    await user.keyboard("{ArrowUp}");
+
+    expect(mockApp.setConversationComposerMessage).toHaveBeenCalledWith("third prompt");
   });
 
   it("backfills older history when the initial page does not overflow the transcript", async () => {

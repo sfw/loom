@@ -100,6 +100,8 @@ describe("useWorkspace", () => {
     renderHook(() =>
       useWorkspace({
         selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "",
         setSelectedWorkspaceId: vi.fn(),
         showArchivedWorkspaces: false,
         setShowArchivedWorkspaces: vi.fn(),
@@ -181,5 +183,292 @@ describe("useWorkspace", () => {
     expect(apiMocks.fetchWorkspaceSettings).toHaveBeenCalledTimes(1);
     expect(apiMocks.fetchWorkspaceInventory).toHaveBeenCalledTimes(1);
     expect(apiMocks.fetchWorkspaceArtifacts).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears stale thread and run selection immediately when switching workspaces", async () => {
+    vi.useFakeTimers();
+    const setSelectedConversationId = vi.fn();
+    const setSelectedRunId = vi.fn();
+
+    let resolveOverview!: (value: any) => void;
+    apiMocks.fetchWorkspaceOverview.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveOverview = resolve; }),
+    );
+
+    const { rerender } = renderHook(
+      ({
+        selectedWorkspaceId,
+        workspaces,
+      }: {
+        selectedWorkspaceId: string;
+        workspaces: any[];
+      }) =>
+        useWorkspace({
+          selectedWorkspaceId,
+          selectedConversationId: "",
+          selectedRunId: "",
+          setSelectedWorkspaceId: vi.fn(),
+          showArchivedWorkspaces: false,
+          setShowArchivedWorkspaces: vi.fn(),
+          createParentPath: "/tmp",
+          setCreateParentPath: vi.fn(),
+          workspaces,
+          setWorkspaces: vi.fn(),
+          runtime: null,
+          setError: vi.fn(),
+          setNotice: vi.fn(),
+          activeTab: "threads",
+          setActiveTab: vi.fn(),
+          setSelectedConversationId,
+          setSelectedRunId,
+        }),
+      {
+        initialProps: {
+          selectedWorkspaceId: "workspace-1",
+          workspaces: [{
+            id: "workspace-1",
+            canonical_path: "/tmp/workspace-1",
+            display_name: "Workspace 1",
+            metadata: {},
+            is_archived: false,
+            sort_order: 0,
+          }],
+        },
+      },
+    );
+
+    await act(async () => {
+      resolveOverview({
+        workspace: {
+          id: "workspace-1",
+          canonical_path: "/tmp/workspace-1",
+          display_name: "Workspace 1",
+        },
+        recent_conversations: [{
+          id: "conversation-1",
+          title: "Conversation 1",
+          model_name: "kimi-k2.5",
+          last_active_at: "",
+          started_at: "",
+          linked_run_ids: [],
+        }],
+        recent_runs: [{
+          id: "run-1",
+          goal: "Run 1",
+          status: "completed",
+          created_at: "",
+          updated_at: "",
+          process_name: "",
+          linked_conversation_ids: [],
+        }],
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    setSelectedConversationId.mockClear();
+    setSelectedRunId.mockClear();
+
+    rerender({
+      selectedWorkspaceId: "workspace-2",
+      workspaces: [
+        {
+          id: "workspace-1",
+          canonical_path: "/tmp/workspace-1",
+          display_name: "Workspace 1",
+          metadata: {},
+          is_archived: false,
+          sort_order: 0,
+        },
+        {
+          id: "workspace-2",
+          canonical_path: "/tmp/workspace-2",
+          display_name: "Workspace 2",
+          metadata: {},
+          is_archived: false,
+          sort_order: 1,
+        },
+      ],
+    });
+
+    expect(setSelectedConversationId).toHaveBeenCalledWith("");
+    expect(setSelectedRunId).toHaveBeenCalledWith("");
+  });
+
+  it("preserves an explicitly targeted thread and run during cross-workspace navigation", async () => {
+    vi.useFakeTimers();
+    const setSelectedConversationId = vi.fn();
+    const setSelectedRunId = vi.fn();
+
+    apiMocks.fetchWorkspaceOverview.mockResolvedValue({
+      workspace: {
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace-1",
+        display_name: "Workspace 1",
+      },
+      recent_conversations: [{
+        id: "conversation-1",
+        title: "Conversation 1",
+        model_name: "kimi-k2.5",
+        last_active_at: "",
+        started_at: "",
+        linked_run_ids: [],
+      }],
+      recent_runs: [{
+        id: "run-1",
+        goal: "Run 1",
+        status: "completed",
+        created_at: "",
+        updated_at: "",
+        process_name: "",
+        linked_conversation_ids: [],
+      }],
+    });
+
+    const { rerender } = renderHook(
+      ({
+        selectedWorkspaceId,
+        selectedConversationId,
+        selectedRunId,
+        workspaces,
+      }: {
+        selectedWorkspaceId: string;
+        selectedConversationId: string;
+        selectedRunId: string;
+        workspaces: any[];
+      }) =>
+        useWorkspace({
+          selectedWorkspaceId,
+          selectedConversationId,
+          selectedRunId,
+          setSelectedWorkspaceId: vi.fn(),
+          showArchivedWorkspaces: false,
+          setShowArchivedWorkspaces: vi.fn(),
+          createParentPath: "/tmp",
+          setCreateParentPath: vi.fn(),
+          workspaces,
+          setWorkspaces: vi.fn(),
+          runtime: null,
+          setError: vi.fn(),
+          setNotice: vi.fn(),
+          activeTab: "threads",
+          setActiveTab: vi.fn(),
+          setSelectedConversationId,
+          setSelectedRunId,
+        }),
+      {
+        initialProps: {
+          selectedWorkspaceId: "workspace-1",
+          selectedConversationId: "conversation-1",
+          selectedRunId: "run-1",
+          workspaces: [
+            {
+              id: "workspace-1",
+              canonical_path: "/tmp/workspace-1",
+              display_name: "Workspace 1",
+              metadata: {},
+              is_archived: false,
+              sort_order: 0,
+            },
+          ],
+        },
+      },
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    setSelectedConversationId.mockClear();
+    setSelectedRunId.mockClear();
+
+    rerender({
+      selectedWorkspaceId: "workspace-2",
+      selectedConversationId: "conversation-2",
+      selectedRunId: "run-2",
+      workspaces: [
+        {
+          id: "workspace-1",
+          canonical_path: "/tmp/workspace-1",
+          display_name: "Workspace 1",
+          metadata: {},
+          is_archived: false,
+          sort_order: 0,
+        },
+        {
+          id: "workspace-2",
+          canonical_path: "/tmp/workspace-2",
+          display_name: "Workspace 2",
+          metadata: {},
+          is_archived: false,
+          sort_order: 1,
+        },
+      ],
+    });
+
+    expect(setSelectedConversationId).not.toHaveBeenCalledWith("");
+    expect(setSelectedRunId).not.toHaveBeenCalledWith("");
+  });
+
+  it("does not clear a selected run just because it is not in the recent-runs overview slice", async () => {
+    vi.useFakeTimers();
+    const setSelectedConversationId = vi.fn();
+    const setSelectedRunId = vi.fn();
+
+    apiMocks.fetchWorkspaceOverview.mockResolvedValue({
+      workspace: {
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace-1",
+        display_name: "Workspace 1",
+      },
+      recent_conversations: [],
+      recent_runs: [{
+        id: "run-1",
+        goal: "Run 1",
+        status: "completed",
+        created_at: "",
+        updated_at: "",
+        process_name: "",
+        linked_conversation_ids: [],
+      }],
+    });
+
+    renderHook(() =>
+      useWorkspace({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "run-newly-created",
+        setSelectedWorkspaceId: vi.fn(),
+        showArchivedWorkspaces: false,
+        setShowArchivedWorkspaces: vi.fn(),
+        createParentPath: "/tmp",
+        setCreateParentPath: vi.fn(),
+        workspaces: [{
+          id: "workspace-1",
+          canonical_path: "/tmp/workspace-1",
+          display_name: "Workspace 1",
+          metadata: {},
+          is_archived: false,
+          sort_order: 0,
+        }] as any,
+        setWorkspaces: vi.fn(),
+        runtime: null,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        activeTab: "runs",
+        setActiveTab: vi.fn(),
+        setSelectedConversationId,
+        setSelectedRunId,
+      }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(setSelectedRunId).not.toHaveBeenCalledWith("run-1");
+    expect(setSelectedRunId).not.toHaveBeenCalledWith("");
   });
 });

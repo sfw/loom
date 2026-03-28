@@ -166,7 +166,10 @@ export interface RunsActions {
   setRunOperatorMessage: React.Dispatch<React.SetStateAction<string>>;
   setRunHistoryQuery: React.Dispatch<React.SetStateAction<string>>;
   setActiveRunMatchIndex: React.Dispatch<React.SetStateAction<number>>;
-  handleLaunchRun: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  handleLaunchRun: (
+    event: FormEvent<HTMLFormElement>,
+    extraContext?: Record<string, unknown>,
+  ) => Promise<void>;
   handleRunControl: (action: "pause" | "resume" | "cancel") => Promise<void>;
   handleDeleteRun: () => Promise<void>;
   handleRestartRun: () => Promise<void>;
@@ -242,9 +245,12 @@ export function useRuns(deps: {
     || null;
   const filteredRunArtifacts = runArtifacts
     .filter((artifact) => {
-      // Filter out meaningless entries like "." or empty paths
-      const p = artifact.path.trim();
-      if (!p || p === "." || p === "./") return false;
+      // Filter out meaningless entries like ".", "./", or "subfolder/."
+      const p = artifact.path.trim().replace(/\\/g, "/");
+      if (!p) return false;
+      const parts = p.split("/").filter(Boolean);
+      if (parts.length === 0) return false;
+      if (parts[parts.length - 1] === ".") return false;
       return true;
     })
     .filter((artifact) =>
@@ -508,7 +514,10 @@ export function useRuns(deps: {
   // Handlers
   // ---------------------------------------------------------------------------
 
-  async function handleLaunchRun(event: FormEvent<HTMLFormElement>) {
+  async function handleLaunchRun(
+    event: FormEvent<HTMLFormElement>,
+    extraContext?: Record<string, unknown>,
+  ) {
     event.preventDefault();
     if (!overview?.workspace.canonical_path) {
       setError("Select a workspace before launching a run.");
@@ -528,6 +537,7 @@ export function useRuns(deps: {
         workspace: overview.workspace.canonical_path,
         process: runProcess.trim() || undefined,
         approval_mode: runApprovalMode || "auto",
+        context: extraContext,
         auto_subfolder: true,
       });
       const nextRunId = created.task_id || created.run_id;

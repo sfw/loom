@@ -22,6 +22,9 @@ import {
   Trash2,
   RotateCcw,
   RefreshCw,
+  Sparkles,
+  Package,
+  FolderTree,
 } from "lucide-react";
 import { useApp } from "@/context/AppContext";
 import { formatDate, formatBytes, highlightText } from "@/utils";
@@ -228,7 +231,7 @@ function RunDot({ status }: { status: string }) {
       className={cn(
         "h-2 w-2 shrink-0 rounded-full",
         active
-          ? "bg-emerald-400 animate-pulse"
+          ? "bg-sky-400 animate-pulse"
           : s === "failed"
             ? "bg-red-400"
             : s === "completed"
@@ -248,7 +251,7 @@ function StatusBadge({ status }: { status: string }) {
       className={cn(
         "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
         s === "executing" || s === "planning" || s === "running"
-          ? "bg-emerald-500/15 text-emerald-400"
+          ? "bg-sky-500/15 text-sky-400"
           : s === "completed"
             ? "bg-emerald-500/15 text-emerald-300"
             : s === "failed"
@@ -279,7 +282,7 @@ function SubtaskStatusIcon({
     case "failed":
       return <AlertTriangle size={14} className="text-red-400" />;
     case "running":
-      return <Loader2 size={14} className={cn("text-amber-400", animated && "animate-spin")} />;
+      return <Loader2 size={14} className={cn("text-sky-400", animated && "animate-spin")} />;
     default:
       return <Clock size={14} className="text-zinc-600" />;
   }
@@ -351,6 +354,83 @@ function processPromptHint(process: {
   return "Tell this process what to work on";
 }
 
+type ProcessBucket = "custom" | "installed" | "builtin";
+
+function normalizePath(value: string): string {
+  return String(value || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function inferProcessBucket(
+  process: { path?: string },
+  workspacePath: string,
+): ProcessBucket {
+  const processPath = normalizePath(process.path || "");
+  const normalizedWorkspace = normalizePath(workspacePath);
+  if (
+    normalizedWorkspace
+    && (
+      processPath.startsWith(`${normalizedWorkspace}/loom-processes/`)
+      || processPath.startsWith(`${normalizedWorkspace}/.loom/processes/`)
+      || processPath === `${normalizedWorkspace}/loom-processes`
+      || processPath === `${normalizedWorkspace}/.loom/processes`
+    )
+  ) {
+    return "custom";
+  }
+  if (processPath.includes("/.loom/processes/") || processPath.endsWith("/.loom/processes")) {
+    return "installed";
+  }
+  return "builtin";
+}
+
+function processBucketLabel(bucket: ProcessBucket): string {
+  switch (bucket) {
+    case "custom":
+      return "Custom";
+    case "installed":
+      return "Installed";
+    default:
+      return "Built-in";
+  }
+}
+
+function processBucketDescription(bucket: ProcessBucket): string {
+  switch (bucket) {
+    case "custom":
+      return "Workspace-local processes that shape this project.";
+    case "installed":
+      return "Processes installed into your personal Loom environment.";
+    default:
+      return "Processes that ship with Loom by default.";
+  }
+}
+
+type LaunchPathOption = {
+  path: string;
+  isDir: boolean;
+  source: "artifact" | "workspace";
+  recency: number;
+};
+
+function pathOptionName(path: string): string {
+  const normalized = normalizePath(path);
+  const parts = normalized.split("/").filter(Boolean);
+  return parts[parts.length - 1] || normalized;
+}
+
+function pathOptionParent(path: string): string {
+  const normalized = normalizePath(path);
+  const parts = normalized.split("/").filter(Boolean);
+  return parts.length > 1 ? parts.slice(0, -1).join("/") : "";
+}
+
+function isHiddenLaunchPath(path: string): boolean {
+  const normalized = normalizePath(path);
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length === 0) return false;
+  return parts.some((part) => part.startsWith("."));
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
@@ -402,11 +482,16 @@ export default function RunsTab() {
     inventory,
     handleOpenWorkspaceFile,
     setActiveTab,
+    loadedWorkspaceFileEntries,
+    loadWorkspaceDirectory,
+    recentWorkspaceArtifacts,
   } = useApp();
 
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activitySearch, setActivitySearch] = useState("");
   const [processQuery, setProcessQuery] = useState("");
+  const [attachQuery, setAttachQuery] = useState("");
+  const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
 
   const highlightQuery = runHistoryQuery || workspaceSearchQuery || "";
   const processes = inventory?.processes || [];
@@ -417,16 +502,17 @@ export default function RunsTab() {
     [processes, runProcess],
   );
   const normalizedProcessQuery = normalizeProcessQuery(processQuery);
-  const visibleProcesses = useMemo(() => {
+  const groupedProcesses = useMemo(() => {
     const scored = processes
       .map((process, index) => {
         const name = normalizeProcessQuery(process.name);
         const description = normalizeProcessQuery(process.description || "");
         const author = normalizeProcessQuery(process.author || "");
-        const text = `${name} ${description} ${author}`;
+        const bucket = inferProcessBucket(process, workspacePath);
+        const text = `${name} ${description} ${author} ${bucket}`;
         const selected = process.name === runProcess;
         const matches = !normalizedProcessQuery || text.includes(normalizedProcessQuery);
-        return { process, index, selected, matches };
+        return { process, index, selected, matches, bucket };
       })
       .filter((entry) => entry.matches)
       .sort((left, right) => {
@@ -435,9 +521,124 @@ export default function RunsTab() {
         }
         return left.index - right.index;
       });
-    return scored.map((entry) => entry.process);
+    const grouped = new Map<ProcessBucket, typeof scored>();
+    grouped.set("custom", []);
+    grouped.set("installed", []);
+    grouped.set("builtin", []);
+    for (const entry of scored) {
+      grouped.get(entry.bucket)!.push(entry);
+    }
+    return grouped;
   }, [normalizedProcessQuery, processes, runProcess]);
   const launchPlaceholder = processPromptHint(selectedProcessInfo);
+  const attachablePathOptions = useMemo(() => {
+    const byPath = new Map<string, LaunchPathOption>();
+    for (const entry of loadedWorkspaceFileEntries) {
+      const cleanPath = normalizePath(entry.path);
+      if (!cleanPath || isHiddenLaunchPath(cleanPath)) continue;
+      byPath.set(cleanPath, {
+        path: cleanPath,
+        isDir: Boolean(entry.is_dir),
+        source: "workspace",
+        recency: Number.MAX_SAFE_INTEGER,
+      });
+    }
+    for (const [artifactIndex, artifact] of recentWorkspaceArtifacts.entries()) {
+      const cleanPath = normalizePath(artifact.path);
+      if (!cleanPath || isHiddenLaunchPath(cleanPath)) continue;
+      const existingArtifact = byPath.get(cleanPath);
+      byPath.set(cleanPath, {
+        path: cleanPath,
+        isDir: false,
+        source: "artifact",
+        recency: Math.min(existingArtifact?.recency ?? Number.MAX_SAFE_INTEGER, artifactIndex),
+      });
+      const parts = cleanPath.split("/").filter(Boolean);
+      for (let index = 1; index < parts.length; index += 1) {
+        const dirPath = parts.slice(0, index).join("/");
+        if (isHiddenLaunchPath(dirPath)) continue;
+        const existingDirectory = byPath.get(dirPath);
+        byPath.set(dirPath, {
+          path: dirPath,
+          isDir: true,
+          source: "artifact",
+          recency: Math.min(existingDirectory?.recency ?? Number.MAX_SAFE_INTEGER, artifactIndex + 0.5),
+        });
+      }
+    }
+    return Array.from(byPath.values());
+  }, [loadedWorkspaceFileEntries, recentWorkspaceArtifacts]);
+  const attachablePathLookup = useMemo(
+    () => new Map(attachablePathOptions.map((option) => [option.path, option])),
+    [attachablePathOptions],
+  );
+  const launchContext = useMemo(() => {
+    if (attachedPaths.length === 0) return undefined;
+    const directories = attachedPaths.filter((path) => attachablePathLookup.get(path)?.isDir);
+    const files = attachedPaths.filter((path) => !attachablePathLookup.get(path)?.isDir);
+    return {
+      workspace_paths: attachedPaths,
+      workspace_files: files,
+      workspace_directories: directories,
+    };
+  }, [attachablePathLookup, attachedPaths]);
+  const visibleAttachSuggestions = useMemo(() => {
+    const query = normalizeProcessQuery(attachQuery);
+    const pathNameRank = (option: LaunchPathOption) => {
+      if (!query) return 3;
+      const name = normalizeProcessQuery(pathOptionName(option.path));
+      const path = normalizeProcessQuery(option.path);
+      if (name.startsWith(query)) return 0;
+      if (name.includes(query)) return 1;
+      if (path.includes(query)) return 2;
+      return 3;
+    };
+    return attachablePathOptions
+      .filter((option) => !attachedPaths.includes(option.path))
+      .filter((option) => {
+        if (!query) return true;
+        const haystack = `${normalizeProcessQuery(option.path)} ${normalizeProcessQuery(pathOptionName(option.path))}`;
+        return haystack.includes(query);
+      })
+      .sort((left, right) => {
+        const leftRank = pathNameRank(left);
+        const rightRank = pathNameRank(right);
+        if (leftRank !== rightRank) {
+          return leftRank - rightRank;
+        }
+        if (left.source !== right.source) {
+          return left.source === "artifact" ? -1 : 1;
+        }
+        if (left.isDir !== right.isDir) {
+          return left.isDir ? -1 : 1;
+        }
+        if (left.recency !== right.recency) {
+          return left.recency - right.recency;
+        }
+        return left.path.localeCompare(right.path);
+      })
+      .slice(0, query ? 24 : 18);
+  }, [attachQuery, attachedPaths, attachablePathOptions]);
+
+  useEffect(() => {
+    if (!selectedRunId && selectedWorkspaceId) {
+      void loadWorkspaceDirectory(selectedWorkspaceId, "");
+    }
+  }, [loadWorkspaceDirectory, selectedRunId, selectedWorkspaceId]);
+
+  useEffect(() => {
+    setAttachedPaths([]);
+    setAttachQuery("");
+  }, [selectedWorkspaceId]);
+
+  function toggleAttachedPath(path: string) {
+    setAttachedPaths((current) =>
+      current.includes(path)
+        ? current.filter((item) => item !== path)
+        : [...current, path],
+    );
+    setAttachQuery("");
+  }
 
   // --- Mode routing ---
   if (selectedRunId) {
@@ -496,29 +697,239 @@ export default function RunsTab() {
   // =========================================================================
   return (
     <div className="flex h-full flex-col overflow-y-auto bg-[#0f0f12]">
-      <div className="flex-1 flex flex-col items-center px-6 py-10 max-w-4xl mx-auto w-full">
-        {/* --- Title --- */}
-        <div className="text-center mb-8">
-          <div className="flex h-12 w-12 mx-auto items-center justify-center rounded-2xl bg-[#6b7a5e]/15 mb-3">
-            <Play className="h-6 w-6 text-[#a3b396]" />
+      <div className="flex-1 flex flex-col items-center px-6 py-8 max-w-5xl mx-auto w-full">
+        <div className="w-full rounded-2xl border border-zinc-800 bg-zinc-900/50 p-5 mb-6">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div className="min-w-0">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#6b7a5e]/15">
+                  <Play className="h-5 w-5 text-[#a3b396]" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-bold text-zinc-100">Launch a Run</h2>
+                  <p className="mt-1 text-sm text-zinc-500">
+                    Launch ad-hoc with just a goal, or choose a process below to structure the run.
+                  </p>
+                </div>
+              </div>
+              {workspacePath && (
+                <p className="flex items-center gap-1.5 text-xs text-zinc-600">
+                  <FolderOpen size={12} />
+                  <span className="font-mono truncate max-w-xl">{workspacePath}</span>
+                </p>
+              )}
+            </div>
+
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-xs text-zinc-500">
+              <div className="flex items-center gap-2">
+                <Sparkles size={12} className="text-[#a3b396]" />
+                <span>
+                  {runProcess
+                    ? `Using ${runProcess}`
+                    : "No process selected. This will run in ad-hoc mode."}
+                </span>
+              </div>
+            </div>
           </div>
-          <h2 className="text-xl font-bold text-zinc-100 mb-1">Launch a Run</h2>
-          {workspacePath && (
-            <p className="flex items-center justify-center gap-1.5 text-xs text-zinc-600">
-              <FolderOpen size={12} />
-              <span className="font-mono truncate max-w-md">{workspacePath}</span>
-            </p>
-          )}
+
+          <form
+            onSubmit={(e: FormEvent<HTMLFormElement>) => handleLaunchRun(e, launchContext)}
+            className="mt-5 space-y-4"
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-600">
+                Mode
+              </span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-[#6b7a5e]/15 px-2.5 py-1 text-xs font-medium text-[#bec8b4]">
+                {runProcess ? <Package size={11} /> : <Sparkles size={11} />}
+                {runProcess || "Ad-hoc"}
+              </span>
+              {runProcess && (
+                <button
+                  type="button"
+                  onClick={() => setRunProcess("")}
+                  className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+                >
+                  Clear process
+                </button>
+              )}
+            </div>
+
+            <textarea
+              value={runGoal}
+              onChange={(e) => setRunGoal(e.target.value)}
+              placeholder={launchPlaceholder}
+              rows={3}
+              disabled={disabled}
+              className="w-full rounded-xl border border-zinc-700 bg-zinc-900/80 px-4 py-3 text-sm text-zinc-200 placeholder:text-zinc-600 resize-none focus:outline-none focus:ring-1 focus:ring-[#8a9a7b]/50 focus:border-[#8a9a7b]/50 disabled:opacity-40"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  e.currentTarget.form?.requestSubmit();
+                }
+              }}
+            />
+
+            {selectedProcessInfo?.description ? (
+              <p className="text-[11px] leading-relaxed text-zinc-500">
+                {selectedProcessInfo.description}
+              </p>
+            ) : (
+              <p className="text-[11px] leading-relaxed text-zinc-600">
+                Start with a plain-English goal and Loom will launch an ad-hoc run, or pick a process below to use a predefined workflow.
+              </p>
+            )}
+
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+              <div className="flex items-center gap-2 mb-2">
+                <FolderTree size={13} className="text-[#a3b396]" />
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+                  Workspace context
+                </p>
+              </div>
+              <p className="mb-3 text-xs text-zinc-600">
+                Attach files or folders from this workspace so downstream processes can use them as explicit context.
+              </p>
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-600" />
+                <input
+                  type="text"
+                  value={attachQuery}
+                  onChange={(e) => setAttachQuery(e.target.value)}
+                  placeholder="Attach files or folders (optional)"
+                  className="w-full rounded-lg border border-zinc-800 bg-zinc-900/70 py-2 pl-8 pr-3 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:ring-1 focus:ring-[#8a9a7b]/50"
+                />
+              </div>
+              {attachedPaths.length > 0 && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {attachedPaths.map((path) => (
+                    <button
+                      key={path}
+                      type="button"
+                      onClick={() => toggleAttachedPath(path)}
+                      className="inline-flex items-center gap-1 rounded-full bg-[#6b7a5e]/15 px-2.5 py-1 text-xs text-[#bec8b4] hover:bg-[#6b7a5e]/25"
+                    >
+                      <span className="truncate max-w-[22rem]">{path}</span>
+                      <XCircle size={11} />
+                    </button>
+                  ))}
+                </div>
+              )}
+              {visibleAttachSuggestions.length > 0 && (
+                <div className="mt-3">
+                  <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
+                    Suggested context
+                  </p>
+                  <div className="max-h-64 overflow-y-auto pr-1">
+                  <div className="flex flex-wrap gap-2">
+                  {visibleAttachSuggestions.map((option) => (
+                    <button
+                      key={option.path}
+                      type="button"
+                      onClick={() => toggleAttachedPath(option.path)}
+                      className="inline-flex items-center gap-1 rounded-full border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-400 hover:border-zinc-700 hover:text-zinc-200"
+                    >
+                      {option.isDir ? <FolderOpen size={11} /> : <FileText size={11} />}
+                      <span>{pathOptionName(option.path)}</span>
+                      {option.source === "artifact" && (
+                        <span className="rounded-full bg-[#6b7a5e]/15 px-1.5 py-0.5 text-[9px] font-medium text-[#bec8b4]">
+                          recent output
+                        </span>
+                      )}
+                      {pathOptionParent(option.path) && (
+                        <span className="max-w-[18rem] truncate text-zinc-600">
+                          {pathOptionParent(option.path)}
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+                </div>
+                </div>
+              )}
+            </div>
+
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowAdvanced(!showAdvanced)}
+                className="flex items-center gap-1 text-[11px] text-zinc-600 hover:text-zinc-400 transition-colors"
+              >
+                {showAdvanced ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+                Advanced options
+              </button>
+              {showAdvanced && (
+                <div className="mt-2 rounded-lg border border-zinc-800 bg-zinc-950/50 p-3">
+                  <label className="flex items-center gap-1.5 text-[11px] font-medium text-zinc-500 mb-2">
+                    <Shield className="h-3 w-3" />
+                    Approval mode
+                  </label>
+                  <div className="flex gap-1.5">
+                    {APPROVAL_MODES.map((mode) => (
+                      <button
+                        key={mode.value}
+                        type="button"
+                        onClick={() => setRunApprovalMode(mode.value)}
+                        disabled={disabled}
+                        title={mode.desc}
+                        className={cn(
+                          "flex-1 rounded-lg px-2.5 py-2 text-[11px] font-medium transition-colors border",
+                          runApprovalMode === mode.value
+                            ? "bg-[#6b7a5e]/15 text-[#bec8b4] border-[#8a9a7b]/30"
+                            : "text-zinc-400 border-zinc-700 hover:bg-zinc-800",
+                          "disabled:opacity-40",
+                        )}
+                      >
+                        {mode.label}
+                        <span className="block text-[9px] text-zinc-600 font-normal mt-0.5">{mode.desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <button
+                type="submit"
+                disabled={disabled || (!runGoal.trim() && !runProcess)}
+                className={cn(
+                  "flex w-full items-center justify-center gap-2 rounded-xl px-5 py-3 text-sm font-semibold transition-colors sm:w-auto sm:min-w-[16rem]",
+                  "bg-[#6b7a5e] text-white hover:bg-[#8a9a7b]",
+                  "disabled:opacity-40 disabled:cursor-not-allowed",
+                )}
+              >
+                {launchingRun ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Launching...
+                  </>
+                ) : (
+                  <>
+                    <Play className="h-4 w-4" />
+                    {runProcess ? `Launch ${runProcess}` : "Launch ad-hoc run"}
+                  </>
+                )}
+              </button>
+              <p className="text-[10px] text-zinc-700">
+                {typeof navigator !== "undefined" && navigator.platform?.includes("Mac") ? "\u2318" : "Ctrl"}+Enter to launch
+              </p>
+            </div>
+          </form>
         </div>
 
-        {/* --- Process cards grid --- */}
         {processes.length > 0 && (
           <div className="w-full mb-6">
-            <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-600">
-                Processes ({processes.length})
-              </p>
-              <div className="relative w-full sm:max-w-xs">
+            <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-600">
+                  Process library ({processes.length})
+                </p>
+                <p className="mt-1 text-xs text-zinc-600">
+                  Pick a process to structure the run, or leave it unset and launch ad-hoc.
+                </p>
+              </div>
+              <div className="relative w-full lg:max-w-sm">
                 <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-600" />
                 <input
                   type="text"
@@ -529,168 +940,83 @@ export default function RunsTab() {
                 />
               </div>
             </div>
-            {normalizedProcessQuery && (
-              <p className="mb-2 text-[10px] text-zinc-600">
-                Showing {visibleProcesses.length} matching process{visibleProcesses.length === 1 ? "" : "es"}
-              </p>
-            )}
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
-              {visibleProcesses.map((p) => {
-                const isSelected = runProcess === p.name;
-                return (
-                  <button
-                    key={p.name}
-                    type="button"
-                    onClick={() => {
-                      setRunProcess(isSelected ? "" : p.name);
-                    }}
-                    className={cn(
-                      "rounded-xl px-4 py-3 text-left transition-all border",
-                      isSelected
-                        ? "bg-[#6b7a5e]/15 border-[#8a9a7b]/50 ring-1 ring-[#8a9a7b]/25"
-                        : "bg-zinc-900/60 border-zinc-800 hover:border-zinc-700 hover:bg-zinc-800/50",
-                    )}
-                  >
-                    <div className="flex items-center justify-between gap-2 mb-1">
-                      <span
-                        className={cn(
-                          "text-sm font-semibold truncate",
-                          isSelected ? "text-[#bec8b4]" : "text-zinc-200",
-                        )}
-                      >
-                        {p.name}
-                      </span>
-                      {p.version && (
-                        <span className="text-[9px] text-zinc-600 shrink-0 font-mono">v{p.version}</span>
-                      )}
+
+            {(["custom", "installed", "builtin"] as ProcessBucket[]).map((bucket) => {
+              const rows = groupedProcesses.get(bucket) || [];
+              if (rows.length === 0) return null;
+              return (
+                <section key={bucket} className="mb-5">
+                  <div className="mb-2 flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-zinc-200">
+                        {processBucketLabel(bucket)}
+                      </p>
+                      <p className="text-xs text-zinc-600">
+                        {processBucketDescription(bucket)}
+                      </p>
                     </div>
-                    {p.description && (
-                      <p className="text-[11px] text-zinc-500 line-clamp-2 leading-relaxed">{p.description}</p>
-                    )}
-                    {p.author && (
-                      <p className="text-[10px] text-zinc-600 mt-1.5">by {p.author}</p>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-            {visibleProcesses.length === 0 && (
+                    <span className="rounded-full bg-zinc-900 px-2 py-0.5 text-[10px] text-zinc-500">
+                      {rows.length}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 lg:grid-cols-2 2xl:grid-cols-3">
+                    {rows.map(({ process: p }) => {
+                      const isSelected = runProcess === p.name;
+                      return (
+                        <button
+                          key={p.name}
+                          type="button"
+                          onClick={() => {
+                            setRunProcess(isSelected ? "" : p.name);
+                          }}
+                          className={cn(
+                            "rounded-xl px-4 py-3 text-left transition-all border",
+                            isSelected
+                              ? "bg-[#6b7a5e]/15 border-[#8a9a7b]/50 ring-1 ring-[#8a9a7b]/25"
+                              : "bg-zinc-900/60 border-zinc-800 hover:border-zinc-700 hover:bg-zinc-800/50",
+                          )}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span
+                                  className={cn(
+                                    "text-sm font-semibold truncate",
+                                    isSelected ? "text-[#bec8b4]" : "text-zinc-200",
+                                  )}
+                                >
+                                  {p.name}
+                                </span>
+                                <span className="rounded-full bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-500">
+                                  {processBucketLabel(bucket)}
+                                </span>
+                              </div>
+                              {p.description && (
+                                <p className="mt-1 text-[11px] text-zinc-500 line-clamp-2 leading-relaxed">
+                                  {p.description}
+                                </p>
+                              )}
+                              <div className="mt-2 flex items-center gap-2 text-[10px] text-zinc-600">
+                                {p.author && <span>by {p.author}</span>}
+                                {p.version && <span className="font-mono">v{p.version}</span>}
+                              </div>
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              );
+            })}
+
+            {Array.from(groupedProcesses.values()).every((rows) => rows.length === 0) && (
               <div className="rounded-xl border border-dashed border-zinc-800 px-4 py-6 text-center text-sm text-zinc-600">
                 No processes match that search yet.
               </div>
             )}
           </div>
         )}
-
-        {/* --- Goal input --- */}
-        <form
-          onSubmit={(e: FormEvent<HTMLFormElement>) => handleLaunchRun(e)}
-          className="w-full space-y-3"
-        >
-          {runProcess && (
-            <div className="flex items-center gap-2 rounded-lg bg-[#6b7a5e]/10 border border-[#8a9a7b]/20 px-3 py-2">
-              <FileText className="h-3.5 w-3.5 text-[#a3b396] shrink-0" />
-              <span className="text-sm text-[#bec8b4] font-medium">{runProcess}</span>
-              <button
-                type="button"
-                onClick={() => {
-                  setRunProcess("");
-                }}
-                className="ml-auto text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
-              >
-                clear
-              </button>
-            </div>
-          )}
-
-          <textarea
-            value={runGoal}
-            onChange={(e) => setRunGoal(e.target.value)}
-            placeholder={launchPlaceholder}
-            rows={3}
-            disabled={disabled}
-            className="w-full rounded-xl border border-zinc-700 bg-zinc-900/80 px-4 py-3 text-sm text-zinc-200 placeholder:text-zinc-600 resize-none focus:outline-none focus:ring-1 focus:ring-[#8a9a7b]/50 focus:border-[#8a9a7b]/50 disabled:opacity-40"
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                e.preventDefault();
-                e.currentTarget.form?.requestSubmit();
-              }
-            }}
-          />
-          {selectedProcessInfo?.description && (
-            <p className="text-[11px] leading-relaxed text-zinc-500">
-              {selectedProcessInfo.description}
-            </p>
-          )}
-
-          {/* --- Advanced options --- */}
-          <div>
-            <button
-              type="button"
-              onClick={() => setShowAdvanced(!showAdvanced)}
-              className="flex items-center gap-1 text-[11px] text-zinc-600 hover:text-zinc-400 transition-colors"
-            >
-              {showAdvanced ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
-              Advanced options
-            </button>
-            {showAdvanced && (
-              <div className="mt-2 rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
-                <label className="flex items-center gap-1.5 text-[11px] font-medium text-zinc-500 mb-2">
-                  <Shield className="h-3 w-3" />
-                  Approval mode
-                </label>
-                <div className="flex gap-1.5">
-                  {APPROVAL_MODES.map((mode) => (
-                    <button
-                      key={mode.value}
-                      type="button"
-                      onClick={() => setRunApprovalMode(mode.value)}
-                      disabled={disabled}
-                      title={mode.desc}
-                      className={cn(
-                        "flex-1 rounded-lg px-2.5 py-2 text-[11px] font-medium transition-colors border",
-                        runApprovalMode === mode.value
-                          ? "bg-[#6b7a5e]/15 text-[#bec8b4] border-[#8a9a7b]/30"
-                          : "text-zinc-400 border-zinc-700 hover:bg-zinc-800",
-                        "disabled:opacity-40",
-                      )}
-                    >
-                      {mode.label}
-                      <span className="block text-[9px] text-zinc-600 font-normal mt-0.5">{mode.desc}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* --- Launch button --- */}
-          <button
-            type="submit"
-            disabled={disabled || (!runGoal.trim() && !runProcess)}
-            className={cn(
-              "flex w-full items-center justify-center gap-2 rounded-xl px-5 py-3 text-sm font-semibold transition-colors",
-              "bg-[#6b7a5e] text-white hover:bg-[#8a9a7b]",
-              "disabled:opacity-40 disabled:cursor-not-allowed",
-            )}
-          >
-            {launchingRun ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Launching...
-              </>
-            ) : (
-              <>
-                <Play className="h-4 w-4" />
-                {runProcess ? `Launch ${runProcess}` : "Launch run"}
-              </>
-            )}
-          </button>
-
-          <p className="text-center text-[10px] text-zinc-700">
-            {typeof navigator !== "undefined" && navigator.platform?.includes("Mac") ? "\u2318" : "Ctrl"}+Enter to launch
-          </p>
-        </form>
 
         {/* --- Recent runs --- */}
         {filteredRuns.length > 0 && (
@@ -1041,8 +1367,8 @@ function RunDetailView({
 
         <div className="flex items-center gap-2 shrink-0">
           {runStreaming && liveAnimationsEnabled && (
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2.5 py-0.5 text-[10px] font-semibold text-emerald-400">
-              <span className={cn("h-1.5 w-1.5 rounded-full bg-emerald-400", liveAnimationsEnabled && "animate-pulse")} />
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-sky-500/15 px-2.5 py-0.5 text-[10px] font-semibold text-sky-400">
+              <span className={cn("h-1.5 w-1.5 rounded-full bg-sky-400", liveAnimationsEnabled && "animate-pulse")} />
               Streaming
             </span>
           )}
@@ -1139,7 +1465,7 @@ function RunDetailView({
                     : status === "failed"
                       ? "border-red-500/40 bg-red-500/5"
                       : status === "running"
-                        ? "border-amber-500/40 bg-amber-500/5 ring-1 ring-amber-500/20"
+                        ? "border-sky-500/40 bg-sky-500/5 ring-1 ring-sky-500/20"
                         : "border-zinc-800 bg-zinc-900/40";
                 const lineColor =
                   status === "completed"
@@ -1538,7 +1864,10 @@ function artifactDisplayDirectory(path: string): string {
 
 function isDisplayableArtifactPath(path: string): boolean {
   const normalized = String(path || "").trim().replace(/\\/g, "/");
-  return normalized !== "" && normalized !== "." && normalized !== "./";
+  if (!normalized) return false;
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length === 0) return false;
+  return parts[parts.length - 1] !== ".";
 }
 
 function ArtifactCard({
