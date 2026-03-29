@@ -19,6 +19,10 @@ from loom.cli.context import (
 from loom.cli.http_tasks import _cancel_task, _check_status, _run_task
 from loom.cli.persistence import PersistenceInitError, _init_persistence
 from loom.config import Config, ConfigError, load_config
+from loom.runtime.capabilities import (
+    optional_addon_status_by_key,
+    optional_addon_statuses,
+)
 
 
 @click.group(invoke_without_command=True)
@@ -247,6 +251,46 @@ def cowork(
         ctx.obj.get("explicit_auth_path"),
         bool(allow_ephemeral or ctx.obj.get("allow_ephemeral", False)),
     )
+
+
+@cli.command()
+@click.option(
+    "--require-addon",
+    "required_addons",
+    multiple=True,
+    help="Require one optional runtime addon by key; exits non-zero when missing.",
+)
+def doctor(required_addons: tuple[str, ...]) -> None:
+    """Report runtime addon availability and optional hard requirements."""
+    statuses = optional_addon_statuses()
+    click.echo("Runtime doctor")
+    if statuses:
+        for status in statuses:
+            state = "installed" if status.installed else "missing"
+            click.echo(f"- {status.label} ({status.key}): {state}")
+            click.echo(f"  Required for: {status.required_for}")
+            click.echo(f"  Install: {status.install_hint}")
+            if status.detail:
+                click.echo(f"  Detail: {status.detail}")
+    else:
+        click.echo("No optional addons registered.")
+
+    missing_required: list[str] = []
+    for raw_key in required_addons:
+        key = str(raw_key or "").strip().lower()
+        status = optional_addon_status_by_key(key)
+        if status is None:
+            click.echo(f"Unknown addon key: {raw_key}", err=True)
+            sys.exit(1)
+        if not status.installed:
+            missing_required.append(key)
+
+    if missing_required:
+        rendered = ", ".join(sorted(missing_required))
+        click.echo(f"Doctor failed: missing required addon(s): {rendered}", err=True)
+        sys.exit(1)
+
+    click.echo("Doctor passed")
 
 
 @cli.command()

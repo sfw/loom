@@ -30,6 +30,7 @@ from loom.cowork.approval import ApprovalDecision, ToolApprover
 from loom.cowork.memory_indexer import CoworkMemoryIndexer
 from loom.cowork.session_state import SessionState, extract_state_from_tool_events
 from loom.engine.semantic_compactor import SemanticCompactor
+from loom.engine.verification.development import development_helper_tool_guidance
 from loom.models.base import ModelProvider, TokenUsage, ToolCall
 from loom.models.retry import (
     ModelRetryPolicy,
@@ -2681,7 +2682,7 @@ TOOL USAGE:
 - Use web_search to find documentation, solutions, or package information online.
 - Use web_fetch to read a specific URL's content.
 - Use web_fetch_html when you explicitly need raw page source markup.
-- Use shell_execute for running tests, builds, linters, etc.
+- {development_helper_tool_guidance()}
 - Use git_command for version control operations (including push).
 - Use task_tracker to organize multi-step work and show progress.
 - Use ask_user when you need the developer's input or decision.

@@ -138,9 +138,11 @@ export default function Sidebar() {
   const [renamingConvId, setRenamingConvId] = useState<string | null>(null);
   const [renameText, setRenameText] = useState("");
 
+  const activeWorkspaces = workspaces.filter((ws) => !ws.is_archived);
+  const archivedWorkspaces = workspaces.filter((ws) => ws.is_archived);
   const visibleWorkspaces = showArchivedWorkspaces
-    ? workspaces
-    : workspaces.filter((ws) => !ws.is_archived);
+    ? [...activeWorkspaces, ...archivedWorkspaces]
+    : activeWorkspaces;
 
   // --- Local tree state ---------------------------------------------------
 
@@ -388,12 +390,13 @@ export default function Sidebar() {
                 "flex h-5 items-center gap-0.5 rounded px-1 text-[10px] font-medium transition-colors",
                 showArchivedWorkspaces ? "text-[#a3b396]" : "text-zinc-600 hover:text-zinc-400",
               )}
+              title={showArchivedWorkspaces ? "Hide archived workspaces" : "Show archived workspaces"}
             >
               <ChevronDown
                 size={10}
                 className={cn("transition-transform", showArchivedWorkspaces && "rotate-180")}
               />
-              {showArchivedWorkspaces ? "All" : "Active"}
+              Archived
             </button>
             <button
               type="button"
@@ -407,7 +410,7 @@ export default function Sidebar() {
         </div>
 
         <div className="flex-1 overflow-y-auto px-2 pb-2">
-          {visibleWorkspaces.length === 0 && (
+          {activeWorkspaces.length === 0 && (!showArchivedWorkspaces || archivedWorkspaces.length === 0) && (
             <button
               type="button"
               onClick={() => setShowNewWorkspace(true)}
@@ -419,7 +422,7 @@ export default function Sidebar() {
           )}
 
           <div className="flex flex-col gap-0.5">
-            {visibleWorkspaces.map((ws) => {
+            {visibleWorkspaces.map((ws, index) => {
               const isSelected = ws.id === selectedWorkspaceId;
               const isExpanded = expandedWorkspaces.has(ws.id);
               const wsName =
@@ -433,8 +436,13 @@ export default function Sidebar() {
               const runCount = showNested ? wsRuns.length : ws.run_count;
 
               return (
+                <div key={ws.id}>
+                  {ws.is_archived && index === activeWorkspaces.length && (
+                    <div className="px-2 pb-1 pt-4 text-[10.5px] font-semibold uppercase tracking-widest text-zinc-600">
+                      Archived Workspaces
+                    </div>
+                  )}
                 <div
-                  key={ws.id}
                   className={cn(
                     "flex flex-col rounded-lg transition-all",
                     isSelected
@@ -763,8 +771,14 @@ export default function Sidebar() {
                     </div>
                   )}
                 </div>
+                </div>
               );
             })}
+            {showArchivedWorkspaces && archivedWorkspaces.length === 0 && (
+              <div className="px-3 py-2 text-[11px] italic text-zinc-700">
+                No archived workspaces
+              </div>
+            )}
           </div>
         </div>
       </div>

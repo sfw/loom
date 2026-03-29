@@ -12,6 +12,7 @@ from pathlib import Path
 from loom.engine.iteration_gates import IterationEvaluation
 from loom.engine.runner import SubtaskResult, SubtaskResultStatus, ToolCallRecord
 from loom.engine.verification import VerificationResult
+from loom.engine.verification.development import optional_failure_capability_for_reason
 from loom.engine.verification.policy import normalize_profile, resolve_policy_decision
 from loom.events.types import (
     ARTIFACT_SEAL_VALIDATION,
@@ -72,6 +73,106 @@ def observe_iteration_runtime_usage(orchestrator, *, task, subtask, result) -> N
     if orchestrator._phase_iteration_policy(subtask) is None:
         return
     orchestrator._update_iteration_runtime(task=task, subtask=subtask, result=result)
+
+
+def _process_outcome_policy(orchestrator) -> dict[str, object]:
+    process = getattr(orchestrator, "_process", None)
+    if process is None:
+        return {}
+    resolver = getattr(process, "verifier_outcome_policy", None)
+    if callable(resolver):
+        outcome_policy = resolver()
+        if isinstance(outcome_policy, dict):
+            normalized = dict(outcome_policy)
+            optional_capabilities_getter = getattr(
+                process,
+                "verifier_optional_capabilities",
+                None,
+            )
+            if callable(optional_capabilities_getter):
+                optional_capabilities = optional_capabilities_getter()
+                if isinstance(optional_capabilities, list) and optional_capabilities:
+                    normalized["optional_capabilities"] = list(optional_capabilities)
+            treat_infra_getter = getattr(
+                process,
+                "verifier_treat_infra_as_warning",
+                None,
+            )
+            if callable(treat_infra_getter):
+                normalized["treat_verifier_infra_as_warning"] = bool(
+                    treat_infra_getter(),
+                )
+            return normalized
+    verification_policy = getattr(process, "verification_policy", None)
+    outcome_policy = getattr(verification_policy, "outcome_policy", {})
+    if isinstance(outcome_policy, dict):
+        return dict(outcome_policy)
+    return {}
+
+
+def _should_complete_with_warning_success(
+    orchestrator,
+    *,
+    subtask: Subtask,
+    verification: VerificationResult,
+    policy_action: str,
+) -> bool:
+    if policy_action != "pass_with_warnings":
+        return False
+    if subtask.is_synthesis:
+        return False
+    outcome_policy = _process_outcome_policy(orchestrator)
+    if not outcome_policy:
+        return False
+    if not bool(outcome_policy.get("treat_verifier_infra_as_warning", False)):
+        return False
+    metadata = dict(verification.metadata) if isinstance(verification.metadata, dict) else {}
+    capability = ""
+    dev_summary = metadata.get("dev_verification_summary", {})
+    if isinstance(dev_summary, dict):
+        reason_code = str(getattr(verification, "reason_code", "") or "").strip().lower()
+        capability = optional_failure_capability_for_reason(
+            dev_summary,
+            reason_code=reason_code,
+        )
+    if not capability:
+        return False
+    optional_capabilities = outcome_policy.get("optional_capabilities", [])
+    if not isinstance(optional_capabilities, list):
+        optional_capabilities = []
+    normalized_optional = {
+        str(item or "").strip().lower()
+        for item in optional_capabilities
+        if str(item or "").strip()
+    }
+    return capability in normalized_optional
+
+
+def _apply_warning_success(
+    *,
+    result: SubtaskResult,
+    verification: VerificationResult,
+    note: str,
+) -> VerificationResult:
+    result.status = SubtaskResultStatus.SUCCESS
+    result.summary = "\n".join(
+        part
+        for part in [result.summary or "", note]
+        if part
+    ).strip()
+    metadata = dict(verification.metadata) if isinstance(verification.metadata, dict) else {}
+    metadata["warning_success"] = True
+    metadata["warning_success_note"] = note
+    verification.metadata = metadata
+    verification.passed = True
+    verification.outcome = "pass_with_warnings"
+    verification.feedback = "\n".join(
+        part for part in [verification.feedback or "", note] if part
+    ).strip()
+    verification.confidence = min(0.75, max(0.35, float(verification.confidence or 0.5)))
+    if str(verification.severity_class or "").strip().lower() not in {"infra", "inconclusive"}:
+        verification.severity_class = "semantic"
+    return verification
 
 async def dispatch_subtask(
     orchestrator,
@@ -744,6 +845,25 @@ async def handle_failure(
     if resolution_plan:
         attempt_record.resolution_plan = resolution_plan
 
+    if _should_complete_with_warning_success(
+        orchestrator,
+        subtask=subtask,
+        verification=verification,
+        policy_action=policy_decision.action,
+    ):
+        note = (
+            "Verification completed with warnings because only optional "
+            "development verification capabilities failed in this environment."
+        )
+        verification = _apply_warning_success(
+            result=result,
+            verification=verification,
+            note=note,
+        )
+        attempt_record.feedback = verification.feedback or attempt_record.feedback
+        await orchestrator._handle_success(task, subtask, result, verification)
+        return None
+
     critical_path_behavior = orchestrator._critical_path_behavior()
     hard_invariant_failure = orchestrator._is_hard_invariant_failure(verification)
     if (
@@ -1200,7 +1320,6 @@ async def handle_success(
             ApprovalDecision.WAIT,
             ApprovalDecision.WAIT_WITH_TIMEOUT,
         ):
-            timeout = 10 if decision == ApprovalDecision.WAIT_WITH_TIMEOUT else None
             async with orchestrator._state_lock:
                 task.status = TaskStatus.WAITING_APPROVAL
                 orchestrator._state.save(task)
@@ -1213,7 +1332,8 @@ async def handle_success(
                     proposed_action=result.summary,
                     risk_level=confidence.band,
                     details=confidence.components,
-                    auto_approve_timeout=timeout,
+                    # Keep the run paused until the user explicitly decides.
+                    auto_approve_timeout=None,
                 )
             )
 

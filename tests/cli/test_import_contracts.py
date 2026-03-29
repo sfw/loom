@@ -26,6 +26,7 @@ def test_cli_public_exports() -> None:
 def test_cli_root_command_registration_order() -> None:
     assert list(cli.commands.keys()) == [
         "cowork",
+        "doctor",
         "serve",
         "run",
         "status",

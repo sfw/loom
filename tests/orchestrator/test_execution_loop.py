@@ -31,8 +31,14 @@ from loom.events.types import (
 )
 from loom.models.base import ModelConnectionError, ModelResponse, TokenUsage, ToolCall
 from loom.models.router import ModelRouter
-from loom.processes.schema import OutputCoordination, PhaseTemplate, ProcessDefinition
+from loom.processes.schema import (
+    OutputCoordination,
+    PhaseTemplate,
+    ProcessDefinition,
+    VerificationPolicyContract,
+)
 from loom.prompts.assembler import PromptAssembler
+from loom.recovery.confidence import ConfidenceScore
 from loom.recovery.retry import AttemptRecord, RetryStrategy
 from loom.state.task_state import Plan, Subtask, SubtaskStatus, TaskStatus
 from loom.tools.registry import ToolResult
@@ -1306,9 +1312,14 @@ class TestOrchestratorExecution:
             ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
             (
                 SubtaskResult(status="success", summary="ok"),
-                VerificationResult(tier=1, passed=True),
+                VerificationResult(tier=2, passed=True, confidence=1.0),
             ),
         ])
+        orch._confidence.score = MagicMock(return_value=ConfidenceScore(
+            score=0.81,
+            band="high",
+            components={"retry_recovery": 1.0},
+        ))
 
         task = _make_task()
         result = await orch.execute_task(task)
@@ -1498,6 +1509,179 @@ class TestOrchestratorExecution:
         attempts = attempts_by_subtask.get("s1", [])
         assert len(attempts) == 1
         assert attempts[0].error is not None
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_allows_optional_dev_verifier_warning_success(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        process = ProcessDefinition(
+            name="build-process",
+            tags=["build", "coding"],
+            verification_policy=VerificationPolicyContract(
+                outcome_policy={
+                    "treat_verifier_infra_as_warning": True,
+                    "optional_capabilities": ["browser_runtime"],
+                },
+            ),
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="Verify microsite", max_retries=0)
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+
+        result = SubtaskResult(status="failed", summary="Execution summary")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="dev_verifier_timeout",
+            severity_class="infra",
+            feedback="Optional browser verification timed out.",
+            metadata={
+                "verification_profile": "coding",
+                "verification_profile_confidence": 0.9,
+                "dev_verification_summary": {
+                    "optional_failure_capabilities": ["browser_runtime"],
+                },
+            },
+        )
+        attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
+
+        orch._handle_success = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask,
+        )
+
+        orch._handle_success.assert_awaited_once()
+        _, _, success_result, success_verification = orch._handle_success.await_args.args
+        assert success_result.status == "success"
+        assert success_verification.passed is True
+        assert success_verification.outcome == "pass_with_warnings"
+        assert "optional development verification capabilities failed" in str(
+            success_verification.feedback,
+        )
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_does_not_auto_success_without_optional_dev_policy(self, tmp_path):
+        state_manager = _make_state_manager(tmp_path)
+        process = ProcessDefinition(name="build-process", tags=["build", "coding"])
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=0)),
+            process=process,
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="Verify microsite", max_retries=0)
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+
+        result = SubtaskResult(status="failed", summary="Execution summary")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="dev_verifier_timeout",
+            severity_class="infra",
+            feedback="Optional browser verification timed out.",
+            metadata={"verification_profile": "coding", "verification_profile_confidence": 0.9},
+        )
+
+        orch._handle_success = AsyncMock()
+
+        replan = await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask={},
+        )
+
+        orch._handle_success.assert_not_awaited()
+        assert replan is not None
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_allows_optional_dev_warning_from_semantic_contract(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        process = ProcessDefinition(
+            name="build-process",
+            tags=["build", "coding"],
+            verification_policy=VerificationPolicyContract(
+                outcome_policy={"treat_verifier_infra_as_warning": True},
+                semantic_checks=[
+                    {
+                        "name": "optional_browser_verification",
+                        "capability": "browser_runtime",
+                        "helper": "browser_assert",
+                        "optional": True,
+                    },
+                ],
+            ),
+        )
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=PromptAssembler(process=process),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+            process=process,
+        )
+        task = _make_task()
+        subtask = Subtask(id="s1", description="Verify microsite", max_retries=0)
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+
+        result = SubtaskResult(status="failed", summary="Execution summary")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="dev_verifier_timeout",
+            severity_class="infra",
+            feedback="Optional browser verification timed out.",
+            metadata={
+                "verification_profile": "coding",
+                "verification_profile_confidence": 0.9,
+                "dev_verification_summary": {
+                    "optional_failure_capabilities": ["browser_runtime"],
+                },
+            },
+        )
+
+        orch._handle_success = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask={},
+        )
+
+        orch._handle_success.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_handle_failure_generates_model_resolution_plan_for_replan(self, tmp_path):

@@ -9,6 +9,7 @@ const apiMocks = vi.hoisted(() => ({
   fetchRunDetail: vi.fn(),
   fetchRunTimeline: vi.fn(),
   fetchRunArtifacts: vi.fn(),
+  fetchRunConversationHistory: vi.fn(),
   subscribeRunStream: vi.fn(() => () => {}),
   cancelRun: vi.fn(),
   deleteRun: vi.fn(),
@@ -22,6 +23,7 @@ vi.mock("../api", () => ({
   createTask: apiMocks.createTask,
   deleteRun: apiMocks.deleteRun,
   fetchRunArtifacts: apiMocks.fetchRunArtifacts,
+  fetchRunConversationHistory: apiMocks.fetchRunConversationHistory,
   fetchRunDetail: apiMocks.fetchRunDetail,
   fetchRunTimeline: apiMocks.fetchRunTimeline,
   pauseRun: apiMocks.pauseRun,
@@ -46,12 +48,14 @@ describe("useRuns", () => {
     apiMocks.fetchRunDetail.mockReset();
     apiMocks.fetchRunTimeline.mockReset();
     apiMocks.fetchRunArtifacts.mockReset();
+    apiMocks.fetchRunConversationHistory.mockReset();
     apiMocks.subscribeRunStream.mockClear();
     apiMocks.cancelRun.mockReset();
     apiMocks.deleteRun.mockReset();
     apiMocks.pauseRun.mockReset();
     apiMocks.resumeRun.mockReset();
     apiMocks.sendRunMessage.mockReset();
+    apiMocks.fetchRunConversationHistory.mockResolvedValue([]);
   });
 
   it("opens the newly created run by task id and does not block launch on workspace refresh", async () => {
@@ -111,6 +115,48 @@ describe("useRuns", () => {
     expect(setActiveTab).toHaveBeenCalledWith("runs");
     expect(setNotice).toHaveBeenCalledWith("Launched run task-123.");
     expect(setError).not.toHaveBeenCalledWith("Load failed");
+  });
+
+  it("restarts in place by keeping the stable task id selected", async () => {
+    apiMocks.restartRun.mockResolvedValue({
+      task_id: "task-123",
+      run_id: "run-retry-2",
+      status: "pending",
+      message: "Restarted run task-123.",
+    });
+
+    const setSelectedRunId = vi.fn();
+    const setError = vi.fn();
+    const setNotice = vi.fn();
+    const setActiveTab = vi.fn();
+    const refreshWorkspaceSurface = vi.fn(async () => {});
+
+    const { result } = renderHook(() =>
+      useRuns({
+        selectedRunId: "task-123",
+        setSelectedRunId,
+        selectedWorkspaceId: "workspace-1",
+        overview: {
+          workspace: {
+            canonical_path: "/tmp/workspace",
+          },
+          recent_runs: [],
+        } as any,
+        setError,
+        setNotice,
+        setActiveTab,
+        refreshWorkspaceSurface,
+      }),
+    );
+
+    await act(async () => {
+      await result.current.handleRestartRun();
+    });
+
+    expect(apiMocks.restartRun).toHaveBeenCalledWith("task-123");
+    expect(setSelectedRunId).toHaveBeenCalledWith("task-123");
+    expect(setActiveTab).toHaveBeenCalledWith("runs");
+    expect(setNotice).toHaveBeenCalledWith("Relaunched as task-123.");
   });
 
   it("refreshes the selected run when the live stream errors", async () => {

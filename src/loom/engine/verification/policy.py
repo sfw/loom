@@ -31,6 +31,10 @@ _CONTRADICTION_REASON_CODES = frozenset({
 })
 _TARGETED_RETRY_REASON_CODES = frozenset({
     "csv_schema_mismatch",
+    "dev_browser_check_failed",
+    "dev_build_failed",
+    "dev_contract_failed",
+    "dev_test_failed",
     "forbidden_output_path",
     "output_path_policy_violation",
     "missing_evidence",
@@ -39,6 +43,9 @@ _TARGETED_RETRY_REASON_CODES = frozenset({
 })
 _INCONCLUSIVE_REASON_CODES = frozenset({
     "claim_inconclusive",
+    "dev_report_contract_violation",
+    "dev_verifier_capability_unavailable",
+    "dev_verifier_timeout",
     "parse_inconclusive",
     "infra_verifier_error",
     "semantic_inconclusive",
@@ -117,6 +124,14 @@ def resolve_failure_action(
     if reason in _TARGETED_RETRY_REASON_CODES:
         return "retry_targeted"
     if reason in _INCONCLUSIVE_REASON_CODES:
+        if reason in {
+            "dev_report_contract_violation",
+            "dev_verifier_capability_unavailable",
+            "dev_verifier_timeout",
+        }:
+            if effective_lane in {"coding", "data_ops", "hybrid"}:
+                return "pass_with_warnings"
+            return "retry_semantic"
         if reason in {
             "parse_inconclusive",
             "infra_verifier_error",

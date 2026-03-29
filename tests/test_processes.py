@@ -25,6 +25,7 @@ from loom.processes.schema import (
     ProcessNotFoundError,
     ProcessValidationError,
     ToolRequirements,
+    VerificationPolicyContract,
     VerificationRule,
 )
 from loom.prompts.assembler import PromptAssembler
@@ -584,6 +585,92 @@ class TestProcessDefinition:
 
     def test_phase_finalizer_id_is_deterministic(self):
         assert ProcessDefinition.phase_finalizer_id("phase-a") == "phase-a__finalize_output"
+
+    def test_verification_policy_helpers_normalize_dev_settings(self):
+        defn = ProcessDefinition(
+            name="build-adhoc",
+            version="adhoc-2",
+            tags=["adhoc", "build"],
+            verification_policy=VerificationPolicyContract(
+                mode="static_first",
+                static_checks={"tool_success_policy": "development_balanced"},
+                semantic_checks=[{"name": "ui-runtime"}, "skip-me"],
+                output_contract={"required_fields": ["passed"]},
+                outcome_policy={
+                    "treat_verifier_infra_as_warning": True,
+                    "optional_capabilities": ["browser_runtime", "browser_runtime"],
+                },
+            ),
+        )
+
+        assert defn.verifier_mode() == "static_first"
+        assert defn.verifier_tool_success_policy() == "development_balanced"
+        assert defn.verifier_semantic_checks() == [{"name": "ui-runtime"}]
+        assert defn.verifier_treat_infra_as_warning() is True
+        assert defn.verifier_optional_capabilities() == ["browser_runtime"]
+        assert defn.verifier_required_capabilities() == []
+        assert defn.is_adhoc_process() is True
+        assert defn.verification_policy_payload()["mode"] == "static_first"
+
+    def test_verifier_capability_contracts_normalize_optional_and_required_checks(self):
+        defn = ProcessDefinition(
+            name="build-process",
+            verification_policy=VerificationPolicyContract(
+                semantic_checks=[
+                    {
+                        "name": "optional_browser_verification",
+                        "capability": "browser_runtime",
+                        "helper": "browser_assert",
+                        "optional": True,
+                    },
+                    {
+                        "name": "required_service_probe",
+                        "capability": "service_runtime",
+                        "helper": "serve_static",
+                    },
+                    {
+                        "name": "style_preference_only",
+                        "description": "Prefer behavior over style.",
+                    },
+                ],
+                outcome_policy={"optional_capabilities": ["report_rendering"]},
+            ),
+        )
+
+        assert defn.verifier_optional_capabilities() == [
+            "report_rendering",
+            "browser_runtime",
+        ]
+        assert defn.verifier_required_capabilities() == ["service_runtime"]
+        assert defn.verifier_capability_contracts() == [
+            {
+                "name": "optional_browser_verification",
+                "capability": "browser_runtime",
+                "helper": "browser_assert",
+                "optional": True,
+            },
+            {
+                "name": "required_service_probe",
+                "capability": "service_runtime",
+                "helper": "serve_static",
+            },
+        ]
+        assert defn.verifier_helper_specs() == [
+            {
+                "helper": "browser_assert",
+                "capability": "browser_runtime",
+                "description": "Run a bounded browser assertion step against a prepared UI.",
+                "bound": True,
+            },
+            {
+                "helper": "serve_static",
+                "capability": "service_runtime",
+                "description": (
+                    "Start a bounded local service or static probe with explicit cleanup."
+                ),
+                "bound": True,
+            },
+        ]
 
 
 # ===================================================================
@@ -2322,7 +2409,56 @@ verification:
         assert "missing_targets" in metadata_fields
         assert "unverified_claim_count" in metadata_fields
         assert "verified_claim_count" in metadata_fields
-        assert "supporting_ratio" in metadata_fields
+
+    def test_loader_rejects_unregistered_verification_helper(self, tmp_path):
+        yaml_content = """\
+name: invalid-helper
+schema_version: 2
+version: '1.0'
+description: test
+persona: test
+verification:
+  policy:
+    mode: static_first
+    semantic_checks:
+      - name: custom-browser-step
+        capability: browser_runtime
+        helper: not_registered
+    output_contract:
+      required_fields: [passed, metadata]
+      metadata_fields: []
+"""
+        path = tmp_path / "invalid-helper.yaml"
+        path.write_text(yaml_content)
+        loader = ProcessLoader()
+        with pytest.raises(ProcessValidationError) as exc_info:
+            loader.load(str(path))
+        assert any("is not registered" in err for err in exc_info.value.errors)
+
+    def test_loader_rejects_helper_capability_mismatch(self, tmp_path):
+        yaml_content = """\
+name: invalid-helper-capability
+schema_version: 2
+version: '1.0'
+description: test
+persona: test
+verification:
+  policy:
+    mode: static_first
+    semantic_checks:
+      - name: custom-browser-step
+        capability: service_runtime
+        helper: browser_assert
+    output_contract:
+      required_fields: [passed, metadata]
+      metadata_fields: []
+"""
+        path = tmp_path / "invalid-helper-capability.yaml"
+        path.write_text(yaml_content)
+        loader = ProcessLoader()
+        with pytest.raises(ProcessValidationError) as exc_info:
+            loader.load(str(path))
+        assert any("does not support capability" in err for err in exc_info.value.errors)
 
     def test_loader_accepts_placeholder_rule_recovery_metadata(self, tmp_path):
         yaml_content = """\

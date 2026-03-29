@@ -19,6 +19,7 @@ from loom import __version__
 from loom.__main__ import cli
 from loom.config import Config, ProcessConfig
 from loom.processes.testing import ProcessCaseResult
+from loom.runtime.capabilities import OptionalAddonStatus
 
 
 @contextmanager
@@ -126,6 +127,71 @@ class TestCLI:
         assert "migrate" in result.output
         assert "doctor" in result.output
         assert "backup" in result.output
+
+    def test_doctor_reports_optional_addons(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_statuses",
+            lambda: [
+                OptionalAddonStatus(
+                    key="browser",
+                    label="Browser Addon",
+                    installed=False,
+                    required_for="Full JS-capable browser_session execution",
+                    install_hint="uv sync --extra browser",
+                    detail="Playwright package is not installed.",
+                )
+            ],
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli, ["doctor"], catch_exceptions=False)
+        assert result.exit_code == 0
+        assert "Runtime doctor" in result.output
+        assert "Browser Addon (browser): missing" in result.output
+        assert "Doctor passed" in result.output
+
+    def test_doctor_requires_installed_addon(self, monkeypatch) -> None:
+        status = OptionalAddonStatus(
+            key="browser",
+            label="Browser Addon",
+            installed=False,
+            required_for="Full JS-capable browser_session execution",
+            install_hint="uv sync --extra browser",
+            detail="Playwright package is not installed.",
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_statuses",
+            lambda: [status],
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_status_by_key",
+            lambda key: status if key == "browser" else None,
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["doctor", "--require-addon", "browser"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 1
+        assert "Doctor failed: missing required addon(s): browser" in result.output
+
+    def test_doctor_rejects_unknown_addon_key(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_statuses",
+            lambda: [],
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_status_by_key",
+            lambda _key: None,
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["doctor", "--require-addon", "unknown-addon"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 1
+        assert "Unknown addon key: unknown-addon" in result.output
 
     def test_db_status_missing_db(self, tmp_path):
         db_path = tmp_path / "loom.db"

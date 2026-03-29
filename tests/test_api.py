@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -35,7 +36,7 @@ from loom.prompts.assembler import PromptAssembler
 from loom.recovery.approval import ApprovalManager, ApprovalRequest
 from loom.recovery.questions import QuestionManager
 from loom.state.conversation_store import ConversationStore
-from loom.state.memory import Database, MemoryManager
+from loom.state.memory import Database, MemoryEntry, MemoryManager
 from loom.state.task_state import (
     Plan,
     Subtask,
@@ -91,10 +92,27 @@ def tool_registry():
 @pytest.fixture
 def mock_orchestrator():
     orch = MagicMock(spec=Orchestrator)
-    orch.execute_task = AsyncMock()
-    orch.cancel_task = MagicMock()
-    orch.pause_task = MagicMock()
-    orch.resume_task = MagicMock()
+    async def _default_execute(task, reuse_existing_plan=False):
+        return task
+
+    def _default_cancel(task):
+        task.status = TaskStatus.CANCELLED
+        if not isinstance(task.metadata, dict):
+            task.metadata = {}
+        task.metadata["cancel_reason"] = "cancel_requested"
+
+    def _default_pause(task):
+        if task.status in (TaskStatus.EXECUTING, TaskStatus.PLANNING):
+            task.status = TaskStatus.PAUSED
+
+    def _default_resume(task):
+        if task.status == TaskStatus.PAUSED:
+            task.status = TaskStatus.EXECUTING
+
+    orch.execute_task = AsyncMock(side_effect=_default_execute)
+    orch.cancel_task = MagicMock(side_effect=_default_cancel)
+    orch.pause_task = MagicMock(side_effect=_default_pause)
+    orch.resume_task = MagicMock(side_effect=_default_resume)
     return orch
 
 
@@ -2301,6 +2319,195 @@ class TestWorkspaceFirstEndpoints:
         assert Path(str(task_row["workspace_path"])).parent == workspace_path.resolve()
 
     @pytest.mark.asyncio
+    async def test_restart_scoped_run_reuses_same_task_and_parent_workspace_grouping(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+        engine,
+    ):
+        workspace_path = tmp_path / "restart-scoped-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Restart Scoped WS",
+        )
+        assert workspace is not None
+
+        create_response = await client.post(
+            "/tasks",
+            json={
+                "goal": "Can you convert all this data into a microsite?",
+                "workspace": str(workspace_path),
+                "approval_mode": "auto",
+                "context": {
+                    "workspace_paths": ["reference-skill", "source-data/report.md"],
+                    "workspace_files": ["source-data/report.md"],
+                    "workspace_directories": ["reference-skill"],
+                },
+                "auto_subfolder": True,
+            },
+        )
+        assert create_response.status_code == 201
+        original_task_id = create_response.json()["task_id"]
+
+        original_row = await database.get_task(original_task_id)
+        assert original_row is not None
+        original_metadata = json.loads(str(original_row.get("metadata") or "{}"))
+        assert original_metadata["source_workspace_root"] == str(workspace_path)
+        assert original_metadata["run_workspace_mode"] == "scoped_subfolder"
+
+        saved_task = state_manager.load(original_task_id)
+        saved_task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="done-step",
+                    description="Already done",
+                    status=SubtaskStatus.COMPLETED,
+                    summary="Preserved",
+                ),
+                Subtask(
+                    id="failed-step",
+                    description="Needs retry",
+                    status=SubtaskStatus.FAILED,
+                    summary="Old failure",
+                    retry_count=2,
+                    active_issue="approval timeout",
+                ),
+                Subtask(
+                    id="blocked-step",
+                    description="Blocked downstream",
+                    status=SubtaskStatus.BLOCKED,
+                    summary="Blocked",
+                    active_issue="dependency failed",
+                ),
+            ],
+        )
+        saved_task.status = TaskStatus.FAILED
+        saved_task.completed_at = "2026-03-28T00:00:00+00:00"
+        state_manager.save(saved_task)
+        await database.update_task_plan(
+            original_task_id,
+            json.dumps(asdict(saved_task.plan)),
+        )
+
+        await database.update_task_status(original_task_id, "failed")
+        engine.submit_task = AsyncMock(side_effect=lambda **kwargs: kwargs["run_id"])
+
+        restart_response = await client.post(f"/runs/{original_task_id}/restart")
+        assert restart_response.status_code == 200
+        restart_payload = restart_response.json()
+        assert restart_payload["task_id"] == original_task_id
+        assert restart_payload["run_id"].startswith("run-")
+        assert restart_payload["run_id"] != original_metadata["run_id"]
+
+        restarted_row = await database.get_task(original_task_id)
+        assert restarted_row is not None
+        restarted_workspace = Path(str(restarted_row["workspace_path"]))
+        assert restarted_workspace == Path(str(original_row["workspace_path"]))
+
+        restarted_metadata = json.loads(str(restarted_row.get("metadata") or "{}"))
+        assert restarted_metadata["source_workspace_root"] == str(workspace_path)
+        assert restarted_metadata["run_workspace_mode"] == "scoped_subfolder"
+        assert restarted_metadata["run_workspace_relative"] == Path(
+            str(original_row["workspace_path"]),
+        ).name
+        assert restarted_metadata["run_id"] == restart_payload["run_id"]
+        assert restarted_metadata["restarted_from_run_id"] == original_metadata["run_id"]
+        assert restarted_metadata["restart_count"] == 1
+
+        restarted_context = json.loads(str(restarted_row.get("context") or "{}"))
+        assert restarted_context == {
+            "workspace_paths": ["reference-skill", "source-data/report.md"],
+            "workspace_files": ["source-data/report.md"],
+            "workspace_directories": ["reference-skill"],
+        }
+        assert restarted_row["status"] == "pending"
+        assert restarted_row["completed_at"] in (None, "")
+        assert json.loads(str(restarted_row["plan"]))["subtasks"][0]["status"] == "completed"
+        assert json.loads(str(restarted_row["plan"]))["subtasks"][1]["status"] == "pending"
+        assert json.loads(str(restarted_row["plan"]))["subtasks"][2]["status"] == "pending"
+
+        restarted_task = state_manager.load(original_task_id)
+        assert restarted_task.plan.subtasks[0].status == SubtaskStatus.COMPLETED
+        assert restarted_task.plan.subtasks[1].status == SubtaskStatus.PENDING
+        assert restarted_task.plan.subtasks[1].retry_count == 0
+        assert restarted_task.plan.subtasks[1].active_issue == ""
+        assert restarted_task.plan.subtasks[2].status == SubtaskStatus.PENDING
+        assert restarted_task.decisions_log[-1] == "Resumed execution from prior task state."
+        engine.submit_task.assert_awaited_once()
+        assert engine.submit_task.await_args.kwargs["task"].id == original_task_id
+        assert engine.submit_task.await_args.kwargs["run_id"] == restart_payload["run_id"]
+        assert engine.submit_task.await_args.kwargs["recovered"] is True
+
+        overview = await client.get(f"/workspaces/{workspace['id']}/overview")
+        assert overview.status_code == 200
+        recent_run_ids = {row["id"] for row in overview.json()["recent_runs"]}
+        assert original_task_id in recent_run_ids
+
+        workspace_list = await client.get("/workspaces")
+        assert workspace_list.status_code == 200
+        canonical_paths = {row["canonical_path"] for row in workspace_list.json()}
+        assert str(workspace_path.resolve()) in canonical_paths
+        assert str(restarted_workspace) not in canonical_paths
+
+    @pytest.mark.asyncio
+    async def test_cancel_run_stops_active_worker_without_pause(
+        self,
+        client,
+        database,
+        state_manager,
+        engine,
+        mock_orchestrator,
+    ):
+        async def _hold_execution(task, reuse_existing_plan=False):
+            await asyncio.sleep(60)
+            return task
+
+        mock_orchestrator.execute_task.side_effect = _hold_execution
+        task = Task(
+            id="task-run-cancel-live-1",
+            goal="Cancel me",
+            status=TaskStatus.PENDING,
+            workspace="/tmp/run-cancel-live",
+        )
+        state_manager.create(task)
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path=task.workspace,
+            status=task.status.value,
+        )
+        await engine.submit_task(task=task)
+
+        for _ in range(20):
+            if engine.task_run_inflight(task.id):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("task worker never started")
+
+        cancel_response = await client.post(f"/runs/{task.id}/cancel")
+        assert cancel_response.status_code == 200
+        assert cancel_response.json()["stop_requested"] is True
+        mock_orchestrator.cancel_task.assert_called()
+
+        for _ in range(40):
+            row = await database.get_task(task.id)
+            if row is not None and str(row.get("status", "") or "").strip().lower() == "cancelled":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("task row never became cancelled")
+
+        assert engine.task_run_inflight(task.id) is False
+        latest_task_run = await database.get_latest_task_run_for_task(task.id)
+        assert latest_task_run is not None
+        assert str(latest_task_run.get("status", "") or "").strip().lower() == "cancelled"
+
+    @pytest.mark.asyncio
     async def test_scoped_run_artifacts_are_rebased_to_parent_workspace_paths(
         self,
         client,
@@ -2632,6 +2839,37 @@ class TestWorkspaceFirstEndpoints:
         cancel_response = await client.post("/runs/task-run-control-1/cancel")
         assert cancel_response.status_code == 200
         mock_orchestrator.cancel_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_instruction_history_remains_available_after_completion(
+        self,
+        client,
+        database,
+        memory_manager,
+    ):
+        await database.insert_task(
+            task_id="task-run-history-1",
+            goal="Completed task",
+            workspace_path="/tmp/run-history",
+            status="completed",
+        )
+        await memory_manager.store(
+            MemoryEntry(
+                task_id="task-run-history-1",
+                entry_type="user_instruction",
+                summary="Narrow scope",
+                detail="Only focus on Alberta results.",
+                tags="conversation",
+            ),
+        )
+
+        response = await client.get("/tasks/task-run-history-1/conversation")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 1
+        assert payload[0]["message"] == "Only focus on Alberta results."
+        assert payload[0]["tags"] == "conversation"
 
     @pytest.mark.asyncio
     async def test_run_stream_uses_workspace_first_event_shape(self, client, database):

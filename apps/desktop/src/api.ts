@@ -147,6 +147,14 @@ export interface WorkspaceArtifact extends RunArtifact {
   run_count: number;
 }
 
+export interface RunConversationEntry {
+  id: string;
+  message: string;
+  summary: string;
+  tags: string;
+  timestamp: string;
+}
+
 export interface WorkspaceSearchItem {
   kind: string;
   item_id: string;
@@ -868,6 +876,14 @@ export function restartRun(runId: string): Promise<TaskCreateResponse> {
   return requestJson<TaskCreateResponse>(`/runs/${encodeURIComponent(runId)}/restart`, {
     method: "POST",
   });
+}
+
+export function fetchRunConversationHistory(
+  runId: string,
+): Promise<RunConversationEntry[]> {
+  return requestJson<RunConversationEntry[]>(
+    `/tasks/${encodeURIComponent(runId)}/conversation`,
+  );
 }
 
 export function sendRunMessage(

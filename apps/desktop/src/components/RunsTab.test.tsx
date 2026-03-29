@@ -20,6 +20,7 @@ describe("RunsTab", () => {
       runDetail: null,
       runTimeline: [],
       runArtifacts: [],
+      runInstructionHistory: [],
       runStreaming: false,
       loadingRunDetail: false,
       runLoadError: "",
@@ -59,6 +60,11 @@ describe("RunsTab", () => {
         workspace: { canonical_path: "/tmp/workspace" },
       },
       inventory: { processes: [] },
+      approvalInbox: [],
+      approvalReplyDrafts: {},
+      setApprovalReplyDrafts: vi.fn(),
+      replyingApprovalId: "",
+      handleReplyApproval: vi.fn(async () => {}),
       loadedWorkspaceFileEntries: [],
       loadWorkspaceDirectory: vi.fn(async () => {}),
       recentWorkspaceArtifacts: [],
@@ -181,6 +187,88 @@ describe("RunsTab", () => {
     expect(
       screen.getAllByText("Decision-grade investment workflow for public equities and private companies.").length,
     ).toBeGreaterThan(0);
+  });
+
+  it("shows an Instructions section with timestamped instruction history", () => {
+    mockApp.selectedRunId = "run-abc";
+    mockApp.runDetail = {
+      id: "run-abc",
+      goal: "Review the site",
+      status: "executing",
+      process_name: "",
+      plan_subtasks: [],
+    };
+    mockApp.runCanMessage = true;
+    mockApp.runInstructionHistory = [
+      {
+        id: "msg-1",
+        message: "Focus on Alberta only.",
+        summary: "Focus on Alberta only.",
+        tags: "conversation",
+        timestamp: "2026-03-28T16:45:00Z",
+      },
+      {
+        id: "msg-2",
+        message: "Ignore this feedback entry",
+        summary: "Ignore this feedback entry",
+        tags: "feedback",
+        timestamp: "2026-03-28T16:40:00Z",
+      },
+    ];
+
+    render(<RunsTab />);
+
+    expect(screen.getByText("Instructions")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Add an instruction to this run...")).toBeInTheDocument();
+    expect(screen.getByText("Instruction history")).toBeInTheDocument();
+    expect(screen.getByText("Focus on Alberta only.")).toBeInTheDocument();
+    expect(screen.queryByText("Ignore this feedback entry")).not.toBeInTheDocument();
+  });
+
+  it("surfaces pending run approvals inline with approve and deny actions", async () => {
+    const user = userEvent.setup();
+    mockApp.selectedRunId = "run-abc";
+    mockApp.runDetail = {
+      id: "run-abc",
+      goal: "Review the site",
+      status: "executing",
+      process_name: "",
+      plan_subtasks: [],
+    };
+    mockApp.approvalInbox = [
+      {
+        id: "task:run-abc:extract-structured-content",
+        kind: "task_approval",
+        status: "pending",
+        created_at: "2026-03-28T16:45:00Z",
+        title: "Extracted content looks complete",
+        summary: "Approve use of extracted-content.json",
+        workspace_id: "workspace-1",
+        workspace_path: "/tmp/workspace",
+        workspace_display_name: "Workspace",
+        task_id: "run-abc",
+        run_id: "run-abc",
+        conversation_id: "",
+        subtask_id: "extract-structured-content",
+        question_id: "",
+        approval_id: "",
+        tool_name: "",
+        risk_level: "medium",
+        request_payload: {},
+        metadata: {},
+      },
+    ];
+
+    render(<RunsTab />);
+
+    expect(screen.getByText("Approvals (1)")).toBeInTheDocument();
+    expect(screen.getByText("Extracted content looks complete")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Approve" }));
+    expect(mockApp.handleReplyApproval).toHaveBeenCalledWith(
+      mockApp.approvalInbox[0],
+      { decision: "approve" },
+    );
   });
 
   it("groups processes into custom, installed, and built-in sections", () => {
@@ -474,6 +562,62 @@ describe("RunsTab", () => {
 
     expect(mockApp.handleOpenWorkspaceFile).toHaveBeenCalledWith(
       "seo-geo-review-https-www-albertadentalassociation/audit-scorecard.md",
+    );
+    expect(mockApp.setActiveTab).toHaveBeenCalledWith("files");
+  });
+
+  it("resolves basename-only timeline file pills against the run workspace artifacts", async () => {
+    const user = userEvent.setup();
+    mockApp.selectedRunId = "run-abc";
+    mockApp.runDetail = {
+      id: "run-abc",
+      goal: "Review the site",
+      status: "completed",
+      process_name: "",
+      workspace_path: "/tmp/workspace/can-you-convert-all-this-data",
+      workspace: {
+        canonical_path: "/tmp/workspace",
+      },
+      plan_subtasks: [],
+    };
+    mockApp.visibleRunArtifacts = [
+      {
+        path: "can-you-convert-all-this-data/ui-integration-validation-report.md",
+        category: "document",
+        source: "seal",
+        sha256: "",
+        size_bytes: 3600,
+        exists_on_disk: true,
+        is_intermediate: false,
+        created_at: "",
+        tool_name: "document_write",
+        subtask_ids: [],
+        phase_ids: [],
+        facets: {},
+      },
+    ];
+    mockApp.visibleRunTimeline = [
+      {
+        id: "evt-2",
+        run_id: "run-abc",
+        event_type: "tool_call_completed",
+        sequence: 2,
+        timestamp: "2026-03-28T01:00:00Z",
+        data: {
+          path: "ui-integration-validation-report.md",
+          tool_name: "document_write",
+          summary: "Wrote validation report",
+        },
+      },
+    ];
+
+    render(<RunsTab />);
+
+    const buttons = screen.getAllByRole("button", { name: /ui-integration-validation-report\.md/i });
+    await user.click(buttons[buttons.length - 1]);
+
+    expect(mockApp.handleOpenWorkspaceFile).toHaveBeenCalledWith(
+      "can-you-convert-all-this-data/ui-integration-validation-report.md",
     );
     expect(mockApp.setActiveTab).toHaveBeenCalledWith("files");
   });

@@ -211,6 +211,15 @@ class TestRetryManager:
         assert strategy == RetryStrategy.GENERIC
         assert markets == []
 
+    def test_classify_failure_dev_verifier_timeout_is_verifier_parse(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="Development browser verification timed out.",
+            execution_error="",
+            verification={"reason_code": "dev_verifier_timeout"},
+        )
+        assert strategy == RetryStrategy.VERIFIER_PARSE
+        assert markets == []
+
     def test_classify_failure_routes_recoverable_placeholder_hard_invariant(self):
         strategy, markets = RetryManager.classify_failure(
             verification_feedback="hard invariant failed",

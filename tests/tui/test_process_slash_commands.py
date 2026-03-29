@@ -2239,6 +2239,75 @@ class TestProcessSlashCommands:
         assert policy.get("output_contract") == {}
         assert policy.get("outcome_policy") == {}
 
+    def test_normalize_adhoc_spec_injects_build_verification_policy(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        normalized = app._normalize_adhoc_spec(
+            {
+                "intent": "build",
+                "name": "build-adhoc",
+                "description": "Build flow",
+                "persona": "Software engineer",
+                "phase_mode": "guided",
+                "tool_guidance": "Implement and verify.",
+                "required_tools": [],
+                "recommended_tools": [],
+                "phases": [],
+            },
+            goal="Fix the broken build and verify the web app",
+            key="cc33dd44ee55ff66",
+            available_tools=[],
+        )
+        policy = normalized.get("verification_policy", {})
+
+        assert policy.get("mode") == "static_first"
+        assert (
+            policy.get("static_checks", {}).get("tool_success_policy")
+            == "development_balanced"
+        )
+        assert policy.get("output_contract", {}).get("required_fields") == [
+            "passed",
+            "outcome",
+            "reason_code",
+            "severity_class",
+        ]
+        assert policy.get("outcome_policy", {}).get("treat_verifier_infra_as_warning") is True
+
+    def test_fallback_adhoc_spec_prefers_verification_helper_for_build_intent(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+
+        spec = app._fallback_adhoc_spec(
+            "build a microsite from this dataset",
+            available_tools=[
+                "search_files",
+                "read_file",
+                "write_file",
+                "verification_helper",
+                "shell_execute",
+                "ripgrep_search",
+                "document_write",
+            ],
+            intent="build",
+        )
+
+        assert "verification_helper" in spec["required_tools"]
+        assert spec["required_tools"].index("verification_helper") < spec["required_tools"].index(
+            "shell_execute"
+        )
+        assert "verification_helper" in spec["tool_guidance"]
+
     def test_normalize_adhoc_spec_merges_model_verification_policy(self):
         from loom.tui.app import LoomApp
 

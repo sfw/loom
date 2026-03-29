@@ -166,7 +166,7 @@ describe("Sidebar", () => {
       button.getAttribute("aria-expanded") !== null,
     );
     expect(workspaceButton).toBeDefined();
-    const workspaceHeader = workspaceButton.closest("div");
+    const workspaceHeader = workspaceButton!.closest("div");
     expect(workspaceHeader).not.toBeNull();
 
     const activeDot = (workspaceHeader as HTMLElement).querySelector("svg.lucide-circle");
@@ -218,5 +218,30 @@ describe("Sidebar", () => {
     expect(
       screen.getByRole("button", { name: /Workspace Two/i }),
     ).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("renders archived workspaces in a separate section", () => {
+    mockApp.showArchivedWorkspaces = true;
+    mockApp.workspaces = [
+      {
+        ...mockApp.workspaces[0],
+        id: "workspace-1",
+        display_name: "Active Workspace",
+        is_archived: false,
+      },
+      {
+        ...mockApp.workspaces[0],
+        id: "workspace-2",
+        display_name: "Archived Workspace",
+        is_archived: true,
+      },
+    ];
+
+    render(<Sidebar />);
+
+    expect(screen.getByText("Archived Workspaces")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Active Workspace/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Archived Workspace/i })).toBeInTheDocument();
+    expect(screen.getAllByText("archived")[0]).toBeInTheDocument();
   });
 });

@@ -80,6 +80,65 @@ def test_task_event_counts_and_verification_reason_counts() -> None:
     assert reasons["unspecified"] == 1
 
 
+def test_development_verification_summary_counts_aggregates_outcome_metadata() -> None:
+    bus = EventBus()
+    bus.emit(Event(
+        event_type=VERIFICATION_OUTCOME,
+        task_id="t1",
+        data={
+            "reason_code": "dev_verifier_timeout",
+            "dev_verification_summary": {
+                "has_optional_verifier_warnings": True,
+                "has_report_mismatch_warning": True,
+                "product_failure_count": 0,
+                "infra_failure_count": 1,
+                "inconclusive_failure_count": 0,
+            },
+        },
+    ))
+    bus.emit(Event(
+        event_type=VERIFICATION_OUTCOME,
+        task_id="t1",
+        data={
+            "reason_code": "dev_test_failed",
+            "dev_verification_summary": {
+                "has_optional_verifier_warnings": False,
+                "has_report_mismatch_warning": False,
+                "product_failure_count": 1,
+                "infra_failure_count": 0,
+                "inconclusive_failure_count": 0,
+            },
+        },
+    ))
+
+    counts = orchestrator_telemetry.development_verification_summary_counts(
+        event_bus=bus,
+        task_id="t1",
+        verification_outcome_event_type=VERIFICATION_OUTCOME,
+    )
+
+    assert counts["optional_warning_outcomes"] == 1
+    assert counts["report_mismatch_warning_outcomes"] == 1
+    assert counts["product_failure_count"] == 1
+    assert counts["infra_failure_count"] == 1
+
+
+def test_verification_severity_counts_groups_reasons() -> None:
+    counts = orchestrator_telemetry.verification_severity_counts({
+        "dev_verifier_timeout": 2,
+        "dev_test_failed": 1,
+        "parse_inconclusive": 3,
+        "hard_invariant_failed": 4,
+        "unknown_reason": 5,
+    })
+
+    assert counts["infra"] == 2
+    assert counts["semantic"] == 1
+    assert counts["inconclusive"] == 3
+    assert counts["hard_invariant"] == 4
+    assert counts["unknown"] == 5
+
+
 def test_emit_telemetry_run_summary_includes_reliability_metrics() -> None:
     bus = EventBus()
     events = []
@@ -122,6 +181,25 @@ def test_emit_telemetry_run_summary_includes_reliability_metrics() -> None:
         task_id="t-run",
         data={"reason_code": "claim_inconclusive"},
     ))
+    bus.emit(Event(
+        event_type=VERIFICATION_OUTCOME,
+        task_id="t-run",
+        data={"reason_code": "dev_verifier_timeout"},
+    ))
+    bus.emit(Event(
+        event_type=VERIFICATION_OUTCOME,
+        task_id="t-run",
+        data={
+            "reason_code": "dev_verifier_timeout",
+            "dev_verification_summary": {
+                "has_optional_verifier_warnings": True,
+                "has_report_mismatch_warning": True,
+                "product_failure_count": 0,
+                "infra_failure_count": 1,
+                "inconclusive_failure_count": 0,
+            },
+        },
+    ))
     bus.emit(Event(event_type="verification_failed", task_id="t-run", data={}))
     bus.emit(Event(event_type="verification_failed", task_id="t-run", data={}))
     bus.emit(Event(event_type="verification_started", task_id="t-run", data={}))
@@ -135,8 +213,22 @@ def test_emit_telemetry_run_summary_includes_reliability_metrics() -> None:
 
     summary_events = [event for event in events if event.event_type == "telemetry_run_summary"]
     assert len(summary_events) == 1
-    metrics = summary_events[0].data.get("reliability_metrics", {})
-    assert metrics["verifier_terminal_failure_rate"] == 0.6667
-    assert metrics["inconclusive_outcome_rate"] == 0.6667
+    summary = summary_events[0].data
+    metrics = summary.get("reliability_metrics", {})
+    assert metrics["verifier_terminal_failure_rate"] == 0.4
+    assert metrics["inconclusive_outcome_rate"] == 0.4
     assert metrics["inconclusive_rescue_rate"] == 1.0
     assert metrics["false_block_audit_rate"] == 1.0
+    assert summary["verification_severity_counts"]["infra"] == 2
+    assert summary["verification_severity_counts"]["hard_invariant"] == 1
+    assert (
+        summary["development_verification_summary_counts"]["optional_warning_outcomes"]
+        == 1
+    )
+    assert (
+        summary["development_verification_summary_counts"][
+            "report_mismatch_warning_outcomes"
+        ]
+        == 1
+    )
+    assert summary["development_verification_health"]["verifier_infra_reasons"] == 2

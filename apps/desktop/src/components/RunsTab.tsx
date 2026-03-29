@@ -27,7 +27,14 @@ import {
   FolderTree,
 } from "lucide-react";
 import { useApp } from "@/context/AppContext";
-import { formatDate, formatBytes, highlightText } from "@/utils";
+import {
+  approvalQuestionContext,
+  approvalQuestionOptions,
+  approvalQuestionType,
+  formatDate,
+  formatBytes,
+  highlightText,
+} from "@/utils";
 import {
   runTimelineTitle,
   runTimelineDetail,
@@ -65,6 +72,8 @@ function eventTypeColor(eventType: string): string {
   if (eventType === "subtask_completed") return "bg-emerald-500/15 text-emerald-400";
   if (eventType === "subtask_started") return "bg-sky-500/15 text-sky-400";
   if (eventType === "subtask_failed" || eventType === "task_failed") return "bg-red-500/15 text-red-400";
+  if (eventType === "task_restarted") return "bg-sky-500/15 text-sky-400";
+  if (eventType === "approval_rejected" || eventType === "approval_timed_out") return "bg-red-500/15 text-red-400";
   if (eventType === "verification_passed") return "bg-emerald-500/10 text-emerald-400/80";
   if (eventType === "verification_failed") return "bg-red-500/15 text-red-400";
   if (eventType.startsWith("verification_")) return "bg-amber-500/10 text-amber-400/80";
@@ -156,9 +165,12 @@ function eventTypeBadgeLabel(eventType: string): string {
     case "task_completed": return "DONE";
     case "task_failed": return "FAILED";
     case "task_cancelled": return "CANCEL";
+    case "task_restarted": return "RESTART";
     case "task_plan_ready": return "PLAN";
     case "approval_requested": return "APPROVE";
     case "approval_received": return "APPROVED";
+    case "approval_rejected": return "REJECTED";
+    case "approval_timed_out": return "TIMEOUT";
     case "ask_user_requested": return "INPUT";
     case "run_validity_scorecard": return "SCORE";
     default: {
@@ -360,6 +372,13 @@ function normalizePath(value: string): string {
   return String(value || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
+function pathBasename(path: string): string {
+  const normalized = normalizePath(path);
+  if (!normalized) return "";
+  const parts = normalized.split("/").filter(Boolean);
+  return parts[parts.length - 1] || "";
+}
+
 function inferProcessBucket(
   process: { path?: string },
   workspacePath: string,
@@ -444,6 +463,7 @@ export default function RunsTab() {
     runDetail,
     runTimeline,
     runArtifacts,
+    runInstructionHistory,
     runStreaming,
     loadingRunDetail,
     runLoadError,
@@ -480,6 +500,11 @@ export default function RunsTab() {
     workspaceSearchQuery,
     overview,
     inventory,
+    approvalInbox,
+    approvalReplyDrafts,
+    setApprovalReplyDrafts,
+    replyingApprovalId,
+    handleReplyApproval,
     handleOpenWorkspaceFile,
     setActiveTab,
     loadedWorkspaceFileEntries,
@@ -648,11 +673,17 @@ export default function RunsTab() {
           runDetail={runDetail}
           runTimeline={runTimeline}
           runArtifacts={runArtifacts}
+          runInstructionHistory={runInstructionHistory}
           runStreaming={runStreaming}
           runIsTerminal={runIsTerminal}
           runCanPause={runCanPause}
           runCanResume={runCanResume}
           runCanMessage={runCanMessage}
+          approvalInbox={approvalInbox}
+          approvalReplyDrafts={approvalReplyDrafts}
+          setApprovalReplyDrafts={setApprovalReplyDrafts}
+          replyingApprovalId={replyingApprovalId}
+          handleReplyApproval={handleReplyApproval}
           visibleRunTimeline={visibleRunTimeline}
           visibleRunArtifacts={visibleRunArtifacts}
           runHistoryQuery={runHistoryQuery}
@@ -1149,11 +1180,17 @@ interface RunDetailViewProps {
   runDetail: NonNullable<ReturnType<typeof useApp>["runDetail"]>;
   runTimeline: ReturnType<typeof useApp>["runTimeline"];
   runArtifacts: ReturnType<typeof useApp>["runArtifacts"];
+  runInstructionHistory: ReturnType<typeof useApp>["runInstructionHistory"];
   runStreaming: boolean;
   runIsTerminal: boolean;
   runCanPause: boolean;
   runCanResume: boolean;
   runCanMessage: boolean;
+  approvalInbox: ReturnType<typeof useApp>["approvalInbox"];
+  approvalReplyDrafts: ReturnType<typeof useApp>["approvalReplyDrafts"];
+  setApprovalReplyDrafts: ReturnType<typeof useApp>["setApprovalReplyDrafts"];
+  replyingApprovalId: string;
+  handleReplyApproval: ReturnType<typeof useApp>["handleReplyApproval"];
   visibleRunTimeline: ReturnType<typeof useApp>["visibleRunTimeline"];
   visibleRunArtifacts: ReturnType<typeof useApp>["visibleRunArtifacts"];
   runHistoryQuery: string;
@@ -1182,11 +1219,17 @@ function RunDetailView({
   runDetail,
   runTimeline,
   runArtifacts,
+  runInstructionHistory,
   runStreaming,
   runIsTerminal,
   runCanPause,
   runCanResume,
   runCanMessage,
+  approvalInbox,
+  approvalReplyDrafts,
+  setApprovalReplyDrafts,
+  replyingApprovalId,
+  handleReplyApproval,
   visibleRunTimeline,
   visibleRunArtifacts,
   runHistoryQuery,
@@ -1215,6 +1258,73 @@ function RunDetailView({
   const displayableRunArtifacts = useMemo(
     () => visibleRunArtifacts.filter((artifact) => isDisplayableArtifactPath(artifact.path)),
     [visibleRunArtifacts],
+  );
+  const runWorkspaceRelative = useMemo(() => {
+    const workspaceRoot = normalizePath(runDetail.workspace?.canonical_path || "");
+    const runWorkspace = normalizePath(runDetail.workspace_path || "");
+    if (!workspaceRoot || !runWorkspace) return "";
+    if (runWorkspace === workspaceRoot) return "";
+    if (!runWorkspace.startsWith(`${workspaceRoot}/`)) return "";
+    return normalizePath(runWorkspace.slice(workspaceRoot.length + 1));
+  }, [runDetail.workspace?.canonical_path, runDetail.workspace_path]);
+  const resolveRunFilePath = useCallback((rawPath: string) => {
+    const cleanPath = normalizePath(rawPath);
+    if (!cleanPath) return "";
+
+    const exactArtifact = displayableRunArtifacts.find((artifact) => normalizePath(artifact.path) === cleanPath);
+    if (exactArtifact) {
+      return exactArtifact.path;
+    }
+
+    if (runWorkspaceRelative && !cleanPath.startsWith(`${runWorkspaceRelative}/`) && cleanPath !== runWorkspaceRelative) {
+      const prefixed = normalizePath(`${runWorkspaceRelative}/${cleanPath}`);
+      const prefixedArtifact = displayableRunArtifacts.find(
+        (artifact) => normalizePath(artifact.path) === prefixed,
+      );
+      if (prefixedArtifact) {
+        return prefixedArtifact.path;
+      }
+    }
+
+    const basename = pathBasename(cleanPath);
+    if (basename) {
+      const basenameMatches = displayableRunArtifacts.filter(
+        (artifact) => pathBasename(artifact.path) === basename,
+      );
+      if (basenameMatches.length === 1) {
+        return basenameMatches[0].path;
+      }
+    }
+
+    if (runWorkspaceRelative && !cleanPath.startsWith(`${runWorkspaceRelative}/`) && cleanPath !== runWorkspaceRelative) {
+      return normalizePath(`${runWorkspaceRelative}/${cleanPath}`);
+    }
+    return cleanPath;
+  }, [displayableRunArtifacts, runWorkspaceRelative]);
+  const pendingRunApprovals = useMemo(
+    () =>
+      approvalInbox
+        .filter(
+          (item) =>
+            item.task_id === runDetail.id
+            && item.status === "pending"
+            && (item.kind === "task_approval" || item.kind === "task_question"),
+        )
+        .sort((left, right) => right.created_at.localeCompare(left.created_at)),
+    [approvalInbox, runDetail.id],
+  );
+  const instructionHistory = useMemo(
+    () =>
+      runInstructionHistory
+        .filter((entry) => {
+          const tags = String(entry.tags || "")
+            .split(",")
+            .map((tag) => tag.trim().toLowerCase())
+            .filter(Boolean);
+          return tags.includes("conversation");
+        })
+        .sort((left, right) => right.timestamp.localeCompare(left.timestamp)),
+    [runInstructionHistory],
   );
   // Build plan graph: prefer authoritative plan_subtasks from API, fall back to timeline extraction
   const planNodes = useMemo(() => {
@@ -1539,7 +1649,235 @@ function RunDetailView({
         )}
 
         {/* ============================================================= */}
-        {/* Section 2: Files & Artifacts                                   */}
+        {/* Section 2: Instructions                                        */}
+        {/* ============================================================= */}
+        {(runCanMessage || instructionHistory.length > 0) && (
+          <section>
+            <div className="flex items-center gap-2 mb-3">
+              <Sparkles size={14} className="text-[#a3b396]" />
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+                Instructions
+              </h3>
+            </div>
+            <div className="rounded-xl border border-zinc-800/70 bg-zinc-900/35 p-4">
+              <p className="text-sm text-zinc-400">
+                Inject a live instruction into this run. Loom will pick it up on the next planning or execution step.
+              </p>
+
+              {runCanMessage ? (
+                <form
+                  onSubmit={(e: FormEvent<HTMLFormElement>) => handleSendRunMessage(e)}
+                  className="mt-4 flex items-center gap-2"
+                >
+                  <input
+                    type="text"
+                    value={runOperatorMessage}
+                    onChange={(e) => setRunOperatorMessage(e.target.value)}
+                    placeholder="Add an instruction to this run..."
+                    disabled={sendingRunMessage}
+                    className="flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:ring-1 focus:ring-[#8a9a7b] disabled:opacity-40"
+                  />
+                  <button
+                    type="submit"
+                    disabled={sendingRunMessage || !runOperatorMessage.trim()}
+                    className="rounded-lg bg-[#6b7a5e] p-2 text-white hover:bg-[#8a9a7b] disabled:opacity-40 transition-colors"
+                    title="Send instruction"
+                  >
+                    {sendingRunMessage ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+                  </button>
+                </form>
+              ) : (
+                <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs text-zinc-500">
+                  This run is not currently accepting new instructions.
+                </div>
+              )}
+
+              {instructionHistory.length > 0 ? (
+                <div className="mt-4 space-y-2">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
+                    Instruction history
+                  </p>
+                  <div className="space-y-2">
+                    {instructionHistory.map((entry) => (
+                      <div
+                        key={entry.id || `${entry.timestamp}-${entry.message}`}
+                        className="rounded-lg border border-zinc-800/70 bg-zinc-950/40 px-3 py-2"
+                      >
+                        <div className="mb-1 flex items-center gap-2">
+                          <span className="rounded-full bg-sky-500/15 px-2 py-0.5 text-[10px] font-semibold text-sky-400">
+                            Instruction
+                          </span>
+                          <span className="text-[10px] text-zinc-600">
+                            {formatDate(entry.timestamp)}
+                          </span>
+                        </div>
+                        <p className="text-sm text-zinc-300">{entry.message}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <p className="mt-4 text-xs text-zinc-600">
+                  No instructions have been sent to this run yet.
+                </p>
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* ============================================================= */}
+        {/* Section 3: Pending approvals                                    */}
+        {/* ============================================================= */}
+        {pendingRunApprovals.length > 0 && (
+          <section>
+            <div className="flex items-center gap-2 mb-3">
+              <Shield size={14} className="text-[#a3b396]" />
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+                Approvals ({pendingRunApprovals.length})
+              </h3>
+            </div>
+            <div className="space-y-3">
+              {pendingRunApprovals.map((item) => {
+                const isQuestion = item.kind === "task_question";
+                const options = isQuestion ? approvalQuestionOptions(item) : [];
+                const questionType = isQuestion ? approvalQuestionType(item) : "";
+                const contextNote = isQuestion ? approvalQuestionContext(item) : "";
+                const draftText = approvalReplyDrafts[item.id] || "";
+                const isReplying = replyingApprovalId === item.id;
+                return (
+                  <div
+                    key={item.id}
+                    className="rounded-xl border border-zinc-800/70 bg-zinc-900/35 p-4"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={cn(
+                            "rounded-full px-2 py-0.5 text-[10px] font-semibold",
+                            isQuestion
+                              ? "bg-sky-500/15 text-sky-400"
+                              : "bg-violet-500/15 text-violet-400",
+                          )}
+                        >
+                          {isQuestion ? "Question" : "Approval needed"}
+                        </span>
+                        {item.risk_level && (
+                          <span
+                            className={cn(
+                              "rounded-full px-2 py-0.5 text-[10px] font-semibold capitalize",
+                              item.risk_level === "high"
+                                ? "bg-red-500/15 text-red-400"
+                                : item.risk_level === "medium"
+                                  ? "bg-amber-500/15 text-amber-400"
+                                  : "bg-zinc-800 text-zinc-400",
+                            )}
+                          >
+                            {item.risk_level}
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-[10px] text-zinc-600">
+                        {formatDate(item.created_at)}
+                      </span>
+                    </div>
+
+                    <p className="mt-3 text-sm font-medium text-zinc-100">
+                      {item.title || (isQuestion ? "Run question" : "Run approval")}
+                    </p>
+                    {item.summary && (
+                      <p className="mt-1 text-sm text-zinc-400 whitespace-pre-wrap break-words">
+                        {item.summary}
+                      </p>
+                    )}
+                    {contextNote && (
+                      <p className="mt-2 text-xs italic text-zinc-500">
+                        {contextNote}
+                      </p>
+                    )}
+
+                    {isQuestion ? (
+                      <div className="mt-4 space-y-3">
+                        {options.length > 0 && (
+                          <div className="flex flex-wrap gap-2">
+                            {options.map((option) => (
+                              <button
+                                key={option.id}
+                                type="button"
+                                disabled={isReplying}
+                                onClick={() =>
+                                  handleReplyApproval(item, {
+                                    decision: "answer",
+                                    response_type: "answered",
+                                    selected_option_ids: [option.id],
+                                    selected_labels: [option.label],
+                                    custom_response: option.label,
+                                  })
+                                }
+                                className="rounded-lg border border-zinc-700/60 bg-zinc-800/60 px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-[#8a9a7b]/40 hover:bg-[#6b7a5e]/10 hover:text-[#bec8b4] disabled:opacity-50"
+                              >
+                                {option.label}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        <div className="flex gap-2">
+                          <textarea
+                            value={draftText}
+                            onChange={(e) =>
+                              setApprovalReplyDrafts((prev) => ({
+                                ...prev,
+                                [item.id]: e.target.value,
+                              }))
+                            }
+                            placeholder={questionType ? `Reply to ${questionType}...` : "Type a custom reply..."}
+                            rows={2}
+                            className="flex-1 rounded-lg border border-zinc-700/60 bg-zinc-800/40 px-3 py-2 text-xs text-zinc-200 placeholder-zinc-600 outline-none transition-colors focus:border-[#8a9a7b]/50 focus:ring-1 focus:ring-[#8a9a7b]/20 resize-none"
+                          />
+                          <button
+                            type="button"
+                            disabled={!draftText.trim() || isReplying}
+                            onClick={() =>
+                              handleReplyApproval(item, {
+                                decision: "answer",
+                                response_type: "answered",
+                                custom_response: draftText.trim(),
+                              })
+                            }
+                            className="self-end rounded-lg bg-[#6b7a5e] px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-[#8a9a7b] disabled:opacity-50"
+                          >
+                            Send
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="mt-4 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          disabled={isReplying}
+                          onClick={() => handleReplyApproval(item, { decision: "approve" })}
+                          className="rounded-lg bg-emerald-600/80 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-50"
+                        >
+                          Approve
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isReplying}
+                          onClick={() => handleReplyApproval(item, { decision: "deny" })}
+                          className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-semibold text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                        >
+                          Deny
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* ============================================================= */}
+        {/* Section 4: Files & Artifacts                                   */}
         {/* ============================================================= */}
         {displayableRunArtifacts.length > 0 && (
           <section>
@@ -1558,7 +1896,7 @@ function RunDetailView({
                     {category}
                   </p>
                   <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                    {artifacts.map((artifact, i) => {
+                    {artifacts.map((artifact) => {
                       const globalIndex = displayableRunArtifacts.indexOf(artifact);
                       return (
                         <ArtifactCard
@@ -1603,7 +1941,7 @@ function RunDetailView({
         )}
 
         {/* ============================================================= */}
-        {/* Section 3: Live Activity                                       */}
+        {/* Section 5: Live Activity                                       */}
         {/* ============================================================= */}
         <section>
           <div className="flex items-center gap-2 mb-3">
@@ -1644,30 +1982,6 @@ function RunDetailView({
                 );
               })}
           </div>
-
-          {/* Operator message input */}
-          {runCanMessage && (
-            <form
-              onSubmit={(e: FormEvent<HTMLFormElement>) => handleSendRunMessage(e)}
-              className="flex items-center gap-2 mb-3"
-            >
-              <input
-                type="text"
-                value={runOperatorMessage}
-                onChange={(e) => setRunOperatorMessage(e.target.value)}
-                placeholder="Send an operator message..."
-                disabled={sendingRunMessage}
-                className="flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:ring-1 focus:ring-[#8a9a7b] disabled:opacity-40"
-              />
-              <button
-                type="submit"
-                disabled={sendingRunMessage || !runOperatorMessage.trim()}
-                className="rounded-lg bg-[#6b7a5e] p-2 text-white hover:bg-[#8a9a7b] disabled:opacity-40 transition-colors"
-              >
-                {sendingRunMessage ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-              </button>
-            </form>
-          )}
 
           {/* Search + scroll controls */}
           <div className="flex items-center gap-2 mb-3">
@@ -1758,7 +2072,7 @@ function RunDetailView({
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                void handleOpenWorkspaceFile(f);
+                                void handleOpenWorkspaceFile(resolveRunFilePath(f));
                                 setActiveTab("files");
                               }}
                               className="inline-flex items-center gap-1 rounded bg-[#6b7a5e]/15 px-1.5 py-px text-[10px] font-mono text-[#a3b396] hover:bg-[#6b7a5e]/30 hover:text-[#bec8b4] transition-colors cursor-pointer"

@@ -12,7 +12,12 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from loom.events.bus import Event, EventBus
-from loom.events.types import APPROVAL_RECEIVED, APPROVAL_REQUESTED
+from loom.events.types import (
+    APPROVAL_RECEIVED,
+    APPROVAL_REJECTED,
+    APPROVAL_REQUESTED,
+    APPROVAL_TIMED_OUT,
+)
 
 
 class ApprovalDecision(StrEnum):
@@ -155,6 +160,18 @@ class ApprovalManager:
                 except TimeoutError:
                     # Deny on timeout — never auto-approve unattended
                     self._approval_results[key] = False
+                    self._event_bus.emit(Event(
+                        event_type=APPROVAL_TIMED_OUT,
+                        task_id=request.task_id,
+                        data={
+                            "subtask_id": request.subtask_id,
+                            "reason": request.reason,
+                            "proposed_action": request.proposed_action,
+                            "risk_level": request.risk_level,
+                            "details": request.details,
+                            "timeout_seconds": timeout,
+                        },
+                    ))
             else:
                 await event.wait()
 
@@ -177,8 +194,9 @@ class ApprovalManager:
         self._approval_results[key] = approved
         event.set()
 
+        event_type = APPROVAL_RECEIVED if approved else APPROVAL_REJECTED
         self._event_bus.emit(Event(
-            event_type=APPROVAL_RECEIVED,
+            event_type=event_type,
             task_id=task_id,
             data={
                 "subtask_id": subtask_id,

@@ -12,6 +12,7 @@ import {
   createTask,
   deleteRun,
   fetchRunArtifacts,
+  fetchRunConversationHistory,
   fetchRunDetail,
   fetchRunTimeline,
   pauseRun,
@@ -20,6 +21,7 @@ import {
   sendRunMessage,
   subscribeRunStream,
   type RunArtifact,
+  type RunConversationEntry,
   type RunDetail,
   type RunTimelineEvent,
   type WorkspaceOverview,
@@ -127,6 +129,7 @@ export interface RunsState {
   runDetail: RunDetail | null;
   runTimeline: RunTimelineEvent[];
   runArtifacts: RunArtifact[];
+  runInstructionHistory: RunConversationEntry[];
   runStreaming: boolean;
   loadingRunDetail: boolean;
   runLoadError: string;
@@ -208,6 +211,7 @@ export function useRuns(deps: {
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
   const [runTimeline, setRunTimeline] = useState<RunTimelineEvent[]>([]);
   const [runArtifacts, setRunArtifacts] = useState<RunArtifact[]>([]);
+  const [runInstructionHistory, setRunInstructionHistory] = useState<RunConversationEntry[]>([]);
   const [runStreaming, setRunStreaming] = useState(false);
   const [loadingRunDetail, setLoadingRunDetail] = useState(false);
   const [runLoadError, setRunLoadError] = useState("");
@@ -322,6 +326,15 @@ export function useRuns(deps: {
     );
   });
 
+  const refreshRunInstructionHistory = useEffectEvent(async (runId: string) => {
+    try {
+      const entries = await fetchRunConversationHistory(runId);
+      setRunInstructionHistory(entries);
+    } catch {
+      setRunInstructionHistory([]);
+    }
+  });
+
   const scheduleRunRefresh = useEffectEvent(() => {
     if (runRefreshTimerRef.current !== null || !selectedRunId) {
       return;
@@ -358,6 +371,7 @@ export function useRuns(deps: {
       setRunDetail(null);
       setRunTimeline([]);
       setRunArtifacts([]);
+      setRunInstructionHistory([]);
       setLoadingRunDetail(false);
       setRunLoadError("");
       setRunHistoryQuery("");
@@ -374,11 +388,16 @@ export function useRuns(deps: {
 
     void (async () => {
       try {
-        const [detail, timeline, artifacts] = await loadRunSnapshot(selectedRunId);
+        const [snapshot, instructionHistory] = await Promise.all([
+          loadRunSnapshot(selectedRunId),
+          fetchRunConversationHistory(selectedRunId).catch(() => [] as RunConversationEntry[]),
+        ]);
+        const [detail, timeline, artifacts] = snapshot;
         if (!cancelled) {
           setRunDetail(detail);
           setRunTimeline(timeline);
           setRunArtifacts(artifacts);
+          setRunInstructionHistory(instructionHistory);
           lastSeenRunEventIdRef.current = timeline.reduce(
             (maxId, row) => Math.max(maxId, Number(row.id || 0)),
             0,
@@ -392,6 +411,7 @@ export function useRuns(deps: {
           setRunDetail(null);
           setRunTimeline([]);
           setRunArtifacts([]);
+          setRunInstructionHistory([]);
         }
       } finally {
         if (!cancelled) {
@@ -653,7 +673,10 @@ export function useRuns(deps: {
     setNotice("");
     try {
       const response = await sendRunMessage(selectedRunId, message);
-      await refreshRun(selectedRunId);
+      await Promise.all([
+        refreshRun(selectedRunId),
+        refreshRunInstructionHistory(selectedRunId),
+      ]);
       setRunOperatorMessage("");
       
     } catch (err) {
@@ -706,6 +729,7 @@ export function useRuns(deps: {
     runDetail,
     runTimeline,
     runArtifacts,
+    runInstructionHistory,
     runStreaming,
     loadingRunDetail,
     runLoadError,

@@ -225,6 +225,18 @@ tools:
 
 The required and excluded lists must not overlap.
 
+Task-shaping note:
+- Choose required tools based on the package's actual work. Research packages
+  often need source-gathering and writing tools; development packages often
+  need file mutation, command execution, and structured verification tools;
+  operational packages may need workflow- or API-specific tools.
+- If the package builds, edits, tests, or verifies software, include
+  `verification_helper` in `tools.required` so Loom can route common
+  build/test/report/runtime verification steps through the structured helper
+  layer instead of relying only on ad hoc shell snippets.
+- Keep `shell_execute` available only when the package genuinely needs
+  arbitrary command execution beyond the built-in helper routes.
+
 ### Auth requirements
 
 If your process needs authenticated APIs/MCPs, declare them explicitly so Loom
@@ -369,6 +381,22 @@ exact path (not `tesla_financial_summary.csv` or other variants).
 - Dependencies form a DAG (directed acyclic graph). Cycles are rejected at load time.
 - Independent phases (no shared dependencies) can run in parallel.
 - Deliverable names must be unique across all phases.
+
+Mixed-workflow note:
+- A single process package can contain both research-oriented and
+  development-oriented phases/subtasks. For example, one package can gather
+  evidence, design an approach, implement code, and then run validation.
+- Today, phases are the main way to express that mixed workflow. The package
+  can model different kinds of work in one DAG, but `verification.policy`
+  still applies at the process level rather than being fully customizable per
+  phase.
+- In practice, choose the overall verification policy based on the package's
+  dominant or riskiest failure mode, then use phases, acceptance criteria,
+  planner examples, and semantic checks to make the mixed workflow explicit.
+- If research and development portions need fundamentally different
+  verification behavior, consider splitting them into separate packages or
+  treating one package as the primary workflow and the other as a follow-on
+  process.
 
 **Model tier guidance:**
 - **Tier 1** — Simple extraction, formatting, data manipulation
@@ -585,6 +613,157 @@ verification:
 - `deliverables` — Check the delivered files
 
 Every process should include the `no-placeholders` regex rule. It catches the most common failure mode (model leaving `[TBD]` stubs).
+
+### Choosing a verification shape by task type
+
+Package verification should match the package's dominant task shape rather than
+assuming every process is primarily research- or development-oriented.
+
+Common patterns:
+
+- Research and analysis packages:
+  Use `mode: llm_first` when the core task is evaluating sources, writing
+  narrative analysis, or judging domain quality. Pair it with deterministic
+  placeholder/structure rules and strong `validity_contract` settings.
+- Development and build packages:
+  Use `mode: static_first` with deterministic checks first, semantic checks
+  second, and capability-aware runtime verification when the package edits or
+  validates software artifacts.
+- Mixed packages:
+  Keep the overall process shaped around the final deliverable. For example, a
+  market-research package that generates a small dashboard can still be
+  research-first, while a code-generation package that includes some discovery
+  phases should still use the stronger development-oriented verification policy.
+- Important current limitation:
+  mixed packages are supported, but Loom does not yet support a completely
+  separate `verification.policy` per phase. Think of verification shape as a
+  process-level default that all subtasks inherit, with subtask/phase wording
+  and capability contracts helping the runtime infer the right behavior inside
+  that shared policy.
+- Other operational packages:
+  Choose the simplest policy that reliably catches the failure modes that
+  matter in that domain. For workflow automation or data maintenance packages,
+  deterministic file, schema, or API-contract checks are usually better than
+  generic prose-quality rules.
+
+Use these questions to decide:
+
+- Is the package's main risk unsupported claims, stale evidence, or poor
+  synthesis? Start with research-oriented verification.
+- Is the package's main risk broken artifacts, failed commands, or runtime
+  regressions? Start with development-oriented verification.
+- Does the package have both? Bias toward the riskier failure mode, then use
+  phases, acceptance criteria, and semantic checks to keep the other mode
+  represented.
+
+### Development-focused verification policies
+
+Packages that produce or verify software should not rely on a purely
+research-style verification shape. Prefer a build-oriented policy that:
+
+- Uses `mode: static_first`
+- Uses `static_checks.tool_success_policy: development_balanced`
+- Treats verifier infrastructure failures as warnings instead of product
+  failures when appropriate
+- Prefers behavior checks over style checks
+- Declares semantic capability contracts for browser/service/runtime checks
+- Uses registered helpers (`run_test_suite`, `run_build_check`,
+  `serve_static`, `http_assert`, `browser_assert`, `browser_session`,
+  `render_verification_report`) instead of one-off verifier shell flows when
+  possible
+
+Recommended baseline:
+
+```yaml
+tools:
+  required:
+    - write_file
+    - shell_execute
+    - verification_helper
+
+verification:
+  policy:
+    mode: static_first
+    static_checks:
+      tool_success_policy: development_balanced
+    semantic_checks:
+      - name: test-suite
+        capability: command_execution
+        helper: run_test_suite
+      - name: build-check
+        capability: command_execution
+        helper: run_build_check
+      - name: local-service-smoke
+        capability: service_runtime
+        helper: serve_static
+      - name: browser-smoke
+        capability: browser_runtime
+        helper: browser_session
+        optional: true
+    output_contract:
+      required_fields: [passed, outcome, reason_code, severity_class, confidence, feedback, issues, metadata]
+    outcome_policy:
+      treat_verifier_infra_as_warning: true
+      prefer_behavior_over_style: true
+      optional_capabilities: [browser_runtime]
+```
+
+Field guidance for development packages:
+
+- `development_balanced` keeps real product failures like broken tests or build
+  failures blocking, while downgrading verifier harness issues such as probe
+  timeouts or missing optional browser capability.
+- `semantic_checks[].capability` declares what kind of verification is being
+  requested. Common values are `command_execution`, `service_runtime`,
+  `browser_runtime`, and `report_rendering`.
+- `semantic_checks[].helper` should name a registered verification helper. Loom
+  validates helper names and capability compatibility at load time.
+- `semantic_checks[].optional: true` is the right shape for checks that improve
+  confidence but should not fail the package when the environment lacks that
+  capability.
+- `outcome_policy.optional_capabilities` is the process-level escape hatch for
+  capabilities such as `browser_runtime` that may be unavailable in some
+  environments.
+- `prefer_behavior_over_style: true` tells Loom to bias toward behavioral
+  checks like "page loads and table renders" instead of brittle source-style
+  rules like "must reference `window.*` explicitly."
+
+Browser verification guidance:
+
+- Use `browser_session` for richer localhost browser checks when the package
+  needs navigation, clicks, form filling, assertions, network capture, or
+  screenshots.
+- Loom prefers a Playwright-backed browser session when the optional browser
+  addon is installed and falls back to a static HTTP/DOM engine otherwise.
+- Treat browser checks as optional unless the package truly requires full
+  browser verification to satisfy its contract.
+- Users can inspect addon availability with `loom doctor` and enforce it with
+  `loom doctor --require-addon browser`.
+- Install the addon with `uv sync --extra browser`; install Playwright browser
+  binaries with `uv run playwright install`.
+
+Subtask design guidance for development packages:
+
+- Keep subtasks aligned to software lifecycle boundaries such as `implement`,
+  `build`, `test`, `runtime-verify`, and `report`.
+- Put deterministic checks as early as possible so failures localize quickly.
+- Reserve browser/runtime subtasks for concrete behavioral validation, not
+  style policing.
+- If a package includes both research and build subtasks, keep the
+  build-oriented phases on the stricter development verification policy instead
+  of inheriting a single research-shaped verifier for the entire package.
+
+General subtask design guidance for all package types:
+
+- Keep subtasks aligned to meaningful task boundaries in the domain rather than
+  arbitrary output chunks.
+- Put deterministic checks as early as possible when they can cheaply localize
+  failures.
+- Use semantic checks for quality dimensions that cannot be expressed as simple
+  file/regex/exit-code checks.
+- If the package mixes task types, reflect that in the subtasks and examples:
+  separate research, transformation, implementation, validation, and synthesis
+  work instead of flattening them into one generic execution phase.
 
 ### Memory types
 
@@ -1065,12 +1244,19 @@ Use this build sequence when authoring new process definitions:
    - Set synthesis phase `verification_tier` >= 2.
    - Keep `final_gate.synthesis_min_verification_tier` >= 2.
    - Keep `max_contradicted_count: 0` for production-grade processes.
-7. Add deterministic + semantic verification:
+7. Add deterministic + semantic verification appropriate to the task:
    - Regex rules for structure/placeholders.
-   - LLM rules for domain quality and claim-source alignment.
+   - LLM rules for domain quality and claim-source alignment when judgment is
+     the main quality bar.
+   - Capability- and artifact-based checks when the package produces software,
+     automations, or other executable/runtime-facing outputs.
 8. Validate migration and behavior in CI:
    - Add `tests:` cases in the package.
    - Include at least one failure-path test for unsupported or contradicted claims.
+   - Add failure-path tests that match the package's dominant risks. For
+     example: unsupported claims for research packages, failing build/test cases
+     for software packages, or schema/contract mismatches for automation/data
+     packages.
 
 Suggested policy baselines:
 

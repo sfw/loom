@@ -72,6 +72,7 @@ def _tool_catalog_category(name: str) -> str:
         "delete_file",
         "search_files",
         "list_directory",
+        "verification_helper",
         "shell_execute",
         "git_command",
         "analyze_code",

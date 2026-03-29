@@ -1078,3 +1078,6 @@ class TestBuildSystemPrompt:
         assert "glob_find" in prompt
         assert "ripgrep_search" in prompt
         assert "ask_user" in prompt
+        assert "verification_helper" in prompt
+        assert "browser_session" in prompt
+        assert "shell_execute" in prompt

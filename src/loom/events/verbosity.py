@@ -7,7 +7,9 @@ from typing import cast
 
 from loom.events.types import (
     ACTIVE_EVENT_TYPES,
+    APPROVAL_REJECTED,
     APPROVAL_REQUESTED,
+    APPROVAL_TIMED_OUT,
     ASK_USER_REQUESTED,
     DEPRECATED_EVENT_TYPES,
     INTERNAL_ONLY_EVENT_TYPES,
@@ -20,6 +22,7 @@ from loom.events.types import (
     TASK_FAILED,
     TASK_INJECTED,
     TASK_PAUSED,
+    TASK_RESTARTED,
     TASK_RESUMED,
     TASK_RUN_ACQUIRED,
     TASK_RUN_HEARTBEAT,
@@ -51,10 +54,13 @@ OPERATOR_PASSTHROUGH_EVENT_TYPES = frozenset(
         TASK_RESUMED,
         TASK_INJECTED,
         APPROVAL_REQUESTED,
+        APPROVAL_REJECTED,
+        APPROVAL_TIMED_OUT,
         ASK_USER_REQUESTED,
         TASK_COMPLETED,
         TASK_FAILED,
         TASK_CANCELLED,
+        TASK_RESTARTED,
     },
 )
 

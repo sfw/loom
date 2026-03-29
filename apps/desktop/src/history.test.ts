@@ -11,6 +11,7 @@ import {
   conversationEventPills,
   conversationEventTitle,
   firstMeaningfulString,
+  isRunTimelineNoise,
   matchesWorkspaceSearch,
   normalizeConversationPrompt,
   notificationSummary,
@@ -97,6 +98,23 @@ describe("history helpers", () => {
       "success",
       "2 options",
     ]);
+  });
+
+  it("treats empty claim verification summaries as noise", () => {
+    const claimSummary: RunTimelineEvent = {
+      ...runEvent,
+      event_type: "claim_verification_summary",
+      data: {
+        extracted: 0,
+        supported: 0,
+        partially_supported: 0,
+        contradicted: 0,
+        insufficient_evidence: 0,
+        pruned: 0,
+      },
+    };
+
+    expect(isRunTimelineNoise(claimSummary)).toBe(true);
   });
 
   it("normalizes conversation prompts and drops invalid ones", () => {

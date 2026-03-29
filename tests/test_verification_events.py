@@ -71,6 +71,14 @@ def test_emit_verification_lifecycle_events_preserve_outcome_fields() -> None:
         outcome="fail",
         reason_code="llm_semantic_failed",
         severity_class="semantic",
+        metadata={
+            "dev_verification_summary": {
+                "canonical_result_path": "runtime-validation-results.json",
+                "canonical_result": {"passed": 15, "total": 16, "failed": 1},
+                "has_report_mismatch_warning": True,
+                "report_paths": ["ui-integration-validation-report.md"],
+            },
+        },
     )
 
     verification_events.emit_verification_started(
@@ -98,9 +106,13 @@ def test_emit_verification_lifecycle_events_preserve_outcome_fields() -> None:
     assert outcome_payload["outcome"] == "fail"
     assert outcome_payload["reason_code"] == "llm_semantic_failed"
     assert outcome_payload["source_component"] == "verification"
+    assert outcome_payload["dev_verification_summary"]["canonical_result_path"] == (
+        "runtime-validation-results.json"
+    )
     terminal_payload = events[2].data
     assert terminal_payload["outcome"] == "fail"
     assert terminal_payload["reason_code"] == "llm_semantic_failed"
+    assert terminal_payload["dev_verification_summary"]["canonical_result"]["failed"] == 1
 
 
 def test_emit_placeholder_findings_event_truncates_and_normalizes() -> None:

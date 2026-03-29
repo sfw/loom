@@ -35,6 +35,7 @@ from loom.tools.shell import (
     check_command_safety,
     high_risk_command_metadata,
 )
+from loom.tools.verification_helper import VerificationHelperTool
 
 WORKSPACE_WRITING_TOOLS = sorted({
     "citation_manager",
@@ -72,6 +73,7 @@ WORKSPACE_WRITING_TOOLS = sorted({
     "symbol_universe_api",
     "timeline_visualizer",
     "valuation_engine",
+    "verification_helper",
     "wp_quality_gate",
     "write_file",
     "delete_file",
@@ -143,6 +145,7 @@ class TestRegistry:
         assert "web_fetch" in tools
         assert "web_fetch_html" in tools
         assert "read_artifact" in tools
+        assert "verification_helper" in tools
 
     def test_register_duplicate_raises(self):
         reg = ToolRegistry()
@@ -172,7 +175,7 @@ class TestRegistry:
             "ReadFileTool", "WriteFileTool", "EditFileTool",
             "DeleteFileTool", "MoveFileTool", "ShellExecuteTool",
             "GitCommandTool", "SearchFilesTool", "ListDirectoryTool",
-            "AnalyzeCodeTool", "WebFetchTool", "WebFetchHtmlTool",
+            "AnalyzeCodeTool", "VerificationHelperTool", "WebFetchTool", "WebFetchHtmlTool",
             "ReadArtifactTool",
         }
         assert expected.issubset(names), f"Missing: {expected - names}"
@@ -823,6 +826,135 @@ class TestShellExecute:
         result = await tool.execute({"command": "ls README.md"}, ctx)
         assert result.success
         assert "README.md" in result.output
+
+
+# --- VerificationHelperTool ---
+
+class TestVerificationHelperTool:
+    async def test_run_build_check_succeeds(self, ctx: ToolContext) -> None:
+        tool = VerificationHelperTool()
+        result = await tool.execute(
+            {
+                "helper": "run_build_check",
+                "args": {"command": "printf 'build ok'"},
+            },
+            ctx,
+        )
+
+        assert result.success is True
+        assert "build ok" in result.output
+        assert result.data == {
+            "exit_code": 0,
+            "command": "printf 'build ok'",
+            "helper": "run_build_check",
+            "helper_capability": "command_execution",
+        }
+
+    async def test_run_test_suite_surfaces_reason_code(self, ctx: ToolContext) -> None:
+        tool = VerificationHelperTool()
+        result = await tool.execute(
+            {
+                "helper": "run_test_suite",
+                "args": {"command": "false"},
+            },
+            ctx,
+        )
+
+        assert result.success is False
+        assert result.error == "dev_test_failed"
+        assert isinstance(result.data, dict)
+        assert result.data["exit_code"] != 0
+        assert result.data["helper"] == "run_test_suite"
+        assert result.data["helper_capability"] == "command_execution"
+        assert result.data["helper_reason_code"] == "dev_test_failed"
+
+    async def test_http_assert_surfaces_helper_metadata(self, ctx: ToolContext) -> None:
+        tool = VerificationHelperTool()
+        result = await tool.execute(
+            {
+                "helper": "http_assert",
+                "args": {"url": "http://127.0.0.1:1/index.html"},
+            },
+            ctx,
+        )
+
+        assert result.success is False
+        assert isinstance(result.data, dict)
+        assert result.data["helper"] == "http_assert"
+        assert result.data["helper_capability"] == "service_runtime"
+        assert result.data["helper_reason_code"] in {
+            "dev_verifier_capability_unavailable",
+            "dev_verifier_timeout",
+        }
+
+    async def test_browser_session_surfaces_helper_metadata_on_failure(
+        self,
+        ctx: ToolContext,
+    ) -> None:
+        tool = VerificationHelperTool()
+        result = await tool.execute(
+            {
+                "helper": "browser_session",
+                "args": {
+                    "start_url": "http://127.0.0.1:1/index.html",
+                    "steps": [{"action": "open", "url": "http://127.0.0.1:1/index.html"}],
+                },
+            },
+            ctx,
+        )
+
+        assert result.success is False
+        assert isinstance(result.data, dict)
+        assert result.data["helper"] == "browser_session"
+        assert result.data["helper_capability"] == "browser_runtime"
+        assert result.data["helper_reason_code"] in {
+            "dev_browser_check_failed",
+            "dev_verifier_capability_unavailable",
+            "dev_verifier_timeout",
+        }
+
+    async def test_render_verification_report_writes_output_file(
+        self,
+        ctx: ToolContext,
+        workspace: Path,
+    ) -> None:
+        tool = VerificationHelperTool()
+        result = await tool.execute(
+            {
+                "helper": "render_verification_report",
+                "args": {
+                    "title": "UI Validation",
+                    "canonical_result": {"passed": 15, "total": 16, "failed": 1},
+                    "output_path": "reports/ui-integration-validation-report.md",
+                },
+            },
+            ctx,
+        )
+
+        report_path = workspace / "reports" / "ui-integration-validation-report.md"
+        assert result.success is True
+        assert report_path.exists()
+        assert result.files_changed == ["reports/ui-integration-validation-report.md"]
+        assert isinstance(result.data, dict)
+        assert result.data["output_path"] == "reports/ui-integration-validation-report.md"
+        assert "# UI Validation" in report_path.read_text()
+
+    async def test_registry_executes_verification_helper_tool(
+        self,
+        registry: ToolRegistry,
+        workspace: Path,
+    ) -> None:
+        result = await registry.execute(
+            "verification_helper",
+            {
+                "helper": "run_build_check",
+                "args": {"command": "printf 'registry ok'"},
+            },
+            workspace=workspace,
+        )
+
+        assert result.success is True
+        assert "registry ok" in result.output
 
 
 # --- Shell Safety ---

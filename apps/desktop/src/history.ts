@@ -112,6 +112,27 @@ const NOISE_EVENT_TYPES = new Set([
 ]);
 
 export function isRunTimelineNoise(event: RunTimelineEvent): boolean {
+  if (event.event_type === "claim_verification_summary") {
+    const d = event.data;
+    const extracted = typeof d.extracted === "number" ? Number(d.extracted) : 0;
+    const supported = typeof d.supported === "number" ? Number(d.supported) : 0;
+    const partiallySupported =
+      typeof d.partially_supported === "number" ? Number(d.partially_supported) : 0;
+    const contradicted = typeof d.contradicted === "number" ? Number(d.contradicted) : 0;
+    const insufficient =
+      typeof d.insufficient_evidence === "number" ? Number(d.insufficient_evidence) : 0;
+    const pruned = typeof d.pruned === "number" ? Number(d.pruned) : 0;
+    if (
+      extracted <= 0 &&
+      supported <= 0 &&
+      partiallySupported <= 0 &&
+      contradicted <= 0 &&
+      insufficient <= 0 &&
+      pruned <= 0
+    ) {
+      return true;
+    }
+  }
   return NOISE_EVENT_TYPES.has(event.event_type);
 }
 
@@ -356,6 +377,8 @@ export function runTimelineDetail(event: RunTimelineEvent): string {
     case "task_cancelled":
     case "task_created":
       return _str(d.goal) || _str(d.summary) || _str(d.message) || "";
+    case "task_restarted":
+      return _str(d.message) || "Run restarted in place";
     case "task_plan_ready":
       return _str(d.message) || _str(d.summary) || "";
     case "task_stalled":
@@ -368,7 +391,13 @@ export function runTimelineDetail(event: RunTimelineEvent): string {
     case "approval_requested":
       return _str(d.message) || `${_str(d.tool_name)}: approval needed`;
     case "approval_received":
-      return _str(d.decision) || "";
+      return d.approved === false ? "Rejected by operator" : _str(d.decision) || "Approved by operator";
+    case "approval_rejected":
+      return _str(d.reason) || "Rejected by operator";
+    case "approval_timed_out":
+      return typeof d.timeout_seconds === "number"
+        ? `Approval timed out after ${d.timeout_seconds}s`
+        : "Approval timed out";
     case "ask_user_requested":
       return _str(d.question) || _str(d.message) || "";
     case "ask_user_answered":

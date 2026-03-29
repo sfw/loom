@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from loom.engine.runner import SubtaskResult
+from loom.engine.verification.types import severity_class_for_reason_code
 from loom.events.types import (
     APPROVAL_RECEIVED,
     APPROVAL_REQUESTED,
@@ -134,6 +135,80 @@ def verification_reason_counts(
     return reasons
 
 
+def development_verification_summary_counts(
+    *,
+    event_bus,
+    task_id: str,
+    verification_outcome_event_type: str,
+) -> dict[str, int]:
+    """Aggregate development verification summary fields from outcome events."""
+    history_limit = max(1000, int(getattr(event_bus, "_max_history", 1000) or 1000))
+    counts = {
+        "optional_warning_outcomes": 0,
+        "report_mismatch_warning_outcomes": 0,
+        "product_failure_count": 0,
+        "infra_failure_count": 0,
+        "inconclusive_failure_count": 0,
+    }
+    for event in event_bus.recent_events(limit=history_limit):
+        if str(getattr(event, "task_id", "") or "") != task_id:
+            continue
+        if str(getattr(event, "event_type", "") or "").strip() != verification_outcome_event_type:
+            continue
+        payload = getattr(event, "data", None)
+        if not isinstance(payload, dict):
+            continue
+        summary = payload.get("dev_verification_summary", {})
+        if not isinstance(summary, dict):
+            continue
+        if bool(summary.get("has_optional_verifier_warnings", False)):
+            counts["optional_warning_outcomes"] = int(
+                counts["optional_warning_outcomes"],
+            ) + 1
+        if bool(summary.get("has_report_mismatch_warning", False)):
+            counts["report_mismatch_warning_outcomes"] = int(
+                counts["report_mismatch_warning_outcomes"],
+            ) + 1
+        for key in (
+            "product_failure_count",
+            "infra_failure_count",
+            "inconclusive_failure_count",
+        ):
+            try:
+                increment = int(summary.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                increment = 0
+            if increment <= 0:
+                continue
+            counts[key] = int(counts[key]) + increment
+    return counts
+
+
+def verification_severity_counts(
+    reason_counts: dict[str, int] | None,
+) -> dict[str, int]:
+    """Aggregate verification reasons by severity class."""
+    counts = {
+        "hard_invariant": 0,
+        "semantic": 0,
+        "inconclusive": 0,
+        "infra": 0,
+        "unknown": 0,
+    }
+    if not isinstance(reason_counts, dict):
+        return counts
+    for reason, value in reason_counts.items():
+        try:
+            increment = int(value)
+        except (TypeError, ValueError):
+            increment = 0
+        if increment <= 0:
+            continue
+        severity = severity_class_for_reason_code(reason) or "unknown"
+        counts[severity] = int(counts.get(severity, 0)) + increment
+    return counts
+
+
 # Extracted telemetry summary emitter
 
 def _emit_telemetry_run_summary(self, task: Task) -> None:
@@ -153,6 +228,14 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
                 validity_summary = run_summary
     event_counts = self._task_event_counts(task.id)
     verification_reason_counts = self._verification_reason_counts(task.id)
+    development_summary_counts = development_verification_summary_counts(
+        event_bus=self._events,
+        task_id=task.id,
+        verification_outcome_event_type=VERIFICATION_OUTCOME,
+    )
+    verification_severity_counts_map = verification_severity_counts(
+        verification_reason_counts,
+    )
     verification_lifecycle_counts = {
         "started": int(event_counts.get(VERIFICATION_STARTED, 0)),
         "passed": int(event_counts.get(VERIFICATION_PASSED, 0)),
@@ -238,6 +321,20 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
             4,
         ),
     }
+    development_verification_health = {
+        "product_failure_reasons": int(verification_reason_counts.get("dev_test_failed", 0))
+        + int(verification_reason_counts.get("dev_build_failed", 0))
+        + int(verification_reason_counts.get("dev_contract_failed", 0))
+        + int(verification_reason_counts.get("dev_browser_check_failed", 0)),
+        "verifier_infra_reasons": int(
+            verification_reason_counts.get("dev_verifier_timeout", 0),
+        )
+        + int(verification_reason_counts.get("dev_verifier_capability_unavailable", 0))
+        + int(verification_reason_counts.get("dev_report_contract_violation", 0)),
+        "report_contract_violation_reasons": int(
+            verification_reason_counts.get("dev_report_contract_violation", 0),
+        ),
+    }
     self._emit(TELEMETRY_RUN_SUMMARY, task.id, {
         "run_id": self._task_run_id(task),
         "model_invocations": int(rollup.get("model_invocations", 0)),
@@ -258,6 +355,9 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
         ),
         "verification_lifecycle_counts": verification_lifecycle_counts,
         "verification_reason_counts": verification_reason_counts,
+        "verification_severity_counts": verification_severity_counts_map,
+        "development_verification_summary_counts": development_summary_counts,
+        "development_verification_health": development_verification_health,
         "remediation_lifecycle_counts": remediation_lifecycle_counts,
         "human_loop_counts": human_loop_counts,
         "control_plane_counts": control_plane_counts,

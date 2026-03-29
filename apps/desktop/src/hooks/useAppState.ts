@@ -11,6 +11,7 @@ import type {
   ModelInfo,
   NotificationEvent,
   RunArtifact,
+  RunConversationEntry,
   RunDetail,
   RunTimelineEvent,
   RuntimeStatus,
@@ -144,6 +145,7 @@ export interface AppState {
   runDetail: RunDetail | null;
   runTimeline: RunTimelineEvent[];
   runArtifacts: RunArtifact[];
+  runInstructionHistory: RunConversationEntry[];
   runStreaming: boolean;
   loadingRunDetail: boolean;
   runLoadError: string;
@@ -725,6 +727,7 @@ export function useAppState(): AppState & AppActions {
     runDetail: runs.runDetail,
     runTimeline: runs.runTimeline,
     runArtifacts: runs.runArtifacts,
+    runInstructionHistory: runs.runInstructionHistory,
     runStreaming: runs.runStreaming,
     loadingRunDetail: runs.loadingRunDetail,
     runLoadError: runs.runLoadError,

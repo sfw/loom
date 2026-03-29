@@ -275,6 +275,12 @@ class RetryManager:
                 ):
                     return RetryStrategy.UNCONFIRMED_DATA, missing_targets
             return RetryStrategy.GENERIC, []
+        if reason_code in {
+            "dev_report_contract_violation",
+            "dev_verifier_capability_unavailable",
+            "dev_verifier_timeout",
+        }:
+            return RetryStrategy.VERIFIER_PARSE, missing_targets
         if policy_decision.action == "pass_with_warnings":
             return RetryStrategy.UNCONFIRMED_DATA, missing_targets
         if policy_decision.action == "retry_targeted":

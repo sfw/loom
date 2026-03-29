@@ -68,6 +68,85 @@ def _tool_usage_text(tool_calls: list | None) -> str:
     return " ".join(names)
 
 
+def _process_policy_signals(process: object | None) -> tuple[int, int, list[str]]:
+    """Return coding/data-ops score boosts derived from process policy."""
+    if process is None:
+        return 0, 0, []
+
+    coding_boost = 0
+    data_ops_boost = 0
+    reasons: list[str] = []
+
+    mode_resolver = getattr(process, "verifier_mode", None)
+    mode = (
+        str(mode_resolver() or "").strip().lower()
+        if callable(mode_resolver)
+        else str(
+            getattr(getattr(process, "verification_policy", None), "mode", "") or "",
+        )
+        .strip()
+        .lower()
+    )
+    if mode == "static_first":
+        coding_boost += 1
+        reasons.append("policy:static_first")
+
+    tool_success_policy_resolver = getattr(process, "verifier_tool_success_policy", None)
+    tool_success_policy = (
+        str(tool_success_policy_resolver() or "").strip().lower()
+        if callable(tool_success_policy_resolver)
+        else ""
+    )
+    if tool_success_policy == "development_balanced":
+        coding_boost += 2
+        reasons.append("policy:development_balanced")
+
+    optional_capabilities_resolver = getattr(process, "verifier_optional_capabilities", None)
+    optional_capabilities = (
+        optional_capabilities_resolver()
+        if callable(optional_capabilities_resolver)
+        else []
+    )
+    if isinstance(optional_capabilities, list):
+        normalized = {
+            str(item or "").strip().lower()
+            for item in optional_capabilities
+            if str(item or "").strip()
+        }
+        if normalized.intersection({"browser_runtime", "service_runtime"}):
+            coding_boost += 1
+            reasons.append("policy:dev_optional_capabilities")
+
+    required_capabilities_resolver = getattr(process, "verifier_required_capabilities", None)
+    required_capabilities = (
+        required_capabilities_resolver()
+        if callable(required_capabilities_resolver)
+        else []
+    )
+    if isinstance(required_capabilities, list):
+        normalized_required = {
+            str(item or "").strip().lower()
+            for item in required_capabilities
+            if str(item or "").strip()
+        }
+        if normalized_required.intersection({"browser_runtime", "service_runtime"}):
+            coding_boost += 1
+            reasons.append("policy:dev_required_capabilities")
+
+    tags = getattr(process, "tags", [])
+    if isinstance(tags, list):
+        normalized_tags = {
+            str(tag or "").strip().lower()
+            for tag in tags
+            if str(tag or "").strip()
+        }
+        if normalized_tags.intersection({"data", "data_ops", "migration", "sql"}):
+            data_ops_boost += 1
+            reasons.append("tags:data_ops")
+
+    return coding_boost, data_ops_boost, reasons
+
+
 def resolve_verification_profile(
     *,
     task: Task | None,
@@ -114,6 +193,11 @@ def resolve_verification_profile(
         coding_score += 2
     if any(token in source for token in ("sql", "table", "query", "warehouse")):
         data_ops_score += 2
+    policy_coding_boost, policy_data_ops_boost, policy_reasons = _process_policy_signals(
+        process,
+    )
+    coding_score += policy_coding_boost
+    data_ops_score += policy_data_ops_boost
 
     scores = {
         "research": research_score,
@@ -128,6 +212,8 @@ def resolve_verification_profile(
         for name, score in scores.items()
         if score > 0
     ) or ("profile_sparse_signal",)
+    if policy_reasons:
+        reason_codes = tuple(list(reason_codes) + policy_reasons)
 
     if top_score <= 0:
         return VerificationProfileResolution(

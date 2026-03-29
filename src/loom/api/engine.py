@@ -23,6 +23,7 @@ from loom.cowork.approval import ApprovalDecision
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import Event, EventBus, EventPersister
 from loom.events.types import (
+    TASK_CANCELLED,
     TASK_FAILED,
     TASK_RUN_ACQUIRED,
     TASK_RUN_HEARTBEAT,
@@ -71,6 +72,14 @@ class ConversationWorker:
     """Tracks one background cowork turn for a persisted conversation."""
 
     session: object
+    task: asyncio.Task
+
+
+@dataclass
+class TaskWorker:
+    """Tracks one background task execution worker for a persisted run."""
+
+    run_id: str
     task: asyncio.Task
 
 
@@ -151,6 +160,7 @@ class Engine:
         self.started_at = datetime.now(UTC).isoformat()
         self._background_tasks: set[asyncio.Task] = set()
         self._conversation_workers: dict[str, ConversationWorker] = {}
+        self._task_workers: dict[str, TaskWorker] = {}
         self._conversation_approvals: dict[str, ConversationApprovalRequest] = {}
         self._runner_id = f"api-{uuid.uuid4().hex[:8]}"
         self._run_lease_seconds = 30
@@ -209,6 +219,25 @@ class Engine:
             return False
         worker = self._conversation_workers.get(clean_id)
         return worker is not None and not worker.task.done()
+
+    def task_run_inflight(self, task_id: str) -> bool:
+        """Return True when a task execution worker is still running."""
+        clean_id = str(task_id or "").strip()
+        if not clean_id:
+            return False
+        worker = self._task_workers.get(clean_id)
+        return worker is not None and not worker.task.done()
+
+    def stop_task_worker(self, task_id: str) -> bool:
+        """Cancel an active task execution worker, if one exists."""
+        clean_id = str(task_id or "").strip()
+        if not clean_id:
+            return False
+        worker = self._task_workers.pop(clean_id, None)
+        if worker is None or worker.task.done():
+            return False
+        worker.task.cancel()
+        return True
 
     def conversation_stop_requested(self, session_id: str) -> bool:
         """Return True when the active cowork turn has a stop flag set."""
@@ -375,6 +404,36 @@ class Engine:
             if pending is not None and not pending.event.is_set():
                 pending.decision = ApprovalDecision.DENY
                 pending.event.set()
+
+        task.add_done_callback(_clear_worker)
+        return task
+
+    def start_task_worker(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        worker: Coroutine[object, object, object],
+    ) -> asyncio.Task:
+        """Start one background execution worker per task."""
+        clean_id = str(task_id or "").strip()
+        if not clean_id:
+            raise ValueError("task_id is required")
+        if self.task_run_inflight(clean_id):
+            raise RuntimeError(f"Task already processing: {clean_id}")
+
+        task = asyncio.create_task(worker)
+        self._task_workers[clean_id] = TaskWorker(
+            run_id=str(run_id or "").strip(),
+            task=task,
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        def _clear_worker(done_task: asyncio.Task) -> None:
+            current = self._task_workers.get(clean_id)
+            if current is not None and current.task is done_task:
+                self._task_workers.pop(clean_id, None)
 
         task.add_done_callback(_clear_worker)
         return task
@@ -705,8 +764,10 @@ class Engine:
                     metadata={"recovered": recovered},
                 )
 
-        bg_task = asyncio.create_task(
-            self._execute_task_run(
+        self.start_task_worker(
+            task_id=task.id,
+            run_id=assigned_run_id,
+            worker=self._execute_task_run(
                 task=task,
                 run_id=assigned_run_id,
                 process=process,
@@ -714,8 +775,6 @@ class Engine:
                 recovered=recovered,
             ),
         )
-        self._background_tasks.add(bg_task)
-        bg_task.add_done_callback(self._background_tasks.discard)
         return assigned_run_id
 
     async def recover_pending_task_runs(self) -> int:
@@ -1092,7 +1151,57 @@ class Engine:
                     last_error="",
                 )
         except asyncio.CancelledError:
-            if lease_enabled:
+            cancelled_task = task
+            if cancelled_task.status != TaskStatus.CANCELLED and self.state_manager.exists(task.id):
+                try:
+                    persisted_task = self.state_manager.load(task.id)
+                except Exception:
+                    persisted_task = None
+                if persisted_task is not None and persisted_task.status == TaskStatus.CANCELLED:
+                    cancelled_task = persisted_task
+            if cancelled_task.status == TaskStatus.CANCELLED:
+                cancel_reason = ""
+                if isinstance(cancelled_task.metadata, dict):
+                    cancel_reason = str(
+                        cancelled_task.metadata.get("cancel_reason", "") or "",
+                    ).strip()
+                try:
+                    self.state_manager.save(cancelled_task)
+                    await self.database.update_task_status(
+                        cancelled_task.id,
+                        TaskStatus.CANCELLED.value,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed persisting cancelled task state for %s",
+                        cancelled_task.id,
+                        exc_info=True,
+                    )
+                if lease_enabled:
+                    try:
+                        await self.database.complete_task_run(
+                            run_id=run_id,
+                            status="cancelled",
+                            last_error=cancel_reason,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed completing cancelled task run %s",
+                            run_id,
+                            exc_info=True,
+                        )
+                self.event_bus.emit(
+                    Event(
+                        event_type=TASK_CANCELLED,
+                        task_id=cancelled_task.id,
+                        data={
+                            "run_id": run_id,
+                            "reason": cancel_reason or "cancel_requested",
+                            "outcome": "cancelled",
+                        },
+                    ),
+                )
+            elif lease_enabled:
                 try:
                     await self.database.requeue_task_run(run_id=run_id)
                 except Exception:

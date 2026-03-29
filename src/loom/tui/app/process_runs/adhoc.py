@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loom import __version__
+from loom.engine.verification.development import (
+    development_helper_tool_guidance,
+    preferred_development_build_tools,
+    recommended_development_build_tools,
+)
 
 from ..models import AdhocProcessCacheEntry
 
@@ -449,28 +454,6 @@ def spec_from_process_defn(
         }
         for phase in list(process_defn.phases)
     ]
-    verification_policy = getattr(process_defn, "verification_policy", None)
-    static_checks = (
-        dict(getattr(verification_policy, "static_checks", {}))
-        if isinstance(getattr(verification_policy, "static_checks", {}), dict)
-        else {}
-    )
-    semantic_checks_raw = getattr(verification_policy, "semantic_checks", [])
-    semantic_checks = (
-        [item for item in semantic_checks_raw if isinstance(item, dict)]
-        if isinstance(semantic_checks_raw, list)
-        else []
-    )
-    output_contract = (
-        dict(getattr(verification_policy, "output_contract", {}))
-        if isinstance(getattr(verification_policy, "output_contract", {}), dict)
-        else {}
-    )
-    outcome_policy = (
-        dict(getattr(verification_policy, "outcome_policy", {}))
-        if isinstance(getattr(verification_policy, "outcome_policy", {}), dict)
-        else {}
-    )
     return {
         "intent": cls._infer_adhoc_intent_from_phases(phases),
         "risk_level": ProcessDefinition._normalize_risk_level(
@@ -496,15 +479,7 @@ def spec_from_process_defn(
             if isinstance(getattr(process_defn, "validity_contract", {}), dict)
             else {}
         ),
-        "verification_policy": {
-            "mode": str(getattr(verification_policy, "mode", "llm_first") or "llm_first")
-            .strip()
-            .lower(),
-            "static_checks": static_checks,
-            "semantic_checks": semantic_checks,
-            "output_contract": output_contract,
-            "outcome_policy": outcome_policy,
-        },
+        "verification_policy": process_defn.verification_policy_payload(),
         "phases": phases,
     }
 
@@ -743,8 +718,63 @@ def adhoc_default_validity_contract(intent: str, risk_level: str) -> dict[str, A
         contract["prune_mode"] = "drop"
     return contract
 
-def adhoc_default_verification_policy() -> dict[str, Any]:
+def _adhoc_build_verification_policy() -> dict[str, Any]:
+    """Return development-oriented verification defaults for build workflows."""
+    return {
+        "mode": "static_first",
+        "static_checks": {
+            # Keep true integrity failures hard, fail real build/test checks,
+            # and downgrade verifier harness/browser issues that are not
+            # evidence of a broken deliverable.
+            "tool_success_policy": "development_balanced",
+            "phase_scope": "current_phase",
+        },
+        "semantic_checks": [
+            {
+                "name": "behavior_over_style_runtime_checks",
+                "description": (
+                    "Prefer runtime and artifact behavior checks over "
+                    "style-only source heuristics for build workflows."
+                ),
+            },
+            {
+                "name": "optional_browser_verification",
+                "kind": "runtime_probe",
+                "capability": "browser_runtime",
+                "helper": "browser_assert",
+                "target": "ui_surface",
+                "optional": True,
+            },
+            {
+                "name": "optional_service_runtime_probe",
+                "kind": "service_probe",
+                "capability": "service_runtime",
+                "helper": "serve_static",
+                "target": "local_service",
+                "optional": True,
+            },
+        ],
+        "output_contract": {
+            "required_fields": ["passed", "outcome", "reason_code", "severity_class"],
+            "metadata_fields": [
+                "verification_profile",
+                "verification_profile_confidence",
+                "dev_verification_summary",
+            ],
+        },
+        "outcome_policy": {
+            "treat_verifier_infra_as_warning": True,
+            "prefer_behavior_over_style": True,
+            "optional_capabilities": ["browser_runtime", "service_runtime"],
+        },
+    }
+
+
+def adhoc_default_verification_policy(intent: str = "research") -> dict[str, Any]:
     """Return verification policy defaults for synthesized ad hoc processes."""
+    normalized_intent = normalize_adhoc_intent(intent, default="research")
+    if normalized_intent == "build":
+        return _adhoc_build_verification_policy()
     return {
         "mode": "llm_first",
         "static_checks": {
@@ -1014,14 +1044,7 @@ def fallback_adhoc_spec(
     slug = self._sanitize_kebab_token(goal, fallback="adhoc-process", max_len=26)
     available = set(available_tools)
     preferred_by_intent: dict[str, list[str]] = {
-        "build": [
-            "search_files",
-            "read_file",
-            "write_file",
-            "shell_execute",
-            "ripgrep_search",
-            "document_write",
-        ],
+        "build": preferred_development_build_tools(available_tools),
         "writing": [
             "read_file",
             "write_file",
@@ -1047,7 +1070,7 @@ def fallback_adhoc_spec(
     if not required_tools and available_tools:
         required_tools = available_tools[: min(5, len(available_tools))]
     recommended_by_intent: dict[str, list[str]] = {
-        "build": ["shell_execute", "ripgrep_search", "web_search"],
+        "build": recommended_development_build_tools(available_tools),
         "writing": ["web_search", "document_write"],
         "research": ["web_search", "web_fetch", "spreadsheet", "calculator"],
     }
@@ -1061,6 +1084,15 @@ def fallback_adhoc_spec(
         intent=resolved_intent,
         raw=None,
     )
+    tool_guidance = (
+        "Use available tools aggressively for evidence gathering, verification, "
+        "and artifact production. Prefer primary sources, maintain traceability, "
+        "and keep outputs concise and decision-oriented."
+    )
+    if resolved_intent == "build":
+        tool_guidance = (
+            f"{tool_guidance}\n\n{development_helper_tool_guidance()}"
+        )
     return {
         "source": "fallback_template",
         "intent": resolved_intent,
@@ -1073,18 +1105,16 @@ def fallback_adhoc_spec(
         ),
         # Guided keeps the planner in control while still providing structure.
         "phase_mode": "guided",
-        "tool_guidance": (
-            "Use available tools aggressively for evidence gathering, verification, "
-            "and artifact production. Prefer primary sources, maintain traceability, "
-            "and keep outputs concise and decision-oriented."
-        ),
+        "tool_guidance": tool_guidance,
         "required_tools": required_tools,
         "recommended_tools": recommended,
         "validity_contract": self._adhoc_default_validity_contract(
             resolved_intent,
             resolved_risk_level,
         ),
-        "verification_policy": self._adhoc_default_verification_policy(),
+        "verification_policy": self._adhoc_default_verification_policy(
+            resolved_intent,
+        ),
         "phases": self._adhoc_intent_phase_blueprint(resolved_intent, slug),
     }
 
@@ -1117,7 +1147,9 @@ def normalize_adhoc_spec(
         resolved_risk_level,
     )
     fallback["validity_contract"] = fallback_validity
-    fallback_verification_policy = self._adhoc_default_verification_policy()
+    fallback_verification_policy = self._adhoc_default_verification_policy(
+        resolved_intent,
+    )
     fallback["verification_policy"] = fallback_verification_policy
     baseline_validity_contract = ProcessDefinition._normalize_validity_contract(
         fallback.get("validity_contract", {}),
@@ -1346,8 +1378,14 @@ def build_adhoc_cache_entry(
         if isinstance(phase, dict)
     ]
     verification_policy_raw = self._merge_adhoc_verification_policy(
-        self._adhoc_default_verification_policy(),
+        self._adhoc_default_verification_policy(
+            str(spec.get("intent", "")) or "research",
+        ),
         spec.get("verification_policy", {}),
+    )
+    resolved_intent = self._normalize_adhoc_intent(
+        str(spec.get("intent", "")),
+        default="research",
     )
     process_defn = ProcessDefinition(
         name=str(spec.get("name", "")).strip() or f"adhoc-{key[:8]}",
@@ -1413,7 +1451,7 @@ def build_adhoc_cache_entry(
                 else {}
             ),
         ),
-        tags=["adhoc", "generated"],
+        tags=list(dict.fromkeys(["adhoc", "generated", resolved_intent])),
     )
     try:
         spec_snapshot = json.loads(json.dumps(spec, ensure_ascii=False))

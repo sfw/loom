@@ -231,6 +231,328 @@ class TestDeterministicVerifier:
         )
 
     @pytest.mark.asyncio
+    async def test_development_balanced_policy_keeps_test_failures_semantic(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="shell_execute",
+            args={"command": "node test-runtime.js 2>&1"},
+            result=ToolResult.fail("Exit code: 1"),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert result.reason_code == "dev_test_failed"
+        assert result.severity_class == "semantic"
+
+    @pytest.mark.asyncio
+    async def test_development_balanced_policy_downgrades_runtime_probe_timeout(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="shell_execute",
+            args={
+                "command": (
+                    "cd dist && python3 -m http.server 8080 &\n"
+                    "sleep 2\n"
+                    "curl -s -o /dev/null -w \"%{http_code}\" "
+                    "http://localhost:8080/index.html"
+                ),
+            },
+            result=ToolResult.fail("Tool 'shell_execute' timed out after 120s"),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert result.passed
+        assert any(
+            c.name == "tool_shell_execute_advisory"
+            and "reason_code=dev_verifier_timeout" in str(c.detail)
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_development_balanced_policy_downgrades_browser_probe_timeout(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="claude_code",
+            args={
+                "prompt": (
+                    "Run Playwright headless browser tests against localhost, "
+                    "capture console logs, and take a screenshot."
+                ),
+            },
+            result=ToolResult.fail("Command timed out"),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert result.passed
+        assert any(
+            c.name == "tool_claude_code_advisory"
+            and "reason_code=dev_verifier_timeout" in str(c.detail)
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_development_balanced_policy_classifies_helper_test_failure(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="verification_helper",
+            args={
+                "helper": "run_test_suite",
+                "args": {"command": "pytest -q"},
+            },
+            result=ToolResult(
+                success=False,
+                output="",
+                error="dev_test_failed",
+                data={"command": "pytest -q", "routed_from_tool": "shell_execute"},
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert result.reason_code == "dev_test_failed"
+        assert result.severity_class == "semantic"
+
+    @pytest.mark.asyncio
+    async def test_development_balanced_policy_downgrades_helper_timeout(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="verification_helper",
+            args={
+                "helper": "run_build_check",
+                "args": {"command": "npm run build"},
+            },
+            result=ToolResult(
+                success=False,
+                output="run_build_check timed out after 120s while running: npm run build",
+                error="dev_verifier_timeout",
+                data={"routed_from_tool": "shell_execute"},
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert result.passed
+        assert any(
+            c.name == "tool_verification_helper_advisory"
+            and "reason_code=dev_verifier_timeout" in str(c.detail)
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_development_balanced_policy_classifies_service_helper_contract_failure(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="verification_helper",
+            args={
+                "helper": "serve_static",
+                "args": {
+                    "command": "python3 -m http.server 8080",
+                    "ready_url": "http://127.0.0.1:8080/index.html",
+                },
+            },
+            result=ToolResult(
+                success=False,
+                output="serve_static assertion failed",
+                error="dev_contract_failed",
+                data={"routed_from_tool": "shell_execute"},
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert result.reason_code == "dev_contract_failed"
+        assert result.severity_class == "semantic"
+
+    @pytest.mark.asyncio
+    async def test_development_balanced_policy_downgrades_browser_helper_timeout(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="verification_helper",
+            args={
+                "helper": "browser_assert",
+                "args": {"url": "http://127.0.0.1:8080/index.html"},
+            },
+            result=ToolResult(
+                success=False,
+                output="browser_assert timed out reaching localhost",
+                error="dev_verifier_timeout",
+                data={},
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert result.passed
+        assert any(
+            c.name == "tool_verification_helper_advisory"
+            and "capability=browser_runtime" in str(c.detail)
+            and "reason_code=dev_verifier_timeout" in str(c.detail)
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_development_balanced_policy_classifies_http_helper_contract_failure(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="verification_helper",
+            args={
+                "helper": "http_assert",
+                "args": {"url": "http://127.0.0.1:8080/index.html"},
+            },
+            result=ToolResult(
+                success=False,
+                output="http_assert assertion failed",
+                error="dev_contract_failed",
+                data={},
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert result.reason_code == "dev_contract_failed"
+        assert result.severity_class == "semantic"
+
+    @pytest.mark.asyncio
+    async def test_development_balanced_policy_classifies_probe_suite_from_helper_metadata(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="verification_helper",
+            args={
+                "helper": "probe_suite",
+                "args": {
+                    "checks": [
+                        {"url": "http://127.0.0.1:8080/index.html"},
+                        {"url": "http://127.0.0.1:8080/pricing.html"},
+                    ],
+                },
+            },
+            result=ToolResult(
+                success=False,
+                output="probe_suite check 2 failed",
+                error="dev_browser_check_failed",
+                data={"helper_capability": "browser_runtime"},
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert result.reason_code == "dev_browser_check_failed"
+        assert result.severity_class == "semantic"
+
+    @pytest.mark.asyncio
+    async def test_development_balanced_policy_classifies_browser_helper_semantic_failure(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="verification_helper",
+            args={
+                "helper": "browser_assert",
+                "args": {"url": "http://127.0.0.1:8080/index.html"},
+            },
+            result=ToolResult(
+                success=False,
+                output="browser_assert assertion failed",
+                error="dev_browser_check_failed",
+                data={},
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert result.reason_code == "dev_browser_check_failed"
+        assert result.severity_class == "semantic"
+
+    @pytest.mark.asyncio
+    async def test_development_balanced_policy_adds_report_consistency_warning(self, tmp_path):
+        process = _make_process(
+            static_checks={"tool_success_policy": "development_balanced"},
+            tags=["adhoc", "build"],
+            version="adhoc-1",
+        )
+        v = DeterministicVerifier(process=process)
+        (tmp_path / "runtime-validation-results.json").write_text(
+            json.dumps({"passed": 15, "failed": 1, "tests": [{} for _ in range(16)]}),
+        )
+        (tmp_path / "ui-integration-validation-report.md").write_text(
+            "# Report\n\n**Score: 16/16 tests passed (100%)**\n",
+        )
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "ui-integration-validation-report.md"},
+            result=ToolResult.ok(
+                "ok",
+                files_changed=[
+                    "runtime-validation-results.json",
+                    "ui-integration-validation-report.md",
+                ],
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], tmp_path)
+        assert result.passed
+        assert any(
+            c.name == "dev_report_consistency_ui-integration-validation-report.md_advisory"
+            and "reason_code=dev_report_contract_violation" in str(c.detail)
+            for c in result.checks
+        )
+        summary = result.metadata.get("dev_verification_summary", {})
+        assert isinstance(summary, dict)
+        assert summary.get("report_mismatch_warning_count") == 1
+        assert summary.get("has_report_mismatch_warning") is True
+        assert summary.get("infra_failure_count") == 1
+        assert summary.get("product_failure_count") == 0
+        assert summary.get("canonical_result_path") == "runtime-validation-results.json"
+        assert summary.get("canonical_result") == {"passed": 15, "total": 16, "failed": 1}
+        assert summary.get("reason_counts", {}).get("dev_report_contract_violation") == 1
+        assert summary.get("capability_counts", {}).get("report_rendering") == 1
+        assert "report_rendering" in summary.get("optional_failure_capabilities", [])
+        assert summary.get("report_mismatch_count") == 1
+        report_artifacts = summary.get("report_artifacts", [])
+        assert isinstance(report_artifacts, list)
+        assert report_artifacts[0].get("path") == "ui-integration-validation-report.md"
+        assert report_artifacts[0].get("matches_canonical") is False
+        advisory_failures = summary.get("advisory_failures", [])
+        assert isinstance(advisory_failures, list)
+        assert advisory_failures[0].get("reason_code") == "dev_report_contract_violation"
+        assert advisory_failures[0].get("capability") == "report_rendering"
+
+    @pytest.mark.asyncio
     async def test_web_tool_transient_failure_is_advisory(self):
         v = DeterministicVerifier()
         tc = MockToolCallRecord(

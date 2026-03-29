@@ -340,6 +340,7 @@ class Orchestrator:
             else:
                 # 1. Planning phase
                 task.status = TaskStatus.PLANNING
+                self._state.save(task)
                 self._emit(TASK_PLANNING, task.id, {
                     "goal": task.goal,
                     "run_id": run_id,

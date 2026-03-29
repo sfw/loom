@@ -22,6 +22,11 @@ from typing import Any
 
 import yaml
 
+from loom.engine.verification_helpers import (
+    get_verification_helper,
+    verification_helper_is_bound,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -338,6 +343,13 @@ class ProcessDefinition:
     _OUTPUT_PUBLISH_MODES = frozenset({"transactional", "best_effort"})
     _OUTPUT_CONFLICT_POLICIES = frozenset({"defer_fifo", "fail_fast"})
     _FINALIZER_INPUT_POLICIES = frozenset({"require_all_workers", "allow_partial"})
+    _VERIFIER_CAPABILITIES = frozenset({
+        "artifact_static",
+        "command_execution",
+        "service_runtime",
+        "browser_runtime",
+        "report_rendering",
+    })
     _PHASE_FINALIZER_SUFFIX = "__finalize_output"
 
     def has_phases(self) -> bool:
@@ -398,10 +410,97 @@ class ProcessDefinition:
     def is_contract_v2(self) -> bool:
         return int(self.schema_version or 1) >= 2
 
+    def verifier_mode(self) -> str:
+        """Return the normalized verification policy mode."""
+        mode = str(self.verification_policy.mode or "llm_first").strip().lower()
+        if mode not in {"llm_first", "static_first"}:
+            return "llm_first"
+        return mode
+
+    def verifier_static_checks(self) -> dict[str, Any]:
+        """Return normalized static verification policy settings."""
+        static_checks = self.verification_policy.static_checks
+        if isinstance(static_checks, dict):
+            return dict(static_checks)
+        return {}
+
+    def verifier_semantic_checks(self) -> list[dict[str, Any]]:
+        """Return normalized semantic verification policy settings."""
+        semantic_checks = self.verification_policy.semantic_checks
+        if not isinstance(semantic_checks, list):
+            return []
+        return [item for item in semantic_checks if isinstance(item, dict)]
+
+    def verifier_semantic_check_contracts(self) -> list[dict[str, Any]]:
+        """Return normalized semantic verifier check contracts."""
+        contracts: list[dict[str, Any]] = []
+        for item in self.verifier_semantic_checks():
+            name = str(item.get("name", "") or "").strip()
+            capability = str(item.get("capability", "") or "").strip().lower()
+            target = str(item.get("target", "") or "").strip()
+            helper = str(item.get("helper", "") or "").strip().lower()
+            kind = str(item.get("kind", "") or "").strip().lower()
+            description = str(item.get("description", "") or "").strip()
+            optional = self._to_bool(item.get("optional", False), default=False)
+            contract: dict[str, Any] = {}
+            if name:
+                contract["name"] = name
+            if capability in self._VERIFIER_CAPABILITIES:
+                contract["capability"] = capability
+            if target:
+                contract["target"] = target
+            if helper:
+                contract["helper"] = helper
+            if kind:
+                contract["kind"] = kind
+            if description:
+                contract["description"] = description
+            if optional:
+                contract["optional"] = True
+            if contract:
+                contracts.append(contract)
+        return contracts
+
+    def verifier_helper_contracts(self) -> list[dict[str, Any]]:
+        """Return semantic verifier checks that declare registered helpers."""
+        contracts: list[dict[str, Any]] = []
+        for item in self.verifier_capability_contracts():
+            helper = str(item.get("helper", "") or "").strip().lower()
+            if helper:
+                contracts.append(dict(item))
+        return contracts
+
+    def verifier_helper_specs(self) -> list[dict[str, object]]:
+        """Return unique helper specs with descriptions for prompts/tooling."""
+        specs: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in self.verifier_helper_contracts():
+            helper = str(item.get("helper", "") or "").strip().lower()
+            capability = str(item.get("capability", "") or "").strip().lower()
+            if not helper or (helper, capability) in seen:
+                continue
+            helper_spec = get_verification_helper(helper)
+            description = helper_spec.description if helper_spec else ""
+            specs.append({
+                "helper": helper,
+                "capability": capability,
+                "description": str(description or "").strip(),
+                "bound": bool(verification_helper_is_bound(helper)),
+            })
+            seen.add((helper, capability))
+        return specs
+
     def verifier_output_contract(self) -> dict[str, Any]:
         output = self.verification_policy.output_contract
         if isinstance(output, dict):
-            return output
+            return dict(output)
+        return {}
+
+    def verifier_outcome_policy(self) -> dict[str, Any]:
+        """Return normalized outcome verification policy settings."""
+        outcome_policy = self.verification_policy.outcome_policy
+        if isinstance(outcome_policy, dict):
+            return dict(outcome_policy)
         return {}
 
     def verifier_required_response_fields(self) -> list[str]:
@@ -442,6 +541,98 @@ class ProcessDefinition:
                 if text:
                     fields.append(text)
         return list(dict.fromkeys(fields))
+
+    def verifier_optional_capabilities(self) -> list[str]:
+        """Return normalized optional verifier capabilities from outcome policy."""
+        normalized: list[str] = []
+        raw = self.verifier_outcome_policy().get("optional_capabilities", [])
+        if isinstance(raw, list):
+            for item in raw:
+                text = str(item or "").strip().lower()
+                if text and text not in normalized:
+                    normalized.append(text)
+        for item in self.verifier_semantic_check_contracts():
+            if not bool(item.get("optional", False)):
+                continue
+            text = str(item.get("capability", "") or "").strip().lower()
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized
+
+    def verifier_required_capabilities(self) -> list[str]:
+        """Return normalized required verifier capabilities from semantic checks."""
+        normalized: list[str] = []
+        for item in self.verifier_semantic_check_contracts():
+            if bool(item.get("optional", False)):
+                continue
+            text = str(item.get("capability", "") or "").strip().lower()
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized
+
+    def verifier_prefers_behavior_over_style(self) -> bool:
+        """Return True when the verifier should prefer behavior checks over style."""
+        return self._to_bool(
+            self.verifier_outcome_policy().get("prefer_behavior_over_style", False),
+            default=False,
+        )
+
+    def verifier_capability_contracts(self) -> list[dict[str, Any]]:
+        """Return semantic verifier checks that declare concrete capabilities."""
+        contracts: list[dict[str, Any]] = []
+        for item in self.verifier_semantic_check_contracts():
+            capability = str(item.get("capability", "") or "").strip().lower()
+            if capability:
+                contracts.append(dict(item))
+        return contracts
+
+    def verifier_treat_infra_as_warning(self) -> bool:
+        """Return True when verifier infra failures can downgrade to warnings."""
+        return self._to_bool(
+            self.verifier_outcome_policy().get("treat_verifier_infra_as_warning", False),
+            default=False,
+        )
+
+    def is_adhoc_process(self) -> bool:
+        """Return True for generated ad hoc process definitions."""
+        if any(str(tag or "").strip().lower() == "adhoc" for tag in self.tags):
+            return True
+
+        version = str(self.version or "").strip().lower()
+        if version.startswith("adhoc-"):
+            return True
+
+        name = str(self.name or "").strip().lower()
+        return name.endswith("-adhoc")
+
+    def verifier_tool_success_policy(
+        self,
+        *,
+        include_adhoc_fallback: bool = False,
+    ) -> str:
+        """Return the normalized tier-1 tool-failure policy."""
+        policy = str(
+            self.verifier_static_checks().get("tool_success_policy", "") or "",
+        ).strip().lower()
+        if policy in {
+            "all_tools_hard",
+            "development_balanced",
+            "safety_integrity_only",
+        }:
+            return policy
+        if include_adhoc_fallback and self.is_adhoc_process():
+            return "safety_integrity_only"
+        return "all_tools_hard"
+
+    def verification_policy_payload(self) -> dict[str, Any]:
+        """Serialize the structured verification policy into plain JSON-safe data."""
+        return {
+            "mode": self.verifier_mode(),
+            "static_checks": self.verifier_static_checks(),
+            "semantic_checks": self.verifier_semantic_checks(),
+            "output_contract": self.verifier_output_contract(),
+            "outcome_policy": self.verifier_outcome_policy(),
+        }
 
     @staticmethod
     def _to_bool(value: object, default: bool = False) -> bool:
@@ -1983,6 +2174,24 @@ class ProcessLoader:
                     "verification.policy.output_contract.required_fields must include "
                     "'metadata' when metadata_fields/counters/flags are declared",
                 )
+
+            for contract in defn.verifier_semantic_check_contracts():
+                helper = str(contract.get("helper", "") or "").strip().lower()
+                capability = str(contract.get("capability", "") or "").strip().lower()
+                if helper:
+                    helper_spec = get_verification_helper(helper)
+                    if helper_spec is None:
+                        errors.append(
+                            "verification.policy.semantic_checks helper "
+                            f"{helper!r} is not registered",
+                        )
+                    elif capability and capability not in helper_spec.capabilities:
+                        supported = ", ".join(helper_spec.capabilities)
+                        errors.append(
+                            "verification.policy.semantic_checks helper "
+                            f"{helper!r} does not support capability {capability!r}; "
+                            f"supported capabilities: {supported}",
+                        )
 
             evidence_required = defn.evidence.record_schema.get("required_fields", [])
             if evidence_required and not isinstance(evidence_required, list):

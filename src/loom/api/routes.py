@@ -10,6 +10,8 @@ import logging
 import mimetypes
 import os
 import time
+import uuid
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -109,13 +111,14 @@ from loom.events.types import (
     TASK_COMPLETED,
     TASK_CREATED,
     TASK_FAILED,
+    TASK_RESTARTED,
     TOKEN_STREAMED,
 )
 from loom.events.verbosity import should_deliver_operator
 from loom.processes.run_workspace import provision_scoped_run_workspace
 from loom.processes.schema import ProcessLoader
 from loom.state.memory import MemoryEntry
-from loom.state.task_state import SubtaskStatus, TaskStatus
+from loom.state.task_state import Plan, Subtask, SubtaskStatus, Task, TaskStatus
 from loom.state.workspaces import canonicalize_workspace_path
 from loom.tools.ask_user import normalize_ask_user_args
 from loom.tools.registry import (
@@ -186,6 +189,96 @@ def _required_auth_resources_for_process(
 
     normalized = coerce_auth_requirements(raw_items)
     return serialize_auth_requirements(normalized)
+
+
+def _prepare_task_for_restart_from_failure(task: Task) -> tuple[Task | None, str | None]:
+    """Reset a terminal task for another execution pass, preserving completed work."""
+    if not task.plan or not task.plan.subtasks:
+        return None, (
+            f"Cannot restart task '{task.id}': no saved subtask plan available."
+        )
+
+    needs_work = False
+    for subtask in task.plan.subtasks:
+        if subtask.status == SubtaskStatus.COMPLETED:
+            continue
+        needs_work = True
+        if subtask.status in {
+            SubtaskStatus.PENDING,
+            SubtaskStatus.RUNNING,
+            SubtaskStatus.FAILED,
+            SubtaskStatus.BLOCKED,
+            SubtaskStatus.SKIPPED,
+        }:
+            subtask.status = SubtaskStatus.PENDING
+        subtask.retry_count = 0
+        subtask.active_issue = ""
+        if subtask.status == SubtaskStatus.PENDING:
+            subtask.summary = ""
+
+    if not needs_work:
+        return None, f"Cannot restart task '{task.id}': no remaining work."
+
+    task.completed_at = ""
+    task.status = TaskStatus.PENDING
+    task.add_decision("Resumed execution from prior task state.")
+    return task, None
+
+
+def _plan_from_json_dict(plan_data: dict[str, Any]) -> Plan:
+    """Reconstruct a persisted plan JSON payload into the dataclass form."""
+    subtasks: list[Subtask] = []
+    for raw in plan_data.get("subtasks", []) or []:
+        if not isinstance(raw, dict):
+            continue
+        validity_snapshot_raw = raw.get("validity_contract_snapshot", {})
+        if not isinstance(validity_snapshot_raw, dict):
+            validity_snapshot_raw = {}
+        best_score_raw = raw.get("iteration_best_score")
+        try:
+            best_score = float(best_score_raw) if best_score_raw is not None else None
+        except (TypeError, ValueError):
+            best_score = None
+        subtasks.append(Subtask(
+            id=str(raw.get("id", "") or ""),
+            description=str(raw.get("description", "") or ""),
+            status=SubtaskStatus(str(raw.get("status", "pending") or "pending")),
+            summary=str(raw.get("summary", "") or ""),
+            active_issue=str(raw.get("active_issue", "") or ""),
+            depends_on=[
+                str(item).strip()
+                for item in (raw.get("depends_on", []) or [])
+                if str(item).strip()
+            ],
+            phase_id=str(raw.get("phase_id", "") or ""),
+            output_role=str(raw.get("output_role", "") or ""),
+            output_strategy=str(raw.get("output_strategy", "") or ""),
+            model_tier=int(raw.get("model_tier", 1) or 1),
+            verification_tier=int(raw.get("verification_tier", 1) or 1),
+            is_critical_path=bool(raw.get("is_critical_path", False)),
+            is_synthesis=bool(raw.get("is_synthesis", False)),
+            acceptance_criteria=str(raw.get("acceptance_criteria", "") or ""),
+            validity_contract_snapshot=dict(validity_snapshot_raw),
+            validity_contract_hash=str(raw.get("validity_contract_hash", "") or ""),
+            retry_count=int(raw.get("retry_count", 0) or 0),
+            max_retries=int(raw.get("max_retries", 3) or 3),
+            iteration_attempt=int(raw.get("iteration_attempt", 0) or 0),
+            iteration_runner_invocations=int(raw.get("iteration_runner_invocations", 0) or 0),
+            iteration_max_attempts=int(raw.get("iteration_max_attempts", 0) or 0),
+            iteration_no_improvement_count=int(
+                raw.get("iteration_no_improvement_count", 0) or 0,
+            ),
+            iteration_best_score=best_score,
+            iteration_terminal_reason=str(raw.get("iteration_terminal_reason", "") or ""),
+            iteration_loop_run_id=str(raw.get("iteration_loop_run_id", "") or ""),
+            iteration_replan_count=int(raw.get("iteration_replan_count", 0) or 0),
+            iteration_last_gate_summary=str(raw.get("iteration_last_gate_summary", "") or ""),
+        ))
+    return Plan(
+        subtasks=subtasks,
+        version=int(plan_data.get("version", 1) or 1),
+        last_replanned=str(plan_data.get("last_replanned", "") or ""),
+    )
 
 
 def _get_engine(request: Request) -> Engine:
@@ -3033,14 +3126,95 @@ async def steer_task(request: Request, task_id: str, body: TaskSteerRequest):
 async def cancel_task(request: Request, task_id: str):
     """Cancel a running task."""
     engine = _get_engine(request)
-
-    if not engine.state_manager.exists(task_id):
+    task_row = await engine.database.get_task(task_id)
+    if task_row is None and not engine.state_manager.exists(task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    task = engine.state_manager.load(task_id)
-    engine.orchestrator.cancel_task(task)
+    if engine.state_manager.exists(task_id):
+        task = engine.state_manager.load(task_id)
+        if task.status not in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            engine.orchestrator.cancel_task(task)
+            if task.status == TaskStatus.CANCELLED:
+                engine.state_manager.save(task)
+                await engine.database.update_task_status(task_id, TaskStatus.CANCELLED.value)
+                latest_run_id = ""
+                if isinstance(task.metadata, dict):
+                    await engine.database.update_task_metadata(task_id, task.metadata)
+                    latest_run_id = str(task.metadata.get("run_id", "") or "").strip()
+                if latest_run_id:
+                    await engine.database.complete_task_run(
+                        run_id=latest_run_id,
+                        status="cancelled",
+                        last_error="cancel_requested",
+                    )
+        stop_requested = engine.stop_task_worker(task_id)
+        if not stop_requested:
+            await engine.database.update_task_status(task_id, TaskStatus.CANCELLED.value)
+            latest_run_id = ""
+            if isinstance(task.metadata, dict):
+                latest_run_id = str(task.metadata.get("run_id", "") or "").strip()
+            engine.event_bus.emit(Event(
+                event_type=TASK_CANCELLED,
+                task_id=task_id,
+                data={
+                    "run_id": latest_run_id,
+                    "reason": "cancel_requested",
+                    "outcome": "cancelled",
+                },
+            ))
+        return {
+            "status": "ok",
+            "message": f"Task {task_id} cancelled.",
+            "task_status": TaskStatus.CANCELLED.value,
+            "stop_requested": bool(stop_requested),
+        }
 
-    return {"status": "ok", "message": f"Task {task_id} cancelled."}
+    current_status = str((task_row or {}).get("status", "") or "").strip().lower()
+    if current_status in ("completed", "failed", "cancelled"):
+        return {
+            "status": "ok",
+            "message": f"Task already {current_status}.",
+            "task_status": current_status,
+            "stop_requested": False,
+        }
+
+    await engine.database.update_task_status(task_id, TaskStatus.CANCELLED.value)
+    latest_run = await engine.database.get_latest_task_run_for_task(task_id)
+    latest_run_id = str((latest_run or {}).get("run_id", "") or "").strip()
+    if latest_run_id:
+        await engine.database.complete_task_run(
+            run_id=latest_run_id,
+            status="cancelled",
+            last_error="cancel_requested",
+        )
+    engine.event_bus.emit(Event(
+        event_type=TASK_CANCEL_REQUESTED,
+        task_id=task_id,
+        data={
+            "requested": True,
+            "path": "api_fallback",
+            "run_id": latest_run_id,
+        },
+    ))
+    engine.event_bus.emit(Event(
+        event_type=TASK_CANCELLED,
+        task_id=task_id,
+        data={
+            "run_id": latest_run_id,
+            "reason": "cancel_requested",
+            "outcome": "cancelled",
+        },
+    ))
+    return {
+        "status": "ok",
+        "message": f"Task {task_id} cancelled.",
+        "task_status": TaskStatus.CANCELLED.value,
+        "stop_requested": False,
+    }
 
 
 @router.post("/tasks/{task_id}/pause")
@@ -3220,7 +3394,8 @@ async def get_conversation_history(request: Request, task_id: str):
     """Retrieve conversation history for a task."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    task_row = await engine.database.get_task(task_id)
+    if task_row is None:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
     entries = await engine.memory_manager.query(
@@ -4606,7 +4781,7 @@ async def delete_run(request: Request, run_id: str):
 
 @router.post("/runs/{run_id}/restart")
 async def restart_run(request: Request, run_id: str):
-    """Re-launch a terminal run with the same goal, workspace, and process."""
+    """Restart a terminal run in place, resuming from saved task state."""
     engine = _get_engine(request)
     task_row = await engine.database.get_task(run_id)
     if task_row is None:
@@ -4617,19 +4792,131 @@ async def restart_run(request: Request, run_id: str):
             status_code=409,
             detail=f"Cannot restart a run with status '{status}'.",
         )
+    metadata = _json_object(task_row.get("metadata"))
+    context = _json_object(task_row.get("context"))
     goal = str(task_row.get("goal", "") or "").strip() or "Untitled run"
-    workspace = str(task_row.get("workspace_path", "") or "").strip() or None
-    process_name = str(task_row.get("process_name", "") or "").strip() or None
-    approval_mode = str(task_row.get("approval_mode", "") or "auto").strip()
-
-    # Delegate to the existing task creation endpoint
-    body = TaskCreateRequest(
-        goal=goal,
-        workspace=workspace,
-        process=process_name,
-        approval_mode=approval_mode,
+    run_workspace = str(task_row.get("workspace_path", "") or "").strip()
+    source_workspace_root = str(metadata.get("source_workspace_root", "") or "").strip()
+    process_name = (
+        str(task_row.get("process_name", "") or "").strip()
+        or str(metadata.get("process", "") or "").strip()
+        or None
     )
-    return await create_new_task(request, body)
+    approval_mode = str(task_row.get("approval_mode", "") or "auto").strip()
+    callback_url = str(task_row.get("callback_url", "") or "").strip() or None
+    previous_run_id = str(metadata.get("run_id", "") or "").strip()
+    next_run_id = f"run-{uuid.uuid4().hex[:12]}"
+    persisted_plan = Plan()
+    raw_plan = task_row.get("plan")
+    if raw_plan:
+        try:
+            plan_data = json.loads(str(raw_plan))
+            if isinstance(plan_data, dict):
+                persisted_plan = _plan_from_json_dict(plan_data)
+        except Exception:
+            logger.warning("Failed to parse persisted plan for restart %s", run_id, exc_info=True)
+
+    if engine.state_manager.exists(run_id):
+        task = engine.state_manager.load(run_id)
+    else:
+        task = Task(
+            id=run_id,
+            goal=goal,
+            status=TaskStatus.PENDING,
+            workspace=run_workspace,
+            plan=persisted_plan,
+            approval_mode=approval_mode,
+            callback_url=callback_url or "",
+            context=context,
+            metadata=metadata,
+            created_at=str(task_row.get("created_at", "") or ""),
+            updated_at=str(task_row.get("updated_at", "") or ""),
+            completed_at=str(task_row.get("completed_at", "") or ""),
+        )
+
+    task.goal = goal
+    task.workspace = run_workspace
+    task.approval_mode = approval_mode
+    task.callback_url = callback_url or ""
+    task.context = context
+    task.metadata = dict(metadata)
+    for key in (
+        "cancel_reason",
+        "paused_from_status",
+        "shutdown_paused",
+        "shutdown_pause_reason",
+        "blocked_subtasks",
+    ):
+        task.metadata.pop(key, None)
+    task.metadata["run_id"] = next_run_id
+    task.metadata["restart_count"] = int(task.metadata.get("restart_count", 0) or 0) + 1
+    task.metadata["restarted_from_run_id"] = previous_run_id
+    task.metadata["last_restarted_at"] = _now_iso()
+
+    task, restart_error = _prepare_task_for_restart_from_failure(task)
+    if task is None:
+        raise HTTPException(status_code=409, detail=restart_error or "Failed to restart run.")
+
+    engine.state_manager.save(task)
+
+    await engine.database.execute(
+        """UPDATE tasks
+           SET goal=?,
+               context=?,
+               workspace_path=?,
+               status=?,
+               plan=?,
+               approval_mode=?,
+               callback_url=?,
+               metadata=?,
+               updated_at=?,
+               completed_at=NULL
+           WHERE id=?""",
+        (
+            task.goal,
+            json.dumps(task.context, ensure_ascii=False) if task.context else None,
+            task.workspace,
+            TaskStatus.PENDING.value,
+            json.dumps(asdict(task.plan), ensure_ascii=False),
+            task.approval_mode,
+            task.callback_url or None,
+            json.dumps(task.metadata, ensure_ascii=False) if task.metadata else None,
+            _now_iso(),
+            task.id,
+        ),
+    )
+
+    process = await engine._resolve_process_definition(
+        process_name=process_name or "",
+        workspace=(
+            Path(source_workspace_root or run_workspace)
+            if (source_workspace_root or run_workspace)
+            else None
+        ),
+    )
+    engine.event_bus.emit(Event(
+        event_type=TASK_RESTARTED,
+        task_id=task.id,
+        data={
+            "run_id": next_run_id,
+            "previous_run_id": previous_run_id,
+            "message": "Run resumed from saved task state.",
+            "recovered": True,
+        },
+    ))
+    await engine.submit_task(
+        task=task,
+        process=process,
+        process_name=process_name or "",
+        run_id=next_run_id,
+        recovered=True,
+    )
+    return TaskCreateResponse(
+        task_id=task.id,
+        status=TaskStatus.PENDING.value,
+        message=f"Restarted run {task.id}.",
+        run_id=next_run_id,
+    )
 
 
 @router.post("/runs/{run_id}/pause")
