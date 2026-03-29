@@ -317,7 +317,7 @@ describe("ThreadsTab", () => {
     expect(screen.getByText("Approval Required")).toBeInTheDocument();
     expect(screen.getAllByText("Will modify notes.md")).toHaveLength(2);
     expect(screen.getByText("Input Requested")).toBeInTheDocument();
-    expect(screen.getAllByText("Which direction should I take?")).toHaveLength(2);
+    expect(screen.getByText("Which direction should I take?")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Option A" })).toBeInTheDocument();
   });
 

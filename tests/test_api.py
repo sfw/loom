@@ -20,7 +20,6 @@ from loom.cowork.session import CoworkTurn, ToolCallEvent
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
-    CONVERSATION_MESSAGE,
     STEER_INSTRUCTION,
     TASK_COMPLETED,
     TASK_CREATED,
@@ -1623,7 +1622,7 @@ class TestWorkspaceFirstEndpoints:
         assert [payload["seq"] for payload in seen_payloads] == [seq2]
 
     @pytest.mark.asyncio
-    async def test_conversation_stream_catches_event_emitted_during_initial_replay(
+    async def test_conversation_stream_subscribes_before_replaying_events(
         self,
         client,
         tmp_path,
@@ -1642,34 +1641,18 @@ class TestWorkspaceFirstEndpoints:
         )
 
         original_get_chat_events = engine.conversation_store.get_chat_events
-        emitted = False
+        original_subscribe_all = engine.event_bus.subscribe_all
+        call_order: list[str] = []
 
-        async def racing_get_chat_events(
+        async def tracking_get_chat_events(
             session_id_arg: str,
             *,
             before_seq: int | None = None,
             after_seq: int | None = None,
             limit: int = 200,
         ):
-            nonlocal emitted
-            if (
-                not emitted
-                and session_id_arg == session_id
-                and (after_seq or 0) == 0
-                and before_seq is None
-            ):
-                emitted = True
-                engine.event_bus.emit(Event(
-                    event_type=CONVERSATION_MESSAGE,
-                    task_id=session_id,
-                    data={
-                        "conversation_id": session_id,
-                        "chat_event_type": "assistant_text",
-                        "seq": 1,
-                        "payload": {"text": "race winner"},
-                    },
-                ))
-                return []
+            if session_id_arg == session_id and before_seq is None and (after_seq or 0) == 0:
+                call_order.append("replay")
             return await original_get_chat_events(
                 session_id_arg,
                 before_seq=before_seq,
@@ -1677,26 +1660,26 @@ class TestWorkspaceFirstEndpoints:
                 limit=limit,
             )
 
+        def tracking_subscribe_all(handler):
+            call_order.append("subscribe")
+            return original_subscribe_all(handler)
+
         monkeypatch.setattr(
             engine.conversation_store,
             "get_chat_events",
-            racing_get_chat_events,
+            tracking_get_chat_events,
         )
+        monkeypatch.setattr(engine.event_bus, "subscribe_all", tracking_subscribe_all)
 
-        async def read_first_payload() -> dict[str, object]:
-            async with client.stream(
-                "GET",
-                f"/conversations/{session_id}/stream",
-            ) as response:
-                async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        return json.loads(line.removeprefix("data: "))
-            raise AssertionError("Expected one streamed payload.")
+        async with client.stream(
+            "GET",
+            f"/conversations/{session_id}/stream?follow=false",
+        ) as response:
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    break
 
-        payload = await asyncio.wait_for(read_first_payload(), timeout=0.5)
-        assert payload["seq"] == 1
-        assert payload["event_type"] == "assistant_text"
-        assert payload["payload"]["text"] == "race winner"
+        assert call_order[:2] == ["subscribe", "replay"]
 
     @pytest.mark.asyncio
     async def test_conversation_messages_support_latest_and_before_turn(
