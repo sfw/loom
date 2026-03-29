@@ -1753,6 +1753,46 @@ class TestWorkspaceFirstEndpoints:
         assert older_rows[-1]["turn_number"] == 150
 
     @pytest.mark.asyncio
+    async def test_conversation_events_after_seq_without_new_rows_returns_empty_page(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-events-incremental-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        await conversation_store.append_turn(
+            session_id,
+            1,
+            "user",
+            "hello",
+        )
+        await conversation_store.append_turn(
+            session_id,
+            2,
+            "assistant",
+            "hi there",
+        )
+        seq = await conversation_store.append_chat_event(
+            session_id,
+            "assistant_text",
+            {"text": "durable reply"},
+        )
+
+        response = await client.get(
+            f"/conversations/{session_id}/events?after_seq={seq}",
+        )
+        assert response.status_code == 200
+        assert response.json() == []
+
+    @pytest.mark.asyncio
     async def test_conversation_events_pagination_stitches_with_stream_cursor(
         self,
         client,

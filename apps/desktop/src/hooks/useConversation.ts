@@ -45,6 +45,8 @@ import { isTransientRequestError } from "../utils";
 export interface ConversationState {
   selectedConversationId: string;
   conversationDetail: ConversationDetail | null;
+  loadingConversationDetail: boolean;
+  conversationLoadError: string;
   conversationMessages: ConversationMessage[];
   conversationEvents: ConversationStreamEvent[];
   conversationStatus: ConversationStatus | null;
@@ -130,6 +132,7 @@ export interface ConversationActions {
   handlePrefillStarterConversation: () => void;
   focusConversationComposer: () => void;
   refreshConversation: (conversationId: string) => Promise<void>;
+  retryConversationLoad: () => Promise<void>;
   loadOlderMessages: () => Promise<void>;
   scrollConversationMatchIntoView: (index: number) => void;
   stepConversationMatch: (delta: number) => void;
@@ -161,6 +164,8 @@ export function useConversation(deps: {
     refreshWorkspaceSurface,
   } = deps;
   const [conversationDetail, setConversationDetail] = useState<ConversationDetail | null>(null);
+  const [loadingConversationDetail, setLoadingConversationDetail] = useState(false);
+  const [conversationLoadError, setConversationLoadError] = useState("");
   const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([]);
   const [conversationEvents, setConversationEvents] = useState<ConversationStreamEvent[]>([]);
   const [optimisticConversationEvents, setOptimisticConversationEvents] = useState<ConversationStreamEvent[]>([]);
@@ -345,6 +350,8 @@ export function useConversation(deps: {
       fetchConversationStatus(conversationId),
     ]);
     setConversationDetail(detail);
+    setConversationLoadError("");
+    setConversationStreamReady(true);
     if (events.length > 0) {
       setConversationEvents((current) => {
         const seen = new Set(current.map((row) => row.seq));
@@ -379,11 +386,31 @@ export function useConversation(deps: {
     }
     setConversationStatus(status);
     // Sync turn pending state from server — clears stale "Processing" indicators
+    setLoadingConversationDetail(false);
     if (!status.processing) {
       setConversationTurnPending(false);
       setConversationStreaming(false);
       setStreamingText(""); setStreamingThinking("");
       setStreamingToolCalls([]);
+    }
+  });
+
+  const retryConversationLoad = useEffectEvent(async () => {
+    if (!selectedConversationId) {
+      return;
+    }
+    setLoadingConversationDetail(true);
+    setConversationLoadError("");
+    try {
+      await refreshConversation(selectedConversationId);
+      if (selectedWorkspaceId) {
+        await refreshWorkspaceSurface(selectedWorkspaceId);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to load conversation.";
+      setConversationLoadError(message);
+      setError(message);
+      setLoadingConversationDetail(false);
     }
   });
 
@@ -468,6 +495,8 @@ export function useConversation(deps: {
   useEffect(() => {
     if (!selectedConversationId) {
       setConversationDetail(null);
+      setLoadingConversationDetail(false);
+      setConversationLoadError("");
       setConversationMessages([]);
       setConversationEvents([]);
       setOptimisticConversationEvents([]);
@@ -484,6 +513,8 @@ export function useConversation(deps: {
       return;
     }
     autoTitledRef.current = false;
+    setLoadingConversationDetail(true);
+    setConversationLoadError("");
     conversationStreamAfterSeqRef.current = 0;
     conversationStreamActivityAtRef.current = 0;
     setConversationStreamReady(false);
@@ -506,6 +537,8 @@ export function useConversation(deps: {
         ]);
         if (!cancelled) {
           setConversationDetail(detail);
+          setLoadingConversationDetail(false);
+          setConversationLoadError("");
           setConversationMessages(messages);
           setConversationEvents(events);
           setOptimisticConversationEvents([]);
@@ -525,13 +558,22 @@ export function useConversation(deps: {
         }
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to load conversation.");
+          const message = err instanceof Error ? err.message : "Failed to load conversation.";
+          setError(message);
+          setLoadingConversationDetail(false);
+          setConversationLoadError(message);
           setConversationDetail(null);
           setConversationMessages([]);
           setConversationEvents([]);
           setOptimisticConversationEvents([]);
           setConversationStatus(null);
           setConversationStreamReady(false);
+          if (
+            selectedWorkspaceId
+            && /404|conversation not found/i.test(message)
+          ) {
+            void refreshWorkspaceSurface(selectedWorkspaceId).catch(() => {});
+          }
         }
       }
     })();
@@ -1174,6 +1216,8 @@ export function useConversation(deps: {
     // State
     selectedConversationId,
     conversationDetail,
+    loadingConversationDetail,
+    conversationLoadError,
     conversationMessages,
     conversationEvents,
     conversationStatus,
@@ -1237,6 +1281,7 @@ export function useConversation(deps: {
     handlePrefillStarterConversation,
     focusConversationComposer,
     refreshConversation,
+    retryConversationLoad,
     loadOlderMessages,
     scrollConversationMatchIntoView,
     stepConversationMatch,

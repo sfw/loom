@@ -45,6 +45,8 @@ describe("ThreadsTab", () => {
         model_name: "kimi-k2.5",
         started_at: "2026-03-27T00:00:00Z",
       },
+      loadingConversationDetail: false,
+      conversationLoadError: "",
       conversationStatus: {
         conversation_id: "conversation-1",
         processing: false,
@@ -107,6 +109,7 @@ describe("ThreadsTab", () => {
       hasOlderMessages: false,
       loadingOlderMessages: false,
       loadOlderMessages: vi.fn(async () => {}),
+      retryConversationLoad: vi.fn(async () => {}),
       setError: vi.fn(),
       setNotice: vi.fn(),
     };
@@ -321,6 +324,24 @@ describe("ThreadsTab", () => {
     expect(screen.getByRole("button", { name: "Option A" })).toBeInTheDocument();
   });
 
+  it("shows a recoverable error state when thread detail fails to load", async () => {
+    const user = userEvent.setup();
+    mockApp.conversationDetail = null;
+    mockApp.loadingConversationDetail = false;
+    mockApp.conversationLoadError = "404 Not Found";
+
+    render(<ThreadsTab />);
+
+    expect(screen.getByText("Couldn't open this thread")).toBeInTheDocument();
+    expect(screen.getByText("404 Not Found")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(mockApp.retryConversationLoad).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "Back to Threads" }));
+    expect(mockApp.setSelectedConversationId).toHaveBeenCalledWith("");
+  });
+
   it("hydrates arrow-key prompt history from persisted thread input history", async () => {
     const user = userEvent.setup();
     mockApp.conversationDetail = {
@@ -343,47 +364,15 @@ describe("ThreadsTab", () => {
     expect(mockApp.setConversationComposerMessage).toHaveBeenCalledWith("third prompt");
   });
 
-  it("backfills older history when the initial page does not overflow the transcript", async () => {
+  it("does not auto-backfill older history when the initial page is short", async () => {
     const loadOlderMessages = vi.fn(async () => {});
     mockApp.hasOlderMessages = true;
     mockApp.loadOlderMessages = loadOlderMessages;
 
-    const clientHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
-    const scrollHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight");
-    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback: FrameRequestCallback) => {
-      callback(0);
-      return 1;
-    });
-    const caf = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+    render(<ThreadsTab />);
 
-    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
-      configurable: true,
-      get: () => 600,
+    await waitFor(() => {
+      expect(loadOlderMessages).not.toHaveBeenCalled();
     });
-    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
-      configurable: true,
-      get: () => 420,
-    });
-
-    try {
-      render(<ThreadsTab />);
-
-      await waitFor(() => {
-        expect(loadOlderMessages).toHaveBeenCalledTimes(1);
-      });
-    } finally {
-      raf.mockRestore();
-      caf.mockRestore();
-      if (clientHeight) {
-        Object.defineProperty(HTMLElement.prototype, "clientHeight", clientHeight);
-      } else {
-        delete (HTMLElement.prototype as any).clientHeight;
-      }
-      if (scrollHeight) {
-        Object.defineProperty(HTMLElement.prototype, "scrollHeight", scrollHeight);
-      } else {
-        delete (HTMLElement.prototype as any).scrollHeight;
-      }
-    }
   });
 });

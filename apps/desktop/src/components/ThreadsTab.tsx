@@ -270,6 +270,8 @@ export default function ThreadsTab() {
   const {
     selectedConversationId,
     conversationDetail,
+    loadingConversationDetail,
+    conversationLoadError,
     conversationStatus,
     conversationStreaming,
     conversationIsProcessing,
@@ -311,6 +313,7 @@ export default function ThreadsTab() {
     hasOlderMessages,
     loadingOlderMessages,
     loadOlderMessages,
+    retryConversationLoad,
     setError,
     setNotice,
   } = useApp();
@@ -441,20 +444,6 @@ export default function ThreadsTab() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messageCount, streamingLen, streamingToolCalls.length, timelineItems.length]);
 
-  // If the latest loaded page doesn't overflow yet, keep backfilling older
-  // history so the user can immediately scroll through older threads.
-  useEffect(() => {
-    if (!hasOlderMessages || loadingOlderMessages) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const rafId = window.requestAnimationFrame(() => {
-      if (el.scrollHeight <= el.clientHeight + 24) {
-        void loadOlderMessages();
-      }
-    });
-    return () => window.cancelAnimationFrame(rafId);
-  }, [hasOlderMessages, loadingOlderMessages, loadOlderMessages, timelineItems.length]);
-
   // Force pin + clear injected messages on conversation switch
   useEffect(() => {
     isPinnedRef.current = true;
@@ -582,6 +571,46 @@ export default function ThreadsTab() {
           <p className="text-xs mt-2 text-zinc-600 leading-relaxed">
             Start a new thread from the sidebar to begin working in this workspace.
           </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (loadingConversationDetail) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-zinc-500 select-none">
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-8 py-10 text-center max-w-sm">
+          <Loader2 size={18} className="mx-auto mb-3 animate-spin text-[#a3b396]" />
+          <p className="text-sm font-medium text-zinc-300">Opening thread...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!conversationDetail && conversationLoadError) {
+    return (
+      <div className="flex h-full items-center justify-center px-6">
+        <div className="w-full max-w-md rounded-2xl border border-red-500/20 bg-zinc-900/40 px-6 py-6 text-center">
+          <p className="text-sm font-semibold text-zinc-100">Couldn&apos;t open this thread</p>
+          <p className="mt-2 text-sm leading-relaxed text-zinc-400">
+            {conversationLoadError}
+          </p>
+          <div className="mt-5 flex items-center justify-center gap-2">
+            <button
+              type="button"
+              onClick={() => void retryConversationLoad()}
+              className="rounded-lg bg-[#6b7a5e] px-3 py-2 text-xs font-medium text-white hover:bg-[#8a9a7b] transition-colors"
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedConversationId("")}
+              className="rounded-lg border border-zinc-700 px-3 py-2 text-xs font-medium text-zinc-300 hover:bg-zinc-800 transition-colors"
+            >
+              Back to Threads
+            </button>
+          </div>
         </div>
       </div>
     );

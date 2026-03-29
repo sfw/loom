@@ -4173,6 +4173,11 @@ async def get_conversation_events(
     )
     if rows:
         return rows
+    if after_seq > 0 and before_seq is None:
+        # Incremental polling/refresh should return only truly new rows.
+        # Falling back to synthesized turn events here duplicates content
+        # that the client may already have from durable chat-event rows.
+        return []
     if before_seq is not None:
         before_turn = max(1, int((int(before_seq) + 99) / 100))
         return await engine.conversation_store.synthesize_chat_events_from_turns(

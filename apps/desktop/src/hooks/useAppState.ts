@@ -115,6 +115,8 @@ export interface AppState {
 
   // Conversation detail
   conversationDetail: ConversationDetail | null;
+  loadingConversationDetail: boolean;
+  conversationLoadError: string;
   conversationMessages: ConversationMessage[];
   conversationEvents: ConversationStreamEvent[];
   conversationStatus: ConversationStatus | null;
@@ -395,6 +397,7 @@ export interface AppActions {
   refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
   refreshApprovalInbox: (workspaceId: string) => Promise<void>;
   refreshConversation: (conversationId: string) => Promise<void>;
+  retryConversationLoad: () => Promise<void>;
   loadOlderMessages: () => Promise<void>;
   hasOlderMessages: boolean;
   loadingOlderMessages: boolean;
@@ -674,6 +677,8 @@ export function useAppState(): AppState & AppActions {
 
     // Conversation
     conversationDetail: conversation.conversationDetail,
+    loadingConversationDetail: conversation.loadingConversationDetail,
+    conversationLoadError: conversation.conversationLoadError,
     conversationMessages: conversation.conversationMessages,
     conversationEvents: conversation.conversationEvents,
     conversationStatus: conversation.conversationStatus,
@@ -728,6 +733,7 @@ export function useAppState(): AppState & AppActions {
     handlePrefillStarterConversation: conversation.handlePrefillStarterConversation,
     focusConversationComposer: conversation.focusConversationComposer,
     refreshConversation: conversation.refreshConversation,
+    retryConversationLoad: conversation.retryConversationLoad,
     loadOlderMessages: conversation.loadOlderMessages,
     hasOlderMessages: conversation.hasOlderMessages,
     loadingOlderMessages: conversation.loadingOlderMessages,
