@@ -23,14 +23,14 @@ export interface DesktopActivityState {
 
 export function useDesktopActivity(deps: {
   connectionState: "connecting" | "connected" | "failed";
-  conversationIsProcessing: boolean;
+  conversationTurnPending: boolean;
   conversationStreaming: boolean;
   streamingToolCalls: Array<{ completed: boolean }>;
   runStreaming: boolean;
 }): DesktopActivityState {
   const {
     connectionState,
-    conversationIsProcessing,
+    conversationTurnPending,
     conversationStreaming,
     streamingToolCalls,
     runStreaming,
@@ -40,7 +40,7 @@ export function useDesktopActivity(deps: {
   const [backendConnected, setBackendConnected] = useState(false);
 
   const localConversationActive = Boolean(
-    conversationIsProcessing
+    conversationTurnPending
     || conversationStreaming
     || streamingToolCalls.some((toolCall) => !toolCall.completed),
   );

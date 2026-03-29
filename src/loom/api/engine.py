@@ -561,14 +561,23 @@ class Engine:
         """Return a global snapshot of active desktop-visible backend work."""
         active_conversation_count = sum(
             1
-            for worker in self._conversation_workers.values()
+            for session_id, worker in self._conversation_workers.items()
             if not worker.task.done()
+            and self.get_pending_conversation_approval(session_id) is None
         )
-        active_run_count = sum(
-            1
-            for worker in self._task_workers.values()
-            if not worker.task.done()
-        )
+        active_run_count = 0
+        for task_id, worker in self._task_workers.items():
+            if worker.task.done():
+                continue
+            if self.state_manager.exists(task_id):
+                task = self.state_manager.load(task_id)
+                if task.status not in {
+                    TaskStatus.PENDING,
+                    TaskStatus.PLANNING,
+                    TaskStatus.EXECUTING,
+                }:
+                    continue
+            active_run_count += 1
         return {
             "status": "ok",
             "active": bool(active_conversation_count or active_run_count),

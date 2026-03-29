@@ -485,7 +485,7 @@ export function useAppState(): AppState & AppActions {
 
   const desktopActivity = useDesktopActivity({
     connectionState: connection.connectionState,
-    conversationIsProcessing: conversation.conversationIsProcessing,
+    conversationTurnPending: conversation.conversationTurnPending,
     conversationStreaming: conversation.conversationStreaming,
     streamingToolCalls: conversation.streamingToolCalls,
     runStreaming: runs.runStreaming,

@@ -32,7 +32,7 @@ describe("useDesktopActivity", () => {
     const { result } = renderHook(() =>
       useDesktopActivity({
         connectionState: "connected",
-        conversationIsProcessing: true,
+        conversationTurnPending: true,
         conversationStreaming: false,
         streamingToolCalls: [],
         runStreaming: false,
@@ -62,7 +62,7 @@ describe("useDesktopActivity", () => {
     const { result } = renderHook(() =>
       useDesktopActivity({
         connectionState: "connected",
-        conversationIsProcessing: false,
+        conversationTurnPending: false,
         conversationStreaming: false,
         streamingToolCalls: [],
         runStreaming: false,

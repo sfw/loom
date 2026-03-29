@@ -668,6 +668,36 @@ class TestSystemEndpoints:
         assert payload["active_run_count"] == 0
 
     @pytest.mark.asyncio
+    async def test_activity_summary_ignores_paused_run_workers(
+        self,
+        client,
+        engine,
+        state_manager,
+    ):
+        paused_task = _make_task(
+            state_manager,
+            task_id="task-activity-paused",
+            goal="Paused task",
+            status=TaskStatus.PAUSED,
+        )
+        pause_gate = asyncio.Event()
+        run_task = engine.start_task_worker(
+            task_id=paused_task.id,
+            run_id="run-activity-paused",
+            worker=pause_gate.wait(),
+        )
+
+        try:
+            response = await client.get("/activity")
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["active"] is False
+            assert payload["active_run_count"] == 0
+        finally:
+            pause_gate.set()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
     async def test_models(self, client):
         response = await client.get("/models")
         assert response.status_code == 200
