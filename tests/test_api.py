@@ -20,6 +20,7 @@ from loom.cowork.session import CoworkTurn, ToolCallEvent
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
+    CONVERSATION_MESSAGE,
     STEER_INSTRUCTION,
     TASK_COMPLETED,
     TASK_CREATED,
@@ -606,6 +607,66 @@ class TestSystemEndpoints:
         assert data["ready"] is True
         assert data["runtime_role"] == "api"
         assert "database_path" in data
+
+    @pytest.mark.asyncio
+    async def test_activity_summary_reports_global_backend_work(
+        self,
+        client,
+        engine,
+        conversation_store,
+        database,
+        tmp_path,
+    ):
+        workspace_path = tmp_path / "activity-ws"
+        workspace_path.mkdir()
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="activity-model",
+        )
+        await database.insert_task(
+            task_id="task-activity-1",
+            goal="Track global activity",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+
+        conversation_gate = asyncio.Event()
+        run_gate = asyncio.Event()
+
+        class FakeConversationSession:
+            stop_requested = False
+
+        conversation_task = engine.start_conversation_worker(
+            session_id,
+            FakeConversationSession(),
+            conversation_gate.wait(),
+        )
+        run_task = engine.start_task_worker(
+            task_id="task-activity-1",
+            run_id="run-activity-1",
+            worker=run_gate.wait(),
+        )
+
+        try:
+            response = await client.get("/activity")
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["status"] == "ok"
+            assert payload["active"] is True
+            assert payload["active_conversation_count"] == 1
+            assert payload["active_run_count"] == 1
+            assert payload["updated_at"]
+        finally:
+            conversation_gate.set()
+            run_gate.set()
+            await asyncio.gather(conversation_task, run_task, return_exceptions=True)
+
+        response = await client.get("/activity")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["active"] is False
+        assert payload["active_conversation_count"] == 0
+        assert payload["active_run_count"] == 0
 
     @pytest.mark.asyncio
     async def test_models(self, client):
@@ -1560,6 +1621,82 @@ class TestWorkspaceFirstEndpoints:
                 seen_payloads.append(json.loads(line.removeprefix("data: ")))
 
         assert [payload["seq"] for payload in seen_payloads] == [seq2]
+
+    @pytest.mark.asyncio
+    async def test_conversation_stream_catches_event_emitted_during_initial_replay(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "chat-stream-race-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        original_get_chat_events = engine.conversation_store.get_chat_events
+        emitted = False
+
+        async def racing_get_chat_events(
+            session_id_arg: str,
+            *,
+            before_seq: int | None = None,
+            after_seq: int | None = None,
+            limit: int = 200,
+        ):
+            nonlocal emitted
+            if (
+                not emitted
+                and session_id_arg == session_id
+                and (after_seq or 0) == 0
+                and before_seq is None
+            ):
+                emitted = True
+                engine.event_bus.emit(Event(
+                    event_type=CONVERSATION_MESSAGE,
+                    task_id=session_id,
+                    data={
+                        "conversation_id": session_id,
+                        "chat_event_type": "assistant_text",
+                        "seq": 1,
+                        "payload": {"text": "race winner"},
+                    },
+                ))
+                return []
+            return await original_get_chat_events(
+                session_id_arg,
+                before_seq=before_seq,
+                after_seq=after_seq,
+                limit=limit,
+            )
+
+        monkeypatch.setattr(
+            engine.conversation_store,
+            "get_chat_events",
+            racing_get_chat_events,
+        )
+
+        async def read_first_payload() -> dict[str, object]:
+            async with client.stream(
+                "GET",
+                f"/conversations/{session_id}/stream",
+            ) as response:
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        return json.loads(line.removeprefix("data: "))
+            raise AssertionError("Expected one streamed payload.")
+
+        payload = await asyncio.wait_for(read_first_payload(), timeout=0.5)
+        assert payload["seq"] == 1
+        assert payload["event_type"] == "assistant_text"
+        assert payload["payload"]["text"] == "race winner"
 
     @pytest.mark.asyncio
     async def test_conversation_messages_support_latest_and_before_turn(

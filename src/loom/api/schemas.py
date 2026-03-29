@@ -253,6 +253,14 @@ class RuntimeStatusResponse(BaseModel):
     workspace_default_path: str = ""
 
 
+class ActivitySummaryResponse(BaseModel):
+    status: str
+    active: bool
+    active_conversation_count: int = 0
+    active_run_count: int = 0
+    updated_at: str = ""
+
+
 class WorkspaceSummaryResponse(BaseModel):
     id: str
     canonical_path: str

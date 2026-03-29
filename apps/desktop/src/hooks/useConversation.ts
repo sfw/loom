@@ -379,9 +379,9 @@ export function useConversation(deps: {
     }
     setConversationStatus(status);
     // Sync turn pending state from server — clears stale "Processing" indicators
-    setConversationStreaming(Boolean(status.processing));
     if (!status.processing) {
       setConversationTurnPending(false);
+      setConversationStreaming(false);
       setStreamingText(""); setStreamingThinking("");
       setStreamingToolCalls([]);
     }
@@ -429,15 +429,18 @@ export function useConversation(deps: {
     }
   }
 
-  const scheduleConversationRefresh = useEffectEvent(() => {
+  const scheduleConversationRefresh = useEffectEvent((options?: { includeWorkspaceSurface?: boolean }) => {
     if (conversationRefreshTimerRef.current !== null || !selectedConversationId) {
       return;
     }
     conversationRefreshTimerRef.current = window.setTimeout(() => {
       conversationRefreshTimerRef.current = null;
+      const includeWorkspaceSurface = Boolean(options?.includeWorkspaceSurface);
       void Promise.all([
         refreshConversation(selectedConversationId),
-        selectedWorkspaceId ? refreshWorkspaceSurface(selectedWorkspaceId) : Promise.resolve(),
+        includeWorkspaceSurface && selectedWorkspaceId
+          ? refreshWorkspaceSurface(selectedWorkspaceId)
+          : Promise.resolve(),
       ]).catch((err) => {
         if (!isTransientRequestError(err)) {
           setError(err instanceof Error ? err.message : "Failed to refresh conversation.");
@@ -518,7 +521,7 @@ export function useConversation(deps: {
           setHasOlderMessages(hasOlderTurns || hasOlderEvents);
           const isActive = status.processing && !status.awaiting_user_input && !status.awaiting_approval;
           setConversationTurnPending(isActive);
-          setConversationStreaming(isActive);
+          setConversationStreaming(false);
         }
       } catch (err) {
         if (!cancelled) {
@@ -558,7 +561,6 @@ export function useConversation(deps: {
       selectedConversationId,
       (event) => {
         conversationStreamActivityAtRef.current = Date.now();
-        setConversationStreaming(event.event_type !== "turn_separator" && event.event_type !== "turn_interrupted");
 
         const isNewEvent = event.seq > maxSeenSeq;
         maxSeenSeq = Math.max(maxSeenSeq, event.seq);
@@ -658,6 +660,7 @@ export function useConversation(deps: {
             }
             return current.filter((m) => m !== nextMsg && m.type !== "next");
           });
+          scheduleConversationRefresh({ includeWorkspaceSurface: true });
         }
         if (event.event_type === "turn_interrupted") {
           setConversationStreaming(false);
@@ -665,9 +668,11 @@ export function useConversation(deps: {
           setStreamingToolCalls([]);
           setLastTurnStats(null);
           setQueuedMessages([]);
+          scheduleConversationRefresh({ includeWorkspaceSurface: true });
         }
         if (event.event_type === "user_message") {
           // Clear streaming buffer for new turn — but preserve queued injects
+          setConversationStreaming(false);
           setStreamingText(""); setStreamingThinking("");
           setStreamingToolCalls([]);
           setLastTurnStats(null);
@@ -737,6 +742,7 @@ export function useConversation(deps: {
         if (event.event_type === "approval_requested") {
           const pendingApproval = event.payload as unknown as ConversationApproval;
           setConversationTurnPending(false);
+          setConversationStreaming(false);
           setConversationStatus((current) => ({
             conversation_id: current?.conversation_id || selectedConversationId,
             processing: true,
@@ -764,6 +770,7 @@ export function useConversation(deps: {
           const pendingPrompt = normalizeConversationPrompt(event.payload.question_payload);
           if (pendingPrompt) {
             setConversationTurnPending(false);
+            setConversationStreaming(false);
             setConversationStatus((current) => ({
               conversation_id: current?.conversation_id || selectedConversationId,
               processing: false,
@@ -788,7 +795,6 @@ export function useConversation(deps: {
             pending_prompt: null,
           }));
         }
-        scheduleConversationRefresh();
       },
       () => {
         // SSE errors are transient — EventSource auto-reconnects.

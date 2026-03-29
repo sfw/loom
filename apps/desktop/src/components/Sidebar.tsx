@@ -3,6 +3,7 @@ import { useApp } from "@/context/AppContext";
 import { createConversation, patchConversation } from "@/api";
 import { cn } from "@/lib/utils";
 import { formatDate, workspaceTagsFromMetadata, type ViewTab } from "@/utils";
+import ActivityBar from "./ActivityBar";
 import {
   LayoutDashboard,
   MessageSquare,
@@ -118,6 +119,7 @@ export default function Sidebar() {
     conversationDetail,
     conversationIsProcessing,
     models,
+    desktopActivity,
     refreshWorkspaceSurface,
     refreshConversation,
     handleArchiveWorkspace,
@@ -321,11 +323,20 @@ export default function Sidebar() {
   return (
     <aside className="flex h-full flex-col bg-[#0f0f12] border-r border-zinc-800/60">
       {/* Brand */}
-      <div className="flex items-center gap-2.5 px-4 pt-4 pb-2">
-        <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#6b7a5e]">
-          <span className="text-xs font-bold text-white leading-none">L</span>
+      <div className="flex items-center justify-between gap-3 px-4 pt-4 pb-2">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#6b7a5e] shadow-[0_0_20px_rgba(138,154,123,0.16)]">
+            <span className="text-xs font-bold text-white leading-none">L</span>
+          </div>
+          <span className="truncate text-[15px] font-semibold tracking-tight text-zinc-100">Loom</span>
         </div>
-        <span className="text-[15px] font-semibold tracking-tight text-zinc-100">Loom</span>
+        <div className="shrink-0">
+          <ActivityBar
+            active={desktopActivity.active}
+            mode={desktopActivity.mode}
+            label={desktopActivity.label}
+          />
+        </div>
       </div>
 
       {/* Divider */}

@@ -212,8 +212,13 @@ describe("ThreadsTab", () => {
     expect(screen.getByText("hello")).toBeInTheDocument();
     expect(screen.getByText("hi there")).toBeInTheDocument();
     expect(screen.getByText("ripgrep_search")).toBeInTheDocument();
-    expect(screen.getByText("2 matches")).toBeInTheDocument();
+    expect(screen.queryByText("2 matches")).not.toBeInTheDocument();
     expect(screen.getByText("25 tokens")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /ripgrep_search/i }));
+    expect(screen.getByText("Tool Call Spec")).toBeInTheDocument();
+    expect(screen.getByText(/"pattern": "TODO"/)).toBeInTheDocument();
+    expect(screen.queryByText("2 matches")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /Reasoning/i }));
 

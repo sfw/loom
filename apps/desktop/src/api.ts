@@ -12,6 +12,14 @@ export interface RuntimeStatus {
   workspace_default_path: string;
 }
 
+export interface ActivitySummary {
+  status: string;
+  active: boolean;
+  active_conversation_count: number;
+  active_run_count: number;
+  updated_at: string;
+}
+
 export interface ModelInfo {
   name: string;
   model: string;
@@ -540,6 +548,10 @@ export async function bootstrapDesktopRuntime(): Promise<boolean> {
 
 export function fetchRuntimeStatus(): Promise<RuntimeStatus> {
   return requestJson<RuntimeStatus>("/runtime");
+}
+
+export function fetchActivitySummary(): Promise<ActivitySummary> {
+  return requestJson<ActivitySummary>("/activity");
 }
 
 export function fetchModels(): Promise<ModelInfo[]> {

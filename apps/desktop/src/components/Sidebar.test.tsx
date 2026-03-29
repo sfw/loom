@@ -95,6 +95,16 @@ describe("Sidebar", () => {
         linked_run_ids: [],
       },
       conversationIsProcessing: true,
+      desktopActivity: {
+        active: false,
+        mode: "idle",
+        activeConversationCount: 0,
+        activeRunCount: 0,
+        sourceCount: 0,
+        label: "Idle",
+        updatedAt: "",
+        backendConnected: false,
+      },
       models: [],
       refreshWorkspaceSurface: vi.fn(async () => {}),
       refreshConversation: vi.fn(async () => {}),
@@ -173,6 +183,26 @@ describe("Sidebar", () => {
     expect(activeDot).not.toBeNull();
     expect(activeDot).toHaveClass("fill-sky-400", "text-sky-400");
     expect(container.querySelector(".fill-emerald-400.text-emerald-400")).toBeNull();
+  });
+
+  it("renders the brand activity bar from shared desktop activity state", () => {
+    mockApp.desktopActivity = {
+      active: true,
+      mode: "mixed",
+      activeConversationCount: 1,
+      activeRunCount: 1,
+      sourceCount: 2,
+      label: "1 active thread · 1 active run",
+      updatedAt: "2026-03-29T12:00:00Z",
+      backendConnected: true,
+    };
+
+    render(<Sidebar />);
+
+    const activityBar = screen.getByTestId("desktop-activity-bar");
+    expect(activityBar).toHaveAttribute("data-active", "true");
+    expect(activityBar).toHaveAttribute("data-mode", "mixed");
+    expect(activityBar).toHaveAttribute("title", "1 active thread · 1 active run");
   });
 
   it("updates workspace chevrons when the selected workspace changes", () => {

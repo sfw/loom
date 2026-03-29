@@ -35,6 +35,7 @@ import { useFiles } from "./useFiles";
 import { useInbox } from "./useInbox";
 import { useCommandPalette } from "./useCommandPalette";
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
+import { useDesktopActivity, type DesktopActivityState } from "./useDesktopActivity";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -48,6 +49,7 @@ export interface AppState {
   settings: SettingsPayload | null;
   runtimeManaged: boolean;
   connectionState: "connecting" | "connected" | "failed";
+  desktopActivity: DesktopActivityState;
 
   // Workspace selection
   selectedWorkspaceId: string;
@@ -481,6 +483,14 @@ export function useAppState(): AppState & AppActions {
     refreshWorkspaceSurface: workspace.refreshWorkspaceSurface,
   });
 
+  const desktopActivity = useDesktopActivity({
+    connectionState: connection.connectionState,
+    conversationIsProcessing: conversation.conversationIsProcessing,
+    conversationStreaming: conversation.conversationStreaming,
+    streamingToolCalls: conversation.streamingToolCalls,
+    runStreaming: runs.runStreaming,
+  });
+
   // -----------------------------------------------------------------------
   // 5. Files (file tree, preview, editor, import)
   // -----------------------------------------------------------------------
@@ -593,6 +603,7 @@ export function useAppState(): AppState & AppActions {
     settings: connection.settings,
     runtimeManaged: connection.runtimeManaged,
     connectionState: connection.connectionState,
+    desktopActivity,
     settingsPreview: connection.settingsPreview,
     retryConnection: connection.retryConnection,
 

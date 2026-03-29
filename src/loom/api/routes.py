@@ -27,6 +27,7 @@ from loom.api.engine import (
     TelemetryPersistDisabledError,
 )
 from loom.api.schemas import (
+    ActivitySummaryResponse,
     ApprovalFeedItemResponse,
     ApprovalReplyRequest,
     ApprovalRequest,
@@ -3522,6 +3523,13 @@ async def get_runtime_status(request: Request):
     return RuntimeStatusResponse(**engine.runtime_status_snapshot())
 
 
+@router.get("/activity", response_model=ActivitySummaryResponse)
+async def get_activity_summary(request: Request):
+    """Return a global snapshot of active desktop-visible backend work."""
+    engine = _get_engine(request)
+    return ActivitySummaryResponse(**(await engine.activity_summary_snapshot()))
+
+
 @router.get("/workspaces", response_model=list[WorkspaceSummaryResponse])
 async def list_workspaces(request: Request, include_archived: bool = False):
     """List registered workspaces with lightweight overview counts."""
@@ -4366,24 +4374,6 @@ async def stream_conversation_events(
         last_event_id = str(request.headers.get("last-event-id", "") or "").strip()
         header_cursor = int(last_event_id) if last_event_id.isdigit() else 0
         cursor = max(0, int(after_seq), header_cursor)
-
-        # First, replay any events after the cursor from the database
-        rows = await engine.conversation_store.get_chat_events(
-            conversation_id,
-            after_seq=cursor,
-            limit=500,
-        )
-        for row in rows:
-            cursor = max(cursor, int(row.get("seq", 0) or 0))
-            yield {
-                "event": "chat_event",
-                "id": str(int(row.get("seq", 0) or 0)),
-                "data": json.dumps(row),
-            }
-        if not follow:
-            return
-
-        # Then subscribe to the event bus for instant delivery of new events
         queue: asyncio.Queue[Event] = asyncio.Queue()
 
         def handler(event: Event):
@@ -4396,6 +4386,24 @@ async def stream_conversation_events(
         engine.event_bus.subscribe_all(handler)
 
         try:
+            yield {"comment": "open"}
+            # Subscribe first, then replay durable rows so we don't miss
+            # events emitted between the initial query and subscription setup.
+            rows = await engine.conversation_store.get_chat_events(
+                conversation_id,
+                after_seq=cursor,
+                limit=500,
+            )
+            for row in rows:
+                cursor = max(cursor, int(row.get("seq", 0) or 0))
+                yield {
+                    "event": "chat_event",
+                    "id": str(int(row.get("seq", 0) or 0)),
+                    "data": json.dumps(row),
+                }
+            if not follow:
+                return
+
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=30.0)

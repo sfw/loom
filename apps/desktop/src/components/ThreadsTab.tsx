@@ -1263,42 +1263,49 @@ function ToolEventCard({
   completedPayload?: Record<string, unknown>;
   createdAt: string;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const toolName = String(
     completedPayload?.tool_name || startedPayload?.tool_name || "tool",
   );
+  const toolCallId = String(
+    completedPayload?.tool_call_id || startedPayload?.tool_call_id || "",
+  );
   const completed = Boolean(completedPayload);
   const success = completedPayload?.success !== false;
-  const argsPreview = (() => {
+  const argsPayload = (() => {
     const rawArgs = startedPayload?.args || completedPayload?.args;
-    if (!rawArgs || typeof rawArgs !== "object") return "";
-    return Object.entries(rawArgs as Record<string, unknown>)
-      .slice(0, 3)
-      .map(([key, value]) => `${key}: ${typeof value === "string" ? value.slice(0, 80) : JSON.stringify(value).slice(0, 60)}`)
-      .join(", ");
+    return rawArgs && typeof rawArgs === "object"
+      ? rawArgs as Record<string, unknown>
+      : null;
   })();
-  const questionPayload = completedPayload?.question_payload;
-  const question =
-    questionPayload
-    && typeof questionPayload === "object"
-    && typeof (questionPayload as { question?: unknown }).question === "string"
-      ? String((questionPayload as { question: string }).question)
-      : "";
-  const outputPreview = question
-    || String(completedPayload?.output || completedPayload?.error || "").slice(0, 220);
   const elapsedMs = Number(completedPayload?.elapsed_ms || 0);
+  const argCount = argsPayload ? Object.keys(argsPayload).length : 0;
+  const statusLabel = !completed ? "Running" : success ? "Done" : "Failed";
+  const statusClass = !completed
+    ? "bg-[#8a9a7b]/15 text-[#bec8b4]"
+    : success
+      ? "bg-emerald-500/15 text-emerald-300"
+      : "bg-red-500/15 text-red-300";
 
   return (
-    <div
-      className={cn(
-        "mx-8 rounded-lg border px-3 py-2 text-xs",
-        completed
-          ? success
-            ? "border-emerald-500/20 bg-emerald-500/5"
-            : "border-red-500/20 bg-red-500/5"
-          : "border-[#8a9a7b]/20 bg-[#8a9a7b]/5",
-      )}
-    >
-      <div className="flex items-center gap-2">
+    <div className="mx-8">
+      <button
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+        className={cn(
+          "flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-left text-xs transition-colors",
+          completed
+            ? success
+              ? "border-emerald-500/20 bg-emerald-500/5 hover:bg-emerald-500/10"
+              : "border-red-500/20 bg-red-500/5 hover:bg-red-500/10"
+            : "border-[#8a9a7b]/20 bg-[#8a9a7b]/5 hover:bg-[#8a9a7b]/10",
+          expanded && "rounded-b-none",
+        )}
+      >
+        <ChevronDown
+          size={12}
+          className={cn("shrink-0 text-zinc-600 transition-transform", expanded && "rotate-180")}
+        />
         {!completed ? (
           <Loader2 size={12} className="text-[#a3b396] animate-spin shrink-0" />
         ) : success ? (
@@ -1314,31 +1321,52 @@ function ToolEventCard({
         >
           {toolName}
         </span>
-        {completed && elapsedMs > 0 && (
-          <span className="text-zinc-600 ml-auto tabular-nums">{elapsedMs}ms</span>
+        <span className={cn("rounded-full px-1.5 py-px text-[9px] font-medium", statusClass)}>
+          {statusLabel}
+        </span>
+        {argCount > 0 && (
+          <span className="text-[10px] text-zinc-600">
+            {argCount} arg{argCount === 1 ? "" : "s"}
+          </span>
         )}
-        {!completed && (
-          <span className="text-zinc-600 ml-auto">running...</span>
+        {toolCallId && (
+          <span className="hidden text-[10px] text-zinc-600 md:inline">
+            {toolCallId}
+          </span>
         )}
-      </div>
-      {argsPreview && !completed && (
-        <p className="mt-1 text-zinc-500 font-mono truncate pl-5">
-          {argsPreview}
-        </p>
-      )}
-      {outputPreview && completed && (
-        <p
+        <span className="ml-auto text-[10px] text-zinc-600">
+          {completed && elapsedMs > 0 ? `${elapsedMs}ms` : formatDate(createdAt)}
+        </span>
+      </button>
+      {expanded && (
+        <div
           className={cn(
-            "mt-1 pl-5 whitespace-pre-wrap break-words",
-            success ? "text-zinc-500" : "text-red-400/70",
+            "rounded-b-lg border border-t-0 px-4 py-3",
+            completed
+              ? success
+                ? "border-emerald-500/20 bg-zinc-950/60"
+                : "border-red-500/20 bg-zinc-950/60"
+              : "border-[#8a9a7b]/20 bg-zinc-950/60",
           )}
         >
-          {outputPreview}
-        </p>
+          {toolCallId && (
+            <div className="mb-3">
+              <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
+                Call ID
+              </p>
+              <code className="text-[11px] text-zinc-400">{toolCallId}</code>
+            </div>
+          )}
+          <div>
+            <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
+              Tool Call Spec
+            </p>
+            <pre className="text-[11px] text-zinc-400 whitespace-pre-wrap break-words font-mono leading-relaxed">
+              {argsPayload ? JSON.stringify(argsPayload, null, 2) : "{}"}
+            </pre>
+          </div>
+        </div>
       )}
-      <div className="mt-1 pl-5 text-[10px] text-zinc-600">
-        {formatDate(createdAt)}
-      </div>
     </div>
   );
 }

@@ -557,6 +557,26 @@ class Engine:
             "workspace_default_path": str(self.config.workspace.default_path),
         }
 
+    async def activity_summary_snapshot(self) -> dict[str, object]:
+        """Return a global snapshot of active desktop-visible backend work."""
+        active_conversation_count = sum(
+            1
+            for worker in self._conversation_workers.values()
+            if not worker.task.done()
+        )
+        active_run_count = sum(
+            1
+            for worker in self._task_workers.values()
+            if not worker.task.done()
+        )
+        return {
+            "status": "ok",
+            "active": bool(active_conversation_count or active_run_count),
+            "active_conversation_count": active_conversation_count,
+            "active_run_count": active_run_count,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+
     def _emit_telemetry_settings_warning(
         self,
         *,
