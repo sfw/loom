@@ -118,6 +118,7 @@ from loom.events.types import (
 from loom.events.verbosity import should_deliver_operator
 from loom.processes.run_workspace import provision_scoped_run_workspace
 from loom.processes.schema import ProcessLoader
+from loom.read_scope import build_attached_read_scope
 from loom.state.memory import MemoryEntry
 from loom.state.task_state import Plan, Subtask, SubtaskStatus, Task, TaskStatus
 from loom.state.workspaces import canonicalize_workspace_path
@@ -2698,6 +2699,14 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         metadata["source_workspace_root"] = requested_workspace
         metadata["run_workspace_relative"] = relative_folder
         metadata["run_workspace_mode"] = "scoped_subfolder"
+        attached_read_roots, attached_read_path_map = build_attached_read_scope(
+            requested_workspace,
+            body.context if isinstance(body.context, dict) else {},
+        )
+        if attached_read_roots:
+            metadata["read_roots"] = attached_read_roots
+        if attached_read_path_map:
+            metadata["attached_read_path_map"] = attached_read_path_map
 
     # API-created tasks always run on the API surface. Do not permit callers
     # to elevate to interactive-only surfaces (for example, tui).

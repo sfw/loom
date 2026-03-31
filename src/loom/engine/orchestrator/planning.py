@@ -25,6 +25,10 @@ from loom.models.request_diagnostics import (
 )
 from loom.models.retry import ModelRetryPolicy, call_with_model_retry
 from loom.processes.phase_alignment import infer_phase_id_for_subtask
+from loom.read_scope import (
+    resolve_read_path_map_from_metadata,
+    resolve_read_roots_from_metadata,
+)
 from loom.state.task_state import Plan, Subtask, SubtaskStatus, Task
 from loom.utils.concurrency import run_blocking_io
 
@@ -99,6 +103,7 @@ async def plan_task(
     code_analysis = ""
     workspace_analysis = ""
     read_roots = orchestrator._read_roots_for_task(task)
+    read_path_map = orchestrator._read_path_map_for_task(task)
     auth_context = None
     try:
         metadata = task.metadata if isinstance(task.metadata, dict) else {}
@@ -120,11 +125,13 @@ async def plan_task(
                     {},
                     workspace=workspace_path,
                     read_roots=read_roots,
+                    read_path_map=read_path_map,
                     auth_context=auth_context,
                 )
 
             async def _do_analysis():
-                analysis_path = read_roots[0] if read_roots else workspace_path
+                analysis_candidates = [path for path in read_roots if path.is_dir()]
+                analysis_path = analysis_candidates[0] if analysis_candidates else workspace_path
                 if orchestrator._process and orchestrator._process.workspace_scan:
                     result = await orchestrator._analyze_workspace_for_process(
                         analysis_path,
@@ -1113,7 +1120,8 @@ async def _attempt_stalled_recovery(
 def _read_roots_for_task(task: Task) -> list[Path]:
     """Resolve additional read roots from task metadata.
 
-    Only parent roots of the task workspace are accepted.
+    Accept workspace ancestors and explicitly attached sibling directories scoped
+    under the source workspace root.
     """
     workspace_text = str(task.workspace or "").strip()
     if not workspace_text:
@@ -1122,32 +1130,21 @@ def _read_roots_for_task(task: Task) -> list[Path]:
         workspace = Path(workspace_text).resolve()
     except Exception:
         return []
-
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
-    raw_roots = metadata.get("read_roots", [])
-    if isinstance(raw_roots, str):
-        raw_roots = [raw_roots]
-    if not isinstance(raw_roots, list):
-        return []
+    return resolve_read_roots_from_metadata(workspace, metadata)
 
-    roots: list[Path] = []
-    seen: set[Path] = set()
-    for raw in raw_roots:
-        try:
-            candidate = Path(str(raw)).expanduser().resolve()
-        except Exception:
-            continue
-        if candidate == Path(candidate.anchor):
-            continue
-        try:
-            workspace.relative_to(candidate)
-        except ValueError:
-            continue
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        roots.append(candidate)
-    return roots
+
+def _read_path_map_for_task(task: Task) -> dict[str, Path]:
+    """Resolve exact attached read paths from task metadata."""
+    workspace_text = str(task.workspace or "").strip()
+    if not workspace_text:
+        return {}
+    try:
+        workspace = Path(workspace_text).resolve()
+    except Exception:
+        return {}
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    return resolve_read_path_map_from_metadata(workspace, metadata)
 
 async def _analyze_workspace(self, workspace_path: Path) -> str:
     """Run code analysis *and* document scan for better planning context.

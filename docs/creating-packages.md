@@ -958,11 +958,18 @@ class MyDomainTool(Tool):
 8. **Workspace-writing tools must declare `is_mutating = True`** so mutation policy is enforced preflight
 9. **Workspace-writing tools must return accurate `files_changed`** (workspace-relative paths) on success
 10. **If write targets use non-standard arg keys, expose `mutation_target_arg_keys`** so path policy can find them (for example `output_path`, `output_json_path`)
+11. **Read inputs must support attached read scope**. In scoped runs, a user-selected file or folder may be available through Loom's read-only alias mapping even when it does not physically exist under `ctx.workspace`.
 
 Mutation policy note:
 - Sealed artifact protection is enforced before mutating tool execution.
 - Successful mutations on tracked sealed files trigger reseal/provenance updates.
 - If a writing tool omits mutating metadata or `files_changed`, runtime safety and synthesis seal checks can drift.
+
+Attached read scope note:
+- `ctx.workspace` is the writable run workspace, not necessarily the full source workspace.
+- User-attached files/folders can be exposed through `ctx.read_roots` and `ctx.read_path_map`.
+- Built-in Loom tools already resolve those aliases. Bundled package tools must do the same for read operations.
+- Do not assume every valid read path is a real on-disk child of `ctx.workspace`.
 
 ### Upgrading existing bundled tools
 
@@ -977,8 +984,12 @@ current mutation contract before release:
    `output_json_path`).
 4. Keep write targets inside `ctx.workspace` and use `_resolve_path(...)`
    for normalization/safety.
-5. Add/refresh package tests so each writer confirms `is_mutating` and
-   `files_changed` behavior for success paths.
+5. For read inputs, use `_resolve_read_path(raw, ctx.workspace, ctx.read_roots, ctx.read_path_map)`
+   or an equivalent helper. Do not resolve reads with plain `Path(ctx.workspace) / raw`
+   unless the input is guaranteed to be a write target inside the run workspace.
+6. Add/refresh package tests so each writer confirms `is_mutating` and
+   `files_changed` behavior for success paths, and each read-oriented tool
+   confirms attached aliases work through `ctx.read_path_map`.
 
 Minimal before/after migration example:
 
@@ -1088,12 +1099,25 @@ The `ctx` object provides:
 | Field | Type | Description |
 |-------|------|-------------|
 | `workspace` | `Path \| None` | The user's workspace directory |
+| `read_roots` | `list[Path]` | Extra read-only directory roots exposed to this run |
+| `read_path_map` | `dict[str, Path]` | Exact workspace-relative attached aliases mapped to real readable paths |
 | `scratch_dir` | `Path \| None` | Temp directory for intermediate files |
 | `subtask_id` | `str` | Current subtask identifier |
 | `auth_context` | `RunAuthContext \| None` | Run-scoped selected auth profiles and secret resolver |
 | `execution_surface` | `"tui" \| "api" \| "cli"` | Current run surface for this tool invocation |
 
 Use `workspace` to resolve file paths. Use `_resolve_path(raw, workspace)` for safe path resolution that prevents directory traversal.
+
+Use `_resolve_read_path(raw, ctx.workspace, ctx.read_roots, ctx.read_path_map)` for read inputs that may come from attached files or folders selected by the user. This matters most for scoped runs, where the writable run folder is separate from the source workspace.
+
+Rule of thumb:
+- Use `_resolve_path(...)` for writes and for paths that must stay inside the run workspace.
+- Use `_resolve_read_path(...)` for read-only inputs such as source folders, attached reports, uploaded CSVs, or package inputs selected in the launcher.
+- If your tool emits user-facing relative paths or manifests, preserve the logical alias/path the user selected when possible rather than leaking absolute external filesystem paths.
+
+Common pitfall:
+- `candidate = (Path(ctx.workspace) / raw_path).resolve(); candidate.relative_to(ctx.workspace.resolve())`
+- That pattern breaks for attached aliases because the alias may be valid through `ctx.read_path_map` without existing as a physical child of `ctx.workspace`.
 
 ### ToolResult
 
@@ -1428,6 +1452,7 @@ Before publishing a package:
 - [ ] `replanning` section describes when to adapt
 - [ ] Bundled tools (if any) handle errors gracefully and return `ToolResult.fail`
 - [ ] Bundled workspace-writing tools set `is_mutating = True` and return accurate `files_changed`
+- [ ] Bundled read-oriented tools support attached aliases through `ctx.read_roots` / `ctx.read_path_map`
 - [ ] Bundled tool names are unique (no collisions with built-ins or other packages)
 - [ ] Dependencies are version-pinned
 - [ ] `loom install /path/to/package` succeeds
@@ -1442,6 +1467,12 @@ Install or enable the required tools, or remove them from `tools.required`.
 
 - `Bundled tool '<name>' ... conflicts with existing tool class ...; skipping bundled tool`:
 Rename the bundled tool to a globally unique name and reinstall the package.
+
+- `root_path is not a directory: <attached-alias>` or a similar failure for a selected context folder:
+Your bundled tool is probably treating a read input as a physical child of
+`ctx.workspace`. Update read-side path resolution to use
+`_resolve_read_path(..., ctx.read_roots, ctx.read_path_map)` instead of plain
+`Path(ctx.workspace) / raw_path`.
 
 - `Failed to create isolated dependency environment`:
 Ensure the selected Python executable can create virtual environments (`python -m venv`).

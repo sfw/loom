@@ -2509,6 +2509,55 @@ class TestWorkspaceFirstEndpoints:
         assert Path(str(task_row["workspace_path"])).parent == workspace_path.resolve()
 
     @pytest.mark.asyncio
+    async def test_scoped_run_records_attached_read_scope_for_selected_context(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "attached-context-ws"
+        workspace_path.mkdir()
+        reference_dir = workspace_path / "reference-skill"
+        reference_dir.mkdir()
+        source_dir = workspace_path / "source-data"
+        source_dir.mkdir()
+        report_path = source_dir / "report.md"
+        report_path.write_text("Attached report", encoding="utf-8")
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Attached Context WS",
+        )
+        assert workspace is not None
+
+        response = await client.post(
+            "/tasks",
+            json={
+                "goal": "Use the attached source material",
+                "workspace": str(workspace_path),
+                "approval_mode": "auto",
+                "context": {
+                    "workspace_paths": ["reference-skill", "source-data/report.md"],
+                    "workspace_files": ["source-data/report.md"],
+                    "workspace_directories": ["reference-skill"],
+                },
+                "auto_subfolder": True,
+            },
+        )
+        assert response.status_code == 201
+        payload = response.json()
+
+        task_row = await database.get_task(payload["task_id"])
+        assert task_row is not None
+        metadata = json.loads(str(task_row.get("metadata") or "{}"))
+        assert metadata["source_workspace_root"] == str(workspace_path)
+        assert metadata["read_roots"] == [str(reference_dir.resolve())]
+        assert metadata["attached_read_path_map"] == {
+            "reference-skill": str(reference_dir.resolve()),
+            "source-data/report.md": str(report_path.resolve()),
+        }
+
+    @pytest.mark.asyncio
     async def test_restart_scoped_run_reuses_same_task_and_parent_workspace_grouping(
         self,
         client,
@@ -2520,6 +2569,12 @@ class TestWorkspaceFirstEndpoints:
     ):
         workspace_path = tmp_path / "restart-scoped-ws"
         workspace_path.mkdir()
+        reference_dir = workspace_path / "reference-skill"
+        reference_dir.mkdir()
+        source_dir = workspace_path / "source-data"
+        source_dir.mkdir()
+        report_path = source_dir / "report.md"
+        report_path.write_text("Source report", encoding="utf-8")
         workspace = await workspace_registry.ensure_workspace(
             str(workspace_path),
             display_name="Restart Scoped WS",
@@ -2548,6 +2603,11 @@ class TestWorkspaceFirstEndpoints:
         original_metadata = json.loads(str(original_row.get("metadata") or "{}"))
         assert original_metadata["source_workspace_root"] == str(workspace_path)
         assert original_metadata["run_workspace_mode"] == "scoped_subfolder"
+        assert original_metadata["read_roots"] == [str(reference_dir.resolve())]
+        assert original_metadata["attached_read_path_map"] == {
+            "reference-skill": str(reference_dir.resolve()),
+            "source-data/report.md": str(report_path.resolve()),
+        }
 
         saved_task = state_manager.load(original_task_id)
         saved_task.plan = Plan(
@@ -2604,6 +2664,11 @@ class TestWorkspaceFirstEndpoints:
         assert restarted_metadata["run_workspace_relative"] == Path(
             str(original_row["workspace_path"]),
         ).name
+        assert restarted_metadata["read_roots"] == [str(reference_dir.resolve())]
+        assert restarted_metadata["attached_read_path_map"] == {
+            "reference-skill": str(reference_dir.resolve()),
+            "source-data/report.md": str(report_path.resolve()),
+        }
         assert restarted_metadata["run_id"] == restart_payload["run_id"]
         assert restarted_metadata["restarted_from_run_id"] == original_metadata["run_id"]
         assert restarted_metadata["restart_count"] == 1

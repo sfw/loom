@@ -288,7 +288,12 @@ class HumanizeWritingTool(Tool):
             return None, "No workspace set"
 
         try:
-            path = self._resolve_read_path(path_raw, ctx.workspace, ctx.read_roots)
+            path = self._resolve_read_path(
+                path_raw,
+                ctx.workspace,
+                ctx.read_roots,
+                ctx.read_path_map,
+            )
         except Exception as e:
             return None, str(e)
         if not path.exists() or not path.is_file():

@@ -353,6 +353,13 @@ class PromptAssembler:
                 text = str(item or "").strip()
                 if text:
                     read_roots.append(text)
+        raw_attached_read_path_map = metadata.get("attached_read_path_map", {})
+        attached_read_paths: list[str] = []
+        if isinstance(raw_attached_read_path_map, dict):
+            for item in raw_attached_read_path_map:
+                text = str(item or "").strip()
+                if text:
+                    attached_read_paths.append(text)
         if read_roots:
             workspace_name = ""
             try:
@@ -377,6 +384,14 @@ class PromptAssembler:
                 f"{roots_text}\n"
                 "- Use explicit `path` when exploring reference roots so reads are "
                 "unambiguous."
+            )
+        if attached_read_paths:
+            attached_text = "\n".join(f"- {path}" for path in attached_read_paths[:8])
+            constraints += (
+                "\n\nATTACHED READ-ONLY CONTEXT:\n"
+                "- These explicit attached workspace paths are available for read-only access:\n"
+                f"{attached_text}\n"
+                "- Prefer these exact relative paths when opening attached files or directories."
             )
 
         sections = [

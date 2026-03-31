@@ -29,6 +29,10 @@ from loom.events.types import (
 from loom.models.base import ModelResponse
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
+from loom.read_scope import (
+    resolve_read_path_map_from_metadata,
+    resolve_read_roots_from_metadata,
+)
 from loom.recovery.questions import QuestionAnswer, QuestionManager, QuestionRequest
 from loom.state.memory import MemoryEntry, MemoryManager
 from loom.state.task_state import Subtask, Task, TaskStateManager, TaskStatus
@@ -962,38 +966,17 @@ class SubtaskRunner:
     def _read_roots_for_task(task: Task, workspace: Path | None) -> list[Path]:
         """Resolve additional read-only roots for this task.
 
-        Only accepts roots that are ancestors of the task workspace so reads
-        can widen safely to parent trees without becoming arbitrary.
+        Accepts workspace ancestors and explicitly attached sibling directories
+        scoped under the source workspace root.
         """
-        if workspace is None:
-            return []
         metadata = task.metadata if isinstance(task.metadata, dict) else {}
-        raw_roots = metadata.get("read_roots", [])
-        if isinstance(raw_roots, str):
-            raw_roots = [raw_roots]
-        if not isinstance(raw_roots, list):
-            return []
+        return resolve_read_roots_from_metadata(workspace, metadata)
 
-        resolved_workspace = workspace.resolve()
-        roots: list[Path] = []
-        seen: set[Path] = set()
-        for raw in raw_roots:
-            try:
-                candidate = Path(str(raw)).expanduser().resolve()
-            except Exception:
-                continue
-            # Disallow filesystem-root grants.
-            if candidate == Path(candidate.anchor):
-                continue
-            try:
-                resolved_workspace.relative_to(candidate)
-            except ValueError:
-                continue
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            roots.append(candidate)
-        return roots
+    @staticmethod
+    def _read_path_map_for_task(task: Task, workspace: Path | None) -> dict[str, Path]:
+        """Resolve exact attached read paths for this task."""
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        return resolve_read_path_map_from_metadata(workspace, metadata)
 
     async def run(
         self,

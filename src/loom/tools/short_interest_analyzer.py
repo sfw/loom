@@ -343,7 +343,12 @@ async def _load_short_interest_rows(
     if source_path:
         if ctx.workspace is None:
             raise ValueError("No workspace set for source_path")
-        path = tool._resolve_read_path(source_path, ctx.workspace, ctx.read_roots)
+        path = tool._resolve_read_path(
+            source_path,
+            ctx.workspace,
+            ctx.read_roots,
+            ctx.read_path_map,
+        )
         text = path.read_text(encoding="utf-8", errors="ignore")
         return parse_finra_short_interest_csv(text, source=str(path)), str(path)
 
@@ -369,7 +374,12 @@ async def _load_daily_short_rows(
     if source_path:
         if ctx.workspace is None:
             raise ValueError("No workspace set for daily source path")
-        path = tool._resolve_read_path(source_path, ctx.workspace, ctx.read_roots)
+        path = tool._resolve_read_path(
+            source_path,
+            ctx.workspace,
+            ctx.read_roots,
+            ctx.read_path_map,
+        )
         text = path.read_text(encoding="utf-8", errors="ignore")
         return parse_finra_daily_short_volume(text, source=str(path)), str(path)
 

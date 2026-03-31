@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
+from loom.read_scope import normalize_workspace_relative_read_path
 from loom.utils.latency import log_latency_event
 
 _MAX_MCP_AUTH_VIEW_CACHE_ENTRIES = 64
@@ -175,6 +176,7 @@ class ToolContext:
 
     workspace: Path | None
     read_roots: list[Path] = field(default_factory=list)
+    read_path_map: dict[str, Path] = field(default_factory=dict)
     scratch_dir: Path | None = None
     changelog: Any | None = None  # ChangeLog instance for tracking file modifications
     subtask_id: str = ""
@@ -285,6 +287,7 @@ class Tool(ABC):
         raw_path: str,
         workspace: Path,
         read_roots: list[Path] | None = None,
+        read_path_map: dict[str, Path] | None = None,
     ) -> Path:
         """Resolve a read path allowing optional parent/root read scopes.
 
@@ -294,13 +297,42 @@ class Tool(ABC):
         path = Path(raw_path).expanduser()
         if path.is_absolute():
             resolved = path.resolve()
-            self._verify_within_allowed_roots(resolved, workspace, read_roots)
+            self._verify_within_allowed_roots(
+                resolved,
+                workspace,
+                read_roots,
+                read_path_map=read_path_map,
+            )
             return resolved
 
         candidates: list[Path] = [workspace / path]
         normalized = self._strip_redundant_workspace_prefix(path, workspace)
         if normalized != path:
             candidates.append(workspace / normalized)
+        normalized_texts = [
+            text
+            for text in {
+                normalize_workspace_relative_read_path(path),
+                normalize_workspace_relative_read_path(normalized),
+            }
+            if text
+        ]
+        for key, target in (read_path_map or {}).items():
+            try:
+                target_path = Path(target).expanduser().resolve()
+            except Exception:
+                continue
+            for text in normalized_texts:
+                if text == key:
+                    candidates.append(target_path)
+                    continue
+                if not target_path.is_dir():
+                    continue
+                prefix = f"{key}/"
+                if text.startswith(prefix):
+                    suffix = text[len(prefix):]
+                    if suffix:
+                        candidates.append(target_path / suffix)
         seen_roots: set[Path] = set()
         for root in read_roots or []:
             try:
@@ -319,7 +351,12 @@ class Tool(ABC):
         for candidate in candidates:
             resolved = candidate.resolve()
             try:
-                self._verify_within_allowed_roots(resolved, workspace, read_roots)
+                self._verify_within_allowed_roots(
+                    resolved,
+                    workspace,
+                    read_roots,
+                    read_path_map=read_path_map,
+                )
             except ToolSafetyError as e:
                 if first_error is None:
                     first_error = e
@@ -335,7 +372,12 @@ class Tool(ABC):
             raise first_error
 
         resolved = (workspace / path).resolve()
-        self._verify_within_allowed_roots(resolved, workspace, read_roots)
+        self._verify_within_allowed_roots(
+            resolved,
+            workspace,
+            read_roots,
+            read_path_map=read_path_map,
+        )
         return resolved
 
     @staticmethod
@@ -376,15 +418,32 @@ class Tool(ABC):
         path: Path,
         workspace: Path,
         extra_roots: list[Path] | None,
+        *,
+        read_path_map: dict[str, Path] | None = None,
     ) -> None:
         """Ensure path stays inside workspace or one of allowed read roots."""
         roots: list[Path] = [workspace.resolve()]
+        exact_paths: list[Path] = []
         if extra_roots:
             for root in extra_roots:
                 try:
-                    roots.append(Path(root).expanduser().resolve())
+                    resolved_root = Path(root).expanduser().resolve()
                 except Exception:
                     continue
+                if resolved_root.is_dir():
+                    roots.append(resolved_root)
+                else:
+                    exact_paths.append(resolved_root)
+        if read_path_map:
+            for target in read_path_map.values():
+                try:
+                    resolved_target = Path(target).expanduser().resolve()
+                except Exception:
+                    continue
+                if resolved_target.is_dir():
+                    roots.append(resolved_target)
+                else:
+                    exact_paths.append(resolved_target)
 
         for root in roots:
             try:
@@ -392,7 +451,11 @@ class Tool(ABC):
                 return
             except ValueError:
                 continue
+        for exact in exact_paths:
+            if path == exact:
+                return
         roots_text = ", ".join(str(root) for root in roots)
+        exact_text = ", ".join(str(path_item) for path_item in exact_paths)
         try:
             workspace_text = str(workspace.resolve())
         except Exception:
@@ -400,6 +463,7 @@ class Tool(ABC):
         raise ToolSafetyError(
             f"Path '{path}' escapes workspace '{workspace_text}'. "
             f"Allowed roots: {roots_text}"
+            + (f"; allowed exact paths: {exact_text}" if exact_text else "")
         )
 
 
@@ -863,6 +927,7 @@ class ToolRegistry:
         arguments: dict,
         workspace: Path | None = None,
         read_roots: list[Path] | None = None,
+        read_path_map: dict[str, Path] | dict[str, str] | None = None,
         scratch_dir: Path | None = None,
         changelog: Any = None,
         subtask_id: str = "",
@@ -924,6 +989,17 @@ class ToolRegistry:
             except Exception:
                 continue
             normalized_read_roots.append(normalized)
+        normalized_read_path_map: dict[str, Path] = {}
+        if isinstance(read_path_map, dict):
+            for raw_key, raw_value in read_path_map.items():
+                key = normalize_workspace_relative_read_path(raw_key)
+                if not key:
+                    continue
+                try:
+                    normalized_value = Path(raw_value).expanduser().resolve()
+                except Exception:
+                    continue
+                normalized_read_path_map[key] = normalized_value
 
         normalized_arguments: dict
         if isinstance(arguments, dict):
@@ -939,6 +1015,7 @@ class ToolRegistry:
         ctx = ToolContext(
             workspace=workspace,
             read_roots=normalized_read_roots,
+            read_path_map=normalized_read_path_map,
             scratch_dir=scratch_dir,
             changelog=changelog,
             subtask_id=subtask_id,

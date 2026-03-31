@@ -169,6 +169,7 @@ def _bind_hybrid_fallback_tools(registry: ToolRegistry) -> None:
                 arguments,
                 workspace=ctx.workspace,
                 read_roots=ctx.read_roots,
+                read_path_map=ctx.read_path_map,
                 scratch_dir=ctx.scratch_dir,
                 changelog=ctx.changelog,
                 subtask_id=ctx.subtask_id,

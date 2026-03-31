@@ -2315,6 +2315,10 @@ class Orchestrator:
     def _read_roots_for_task(task: Task) -> list[Path]:
         return orchestrator_planning._read_roots_for_task(task)
 
+    @staticmethod
+    def _read_path_map_for_task(task: Task) -> dict[str, Path]:
+        return orchestrator_planning._read_path_map_for_task(task)
+
     # Document extensions grouped by category for workspace scanning.
     _DOC_EXTENSIONS: dict[str, tuple[str, ...]] = {
         "Documents": (".md", ".rst", ".txt", ".pdf"),

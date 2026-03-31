@@ -265,7 +265,12 @@ def _load_table(
 
     table_path = str(args.get("table_path", "")).strip()
     if table_path and ctx.workspace is not None:
-        path = tool._resolve_read_path(table_path, ctx.workspace, ctx.read_roots)
+        path = tool._resolve_read_path(
+            table_path,
+            ctx.workspace,
+            ctx.read_roots,
+            ctx.read_path_map,
+        )
         if not path.exists() or not path.is_file():
             return None
         if path.suffix.lower() == ".json":

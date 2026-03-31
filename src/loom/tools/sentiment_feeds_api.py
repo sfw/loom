@@ -256,7 +256,12 @@ async def _load_ratio_row(
     if source_path:
         if ctx.workspace is None:
             raise ValueError("No workspace set for source_path")
-        path = tool._resolve_read_path(source_path, ctx.workspace, ctx.read_roots)
+        path = tool._resolve_read_path(
+            source_path,
+            ctx.workspace,
+            ctx.read_roots,
+            ctx.read_path_map,
+        )
         text = path.read_text(encoding="utf-8", errors="ignore")
         row = _last_csv_row(text)
         return row, str(path)

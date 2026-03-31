@@ -252,7 +252,12 @@ def _load_events(
     if path_text:
         if ctx.workspace is None:
             return []
-        path = tool._resolve_read_path(path_text, ctx.workspace, ctx.read_roots)
+        path = tool._resolve_read_path(
+            path_text,
+            ctx.workspace,
+            ctx.read_roots,
+            ctx.read_path_map,
+        )
         if path.exists() and path.is_file():
             rows.extend(_read_events_file(path))
 

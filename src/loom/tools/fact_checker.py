@@ -297,7 +297,12 @@ def _load_claims(
     if claims_path:
         if ctx.workspace is None:
             return []
-        path = tool._resolve_read_path(claims_path, ctx.workspace, ctx.read_roots)
+        path = tool._resolve_read_path(
+            claims_path,
+            ctx.workspace,
+            ctx.read_roots,
+            ctx.read_path_map,
+        )
         if path.exists() and path.is_file():
             claims.extend(_read_claims_file(path))
 
@@ -354,7 +359,12 @@ async def _load_sources(
     if index_path:
         if ctx.workspace is None:
             return []
-        path = tool._resolve_read_path(index_path, ctx.workspace, ctx.read_roots)
+        path = tool._resolve_read_path(
+            index_path,
+            ctx.workspace,
+            ctx.read_roots,
+            ctx.read_path_map,
+        )
         if path.exists() and path.is_file():
             refs.extend(_read_source_index(path))
 
@@ -375,7 +385,12 @@ async def _load_sources(
         if ctx.workspace is None:
             continue
         try:
-            path = tool._resolve_read_path(ref, ctx.workspace, ctx.read_roots)
+            path = tool._resolve_read_path(
+                ref,
+                ctx.workspace,
+                ctx.read_roots,
+                ctx.read_path_map,
+            )
         except Exception:
             continue
         if not path.exists() or not path.is_file():

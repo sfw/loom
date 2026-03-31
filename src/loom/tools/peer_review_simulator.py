@@ -137,7 +137,12 @@ class PeerReviewSimulatorTool(Tool):
         if not content and path_text:
             if ctx.workspace is None:
                 return ToolResult.fail("No workspace set")
-            path = self._resolve_read_path(path_text, ctx.workspace, ctx.read_roots)
+            path = self._resolve_read_path(
+                path_text,
+                ctx.workspace,
+                ctx.read_roots,
+                ctx.read_path_map,
+            )
             if not path.exists() or not path.is_file():
                 return ToolResult.fail("Review path not found")
             content = path.read_text(encoding="utf-8", errors="replace")

@@ -91,6 +91,7 @@ async def run_subtask(
     try:
         workspace = Path(task.workspace) if task.workspace else None
         read_roots = runner._read_roots_for_task(task, workspace)
+        read_path_map = runner._read_path_map_for_task(task, workspace)
         auth_context = None
         try:
             metadata = task.metadata if isinstance(task.metadata, dict) else {}
@@ -687,6 +688,7 @@ async def run_subtask(
                                 resolved_tool_name, execute_args,
                                 workspace=workspace,
                                 read_roots=read_roots,
+                                read_path_map=read_path_map,
                                 scratch_dir=runner._config.scratch_path,
                                 changelog=changelog,
                                 subtask_id=subtask.id,

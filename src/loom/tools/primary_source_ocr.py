@@ -111,7 +111,12 @@ class PrimarySourceOcrTool(Tool):
         if not path_text:
             return ToolResult.fail("path is required")
 
-        path = self._resolve_read_path(path_text, ctx.workspace, ctx.read_roots)
+        path = self._resolve_read_path(
+            path_text,
+            ctx.workspace,
+            ctx.read_roots,
+            ctx.read_path_map,
+        )
         if not path.exists() or not path.is_file():
             return ToolResult.fail(f"File not found: {path_text}")
 

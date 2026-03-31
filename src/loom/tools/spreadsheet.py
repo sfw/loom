@@ -117,6 +117,7 @@ class SpreadsheetTool(Tool):
                     raw_path,
                     ctx.workspace,
                     ctx.read_roots,
+                    ctx.read_path_map,
                 )
             else:
                 filepath = self._resolve_path(raw_path, ctx.workspace)

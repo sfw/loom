@@ -305,6 +305,27 @@ class TestExecutorPrompt:
         assert "source-workspace" in prompt
         assert "Do NOT prefix write paths with `myapp/`" in prompt
 
+    def test_executor_includes_attached_read_only_context_paths(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+        state_manager: TaskStateManager,
+    ):
+        state_manager.create(sample_task)
+        sample_task.metadata["attached_read_path_map"] = {
+            "source-data/report.md": "/tmp/source-data/report.md",
+        }
+        subtask = sample_task.get_subtask("add-tsconfig")
+
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+
+        assert "ATTACHED READ-ONLY CONTEXT" in prompt
+        assert "source-data/report.md" in prompt
+
     def test_executor_section_order(
         self,
         assembler: PromptAssembler,

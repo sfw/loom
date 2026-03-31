@@ -636,6 +636,30 @@ class TestReadFile:
         assert result.success
         assert "Campaign brief" in result.output
 
+    async def test_read_file_relative_path_resolves_from_attached_file_map(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        source_dir = root / "source-data"
+        root.mkdir()
+        run_ws.mkdir()
+        source_dir.mkdir()
+        report_path = source_dir / "report.md"
+        report_path.write_text("Attached report")
+        (source_dir / "other.md").write_text("Sibling file")
+
+        tool = ReadFileTool()
+        ctx = ToolContext(
+            workspace=run_ws,
+            read_path_map={"source-data/report.md": report_path},
+        )
+        result = await tool.execute({"path": "source-data/report.md"}, ctx)
+        assert result.success
+        assert "Attached report" in result.output
+
+        other_result = await tool.execute({"path": "source-data/other.md"}, ctx)
+        assert not other_result.success
+        assert "not found" in other_result.error
+
     async def test_read_image_returns_metadata(self, ctx: ToolContext, workspace: Path):
         # Create a dummy image file
         img_path = workspace / "logo.png"
@@ -1115,6 +1139,27 @@ class TestSearchFiles:
         assert result.success
         assert "notes.txt" in result.output
 
+    async def test_search_exact_attached_file_via_read_path_map(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        source_dir = root / "source-data"
+        source_dir.mkdir(parents=True)
+        run_ws.mkdir()
+        report_path = source_dir / "report.md"
+        report_path.write_text("creative brief source\n")
+
+        tool = SearchFilesTool()
+        ctx = ToolContext(
+            workspace=run_ws,
+            read_path_map={"source-data/report.md": report_path},
+        )
+        result = await tool.execute(
+            {"pattern": "creative brief", "path": "source-data/report.md"},
+            ctx,
+        )
+        assert result.success
+        assert "report.md:1:" in result.output
+
 
 # --- ListDirectoryTool ---
 
@@ -1168,6 +1213,25 @@ class TestListDirectory:
         tool = ListDirectoryTool()
         ctx = ToolContext(workspace=run_ws, read_roots=[root])
         result = await tool.execute({"path": "docs"}, ctx)
+        assert result.success
+        assert "brief.md" in result.output
+
+    async def test_list_relative_path_resolves_from_attached_directory_map(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        audit_dir = root / "seo-geo-review"
+        root.mkdir()
+        run_ws.mkdir()
+        audit_dir.mkdir()
+        (audit_dir / "brief.md").write_text("brief")
+
+        tool = ListDirectoryTool()
+        ctx = ToolContext(
+            workspace=run_ws,
+            read_roots=[audit_dir],
+            read_path_map={"seo-geo-review": audit_dir},
+        )
+        result = await tool.execute({"path": "seo-geo-review"}, ctx)
         assert result.success
         assert "brief.md" in result.output
 
