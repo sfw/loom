@@ -1330,6 +1330,7 @@ class SubtaskRunner:
         allowed_output_prefixes: list[str],
         enforce_deliverable_paths: bool,
         edit_existing_only: bool,
+        already_touched_deliverables: set[str] | None = None,
     ) -> str | None:
         return runner_policy.validate_deliverable_write_policy(
             tool_name=tool_name,
@@ -1342,6 +1343,7 @@ class SubtaskRunner:
             allowed_output_prefixes=allowed_output_prefixes,
             enforce_deliverable_paths=enforce_deliverable_paths,
             edit_existing_only=edit_existing_only,
+            already_touched_deliverables=already_touched_deliverables,
             normalize_deliverable_paths=cls._normalize_deliverable_paths,
             target_paths_for_policy=cls._target_paths_for_policy,
             looks_like_deliverable_variant=cls._looks_like_deliverable_variant,

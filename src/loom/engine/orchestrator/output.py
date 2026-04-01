@@ -1032,6 +1032,13 @@ def _augment_retry_context_for_outputs(
             "Write/update only these deliverable filenames for this phase. "
             "If fixing verification issues, patch these files in place."
         )
+        if output_strategy != "fan_in":
+            lines.append(
+                "Direct-mode deliverable rule: gather all required evidence before "
+                "the first canonical write. Each listed deliverable may be written "
+                "at most once in a subtask attempt; after all are written, stop "
+                "calling tools and return your completion response."
+            )
     if (
         strategy in {
             RetryStrategy.RATE_LIMIT,

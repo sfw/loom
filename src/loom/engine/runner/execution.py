@@ -169,6 +169,14 @@ async def run_subtask(
             allowed_output_prefixes or [],
             workspace=workspace,
         )
+        canonical_deliverable_set = set(canonical_deliverables)
+        one_shot_direct_deliverable_mode = (
+            bool(canonical_deliverables)
+            and not normalized_allowed_output_prefixes
+        )
+        touched_canonical_deliverables: set[str] = set()
+        completion_only_after_deliverables = False
+        completion_only_instruction_sent = False
         iteration_budget = runner._tool_iteration_budget(
             subtask=subtask,
             retry_strategy=retry_strategy,
@@ -197,10 +205,24 @@ async def run_subtask(
                 task_id=task.id,
                 subtask_id=subtask.id,
             )
-            tool_schemas = runner._tools.all_schemas(
-                auth_context=auth_context,
-                execution_surface=execution_surface,
-            )
+            if completion_only_after_deliverables and not completion_only_instruction_sent:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "CANONICAL DELIVERABLE WRITE COMPLETE: all required deliverables "
+                        "for this subtask have already been written once. Do not call "
+                        "more tools or modify files. Respond with your final completion "
+                        "message only."
+                    ),
+                })
+                completion_only_instruction_sent = True
+            if completion_only_after_deliverables:
+                tool_schemas = []
+            else:
+                tool_schemas = runner._tools.all_schemas(
+                    auth_context=auth_context,
+                    execution_surface=execution_surface,
+                )
             operation = "stream" if streaming else "complete"
             session.response = None
             policy = ModelRetryPolicy.from_execution_config(runner._config.execution)
@@ -400,21 +422,47 @@ async def run_subtask(
                     mutation_target_arg_keys = tuple(
                         getattr(tool_obj, "mutation_target_arg_keys", ()) or (),
                     )
-                    runner._increment_subtask_counter("tool_calls")
-                    if is_mutating_tool:
-                        runner._increment_subtask_counter("mutating_tool_calls")
-                    policy_error = runner._validate_deliverable_write_policy(
-                        tool_name=resolved_tool_name,
-                        tool_args=resolved_tool_args,
+                    attempted_paths = runner._target_paths_for_policy(
+                        tool_name=tc.name,
+                        tool_args=tc.arguments,
                         workspace=workspace,
                         is_mutating_tool=is_mutating_tool,
                         mutation_target_arg_keys=mutation_target_arg_keys,
-                        expected_deliverables=canonical_deliverables,
-                        forbidden_deliverables=canonical_forbidden_deliverables,
-                        allowed_output_prefixes=normalized_allowed_output_prefixes,
-                        enforce_deliverable_paths=enforce_deliverable_paths,
-                        edit_existing_only=edit_existing_only,
                     )
+                    runner._increment_subtask_counter("tool_calls")
+                    if is_mutating_tool:
+                        runner._increment_subtask_counter("mutating_tool_calls")
+                    if (
+                        completion_only_after_deliverables
+                        and is_mutating_tool
+                        and attempted_paths
+                    ):
+                        policy_error = (
+                            "reason_code=forbidden_output_path; "
+                            "Canonical deliverable completion violation: "
+                            "all required deliverables for this subtask attempt "
+                            "have already been written. Do not call mutating tools "
+                            "after the canonical write; return the completion "
+                            "response instead."
+                        )
+                    else:
+                        policy_error = runner._validate_deliverable_write_policy(
+                            tool_name=resolved_tool_name,
+                            tool_args=resolved_tool_args,
+                            workspace=workspace,
+                            is_mutating_tool=is_mutating_tool,
+                            mutation_target_arg_keys=mutation_target_arg_keys,
+                            expected_deliverables=canonical_deliverables,
+                            forbidden_deliverables=canonical_forbidden_deliverables,
+                            allowed_output_prefixes=normalized_allowed_output_prefixes,
+                            enforce_deliverable_paths=enforce_deliverable_paths,
+                            edit_existing_only=edit_existing_only,
+                            already_touched_deliverables=(
+                                touched_canonical_deliverables
+                                if one_shot_direct_deliverable_mode
+                                else None
+                            ),
+                        )
                     if not policy_error:
                         policy_error = runner._validate_sealed_artifact_mutation_policy(
                             task=task,
@@ -427,13 +475,6 @@ async def run_subtask(
                             current_tool_calls=tool_calls_record,
                         )
                     if policy_error:
-                        blocked_paths = runner._target_paths_for_policy(
-                            tool_name=tc.name,
-                            tool_args=tc.arguments,
-                            workspace=workspace,
-                            is_mutating_tool=is_mutating_tool,
-                            mutation_target_arg_keys=mutation_target_arg_keys,
-                        )
                         if runner._is_forbidden_output_path_error(policy_error):
                             runner._emit_telemetry_event(
                                 event_type=FORBIDDEN_CANONICAL_WRITE_BLOCKED,
@@ -441,7 +482,7 @@ async def run_subtask(
                                 data={
                                     "subtask_id": subtask.id,
                                     "tool": resolved_tool_name,
-                                    "attempted_paths": blocked_paths,
+                                    "attempted_paths": attempted_paths,
                                     "expected_deliverables": list(canonical_deliverables),
                                     "forbidden_deliverables": list(
                                         canonical_forbidden_deliverables,
@@ -457,7 +498,7 @@ async def run_subtask(
                                 task_id=task.id,
                                 subtask_id=subtask.id,
                                 tool_name=resolved_tool_name,
-                                attempted_paths=blocked_paths,
+                                attempted_paths=attempted_paths,
                                 policy_error=policy_error,
                             )
                         tool_result = ToolResult.fail(policy_error)
@@ -841,6 +882,22 @@ async def run_subtask(
                             tool_result.data = data
                         else:
                             tool_result.data = data
+                    if (
+                        one_shot_direct_deliverable_mode
+                        and is_mutating_tool
+                        and tool_result.success
+                    ):
+                        touched_paths = [
+                            path
+                            for path in attempted_paths
+                            if path in canonical_deliverable_set
+                        ]
+                        if touched_paths:
+                            touched_canonical_deliverables.update(touched_paths)
+                            if canonical_deliverable_set.issubset(
+                                touched_canonical_deliverables,
+                            ):
+                                completion_only_after_deliverables = True
                     runner._emit_tool_event(
                         TOOL_CALL_COMPLETED, task.id, subtask.id,
                         resolved_tool_name, resolved_tool_args,
@@ -872,12 +929,13 @@ async def run_subtask(
                     break
 
                 # Anti-amnesia reminder
-                messages.append({
-                    # Some OpenAI-compatible providers reject repeated in-thread
-                    # system messages during tool-call loops.
-                    "role": "user",
-                    "content": runner._build_todo_reminder(task, subtask),
-                })
+                if not completion_only_after_deliverables:
+                    messages.append({
+                        # Some OpenAI-compatible providers reject repeated in-thread
+                        # system messages during tool-call loops.
+                        "role": "user",
+                        "content": runner._build_todo_reminder(task, subtask),
+                    })
             else:
                 # Text-only response. Depending on configured mode, require
                 # explicit completion contract payload before termination.

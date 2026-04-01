@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from loom.engine.orchestrator import output as orchestrator_output
+from loom.recovery.retry import RetryStrategy
 
 
 def test_output_helpers_use_defaults_without_process() -> None:
@@ -201,3 +202,30 @@ def test_commit_finalizer_stage_publish_commits_staged_files(tmp_path) -> None:
     assert not stage_path.exists()
     assert stub.sealed == [canonical_rel]
     assert stub.restored is False
+
+
+def test_augment_retry_context_for_outputs_describes_direct_one_shot_writes() -> None:
+    orchestrator = SimpleNamespace(
+        _files_from_attempts=lambda _attempts: [],
+        _output_intermediate_root=lambda: ".loom/phase-artifacts",
+        _OUTPUT_ROLE_PHASE_FINALIZER="phase_finalizer",
+    )
+    subtask = SimpleNamespace(
+        id="draft-report",
+        phase_id="research",
+        output_role="worker",
+        output_strategy="direct",
+    )
+
+    context = orchestrator_output._augment_retry_context_for_outputs(
+        orchestrator,
+        subtask=subtask,
+        attempts=[],
+        strategy=RetryStrategy.GENERIC,
+        expected_deliverables=["report.md"],
+        forbidden_deliverables=[],
+        base_context="Base",
+    )
+
+    assert "CANONICAL DELIVERABLE FILES FOR THIS SUBTASK" in context
+    assert "Each listed deliverable may be written at most once" in context

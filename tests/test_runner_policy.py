@@ -52,6 +52,27 @@ def test_validate_deliverable_write_policy_blocks_prefix_violation() -> None:
     assert "intermediate artifact prefix" in error
 
 
+def test_validate_deliverable_write_policy_blocks_second_write_to_same_deliverable() -> None:
+    error = runner_policy.validate_deliverable_write_policy(
+        tool_name="edit_file",
+        tool_args={"path": "report.md"},
+        workspace=None,
+        expected_deliverables=["report.md"],
+        forbidden_deliverables=[],
+        allowed_output_prefixes=[],
+        enforce_deliverable_paths=False,
+        edit_existing_only=False,
+        already_touched_deliverables={"report.md"},
+        normalize_deliverable_paths=lambda paths, workspace=None: list(paths),
+        target_paths_for_policy=lambda **kwargs: ["report.md"],
+        looks_like_deliverable_variant=lambda **kwargs: False,
+    )
+
+    assert error is not None
+    assert "reason_code=forbidden_output_path" in error
+    assert "already written in this subtask attempt" in error
+
+
 def test_validate_sealed_artifact_mutation_policy_allow_and_deny_paths() -> None:
     task = SimpleNamespace(metadata={})
 
