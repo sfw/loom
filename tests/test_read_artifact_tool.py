@@ -61,3 +61,51 @@ class TestReadArtifactTool:
 
         assert result.success is False
         assert "Artifact not found" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_query_reads_relevant_snippets_from_text_artifact(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        content = (
+            "# Platform Reference\n\n"
+            "Background information about general account settings.\n\n"
+            "The auth token refresh endpoint rotates bearer tokens every 15 minutes "
+            "and supports manual revocation for compromised sessions.\n\n"
+            "Additional product notes about billing and user seats.\n"
+        )
+        record = persist_fetch_artifact(
+            content_bytes=content.encode("utf-8"),
+            source_url="https://example.com/reference",
+            media_type="text/markdown",
+            content_kind=ContentKind.TEXT,
+            workspace=workspace,
+            scratch_dir=scratch,
+            subtask_id="research-pass",
+        )
+
+        tool = ReadArtifactTool()
+        ctx = ToolContext(
+            workspace=workspace,
+            read_roots=[],
+            scratch_dir=scratch,
+            changelog=None,
+            subtask_id="research-pass",
+            auth_context=None,
+        )
+        result = await tool.execute(
+            {
+                "artifact_ref": record.artifact_ref,
+                "query": "auth token refresh",
+                "max_snippets": 2,
+            },
+            ctx,
+        )
+
+        assert result.success is True
+        assert "Relevant snippets for query: auth token refresh" in result.output
+        assert "rotates bearer tokens every 15 minutes" in result.output
+        assert isinstance(result.data, dict)
+        assert result.data.get("retrieval_strategy") == "query_snippets"
+        assert result.data.get("query") == "auth token refresh"

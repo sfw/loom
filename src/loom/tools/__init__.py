@@ -324,4 +324,7 @@ def _instantiate_tool(tool_cls: type[Tool], config: Config | None) -> Tool | Non
     if class_name == "FactCheckerTool":
         return tool_cls(config=config)
 
+    if class_name == "WebFetchTool":
+        return tool_cls(config=config)
+
     return tool_cls()

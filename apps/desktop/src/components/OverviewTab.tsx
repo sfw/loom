@@ -13,6 +13,7 @@ import { useApp } from "@/context/AppContext";
 import { formatDate } from "@/utils";
 import { notificationSummary } from "@/history";
 import { cn } from "@/lib/utils";
+import { displayRunStatus, normalizeRunStatus } from "@/runStatus";
 
 export default function OverviewTab() {
   const {
@@ -463,7 +464,7 @@ function EmptyCard({ message }: { message: string }) {
 }
 
 function RunDot({ status }: { status: string }) {
-  const s = status.toLowerCase();
+  const s = normalizeRunStatus(status);
   return (
     <Circle
       size={8}
@@ -486,7 +487,7 @@ function RunDot({ status }: { status: string }) {
 }
 
 function StatusPill({ status }: { status: string }) {
-  const s = status.toLowerCase();
+  const s = normalizeRunStatus(status);
   return (
     <span
       className={cn(
@@ -504,7 +505,7 @@ function StatusPill({ status }: { status: string }) {
                   : "bg-zinc-800 text-zinc-500",
       )}
     >
-      {status}
+      {displayRunStatus(status)}
     </span>
   );
 }

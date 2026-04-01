@@ -139,11 +139,280 @@ export interface ConversationActions {
 }
 
 // ---------------------------------------------------------------------------
+// Replay helpers
+// ---------------------------------------------------------------------------
+
+export function conversationEventKey(event: ConversationStreamEvent): string {
+  if (event._client_id) {
+    return `optimistic:${event._client_id}`;
+  }
+  if (!event._optimistic && event.turn_number == null && Number(event.seq || 0) > 0) {
+    return `event:${event.seq}`;
+  }
+  if (event.turn_number != null) {
+    return `synthetic:${event.turn_number}:${event.event_type}:${event.seq}`;
+  }
+  return `event:${event.seq}:${event.event_type}:${event.created_at}`;
+}
+
+export function conversationMessageKey(message: ConversationMessage): string {
+  if (Number(message.id || 0) > 0) {
+    return `message:${message.id}`;
+  }
+  return `message:${message.turn_number}:${message.role}:${message.created_at}`;
+}
+
+export function isDurableConversationEvent(
+  event: ConversationStreamEvent | undefined,
+): boolean {
+  return Boolean(event && !event._optimistic && Number(event.id || 0) > 0);
+}
+
+export function mergeConversationMessages(
+  current: ConversationMessage[],
+  incoming: ConversationMessage[],
+  mode: "prepend" | "append",
+): ConversationMessage[] {
+  if (incoming.length === 0) {
+    return current;
+  }
+  const seen = new Set(current.map((message) => conversationMessageKey(message)));
+  const unique = incoming.filter((message) => !seen.has(conversationMessageKey(message)));
+  if (unique.length === 0) {
+    return current;
+  }
+  return mode === "prepend" ? [...unique, ...current] : [...current, ...unique];
+}
+
+export function mergeConversationEvents(
+  current: ConversationStreamEvent[],
+  incoming: ConversationStreamEvent[],
+  mode: "prepend" | "append",
+): ConversationStreamEvent[] {
+  if (incoming.length === 0) {
+    return current;
+  }
+  const seen = new Set(current.map((event) => conversationEventKey(event)));
+  const unique = incoming.filter((event) => !seen.has(conversationEventKey(event)));
+  if (unique.length === 0) {
+    return current;
+  }
+  return mode === "prepend" ? [...unique, ...current] : [...current, ...unique];
+}
+
+export function hasOlderConversationHistory(
+  messages: ConversationMessage[],
+  events: ConversationStreamEvent[],
+): boolean {
+  const oldestTurn = Number(messages[0]?.turn_number || 0);
+  if (oldestTurn > 1) {
+    return true;
+  }
+  const oldestEvent = events[0];
+  return isDurableConversationEvent(oldestEvent) && Number(oldestEvent?.seq || 0) > 1;
+}
+
+export function durableConversationSeq(events: ConversationStreamEvent[]): number {
+  return Math.max(
+    0,
+    ...events
+      .filter((event) => !event._optimistic && event.turn_number == null && Number(event.seq || 0) > 0)
+      .map((event) => event.seq),
+  );
+}
+
+function settledValue<T>(
+  result: PromiseSettledResult<T>,
+  fallback: T,
+): T {
+  return result.status === "fulfilled" ? result.value : fallback;
+}
+
+function firstSettledError(
+  results: PromiseSettledResult<unknown>[],
+): Error | null {
+  for (const result of results) {
+    if (result.status !== "rejected") {
+      continue;
+    }
+    if (result.reason instanceof Error) {
+      return result.reason;
+    }
+    return new Error(String(result.reason || "Request failed"));
+  }
+  return null;
+}
+
+export function shouldContinuouslySyncConversation(options: {
+  localProcessing: boolean;
+  turnPending: boolean;
+  streaming: boolean;
+  serverReportedActive: boolean;
+}): boolean {
+  return Boolean(
+    options.localProcessing
+    || options.turnPending
+    || options.streaming
+    || options.serverReportedActive,
+  );
+}
+
+const INITIAL_TURN_PROGRESS_EVENT_TYPES = new Set([
+  "assistant_text",
+  "assistant_thinking",
+  "tool_call_started",
+  "tool_call_completed",
+  "turn_separator",
+  "turn_interrupted",
+]);
+
+export function isInitialTurnProgressEvent(eventType: string): boolean {
+  return INITIAL_TURN_PROGRESS_EVENT_TYPES.has(eventType);
+}
+
+export function defaultConversationTitle(title: string | null | undefined): boolean {
+  return /^Conversation [a-f0-9]{6,}$/.test(String(title || ""));
+}
+
+export interface PendingConversationTitle {
+  conversationId: string;
+  title: string;
+}
+
+export function reconcilePendingConversationTitle<T extends { id: string; title: string }>(
+  detail: T,
+  pendingTitle: PendingConversationTitle | null | undefined,
+): { detail: T; keepPending: boolean } {
+  if (!pendingTitle || pendingTitle.conversationId !== detail.id) {
+    return { detail, keepPending: false };
+  }
+
+  const incomingTitle = String(detail.title || "").trim();
+  if (!incomingTitle || defaultConversationTitle(incomingTitle)) {
+    return {
+      detail: {
+        ...detail,
+        title: pendingTitle.title,
+      },
+      keepPending: true,
+    };
+  }
+
+  if (incomingTitle === pendingTitle.title) {
+    return { detail, keepPending: false };
+  }
+
+  return { detail, keepPending: false };
+}
+
+function optimisticUserText(event: ConversationStreamEvent): string {
+  return String(event.payload.text || "");
+}
+
+function optimisticUserEventMatchIndex(
+  events: ConversationStreamEvent[],
+  text: string,
+  options?: { preferNonQueued?: boolean },
+): number {
+  const matchEvent = (event: ConversationStreamEvent, allowQueued: boolean) => (
+    event._optimistic
+    && event.event_type === "user_message"
+    && optimisticUserText(event) === text
+    && (allowQueued || event._delivery_state !== "queued")
+  );
+
+  if (options?.preferNonQueued !== false) {
+    const nonQueuedIndex = events.findIndex((event) => matchEvent(event, false));
+    if (nonQueuedIndex >= 0) {
+      return nonQueuedIndex;
+    }
+  }
+
+  return events.findIndex((event) => matchEvent(event, true));
+}
+
+export function reconcileOptimisticConversationEvents(
+  current: ConversationStreamEvent[],
+  acknowledgedEvents: ConversationStreamEvent[],
+): ConversationStreamEvent[] {
+  const acknowledgedUserTexts = acknowledgedEvents
+    .filter((event) => event.event_type === "user_message")
+    .map((event) => optimisticUserText(event))
+    .filter((text) => text.length > 0);
+  if (acknowledgedUserTexts.length === 0) {
+    return current;
+  }
+
+  let next = current;
+  for (const text of acknowledgedUserTexts) {
+    const matchIndex = optimisticUserEventMatchIndex(next, text);
+    if (matchIndex >= 0) {
+      next = [...next.slice(0, matchIndex), ...next.slice(matchIndex + 1)];
+    }
+  }
+  return next;
+}
+
+export async function hydrateConversationReplayPages(args: {
+  seedMessages: ConversationMessage[];
+  seedEvents: ConversationStreamEvent[];
+  fetchMessagesPage: (beforeTurn: number) => Promise<ConversationMessage[]>;
+  fetchEventsPage: (options: { beforeSeq?: number; beforeTurn?: number }) => Promise<ConversationStreamEvent[]>;
+}): Promise<{
+  messages: ConversationMessage[];
+  events: ConversationStreamEvent[];
+  hasOlder: boolean;
+}> {
+  const {
+    seedMessages,
+    seedEvents,
+    fetchMessagesPage,
+    fetchEventsPage,
+  } = args;
+  let replayMessages = seedMessages;
+  let replayEvents = seedEvents;
+  let keepLoading = hasOlderConversationHistory(replayMessages, replayEvents);
+
+  while (keepLoading) {
+    const oldestTurn = replayMessages[0]?.turn_number;
+    const oldestEvent = replayEvents[0];
+    const oldestSeq = isDurableConversationEvent(oldestEvent) ? oldestEvent?.seq : undefined;
+    const [olderMessages, olderEvents] = await Promise.all([
+      oldestTurn != null
+        ? fetchMessagesPage(oldestTurn)
+        : Promise.resolve([]),
+      (oldestSeq != null || oldestTurn != null)
+        ? fetchEventsPage({
+            beforeSeq: oldestSeq,
+            beforeTurn: oldestTurn,
+          })
+        : Promise.resolve([]),
+    ]);
+
+    if (olderMessages.length === 0 && olderEvents.length === 0) {
+      keepLoading = false;
+      break;
+    }
+
+    replayMessages = mergeConversationMessages(replayMessages, olderMessages, "prepend");
+    replayEvents = mergeConversationEvents(replayEvents, olderEvents, "prepend");
+    keepLoading = hasOlderConversationHistory(replayMessages, replayEvents);
+  }
+
+  return {
+    messages: replayMessages,
+    events: replayEvents,
+    hasOlder: keepLoading,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Hook
 // ---------------------------------------------------------------------------
 
 export function useConversation(deps: {
   selectedConversationId: string;
+  connectionState?: "connecting" | "connected" | "failed";
   setSelectedConversationId: React.Dispatch<React.SetStateAction<string>>;
   selectedWorkspaceId: string;
   overview: WorkspaceOverview | null;
@@ -155,6 +424,7 @@ export function useConversation(deps: {
 }): ConversationState & ConversationActions {
   const {
     selectedConversationId,
+    connectionState = "connected",
     setSelectedConversationId,
     selectedWorkspaceId,
     overview,
@@ -211,21 +481,60 @@ export function useConversation(deps: {
   const conversationMatchRefs = useRef<Array<HTMLDivElement | null>>([]);
   const turnTimeoutCleanupRef = useRef<(() => void) | null>(null);
   const autoTitledRef = useRef(false);
+  const conversationReplayHydrationTokenRef = useRef(0);
   const conversationMessagesRef = useRef<ConversationMessage[]>([]);
   const conversationEventsRef = useRef<ConversationStreamEvent[]>([]);
   const optimisticConversationEventsRef = useRef<ConversationStreamEvent[]>([]);
   const conversationDetailRef = useRef<ConversationDetail | null>(null);
+  const conversationStatusRef = useRef<ConversationStatus | null>(null);
+  const conversationStreamingRef = useRef(false);
+  const streamingTextRef = useRef("");
+  const streamingThinkingRef = useRef("");
+  const streamingToolCallsRef = useRef<Array<{
+    id: string;
+    tool_name: string;
+    started_at: string;
+    completed: boolean;
+    success?: boolean;
+    args_preview?: string;
+    output_preview?: string;
+    elapsed_ms?: number;
+  }>>([]);
+  const lastTurnStatsRef = useRef<{
+    tokens: number;
+    tool_count: number;
+    visible: boolean;
+  } | null>(null);
+  const queuedMessagesRef = useRef<Array<{
+    id: string;
+    text: string;
+    queuedAt: number;
+    type: "inject" | "redirect" | "next";
+  }>>([]);
+  const conversationTurnPendingRef = useRef(false);
   const conversationStreamAfterSeqRef = useRef(0);
+  const conversationStreamMaxSeenSeqRef = useRef(0);
   const conversationStreamActivityAtRef = useRef(0);
+  const pendingConversationStreamEventsRef = useRef<ConversationStreamEvent[]>([]);
+  const conversationStreamFrameRef = useRef<number | null>(null);
+  const conversationSyncInFlightRef = useRef(false);
+  const pendingConversationTitleRef = useRef<PendingConversationTitle | null>(null);
   const [conversationStreamReady, setConversationStreamReady] = useState(false);
-
-  function defaultConversationTitle(title: string | null | undefined): boolean {
-    return /^Conversation [a-f0-9]{6,}$/.test(String(title || ""));
-  }
 
   function trimmedConversationTitleFromText(text: string): string {
     const raw = String(text || "").trim();
     return raw.length > 60 ? `${raw.slice(0, 57)}...` : raw;
+  }
+
+  function applyIncomingConversationDetail(detail: ConversationDetail) {
+    const reconciled = reconcilePendingConversationTitle(
+      detail,
+      pendingConversationTitleRef.current,
+    );
+    pendingConversationTitleRef.current = reconciled.keepPending
+      ? pendingConversationTitleRef.current
+      : null;
+    setConversationDetail(reconciled.detail);
   }
 
   function maybeApplyOptimisticConversationTitle(rawText: string) {
@@ -235,23 +544,33 @@ export function useConversation(deps: {
     }
     const nextTitle = trimmedConversationTitleFromText(rawText);
     if (!nextTitle) return;
+    const conversationId = detail.id;
+    const workspaceId = selectedWorkspaceId;
     autoTitledRef.current = true;
+    pendingConversationTitleRef.current = {
+      conversationId,
+      title: nextTitle,
+    };
     setConversationDetail((current) => current ? { ...current, title: nextTitle } : current);
-    void patchConversation(selectedConversationId, { title: nextTitle }).then(() => {
-      if (selectedWorkspaceId) {
-        return refreshWorkspaceSurface(selectedWorkspaceId);
+    void patchConversation(conversationId, { title: nextTitle }).then((updatedDetail) => {
+      if (selectedConversationId === conversationId) {
+        applyIncomingConversationDetail(updatedDetail);
+      }
+      if (workspaceId) {
+        return refreshWorkspaceSurface(workspaceId);
       }
       return Promise.resolve();
     }).catch(() => {
       autoTitledRef.current = false;
+      pendingConversationTitleRef.current = null;
     });
   }
 
   // Pagination
   const [hasOlderMessages, setHasOlderMessages] = useState(false);
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
-  const MESSAGE_PAGE_SIZE = 100;
-  const EVENT_PAGE_SIZE = 200;
+  const MESSAGE_PAGE_SIZE = 250;
+  const EVENT_PAGE_SIZE = 250;
 
   // ---------------------------------------------------------------------------
   // Computed values
@@ -288,6 +607,11 @@ export function useConversation(deps: {
     conversationDetail
     || workspaceConversationRows.find((conversation) => conversation.id === selectedConversationId)
     || null;
+  const selectedConversationServerActive = Boolean(
+    selectedConversationSummary
+    && "is_active" in selectedConversationSummary
+    && selectedConversationSummary.is_active,
+  );
   const selectedConversationRunIds = selectedConversationSummary
     ? ("linked_run_ids" in selectedConversationSummary ? selectedConversationSummary.linked_run_ids : [])
     : [];
@@ -338,56 +662,96 @@ export function useConversation(deps: {
     conversationDetailRef.current = conversationDetail;
   }, [conversationDetail]);
 
+  useEffect(() => {
+    conversationStatusRef.current = conversationStatus;
+  }, [conversationStatus]);
+
+  useEffect(() => {
+    conversationStreamingRef.current = conversationStreaming;
+  }, [conversationStreaming]);
+
+  useEffect(() => {
+    streamingTextRef.current = streamingText;
+  }, [streamingText]);
+
+  useEffect(() => {
+    streamingThinkingRef.current = streamingThinking;
+  }, [streamingThinking]);
+
+  useEffect(() => {
+    streamingToolCallsRef.current = streamingToolCalls;
+  }, [streamingToolCalls]);
+
+  useEffect(() => {
+    lastTurnStatsRef.current = lastTurnStats;
+  }, [lastTurnStats]);
+
+  useEffect(() => {
+    queuedMessagesRef.current = queuedMessages;
+  }, [queuedMessages]);
+
+  useEffect(() => {
+    conversationTurnPendingRef.current = conversationTurnPending;
+  }, [conversationTurnPending]);
+
   // ---------------------------------------------------------------------------
   // useEffectEvent handlers
   // ---------------------------------------------------------------------------
 
   const refreshConversation = useEffectEvent(async (conversationId: string) => {
-    const latestSeq = Math.max(0, ...conversationEventsRef.current.map((event) => event.seq));
-    const [detail, events, status] = await Promise.all([
+    const latestSeq = durableConversationSeq(conversationEventsRef.current);
+    const [detailResult, eventsResult, statusResult, messagesResult] = await Promise.allSettled([
       fetchConversationDetail(conversationId),
       fetchConversationEvents(conversationId, { afterSeq: latestSeq, limit: EVENT_PAGE_SIZE }),
       fetchConversationStatus(conversationId),
+      fetchConversationMessages(conversationId, {
+        latest: true,
+        limit: MESSAGE_PAGE_SIZE,
+      }),
     ]);
-    setConversationDetail(detail);
+    const detail = settledValue(detailResult, null);
+    const events = settledValue(eventsResult, [] as ConversationStreamEvent[]);
+    const status = settledValue(statusResult, null);
+    const messages = settledValue(messagesResult, [] as ConversationMessage[]);
+    if (detail == null && events.length === 0 && status == null && messages.length === 0) {
+      throw firstSettledError([detailResult, eventsResult, statusResult, messagesResult])
+        || new Error("Failed to load conversation.");
+    }
+    if (detail != null) {
+      applyIncomingConversationDetail(detail);
+    }
     setConversationLoadError("");
     setConversationStreamReady(true);
+    if (messages.length > 0) {
+      setConversationMessages((current) =>
+        mergeConversationMessages(current, messages, "append"),
+      );
+    }
     if (events.length > 0) {
       setConversationEvents((current) => {
-        const seen = new Set(current.map((row) => row.seq));
-        const appended = events.filter((row) => !seen.has(row.seq));
+        const seen = new Set(current.map((row) => conversationEventKey(row)));
+        const appended = events.filter((row) => !seen.has(conversationEventKey(row)));
         return appended.length > 0 ? [...current, ...appended] : current;
       });
-      const acknowledgedUserTexts = events
-        .filter((event) => event.event_type === "user_message")
-        .map((event) => String(event.payload.text || ""))
-        .filter((text) => text.length > 0);
-      if (acknowledgedUserTexts.length > 0) {
-        setOptimisticConversationEvents((current) => {
-          let next = current;
-          for (const text of acknowledgedUserTexts) {
-            const matchIndex = next.findIndex((event) =>
-              event._optimistic
-              && event.event_type === "user_message"
-              && String(event.payload.text || "") === text
-            );
-            if (matchIndex >= 0) {
-              next = [...next.slice(0, matchIndex), ...next.slice(matchIndex + 1)];
-            }
-          }
-          return next;
-        });
-      }
-      const maxFetchedSeq = Math.max(0, ...events.map((event) => event.seq));
+      setOptimisticConversationEvents((current) =>
+        reconcileOptimisticConversationEvents(current, events),
+      );
+      const maxFetchedSeq = durableConversationSeq(events);
       conversationStreamAfterSeqRef.current = Math.max(
         conversationStreamAfterSeqRef.current,
         maxFetchedSeq,
       );
+      conversationStreamMaxSeenSeqRef.current = Math.max(
+        conversationStreamMaxSeenSeqRef.current,
+        ...events.map((row) => row.seq),
+      );
     }
-    setConversationStatus(status);
+    if (status != null) {
+      setConversationStatus(status);
+    }
     // Sync turn pending state from server — clears stale "Processing" indicators
     setLoadingConversationDetail(false);
-    if (!status.processing) {
+    if (status != null && !status.processing) {
       setConversationTurnPending(false);
       setConversationStreaming(false);
       setStreamingText(""); setStreamingThinking("");
@@ -414,46 +778,57 @@ export function useConversation(deps: {
     }
   });
 
-  async function loadOlderMessages() {
-    if (!selectedConversationId || loadingOlderMessages || !hasOlderMessages) return;
+  const hydrateConversationReplay = useEffectEvent(async (options?: {
+    conversationId?: string;
+    seedMessages?: ConversationMessage[];
+    seedEvents?: ConversationStreamEvent[];
+  }) => {
+    const conversationId = options?.conversationId || selectedConversationId;
+    const seededHydration = Array.isArray(options?.seedMessages) || Array.isArray(options?.seedEvents);
+    if (!conversationId || loadingOlderMessages || (!seededHydration && !hasOlderMessages)) {
+      return;
+    }
+    const token = ++conversationReplayHydrationTokenRef.current;
     setLoadingOlderMessages(true);
     try {
-      const oldestTurn = conversationMessages[0]?.turn_number;
-      const oldestSeq = conversationEvents[0]?.seq;
-      const [olderMessages, olderEvents] = await Promise.all([
-        oldestTurn != null
-          ? fetchConversationMessages(selectedConversationId, {
-              beforeTurn: oldestTurn,
-              limit: MESSAGE_PAGE_SIZE,
-            })
-          : Promise.resolve([]),
-        oldestSeq != null
-          ? fetchConversationEvents(selectedConversationId, {
-              beforeSeq: oldestSeq,
-              limit: EVENT_PAGE_SIZE,
-            })
-          : Promise.resolve([]),
-      ]);
+      const replay = await hydrateConversationReplayPages({
+        seedMessages: options?.seedMessages || conversationMessagesRef.current,
+        seedEvents: options?.seedEvents || conversationEventsRef.current,
+        fetchMessagesPage: (beforeTurn) =>
+          fetchConversationMessages(conversationId, {
+            beforeTurn,
+            limit: MESSAGE_PAGE_SIZE,
+          }),
+        fetchEventsPage: ({ beforeSeq, beforeTurn }) =>
+          fetchConversationEvents(conversationId, {
+            beforeSeq,
+            beforeTurn,
+            limit: EVENT_PAGE_SIZE,
+          }),
+      });
 
-      if (olderMessages.length > 0) {
-        setConversationMessages((current) => [...olderMessages, ...current]);
+      if (token === conversationReplayHydrationTokenRef.current) {
+        setConversationMessages((current) =>
+          mergeConversationMessages(current, replay.messages, "prepend"),
+        );
+        setConversationEvents((current) =>
+          mergeConversationEvents(current, replay.events, "prepend"),
+        );
+        setHasOlderMessages(replay.hasOlder);
       }
-      if (olderEvents.length > 0) {
-        setConversationEvents((current) => {
-          const seen = new Set(current.map((row) => row.seq));
-          const prepended = olderEvents.filter((row) => !seen.has(row.seq));
-          return prepended.length > 0 ? [...prepended, ...current] : current;
-        });
-      }
-
-      const hasOlderTurns = olderMessages.length > 0 && Number(olderMessages[0]?.turn_number || 0) > 1;
-      const hasOlderEvents = olderEvents.length > 0 && Number(olderEvents[0]?.seq || 0) > 1;
-      setHasOlderMessages(hasOlderTurns || hasOlderEvents);
     } catch {
-      // Silently fail — user can try scrolling up again
+      if (token === conversationReplayHydrationTokenRef.current) {
+        setHasOlderMessages(true);
+      }
     } finally {
-      setLoadingOlderMessages(false);
+      if (token === conversationReplayHydrationTokenRef.current) {
+        setLoadingOlderMessages(false);
+      }
     }
+  });
+
+  async function loadOlderMessages() {
+    await hydrateConversationReplay();
   }
 
   const scheduleConversationRefresh = useEffectEvent((options?: { includeWorkspaceSurface?: boolean }) => {
@@ -476,6 +851,435 @@ export function useConversation(deps: {
     }, 200);
   });
 
+  const syncConversationLiveState = useEffectEvent(async (conversationId: string) => {
+    if (!conversationId || conversationSyncInFlightRef.current) {
+      return;
+    }
+    conversationSyncInFlightRef.current = true;
+    try {
+      const latestSeq = durableConversationSeq(conversationEventsRef.current);
+      const [eventsResult, statusResult] = await Promise.allSettled([
+        fetchConversationEvents(conversationId, {
+          afterSeq: latestSeq,
+          limit: EVENT_PAGE_SIZE,
+        }),
+        fetchConversationStatus(conversationId),
+      ]);
+      const events = settledValue(eventsResult, [] as ConversationStreamEvent[]);
+      const status = settledValue(statusResult, null);
+      const messages = status != null && !status.processing
+        ? await fetchConversationMessages(conversationId, {
+            latest: true,
+            limit: MESSAGE_PAGE_SIZE,
+          }).catch(() => [] as ConversationMessage[])
+        : [];
+      if (events.length === 0 && status == null) {
+        throw firstSettledError([eventsResult, statusResult])
+          || new Error("Failed to refresh conversation.");
+      }
+
+      if (messages.length > 0) {
+        setConversationMessages((current) =>
+          mergeConversationMessages(current, messages, "append"),
+        );
+      }
+      if (events.length > 0) {
+        setConversationEvents((current) => {
+          const seen = new Set(current.map((row) => conversationEventKey(row)));
+          const appended = events.filter((row) => !seen.has(conversationEventKey(row)));
+          return appended.length > 0 ? [...current, ...appended] : current;
+        });
+        setOptimisticConversationEvents((current) =>
+          reconcileOptimisticConversationEvents(current, events),
+        );
+        const maxFetchedSeq = durableConversationSeq(events);
+        conversationStreamAfterSeqRef.current = Math.max(
+          conversationStreamAfterSeqRef.current,
+          maxFetchedSeq,
+        );
+        conversationStreamMaxSeenSeqRef.current = Math.max(
+          conversationStreamMaxSeenSeqRef.current,
+          ...events.map((row) => row.seq),
+        );
+        conversationStreamActivityAtRef.current = Date.now();
+      }
+
+      if (status != null) {
+        setConversationStatus(status);
+      }
+      setConversationStreamReady(true);
+
+      if (status != null && !status.processing) {
+        setConversationTurnPending(false);
+        setConversationStreaming(false);
+        setStreamingText("");
+        setStreamingThinking("");
+        setStreamingToolCalls([]);
+      }
+    } finally {
+      conversationSyncInFlightRef.current = false;
+    }
+  });
+
+  const flushConversationStreamBatch = useEffectEvent(() => {
+    if (conversationStreamFrameRef.current !== null) {
+      window.cancelAnimationFrame(conversationStreamFrameRef.current);
+      conversationStreamFrameRef.current = null;
+    }
+
+    const batch = pendingConversationStreamEventsRef.current;
+    if (batch.length === 0) {
+      return;
+    }
+    pendingConversationStreamEventsRef.current = [];
+
+    let nextEvents = conversationEventsRef.current;
+    let nextOptimisticEvents = optimisticConversationEventsRef.current;
+    let nextConversationStreaming = conversationStreamingRef.current;
+    let nextStreamingText = streamingTextRef.current;
+    let nextStreamingThinking = streamingThinkingRef.current;
+    let nextStreamingToolCalls = streamingToolCallsRef.current;
+    let nextLastTurnStats = lastTurnStatsRef.current;
+    let nextQueuedMessages = queuedMessagesRef.current;
+    let nextStatus = conversationStatusRef.current;
+    let nextTurnPending = conversationTurnPendingRef.current;
+    let queuedNextMessage: { id: string; text: string } | null = null;
+    let shouldRefreshConversation = false;
+    let shouldRefreshWorkspaceSurface = false;
+    let autoTitleCandidate = "";
+
+    const seenEventKeys = new Set(nextEvents.map((event) => conversationEventKey(event)));
+
+    for (const event of batch) {
+      conversationStreamActivityAtRef.current = Date.now();
+
+      const eventKey = conversationEventKey(event);
+      if (!seenEventKeys.has(eventKey)) {
+        seenEventKeys.add(eventKey);
+        nextEvents = [...nextEvents, event];
+      }
+
+      if (event.event_type === "user_message") {
+        nextOptimisticEvents = reconcileOptimisticConversationEvents(nextOptimisticEvents, [event]);
+      }
+
+      const isNewEvent = event.seq > conversationStreamMaxSeenSeqRef.current;
+      conversationStreamMaxSeenSeqRef.current = Math.max(
+        conversationStreamMaxSeenSeqRef.current,
+        event.seq,
+      );
+      if (!event._optimistic && event.turn_number == null && Number(event.seq || 0) > 0) {
+        conversationStreamAfterSeqRef.current = Math.max(
+          conversationStreamAfterSeqRef.current,
+          event.seq,
+        );
+      }
+
+      if (!isNewEvent) {
+        continue;
+      }
+
+      if (event.event_type === "assistant_thinking") {
+        nextConversationStreaming = true;
+        const text = String(event.payload.text || "");
+        if (text) {
+          nextStreamingThinking += text;
+        }
+      }
+
+      if (event.event_type === "assistant_text") {
+        nextConversationStreaming = true;
+        const text = String(event.payload.text || "");
+        if (text) {
+          nextStreamingText += text;
+        }
+      }
+
+      if (event.event_type === "tool_call_started") {
+        const toolName = String(event.payload.tool_name || "tool");
+        const callId = String(event.payload.tool_call_id || event.payload.id || `tc-${Date.now()}`);
+        const argsPreview = typeof event.payload.args === "object" && event.payload.args
+          ? Object.entries(event.payload.args as Record<string, unknown>)
+              .slice(0, 3)
+              .map(([key, value]) => `${key}: ${typeof value === "string" ? value.slice(0, 60) : JSON.stringify(value).slice(0, 40)}`)
+              .join(", ")
+          : "";
+        nextStreamingToolCalls = [
+          ...nextStreamingToolCalls,
+          {
+            id: callId,
+            tool_name: toolName,
+            started_at: event.created_at,
+            completed: false,
+            args_preview: argsPreview,
+          },
+        ];
+      }
+
+      if (event.event_type === "tool_call_completed") {
+        const callId = String(event.payload.tool_call_id || event.payload.id || "");
+        const toolName = String(event.payload.tool_name || "tool");
+        const success = event.payload.success !== false;
+        const elapsed = typeof event.payload.elapsed_ms === "number"
+          ? event.payload.elapsed_ms
+          : undefined;
+        const outputPreview = typeof event.payload.output === "string"
+          ? event.payload.output.slice(0, 120)
+          : typeof event.payload.error === "string"
+            ? event.payload.error.slice(0, 120)
+            : "";
+        const match = nextStreamingToolCalls.find((toolCall) =>
+          toolCall.id === callId
+          || (!callId && toolCall.tool_name === toolName && !toolCall.completed)
+        );
+        if (match) {
+          nextStreamingToolCalls = nextStreamingToolCalls.map((toolCall) =>
+            toolCall === match
+              ? {
+                  ...toolCall,
+                  completed: true,
+                  success,
+                  elapsed_ms: elapsed,
+                  output_preview: outputPreview,
+                }
+              : toolCall,
+          );
+        } else {
+          nextStreamingToolCalls = [
+            ...nextStreamingToolCalls,
+            {
+              id: callId || `tc-${Date.now()}`,
+              tool_name: toolName,
+              started_at: event.created_at,
+              completed: true,
+              success,
+              elapsed_ms: elapsed,
+              output_preview: outputPreview,
+            },
+          ];
+        }
+      }
+
+      if (event.event_type === "turn_separator") {
+        const tokens = Number(event.payload.tokens || 0);
+        const toolCount = Number(event.payload.tool_count || 0);
+        nextLastTurnStats = { tokens, tool_count: toolCount, visible: true };
+        nextConversationStreaming = false;
+        nextStreamingText = "";
+        nextStreamingThinking = "";
+        nextStreamingToolCalls = [];
+        const nextMessage = nextQueuedMessages.find((message) => message.type === "next");
+        if (nextMessage) {
+          queuedNextMessage = {
+            id: nextMessage.id,
+            text: nextMessage.text,
+          };
+          nextQueuedMessages = nextQueuedMessages.filter((message) => message.id !== nextMessage.id);
+        }
+        shouldRefreshConversation = true;
+        shouldRefreshWorkspaceSurface = true;
+
+        const detail = conversationDetailRef.current;
+        if (
+          detail
+          && defaultConversationTitle(detail.title || "")
+          && !autoTitledRef.current
+        ) {
+          const firstOptimisticUser = nextOptimisticEvents.find((candidate) =>
+            candidate.event_type === "user_message"
+          );
+          const firstUserMessage = conversationMessagesRef.current.find((message) => message.role === "user");
+          const rawTitle = String(
+            firstUserMessage?.content
+            || firstOptimisticUser?.payload.text
+            || "",
+          ).trim();
+          if (rawTitle) {
+            autoTitleCandidate = rawTitle;
+          }
+        }
+      }
+
+      if (event.event_type === "turn_interrupted") {
+        nextConversationStreaming = false;
+        nextStreamingText = "";
+        nextStreamingThinking = "";
+        nextStreamingToolCalls = [];
+        nextLastTurnStats = null;
+        nextQueuedMessages = [];
+        shouldRefreshConversation = true;
+        shouldRefreshWorkspaceSurface = true;
+      }
+
+      if (event.event_type === "user_message") {
+        nextConversationStreaming = false;
+        nextStreamingText = "";
+        nextStreamingThinking = "";
+        nextStreamingToolCalls = [];
+        nextLastTurnStats = null;
+      }
+
+      if (isInitialTurnProgressEvent(event.event_type)) {
+        nextTurnPending = false;
+        turnTimeoutCleanupRef.current?.();
+        turnTimeoutCleanupRef.current = null;
+      }
+
+      if (event.event_type === "user_message") {
+        nextStatus = {
+          conversation_id: nextStatus?.conversation_id || selectedConversationId,
+          processing: true,
+          stop_requested: nextStatus?.stop_requested || false,
+          pending_inject_count: 0,
+          awaiting_approval: false,
+          pending_approval: null,
+          awaiting_user_input: false,
+          pending_prompt: null,
+        };
+      }
+
+      if (event.event_type === "steering_instruction") {
+        const pendingCount = Number(event.payload.pending_inject_count || 0);
+        nextStatus = {
+          conversation_id: nextStatus?.conversation_id || selectedConversationId,
+          processing: nextStatus?.processing ?? true,
+          stop_requested: nextStatus?.stop_requested || false,
+          pending_inject_count: pendingCount,
+          awaiting_approval: nextStatus?.awaiting_approval || false,
+          pending_approval: nextStatus?.pending_approval || null,
+          awaiting_user_input: nextStatus?.awaiting_user_input || false,
+          pending_prompt: nextStatus?.pending_prompt || null,
+        };
+      }
+
+      if (event.event_type === "approval_requested") {
+        const pendingApproval = event.payload as unknown as ConversationApproval;
+        nextTurnPending = false;
+        nextConversationStreaming = false;
+        nextStatus = {
+          conversation_id: nextStatus?.conversation_id || selectedConversationId,
+          processing: true,
+          stop_requested: nextStatus?.stop_requested || false,
+          pending_inject_count: nextStatus?.pending_inject_count || 0,
+          awaiting_approval: true,
+          pending_approval: pendingApproval,
+          awaiting_user_input: false,
+          pending_prompt: null,
+        };
+      }
+
+      if (event.event_type === "approval_resolved") {
+        nextStatus = {
+          conversation_id: nextStatus?.conversation_id || selectedConversationId,
+          processing: true,
+          stop_requested: nextStatus?.stop_requested || false,
+          pending_inject_count: nextStatus?.pending_inject_count || 0,
+          awaiting_approval: false,
+          pending_approval: null,
+          awaiting_user_input: false,
+          pending_prompt: null,
+        };
+      }
+
+      if (event.event_type === "tool_call_completed" && event.payload.tool_name === "ask_user") {
+        const pendingPrompt = normalizeConversationPrompt(event.payload.question_payload);
+        if (pendingPrompt) {
+          nextTurnPending = false;
+          nextConversationStreaming = false;
+          nextStatus = {
+            conversation_id: nextStatus?.conversation_id || selectedConversationId,
+            processing: false,
+            stop_requested: false,
+            pending_inject_count: 0,
+            awaiting_approval: false,
+            pending_approval: null,
+            awaiting_user_input: true,
+            pending_prompt: pendingPrompt,
+          };
+        }
+      }
+
+      if (event.event_type === "turn_separator" || event.event_type === "turn_interrupted") {
+        nextStatus = {
+          conversation_id: nextStatus?.conversation_id || selectedConversationId,
+          processing: false,
+          stop_requested: false,
+          pending_inject_count: 0,
+          awaiting_approval: false,
+          pending_approval: null,
+          awaiting_user_input: false,
+          pending_prompt: null,
+        };
+      }
+    }
+
+    if (nextEvents !== conversationEventsRef.current) {
+      conversationEventsRef.current = nextEvents;
+      setConversationEvents(nextEvents);
+    }
+    if (nextOptimisticEvents !== optimisticConversationEventsRef.current) {
+      optimisticConversationEventsRef.current = nextOptimisticEvents;
+      setOptimisticConversationEvents(nextOptimisticEvents);
+    }
+    if (nextConversationStreaming !== conversationStreamingRef.current) {
+      conversationStreamingRef.current = nextConversationStreaming;
+      setConversationStreaming(nextConversationStreaming);
+    }
+    if (nextStreamingText !== streamingTextRef.current) {
+      streamingTextRef.current = nextStreamingText;
+      setStreamingText(nextStreamingText);
+    }
+    if (nextStreamingThinking !== streamingThinkingRef.current) {
+      streamingThinkingRef.current = nextStreamingThinking;
+      setStreamingThinking(nextStreamingThinking);
+    }
+    if (nextStreamingToolCalls !== streamingToolCallsRef.current) {
+      streamingToolCallsRef.current = nextStreamingToolCalls;
+      setStreamingToolCalls(nextStreamingToolCalls);
+    }
+    if (nextLastTurnStats !== lastTurnStatsRef.current) {
+      lastTurnStatsRef.current = nextLastTurnStats;
+      setLastTurnStats(nextLastTurnStats);
+    }
+    if (nextQueuedMessages !== queuedMessagesRef.current) {
+      queuedMessagesRef.current = nextQueuedMessages;
+      setQueuedMessages(nextQueuedMessages);
+    }
+    if (nextStatus !== conversationStatusRef.current) {
+      conversationStatusRef.current = nextStatus;
+      setConversationStatus(nextStatus);
+    }
+    if (nextTurnPending !== conversationTurnPendingRef.current) {
+      conversationTurnPendingRef.current = nextTurnPending;
+      setConversationTurnPending(nextTurnPending);
+    }
+
+    if (autoTitleCandidate) {
+      maybeApplyOptimisticConversationTitle(autoTitleCandidate);
+    }
+    if (queuedNextMessage) {
+      void submitConversationMessage(queuedNextMessage.text);
+    }
+    if (shouldRefreshConversation) {
+      scheduleConversationRefresh({
+        includeWorkspaceSurface: shouldRefreshWorkspaceSurface,
+      });
+    }
+  });
+
+  const queueConversationStreamEvent = useEffectEvent((event: ConversationStreamEvent) => {
+    pendingConversationStreamEventsRef.current = [
+      ...pendingConversationStreamEventsRef.current,
+      event,
+    ];
+    if (conversationStreamFrameRef.current !== null) {
+      return;
+    }
+    conversationStreamFrameRef.current = window.requestAnimationFrame(() => {
+      flushConversationStreamBatch();
+    });
+  });
+
   // ---------------------------------------------------------------------------
   // Effects
   // ---------------------------------------------------------------------------
@@ -486,6 +1290,11 @@ export function useConversation(deps: {
       if (conversationRefreshTimerRef.current !== null) {
         window.clearTimeout(conversationRefreshTimerRef.current);
       }
+      if (conversationStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(conversationStreamFrameRef.current);
+        conversationStreamFrameRef.current = null;
+      }
+      pendingConversationStreamEventsRef.current = [];
       turnTimeoutCleanupRef.current?.();
       turnTimeoutCleanupRef.current = null;
     };
@@ -501,32 +1310,87 @@ export function useConversation(deps: {
       setConversationEvents([]);
       setOptimisticConversationEvents([]);
       setConversationStatus(null);
+      conversationReplayHydrationTokenRef.current += 1;
       conversationStreamAfterSeqRef.current = 0;
+      conversationStreamMaxSeenSeqRef.current = 0;
       conversationStreamActivityAtRef.current = 0;
+      pendingConversationStreamEventsRef.current = [];
+      if (conversationStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(conversationStreamFrameRef.current);
+        conversationStreamFrameRef.current = null;
+      }
       setConversationStreamReady(false);
       setConversationTurnPending(false);
       setConversationStreaming(false);
       setHasOlderMessages(false);
+      setLoadingOlderMessages(false);
       setConversationHistoryQuery("");
       setActiveConversationMatchIndex(0);
       autoTitledRef.current = false;
       return;
     }
     autoTitledRef.current = false;
+    pendingConversationTitleRef.current = null;
+    const hasMatchingConversationDetail =
+      conversationDetailRef.current?.id === selectedConversationId;
+    if (connectionState !== "connected") {
+      if (!hasMatchingConversationDetail) {
+        setConversationDetail(null);
+        setConversationMessages([]);
+        setConversationEvents([]);
+        setOptimisticConversationEvents([]);
+        setConversationStatus(null);
+        setLoadingOlderMessages(false);
+        setConversationHistoryQuery("");
+        setActiveConversationMatchIndex(0);
+      }
+      setLoadingConversationDetail(!hasMatchingConversationDetail);
+      conversationReplayHydrationTokenRef.current += 1;
+      conversationStreamAfterSeqRef.current = 0;
+      conversationStreamMaxSeenSeqRef.current = 0;
+      conversationStreamActivityAtRef.current = 0;
+      pendingConversationStreamEventsRef.current = [];
+      if (conversationStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(conversationStreamFrameRef.current);
+        conversationStreamFrameRef.current = null;
+      }
+      setConversationStreamReady(false);
+      setConversationStreaming(false);
+      return;
+    }
+    conversationReplayHydrationTokenRef.current += 1;
     setLoadingConversationDetail(true);
     setConversationLoadError("");
+    setOptimisticConversationEvents((current) =>
+      current.filter((event) => event.session_id === selectedConversationId),
+    );
     conversationStreamAfterSeqRef.current = 0;
+    conversationStreamMaxSeenSeqRef.current = 0;
     conversationStreamActivityAtRef.current = 0;
+    pendingConversationStreamEventsRef.current = [];
+    if (conversationStreamFrameRef.current !== null) {
+      window.cancelAnimationFrame(conversationStreamFrameRef.current);
+      conversationStreamFrameRef.current = null;
+    }
     setConversationStreamReady(false);
+    if (!hasMatchingConversationDetail) {
+      setConversationDetail(null);
+      setConversationMessages([]);
+      setConversationEvents([]);
+      setConversationStatus(null);
+      setLoadingOlderMessages(false);
+      setConversationHistoryQuery("");
+      setActiveConversationMatchIndex(0);
+    }
     let cancelled = false;
 
     void (async () => {
       try {
-        const [detail, status] = await Promise.all([
+        const [detailResult, statusResult] = await Promise.allSettled([
           fetchConversationDetail(selectedConversationId),
           fetchConversationStatus(selectedConversationId),
         ]);
-        const [messages, events] = await Promise.all([
+        const [messagesResult, eventsResult] = await Promise.allSettled([
           fetchConversationMessages(selectedConversationId, {
             latest: true,
             limit: MESSAGE_PAGE_SIZE,
@@ -535,26 +1399,54 @@ export function useConversation(deps: {
             limit: EVENT_PAGE_SIZE,
           }),
         ]);
+        const detail = settledValue(detailResult, null);
+        const status = settledValue(statusResult, null);
+        const messages = settledValue(messagesResult, [] as ConversationMessage[]);
+        const events = settledValue(eventsResult, [] as ConversationStreamEvent[]);
+        if (detail == null && status == null && messages.length === 0 && events.length === 0) {
+          throw firstSettledError([detailResult, statusResult, messagesResult, eventsResult])
+            || new Error("Failed to load conversation.");
+        }
         if (!cancelled) {
-          setConversationDetail(detail);
+          if (detail != null) {
+            applyIncomingConversationDetail(detail);
+          }
           setLoadingConversationDetail(false);
           setConversationLoadError("");
           setConversationMessages(messages);
           setConversationEvents(events);
-          setOptimisticConversationEvents([]);
-          setConversationStatus(status);
-          conversationStreamAfterSeqRef.current = Math.max(
-            0,
+          setOptimisticConversationEvents((current) =>
+            reconcileOptimisticConversationEvents(
+              current.filter((event) => event.session_id === selectedConversationId),
+              events,
+            ),
+          );
+          if (status != null) {
+            setConversationStatus(status);
+          }
+          conversationStreamAfterSeqRef.current = durableConversationSeq(events);
+          conversationStreamMaxSeenSeqRef.current = Math.max(
+            conversationStreamAfterSeqRef.current,
             ...events.map((event) => event.seq),
           );
           conversationStreamActivityAtRef.current = Date.now();
           setConversationStreamReady(true);
-          const hasOlderTurns = messages.length > 0 && Number(messages[0]?.turn_number || 0) > 1;
-          const hasOlderEvents = events.length > 0 && Number(events[0]?.seq || 0) > 1;
-          setHasOlderMessages(hasOlderTurns || hasOlderEvents);
-          const isActive = status.processing && !status.awaiting_user_input && !status.awaiting_approval;
+          const hasOlder = hasOlderConversationHistory(messages, events);
+          setHasOlderMessages(hasOlder);
+          const isActive = Boolean(
+            status?.processing
+            && !status.awaiting_user_input
+            && !status.awaiting_approval,
+          );
           setConversationTurnPending(isActive);
           setConversationStreaming(false);
+          if (hasOlder) {
+            void hydrateConversationReplay({
+              conversationId: selectedConversationId,
+              seedMessages: messages,
+              seedEvents: events,
+            });
+          }
         }
       } catch (err) {
         if (!cancelled) {
@@ -562,12 +1454,15 @@ export function useConversation(deps: {
           setError(message);
           setLoadingConversationDetail(false);
           setConversationLoadError(message);
-          setConversationDetail(null);
-          setConversationMessages([]);
-          setConversationEvents([]);
-          setOptimisticConversationEvents([]);
-          setConversationStatus(null);
+          if (!hasMatchingConversationDetail) {
+            setConversationDetail(null);
+            setConversationMessages([]);
+            setConversationEvents([]);
+            setOptimisticConversationEvents([]);
+            setConversationStatus(null);
+          }
           setConversationStreamReady(false);
+          setLoadingOlderMessages(false);
           if (
             selectedWorkspaceId
             && /404|conversation not found/i.test(message)
@@ -581,10 +1476,18 @@ export function useConversation(deps: {
     return () => {
       cancelled = true;
     };
-  }, [selectedConversationId]);
+  }, [connectionState, selectedConversationId, selectedWorkspaceId]);
 
   // Conversation stream subscription
   useEffect(() => {
+    if (connectionState !== "connected") {
+      setConversationStreaming(false);
+      setStreamingText("");
+      setStreamingThinking("");
+      setStreamingToolCalls([]);
+      setLastTurnStats(null);
+      return;
+    }
     if (!selectedConversationId || !conversationStreamReady) {
       setConversationStreaming(false);
       setStreamingText(""); setStreamingThinking("");
@@ -596,247 +1499,19 @@ export function useConversation(deps: {
     setStreamingText(""); setStreamingThinking("");
     setStreamingToolCalls([]);
     setLastTurnStats(null);
-    // Track the highest seq seen so far to distinguish new events from replays
-    let maxSeenSeq = Math.max(0, conversationStreamAfterSeqRef.current);
+    streamingTextRef.current = "";
+    streamingThinkingRef.current = "";
+    streamingToolCallsRef.current = [];
+    lastTurnStatsRef.current = null;
+    conversationStreamMaxSeenSeqRef.current = Math.max(
+      conversationStreamMaxSeenSeqRef.current,
+      conversationStreamAfterSeqRef.current,
+    );
 
     const cleanup = subscribeConversationStream(
       selectedConversationId,
       (event) => {
-        conversationStreamActivityAtRef.current = Date.now();
-
-        const isNewEvent = event.seq > maxSeenSeq;
-        maxSeenSeq = Math.max(maxSeenSeq, event.seq);
-        conversationStreamAfterSeqRef.current = Math.max(
-          conversationStreamAfterSeqRef.current,
-          event.seq,
-        );
-
-        setConversationEvents((current) => {
-          if (current.some((row) => row.seq === event.seq)) {
-            return current;
-          }
-          return [...current, event];
-        });
-        if (event.event_type === "user_message") {
-          const eventText = String(event.payload.text || "");
-          if (eventText) {
-            setOptimisticConversationEvents((current) => {
-              const matchIndex = current.findIndex((candidate) =>
-                candidate._optimistic
-                && candidate.event_type === "user_message"
-                && String(candidate.payload.text || "") === eventText
-              );
-              return matchIndex >= 0
-                ? [...current.slice(0, matchIndex), ...current.slice(matchIndex + 1)]
-                : current;
-            });
-          }
-        }
-
-        if (!isNewEvent) return;
-
-        // --- Live streaming: accumulate text, thinking, and track tool calls ---
-        if (event.event_type === "assistant_thinking") {
-          setConversationStreaming(true);
-          const text = String(event.payload.text || "");
-          if (text) {
-            setStreamingThinking((current) => current + text);
-          }
-        }
-        if (event.event_type === "assistant_text") {
-          setConversationStreaming(true);
-          const text = String(event.payload.text || "");
-          if (text) {
-            setStreamingText((current) => current + text);
-          }
-        }
-        if (event.event_type === "tool_call_started") {
-          const toolName = String(event.payload.tool_name || "tool");
-          const callId = String(event.payload.tool_call_id || event.payload.id || `tc-${Date.now()}`);
-          const argsPreview = typeof event.payload.args === "object" && event.payload.args
-            ? Object.entries(event.payload.args as Record<string, unknown>)
-                .slice(0, 3)
-                .map(([k, v]) => `${k}: ${typeof v === "string" ? v.slice(0, 60) : JSON.stringify(v).slice(0, 40)}`)
-                .join(", ")
-            : "";
-          setStreamingToolCalls((current) => [
-            ...current,
-            { id: callId, tool_name: toolName, started_at: event.created_at, completed: false, args_preview: argsPreview },
-          ]);
-        }
-        if (event.event_type === "tool_call_completed") {
-          const callId = String(event.payload.tool_call_id || event.payload.id || "");
-          const toolName = String(event.payload.tool_name || "tool");
-          const success = event.payload.success !== false;
-          const elapsed = typeof event.payload.elapsed_ms === "number" ? event.payload.elapsed_ms : undefined;
-          const outputPreview = typeof event.payload.output === "string"
-            ? event.payload.output.slice(0, 120)
-            : typeof event.payload.error === "string"
-              ? event.payload.error.slice(0, 120)
-              : "";
-          setStreamingToolCalls((current) => {
-            const match = current.find((tc) => tc.id === callId || (!callId && tc.tool_name === toolName && !tc.completed));
-            if (match) {
-              return current.map((tc) =>
-                tc === match ? { ...tc, completed: true, success, elapsed_ms: elapsed, output_preview: outputPreview } : tc
-              );
-            }
-            // If we didn't find a matching started call, add a completed one
-            return [...current, { id: callId || `tc-${Date.now()}`, tool_name: toolName, started_at: event.created_at, completed: true, success, elapsed_ms: elapsed, output_preview: outputPreview }];
-          });
-        }
-        if (event.event_type === "turn_separator") {
-          const tokens = Number(event.payload.tokens || 0);
-          const toolCount = Number(event.payload.tool_count || 0);
-          setLastTurnStats({ tokens, tool_count: toolCount, visible: true });
-          // Clear streaming buffer on turn completion
-          setConversationStreaming(false);
-          setStreamingText(""); setStreamingThinking("");
-          setStreamingToolCalls([]);
-          // Auto-send the first queued "next" message, clear the rest
-          setQueuedMessages((current) => {
-            const nextMsg = current.find((m) => m.type === "next");
-            if (nextMsg) {
-              // Fire and forget — send as a new turn
-              void submitConversationMessage(nextMsg.text);
-            }
-            return current.filter((m) => m !== nextMsg && m.type !== "next");
-          });
-          scheduleConversationRefresh({ includeWorkspaceSurface: true });
-        }
-        if (event.event_type === "turn_interrupted") {
-          setConversationStreaming(false);
-          setStreamingText(""); setStreamingThinking("");
-          setStreamingToolCalls([]);
-          setLastTurnStats(null);
-          setQueuedMessages([]);
-          scheduleConversationRefresh({ includeWorkspaceSurface: true });
-        }
-        if (event.event_type === "user_message") {
-          // Clear streaming buffer for new turn — but preserve queued injects
-          setConversationStreaming(false);
-          setStreamingText(""); setStreamingThinking("");
-          setStreamingToolCalls([]);
-          setLastTurnStats(null);
-        }
-        // Auto-title: only on the very first turn (turn_count was 0 before this turn)
-        if (event.event_type === "turn_separator" && isNewEvent) {
-          const detail = conversationDetailRef.current;
-          const turnCount = Number(event.payload.turn_count ?? event.payload.tool_count ?? -1);
-          // Only auto-title if title still matches default AND this is the first turn
-          if (
-            detail
-            && defaultConversationTitle(detail.title || "")
-            && !autoTitledRef.current
-          ) {
-            const firstOptimisticUser = optimisticConversationEventsRef.current.find((evt) => evt.event_type === "user_message");
-            const firstUserMsg = conversationMessagesRef.current.find((m) => m.role === "user");
-            const raw = String(
-              firstUserMsg?.content
-              || firstOptimisticUser?.payload.text
-              || "",
-            ).trim();
-            if (raw) {
-              maybeApplyOptimisticConversationTitle(raw);
-            }
-          }
-        }
-        // --- End live streaming ---
-
-        if (
-          event.event_type === "assistant_text"
-          || event.event_type === "turn_separator"
-          || event.event_type === "turn_interrupted"
-        ) {
-          setConversationTurnPending(false);
-          // Clear the safety timeout — the turn is alive
-          turnTimeoutCleanupRef.current?.();
-          turnTimeoutCleanupRef.current = null;
-        }
-        if (event.event_type === "user_message") {
-          setConversationStatus((current) => ({
-            conversation_id: current?.conversation_id || selectedConversationId,
-            processing: true,
-            stop_requested: current?.stop_requested || false,
-            pending_inject_count: 0,
-            awaiting_approval: false,
-            pending_approval: null,
-            awaiting_user_input: false,
-            pending_prompt: null,
-          }));
-        }
-        if (event.event_type === "steering_instruction") {
-          const pendingCount = Number(event.payload.pending_inject_count || 0);
-          setConversationStatus((current) => ({
-            conversation_id: current?.conversation_id || selectedConversationId,
-            processing: current?.processing ?? true,
-            stop_requested: current?.stop_requested || false,
-            pending_inject_count: pendingCount,
-            awaiting_approval: current?.awaiting_approval || false,
-            pending_approval: current?.pending_approval || null,
-            awaiting_user_input: current?.awaiting_user_input || false,
-            pending_prompt: current?.pending_prompt || null,
-          }));
-          // Don't remove from visual queue here — the SSE event arrives
-          // almost instantly after inject POST, causing the UI to flash.
-          // Queue is cleared on turn_separator when injects are consumed.
-        }
-        if (event.event_type === "approval_requested") {
-          const pendingApproval = event.payload as unknown as ConversationApproval;
-          setConversationTurnPending(false);
-          setConversationStreaming(false);
-          setConversationStatus((current) => ({
-            conversation_id: current?.conversation_id || selectedConversationId,
-            processing: true,
-            stop_requested: current?.stop_requested || false,
-            pending_inject_count: current?.pending_inject_count || 0,
-            awaiting_approval: true,
-            pending_approval: pendingApproval,
-            awaiting_user_input: false,
-            pending_prompt: null,
-          }));
-        }
-        if (event.event_type === "approval_resolved") {
-          setConversationStatus((current) => ({
-            conversation_id: current?.conversation_id || selectedConversationId,
-            processing: true,
-            stop_requested: current?.stop_requested || false,
-            pending_inject_count: current?.pending_inject_count || 0,
-            awaiting_approval: false,
-            pending_approval: null,
-            awaiting_user_input: false,
-            pending_prompt: null,
-          }));
-        }
-        if (event.event_type === "tool_call_completed" && event.payload.tool_name === "ask_user") {
-          const pendingPrompt = normalizeConversationPrompt(event.payload.question_payload);
-          if (pendingPrompt) {
-            setConversationTurnPending(false);
-            setConversationStreaming(false);
-            setConversationStatus((current) => ({
-              conversation_id: current?.conversation_id || selectedConversationId,
-              processing: false,
-              stop_requested: false,
-              pending_inject_count: 0,
-              awaiting_approval: false,
-              pending_approval: null,
-              awaiting_user_input: true,
-              pending_prompt: pendingPrompt,
-            }));
-          }
-        }
-        if (event.event_type === "turn_separator" || event.event_type === "turn_interrupted") {
-          setConversationStatus((current) => ({
-            conversation_id: current?.conversation_id || selectedConversationId,
-            processing: false,
-            stop_requested: false,
-            pending_inject_count: 0,
-            awaiting_approval: false,
-            pending_approval: null,
-            awaiting_user_input: false,
-            pending_prompt: null,
-          }));
-        }
+        queueConversationStreamEvent(event);
       },
       () => {
         // SSE errors are transient — EventSource auto-reconnects.
@@ -847,34 +1522,65 @@ export function useConversation(deps: {
       { afterSeq: conversationStreamAfterSeqRef.current },
     );
     return () => {
+      if (conversationStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(conversationStreamFrameRef.current);
+        conversationStreamFrameRef.current = null;
+      }
+      pendingConversationStreamEventsRef.current = [];
       setConversationStreaming(false);
       cleanup();
     };
-  }, [conversationStreamReady, scheduleConversationRefresh, selectedConversationId]);
+  }, [
+    connectionState,
+    conversationStreamReady,
+    queueConversationStreamEvent,
+    scheduleConversationRefresh,
+    selectedConversationId,
+  ]);
 
   useEffect(() => {
-    if (!selectedConversationId || !conversationIsProcessing) {
+    if (connectionState !== "connected") {
       return;
     }
-    const timer = window.setInterval(() => {
-      const staleForMs = Date.now() - conversationStreamActivityAtRef.current;
-      if (conversationStreamActivityAtRef.current > 0 && staleForMs < 8000) {
-        return;
+    if (!selectedConversationId || !conversationStreamReady) {
+      return;
+    }
+    const shouldSync = shouldContinuouslySyncConversation({
+      localProcessing: conversationIsProcessing,
+      turnPending: conversationTurnPending,
+      streaming: conversationStreaming,
+      serverReportedActive: selectedConversationServerActive,
+    });
+    if (!shouldSync) {
+      return;
+    }
+
+    void syncConversationLiveState(selectedConversationId).catch((err) => {
+      if (!isTransientRequestError(err)) {
+        setError(err instanceof Error ? err.message : "Failed to refresh conversation.");
       }
-      void refreshConversation(selectedConversationId).catch((err) => {
+    });
+
+    const timer = window.setInterval(() => {
+      void syncConversationLiveState(selectedConversationId).catch((err) => {
         if (!isTransientRequestError(err)) {
           setError(err instanceof Error ? err.message : "Failed to refresh conversation.");
         }
       });
-    }, 5000);
+    }, 1250);
     return () => {
       window.clearInterval(timer);
     };
   }, [
+    connectionState,
     conversationIsProcessing,
-    refreshConversation,
+    conversationStreaming,
+    conversationStreamReady,
+    conversationTurnPending,
     selectedConversationId,
+    selectedConversationServerActive,
     setError,
+    syncConversationLiveState,
   ]);
 
   // Conversation match scroll tracking
@@ -957,6 +1663,7 @@ export function useConversation(deps: {
     setSendingConversationMessage(true);
     setError("");
     setNotice("");
+    let optimisticClientId = "";
     try {
       if (isProcessing) {
         // Conversation is active — queue for next turn (user can inject/redirect manually)
@@ -969,6 +1676,7 @@ export function useConversation(deps: {
         // Optimistically add the user message to the visible list immediately
         const createdAt = new Date().toISOString();
         const clientId = `local-user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        optimisticClientId = clientId;
         setOptimisticConversationEvents((current) => [
           ...current,
           {
@@ -981,6 +1689,7 @@ export function useConversation(deps: {
             created_at: createdAt,
             _optimistic: true,
             _client_id: clientId,
+            _delivery_state: "sending",
           },
         ]);
         setConversationComposerMessage("");
@@ -999,31 +1708,41 @@ export function useConversation(deps: {
           selectedConversationId,
           message,
         );
+        setOptimisticConversationEvents((current) => current.map((event) => (
+          event._client_id === optimisticClientId
+            ? { ...event, _delivery_state: "accepted" }
+            : event
+        )));
         maybeApplyOptimisticConversationTitle(message);
 
-        // Safety timeout: if no streaming event arrives within 30s,
+        // Safety timeout: if no assistant-side progress arrives within 120s,
         // reset the pending state so the UI doesn't freeze forever.
         const turnTimeoutId = window.setTimeout(() => {
           setConversationTurnPending((current) => {
             if (current) {
               setError("Thread timed out waiting for a response. Try sending again.");
+              setOptimisticConversationEvents((events) => events.map((event) => (
+                event._client_id === optimisticClientId
+                  ? { ...event, _delivery_state: "failed" }
+                  : event
+              )));
               setConversationStatus((s) => s ? { ...s, processing: false } : s);
             }
             return false;
           });
         }, 120_000);
 
-        // Clear the timeout when streaming events start arriving
+        // Clear the timeout once the turn starts producing assistant-side progress.
         const clearTurnTimeout = () => window.clearTimeout(turnTimeoutId);
-        // The turn_separator or assistant_text event handler already sets
-        // conversationTurnPending to false, which will make this timeout a no-op.
+        // Progress events set conversationTurnPending to false, which makes this
+        // timeout a no-op even if the cleanup is not called first.
         // But we store the cleanup so it can be cleared on unmount.
         turnTimeoutCleanupRef.current = clearTurnTimeout;
       }
     } catch (err) {
       if (!isProcessing) {
         setOptimisticConversationEvents((current) =>
-          current.filter((event) => !(event._optimistic && String(event.payload.text || "") === message)),
+          current.filter((event) => event._client_id !== optimisticClientId),
         );
         setConversationTurnPending(false);
         setConversationStatus((current) => ({

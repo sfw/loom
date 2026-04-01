@@ -462,6 +462,7 @@ export interface ConversationStreamEvent {
   turn_number?: number;
   _optimistic?: boolean;
   _client_id?: string;
+  _delivery_state?: "queued" | "sending" | "accepted" | "failed";
 }
 
 export interface RunStreamEvent {
@@ -491,6 +492,14 @@ let runtimeBaseUrl = (() => {
   return raw.replace(/\/+$/, "");
 })();
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
+const HEAVY_REQUEST_TIMEOUT_MS = 20000;
+const RUN_TIMELINE_REQUEST_LIMIT = 1000;
+
+type RequestJsonInit = RequestInit & {
+  timeoutMs?: number;
+};
+
 async function tryInvokeDesktopCommand<T>(command: string): Promise<T | null> {
   try {
     const mod = await import("@tauri-apps/api/core");
@@ -502,13 +511,47 @@ async function tryInvokeDesktopCommand<T>(command: string): Promise<T | null> {
 
 async function requestJson<T>(
   path: string,
-  init?: RequestInit,
+  init?: RequestJsonInit,
 ): Promise<T> {
-  const response = await fetch(`${runtimeBaseUrl}${path}`, init);
-  if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
+  const {
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    signal: sourceSignal,
+    ...fetchInit
+  } = init ?? {};
+  const controller = new AbortController();
+  const timeoutId = globalThis.setTimeout(() => {
+    controller.abort(new Error(`Request timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  const abortFromSource = () => {
+    controller.abort(sourceSignal?.reason);
+  };
+
+  if (sourceSignal) {
+    if (sourceSignal.aborted) {
+      abortFromSource();
+    } else {
+      sourceSignal.addEventListener("abort", abortFromSource, { once: true });
+    }
   }
-  return (await response.json()) as T;
+
+  try {
+    const response = await fetch(`${runtimeBaseUrl}${path}`, {
+      ...fetchInit,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`${response.status} ${response.statusText}`);
+    }
+    return (await response.json()) as T;
+  } catch (error) {
+    if (controller.signal.aborted && !sourceSignal?.aborted) {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    globalThis.clearTimeout(timeoutId);
+    sourceSignal?.removeEventListener("abort", abortFromSource);
+  }
 }
 
 export function getRuntimeBaseUrl(): string {
@@ -612,6 +655,7 @@ export function fetchWorkspaceArtifacts(
 ): Promise<WorkspaceArtifact[]> {
   return requestJson<WorkspaceArtifact[]>(
     `/workspaces/${encodeURIComponent(workspaceId)}/artifacts`,
+    { timeoutMs: HEAVY_REQUEST_TIMEOUT_MS },
   );
 }
 
@@ -626,6 +670,7 @@ export function fetchWorkspaceFiles(
   const suffix = params.size > 0 ? `?${params.toString()}` : "";
   return requestJson<WorkspaceFileEntry[]>(
     `/workspaces/${encodeURIComponent(workspaceId)}/files${suffix}`,
+    { timeoutMs: HEAVY_REQUEST_TIMEOUT_MS },
   );
 }
 
@@ -636,6 +681,7 @@ export function fetchWorkspaceFilePreview(
   const params = new URLSearchParams({ path });
   return requestJson<WorkspaceFilePreview>(
     `/workspaces/${encodeURIComponent(workspaceId)}/files/preview?${params.toString()}`,
+    { timeoutMs: HEAVY_REQUEST_TIMEOUT_MS },
   );
 }
 
@@ -748,20 +794,23 @@ export function fetchConversationMessages(
   const qs = params.toString();
   return requestJson<ConversationMessage[]>(
     `/conversations/${encodeURIComponent(conversationId)}/messages${qs ? `?${qs}` : ""}`,
+    { timeoutMs: HEAVY_REQUEST_TIMEOUT_MS },
   );
 }
 
 export function fetchConversationEvents(
   conversationId: string,
-  options?: { beforeSeq?: number; afterSeq?: number; limit?: number },
+  options?: { beforeSeq?: number; beforeTurn?: number; afterSeq?: number; limit?: number },
 ): Promise<ConversationStreamEvent[]> {
   const params = new URLSearchParams();
   if (options?.beforeSeq != null) params.set("before_seq", String(options.beforeSeq));
+  if (options?.beforeTurn != null) params.set("before_turn", String(options.beforeTurn));
   if (options?.afterSeq != null) params.set("after_seq", String(options.afterSeq));
   if (options?.limit != null) params.set("limit", String(options.limit));
   const qs = params.toString();
   return requestJson<ConversationStreamEvent[]>(
     `/conversations/${encodeURIComponent(conversationId)}/events${qs ? `?${qs}` : ""}`,
+    { timeoutMs: HEAVY_REQUEST_TIMEOUT_MS },
   );
 }
 
@@ -835,18 +884,26 @@ export function resolveConversationApproval(
 }
 
 export function fetchRunDetail(runId: string): Promise<RunDetail> {
-  return requestJson<RunDetail>(`/runs/${encodeURIComponent(runId)}`);
+  return requestJson<RunDetail>(
+    `/runs/${encodeURIComponent(runId)}`,
+    { timeoutMs: HEAVY_REQUEST_TIMEOUT_MS },
+  );
 }
 
 export function fetchRunTimeline(runId: string): Promise<RunTimelineEvent[]> {
+  const params = new URLSearchParams({
+    limit: String(RUN_TIMELINE_REQUEST_LIMIT),
+  });
   return requestJson<RunTimelineEvent[]>(
-    `/runs/${encodeURIComponent(runId)}/timeline`,
+    `/runs/${encodeURIComponent(runId)}/timeline?${params.toString()}`,
+    { timeoutMs: HEAVY_REQUEST_TIMEOUT_MS },
   );
 }
 
 export function fetchRunArtifacts(runId: string): Promise<RunArtifact[]> {
   return requestJson<RunArtifact[]>(
     `/runs/${encodeURIComponent(runId)}/artifacts`,
+    { timeoutMs: HEAVY_REQUEST_TIMEOUT_MS },
   );
 }
 
@@ -895,6 +952,7 @@ export function fetchRunConversationHistory(
 ): Promise<RunConversationEntry[]> {
   return requestJson<RunConversationEntry[]>(
     `/tasks/${encodeURIComponent(runId)}/conversation`,
+    { timeoutMs: HEAVY_REQUEST_TIMEOUT_MS },
   );
 }
 

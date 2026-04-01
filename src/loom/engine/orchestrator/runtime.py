@@ -31,6 +31,20 @@ def initialize_task_run_id(orchestrator, task: Task) -> str:
     return run_id
 
 
+async def initialize_task_run_id_async(orchestrator, task: Task) -> str:
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    run_id = str(metadata.get("run_id", "") or "").strip()
+    if not run_id:
+        run_id = f"run-{uuid.uuid4().hex[:12]}"
+        metadata["run_id"] = run_id
+        task.metadata = metadata
+        await orchestrator._save_task_state(task)
+    orchestrator._active_run_id = run_id
+    return run_id
+
+
 def emit_event(orchestrator, event_type: str, task_id: str, data: dict) -> None:
     payload = dict(data or {})
     payload.setdefault("source_component", "orchestrator")

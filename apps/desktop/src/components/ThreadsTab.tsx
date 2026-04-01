@@ -1,4 +1,12 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo, type FormEvent } from "react";
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo,
+  useDeferredValue,
+  type FormEvent,
+} from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useApp } from "@/context/AppContext";
@@ -7,10 +15,23 @@ import {
   type ConversationApproval,
   type ConversationDetail,
   type ConversationMessage,
+  type ConversationPrompt,
   type ConversationStreamEvent,
 } from "@/api";
 import { cn } from "@/lib/utils";
-import { formatDate, highlightText } from "@/utils";
+import { formatDate } from "@/utils";
+import {
+  appendConversationTimelineItems,
+  buildHistoricalConversationTimelineItems,
+  buildConversationMessageFallbackItems,
+  buildConversationTimelineItems,
+  buildConversationTimelineWindow,
+  canUseDeferredConversationTranscript,
+  historicalConversationTimelineCoversLiveTail,
+  estimateConversationTimelineItemHeight,
+  shouldDeferConversationTranscript,
+  type ConversationTimelineItem,
+} from "@/conversationTimeline";
 import {
   conversationApprovalPreview,
   conversationEventDetail,
@@ -30,7 +51,6 @@ import {
   CheckCircle2,
   XCircle,
   Zap,
-  Pause,
   CornerDownLeft,
   Pencil,
   Trash2,
@@ -38,20 +58,17 @@ import {
   Copy,
   MessageSquare,
 } from "lucide-react";
+import { useVirtualizedList } from "@/hooks/useVirtualizedList";
 
-/** Animated thinking indicator with live or persisted reasoning content. */
+/** Lightweight live thinking indicator for the active turn only. */
 function ThinkingIndicator({
-  thinkingText,
   live = true,
   label = "Thinking...",
 }: {
-  thinkingText: string;
   live?: boolean;
   label?: string;
 }) {
   const [elapsed, setElapsed] = useState(0);
-  const [expanded, setExpanded] = useState(false);
-  const hasContent = thinkingText.trim().length > 0;
   useEffect(() => {
     if (!live) return;
     setElapsed(0);
@@ -65,180 +82,80 @@ function ThinkingIndicator({
     return `${m}m ${rem}s`;
   };
   return (
-    <div className="mr-12">
-      <button
-        type="button"
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 rounded-lg bg-zinc-800/40 border border-zinc-800 px-4 py-2.5 w-full text-left hover:bg-zinc-800/60 transition-colors"
-      >
-        <Loader2 size={14} className={cn("text-[#a3b396] shrink-0", live && "animate-spin")} />
-        <span className="text-xs text-zinc-400 flex-1">{label}</span>
-        {live && (
-          <span className="text-[10px] text-zinc-600 tabular-nums">{formatElapsed(elapsed)}</span>
-        )}
-        {expanded ? <ChevronUp size={10} className="text-zinc-600" /> : <ChevronDown size={10} className="text-zinc-600" />}
-      </button>
-      {expanded && (
-        <div className="mt-1 rounded-lg border border-zinc-800 bg-zinc-900/60 px-4 py-3 max-h-48 overflow-y-auto">
-          {hasContent ? (
-            <p className="text-[11px] text-zinc-500 leading-relaxed whitespace-pre-wrap break-words">
-              {thinkingText}
-              {live && (
-                <span className="inline-block w-1.5 h-3 bg-zinc-500 animate-pulse ml-0.5 align-middle" />
-              )}
-            </p>
-          ) : (
-            <div className="flex items-center gap-2">
-              <span className="h-1.5 w-1.5 rounded-full bg-[#a3b396] animate-pulse" />
-              <span className="text-[10px] text-zinc-600">Processing...</span>
-            </div>
+    <div className="mr-12 py-1">
+      <div className="flex items-center gap-2 px-1 text-zinc-600">
+        <Loader2 size={11} className={cn("shrink-0 text-zinc-600/80", live && "animate-spin")} />
+        <span
+          className={cn(
+            "flex-1 text-[11px] font-medium tracking-[0.01em]",
+            live ? "thinking-shimmer" : "text-zinc-500",
           )}
-        </div>
-      )}
+        >
+          {label}
+        </span>
+        {live && (
+          <span className="text-[10px] text-zinc-700/80 tabular-nums">{formatElapsed(elapsed)}</span>
+        )}
+      </div>
     </div>
   );
 }
 
-type ComposerAction = "send" | "inject" | "redirect" | "stop";
+function formatToolDuration(elapsedMs: number): string {
+  const safeElapsedMs = Math.max(0, Math.round(elapsedMs));
+  if (safeElapsedMs < 1000) {
+    return `${safeElapsedMs}ms`;
+  }
+  if (safeElapsedMs < 60_000) {
+    const seconds = safeElapsedMs / 1000;
+    return seconds >= 10 ? `${Math.round(seconds)}s` : `${seconds.toFixed(1)}s`;
+  }
+  const minutes = Math.floor(safeElapsedMs / 60_000);
+  const seconds = Math.floor((safeElapsedMs % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
+}
 
-type TimelineItem =
-  | {
-      kind: "text";
-      id: string;
-      seq: number;
-      role: "user" | "assistant";
-      text: string;
-      createdAt: string;
-      pending: boolean;
-    }
-  | {
-      kind: "thinking";
-      id: string;
-      seq: number;
-      text: string;
-      createdAt: string;
-    }
-  | {
-      kind: "tool";
-      id: string;
-      seq: number;
-      createdAt: string;
-      startedPayload?: Record<string, unknown>;
-      completedPayload?: Record<string, unknown>;
-    }
-  | {
-      kind: "event";
-      id: string;
-      seq: number;
-      event: ConversationStreamEvent;
-    };
+function toolCardArgText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
 
-function buildTimelineItems(events: ConversationStreamEvent[]): TimelineItem[] {
-  const items: TimelineItem[] = [];
+function compactToolCardUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    return "";
+  }
+  try {
+    const parsed = new URL(trimmed);
+    const suffix = `${parsed.pathname}${parsed.search}${parsed.hash}`.replace(/\/$/, "");
+    return `${parsed.host}${suffix}`;
+  } catch {
+    return trimmed.replace(/^https?:\/\//i, "").replace(/\/$/, "");
+  }
+}
 
-  for (const event of events) {
-    if (event.event_type === "user_message" || event.event_type === "assistant_text") {
-      const role = event.event_type === "user_message" ? "user" : "assistant";
-      const text = String(event.payload.text || "");
-      const pending = Boolean(event._optimistic);
-      if (!text) continue;
-      const previous = items[items.length - 1];
-      if (previous?.kind === "text" && previous.role === role && previous.pending === pending) {
-        previous.text += text;
-        previous.createdAt = event.created_at;
-        previous.seq = event.seq;
-      } else {
-        items.push({
-          kind: "text",
-          id: `text-${event.seq}`,
-          seq: event.seq,
-          role,
-          text,
-          createdAt: event.created_at,
-          pending,
-        });
-      }
-      continue;
-    }
-
-    if (event.event_type === "assistant_thinking") {
-      const text = String(event.payload.text || "");
-      if (!text) continue;
-      const previous = items[items.length - 1];
-      if (previous?.kind === "thinking") {
-        previous.text += text;
-        previous.createdAt = event.created_at;
-        previous.seq = event.seq;
-      } else {
-        items.push({
-          kind: "thinking",
-          id: `thinking-${event.seq}`,
-          seq: event.seq,
-          text,
-          createdAt: event.created_at,
-        });
-      }
-      continue;
-    }
-
-    if (event.event_type === "tool_call_started") {
-      items.push({
-        kind: "tool",
-        id: `tool-${event.seq}`,
-        seq: event.seq,
-        createdAt: event.created_at,
-        startedPayload: event.payload,
-      });
-      continue;
-    }
-
-    if (event.event_type === "tool_call_completed") {
-      const toolCallId = String(event.payload.tool_call_id || "");
-      const toolName = String(event.payload.tool_name || "");
-      const matchIndex = [...items]
-        .reverse()
-        .findIndex((candidate) => (
-          candidate.kind === "tool"
-          && candidate.completedPayload == null
-          && (
-            (toolCallId && String(candidate.startedPayload?.tool_call_id || "") === toolCallId)
-            || (
-              !toolCallId
-              && toolName
-              && String(candidate.startedPayload?.tool_name || "") === toolName
-            )
-          )
-        ));
-      if (matchIndex >= 0) {
-        const targetIndex = items.length - 1 - matchIndex;
-        const existing = items[targetIndex];
-        if (existing?.kind === "tool") {
-          existing.completedPayload = event.payload;
-          existing.createdAt = event.created_at;
-          existing.seq = event.seq;
-          continue;
-        }
-      }
-      items.push({
-        kind: "tool",
-        id: `tool-${event.seq}`,
-        seq: event.seq,
-        createdAt: event.created_at,
-        completedPayload: event.payload,
-      });
-      continue;
-    }
-
-    items.push({
-      kind: "event",
-      id: `event-${event.seq}`,
-      seq: event.seq,
-      event,
-    });
+function toolCardArgsPreview(
+  toolName: string,
+  argsPayload: Record<string, unknown> | null,
+): string {
+  if (!argsPayload) {
+    return "";
   }
 
-  return items;
+  const normalizedToolName = toolName.trim().toLowerCase();
+  if (normalizedToolName === "web_search") {
+    return toolCardArgText(argsPayload.query);
+  }
+
+  if (normalizedToolName === "web_fetch" || normalizedToolName === "web_fetch_html") {
+    const url = compactToolCardUrl(toolCardArgText(argsPayload.url));
+    const query = toolCardArgText(argsPayload.query);
+    return [url, query].filter(Boolean).join(" · ");
+  }
+
+  return "";
 }
+
+type ComposerAction = "send" | "inject" | "redirect" | "stop";
 
 function conversationInputHistory(
   detail: ConversationDetail | null,
@@ -319,11 +236,14 @@ export default function ThreadsTab() {
   } = useApp();
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const timelineContainerRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const [composerDropdownOpen, setComposerDropdownOpen] = useState(false);
   const [composerAction, setComposerAction] = useState<ComposerAction>("send");
   const dropdownRef = useRef<HTMLDivElement>(null);
   const [pastedImages, setPastedImages] = useState<Array<{ id: string; dataUrl: string; name: string }>>([]);
+  const [archivedTimelineVisibleCount, setArchivedTimelineVisibleCount] = useState(0);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
 
   // Build set of known workspace file paths for linkifying code elements
   const knownFilePaths = useMemo(() => {
@@ -366,6 +286,7 @@ export default function ThreadsTab() {
 
   // Injected messages shown as user bubbles in the chat
   const [injectedMessages, setInjectedMessages] = useState<Array<{ id: string; text: string; type: "inject" | "redirect"; timestamp: string }>>([]);
+  const [transcriptHydratedConversationId, setTranscriptHydratedConversationId] = useState("");
 
   // Message history for up/down arrow cycling
   const messageHistoryRef = useRef<string[]>([]);
@@ -386,6 +307,7 @@ export default function ThreadsTab() {
     if (!el) return;
     const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 80;
     isPinnedRef.current = atBottom;
+    setShowJumpToLatest(!atBottom);
     // Mark user as actively scrolling — suppress auto-scroll briefly
     if (!atBottom) {
       userScrollingRef.current = true;
@@ -394,31 +316,142 @@ export default function ThreadsTab() {
         userScrollingRef.current = false;
       }, 1000);
     }
-    // Load older messages when scrolled near the top
-    if (el.scrollTop < 200 && hasOlderMessages && !loadingOlderMessages) {
-      const prevHeight = el.scrollHeight;
-      void loadOlderMessages().then(() => {
-        // Preserve scroll position after prepending older messages
-        requestAnimationFrame(() => {
-          const newHeight = el.scrollHeight;
-          el.scrollTop += newHeight - prevHeight;
-        });
-      });
-    }
-  }, [hasOlderMessages, loadingOlderMessages, loadOlderMessages]);
+  }, []);
 
   const messageCount = visibleConversationMessages.length;
   const streamingLen = streamingText.length + streamingThinking.length;
+  const liveTranscriptHasContent = visibleConversationEvents.length > 0 || visibleConversationMessages.length > 0;
+  const deferredConversationEvents = useDeferredValue(visibleConversationEvents);
+  const deferredConversationMessages = useDeferredValue(visibleConversationMessages);
+  const shouldDeferTranscript = shouldDeferConversationTranscript({
+    isProcessing: conversationIsProcessing,
+    eventCount: visibleConversationEvents.length,
+    messageCount: visibleConversationMessages.length,
+    searchActive: conversationHistoryQuery.trim().length > 0,
+    selectionHydrated: transcriptHydratedConversationId === selectedConversationId,
+  });
+  const useDeferredTranscript = canUseDeferredConversationTranscript({
+    shouldDefer: shouldDeferTranscript,
+    selectedConversationId,
+    liveHasContent: liveTranscriptHasContent,
+    deferredEvents: deferredConversationEvents,
+    deferredMessages: deferredConversationMessages,
+  });
+  const transcriptSourceEvents = useDeferredTranscript
+    ? deferredConversationEvents
+    : visibleConversationEvents;
+  const transcriptSourceMessages = useDeferredTranscript
+    ? deferredConversationMessages
+    : visibleConversationMessages;
+  const timelineCacheRef = useRef<{
+    events: ConversationStreamEvent[];
+    items: ConversationTimelineItem[];
+  }>({
+    events: [],
+    items: [],
+  });
   const timelineItems = useMemo(
-    () => buildTimelineItems(visibleConversationEvents),
-    [visibleConversationEvents],
+    () => {
+      const cached = timelineCacheRef.current;
+      if (cached.events === transcriptSourceEvents) {
+        return cached.items;
+      }
+
+      let nextItems: ConversationTimelineItem[];
+      if (
+        cached.events.length > 0
+        && transcriptSourceEvents.length >= cached.events.length
+        && cached.events.every((event, index) => transcriptSourceEvents[index] === event)
+      ) {
+        const appendedEvents = transcriptSourceEvents.slice(cached.events.length);
+        nextItems = appendedEvents.length > 0
+          ? appendConversationTimelineItems(cached.items, appendedEvents)
+          : cached.items;
+      } else {
+        nextItems = buildConversationTimelineItems(transcriptSourceEvents);
+      }
+
+      timelineCacheRef.current = {
+        events: transcriptSourceEvents,
+        items: nextItems,
+      };
+      return nextItems;
+    },
+    [transcriptSourceEvents],
   );
-  const activeApprovalId = pendingConversationApproval?.approval_id || "";
+  const fallbackTimelineItems = useMemo(
+    () => buildConversationMessageFallbackItems(transcriptSourceMessages),
+    [transcriptSourceMessages],
+  );
+  const historicalTimelineItems = useMemo(
+    () => buildHistoricalConversationTimelineItems(
+      transcriptSourceMessages,
+      transcriptSourceEvents,
+    ),
+    [transcriptSourceEvents, transcriptSourceMessages],
+  );
+  const historicalTimelineReady = useMemo(() => {
+    if (historicalTimelineItems.length === 0) {
+      return false;
+    }
+    return historicalConversationTimelineCoversLiveTail(
+      timelineItems,
+      historicalTimelineItems,
+    );
+  }, [historicalTimelineItems, timelineItems]);
+  const prefersHistoricalTranscript = !conversationIsProcessing
+    && !conversationStreaming
+    && historicalTimelineReady
+    && transcriptSourceMessages.length > 0;
+  const transcriptTimelineItems = prefersHistoricalTranscript
+    ? (historicalTimelineItems.length > 0 ? historicalTimelineItems : timelineItems)
+    : (timelineItems.length > 0 ? timelineItems : fallbackTimelineItems);
+  const archiveDisabled = conversationHistoryQuery.trim().length > 0;
+  const {
+    archivedCount: archivedTimelineCount,
+    nextRevealCount: nextArchivedRevealCount,
+    renderedItems: renderedTimelineItems,
+  } = useMemo(
+    () => buildConversationTimelineWindow(transcriptTimelineItems, {
+      archivedVisibleCount: archivedTimelineVisibleCount,
+      disableArchive: archiveDisabled,
+    }),
+    [archiveDisabled, archivedTimelineVisibleCount, transcriptTimelineItems],
+  );
+  const latestRenderedTimelineItem = renderedTimelineItems[renderedTimelineItems.length - 1];
+  const showLiveAssistantDraft = Boolean(
+    conversationIsProcessing
+    && streamingText.trim()
+    && !(
+      latestRenderedTimelineItem?.kind === "text"
+      && latestRenderedTimelineItem.role === "assistant"
+      && latestRenderedTimelineItem.text === streamingText
+    ),
+  );
+  const { totalHeight: virtualTimelineHeight, virtualItems, reportSize: reportTimelineRowSize } = useVirtualizedList({
+    items: renderedTimelineItems,
+    containerRef: scrollRef,
+    listRef: timelineContainerRef,
+    estimateSize: estimateConversationTimelineItemHeight,
+  });
   const activeAskUserToolCallId = pendingConversationPrompt?.tool_call_id || "";
+  const activeApprovalToolTimelineId = useMemo(() => {
+    if (!conversationAwaitingApproval || !pendingConversationApproval) return "";
+    const pendingToolName = String(pendingConversationApproval.tool_name || "");
+    for (let index = renderedTimelineItems.length - 1; index >= 0; index -= 1) {
+      const item = renderedTimelineItems[index];
+      if (item?.kind !== "tool") continue;
+      const toolName = String(item.completedPayload?.tool_name || item.startedPayload?.tool_name || "");
+      if (toolName !== pendingToolName) continue;
+      if (item.completedPayload != null) continue;
+      return item.id;
+    }
+    return "";
+  }, [conversationAwaitingApproval, pendingConversationApproval, renderedTimelineItems]);
   const activeAskUserTimelineId = useMemo(() => {
     if (!conversationAwaitingInput) return "";
-    for (let index = timelineItems.length - 1; index >= 0; index -= 1) {
-      const item = timelineItems[index];
+    for (let index = renderedTimelineItems.length - 1; index >= 0; index -= 1) {
+      const item = renderedTimelineItems[index];
       if (item?.kind !== "tool") continue;
       const toolName = String(item.completedPayload?.tool_name || item.startedPayload?.tool_name || "");
       if (toolName !== "ask_user") continue;
@@ -428,26 +461,37 @@ export default function ThreadsTab() {
       }
     }
     return "";
-  }, [conversationAwaitingInput, activeAskUserToolCallId, timelineItems]);
-  const activeThinkingItemId = useMemo(() => {
-    if (!conversationIsProcessing || timelineItems.length === 0) {
-      return null;
-    }
-    const lastItem = timelineItems[timelineItems.length - 1];
-    return lastItem?.kind === "thinking" ? lastItem.id : null;
-  }, [conversationIsProcessing, timelineItems]);
-
+  }, [conversationAwaitingInput, activeAskUserToolCallId, renderedTimelineItems]);
   // Scroll to bottom when content changes and pinned (debounced)
   useEffect(() => {
     if (!isPinnedRef.current || userScrollingRef.current) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messageCount, streamingLen, streamingToolCalls.length, timelineItems.length]);
+  }, [messageCount, streamingLen, streamingToolCalls.length, renderedTimelineItems.length, virtualTimelineHeight]);
+
+  useEffect(() => {
+    setTranscriptHydratedConversationId("");
+    timelineCacheRef.current = {
+      events: [],
+      items: [],
+    };
+  }, [selectedConversationId]);
+
+  useEffect(() => {
+    if (!selectedConversationId || !liveTranscriptHasContent) {
+      return;
+    }
+    setTranscriptHydratedConversationId((current) => (
+      current === selectedConversationId ? current : selectedConversationId
+    ));
+  }, [liveTranscriptHasContent, selectedConversationId]);
 
   // Force pin + clear injected messages on conversation switch
   useEffect(() => {
     isPinnedRef.current = true;
     userScrollingRef.current = false;
+    setShowJumpToLatest(false);
+    setArchivedTimelineVisibleCount(0);
     setInjectedMessages([]);
     messageHistoryRef.current = hydratedInputHistory;
     historyIndexRef.current = -1;
@@ -461,6 +505,13 @@ export default function ThreadsTab() {
     messageHistoryRef.current = hydratedInputHistory;
   }, [hydratedInputHistory]);
 
+  useEffect(() => {
+    if (!archiveDisabled) {
+      return;
+    }
+    setArchivedTimelineVisibleCount(0);
+  }, [archiveDisabled, conversationHistoryQuery]);
+
   // Reset composer action and clear inject bubbles when processing ends
   useEffect(() => {
     if (!conversationIsProcessing) {
@@ -472,7 +523,8 @@ export default function ThreadsTab() {
   const workspaceConversations = overview?.recent_conversations ?? [];
   const selectedConversationBelongsToWorkspace = !selectedConversationId
     ? true
-    : workspaceConversations.some((conversation) => conversation.id === selectedConversationId)
+    : loadingConversationDetail
+      || workspaceConversations.some((conversation) => conversation.id === selectedConversationId)
       || (
         conversationDetail != null
         && String((conversationDetail as { workspace_id?: string }).workspace_id || "") === selectedWorkspaceId
@@ -818,6 +870,25 @@ export default function ThreadsTab() {
           ? "Stop"
           : "Send";
 
+  function handleRevealOlderTranscript() {
+    setArchivedTimelineVisibleCount((current) => current + Math.max(1, nextArchivedRevealCount));
+  }
+
+  function handleRevealFullTranscript() {
+    setArchivedTimelineVisibleCount(Number.MAX_SAFE_INTEGER);
+  }
+
+  function handleJumpToLatest() {
+    const el = scrollRef.current;
+    if (!el) return;
+    isPinnedRef.current = true;
+    userScrollingRef.current = false;
+    setShowJumpToLatest(false);
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+  }
+
   /* ---- Render ---- */
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -868,11 +939,11 @@ export default function ThreadsTab() {
 
       {/* ===== Message stream ===== */}
       <div ref={scrollRef} onScroll={handleChatScroll} className="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-3">
-        {/* Loading older messages indicator */}
+        {/* Transcript hydration indicator */}
         {loadingOlderMessages && (
           <div className="flex items-center justify-center py-3">
             <Loader2 size={14} className="text-zinc-600 animate-spin" />
-            <span className="text-[11px] text-zinc-600 ml-2">Loading older messages...</span>
+            <span className="text-[11px] text-zinc-600 ml-2">Loading transcript...</span>
           </div>
         )}
         {hasOlderMessages && !loadingOlderMessages && (
@@ -881,12 +952,41 @@ export default function ThreadsTab() {
             onClick={() => void loadOlderMessages()}
             className="flex items-center justify-center w-full py-2 text-[11px] text-zinc-600 hover:text-zinc-400 transition-colors"
           >
-            Load older messages
+            Retry loading transcript
           </button>
         )}
 
+        {archivedTimelineCount > 0 && (
+          <div className="flex flex-col items-center gap-2 py-1">
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3 text-center">
+              <p className="text-[11px] font-medium text-zinc-300">
+                {archivedTimelineCount.toLocaleString()} older transcript row{archivedTimelineCount === 1 ? "" : "s"} archived
+              </p>
+              <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">
+                The full replay is loaded. Older rows stay collapsed until you ask for them so long threads stay fast.
+              </p>
+              <div className="mt-3 flex items-center justify-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleRevealOlderTranscript}
+                  className="rounded-lg border border-zinc-700 px-3 py-1.5 text-[11px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800"
+                >
+                  Show {nextArchivedRevealCount.toLocaleString()} older rows
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRevealFullTranscript}
+                  className="rounded-lg px-3 py-1.5 text-[11px] font-medium text-[#a3b396] transition-colors hover:bg-[#6b7a5e]/10"
+                >
+                  Show full transcript
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Empty thread */}
-        {timelineItems.length === 0 &&
+        {renderedTimelineItems.length === 0 &&
           !streamingText &&
           streamingToolCalls.length === 0 && (
             <p className="py-16 text-center text-xs text-zinc-600">
@@ -895,119 +995,28 @@ export default function ThreadsTab() {
           )}
 
         {/* Transcript timeline */}
-        {timelineItems.map((item) => {
-          if (item.kind === "text") {
-            const isUser = item.role === "user";
-            return (
-              <div
-                key={item.id}
-                className={cn(
-                  "group relative",
-                  isUser && "pl-16",
-                  !isUser && "pr-8",
-                )}
-              >
-                <div
-                  className={cn(
-                    "rounded-xl px-4 py-3",
-                    isUser && "bg-[#8a9a7b]/8 border border-[#8a9a7b]/10",
-                    isUser && item.pending && "border-[#a3b396]/30 bg-[#8a9a7b]/12",
-                    !isUser && "bg-transparent",
-                  )}
-                >
-                  <span className={cn(
-                    "float-right flex items-center gap-1.5 transition-opacity ml-3 mt-0.5",
-                    item.pending ? "opacity-100" : "opacity-0 group-hover:opacity-100",
-                  )}>
-                    {item.pending && (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-[#8a9a7b]/15 px-1.5 py-px text-[9px] font-medium text-[#a3b396]">
-                        <span className="h-1.5 w-1.5 rounded-full bg-[#a3b396] animate-pulse" />
-                        Sending...
-                      </span>
-                    )}
-                    <CopyButton text={item.text} />
-                    <span className="text-[10px] text-zinc-700">
-                      {formatDate(item.createdAt)}
-                    </span>
-                  </span>
-                  <div className={cn(
-                    "prose prose-invert prose-sm max-w-none",
-                    "prose-p:my-1.5 prose-p:leading-relaxed",
-                    "prose-headings:text-zinc-200 prose-headings:font-semibold prose-headings:mt-3 prose-headings:mb-1.5",
-                    "prose-h1:text-lg prose-h2:text-base prose-h3:text-sm",
-                    "prose-code:text-[#bec8b4] prose-code:bg-zinc-800 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-code:before:content-none prose-code:after:content-none",
-                    "prose-pre:bg-zinc-900 prose-pre:border prose-pre:border-zinc-800 prose-pre:rounded-lg prose-pre:text-xs",
-                    "prose-a:text-[#a3b396] prose-a:no-underline hover:prose-a:underline",
-                    "prose-strong:text-zinc-200 prose-em:text-zinc-300",
-                    "prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5",
-                    "prose-blockquote:border-[#8a9a7b]/30 prose-blockquote:text-zinc-400",
-                    "prose-hr:border-zinc-800",
-                    "prose-th:text-zinc-300 prose-td:text-zinc-400",
-                    isUser && "text-zinc-200",
-                    !isUser && "text-zinc-300",
-                  )}>
-                    <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{item.text}</Markdown>
-                  </div>
-                </div>
-              </div>
-            );
-          }
-
-          if (item.kind === "thinking") {
-            const isLiveThinking = item.id === activeThinkingItemId;
-            return (
-              <div key={item.id}>
-                <ThinkingIndicator
-                  thinkingText={item.text}
-                  live={isLiveThinking}
-                  label={isLiveThinking ? "Thinking..." : "Reasoning"}
-                />
-              </div>
-            );
-          }
-
-          if (item.kind === "tool") {
-            const toolName = String(item.completedPayload?.tool_name || item.startedPayload?.tool_name || "");
-            const showInlinePrompt =
-              conversationAwaitingInput
-              && pendingConversationPrompt
-              && toolName === "ask_user"
-              && item.id === activeAskUserTimelineId;
-            return (
-              <div key={item.id} className="space-y-3">
-                <ToolEventCard
-                  startedPayload={item.startedPayload}
-                  completedPayload={item.completedPayload}
-                  createdAt={item.createdAt}
-                />
-                {showInlinePrompt && (
-                  <AskUserCard
-                    prompt={pendingConversationPrompt}
-                    options={quickReplyOptions}
-                    onReply={handleQuickConversationReply}
-                  />
-                )}
-              </div>
-            );
-          }
-
-          const showInlineApproval =
-            conversationAwaitingApproval
-            && pendingConversationApproval
-            && item.event.event_type === "approval_requested"
-            && String(item.event.payload.approval_id || "") === activeApprovalId;
-          return (
-            <div key={item.id} className="space-y-3">
-              <ConversationEventCard event={item.event} />
-              {showInlineApproval && (
-                <ApprovalActionCard
-                  approval={pendingConversationApproval}
-                  onResolve={handleResolveConversationApproval}
-                />
-              )}
-            </div>
-          );
-        })}
+        {renderedTimelineItems.length > 0 && (
+          <div ref={timelineContainerRef} className="relative" style={{ height: virtualTimelineHeight }}>
+            {virtualItems.map((virtualItem) => (
+              <TimelineVirtualRow
+                key={virtualItem.item.id}
+                item={virtualItem.item}
+                top={virtualItem.start}
+                reportSize={reportTimelineRowSize}
+                markdownComponents={markdownComponents}
+                conversationAwaitingApproval={conversationAwaitingApproval}
+                pendingConversationApproval={pendingConversationApproval}
+                activeApprovalToolTimelineId={activeApprovalToolTimelineId}
+                handleResolveConversationApproval={handleResolveConversationApproval}
+                conversationAwaitingInput={conversationAwaitingInput}
+                pendingConversationPrompt={pendingConversationPrompt}
+                activeAskUserTimelineId={activeAskUserTimelineId}
+                quickReplyOptions={quickReplyOptions}
+                handleQuickConversationReply={handleQuickConversationReply}
+              />
+            ))}
+          </div>
+        )}
 
         {/* ===== Injected messages (shown as user bubbles) ===== */}
         {injectedMessages.map((im) => (
@@ -1028,9 +1037,51 @@ export default function ThreadsTab() {
         ))}
 
         {/* ===== Live thinking placeholder ===== */}
-        {conversationIsProcessing && activeThinkingItemId == null && (
+        {conversationIsProcessing && !showLiveAssistantDraft && (
           <div className="space-y-2">
-            <ThinkingIndicator thinkingText="" />
+            <ThinkingIndicator />
+          </div>
+        )}
+
+        {showLiveAssistantDraft && (
+          <div className="group relative pr-8">
+            <div className="rounded-xl border border-[#8a9a7b]/10 bg-[#8a9a7b]/[0.05] px-4 py-3">
+              <span className="float-right ml-3 mt-0.5 inline-flex items-center gap-1.5 rounded-full bg-[#8a9a7b]/15 px-1.5 py-px text-[9px] font-medium text-[#a3b396]">
+                <span className="h-1.5 w-1.5 rounded-full bg-[#a3b396] animate-pulse" />
+                Live
+              </span>
+              <div className={cn(
+                "prose prose-invert prose-sm max-w-none",
+                "prose-p:my-1.5 prose-p:leading-relaxed",
+                "prose-headings:mb-1.5 prose-headings:mt-3 prose-headings:font-semibold prose-headings:text-zinc-200",
+                "prose-h1:text-lg prose-h2:text-base prose-h3:text-sm",
+                "prose-code:rounded prose-code:bg-zinc-800 prose-code:px-1 prose-code:py-0.5 prose-code:text-xs prose-code:text-[#bec8b4] prose-code:before:content-none prose-code:after:content-none",
+                "prose-pre:rounded-lg prose-pre:border prose-pre:border-zinc-800 prose-pre:bg-zinc-900 prose-pre:text-xs",
+                "prose-a:text-[#a3b396] prose-a:no-underline hover:prose-a:underline",
+                "prose-strong:text-zinc-200 prose-em:text-zinc-300",
+                "prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5",
+                "prose-blockquote:border-[#8a9a7b]/30 prose-blockquote:text-zinc-400",
+                "prose-hr:border-zinc-800",
+                "prose-th:text-zinc-300 prose-td:text-zinc-400",
+                "text-zinc-300",
+              )}>
+                <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{streamingText}</Markdown>
+                <span className="ml-0.5 inline-block h-4 w-1 rounded-full bg-[#a3b396]/70 align-[-0.15em] animate-pulse" />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showJumpToLatest && (
+          <div className="sticky bottom-4 flex justify-end pr-1">
+            <button
+              type="button"
+              onClick={handleJumpToLatest}
+              className="inline-flex items-center gap-1.5 rounded-full border border-zinc-700 bg-zinc-950/95 px-3 py-2 text-[11px] font-medium text-zinc-200 shadow-lg backdrop-blur transition-colors hover:border-[#8a9a7b]/40 hover:text-[#bec8b4]"
+            >
+              <ChevronDown size={12} />
+              Jump to latest
+            </button>
           </div>
         )}
 
@@ -1230,6 +1281,212 @@ export default function ThreadsTab() {
   );
 }
 
+const TimelineVirtualRow = React.memo(function TimelineVirtualRow({
+  item,
+  top,
+  reportSize,
+  markdownComponents,
+  conversationAwaitingApproval,
+  pendingConversationApproval,
+  activeApprovalToolTimelineId,
+  handleResolveConversationApproval,
+  conversationAwaitingInput,
+  pendingConversationPrompt,
+  activeAskUserTimelineId,
+  quickReplyOptions,
+  handleQuickConversationReply,
+}: {
+  item: ConversationTimelineItem;
+  top: number;
+  reportSize: (id: string, size: number) => void;
+  markdownComponents: React.ComponentProps<typeof Markdown>["components"];
+  conversationAwaitingApproval: boolean;
+  pendingConversationApproval: ConversationApproval | null;
+  activeApprovalToolTimelineId: string;
+  handleResolveConversationApproval: (decision: "approve" | "approve_all" | "deny") => void;
+  conversationAwaitingInput: boolean;
+  pendingConversationPrompt: ConversationPrompt | null;
+  activeAskUserTimelineId: string;
+  quickReplyOptions: Array<{ id: string; label: string; description?: string }>;
+  handleQuickConversationReply: (optionLabel: string) => Promise<void>;
+}) {
+  const rowRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const node = rowRef.current;
+    if (!node) {
+      return;
+    }
+
+    const measure = () => {
+      reportSize(item.id, node.getBoundingClientRect().height);
+    };
+
+    measure();
+    if (typeof ResizeObserver !== "function") {
+      return;
+    }
+
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [item, reportSize]);
+
+  return (
+    <div className="absolute inset-x-0" style={{ top }}>
+      <div ref={rowRef} className="pb-3">
+        <TimelineRowContent
+          item={item}
+          markdownComponents={markdownComponents}
+          conversationAwaitingApproval={conversationAwaitingApproval}
+          pendingConversationApproval={pendingConversationApproval}
+          activeApprovalToolTimelineId={activeApprovalToolTimelineId}
+          handleResolveConversationApproval={handleResolveConversationApproval}
+          conversationAwaitingInput={conversationAwaitingInput}
+          pendingConversationPrompt={pendingConversationPrompt}
+          activeAskUserTimelineId={activeAskUserTimelineId}
+          quickReplyOptions={quickReplyOptions}
+          handleQuickConversationReply={handleQuickConversationReply}
+        />
+      </div>
+    </div>
+  );
+});
+
+const TimelineRowContent = React.memo(function TimelineRowContent({
+  item,
+  markdownComponents,
+  conversationAwaitingApproval,
+  pendingConversationApproval,
+  activeApprovalToolTimelineId,
+  handleResolveConversationApproval,
+  conversationAwaitingInput,
+  pendingConversationPrompt,
+  activeAskUserTimelineId,
+  quickReplyOptions,
+  handleQuickConversationReply,
+}: {
+  item: ConversationTimelineItem;
+  markdownComponents: React.ComponentProps<typeof Markdown>["components"];
+  conversationAwaitingApproval: boolean;
+  pendingConversationApproval: ConversationApproval | null;
+  activeApprovalToolTimelineId: string;
+  handleResolveConversationApproval: (decision: "approve" | "approve_all" | "deny") => void;
+  conversationAwaitingInput: boolean;
+  pendingConversationPrompt: ConversationPrompt | null;
+  activeAskUserTimelineId: string;
+  quickReplyOptions: Array<{ id: string; label: string; description?: string }>;
+  handleQuickConversationReply: (optionLabel: string) => Promise<void>;
+}) {
+  if (item.kind === "text") {
+    const isUser = item.role === "user";
+    const isSending = item.deliveryState === "sending";
+    const isTimedOut = item.deliveryState === "failed";
+
+    return (
+      <div
+        className={cn(
+          "group relative",
+          isUser && "pl-16",
+          !isUser && "pr-8",
+        )}
+      >
+        <div
+          className={cn(
+            "rounded-xl px-4 py-3",
+            isUser && "border border-[#8a9a7b]/10 bg-[#8a9a7b]/8",
+            isUser && isSending && "border-[#a3b396]/30 bg-[#8a9a7b]/12",
+            isUser && isTimedOut && "border-red-400/30 bg-red-500/8",
+            !isUser && "bg-transparent",
+          )}
+        >
+          <span className={cn(
+            "float-right ml-3 mt-0.5 flex items-center gap-1.5 transition-opacity",
+            (isSending || isTimedOut) ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+          )}>
+            {isSending && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-[#8a9a7b]/15 px-1.5 py-px text-[9px] font-medium text-[#a3b396]">
+                <span className="h-1.5 w-1.5 rounded-full bg-[#a3b396] animate-pulse" />
+                Sending...
+              </span>
+            )}
+            {isTimedOut && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-red-500/15 px-1.5 py-px text-[9px] font-medium text-red-300">
+                <span className="h-1.5 w-1.5 rounded-full bg-red-300" />
+                Timed out
+              </span>
+            )}
+            <CopyButton text={item.text} />
+            <span className="text-[10px] text-zinc-700">
+              {formatDate(item.createdAt)}
+            </span>
+          </span>
+          <div className={cn(
+            "prose prose-invert prose-sm max-w-none",
+            "prose-p:my-1.5 prose-p:leading-relaxed",
+            "prose-headings:mb-1.5 prose-headings:mt-3 prose-headings:font-semibold prose-headings:text-zinc-200",
+            "prose-h1:text-lg prose-h2:text-base prose-h3:text-sm",
+            "prose-code:rounded prose-code:bg-zinc-800 prose-code:px-1 prose-code:py-0.5 prose-code:text-xs prose-code:text-[#bec8b4] prose-code:before:content-none prose-code:after:content-none",
+            "prose-pre:rounded-lg prose-pre:border prose-pre:border-zinc-800 prose-pre:bg-zinc-900 prose-pre:text-xs",
+            "prose-a:text-[#a3b396] prose-a:no-underline hover:prose-a:underline",
+            "prose-strong:text-zinc-200 prose-em:text-zinc-300",
+            "prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5",
+            "prose-blockquote:border-[#8a9a7b]/30 prose-blockquote:text-zinc-400",
+            "prose-hr:border-zinc-800",
+            "prose-th:text-zinc-300 prose-td:text-zinc-400",
+            isUser && "text-zinc-200",
+            !isUser && "text-zinc-300",
+          )}>
+            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{item.text}</Markdown>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === "tool") {
+    const toolName = String(item.completedPayload?.tool_name || item.startedPayload?.tool_name || "");
+    const showInlineApproval =
+      conversationAwaitingApproval
+      && pendingConversationApproval
+      && item.id === activeApprovalToolTimelineId;
+    const showInlinePrompt =
+      conversationAwaitingInput
+      && pendingConversationPrompt
+      && toolName === "ask_user"
+      && item.id === activeAskUserTimelineId;
+
+    return (
+      <div className="space-y-3">
+        <ToolEventCard
+          startedPayload={item.startedPayload}
+          completedPayload={item.completedPayload}
+          createdAt={item.createdAt}
+        />
+        {showInlineApproval && (
+          <ApprovalActionCard
+            approval={pendingConversationApproval}
+            onResolve={handleResolveConversationApproval}
+          />
+        )}
+        {showInlinePrompt && pendingConversationPrompt && (
+          <AskUserCard
+            prompt={pendingConversationPrompt}
+            options={quickReplyOptions}
+            onReply={handleQuickConversationReply}
+          />
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <ConversationEventCard event={item.event} />
+    </div>
+  );
+});
+
 function ConversationEventCard({ event }: { event: ConversationStreamEvent }) {
   if (event.event_type === "turn_separator") {
     const tokens = Number(event.payload.tokens || 0);
@@ -1300,6 +1557,23 @@ function ToolEventCard({
     completedPayload?.tool_call_id || startedPayload?.tool_call_id || "",
   );
   const completed = Boolean(completedPayload);
+  const startedAtMs = Date.parse(createdAt);
+  const [liveElapsedMs, setLiveElapsedMs] = useState(() =>
+    Number.isFinite(startedAtMs) ? Math.max(0, Date.now() - startedAtMs) : 0,
+  );
+  useEffect(() => {
+    if (completed || !Number.isFinite(startedAtMs)) {
+      return;
+    }
+    const tick = () => {
+      setLiveElapsedMs(Math.max(0, Date.now() - startedAtMs));
+    };
+    tick();
+    const timer = window.setInterval(tick, 250);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [completed, startedAtMs]);
   const success = completedPayload?.success !== false;
   const argsPayload = (() => {
     const rawArgs = startedPayload?.args || completedPayload?.args;
@@ -1308,7 +1582,13 @@ function ToolEventCard({
       : null;
   })();
   const elapsedMs = Number(completedPayload?.elapsed_ms || 0);
+  const elapsedLabel = completed && elapsedMs > 0
+    ? formatToolDuration(elapsedMs)
+    : !completed && liveElapsedMs > 0
+      ? formatToolDuration(liveElapsedMs)
+      : formatDate(createdAt);
   const argCount = argsPayload ? Object.keys(argsPayload).length : 0;
+  const argsPreview = toolCardArgsPreview(toolName, argsPayload);
   const statusLabel = !completed ? "Running" : success ? "Done" : "Failed";
   const statusClass = !completed
     ? "bg-[#8a9a7b]/15 text-[#bec8b4]"
@@ -1358,13 +1638,21 @@ function ToolEventCard({
             {argCount} arg{argCount === 1 ? "" : "s"}
           </span>
         )}
+        {argsPreview && (
+          <span
+            className="min-w-0 flex-1 truncate text-[10px] text-zinc-500"
+            title={argsPreview}
+          >
+            {argsPreview}
+          </span>
+        )}
         {toolCallId && (
-          <span className="hidden text-[10px] text-zinc-600 md:inline">
+          <span className="hidden shrink-0 text-[10px] text-zinc-600 md:inline">
             {toolCallId}
           </span>
         )}
-        <span className="ml-auto text-[10px] text-zinc-600">
-          {completed && elapsedMs > 0 ? `${elapsedMs}ms` : formatDate(createdAt)}
+        <span className="ml-auto shrink-0 text-[10px] text-zinc-600">
+          {elapsedLabel}
         </span>
       </button>
       {expanded && (

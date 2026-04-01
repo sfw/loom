@@ -185,6 +185,76 @@ describe("useWorkspace", () => {
     expect(apiMocks.fetchWorkspaceArtifacts).toHaveBeenCalledTimes(1);
   });
 
+  it("preserves the loaded workspace surface during a disconnect and refreshes on reconnect", async () => {
+    const initialProps: { connectionState: "connected" | "failed" } = {
+      connectionState: "connected",
+    };
+    const { result, rerender } = renderHook(
+      ({ connectionState }: { connectionState: "connected" | "failed" }) =>
+        useWorkspace({
+          selectedWorkspaceId: "workspace-1",
+          selectedConversationId: "",
+          selectedRunId: "",
+          connectionState,
+          setSelectedWorkspaceId: vi.fn(),
+          showArchivedWorkspaces: false,
+          setShowArchivedWorkspaces: vi.fn(),
+          createParentPath: "/tmp",
+          setCreateParentPath: vi.fn(),
+          workspaces: [{
+            id: "workspace-1",
+            canonical_path: "/tmp/workspace",
+            display_name: "Workspace 1",
+            metadata: {},
+            is_archived: false,
+            sort_order: 0,
+          }] as any,
+          setWorkspaces: vi.fn(),
+          runtime: null,
+          setError: vi.fn(),
+          setNotice: vi.fn(),
+          activeTab: "overview",
+          setActiveTab: vi.fn(),
+          setSelectedConversationId: vi.fn(),
+          setSelectedRunId: vi.fn(),
+        }),
+      {
+        initialProps,
+      },
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(result.current.overview?.workspace.id).toBe("workspace-1");
+
+    apiMocks.fetchWorkspaceOverview.mockClear();
+    apiMocks.fetchWorkspaceSettings.mockClear();
+    apiMocks.fetchApprovals.mockClear();
+    apiMocks.fetchWorkspaceInventory.mockClear();
+    apiMocks.fetchWorkspaceArtifacts.mockClear();
+
+    rerender({ connectionState: "failed" });
+
+    expect(result.current.overview?.workspace.id).toBe("workspace-1");
+    expect(result.current.loadingOverview).toBe(false);
+
+    rerender({ connectionState: "connected" });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchWorkspaceOverview).toHaveBeenCalledWith("workspace-1");
+    expect(apiMocks.fetchWorkspaceSettings).toHaveBeenCalledWith("workspace-1");
+    expect(apiMocks.fetchApprovals).toHaveBeenCalledWith("workspace-1");
+    expect(apiMocks.fetchWorkspaceInventory).toHaveBeenCalledWith("workspace-1");
+    expect(apiMocks.fetchWorkspaceArtifacts).toHaveBeenCalledWith("workspace-1");
+  });
+
   it("clears stale thread and run selection immediately when switching workspaces", async () => {
     vi.useFakeTimers();
     const setSelectedConversationId = vi.fn();
@@ -470,5 +540,84 @@ describe("useWorkspace", () => {
 
     expect(setSelectedRunId).not.toHaveBeenCalledWith("run-1");
     expect(setSelectedRunId).not.toHaveBeenCalledWith("");
+  });
+
+  it("does not refetch the full workspace surface when only the selected thread or run changes", async () => {
+    const { rerender } = renderHook(
+      ({
+        selectedConversationId,
+        selectedRunId,
+      }: {
+        selectedConversationId: string;
+        selectedRunId: string;
+      }) =>
+        useWorkspace({
+          selectedWorkspaceId: "workspace-1",
+          selectedConversationId,
+          selectedRunId,
+          setSelectedWorkspaceId: vi.fn(),
+          showArchivedWorkspaces: false,
+          setShowArchivedWorkspaces: vi.fn(),
+          createParentPath: "/tmp",
+          setCreateParentPath: vi.fn(),
+          workspaces: [{
+            id: "workspace-1",
+            canonical_path: "/tmp/workspace",
+            display_name: "Workspace 1",
+            metadata: {},
+            is_archived: false,
+            sort_order: 0,
+          }] as any,
+          setWorkspaces: vi.fn(),
+          runtime: null,
+          setError: vi.fn(),
+          setNotice: vi.fn(),
+          activeTab: "threads",
+          setActiveTab: vi.fn(),
+          setSelectedConversationId: vi.fn(),
+          setSelectedRunId: vi.fn(),
+        }),
+      {
+        initialProps: {
+          selectedConversationId: "",
+          selectedRunId: "",
+        },
+      },
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    apiMocks.fetchWorkspaceOverview.mockClear();
+    apiMocks.fetchWorkspaceSettings.mockClear();
+    apiMocks.fetchApprovals.mockClear();
+    apiMocks.fetchWorkspaceInventory.mockClear();
+    apiMocks.fetchWorkspaceArtifacts.mockClear();
+
+    rerender({
+      selectedConversationId: "conversation-1",
+      selectedRunId: "",
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    rerender({
+      selectedConversationId: "conversation-1",
+      selectedRunId: "run-1",
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchWorkspaceOverview).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceSettings).not.toHaveBeenCalled();
+    expect(apiMocks.fetchApprovals).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceInventory).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceArtifacts).not.toHaveBeenCalled();
   });
 });

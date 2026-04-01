@@ -59,11 +59,12 @@ _register(
         types.SUBTASK_BLOCKED,
         types.SUBTASK_OUTPUT_CONFLICT_DEFERRED,
         types.SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING,
-        types.SUBTASK_POLICY_RECONCILED,
         types.SUBTASK_RETRYING,
     ),
     "subtask",
 )
+
+_register((types.SUBTASK_POLICY_RECONCILED,), "task")
 
 _register(
     (

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useApp } from "@/context/AppContext";
 import { createConversation, patchConversation } from "@/api";
 import { cn } from "@/lib/utils";
+import { normalizeRunStatus } from "@/runStatus";
 import { formatDate, workspaceTagsFromMetadata, type ViewTab } from "@/utils";
 import ActivityBar from "./ActivityBar";
 import {
@@ -36,10 +37,6 @@ function SectionChevron({ expanded }: { expanded: boolean }) {
       )}
     </span>
   );
-}
-
-function normalizeRunStatus(status: string): string {
-  return String(status || "").trim().toLowerCase();
 }
 
 function runStatusLabel(status: string): string {
@@ -115,6 +112,7 @@ export default function Sidebar() {
     setShowArchivedWorkspaces,
     setShowNewWorkspace,
     runtime,
+    connectionState,
     overview,
     conversationDetail,
     conversationIsProcessing,
@@ -126,6 +124,8 @@ export default function Sidebar() {
     setError,
     setNotice,
   } = useApp();
+  const runtimeConnectionState =
+    connectionState || (runtime?.ready ? "connected" : "connecting");
 
   const [wsContextMenu, setWsContextMenu] = useState<{ wsId: string; x: number; y: number } | null>(null);
 
@@ -229,10 +229,16 @@ export default function Sidebar() {
     setError("");
     try {
       const created = await createConversation(selectedWorkspaceId, {});
-      await refreshWorkspaceSurface(selectedWorkspaceId);
       setSelectedConversationId(created.id);
       setActiveTab("threads");
       setNotice(`Started conversation ${created.title || created.id.slice(0, 8)}`);
+      void refreshWorkspaceSurface(selectedWorkspaceId).catch((err) => {
+        if (err instanceof Error) {
+          setError(err.message);
+          return;
+        }
+        setError("Failed to refresh workspace.");
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create conversation.");
     } finally {
@@ -249,13 +255,19 @@ export default function Sidebar() {
         model_name: newConvModel.trim() || undefined,
         system_prompt: newConvPrompt.trim() || undefined,
       });
-      await refreshWorkspaceSurface(selectedWorkspaceId);
       setSelectedConversationId(created.id);
       setActiveTab("threads");
       setShowNewConvPopover(false);
       setNewConvModel("");
       setNewConvPrompt("");
       setNotice(`Started conversation ${created.title || created.id.slice(0, 8)}`);
+      void refreshWorkspaceSurface(selectedWorkspaceId).catch((err) => {
+        if (err instanceof Error) {
+          setError(err.message);
+          return;
+        }
+        setError("Failed to refresh workspace.");
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create conversation.");
     } finally {
@@ -831,13 +843,19 @@ export default function Sidebar() {
           <span
             className={cn(
               "h-[6px] w-[6px] shrink-0 rounded-full",
-              runtime?.ready
+              runtimeConnectionState === "connected"
                 ? "bg-emerald-500 shadow-[0_0_5px_rgba(16,185,129,0.35)]"
-                : "bg-yellow-500 shadow-[0_0_5px_rgba(234,179,8,0.35)]",
+                : runtimeConnectionState === "connecting"
+                  ? "bg-sky-500 shadow-[0_0_5px_rgba(14,165,233,0.35)]"
+                  : "bg-amber-500 shadow-[0_0_5px_rgba(245,158,11,0.35)]",
             )}
           />
           <span className="truncate text-[11px] text-zinc-500">
-            {runtime?.ready ? "Connected" : "Starting..."}
+            {runtimeConnectionState === "connected"
+              ? "Connected"
+              : runtimeConnectionState === "connecting"
+                ? "Reconnecting..."
+                : "Disconnected"}
             {runtime?.version ? ` \u00b7 ${runtime.version}` : ""}
           </span>
         </div>

@@ -115,6 +115,30 @@ def test_emit_verification_lifecycle_events_preserve_outcome_fields() -> None:
     assert terminal_payload["dev_verification_summary"]["canonical_result"]["failed"] == 1
 
 
+def test_emit_verification_terminal_fills_required_fields_for_pass() -> None:
+    bus = EventBus()
+    events = []
+    bus.subscribe_all(lambda event: events.append(event))
+    result = VerificationResult(
+        tier=1,
+        passed=True,
+        confidence=0.93,
+        outcome="",
+        reason_code="",
+    )
+
+    verification_events.emit_verification_terminal(
+        bus,
+        task_id="task-1",
+        subtask_id="phase-a",
+        result=result,
+    )
+
+    payload = events[0].data
+    assert payload["outcome"] == "pass"
+    assert payload["reason_code"] == "verification_passed"
+
+
 def test_emit_placeholder_findings_event_truncates_and_normalizes() -> None:
     bus = EventBus()
     events = []

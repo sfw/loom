@@ -198,6 +198,10 @@ class Tool(ABC):
 
     _registered_classes: ClassVar[set[type[Tool]]] = set()
     __loom_register__: ClassVar[bool] = True
+    _AUTO_REGISTER_MODULE_PREFIXES: ClassVar[tuple[str, ...]] = (
+        "loom.tools",
+        "loom.processes._bundled",
+    )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -205,8 +209,16 @@ class Tool(ABC):
         if (
             getattr(cls, "__loom_register__", True)
             and not getattr(cls, "__abstractmethods__", None)
+            and cls._should_auto_register()
         ):
             Tool._registered_classes.add(cls)
+
+    @classmethod
+    def _should_auto_register(cls) -> bool:
+        module_name = str(getattr(cls, "__module__", "") or "").strip()
+        if not module_name:
+            return False
+        return module_name.startswith(cls._AUTO_REGISTER_MODULE_PREFIXES)
 
     @property
     @abstractmethod

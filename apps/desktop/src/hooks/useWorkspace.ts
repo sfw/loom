@@ -132,6 +132,7 @@ export function useWorkspace(deps: {
   selectedWorkspaceId: string;
   selectedConversationId: string;
   selectedRunId: string;
+  connectionState?: "connecting" | "connected" | "failed";
   setSelectedWorkspaceId: React.Dispatch<React.SetStateAction<string>>;
   showArchivedWorkspaces: boolean;
   setShowArchivedWorkspaces: React.Dispatch<React.SetStateAction<boolean>>;
@@ -151,6 +152,7 @@ export function useWorkspace(deps: {
     selectedWorkspaceId,
     selectedConversationId,
     selectedRunId,
+    connectionState = "connected",
     setSelectedWorkspaceId,
     showArchivedWorkspaces,
     setShowArchivedWorkspaces,
@@ -200,6 +202,7 @@ export function useWorkspace(deps: {
   const selectedWorkspaceIdRef = useRef(selectedWorkspaceId);
   const previousSelectedConversationIdRef = useRef(selectedConversationId);
   const previousSelectedRunIdRef = useRef(selectedRunId);
+  const overviewRef = useRef<WorkspaceOverview | null>(null);
 
   // ---------------------------------------------------------------------------
   // useEffectEvent handlers
@@ -313,6 +316,10 @@ export function useWorkspace(deps: {
   }, [selectedWorkspaceId]);
 
   useEffect(() => {
+    overviewRef.current = overview;
+  }, [overview]);
+
+  useEffect(() => {
     if (!selectedWorkspaceId) {
       setOverview(null);
       setApprovalInbox([]);
@@ -325,17 +332,35 @@ export function useWorkspace(deps: {
       previousWorkspaceIdRef.current = "";
       return;
     }
+    const hasMatchingOverview =
+      overviewRef.current?.workspace?.id === selectedWorkspaceId;
+    if (connectionState !== "connected") {
+      if (!hasMatchingOverview) {
+        setOverview(null);
+        setApprovalInbox([]);
+        setNotifications([]);
+        setInventory(null);
+        setWorkspaceArtifacts([]);
+        setWorkspaceSearchResults(null);
+        setWorkspaceSettings(null);
+        lastSeenNotificationStreamIdRef.current = 0;
+      }
+      setLoadingOverview(!hasMatchingOverview);
+      return;
+    }
     let cancelled = false;
     setLoadingOverview(true);
     setError("");
-    setOverview(null);
-    setApprovalInbox([]);
-    setNotifications([]);
-    setInventory(null);
-    setWorkspaceArtifacts([]);
-    setWorkspaceSearchResults(null);
-    setWorkspaceSettings(null);
-    lastSeenNotificationStreamIdRef.current = 0;
+    if (!hasMatchingOverview) {
+      setOverview(null);
+      setApprovalInbox([]);
+      setNotifications([]);
+      setInventory(null);
+      setWorkspaceArtifacts([]);
+      setWorkspaceSearchResults(null);
+      setWorkspaceSettings(null);
+      lastSeenNotificationStreamIdRef.current = 0;
+    }
     if (
       previousWorkspaceIdRef.current
       && previousWorkspaceIdRef.current !== selectedWorkspaceId
@@ -396,10 +421,12 @@ export function useWorkspace(deps: {
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : "Failed to load overview.");
-          setOverview(null);
-          setWorkspaceSettings(null);
-          setInventory(null);
-          setWorkspaceArtifacts([]);
+          if (!hasMatchingOverview) {
+            setOverview(null);
+            setWorkspaceSettings(null);
+            setInventory(null);
+            setWorkspaceArtifacts([]);
+          }
         }
       } finally {
         if (!cancelled) {
@@ -411,7 +438,7 @@ export function useWorkspace(deps: {
     return () => {
       cancelled = true;
     };
-  }, [selectedWorkspaceId]);
+  }, [connectionState, selectedWorkspaceId]);
 
   useEffect(() => {
     previousSelectedConversationIdRef.current = selectedConversationId;

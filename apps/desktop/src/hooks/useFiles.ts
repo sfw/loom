@@ -24,6 +24,18 @@ import {
   fileSortKey,
 } from "../utils";
 
+function isNotFoundRequestError(error: unknown): boolean {
+  const message = String(error instanceof Error ? error.message : error || "")
+    .trim()
+    .toLowerCase();
+  if (!message) {
+    return false;
+  }
+  return message === "404"
+    || message.startsWith("404 ")
+    || message.includes(" not found");
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -32,6 +44,7 @@ export interface FilesState {
   workspaceFilesByDirectory: Record<string, WorkspaceFileEntry[]>;
   expandedWorkspaceDirectories: string[];
   loadingWorkspaceDirectory: string;
+  refreshingWorkspaceFiles: boolean;
   selectedWorkspaceFilePath: string;
   workspaceFilePreview: WorkspaceFilePreview | null;
   loadingWorkspaceFilePreview: boolean;
@@ -79,6 +92,7 @@ export interface FilesActions {
   handleRevealWorkspaceFile: () => Promise<void>;
   handleSaveWorkspaceFile: () => Promise<void>;
   handleResetWorkspaceFileEditor: () => void;
+  handleRefreshWorkspaceFiles: () => Promise<void>;
   handleExpandActiveWorkspaceFiles: () => Promise<void>;
   handleExpandRecentWorkspaceFiles: () => Promise<void>;
   toggleWorkspaceDirectory: (path: string) => void;
@@ -127,6 +141,7 @@ export function useFiles(deps: {
     useState<Record<string, WorkspaceFileEntry[]>>({});
   const [expandedWorkspaceDirectories, setExpandedWorkspaceDirectories] = useState<string[]>([""]);
   const [loadingWorkspaceDirectory, setLoadingWorkspaceDirectory] = useState("");
+  const [refreshingWorkspaceFiles, setRefreshingWorkspaceFiles] = useState(false);
   const [selectedWorkspaceFilePath, setSelectedWorkspaceFilePath] = useState("");
   const [workspaceFilePreview, setWorkspaceFilePreview] =
     useState<WorkspaceFilePreview | null>(null);
@@ -149,13 +164,20 @@ export function useFiles(deps: {
   // useEffectEvent handlers
   // ---------------------------------------------------------------------------
 
+  async function readWorkspaceDirectory(workspaceId: string, directory = "") {
+    const rows = await fetchWorkspaceFiles(workspaceId, directory);
+    return rows
+      .slice()
+      .sort((left, right) => fileSortKey(left).localeCompare(fileSortKey(right)));
+  }
+
   const loadWorkspaceDirectory = useEffectEvent(async (workspaceId: string, directory = "") => {
     setLoadingWorkspaceDirectory(directory);
     try {
-      const rows = await fetchWorkspaceFiles(workspaceId, directory);
+      const rows = await readWorkspaceDirectory(workspaceId, directory);
       setWorkspaceFilesByDirectory((current) => ({
         ...current,
-        [directory]: rows.slice().sort((left, right) => fileSortKey(left).localeCompare(fileSortKey(right))),
+        [directory]: rows,
       }));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load workspace files.");
@@ -534,6 +556,70 @@ export function useFiles(deps: {
     setError("");
   }
 
+  async function handleRefreshWorkspaceFiles() {
+    if (!selectedWorkspaceId) {
+      return;
+    }
+    setRefreshingWorkspaceFiles(true);
+    setError("");
+    setNotice("");
+    const directories = Array.from(
+      new Set(["", ...Object.keys(workspaceFilesByDirectory), ...expandedWorkspaceDirectories]),
+    ).sort((left, right) => {
+      const depthDifference = left.split("/").length - right.split("/").length;
+      if (depthDifference !== 0) {
+        return depthDifference;
+      }
+      return left.localeCompare(right);
+    });
+    try {
+      const nextWorkspaceFilesByDirectory: Record<string, WorkspaceFileEntry[]> = {};
+      const missingDirectories = new Set<string>();
+      for (const directory of directories) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const rows = await readWorkspaceDirectory(selectedWorkspaceId, directory);
+          nextWorkspaceFilesByDirectory[directory] = rows;
+        } catch (err) {
+          if (!isNotFoundRequestError(err)) {
+            throw err;
+          }
+          missingDirectories.add(directory);
+        }
+      }
+      setWorkspaceFilesByDirectory(nextWorkspaceFilesByDirectory);
+      if (missingDirectories.size > 0) {
+        setExpandedWorkspaceDirectories((current) =>
+          current.filter((directory) => !missingDirectories.has(directory)),
+        );
+      }
+      if (selectedWorkspaceFilePath) {
+        setLoadingWorkspaceFilePreview(true);
+        try {
+          const preview = await fetchWorkspaceFilePreview(
+            selectedWorkspaceId,
+            selectedWorkspaceFilePath,
+          );
+          setWorkspaceFilePreview(preview);
+        } catch (err) {
+          if (isNotFoundRequestError(err)) {
+            setSelectedWorkspaceFilePath("");
+            setWorkspaceFilePreview(null);
+          } else {
+            setWorkspaceFilePreview(null);
+            setError(err instanceof Error ? err.message : "Failed to load file preview.");
+          }
+        } finally {
+          setLoadingWorkspaceFilePreview(false);
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to reload workspace files.");
+    } finally {
+      setRefreshingWorkspaceFiles(false);
+    }
+  }
+
   async function handleExpandActiveWorkspaceFiles() {
     if (!selectedWorkspaceId || contextualFilePaths.size === 0) {
       return;
@@ -656,6 +742,7 @@ export function useFiles(deps: {
     workspaceFilesByDirectory,
     expandedWorkspaceDirectories,
     loadingWorkspaceDirectory,
+    refreshingWorkspaceFiles,
     selectedWorkspaceFilePath,
     workspaceFilePreview,
     loadingWorkspaceFilePreview,
@@ -702,6 +789,7 @@ export function useFiles(deps: {
     handleRevealWorkspaceFile,
     handleSaveWorkspaceFile,
     handleResetWorkspaceFileEditor,
+    handleRefreshWorkspaceFiles,
     handleExpandActiveWorkspaceFiles,
     handleExpandRecentWorkspaceFiles,
     toggleWorkspaceDirectory,

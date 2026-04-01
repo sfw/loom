@@ -80,7 +80,7 @@ async def plan_task_with_validation(orchestrator, task: Task) -> Plan:
                 "Rejected planner output due to invalid topology "
                 f"(attempt {attempt}/{max_attempts}): {last_error}",
             )
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
             if attempt >= max_attempts:
                 break
             planner_feedback = (
@@ -386,7 +386,7 @@ async def replan_task(
                 task.add_decision(
                     f"Rejected replanned plan: {parse_error}",
                 )
-                orchestrator._state.save(task)
+                await orchestrator._save_task_state(task)
                 if structural_attempt >= max_structural_attempts:
                     return False
                 topology_feedback = (
@@ -417,7 +417,7 @@ async def replan_task(
                     "max_attempts": max_structural_attempts,
                 })
                 task.add_decision(f"Rejected replanned plan: {topology_error}")
-                orchestrator._state.save(task)
+                await orchestrator._save_task_state(task)
                 if structural_attempt >= max_structural_attempts:
                     return False
                 topology_feedback = (
@@ -445,7 +445,7 @@ async def replan_task(
                 task.add_decision(
                     f"Rejected replanned plan: {validation_error}",
                 )
-                orchestrator._state.save(task)
+                await orchestrator._save_task_state(task)
                 if structural_attempt >= max_structural_attempts:
                     return False
                 topology_feedback = (
@@ -468,7 +468,7 @@ async def replan_task(
                     s.status = SubtaskStatus.COMPLETED
 
             task.plan = new_plan
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
 
             orchestrator._emit(TASK_PLAN_READY, task.id, {
                 "subtask_count": len(new_plan.subtasks),
@@ -482,7 +482,7 @@ async def replan_task(
 
     except Exception as e:
         task.add_error("replanner", str(e))
-        orchestrator._state.save(task)
+        await orchestrator._save_task_state(task)
         return False
 
 
@@ -1079,7 +1079,7 @@ async def _attempt_stalled_recovery(
             "Recovered from scheduler stall by demoting non-terminal synthesis subtasks.",
         )
         async with self._state_lock:
-            self._state.save(task)
+            await self._save_task_state(task)
         self._emit(TASK_PLAN_NORMALIZED, task.id, {
             "context": "stalled_recovery",
             "normalized_subtasks": normalized_subtasks,

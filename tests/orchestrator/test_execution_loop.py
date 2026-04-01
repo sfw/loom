@@ -1364,10 +1364,22 @@ class TestOrchestratorExecution:
                 usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
             ),
         ])
+        verifier_model = AsyncMock()
+        verifier_model.name = "mock-verifier"
+        verifier_model.complete = AsyncMock(return_value=ModelResponse(
+            text=(
+                "Assessment: passed.\n"
+                "Confidence: 0.88\n"
+                "Reason: acceptance criteria were satisfied."
+            ),
+            usage=TokenUsage(input_tokens=30, output_tokens=20, total_tokens=50),
+        ))
 
         def select_fn(tier=1, role="executor"):
             if role == "planner":
                 return planner_model
+            if role == "verifier":
+                return verifier_model
             return executor_model
 
         router.select = MagicMock(side_effect=select_fn)
@@ -1383,6 +1395,7 @@ class TestOrchestratorExecution:
             event_bus=bus,
             config=cfg,
         )
+        orch._runner._spawn_memory_extraction = MagicMock()
 
         task = _make_task()
         result = await orch.execute_task(task)
@@ -2663,6 +2676,7 @@ class TestOrchestratorExecution:
             "read_file", {"path": "/tmp/x"},
             workspace=None,
             read_roots=[],
+            read_path_map={},
             scratch_dir=ANY,
             changelog=None,
             subtask_id="s1",

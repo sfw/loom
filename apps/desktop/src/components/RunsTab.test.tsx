@@ -88,6 +88,47 @@ describe("RunsTab", () => {
     expect(screen.queryByText("Launch a Run")).not.toBeInTheDocument();
   });
 
+  it("does not mount tool-call payloads until the row is expanded", async () => {
+    const user = userEvent.setup();
+    mockApp.selectedRunId = "run-abc";
+    mockApp.runDetail = {
+      id: "run-abc",
+      goal: "Review the site",
+      status: "executing",
+      process_name: "",
+      plan_subtasks: [],
+    };
+    mockApp.visibleRunTimeline = [
+      {
+        id: 1,
+        task_id: "run-abc",
+        run_id: "run-abc",
+        correlation_id: "corr-1",
+        event_id: "evt-1",
+        sequence: 1,
+        timestamp: "2026-03-30T20:00:00Z",
+        event_type: "tool_call_started",
+        source_component: "test",
+        schema_version: 1,
+        data: {
+          tool_name: "write_file",
+          args: {
+            path: "report.md",
+            content: "very secret payload",
+          },
+        },
+      },
+    ];
+
+    render(<RunsTab />);
+
+    expect(screen.queryByText("very secret payload")).not.toBeInTheDocument();
+
+    await user.click(screen.getByText("Show tool call"));
+
+    expect(screen.getByText(/very secret payload/i)).toBeInTheDocument();
+  });
+
   it("offers a retry action when a selected run fails to load", async () => {
     const user = userEvent.setup();
     mockApp.selectedRunId = "run-abc";
@@ -269,6 +310,43 @@ describe("RunsTab", () => {
       mockApp.approvalInbox[0],
       { decision: "approve" },
     );
+  });
+
+  it("caps rendered live activity by default to keep noisy runs responsive", async () => {
+    mockApp.selectedRunId = "run-abc";
+    mockApp.runDetail = {
+      id: "run-abc",
+      goal: "Review the site",
+      status: "executing",
+      process_name: "",
+      plan_subtasks: [],
+    };
+    mockApp.visibleRunTimeline = Array.from({ length: 300 }, (_value, index) => ({
+      id: index + 1,
+      task_id: "run-abc",
+      run_id: "exec-run-1",
+      correlation_id: `corr-${index + 1}`,
+      event_id: `evt-${index + 1}`,
+      sequence: index + 1,
+      timestamp: `2026-03-28T16:${String(index % 60).padStart(2, "0")}:00Z`,
+      event_type: "tool_call_started",
+      source_component: "tests",
+      schema_version: 1,
+      data: {
+        tool_name: "list_directory",
+        args: {
+          path: `path-${index + 1}.txt`,
+        },
+      },
+    }));
+
+    render(<RunsTab />);
+
+    expect(
+      screen.getByText("Showing the latest 250 of 300 events to keep the desktop responsive."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("list_directory → path-1.txt")).not.toBeInTheDocument();
+    expect(screen.getByText("list_directory → path-300.txt")).toBeInTheDocument();
   });
 
   it("groups processes into custom, installed, and built-in sections", () => {

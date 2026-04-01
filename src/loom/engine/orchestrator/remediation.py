@@ -248,7 +248,7 @@ async def queue_remediation_work_item(
         )
         item["updated_at"] = now.isoformat()
         async with orchestrator._state_lock:
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
         orchestrator._emit(UNCONFIRMED_DATA_QUEUED, task.id, {
             "remediation_id": str(item.get("id", "")).strip(),
             "subtask_id": subtask.id,
@@ -294,7 +294,7 @@ async def queue_remediation_work_item(
             "Queued remediation for "
             f"{subtask.id} ({strategy.value}, blocking={blocking})."
         )
-        orchestrator._state.save(task)
+        await orchestrator._save_task_state(task)
     orchestrator._emit(REMEDIATION_QUEUED, task.id, {
         "remediation_id": item["id"],
         "subtask_id": subtask.id,
@@ -496,7 +496,7 @@ async def process_remediation_queue(
 
     if changed:
         async with orchestrator._state_lock:
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
 
 async def execute_remediation_item(
     orchestrator,
@@ -633,7 +633,10 @@ async def run_confirm_or_prune_remediation(
                 last_failure = deterministic_note
 
         prior_successful_tool_calls: list[ToolCallRecord] = []
-        prior_evidence_records = orchestrator._evidence_for_subtask(task.id, subtask.id)
+        prior_evidence_records = await orchestrator._evidence_for_subtask_async(
+            task.id,
+            subtask.id,
+        )
         for attempt in attempts:
             raw_calls = getattr(attempt, "successful_tool_calls", [])
             if isinstance(raw_calls, list):
@@ -834,7 +837,7 @@ async def run_confirm_or_prune_remediation(
                     if remediation_result.summary
                     else message
                 )
-        orchestrator._persist_subtask_evidence(
+        await orchestrator._persist_subtask_evidence_async(
             task.id,
             subtask.id,
             remediation_result.evidence_records,
@@ -2091,7 +2094,7 @@ async def _hydrate_remediation_queue_from_db(self, task: Task) -> None:
         if not item_id or item_id in existing_ids:
             continue
         queue.append(item)
-    self._state.save(task)
+    await self._save_task_state(task)
 
 async def _persist_remediation_attempt(
     self,

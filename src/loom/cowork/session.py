@@ -153,6 +153,13 @@ _HEAVY_OUTPUT_TOOLS = frozenset({
     "glob_find",
     "conversation_recall",
 })
+_PARALLEL_BATCH_TOOL_NAMES = frozenset({
+    "archive_access",
+    "web_fetch",
+    "web_fetch_html",
+    "web_search",
+})
+MAX_PARALLEL_TOOL_BATCH_SIZE = 4
 
 # Phrases that suggest the user is referencing earlier context.
 _DANGLING_REF_INDICATORS = [
@@ -474,6 +481,12 @@ def _compact_preview(text: Any, limit: int) -> tuple[str, bool]:
         return normalized[:limit], True
     keep = max(0, limit - len(marker))
     return f"{normalized[:keep]}{marker}", True
+
+
+def _tool_result_preview(text: Any, limit: int) -> str:
+    """Return a fast deterministic preview for hot-path tool context."""
+    preview, _ = _compact_preview(text, limit)
+    return preview
 
 
 class CoworkSession:
@@ -900,33 +913,14 @@ class CoworkSession:
                     tool_calls=tc_dicts,
                 )
 
-                ask_user_pending = False
-                for tc in response.tool_calls:
-                    await self._await_if_paused(stage=f"tool_start:{tc.name}")
-                    self._raise_if_stop_requested(stage=f"tool_start:{tc.name}")
-                    event = ToolCallEvent(
-                        name=tc.name,
-                        args=tc.arguments,
-                        tool_call_id=str(getattr(tc, "id", "") or ""),
-                    )
-                    yield event  # signal: tool call starting
-
-                    result, elapsed_ms = await self._execute_tool_call(
-                        tc.name,
-                        tc.arguments,
-                        tool_call_id=event.tool_call_id,
-                        caller_tool_name=tc.name,
-                    )
-                    event.result = result
-                    event.elapsed_ms = elapsed_ms
-                    all_tool_events.append(event)
+                ask_user_pending = any(
+                    tc.name in _USER_INTERACTION_TOOLS
+                    for tc in response.tool_calls
+                )
+                async for event in self._iter_tool_call_events(response.tool_calls):
+                    if event.result is not None:
+                        all_tool_events.append(event)
                     yield event
-                    self._raise_if_stop_requested(stage=f"tool_complete:{tc.name}")
-
-                    await self._append_tool_result(tc.id, tc.name, result)
-
-                    if tc.name in _USER_INTERACTION_TOOLS:
-                        ask_user_pending = True
 
                 if ask_user_pending:
                     break
@@ -1147,33 +1141,14 @@ class CoworkSession:
                     tool_calls=tc_dicts,
                 )
 
-                ask_user_pending = False
-                for tc in final_tool_calls:
-                    await self._await_if_paused(stage=f"tool_start:{tc.name}")
-                    self._raise_if_stop_requested(stage=f"tool_start:{tc.name}")
-                    event = ToolCallEvent(
-                        name=tc.name,
-                        args=tc.arguments,
-                        tool_call_id=str(getattr(tc, "id", "") or ""),
-                    )
+                ask_user_pending = any(
+                    tc.name in _USER_INTERACTION_TOOLS
+                    for tc in final_tool_calls
+                )
+                async for event in self._iter_tool_call_events(final_tool_calls):
+                    if event.result is not None:
+                        all_tool_events.append(event)
                     yield event
-
-                    result, elapsed_ms = await self._execute_tool_call(
-                        tc.name,
-                        tc.arguments,
-                        tool_call_id=event.tool_call_id,
-                        caller_tool_name=tc.name,
-                    )
-                    event.result = result
-                    event.elapsed_ms = elapsed_ms
-                    all_tool_events.append(event)
-                    yield event
-                    self._raise_if_stop_requested(stage=f"tool_complete:{tc.name}")
-
-                    await self._append_tool_result(tc.id, tc.name, result)
-
-                    if tc.name in _USER_INTERACTION_TOOLS:
-                        ask_user_pending = True
 
                 if ask_user_pending:
                     break
@@ -1705,6 +1680,112 @@ class CoworkSession:
             idx += 1
 
         return sanitized
+
+    def _tool_allows_parallel_batch(self, tool_name: str) -> bool:
+        clean_name = str(tool_name or "").strip()
+        if not clean_name or clean_name not in _PARALLEL_BATCH_TOOL_NAMES:
+            return False
+        if clean_name in _USER_INTERACTION_TOOLS or clean_name in _CORE_TOOL_NAMES:
+            return False
+        tool = self._tools.get(clean_name)
+        if tool is None:
+            return False
+        if bool(getattr(tool, "is_mutating", False)):
+            return False
+        if tool_auth_required(tool):
+            return False
+        return True
+
+    def _should_parallelize_tool_batch(self, tool_calls: list[ToolCall]) -> bool:
+        if len(tool_calls) < 2:
+            return False
+        return all(self._tool_allows_parallel_batch(tc.name) for tc in tool_calls)
+
+    async def _iter_tool_call_events(
+        self,
+        tool_calls: list[ToolCall],
+    ) -> AsyncGenerator[ToolCallEvent, None]:
+        if self._should_parallelize_tool_batch(tool_calls):
+            events = [
+                ToolCallEvent(
+                    name=tc.name,
+                    args=tc.arguments,
+                    tool_call_id=str(getattr(tc, "id", "") or ""),
+                )
+                for tc in tool_calls
+            ]
+            for event in events:
+                await self._await_if_paused(stage=f"tool_start:{event.name}")
+                self._raise_if_stop_requested(stage=f"tool_start:{event.name}")
+                yield event
+
+            semaphore = asyncio.Semaphore(MAX_PARALLEL_TOOL_BATCH_SIZE)
+
+            async def _run_one(idx: int, tc: ToolCall) -> tuple[int, ToolResult, int]:
+                async with semaphore:
+                    result, elapsed_ms = await self._execute_tool_call(
+                        tc.name,
+                        tc.arguments,
+                        tool_call_id=str(getattr(tc, "id", "") or ""),
+                        caller_tool_name=tc.name,
+                    )
+                    return idx, result, elapsed_ms
+
+            tasks = [
+                asyncio.create_task(_run_one(idx, tc))
+                for idx, tc in enumerate(tool_calls)
+            ]
+            completed_results: dict[int, tuple[ToolResult, int]] = {}
+            try:
+                for task in asyncio.as_completed(tasks):
+                    idx, result, elapsed_ms = await task
+                    event = events[idx]
+                    event.result = result
+                    event.elapsed_ms = elapsed_ms
+                    completed_results[idx] = (result, elapsed_ms)
+                    yield event
+                    self._raise_if_stop_requested(stage=f"tool_complete:{event.name}")
+            except Exception:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+            for idx, tc in enumerate(tool_calls):
+                result, _elapsed_ms = completed_results[idx]
+                await self._append_tool_result(
+                    str(getattr(tc, "id", "") or ""),
+                    tc.name,
+                    result,
+                )
+            return
+
+        for tc in tool_calls:
+            await self._await_if_paused(stage=f"tool_start:{tc.name}")
+            self._raise_if_stop_requested(stage=f"tool_start:{tc.name}")
+            event = ToolCallEvent(
+                name=tc.name,
+                args=tc.arguments,
+                tool_call_id=str(getattr(tc, "id", "") or ""),
+            )
+            yield event
+
+            result, elapsed_ms = await self._execute_tool_call(
+                tc.name,
+                tc.arguments,
+                tool_call_id=event.tool_call_id,
+                caller_tool_name=tc.name,
+            )
+            event.result = result
+            event.elapsed_ms = elapsed_ms
+            yield event
+            self._raise_if_stop_requested(stage=f"tool_complete:{tc.name}")
+
+            await self._append_tool_result(
+                str(getattr(tc, "id", "") or ""),
+                tc.name,
+                result,
+            )
 
     async def _execute_tool_call(
         self,
@@ -2489,11 +2570,7 @@ class CoworkSession:
 
         if len(data) > 12:
             packed = json.dumps(data, ensure_ascii=False, default=str)
-            summary_text = await self._compact_text(
-                packed,
-                max_chars=900,
-                label="cowork tool data payload",
-            )
+            summary_text = _tool_result_preview(packed, 900)
             return {
                 "summary": summary_text,
                 "key_count": len(data),
@@ -2502,20 +2579,12 @@ class CoworkSession:
         summary: dict = {}
         for key, value in data.items():
             if isinstance(value, str):
-                summary[key] = await self._compact_text(
-                    value,
-                    max_chars=180,
-                    label=f"cowork tool data {key}",
-                )
+                summary[key] = _tool_result_preview(value, 180)
             elif isinstance(value, (int, float, bool)) or value is None:
                 summary[key] = value
             elif isinstance(value, (list, dict)):
                 packed = json.dumps(value, ensure_ascii=False, default=str)
-                summary[key] = await self._compact_text(
-                    packed,
-                    max_chars=220,
-                    label=f"cowork tool data {key}",
-                )
+                summary[key] = _tool_result_preview(packed, 220)
             else:
                 summary[key] = str(type(value).__name__)
         return summary or None
@@ -2544,11 +2613,7 @@ class CoworkSession:
             for key in ("text", "text_fallback", "extracted_text", "thinking"):
                 value = compact.get(key)
                 if isinstance(value, str):
-                    compact[key] = await self._compact_text(
-                        value,
-                        max_chars=max_chars,
-                        label=f"cowork content block {key}",
-                    )
+                    compact[key] = _tool_result_preview(value, max_chars)
             serialized_blocks.append(compact)
         return serialized_blocks or None
 
@@ -2558,11 +2623,7 @@ class CoworkSession:
         result: ToolResult,
     ) -> str:
         limit = self._tool_output_limit(tool_name)
-        output_text = await self._compact_text(
-            result.output,
-            max_chars=limit,
-            label=f"cowork {tool_name} tool output",
-        )
+        output_text = _tool_result_preview(result.output, limit)
         payload: dict = {
             "success": result.success,
             "output": output_text,
@@ -2572,11 +2633,7 @@ class CoworkSession:
 
         if len(payload["files_changed"]) > 20:
             files_text = "\n".join(payload["files_changed"])
-            payload["files_changed_summary"] = await self._compact_text(
-                files_text,
-                max_chars=380,
-                label=f"cowork {tool_name} files changed",
-            )
+            payload["files_changed_summary"] = _tool_result_preview(files_text, 380)
             payload["files_changed_count"] = len(payload["files_changed"])
             payload.pop("files_changed", None)
 

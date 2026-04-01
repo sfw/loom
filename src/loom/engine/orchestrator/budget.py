@@ -147,7 +147,7 @@ async def _enforce_global_budget(self, task: Task) -> bool:
         f"Global run budget exhausted: {budget_name} "
         f"(observed={observed}, limit={limit})",
     )
-    self._state.save(task)
+    await self._save_task_state(task)
     self._emit(TASK_BUDGET_EXHAUSTED, task.id, {
         "run_id": self._task_run_id(task),
         "budget_name": budget_name,

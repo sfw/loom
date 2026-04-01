@@ -224,6 +224,15 @@ def _make_task_with_plan(state_manager, task_id="test-1"):
     return task
 
 
+def test_engine_binds_delegate_task_for_api_cowork(engine):
+    from loom.tools.delegate_task import DelegateTaskTool
+
+    delegate = engine.tool_registry.get("delegate_task")
+
+    assert isinstance(delegate, DelegateTaskTool)
+    assert callable(getattr(delegate, "_factory", None))
+
+
 class TestInterruptedRunReconciliation:
     @pytest.mark.asyncio
     async def test_marks_non_durable_interrupted_runs_failed(
@@ -803,6 +812,45 @@ class TestWorkspaceFirstEndpoints:
         assert payload["counts"]["runs"] == 1
         assert payload["counts"]["conversations"] == 1
         assert payload["recent_conversations"][0]["linked_run_ids"] == ["task-ws-2"]
+
+    @pytest.mark.asyncio
+    async def test_workspace_summaries_prefer_live_terminal_status_for_active_counts(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "live-status-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+
+        await database.insert_task(
+            task_id="task-live-status-1",
+            goal="Finalize the report",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+        _make_task(
+            state_manager,
+            task_id="task-live-status-1",
+            goal="Finalize the report",
+            status=TaskStatus.COMPLETED,
+        )
+
+        list_response = await client.get("/workspaces")
+        assert list_response.status_code == 200
+        list_payload = list_response.json()
+        live_row = next(row for row in list_payload if row["id"] == workspace["id"])
+        assert live_row["active_run_count"] == 0
+
+        overview_response = await client.get(f"/workspaces/{workspace['id']}/overview")
+        assert overview_response.status_code == 200
+        overview_payload = overview_response.json()
+        assert overview_payload["workspace"]["active_run_count"] == 0
+        assert overview_payload["recent_runs"][0]["status"] == "completed"
 
     @pytest.mark.asyncio
     async def test_unified_approvals_list_and_reply(
@@ -1864,6 +1912,304 @@ class TestWorkspaceFirstEndpoints:
         ]
 
     @pytest.mark.asyncio
+    async def test_conversation_events_expand_prefix_for_streamed_assistant_text(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-events-prefix-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        for event_type, payload in [
+            ("user_message", {"text": "show me a code block"}),
+            ("assistant_text", {"text": "```py\npri", "streaming": True}),
+            ("assistant_text", {"text": "nt('hi')\n```", "streaming": True}),
+            ("turn_separator", {"tokens": 8, "tool_count": 0}),
+        ]:
+            await conversation_store.append_chat_event(session_id, event_type, payload)
+
+        response = await client.get(
+            f"/conversations/{session_id}/events?limit=2",
+        )
+        assert response.status_code == 200
+        rows = response.json()
+
+        assert [row["seq"] for row in rows] == [1, 2, 3, 4]
+        assert rows[0]["event_type"] == "user_message"
+        assert rows[1]["payload"]["text"] == "```py\npri"
+        assert rows[2]["payload"]["text"] == "nt('hi')\n```"
+
+    @pytest.mark.asyncio
+    async def test_conversation_stream_initial_replay_expands_prefix_for_streamed_assistant_text(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-stream-prefix-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        for event_type, payload in [
+            ("user_message", {"text": "show me a code block"}),
+            ("assistant_text", {"text": "```py\npri", "streaming": True}),
+            ("assistant_text", {"text": "nt('hi')\n```", "streaming": True}),
+            ("turn_separator", {"tokens": 8, "tool_count": 0}),
+        ]:
+            await conversation_store.append_chat_event(session_id, event_type, payload)
+
+        async with client.stream(
+            "GET",
+            f"/conversations/{session_id}/stream?follow=false",
+        ) as response:
+            seen_payloads: list[dict[str, object]] = []
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                seen_payloads.append(json.loads(line.removeprefix("data: ")))
+
+        assert [payload["seq"] for payload in seen_payloads] == [1, 2, 3, 4]
+
+    @pytest.mark.asyncio
+    async def test_conversation_events_expand_prefix_across_multiple_pages(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-events-multipage-prefix-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        await conversation_store.append_chat_event(
+            session_id,
+            "user_message",
+            {"text": "show me markdown"},
+        )
+        for chunk in [
+            "```markdown\n",
+            "# Heading\n\n",
+            "## Section\n\n",
+            "- one\n",
+            "- two\n",
+            "```\n",
+            "\nThanks!",
+        ]:
+            await conversation_store.append_chat_event(
+                session_id,
+                "assistant_text",
+                {"text": chunk, "streaming": True},
+            )
+        await conversation_store.append_chat_event(
+            session_id,
+            "turn_separator",
+            {"tokens": 12, "tool_count": 0},
+        )
+
+        response = await client.get(
+            f"/conversations/{session_id}/events?limit=2",
+        )
+        assert response.status_code == 200
+        rows = response.json()
+
+        assert [row["seq"] for row in rows] == list(range(1, 10))
+        assert rows[0]["event_type"] == "user_message"
+        assert rows[1]["payload"]["text"] == "```markdown\n"
+        assert rows[7]["payload"]["text"] == "\nThanks!"
+        assert rows[8]["event_type"] == "turn_separator"
+
+    @pytest.mark.asyncio
+    async def test_conversation_events_keep_prefix_expansion_bounded_for_long_streams(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-events-bounded-prefix-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        await conversation_store.append_chat_event(
+            session_id,
+            "user_message",
+            {"text": "show me a very long streamed answer"},
+        )
+        for index in range(1, 401):
+            await conversation_store.append_chat_event(
+                session_id,
+                "assistant_text",
+                {"text": f"chunk {index}\n", "streaming": True},
+            )
+        await conversation_store.append_chat_event(
+            session_id,
+            "turn_separator",
+            {"tokens": 400, "tool_count": 0},
+        )
+
+        response = await client.get(
+            f"/conversations/{session_id}/events?limit=10",
+        )
+        assert response.status_code == 200
+        rows = response.json()
+
+        assert 10 <= len(rows) <= 74
+        assert rows[0]["seq"] > 1
+        assert rows[-1]["seq"] == 402
+
+    @pytest.mark.asyncio
+    async def test_conversation_stream_initial_replay_keeps_prefix_expansion_bounded(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-stream-bounded-prefix-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        await conversation_store.append_chat_event(
+            session_id,
+            "user_message",
+            {"text": "show me a very long streamed answer"},
+        )
+        for index in range(1, 701):
+            await conversation_store.append_chat_event(
+                session_id,
+                "assistant_text",
+                {"text": f"chunk {index}\n", "streaming": True},
+            )
+        await conversation_store.append_chat_event(
+            session_id,
+            "turn_separator",
+            {"tokens": 700, "tool_count": 0},
+        )
+
+        async with client.stream(
+            "GET",
+            f"/conversations/{session_id}/stream?follow=false",
+        ) as response:
+            seen_payloads: list[dict[str, object]] = []
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                seen_payloads.append(json.loads(line.removeprefix("data: ")))
+
+        assert 500 <= len(seen_payloads) <= 564
+        assert int(seen_payloads[0]["seq"]) > 1
+        assert seen_payloads[-1]["seq"] == 702
+
+    @pytest.mark.asyncio
+    async def test_conversation_events_before_turn_bridges_hybrid_history(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-events-hybrid-page-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        for turn_number in range(1, 251):
+            role = "assistant" if turn_number % 2 == 0 else "user"
+            await conversation_store.append_turn(
+                session_id,
+                turn_number,
+                role,
+                f"message {turn_number}",
+            )
+
+        for event_type, payload in [
+            ("user_message", {"text": "message 249"}),
+            ("assistant_text", {"text": "message 250"}),
+        ]:
+            await conversation_store.append_chat_event(session_id, event_type, payload)
+
+        latest_response = await client.get(
+            f"/conversations/{session_id}/events?limit=10",
+        )
+        assert latest_response.status_code == 200
+        latest_rows = latest_response.json()
+        assert [row["seq"] for row in latest_rows] == [1, 2]
+
+        older_without_turn_response = await client.get(
+            f"/conversations/{session_id}/events?before_seq=1&limit=10",
+        )
+        assert older_without_turn_response.status_code == 200
+        assert older_without_turn_response.json() == []
+
+        older_with_turn_response = await client.get(
+            f"/conversations/{session_id}/events?before_seq=1&before_turn=151&limit=100",
+        )
+        assert older_with_turn_response.status_code == 200
+        older_rows = older_with_turn_response.json()
+        assert older_rows[0]["turn_number"] == 51
+        assert older_rows[-1]["turn_number"] == 150
+
+    @pytest.mark.asyncio
+    async def test_conversation_events_before_turn_without_seq_returns_legacy_page(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-events-before-turn-only-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        for turn_number in range(1, 7):
+            role = "assistant" if turn_number % 2 == 0 else "user"
+            await conversation_store.append_turn(
+                session_id,
+                turn_number,
+                role,
+                f"message {turn_number}",
+            )
+
+        response = await client.get(
+            f"/conversations/{session_id}/events?before_turn=5&limit=10",
+        )
+        assert response.status_code == 200
+        rows = response.json()
+        assert [row["turn_number"] for row in rows] == [1, 2, 3, 4]
+
+    @pytest.mark.asyncio
     async def test_conversation_status_reports_pending_ask_user_prompt(
         self,
         client,
@@ -2855,6 +3201,108 @@ class TestWorkspaceFirstEndpoints:
         assert workspace_payload[0]["path"] == f"{run_workspace.name}/{artifact_relpath}"
         assert workspace_payload[0]["latest_run_id"] == "task-scoped-artifacts-1"
         assert workspace_payload[0]["run_ids"] == ["task-scoped-artifacts-1"]
+        assert workspace_payload[0]["run_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_scoped_run_artifacts_keep_attached_source_paths_at_workspace_root(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "scoped-source-artifacts-ws"
+        workspace_path.mkdir()
+        source_dir = workspace_path / "seo-geo-review"
+        source_dir.mkdir()
+        source_file = source_dir / "audit-scope.md"
+        source_text = "# Audit Scope\n\nSource context.\n"
+        source_file.write_text(source_text, encoding="utf-8")
+        source_bytes = source_text.encode("utf-8")
+        source_sha = hashlib.sha256(source_bytes).hexdigest()
+
+        run_workspace = workspace_path / "report-microsite"
+        run_workspace.mkdir()
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Scoped Source Artifacts WS",
+        )
+        assert workspace is not None
+
+        await database.insert_task(
+            task_id="task-scoped-source-artifacts-1",
+            goal="Make the results into a microsite",
+            workspace_path=str(run_workspace),
+            status="completed",
+            context={
+                "workspace_paths": [source_dir.name],
+                "workspace_directories": [source_dir.name],
+            },
+            metadata={
+                "source_workspace_root": str(workspace_path),
+                "run_workspace_relative": run_workspace.name,
+                "run_workspace_mode": "scoped_subfolder",
+            },
+        )
+        state_manager.save_evidence_records(
+            "task-scoped-source-artifacts-1",
+            [
+                {
+                    "evidence_id": "EV-SCOPED-SOURCE-REL-1",
+                    "task_id": "task-scoped-source-artifacts-1",
+                    "subtask_id": "review-source-folder",
+                    "phase_id": "research",
+                    "tool": "read_file",
+                    "evidence_kind": "artifact",
+                    "artifact_workspace_relpath": f"{source_dir.name}/{source_file.name}",
+                    "artifact_sha256": source_sha,
+                    "artifact_size_bytes": len(source_bytes),
+                    "created_at": "2026-03-27T18:10:00",
+                },
+                {
+                    "evidence_id": "EV-SCOPED-SOURCE-ABS-1",
+                    "task_id": "task-scoped-source-artifacts-1",
+                    "subtask_id": "review-source-folder",
+                    "phase_id": "research",
+                    "tool": "read_file",
+                    "evidence_kind": "artifact",
+                    "artifact_workspace_relpath": str(source_file.resolve()),
+                    "artifact_sha256": source_sha,
+                    "artifact_size_bytes": len(source_bytes),
+                    "created_at": "2026-03-27T18:10:01",
+                },
+            ],
+        )
+
+        run_artifacts = await client.get("/runs/task-scoped-source-artifacts-1/artifacts")
+        assert run_artifacts.status_code == 200
+        assert run_artifacts.json() == [
+            {
+                "path": f"{source_dir.name}/{source_file.name}",
+                "category": "document",
+                "source": "evidence",
+                "sha256": source_sha,
+                "size_bytes": len(source_bytes),
+                "exists_on_disk": True,
+                "is_intermediate": False,
+                "created_at": "2026-03-27T18:10:01",
+                "tool_name": "read_file",
+                "subtask_ids": ["review-source-folder"],
+                "phase_ids": ["research"],
+                "facets": {},
+            },
+        ]
+
+        workspace_artifacts = await client.get(f"/workspaces/{workspace['id']}/artifacts")
+        assert workspace_artifacts.status_code == 200
+        workspace_payload = workspace_artifacts.json()
+        assert len(workspace_payload) == 1
+        assert workspace_payload[0]["path"] == f"{source_dir.name}/{source_file.name}"
+        assert workspace_payload[0]["exists_on_disk"] is True
+        assert workspace_payload[0]["latest_run_id"] == "task-scoped-source-artifacts-1"
+        assert workspace_payload[0]["run_ids"] == ["task-scoped-source-artifacts-1"]
         assert workspace_payload[0]["run_count"] == 1
 
     @pytest.mark.asyncio

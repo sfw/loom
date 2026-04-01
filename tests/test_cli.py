@@ -17,7 +17,9 @@ from click.testing import CliRunner
 
 from loom import __version__
 from loom.__main__ import cli
-from loom.config import Config, ProcessConfig
+from loom.auth.config import AuthConfig, MergedAuthConfig
+from loom.config import Config, MCPConfig, ProcessConfig
+from loom.mcp.config import MergedMCPConfig
 from loom.processes.testing import ProcessCaseResult
 from loom.runtime.capabilities import OptionalAddonStatus
 
@@ -60,6 +62,63 @@ def _oauth_token_server(*, status_code: int = 200, payload: dict | None = None):
 
 class TestCLI:
     """Test CLI commands."""
+
+    @staticmethod
+    def _patch_doctor_side_effects(monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(
+            "loom.auth.config.load_merged_auth_config",
+            lambda **_kwargs: MergedAuthConfig(
+                config=AuthConfig(),
+                user_path=tmp_path / "auth.toml",
+                explicit_path=None,
+                workspace_defaults={},
+                workspace_defaults_path=tmp_path / ".loom" / "auth.defaults.toml",
+            ),
+        )
+        monkeypatch.setattr(
+            "loom.mcp.config.load_merged_mcp_config",
+            lambda **_kwargs: MergedMCPConfig(
+                config=MCPConfig(servers={}),
+                sources={},
+                explicit_path=None,
+                workspace_path=tmp_path / ".loom" / "mcp.toml",
+                user_path=tmp_path / "mcp.toml",
+                legacy_config_path=None,
+            ),
+        )
+
+    @staticmethod
+    def _doctor_statuses() -> list[OptionalAddonStatus]:
+        return [
+            OptionalAddonStatus(
+                key="browser",
+                label="Browser Addon",
+                installed=False,
+                required_for="Full JS-capable browser_session execution",
+                install_hint="uv sync --extra browser",
+                detail="Playwright package is not installed.",
+            ),
+            OptionalAddonStatus(
+                key="treesitter",
+                label="Tree-sitter Addon",
+                installed=True,
+                required_for=(
+                    "Structural code analysis and structured edit_file matching"
+                ),
+                install_hint="uv sync --extra treesitter",
+                detail="tree-sitter-language-pack importable.",
+            ),
+            OptionalAddonStatus(
+                key="mcp",
+                label="MCP Addon",
+                installed=False,
+                required_for=(
+                    "MCP-backed tool discovery and external MCP server integrations"
+                ),
+                install_hint="uv sync --extra mcp",
+                detail="MCP package is not installed.",
+            ),
+        ]
 
     def test_help(self):
         runner = CliRunner()
@@ -128,28 +187,50 @@ class TestCLI:
         assert "doctor" in result.output
         assert "backup" in result.output
 
-    def test_doctor_reports_optional_addons(self, monkeypatch) -> None:
+    def test_doctor_reports_runtime_sections(self, monkeypatch, tmp_path: Path) -> None:
+        self._patch_doctor_side_effects(monkeypatch, tmp_path)
+        cfg_path = tmp_path / "loom.toml"
+        db_path = tmp_path / "loom.db"
+        cfg_path.write_text(
+            "[models.local]\n"
+            "provider = \"ollama\"\n"
+            "model = \"llama3\"\n"
+            "roles = [\"executor\", \"planner\", \"verifier\"]\n"
+            "[memory]\n"
+            f"database_path = \"{db_path}\"\n",
+            encoding="utf-8",
+        )
+        statuses = self._doctor_statuses()
         monkeypatch.setattr(
             "loom.cli.commands.root.optional_addon_statuses",
-            lambda: [
-                OptionalAddonStatus(
-                    key="browser",
-                    label="Browser Addon",
-                    installed=False,
-                    required_for="Full JS-capable browser_session execution",
-                    install_hint="uv sync --extra browser",
-                    detail="Playwright package is not installed.",
-                )
-            ],
+            lambda: statuses,
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_status_by_key",
+            lambda key: next((status for status in statuses if status.key == key), None),
         )
         runner = CliRunner()
-        result = runner.invoke(cli, ["doctor"], catch_exceptions=False)
+        result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "doctor"],
+            catch_exceptions=False,
+        )
         assert result.exit_code == 0
         assert "Runtime doctor" in result.output
+        assert "Environment" in result.output
+        assert "Configuration" in result.output
+        assert "Persistence" in result.output
+        assert "Auth" in result.output
+        assert "MCP" in result.output
+        assert "Optional Addons" in result.output
+        assert "Model role executor:" in result.output
+        assert "Database path:" in result.output
         assert "Browser Addon (browser): missing" in result.output
+        assert "Tree-sitter Addon (treesitter): installed" in result.output
         assert "Doctor passed" in result.output
 
-    def test_doctor_requires_installed_addon(self, monkeypatch) -> None:
+    def test_doctor_requires_installed_addon(self, monkeypatch, tmp_path: Path) -> None:
+        self._patch_doctor_side_effects(monkeypatch, tmp_path)
         status = OptionalAddonStatus(
             key="browser",
             label="Browser Addon",
@@ -173,9 +254,11 @@ class TestCLI:
             catch_exceptions=False,
         )
         assert result.exit_code == 1
-        assert "Doctor failed: missing required addon(s): browser" in result.output
+        assert "Missing required addon(s): browser" in result.output
+        assert "Doctor failed" in result.output
 
-    def test_doctor_rejects_unknown_addon_key(self, monkeypatch) -> None:
+    def test_doctor_rejects_unknown_addon_key(self, monkeypatch, tmp_path: Path) -> None:
+        self._patch_doctor_side_effects(monkeypatch, tmp_path)
         monkeypatch.setattr(
             "loom.cli.commands.root.optional_addon_statuses",
             lambda: [],
@@ -192,6 +275,36 @@ class TestCLI:
         )
         assert result.exit_code == 1
         assert "Unknown addon key: unknown-addon" in result.output
+        assert "Doctor failed" in result.output
+
+    def test_doctor_reports_invalid_config_without_preemptive_exit(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        self._patch_doctor_side_effects(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_statuses",
+            lambda: [],
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_status_by_key",
+            lambda _key: None,
+        )
+        cfg_path = tmp_path / "broken.toml"
+        cfg_path.write_text("[models.bad\nprovider = 'ollama'\n", encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "doctor"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 1
+        assert "Configuration" in result.output
+        assert "Status: invalid" in result.output
+        assert "Invalid Loom config" in result.output
+        assert "Doctor failed" in result.output
 
     def test_db_status_missing_db(self, tmp_path):
         db_path = tmp_path / "loom.db"

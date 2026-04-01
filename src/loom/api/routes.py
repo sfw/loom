@@ -118,7 +118,7 @@ from loom.events.types import (
 from loom.events.verbosity import should_deliver_operator
 from loom.processes.run_workspace import provision_scoped_run_workspace
 from loom.processes.schema import ProcessLoader
-from loom.read_scope import build_attached_read_scope
+from loom.read_scope import build_attached_read_scope, iter_context_workspace_paths
 from loom.state.memory import MemoryEntry
 from loom.state.task_state import Plan, Subtask, SubtaskStatus, Task, TaskStatus
 from loom.state.workspaces import canonicalize_workspace_path
@@ -479,6 +479,113 @@ def _workspace_visible_artifact_path(task_row: dict[str, Any], relpath: object) 
     if not prefix:
         return artifact_relpath
     return f"{prefix}/{artifact_relpath}"
+
+
+def _artifact_relpath_within_root(workspace_path: object, relpath: object) -> str:
+    workspace_text = canonicalize_workspace_path(workspace_path)
+    artifact_relpath = str(relpath or "").strip()
+    if not workspace_text or not artifact_relpath:
+        return ""
+    try:
+        workspace_root = Path(workspace_text).expanduser().resolve()
+        candidate = Path(artifact_relpath).expanduser()
+        if candidate.is_absolute():
+            resolved = candidate.resolve(strict=False)
+        else:
+            resolved = (workspace_root / candidate).resolve(strict=False)
+        relative = resolved.relative_to(workspace_root)
+    except Exception:
+        return ""
+    relative_text = str(relative).replace("\\", "/").strip().strip("/\\")
+    if not relative_text or relative_text == ".":
+        return ""
+    return relative_text
+
+
+def _artifact_matches_attached_context(task_row: dict[str, Any], relpath: str) -> bool:
+    artifact_relpath = str(relpath or "").strip().strip("/\\")
+    if not artifact_relpath:
+        return False
+    context = _json_object(task_row.get("context"))
+    for attached in iter_context_workspace_paths(context):
+        if artifact_relpath == attached or artifact_relpath.startswith(f"{attached}/"):
+            return True
+    return False
+
+
+def _artifact_fallback_visible_path(task_row: dict[str, Any], relpath: object) -> str:
+    artifact_relpath = str(relpath or "").strip().replace("\\", "/")
+    if not artifact_relpath:
+        return ""
+    try:
+        candidate = Path(artifact_relpath).expanduser()
+    except Exception:
+        candidate = Path(artifact_relpath)
+    if candidate.is_absolute():
+        return artifact_relpath
+    return _workspace_visible_artifact_path(task_row, artifact_relpath)
+
+
+def _resolve_artifact_locator(
+    task_row: dict[str, Any],
+    relpath: object,
+    *,
+    prefer_run_workspace: bool = False,
+) -> tuple[str, str, bool]:
+    artifact_relpath = str(relpath or "").strip()
+    if not artifact_relpath:
+        return "", "", False
+
+    metadata = _json_object(task_row.get("metadata"))
+    run_workspace = canonicalize_workspace_path(task_row.get("workspace_path"))
+    source_workspace = canonicalize_workspace_path(metadata.get("source_workspace_root"))
+    if source_workspace == run_workspace:
+        source_workspace = ""
+
+    run_relpath = _artifact_relpath_within_root(run_workspace, artifact_relpath)
+    source_relpath = (
+        _artifact_relpath_within_root(source_workspace, artifact_relpath)
+        if source_workspace
+        else ""
+    )
+    run_exists = (
+        _artifact_exists_on_disk(run_workspace, run_relpath)
+        if run_relpath
+        else False
+    )
+    source_exists = (
+        _artifact_exists_on_disk(source_workspace, source_relpath)
+        if source_relpath
+        else False
+    )
+
+    if prefer_run_workspace and run_relpath:
+        return (
+            f"run:{run_relpath}",
+            _workspace_visible_artifact_path(task_row, run_relpath),
+            run_exists,
+        )
+    if run_exists and run_relpath:
+        return (
+            f"run:{run_relpath}",
+            _workspace_visible_artifact_path(task_row, run_relpath),
+            True,
+        )
+    if source_exists and source_relpath:
+        return f"source:{source_relpath}", source_relpath, True
+    if source_relpath and _artifact_matches_attached_context(task_row, source_relpath):
+        return f"source:{source_relpath}", source_relpath, False
+    if run_relpath:
+        return (
+            f"run:{run_relpath}",
+            _workspace_visible_artifact_path(task_row, run_relpath),
+            False,
+        )
+    if source_relpath:
+        return f"source:{source_relpath}", source_relpath, False
+
+    fallback = _artifact_fallback_visible_path(task_row, artifact_relpath)
+    return f"raw:{fallback or artifact_relpath}", fallback, False
 
 
 def _latest_timestamp(*values: object) -> str:
@@ -1026,6 +1133,28 @@ def _task_phase_ids(task: object) -> dict[str, str]:
     return phase_ids
 
 
+async def _load_task_state(engine: Engine, task_id: str) -> Task | None:
+    try:
+        task = await asyncio.to_thread(engine.state_manager.load, task_id)
+    except Exception:
+        return None
+    return task if isinstance(task, Task) else None
+
+
+async def _load_task_evidence_records(
+    engine: Engine,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    try:
+        records = await asyncio.to_thread(
+            engine.state_manager.load_evidence_records,
+            task_id,
+        )
+    except Exception:
+        return []
+    return [record for record in records if isinstance(record, dict)]
+
+
 async def _build_run_artifacts(
     engine: Engine,
     task_row: dict[str, Any],
@@ -1035,38 +1164,36 @@ async def _build_run_artifacts(
     seals = metadata.get("artifact_seals")
     if not isinstance(seals, dict):
         seals = {}
-    try:
-        evidence_records = engine.state_manager.load_evidence_records(task_id)
-    except Exception:
-        evidence_records = []
+    evidence_records = await _load_task_evidence_records(engine, task_id)
 
     phase_by_subtask: dict[str, str] = {}
-    if engine.state_manager.exists(task_id):
-        try:
-            phase_by_subtask = _task_phase_ids(engine.state_manager.load(task_id))
-        except Exception:
-            phase_by_subtask = {}
+    loaded_task = await _load_task_state(engine, task_id)
+    if loaded_task is not None:
+        phase_by_subtask = _task_phase_ids(loaded_task)
 
     artifact_rows: dict[str, dict[str, Any]] = {}
-    workspace_path = str(task_row.get("workspace_path", "") or "").strip()
 
     for relpath, seal in seals.items():
         artifact_relpath = str(relpath or "").strip()
         if not artifact_relpath or not isinstance(seal, dict):
             continue
+        artifact_key, workspace_visible_path, exists_on_disk = _resolve_artifact_locator(
+            task_row,
+            artifact_relpath,
+            prefer_run_workspace=True,
+        )
         subtask_ids: list[str] = []
         phase_ids: list[str] = []
         subtask_id = str(seal.get("subtask_id", "") or "").strip()
         _append_unique(subtask_ids, subtask_id)
         _append_unique(phase_ids, phase_by_subtask.get(subtask_id, ""))
-        workspace_visible_path = _workspace_visible_artifact_path(task_row, artifact_relpath)
-        artifact_rows[artifact_relpath] = {
+        artifact_rows[artifact_key or artifact_relpath] = {
             "path": workspace_visible_path,
             "category": _artifact_category(artifact_relpath),
             "source": "seal",
             "sha256": str(seal.get("sha256", "") or ""),
             "size_bytes": int(seal.get("size_bytes", 0) or 0),
-            "exists_on_disk": _artifact_exists_on_disk(workspace_path, artifact_relpath),
+            "exists_on_disk": exists_on_disk,
             "is_intermediate": _artifact_is_intermediate(artifact_relpath),
             "created_at": str(seal.get("sealed_at", "") or ""),
             "tool_name": str(seal.get("tool", "") or ""),
@@ -1081,11 +1208,15 @@ async def _build_run_artifacts(
         artifact_relpath = str(record.get("artifact_workspace_relpath", "") or "").strip()
         if not artifact_relpath:
             continue
+        artifact_key, workspace_visible_path, exists_on_disk = _resolve_artifact_locator(
+            task_row,
+            artifact_relpath,
+            prefer_run_workspace=artifact_relpath in seals,
+        )
         facets = record.get("facets")
         if not isinstance(facets, dict):
             facets = {}
-        workspace_visible_path = _workspace_visible_artifact_path(task_row, artifact_relpath)
-        row = artifact_rows.get(artifact_relpath)
+        row = artifact_rows.get(artifact_key or artifact_relpath)
         if row is None:
             row = {
                 "path": workspace_visible_path,
@@ -1097,7 +1228,7 @@ async def _build_run_artifacts(
                 "source": "evidence",
                 "sha256": "",
                 "size_bytes": 0,
-                "exists_on_disk": _artifact_exists_on_disk(workspace_path, artifact_relpath),
+                "exists_on_disk": exists_on_disk,
                 "is_intermediate": _artifact_is_intermediate(artifact_relpath),
                 "created_at": "",
                 "tool_name": "",
@@ -1105,7 +1236,7 @@ async def _build_run_artifacts(
                 "phase_ids": [],
                 "facets": {},
             }
-            artifact_rows[artifact_relpath] = row
+            artifact_rows[artifact_key or artifact_relpath] = row
         elif row.get("source") == "seal":
             row["source"] = "seal+evidence"
 
@@ -1122,7 +1253,7 @@ async def _build_run_artifacts(
         if tool_name:
             row["tool_name"] = tool_name
         row["path"] = workspace_visible_path
-        row["exists_on_disk"] = _artifact_exists_on_disk(workspace_path, artifact_relpath)
+        row["exists_on_disk"] = exists_on_disk
         evidence_category = _artifact_category(
             artifact_relpath,
             evidence_kind=record.get("evidence_kind"),
@@ -1793,15 +1924,7 @@ async def _build_run_summary(
     latest_run = await engine.database.get_latest_task_run_for_task(task_id)
     linked_conversations = await engine.conversation_store.list_linked_conversations(task_id)
 
-    # Prefer live status from state manager over potentially stale DB status
-    db_status = str(task_row.get("status", "") or "")
-    live_status = db_status
-    if engine.state_manager.exists(task_id):
-        try:
-            live_task = engine.state_manager.load(task_id)
-            live_status = live_task.status.value
-        except Exception:
-            pass
+    live_status = await _resolve_task_status(engine, task_row)
 
     return RunSummaryResponse(
         id=task_id,
@@ -1824,6 +1947,17 @@ async def _build_run_summary(
         ],
         changed_files_count=0,
     )
+
+
+async def _resolve_task_status(engine: Engine, task_row: dict[str, Any]) -> str:
+    task_id = str(task_row.get("id", "") or "").strip()
+    db_status = str(task_row.get("status", "") or "").strip().lower()
+    if not task_id:
+        return db_status
+    live_task = await _load_task_state(engine, task_id)
+    if live_task is not None:
+        return str(live_task.status.value or "").strip().lower()
+    return db_status
 
 
 async def _build_workspace_summary(
@@ -1850,6 +1984,9 @@ async def _build_workspace_summary(
     for row in session_rows:
         last_activity_at = _latest_timestamp(last_activity_at, row.get("last_active_at"))
     active_statuses = {"pending", "planning", "executing", "paused"}
+    resolved_task_statuses = await asyncio.gather(
+        *(_resolve_task_status(engine, row) for row in task_rows),
+    ) if task_rows else []
     workspace_path = str(workspace.get("canonical_path", "") or "")
     return WorkspaceSummaryResponse(
         id=workspace_id,
@@ -1871,8 +2008,8 @@ async def _build_workspace_summary(
         run_count=len(task_rows),
         active_run_count=sum(
             1
-            for row in task_rows
-            if str(row.get("status", "") or "").strip().lower() in active_statuses
+            for status in resolved_task_statuses
+            if status in active_statuses
         ),
         last_activity_at=last_activity_at,
     )
@@ -1938,12 +2075,15 @@ async def _task_context(
     task_id: str,
 ) -> tuple[dict[str, Any], str, str, str]:
     task_row = await engine.database.get_task(task_id)
-    if task_row is None and engine.state_manager.exists(task_id):
-        task = engine.state_manager.load(task_id)
+    if task_row is None:
+        task = await _load_task_state(engine, task_id)
+    else:
+        task = None
+    if task is not None:
         task_row = {
             "id": task.id,
             "goal": task.goal,
-            "workspace_path": task.workspace_path,
+            "workspace_path": task.workspace,
             "status": task.status.value,
             "created_at": task.created_at,
             "updated_at": task.updated_at,
@@ -2427,6 +2567,51 @@ def _normalize_conversation_approval_decision(raw: object) -> CoworkApprovalDeci
     if value == CoworkApprovalDecision.DENY.value:
         return CoworkApprovalDecision.DENY
     return CoworkApprovalDecision.APPROVE
+
+
+_CONVERSATION_PREFIX_EVENT_TYPES = {"assistant_text", "assistant_thinking"}
+_CONVERSATION_PREFIX_EXTRA_ROW_BUDGET = 64
+_CONVERSATION_PREFIX_FETCH_BATCH = 32
+
+
+async def _expand_conversation_event_page_prefix(
+    engine: Engine,
+    conversation_id: str,
+    rows: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Ensure a history page does not begin mid-assistant transcript run.
+
+    Streamed assistant replies are persisted as many small replay rows. If a
+    paged history fetch starts on one of those rows, the desktop transcript can
+    render incomplete Markdown until older rows hydrate. When the first row is
+    assistant text/thinking, we pull earlier rows until the page starts at a
+    stable boundary or we exhaust a bounded prefix budget.
+    """
+    expanded = list(rows)
+    extra_rows = 0
+    while expanded:
+        first = expanded[0]
+        event_type = str(first.get("event_type", "") or "").strip()
+        if event_type not in _CONVERSATION_PREFIX_EVENT_TYPES:
+            break
+        first_seq = int(first.get("seq", 0) or 0)
+        if first_seq <= 1:
+            break
+        remaining_budget = _CONVERSATION_PREFIX_EXTRA_ROW_BUDGET - extra_rows
+        if remaining_budget <= 0:
+            break
+        older = await engine.conversation_store.get_chat_events(
+            conversation_id,
+            before_seq=first_seq,
+            limit=min(limit, _CONVERSATION_PREFIX_FETCH_BATCH, remaining_budget),
+        )
+        if not older:
+            break
+        expanded = [*older, *expanded]
+        extra_rows += len(older)
+    return expanded
 
 
 async def _conversation_pending_prompt(
@@ -3676,7 +3861,7 @@ async def get_workspace_inventory(request: Request, workspace_id: str):
             author=str(row.get("author", "") or ""),
             path=str(row.get("path", "") or ""),
         )
-        for row in loader.list_available()
+        for row in await asyncio.to_thread(loader.list_available)
     ]
     mcp_rows = [
         MCPServerInfoResponse(
@@ -4164,6 +4349,7 @@ async def get_conversation_events(
     request: Request,
     conversation_id: str,
     before_seq: int | None = None,
+    before_turn: int | None = None,
     after_seq: int = 0,
     limit: int = 200,
 ):
@@ -4172,6 +4358,12 @@ async def get_conversation_events(
     session = await engine.conversation_store.get_session(conversation_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"Conversation not found: {conversation_id}")
+    if before_turn is not None and before_seq is None:
+        return await engine.conversation_store.synthesize_chat_events_from_turns(
+            conversation_id,
+            before_turn=max(1, int(before_turn)),
+            limit=limit,
+        )
     rows = await engine.conversation_store.get_chat_events(
         conversation_id,
         before_seq=(
@@ -4181,6 +4373,13 @@ async def get_conversation_events(
         limit=limit,
     )
     if rows:
+        if before_seq is not None or after_seq <= 0:
+            rows = await _expand_conversation_event_page_prefix(
+                engine,
+                conversation_id,
+                rows,
+                limit=limit,
+            )
         return rows
     if after_seq > 0 and before_seq is None:
         # Incremental polling/refresh should return only truly new rows.
@@ -4188,10 +4387,11 @@ async def get_conversation_events(
         # that the client may already have from durable chat-event rows.
         return []
     if before_seq is not None:
-        before_turn = max(1, int((int(before_seq) + 99) / 100))
+        if before_turn is None:
+            before_turn = max(1, int((int(before_seq) + 99) / 100))
         return await engine.conversation_store.synthesize_chat_events_from_turns(
             conversation_id,
-            before_turn=before_turn,
+            before_turn=max(1, int(before_turn)),
             limit=limit,
         )
     return await engine.conversation_store.synthesize_chat_events_from_turns(
@@ -4408,6 +4608,13 @@ async def stream_conversation_events(
                 after_seq=cursor,
                 limit=500,
             )
+            if cursor <= 0 and rows:
+                rows = await _expand_conversation_event_page_prefix(
+                    engine,
+                    conversation_id,
+                    rows,
+                    limit=500,
+                )
             for row in rows:
                 cursor = max(cursor, int(row.get("seq", 0) or 0))
                 yield {
@@ -4472,23 +4679,19 @@ async def get_run(request: Request, run_id: str):
 
     # Include plan/subtask data from state manager when available
     plan_data: list[dict[str, Any]] = []
-    if engine.state_manager.exists(run_id):
-        try:
-            task_obj = engine.state_manager.load(run_id)
-            if task_obj.plan and task_obj.plan.subtasks:
-                for s in task_obj.plan.subtasks:
-                    plan_data.append({
-                        "id": s.id,
-                        "description": s.description,
-                        "status": s.status.value,
-                        "depends_on": s.depends_on,
-                        "phase_id": s.phase_id,
-                        "summary": s.summary or "",
-                        "is_critical_path": s.is_critical_path,
-                        "is_synthesis": s.is_synthesis,
-                    })
-        except Exception:
-            pass
+    task_obj = await _load_task_state(engine, run_id)
+    if task_obj is not None and task_obj.plan and task_obj.plan.subtasks:
+        for s in task_obj.plan.subtasks:
+            plan_data.append({
+                "id": s.id,
+                "description": s.description,
+                "status": s.status.value,
+                "depends_on": s.depends_on,
+                "phase_id": s.phase_id,
+                "summary": s.summary or "",
+                "is_critical_path": s.is_critical_path,
+                "is_synthesis": s.is_synthesis,
+            })
 
     return {
         **summary.model_dump(),

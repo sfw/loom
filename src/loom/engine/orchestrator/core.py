@@ -63,6 +63,7 @@ from loom.state.task_state import (
 )
 from loom.tools.registry import ToolRegistry
 from loom.tools.workspace import ChangeLog
+from loom.utils.concurrency import run_blocking_io
 
 from . import budget as orchestrator_budget
 from . import dispatch as orchestrator_dispatch
@@ -299,7 +300,7 @@ class Orchestrator:
         try:
             self._telemetry_rollup = self._new_telemetry_rollup()
             self._run_budget = _RunBudget(self._config)
-            run_id = self._initialize_task_run_id(task)
+            run_id = await self._initialize_task_run_id_async(task)
             self._emit(TASK_RUN_ACQUIRED, task.id, {
                 "run_id": run_id,
             })
@@ -329,7 +330,7 @@ class Orchestrator:
                     if reused_plan_replanned and task.plan and task.plan.subtasks:
                         plan = task.plan
                 task.status = TaskStatus.EXECUTING
-                self._state.save(task)
+                await self._save_task_state(task)
                 if not reused_plan_replanned:
                     self._emit(TASK_PLAN_READY, task.id, {
                         "subtask_count": len(plan.subtasks),
@@ -340,7 +341,7 @@ class Orchestrator:
             else:
                 # 1. Planning phase
                 task.status = TaskStatus.PLANNING
-                self._state.save(task)
+                await self._save_task_state(task)
                 self._emit(TASK_PLANNING, task.id, {
                     "goal": task.goal,
                     "run_id": run_id,
@@ -349,7 +350,7 @@ class Orchestrator:
                 plan = await self._plan_task_with_validation(task)
                 task.plan = plan
                 task.status = TaskStatus.EXECUTING
-                self._state.save(task)
+                await self._save_task_state(task)
                 self._emit(TASK_PLAN_READY, task.id, {
                     "subtask_count": len(plan.subtasks),
                     "subtask_ids": [s.id for s in plan.subtasks],
@@ -595,7 +596,7 @@ class Orchestrator:
             )
             if bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
                 await self._sync_remediation_queue_to_db(task)
-            result_task = self._finalize_task(task)
+            result_task = await self._finalize_task_async(task)
             self._export_evidence_ledger_csv(result_task)
 
             # 4. Learn from execution (best-effort)
@@ -608,7 +609,7 @@ class Orchestrator:
             task.status = TaskStatus.FAILED
             task.add_error("orchestrator", f"{type(e).__name__}: {e}")
             try:
-                self._state.save(task)
+                await self._save_task_state(task)
             except Exception as save_err:
                 logger.error("Failed to save after fatal: %s", save_err)
             self._emit(TASK_FAILED, task.id, {
@@ -1110,7 +1111,7 @@ class Orchestrator:
                     + (verification.feedback or subtask.summary or "unknown failure")
                 ),
             )
-            self._state.save(task)
+            await self._save_task_state(task)
 
     def _phase_mode(self) -> str:
         return orchestrator_planning.phase_mode(self)
@@ -1136,7 +1137,7 @@ class Orchestrator:
         if mode == "require_approval":
             async with self._state_lock:
                 task.status = TaskStatus.WAITING_APPROVAL
-                self._state.save(task)
+                await self._save_task_state(task)
             approved = await self._approval.request_approval(
                 ApprovalRequest(
                     task_id=task.id,
@@ -1153,7 +1154,7 @@ class Orchestrator:
             )
             async with self._state_lock:
                 task.status = TaskStatus.PLANNING
-                self._state.save(task)
+                await self._save_task_state(task)
             if not approved:
                 raise ValueError(
                     f"Planner degraded fallback not approved ({reason_code})",
@@ -2245,7 +2246,7 @@ class Orchestrator:
             "reason": "verifier_parse_error",
         })
         prior_calls: list[ToolCallRecord] = []
-        prior_evidence = self._evidence_for_subtask(task.id, subtask.id)
+        prior_evidence = await self._evidence_for_subtask_async(task.id, subtask.id)
         for attempt in attempts:
             raw_calls = getattr(attempt, "successful_tool_calls", [])
             if isinstance(raw_calls, list):
@@ -2423,8 +2424,51 @@ class Orchestrator:
             "current_plan_version": int(task.plan.version),
         })
 
+    async def _save_task_state(self, task: Task) -> None:
+        await run_blocking_io(self._state.save, task)
+
+    async def _load_task_state(self, task_id: str) -> Task | None:
+        try:
+            task = await run_blocking_io(self._state.load, task_id)
+        except Exception:
+            return None
+        return task if isinstance(task, Task) else None
+
+    async def _task_state_exists(self, task_id: str) -> bool:
+        return bool(await run_blocking_io(self._state.exists, task_id))
+
+    async def _load_evidence_records(self, task_id: str) -> list[dict]:
+        try:
+            records = await run_blocking_io(self._state.load_evidence_records, task_id)
+        except Exception:
+            return []
+        return [record for record in records if isinstance(record, dict)]
+
+    async def _append_evidence_records(
+        self,
+        task_id: str,
+        records: list[dict],
+    ) -> list[dict]:
+        merged = await run_blocking_io(
+            self._state.append_evidence_records,
+            task_id,
+            records,
+        )
+        return [record for record in merged if isinstance(record, dict)]
+
     def _evidence_for_subtask(self, task_id: str, subtask_id: str) -> list[dict]:
-        return orchestrator_evidence._evidence_for_subtask(self, task_id, subtask_id)
+        return orchestrator_evidence._evidence_for_subtask(
+            self,
+            task_id,
+            subtask_id,
+        )
+
+    async def _evidence_for_subtask_async(self, task_id: str, subtask_id: str) -> list[dict]:
+        return await orchestrator_evidence._evidence_for_subtask_async(
+            self,
+            task_id,
+            subtask_id,
+        )
 
     def _persist_subtask_evidence(
         self,
@@ -2436,6 +2480,24 @@ class Orchestrator:
         workspace: str | Path | None = None,
     ) -> None:
         return orchestrator_evidence._persist_subtask_evidence(
+            self,
+            task_id,
+            subtask_id,
+            evidence_records,
+            tool_calls=tool_calls,
+            workspace=workspace,
+        )
+
+    async def _persist_subtask_evidence_async(
+        self,
+        task_id: str,
+        subtask_id: str,
+        evidence_records: list[dict] | None,
+        *,
+        tool_calls: list[ToolCallRecord] | None = None,
+        workspace: str | Path | None = None,
+    ) -> None:
+        return await orchestrator_evidence._persist_subtask_evidence_async(
             self,
             task_id,
             subtask_id,
@@ -2564,6 +2626,9 @@ class Orchestrator:
     def _finalize_task(self, task: Task) -> Task:
         return orchestrator_output._finalize_task(self, task)
 
+    async def _finalize_task_async(self, task: Task) -> Task:
+        return await orchestrator_output._finalize_task_async(self, task)
+
     async def _learn_from_task(self, task: Task) -> None:
         return await orchestrator_telemetry._learn_from_task(self, task)
 
@@ -2576,6 +2641,9 @@ class Orchestrator:
 
     def _initialize_task_run_id(self, task: Task) -> str:
         return orchestrator_runtime.initialize_task_run_id(self, task)
+
+    async def _initialize_task_run_id_async(self, task: Task) -> str:
+        return await orchestrator_runtime.initialize_task_run_id_async(self, task)
 
     def _apply_budget_metadata(
         self,

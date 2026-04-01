@@ -96,6 +96,7 @@ export interface AppState {
   workspaceFilesByDirectory: Record<string, WorkspaceFileEntry[]>;
   expandedWorkspaceDirectories: string[];
   loadingWorkspaceDirectory: string;
+  refreshingWorkspaceFiles: boolean;
   selectedWorkspaceFilePath: string;
   workspaceFilePreview: WorkspaceFilePreview | null;
   loadingWorkspaceFilePreview: boolean;
@@ -374,6 +375,7 @@ export interface AppActions {
   handleRevealWorkspaceFile: () => Promise<void>;
   handleSaveWorkspaceFile: () => Promise<void>;
   handleResetWorkspaceFileEditor: () => void;
+  handleRefreshWorkspaceFiles: () => Promise<void>;
   handleExpandActiveWorkspaceFiles: () => Promise<void>;
   handleExpandRecentWorkspaceFiles: () => Promise<void>;
   toggleWorkspaceDirectory: (path: string) => void;
@@ -441,6 +443,7 @@ export function useAppState(): AppState & AppActions {
     selectedWorkspaceId,
     selectedConversationId,
     selectedRunId,
+    connectionState: connection.connectionState,
     setSelectedWorkspaceId,
     showArchivedWorkspaces,
     setShowArchivedWorkspaces,
@@ -462,6 +465,7 @@ export function useAppState(): AppState & AppActions {
   // -----------------------------------------------------------------------
   const conversation = useConversation({
     selectedConversationId,
+    connectionState: connection.connectionState,
     setSelectedConversationId,
     selectedWorkspaceId,
     overview: workspace.overview,
@@ -477,6 +481,7 @@ export function useAppState(): AppState & AppActions {
   // -----------------------------------------------------------------------
   const runs = useRuns({
     selectedRunId,
+    connectionState: connection.connectionState,
     setSelectedRunId,
     selectedWorkspaceId,
     overview: workspace.overview,
@@ -791,6 +796,7 @@ export function useAppState(): AppState & AppActions {
     workspaceFilesByDirectory: files.workspaceFilesByDirectory,
     expandedWorkspaceDirectories: files.expandedWorkspaceDirectories,
     loadingWorkspaceDirectory: files.loadingWorkspaceDirectory,
+    refreshingWorkspaceFiles: files.refreshingWorkspaceFiles,
     selectedWorkspaceFilePath: files.selectedWorkspaceFilePath,
     setSelectedWorkspaceFilePath: files.setSelectedWorkspaceFilePath,
     workspaceFilePreview: files.workspaceFilePreview,
@@ -830,6 +836,7 @@ export function useAppState(): AppState & AppActions {
     handleRevealWorkspaceFile: files.handleRevealWorkspaceFile,
     handleSaveWorkspaceFile: files.handleSaveWorkspaceFile,
     handleResetWorkspaceFileEditor: files.handleResetWorkspaceFileEditor,
+    handleRefreshWorkspaceFiles: files.handleRefreshWorkspaceFiles,
     handleExpandActiveWorkspaceFiles: files.handleExpandActiveWorkspaceFiles,
     handleExpandRecentWorkspaceFiles: files.handleExpandRecentWorkspaceFiles,
     toggleWorkspaceDirectory: files.toggleWorkspaceDirectory,

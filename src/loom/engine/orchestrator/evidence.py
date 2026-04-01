@@ -127,6 +127,70 @@ def _persist_subtask_evidence(
     except Exception as e:
         logger.warning("Failed persisting evidence ledger for %s: %s", task_id, e)
 
+
+async def _evidence_for_subtask_async(self, task_id: str, subtask_id: str) -> list[dict]:
+    """Load persisted evidence records scoped to one subtask without blocking the loop."""
+    try:
+        records = await self._load_evidence_records(task_id)
+    except Exception as e:
+        logger.warning("Failed loading evidence ledger for %s: %s", task_id, e)
+        return []
+    scoped: list[dict] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("subtask_id", "")).strip() != subtask_id:
+            continue
+        scoped.append(item)
+    return scoped
+
+
+async def _persist_subtask_evidence_async(
+    self,
+    task_id: str,
+    subtask_id: str,
+    evidence_records: list[dict] | None,
+    *,
+    tool_calls: list[ToolCallRecord] | None = None,
+    workspace: str | Path | None = None,
+) -> None:
+    """Persist newly captured evidence records without blocking the loop."""
+    scoped: list[dict] = []
+    if evidence_records:
+        for item in evidence_records:
+            if not isinstance(item, dict):
+                continue
+            normalized = dict(item)
+            normalized["subtask_id"] = subtask_id
+            normalized.setdefault("task_id", task_id)
+            scoped.append(normalized)
+    existing_ids: set[str] = {
+        str(item.get("evidence_id", "") or "").strip()
+        for item in scoped
+        if isinstance(item, dict) and str(item.get("evidence_id", "") or "").strip()
+    }
+    workspace_path: Path | None = None
+    if workspace:
+        try:
+            workspace_path = Path(str(workspace)).expanduser().resolve()
+        except Exception:
+            workspace_path = None
+    provenance_records = self._artifact_provenance_evidence(
+        task_id=task_id,
+        subtask_id=subtask_id,
+        tool_calls=tool_calls,
+        existing_ids=existing_ids,
+        workspace=workspace_path,
+    )
+    if provenance_records:
+        scoped = merge_evidence_records(scoped, provenance_records)
+    if not scoped:
+        return
+    try:
+        await self._append_evidence_records(task_id, scoped)
+    except Exception as e:
+        logger.warning("Failed persisting evidence ledger for %s: %s", task_id, e)
+
 def _artifact_content_for_call(
     tool_name: str,
     args: dict[str, object],

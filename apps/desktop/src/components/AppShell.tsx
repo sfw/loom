@@ -63,6 +63,9 @@ export default function AppShell() {
   const conversationCount = overview?.recent_conversations?.length ?? 0;
   const runCount = overview?.recent_runs?.length ?? 0;
   const closeConfirmedRef = useRef(false);
+  const hasShellSnapshot = Boolean(runtime) || workspaces.length > 0;
+  const showBlockingConnectionScreen =
+    connectionState !== "connected" && !hasShellSnapshot;
 
   // Auto-dismiss toasts after 4 seconds
   useEffect(() => {
@@ -131,7 +134,7 @@ export default function AppShell() {
   }, [totalActiveRuns]);
 
   // Show connection screen when not connected
-  if (connectionState !== "connected") {
+  if (showBlockingConnectionScreen) {
     return (
       <div className="flex h-screen items-center justify-center bg-[#09090b] text-zinc-100">
         <div className="max-w-sm text-center">
@@ -254,6 +257,37 @@ export default function AppShell() {
             </kbd>
           </button>
         </header>
+
+        {connectionState !== "connected" && (
+          <div
+            className={cn(
+              "flex items-center justify-between gap-3 border-b px-5 py-2 text-xs",
+              connectionState === "connecting"
+                ? "border-sky-500/20 bg-sky-500/8 text-sky-200"
+                : "border-amber-500/20 bg-amber-500/8 text-amber-200",
+            )}
+          >
+            <div className="flex min-w-0 items-center gap-2">
+              {connectionState === "connecting" ? (
+                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+              ) : (
+                <WifiOff className="h-3.5 w-3.5 shrink-0" />
+              )}
+              <span className="truncate">
+                {connectionState === "connecting"
+                  ? "Reconnecting to Loomd..."
+                  : "Connection to Loomd dropped. Retrying automatically..."}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={retryConnection}
+              className="shrink-0 rounded-md border border-current/20 px-2 py-1 font-medium text-inherit transition-colors hover:bg-white/5"
+            >
+              Retry now
+            </button>
+          </div>
+        )}
 
         {/* Tab content */}
         <div className="flex-1 overflow-hidden min-h-0">

@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useApp } from "@/context/AppContext";
@@ -16,11 +16,14 @@ import {
   Eye,
   Save,
   RotateCcw,
+  RefreshCw,
   Upload,
   Filter,
   Code,
   BookOpen,
 } from "lucide-react";
+
+const MAX_AUTO_RENDERED_MARKDOWN_CHARS = 100_000;
 
 export default function FilesTab() {
   const {
@@ -28,6 +31,7 @@ export default function FilesTab() {
     workspaceFilesByDirectory,
     expandedWorkspaceDirectories,
     loadingWorkspaceDirectory,
+    refreshingWorkspaceFiles,
     selectedWorkspaceFilePath,
     selectedWorkspaceFileEntry,
     workspaceFilePreview,
@@ -59,6 +63,7 @@ export default function FilesTab() {
     handleRevealWorkspaceFile,
     handleSaveWorkspaceFile,
     handleResetWorkspaceFileEditor,
+    handleRefreshWorkspaceFiles,
     handleExpandActiveWorkspaceFiles,
     handleExpandRecentWorkspaceFiles,
     handleImportWorkspaceFiles,
@@ -70,11 +75,18 @@ export default function FilesTab() {
   } = useApp();
 
   const [mdRendered, setMdRendered] = useState(true);
+  const [allowLargeMarkdownRender, setAllowLargeMarkdownRender] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [creatingFolder, setCreatingFolder] = useState(false);
 
   const isMarkdownFile = selectedWorkspaceFilePath.endsWith(".md") || selectedWorkspaceFilePath.endsWith(".mdx") || workspaceFilePreview?.language === "markdown";
+  const isLargeMarkdownPreview = isMarkdownFile
+    && (workspaceFilePreview?.text_content?.length || 0) > MAX_AUTO_RENDERED_MARKDOWN_CHARS;
+
+  useEffect(() => {
+    setAllowLargeMarkdownRender(false);
+  }, [selectedWorkspaceFilePath]);
 
   const handleCreateFolder = useCallback(async () => {
     if (!newFolderName.trim() || !selectedWorkspaceSummary?.canonical_path) return;
@@ -233,6 +245,40 @@ export default function FilesTab() {
     if (preview.preview_kind === "text") {
       // Markdown rendered view
       if (isMarkdownFile && mdRendered) {
+        if (isLargeMarkdownPreview && !allowLargeMarkdownRender) {
+          return (
+            <div className="flex flex-col gap-4 p-6">
+              <div className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4">
+                <p className="text-sm font-medium text-zinc-200">
+                  Large Markdown preview paused
+                </p>
+                <p className="mt-2 text-sm leading-relaxed text-zinc-500">
+                  This file is large enough that rendering it as Markdown can stall the desktop.
+                  View the raw source, or opt in to rendering it inline for this file only.
+                </p>
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setAllowLargeMarkdownRender(true)}
+                    className="rounded-lg bg-[#6b7a5e] px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-[#8a9a7b]"
+                  >
+                    Render anyway
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMdRendered(false)}
+                    className="rounded-lg border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+                  >
+                    View source
+                  </button>
+                  <span className="text-[11px] text-zinc-600">
+                    {(preview.text_content || "").length.toLocaleString()} characters
+                  </span>
+                </div>
+              </div>
+            </div>
+          );
+        }
         return (
           <div className="p-6 prose prose-invert prose-sm max-w-none prose-p:my-2 prose-p:leading-relaxed prose-headings:text-zinc-200 prose-headings:font-semibold prose-h1:text-xl prose-h2:text-lg prose-h3:text-base prose-code:text-[#bec8b4] prose-code:bg-zinc-800 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-code:before:content-none prose-code:after:content-none prose-pre:bg-zinc-900 prose-pre:border prose-pre:border-zinc-800 prose-pre:rounded-lg prose-pre:text-xs prose-a:text-[#a3b396] prose-strong:text-zinc-200 prose-em:text-zinc-300 prose-blockquote:border-zinc-700 prose-blockquote:text-zinc-400 prose-hr:border-zinc-800 prose-th:text-zinc-300 prose-td:text-zinc-400 prose-table:text-xs">
             <Markdown remarkPlugins={[remarkGfm]}>{preview.text_content || ""}</Markdown>
@@ -398,6 +444,19 @@ export default function FilesTab() {
 
           {/* Expand helpers */}
           <div className="ml-auto flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => void handleRefreshWorkspaceFiles()}
+              disabled={!selectedWorkspaceId || refreshingWorkspaceFiles}
+              className="flex items-center justify-center rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-40"
+              title="Reload files"
+              aria-label="Reload files"
+            >
+              <RefreshCw
+                size={12}
+                className={cn(refreshingWorkspaceFiles && "animate-spin")}
+              />
+            </button>
             {hasContextualFiles && workspaceFileTreeMode === "active" && (
               <button
                 type="button"

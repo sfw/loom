@@ -214,7 +214,7 @@ async def dispatch_subtask(
         subtask.status = SubtaskStatus.RUNNING
         if subtask.verification_tier < required_verification_tier:
             subtask.verification_tier = required_verification_tier
-        orchestrator._state.save(task)
+        await orchestrator._save_task_state(task)
     orchestrator._emit(SUBTASK_STARTED, task.id, {"subtask_id": subtask.id})
 
     # Determine escalation tier
@@ -225,7 +225,10 @@ async def dispatch_subtask(
         else RetryStrategy.GENERIC
     )
     prior_successful_tool_calls: list[ToolCallRecord] = []
-    prior_evidence_records = orchestrator._evidence_for_subtask(task.id, subtask.id)
+    prior_evidence_records = await orchestrator._evidence_for_subtask_async(
+        task.id,
+        subtask.id,
+    )
     for attempt in attempts:
         raw_calls = getattr(attempt, "successful_tool_calls", [])
         if isinstance(raw_calls, list):
@@ -726,7 +729,7 @@ async def handle_failure(
     attempts_by_subtask: dict[str, list[AttemptRecord]],
 ) -> dict[str, str | None] | None:
     """Process a failed subtask: record attempt, retry or replan."""
-    orchestrator._persist_subtask_evidence(
+    await orchestrator._persist_subtask_evidence_async(
         task.id,
         subtask.id,
         result.evidence_records,
@@ -918,7 +921,7 @@ async def handle_failure(
             summary=subtask.summary,
         )
         task.add_error(subtask.id, f"Verification failed (tier {verification.tier})")
-        orchestrator._state.save(task)
+        await orchestrator._save_task_state(task)
 
     orchestrator._emit(SUBTASK_FAILED, task.id, {
         "subtask_id": subtask.id,
@@ -1011,7 +1014,7 @@ async def handle_failure(
                 status=SubtaskStatus.PENDING,
                 retry_count=subtask.retry_count,
             )
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
 
         orchestrator._emit(SUBTASK_RETRYING, task.id, {
             "subtask_id": subtask.id,
@@ -1075,7 +1078,7 @@ async def handle_failure(
                         iteration_terminal_reason=subtask.iteration_terminal_reason,
                         iteration_replan_count=subtask.iteration_replan_count,
                     )
-                    orchestrator._state.save(task)
+                    await orchestrator._save_task_state(task)
                 return replan_request
 
             if subtask.is_critical_path:
@@ -1108,7 +1111,7 @@ async def handle_failure(
                     subtask.id,
                     f"Iteration exhausted ({terminal_reason}): {gate_summary}",
                 )
-                orchestrator._state.save(task)
+                await orchestrator._save_task_state(task)
             return None
         # All retries exhausted.
         # Critical-path failures abort the remaining plan.
@@ -1215,7 +1218,7 @@ async def handle_success(
     verification: VerificationResult,
 ) -> None:
     """Process a successful subtask: update state, check approval."""
-    orchestrator._persist_subtask_evidence(
+    await orchestrator._persist_subtask_evidence_async(
         task.id,
         subtask.id,
         result.evidence_records,
@@ -1277,7 +1280,7 @@ async def handle_success(
             task.workspace_changes.files_deleted = len(change_summary["deleted"])
             task.workspace_changes.last_change = datetime.now().isoformat()
 
-        orchestrator._state.save(task)
+        await orchestrator._save_task_state(task)
 
     remediation_mode = ""
     remediation_required = False
@@ -1322,7 +1325,7 @@ async def handle_success(
         ):
             async with orchestrator._state_lock:
                 task.status = TaskStatus.WAITING_APPROVAL
-                orchestrator._state.save(task)
+                await orchestrator._save_task_state(task)
 
             approved = await orchestrator._approval.request_approval(
                 ApprovalRequest(
@@ -1339,7 +1342,7 @@ async def handle_success(
 
             async with orchestrator._state_lock:
                 task.status = TaskStatus.EXECUTING
-                orchestrator._state.save(task)
+                await orchestrator._save_task_state(task)
 
             if not approved:
                 async with orchestrator._state_lock:
@@ -1349,7 +1352,7 @@ async def handle_success(
                         status=SubtaskStatus.FAILED,
                         summary="Rejected by human reviewer",
                     )
-                    orchestrator._state.save(task)
+                    await orchestrator._save_task_state(task)
 
         elif decision == ApprovalDecision.ABORT:
             async with orchestrator._state_lock:
@@ -1359,7 +1362,7 @@ async def handle_success(
                     status=SubtaskStatus.FAILED,
                     summary="Aborted: confidence too low",
                 )
-                orchestrator._state.save(task)
+                await orchestrator._save_task_state(task)
 
 async def handle_iteration_after_success(
     orchestrator,
@@ -1499,7 +1502,7 @@ async def handle_iteration_after_success(
                 iteration_no_improvement_count=subtask.iteration_no_improvement_count,
                 iteration_last_gate_summary=subtask.iteration_last_gate_summary,
             )
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
         await orchestrator._persist_iteration_evaluation(
             task=task,
             subtask=subtask,
@@ -1568,7 +1571,7 @@ async def handle_iteration_after_success(
                 iteration_terminal_reason=subtask.iteration_terminal_reason,
                 iteration_replan_count=subtask.iteration_replan_count,
             )
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
         return replan_request
 
     if subtask.is_critical_path:
@@ -1601,7 +1604,7 @@ async def handle_iteration_after_success(
             subtask.id,
             f"Iteration exhausted ({terminal_reason}): {gate_summary}",
         )
-        orchestrator._state.save(task)
+        await orchestrator._save_task_state(task)
     return None
 
 
@@ -1823,7 +1826,7 @@ async def _request_iteration_replan(
         prior_fingerprints = prior_fingerprints[-8:]
     seen_fingerprints[subtask_key] = prior_fingerprints
     task.metadata = metadata
-    self._state.save(task)
+    await self._save_task_state(task)
 
     return {
         "reason": f"iteration_loop_exhausted:{terminal_reason}",
@@ -2057,7 +2060,7 @@ async def _reconcile_iteration_state(self, task: Task) -> None:
     if prior_count == current_count and not hydrated_subtask_ids:
         return
 
-    self._state.save(task)
+    await self._save_task_state(task)
     self._emit(ITERATION_STATE_RECONCILED, task.id, {
         "run_id": self._task_run_id(task),
         "task_id": task.id,
@@ -2150,7 +2153,7 @@ async def _reconcile_subtask_policy_state(self, task: Task) -> None:
 
     if not changed:
         return
-    self._state.save(task)
+    await self._save_task_state(task)
     self._emit(SUBTASK_POLICY_RECONCILED, task.id, {
         "run_id": self._task_run_id(task),
         "reconciled_subtasks": reconciled,

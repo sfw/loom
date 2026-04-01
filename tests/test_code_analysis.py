@@ -13,6 +13,7 @@ from loom.tools.code_analysis import (
     analyze_file,
     detect_language,
     extract_go,
+    extract_html,
     extract_javascript,
     extract_python,
     extract_rust,
@@ -43,6 +44,12 @@ class TestDetectLanguage:
 
     def test_jsx(self):
         assert detect_language("App.jsx") == "javascript"
+
+    def test_html(self):
+        assert detect_language("index.html") == "html"
+
+    def test_htm(self):
+        assert detect_language("snippet.htm") == "html"
 
 
 # --- Python Extractor ---
@@ -163,6 +170,37 @@ class TestExtractRust:
         assert "crate::config" in result.imports
 
 
+# --- HTML Extractor ---
+
+
+class TestExtractHtml:
+    def test_extracts_elements_ids_classes_and_imports(self):
+        source = (
+            "<!DOCTYPE html>"
+            "<html><head><link rel='stylesheet' href='/styles.css'></head>"
+            "<body>"
+            "<header id='hero' class='hero shell'></header>"
+            "<main><script src='/app.js'></script><my-card></my-card></main>"
+            "</body></html>"
+        )
+        result = extract_html(source)
+        assert "header" in result.elements
+        assert "main" in result.elements
+        assert "my-card" in result.elements
+        assert "hero" in result.ids
+        assert "hero" in result.classes
+        assert "shell" in result.classes
+        assert "/styles.css" in result.imports
+        assert "/app.js" in result.imports
+
+    def test_skips_html_shell_tags(self):
+        result = extract_html("<html><head></head><body><main></main></body></html>")
+        assert "html" not in result.elements
+        assert "head" not in result.elements
+        assert "body" not in result.elements
+        assert "main" in result.elements
+
+
 # --- CodeStructure ---
 
 
@@ -172,6 +210,8 @@ class TestCodeStructure:
             file_path="src/main.py",
             language="python",
             imports=["os", "sys"],
+            elements=["main"],
+            ids=["app"],
             classes=["App"],
             functions=["main", "run"],
         )
@@ -179,6 +219,8 @@ class TestCodeStructure:
         assert "src/main.py" in summary
         assert "python" in summary
         assert "os" in summary
+        assert "main" in summary
+        assert "app" in summary
         assert "App" in summary
         assert "main" in summary
 
@@ -210,6 +252,14 @@ class TestAnalyzeFile:
     def test_file_path_preserved(self):
         result = analyze_file("src/utils.py", "x = 1")
         assert result.file_path == "src/utils.py"
+
+    def test_html_file(self):
+        source = "<html><body><main id='app'><script src='/app.js'></script></main></body></html>"
+        result = analyze_file("index.html", source)
+        assert result.language == "html"
+        assert "main" in result.elements
+        assert "app" in result.ids
+        assert "/app.js" in result.imports
 
 
 # --- analyze_directory ---
@@ -258,6 +308,13 @@ class TestAnalyzeDirectory:
         assert len(results) == 1
         assert "src/app.py" in results[0].file_path
 
+    def test_scans_html_files(self, tmp_path: Path):
+        (tmp_path / "index.html").write_text("<html><body><main></main></body></html>")
+        results = analyze_directory(tmp_path)
+        assert len(results) == 1
+        assert results[0].language == "html"
+        assert "main" in results[0].elements
+
     def test_skips_non_source_files(self, tmp_path: Path):
         (tmp_path / "readme.md").write_text("# Hello")
         (tmp_path / "config.json").write_text("{}")
@@ -285,6 +342,17 @@ class TestAnalyzeCodeTool:
         assert result.success
         assert "App" in result.output
         assert "run" in result.output
+
+    async def test_analyze_html_file(self, ctx: ToolContext, workspace: Path):
+        (workspace / "index.html").write_text(
+            "<html><body><main id='app'><script src='/app.js'></script></main></body></html>",
+        )
+        tool = AnalyzeCodeTool()
+        result = await tool.execute({"path": "index.html"}, ctx)
+        assert result.success
+        assert "Elements: main, script" in result.output
+        assert "IDs: app" in result.output
+        assert "Imports: /app.js" in result.output
 
     async def test_analyze_missing_file(self, ctx: ToolContext):
         tool = AnalyzeCodeTool()

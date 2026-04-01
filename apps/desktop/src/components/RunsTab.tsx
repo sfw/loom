@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect, useCallback, lazy, Suspense, type FormEvent } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback, useDeferredValue, lazy, Suspense, type FormEvent } from "react";
 
 const Markdown = lazy(() => import("react-markdown"));
 import {
@@ -27,6 +27,7 @@ import {
   FolderTree,
 } from "lucide-react";
 import { useApp } from "@/context/AppContext";
+import type { RunTimelineEvent } from "@/api";
 import {
   approvalQuestionContext,
   approvalQuestionOptions,
@@ -42,6 +43,7 @@ import {
   runTimelineToolArgs,
   runTimelineToolName,
 } from "../history";
+import { displayRunStatus, normalizeRunStatus } from "../runStatus";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -61,6 +63,10 @@ const APPROVAL_MODES = [
   { value: "manual", label: "Manual", desc: "Gate every step" },
   { value: "disabled", label: "Disabled", desc: "No gating" },
 ] as const;
+
+const MAX_RENDERED_ACTIVITY_EVENTS = 250;
+const MAX_TOOL_ARGS_PREVIEW_CHARS = 12_000;
+const MAX_ACTIVITY_DETAIL_RENDER_CHARS = 8_000;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -235,8 +241,91 @@ function ScrollButton({ direction, scrollRef }: { direction: "up" | "down"; scro
   );
 }
 
+function hasToolArgs(event: RunTimelineEvent): boolean {
+  const args = event.data.args;
+  return Boolean(args && typeof args === "object" && Object.keys(args).length > 0);
+}
+
+function truncatedPreview(text: string, maxChars: number): { text: string; truncated: boolean } {
+  if (text.length <= maxChars) {
+    return { text, truncated: false };
+  }
+  return {
+    text: `${text.slice(0, maxChars)}\n\n...\n\n[truncated in desktop preview]`,
+    truncated: true,
+  };
+}
+
+function ActivityDetailMarkdown({ detail }: { detail: string }) {
+  const [open, setOpen] = useState(false);
+  const preview = useMemo(
+    () => (open ? truncatedPreview(detail, MAX_ACTIVITY_DETAIL_RENDER_CHARS) : null),
+    [detail, open],
+  );
+
+  return (
+    <details
+      className="mt-1.5"
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="text-[10px] text-zinc-600 cursor-pointer hover:text-zinc-400 transition-colors select-none">
+        Show details
+      </summary>
+      {open && preview && (
+        <div className="mt-1 border-l-2 border-zinc-800 pl-2.5 text-[11px] text-zinc-400 leading-relaxed prose-invert prose-xs [&_strong]:text-zinc-300 [&_em]:text-zinc-400 [&_code]:text-[#a3b396] [&_code]:bg-zinc-800/60 [&_code]:px-1 [&_code]:py-px [&_code]:rounded [&_code]:text-[10px] [&_ul]:list-disc [&_ul]:pl-4 [&_ul]:my-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_ol]:my-1 [&_li]:my-0.5 [&_p]:my-1 [&_h1]:text-xs [&_h1]:font-semibold [&_h1]:text-zinc-300 [&_h2]:text-xs [&_h2]:font-semibold [&_h2]:text-zinc-300 [&_h3]:text-[11px] [&_h3]:font-semibold [&_h3]:text-zinc-300">
+          <Suspense fallback={<p className="text-zinc-600">Loading...</p>}>
+            <Markdown>{preview.text}</Markdown>
+          </Suspense>
+          {preview.truncated && (
+            <p className="mt-2 text-[10px] text-zinc-600">
+              Detail was truncated to keep the desktop responsive.
+            </p>
+          )}
+        </div>
+      )}
+    </details>
+  );
+}
+
+function ActivityToolArgs({ event }: { event: RunTimelineEvent }) {
+  const [open, setOpen] = useState(false);
+  const preview = useMemo(() => {
+    if (!open) {
+      return null;
+    }
+    return truncatedPreview(runTimelineToolArgs(event), MAX_TOOL_ARGS_PREVIEW_CHARS);
+  }, [event, open]);
+
+  if (!hasToolArgs(event)) {
+    return null;
+  }
+
+  return (
+    <details
+      className="mt-1.5"
+      onToggle={(toggleEvent) => setOpen(toggleEvent.currentTarget.open)}
+    >
+      <summary className="text-[10px] text-zinc-600 cursor-pointer hover:text-zinc-400 transition-colors select-none">
+        Show tool call
+      </summary>
+      {open && preview && (
+        <div>
+          <pre className="mt-1 border-l-2 border-zinc-800 pl-2.5 text-[10px] text-zinc-500 font-mono leading-relaxed overflow-x-auto whitespace-pre-wrap break-all max-h-60 overflow-y-auto">
+            {preview.text}
+          </pre>
+          {preview.truncated && (
+            <p className="mt-2 text-[10px] text-zinc-600">
+              Tool-call args were truncated to keep the desktop responsive.
+            </p>
+          )}
+        </div>
+      )}
+    </details>
+  );
+}
+
 function RunDot({ status }: { status: string }) {
-  const s = status.toLowerCase();
+  const s = normalizeRunStatus(status);
   const active = s === "executing" || s === "planning" || s === "running";
   return (
     <span
@@ -257,7 +346,7 @@ function RunDot({ status }: { status: string }) {
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const s = status.toLowerCase();
+  const s = normalizeRunStatus(status);
   return (
     <span
       className={cn(
@@ -276,7 +365,7 @@ function StatusBadge({ status }: { status: string }) {
       )}
     >
       <RunDot status={status} />
-      {status}
+      {displayRunStatus(status)}
     </span>
   );
 }
@@ -1326,6 +1415,9 @@ function RunDetailView({
         .sort((left, right) => right.timestamp.localeCompare(left.timestamp)),
     [runInstructionHistory],
   );
+  const deferredRunHistoryQuery = useDeferredValue(runHistoryQuery);
+  const deferredActivitySearch = useDeferredValue(activitySearch);
+  const [showFullActivity, setShowFullActivity] = useState(false);
   // Build plan graph: prefer authoritative plan_subtasks from API, fall back to timeline extraction
   const planNodes = useMemo(() => {
     const apiPlan = runDetail.plan_subtasks;
@@ -1395,8 +1487,8 @@ function RunDetailView({
     let events = visibleRunTimeline.filter(
       (e) => !hiddenCategories.has(eventCategory(e.event_type)),
     );
-    if (activitySearch.trim()) {
-      const needle = activitySearch.toLowerCase();
+    if (deferredActivitySearch.trim()) {
+      const needle = deferredActivitySearch.toLowerCase();
       events = events.filter((e) => {
         const title = runTimelineTitle(e).toLowerCase();
         const detail = runTimelineDetail(e).toLowerCase();
@@ -1404,12 +1496,27 @@ function RunDetailView({
       });
     }
     return events;
-  }, [visibleRunTimeline, hiddenCategories, activitySearch]);
+  }, [visibleRunTimeline, hiddenCategories, deferredActivitySearch]);
+  const hasActivityFilter = Boolean(
+    deferredRunHistoryQuery.trim() || deferredActivitySearch.trim(),
+  );
+  const displayedActivity = useMemo(() => {
+    if (showFullActivity || hasActivityFilter) {
+      return filteredActivity;
+    }
+    return filteredActivity.slice(-MAX_RENDERED_ACTIVITY_EVENTS);
+  }, [filteredActivity, hasActivityFilter, showFullActivity]);
+  const hiddenActivityCount = Math.max(0, filteredActivity.length - displayedActivity.length);
+  const activityIndexOffset = Math.max(0, filteredActivity.length - displayedActivity.length);
 
   // --- Activity scroll: pin to bottom during streaming, unpin on user scroll up ---
   const activityScrollRef = useRef<HTMLDivElement>(null);
   const isPinnedRef = useRef(true);
-  const prevActivityLenRef = useRef(filteredActivity.length);
+  const prevActivityLenRef = useRef(displayedActivity.length);
+
+  useEffect(() => {
+    setShowFullActivity(false);
+  }, [runDetail.id]);
 
   const handleActivityScroll = useCallback(() => {
     const el = activityScrollRef.current;
@@ -1422,11 +1529,11 @@ function RunDetailView({
     const el = activityScrollRef.current;
     if (!el) return;
     // Auto-scroll to bottom when new events arrive and pinned
-    if (isPinnedRef.current && filteredActivity.length !== prevActivityLenRef.current) {
+    if (isPinnedRef.current && displayedActivity.length !== prevActivityLenRef.current) {
       el.scrollTop = el.scrollHeight;
     }
-    prevActivityLenRef.current = filteredActivity.length;
-  }, [filteredActivity.length]);
+    prevActivityLenRef.current = displayedActivity.length;
+  }, [displayedActivity.length]);
 
   // Initial pin on mount
   useEffect(() => {
@@ -1512,7 +1619,7 @@ function RunDetailView({
               <XCircle size={12} /> Cancel
             </button>
           )}
-          {runIsTerminal && runDetail.status.toLowerCase() !== "completed" && (
+          {runIsTerminal && normalizeRunStatus(runDetail.status) !== "completed" && (
             <button
               type="button"
               onClick={() => {
@@ -1996,14 +2103,31 @@ function RunDetailView({
               />
             </div>
             <div className="flex items-center gap-1 text-[10px] text-zinc-500 shrink-0">
-              <span className="tabular-nums">{filteredActivity.length}</span>
+              <span className="tabular-nums">{displayedActivity.length}</span>
               <ScrollButton direction="up" scrollRef={activityScrollRef} />
               <ScrollButton direction="down" scrollRef={activityScrollRef} />
             </div>
           </div>
 
+          {!hasActivityFilter && filteredActivity.length > MAX_RENDERED_ACTIVITY_EVENTS && (
+            <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-zinc-800/70 bg-zinc-900/40 px-3 py-2 text-[11px] text-zinc-500">
+              <p className="min-w-0 flex-1">
+                {showFullActivity
+                  ? `Showing all ${filteredActivity.length} events.`
+                  : `Showing the latest ${displayedActivity.length} of ${filteredActivity.length} events to keep the desktop responsive.`}
+              </p>
+              <button
+                type="button"
+                onClick={() => setShowFullActivity((current) => !current)}
+                className="shrink-0 rounded-md border border-zinc-700/80 px-2 py-1 font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+              >
+                {showFullActivity ? "Show latest" : `Show all (${hiddenActivityCount} older)`}
+              </button>
+            </div>
+          )}
+
           {/* Timeline events — scrollable container pinned to bottom during streaming */}
-          {filteredActivity.length === 0 ? (
+          {displayedActivity.length === 0 ? (
             <div className="text-center py-8 border border-dashed border-zinc-800 rounded-xl">
               <Clock className="h-6 w-6 text-zinc-700 mx-auto mb-2" />
               <p className="text-xs text-zinc-600">No timeline events yet</p>
@@ -2014,11 +2138,11 @@ function RunDetailView({
               onScroll={handleActivityScroll}
               className="space-y-1.5 max-h-[60vh] overflow-y-auto rounded-lg scroll-smooth"
             >
-              {filteredActivity.map((event, index) => {
+              {displayedActivity.map((event, index) => {
                 const title = runTimelineTitle(event);
                 const detail = runTimelineDetail(event);
                 const { files, duration, metrics } = extractEventHighlights(event);
-                const refIndex = displayableRunArtifacts.length + index;
+                const refIndex = displayableRunArtifacts.length + activityIndexOffset + index;
                 const hasStructured = files.length > 0 || duration || metrics.length > 0;
                 const longContent = detail && detail !== title && isLongDetail(detail);
                 const shortDetail = detail && detail !== title && !longContent;
@@ -2095,30 +2219,10 @@ function RunDetailView({
                       )}
 
                       {/* Long content: collapsible with rendered markdown */}
-                      {longContent && (
-                        <details className="mt-1.5">
-                          <summary className="text-[10px] text-zinc-600 cursor-pointer hover:text-zinc-400 transition-colors select-none">
-                            Show details
-                          </summary>
-                          <div className="mt-1 border-l-2 border-zinc-800 pl-2.5 text-[11px] text-zinc-400 leading-relaxed prose-invert prose-xs [&_strong]:text-zinc-300 [&_em]:text-zinc-400 [&_code]:text-[#a3b396] [&_code]:bg-zinc-800/60 [&_code]:px-1 [&_code]:py-px [&_code]:rounded [&_code]:text-[10px] [&_ul]:list-disc [&_ul]:pl-4 [&_ul]:my-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_ol]:my-1 [&_li]:my-0.5 [&_p]:my-1 [&_h1]:text-xs [&_h1]:font-semibold [&_h1]:text-zinc-300 [&_h2]:text-xs [&_h2]:font-semibold [&_h2]:text-zinc-300 [&_h3]:text-[11px] [&_h3]:font-semibold [&_h3]:text-zinc-300">
-                            <Suspense fallback={<p className="text-zinc-600">Loading...</p>}>
-                              <Markdown>{detail}</Markdown>
-                            </Suspense>
-                          </div>
-                        </details>
-                      )}
+                      {longContent && <ActivityDetailMarkdown detail={detail} />}
 
                       {/* Tool call args: collapsible */}
-                      {runTimelineToolArgs(event) && (
-                        <details className="mt-1.5">
-                          <summary className="text-[10px] text-zinc-600 cursor-pointer hover:text-zinc-400 transition-colors select-none">
-                            Show tool call
-                          </summary>
-                          <pre className="mt-1 border-l-2 border-zinc-800 pl-2.5 text-[10px] text-zinc-500 font-mono leading-relaxed overflow-x-auto whitespace-pre-wrap break-all max-h-60 overflow-y-auto">
-                            {runTimelineToolArgs(event)}
-                          </pre>
-                        </details>
-                      )}
+                      <ActivityToolArgs event={event} />
                     </div>
 
                     {/* Timestamp */}

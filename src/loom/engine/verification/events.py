@@ -167,6 +167,10 @@ def emit_verification_terminal(
     if not event_bus or not task_id:
         return
     terminal_type = VERIFICATION_PASSED if bool(result.passed) else VERIFICATION_FAILED
+    outcome = str(result.outcome or "").strip() or ("pass" if result.passed else "fail")
+    reason_code = str(result.reason_code or "").strip()
+    if not reason_code:
+        reason_code = "verification_passed" if result.passed else "verification_failed"
     metadata = result.metadata if isinstance(result.metadata, dict) else {}
     dev_summary = event_safe_development_summary(
         metadata.get("dev_verification_summary", {}),
@@ -174,8 +178,8 @@ def emit_verification_terminal(
     data: dict[str, object] = {
         "subtask_id": subtask_id,
         "tier": int(result.tier),
-        "outcome": str(result.outcome or ""),
-        "reason_code": str(result.reason_code or ""),
+        "outcome": outcome,
+        "reason_code": reason_code,
         "severity_class": str(result.severity_class or ""),
         "confidence": float(result.confidence),
         "source_component": "verification",

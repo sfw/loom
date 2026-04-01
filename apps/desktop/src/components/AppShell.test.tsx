@@ -1,4 +1,4 @@
-import { render, waitFor } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import AppShell from "./AppShell";
@@ -179,5 +179,17 @@ describe("AppShell close confirmation", () => {
     render(<AppShell />);
 
     await waitFor(() => expect(mockApp.setActiveTab).toHaveBeenCalledWith("overview"));
+  });
+
+  it("keeps the shell visible and shows a reconnect banner when cached data exists", () => {
+    mockApp.connectionState = "failed";
+
+    render(<AppShell />);
+
+    expect(screen.getByText("Sidebar")).toBeInTheDocument();
+    expect(
+      screen.getByText("Connection to Loomd dropped. Retrying automatically..."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Cannot reach Loomd")).not.toBeInTheDocument();
   });
 });

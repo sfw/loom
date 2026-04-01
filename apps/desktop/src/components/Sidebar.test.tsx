@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import Sidebar from "./Sidebar";
+import { createConversation, patchConversation } from "@/api";
 
 let mockApp: any;
 
@@ -10,8 +11,58 @@ vi.mock("@/context/AppContext", () => ({
   useApp: () => mockApp,
 }));
 
+vi.mock("@/api", () => ({
+  createConversation: vi.fn(),
+  patchConversation: vi.fn(),
+}));
+
 describe("Sidebar", () => {
   beforeEach(() => {
+    vi.mocked(createConversation).mockResolvedValue({
+      id: "conversation-created",
+      workspace_id: "workspace-1",
+      workspace_path: "/tmp/workspace",
+      model_name: "kimi-k2.5",
+      title: "Conversation created",
+      turn_count: 0,
+      total_tokens: 0,
+      last_active_at: "2026-03-27T00:02:00Z",
+      started_at: "2026-03-27T00:02:00Z",
+      is_active: false,
+      linked_run_ids: [],
+    });
+    vi.mocked(patchConversation).mockResolvedValue({
+      id: "conversation-1",
+      workspace_id: "workspace-1",
+      workspace_path: "/tmp/workspace",
+      model_name: "kimi-k2.5",
+      title: "Renamed",
+      turn_count: 2,
+      total_tokens: 42,
+      last_active_at: "2026-03-27T00:01:00Z",
+      started_at: "2026-03-27T00:00:00Z",
+      is_active: true,
+      linked_run_ids: [],
+      system_prompt: "",
+      session_state: {},
+      workspace: {
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+        display_name: "Workspace",
+        workspace_type: "local",
+        is_archived: false,
+        sort_order: 0,
+        last_opened_at: "2026-03-27T00:00:00Z",
+        created_at: "2026-03-27T00:00:00Z",
+        updated_at: "2026-03-27T00:00:00Z",
+        metadata: {},
+        exists_on_disk: true,
+        conversation_count: 1,
+        run_count: 0,
+        active_run_count: 0,
+        last_activity_at: "2026-03-27T00:00:00Z",
+      },
+    });
     mockApp = {
       activeTab: "threads",
       setActiveTab: vi.fn(),
@@ -43,6 +94,7 @@ describe("Sidebar", () => {
       setShowArchivedWorkspaces: vi.fn(),
       setShowNewWorkspace: vi.fn(),
       runtime: { ready: true, version: "0.2.2" },
+      connectionState: "connected",
       approvalInbox: [],
       overview: {
         workspace: {
@@ -205,6 +257,14 @@ describe("Sidebar", () => {
     expect(activityBar).toHaveAttribute("title", "1 active thread · 1 active run");
   });
 
+  it("shows the runtime footer from live connection state", () => {
+    mockApp.connectionState = "failed";
+
+    render(<Sidebar />);
+
+    expect(screen.getByText("Disconnected · 0.2.2")).toBeInTheDocument();
+  });
+
   it("updates workspace chevrons when the selected workspace changes", () => {
     mockApp.workspaces = [
       {
@@ -273,5 +333,23 @@ describe("Sidebar", () => {
     expect(screen.getByRole("button", { name: /Active Workspace/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Archived Workspace/i })).toBeInTheDocument();
     expect(screen.getAllByText("archived")[0]).toBeInTheDocument();
+  });
+
+  it("selects a newly created thread immediately without waiting for workspace refresh", async () => {
+    const user = userEvent.setup();
+    mockApp.selectedConversationId = "";
+    mockApp.conversationDetail = null;
+    mockApp.overview.recent_conversations = [];
+    mockApp.refreshWorkspaceSurface = vi.fn(() => new Promise(() => {}));
+
+    render(<Sidebar />);
+
+    const plusButtons = screen.getAllByTitle(/Click: new thread/i);
+    await user.click(plusButtons[plusButtons.length - 1]!);
+
+    expect(createConversation).toHaveBeenCalledWith("workspace-1", {});
+    expect(mockApp.setSelectedConversationId).toHaveBeenCalledWith("conversation-created");
+    expect(mockApp.setActiveTab).toHaveBeenCalledWith("threads");
+    expect(mockApp.refreshWorkspaceSurface).toHaveBeenCalledWith("workspace-1");
   });
 });

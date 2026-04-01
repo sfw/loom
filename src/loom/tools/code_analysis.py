@@ -1,15 +1,17 @@
-"""Code analysis tool with tree-sitter and regex backends.
+"""Code analysis tool with tree-sitter and fallback extractors.
 
-Parses source files and returns structural information:
-classes, functions, imports. Uses tree-sitter when available
-(via ``tree-sitter-language-pack``), falling back to regex
-extractors for Python, JavaScript/TypeScript, Go, and Rust.
+Parses source and markup files and returns structural information:
+imports, elements, classes, functions, exports, and ids. Uses
+tree-sitter when available (via ``tree-sitter-language-pack``),
+falling back to built-in extractors for Python, JavaScript/
+TypeScript, Go, Rust, and HTML.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
@@ -24,6 +26,8 @@ class CodeStructure:
     file_path: str = ""
     language: str = ""
     imports: list[str] = field(default_factory=list)
+    elements: list[str] = field(default_factory=list)
+    ids: list[str] = field(default_factory=list)
     classes: list[str] = field(default_factory=list)
     functions: list[str] = field(default_factory=list)
     exports: list[str] = field(default_factory=list)
@@ -32,6 +36,10 @@ class CodeStructure:
         lines = [f"File: {self.file_path} ({self.language})"]
         if self.imports:
             lines.append(f"  Imports: {', '.join(self.imports)}")
+        if self.elements:
+            lines.append(f"  Elements: {', '.join(self.elements)}")
+        if self.ids:
+            lines.append(f"  IDs: {', '.join(self.ids)}")
         if self.classes:
             lines.append(f"  Classes: {', '.join(self.classes)}")
         if self.functions:
@@ -39,6 +47,12 @@ class CodeStructure:
         if self.exports:
             lines.append(f"  Exports: {', '.join(self.exports)}")
         return "\n".join(lines)
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    value = value.strip()
+    if value and value not in items:
+        items.append(value)
 
 
 _LANG_MAP = {
@@ -49,6 +63,8 @@ _LANG_MAP = {
     ".jsx": "javascript",
     ".go": "go",
     ".rs": "rust",
+    ".html": "html",
+    ".htm": "html",
 }
 
 
@@ -152,12 +168,60 @@ def extract_rust(source: str) -> CodeStructure:
     return structure
 
 
+_HTML_SKIPPED_TAGS = {"html", "head", "body"}
+
+
+class _HTMLStructureParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.structure = CodeStructure(language="html")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._record_tag(tag, attrs)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._record_tag(tag, attrs)
+
+    def _record_tag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        normalized_tag = tag.lower().strip()
+        if normalized_tag and normalized_tag not in _HTML_SKIPPED_TAGS:
+            _append_unique(self.structure.elements, normalized_tag)
+
+        attr_map = {
+            name.lower().strip(): (value or "").strip()
+            for name, value in attrs
+            if name
+        }
+
+        for key in ("src", "href"):
+            value = attr_map.get(key, "")
+            if value:
+                _append_unique(self.structure.imports, value)
+
+        id_value = attr_map.get("id", "")
+        if id_value:
+            _append_unique(self.structure.ids, id_value)
+
+        class_value = attr_map.get("class", "")
+        for class_name in class_value.split():
+            _append_unique(self.structure.classes, class_name)
+
+
+def extract_html(source: str) -> CodeStructure:
+    """Extract structure from HTML source."""
+    parser = _HTMLStructureParser()
+    parser.feed(source)
+    parser.close()
+    return parser.structure
+
+
 _EXTRACTORS = {
     "python": extract_python,
     "javascript": extract_javascript,
     "typescript": extract_javascript,  # same patterns work
     "go": extract_go,
     "rust": extract_rust,
+    "html": extract_html,
 }
 
 
@@ -246,8 +310,8 @@ class AnalyzeCodeTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Analyze source file structure (classes, functions, imports). "
-            "Supports Python, JS/TS, Go, Rust."
+            "Analyze source and markup structure (imports, elements, classes, "
+            "functions). Supports Python, JS/TS, Go, Rust, HTML."
         )
 
     @property
@@ -284,7 +348,7 @@ class AnalyzeCodeTool(Tool):
         if lang == "unknown":
             return ToolResult.fail(
                 f"Unsupported language for {args['path']}. "
-                "Supported: .py, .js, .ts, .tsx, .jsx, .go, .rs"
+                "Supported: .py, .js, .ts, .tsx, .jsx, .go, .rs, .html, .htm"
             )
 
         source = path.read_text(encoding="utf-8", errors="replace")

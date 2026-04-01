@@ -183,6 +183,7 @@ class TestWebToolSchemas:
         tool = WebFetchTool()
         props = tool.parameters.get("properties", {})
         assert "url" in props
+        assert "query" in props
         assert "extract_text" not in props
 
     def test_web_fetch_html_schema(self):
@@ -202,6 +203,8 @@ class TestWebToolHiddenRuntimeArgs:
             *,
             extract_text: bool,
             max_download_bytes: int,
+            query: str,
+            summarizer,
             enable_filetype_ingest_router: bool,
             artifact_retention_max_age_days: int,
             artifact_retention_max_files_per_scope: int,
@@ -211,6 +214,8 @@ class TestWebToolHiddenRuntimeArgs:
             captured["url"] = url
             captured["extract_text"] = extract_text
             captured["max_download_bytes"] = max_download_bytes
+            captured["query"] = query
+            captured["summarizer"] = summarizer
             captured["enable_filetype_ingest_router"] = enable_filetype_ingest_router
             captured["artifact_retention_max_age_days"] = artifact_retention_max_age_days
             captured["artifact_retention_max_files_per_scope"] = (
@@ -228,6 +233,7 @@ class TestWebToolHiddenRuntimeArgs:
         result = await tool.execute(
             {
                 "url": "https://example.com/report.pdf",
+                "query": "quarterly guidance",
                 "_enable_filetype_ingest_router": False,
                 "_artifact_retention_max_age_days": 31,
                 "_artifact_retention_max_files_per_scope": 120,
@@ -237,7 +243,9 @@ class TestWebToolHiddenRuntimeArgs:
         )
         assert result.success
         assert captured["url"] == "https://example.com/report.pdf"
+        assert captured["query"] == "quarterly guidance"
         assert captured["extract_text"] is True
+        assert captured["summarizer"] is not None
         assert captured["enable_filetype_ingest_router"] is False
         assert captured["artifact_retention_max_age_days"] == 31
         assert captured["artifact_retention_max_files_per_scope"] == 120
@@ -269,6 +277,239 @@ class _FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         del exc_type, exc, tb
         return False
+
+
+def _patch_text_fetch(
+    monkeypatch,
+    *,
+    content: str,
+    content_type: str = "text/html; charset=utf-8",
+    url: str = "https://example.com/page",
+):
+    fake_response = _FakeResponse(
+        url,
+        headers={
+            "content-type": content_type,
+            "content-length": str(len(content.encode("utf-8"))),
+        },
+    )
+
+    async def _fake_get_with_retries(client, target_url, headers=None, stream=False):
+        del client, target_url, headers, stream
+        return fake_response
+
+    async def _fake_read_response_limited(response, max_bytes):
+        del response, max_bytes
+        return (content.encode("utf-8"), False)
+
+    monkeypatch.setattr("loom.tools.web.httpx.AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr("loom.tools.web._get_with_retries", _fake_get_with_retries)
+    monkeypatch.setattr("loom.tools.web._read_response_limited", _fake_read_response_limited)
+
+
+class _FakeSummarizer:
+    def __init__(self, text: str):
+        self.text = text
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def summarize_medium(self, prepared, *, url: str, query: str) -> str | None:
+        self.calls.append((prepared.title, url, query))
+        return self.text
+
+
+class TestWebFetchTextTiers:
+    @pytest.mark.asyncio
+    async def test_small_html_returns_cleaned_markdown_payload(self, monkeypatch):
+        html = """
+        <html>
+          <head><title>Example Guide</title></head>
+          <body>
+            <nav>Home Docs Pricing</nav>
+            <main>
+              <h1>Example Guide</h1>
+              <p>Use the API carefully and review the quickstart before deploying.</p>
+              <ul>
+                <li>Install the package</li>
+                <li>Run the setup command</li>
+              </ul>
+            </main>
+            <footer>copyright footer links</footer>
+          </body>
+        </html>
+        """
+        _patch_text_fetch(
+            monkeypatch,
+            content=html,
+            url="https://example.com/ops",
+        )
+
+        result = await _execute_web_fetch(
+            "https://example.com/guide",
+            extract_text=True,
+            max_download_bytes=32_000,
+            enable_filetype_ingest_router=True,
+            ctx=None,
+        )
+
+        assert result.success is True
+        assert "<source_content " in result.output
+        assert "<![CDATA[" in result.output
+        assert "# Example Guide" in result.output
+        assert "Install the package" in result.output
+        assert "Home Docs Pricing" not in result.output
+        assert isinstance(result.data, dict)
+        assert result.data.get("render_strategy") == "full_content"
+        assert result.data.get("source_format") == "markdown"
+
+    @pytest.mark.asyncio
+    async def test_medium_html_returns_summary_payload(self, monkeypatch):
+        sections = []
+        for idx in range(240):
+            if idx % 40 == 0:
+                sections.append(f"<h2>Section {idx // 40 + 1}</h2>")
+            sections.append(
+                "<p>"
+                f"Fact {idx}: The deployment service processes 42 jobs per hour, "
+                f"records {idx % 100}% utilization, and keeps a detailed audit log "
+                "for each release window."
+                "</p>"
+            )
+        html = (
+            "<html><body><main><h1>Deployment Manual</h1>"
+            + "".join(sections)
+            + "</main></body></html>"
+        )
+        _patch_text_fetch(
+            monkeypatch,
+            content=html,
+            url="https://example.com/ops",
+        )
+
+        result = await _execute_web_fetch(
+            "https://example.com/manual",
+            extract_text=True,
+            max_download_bytes=256_000,
+            enable_filetype_ingest_router=True,
+            ctx=None,
+        )
+
+        assert result.success is True
+        assert "<source_summary " in result.output
+        assert "Extracted facts and arguments:" in result.output
+        assert "Key sections:" in result.output
+        assert isinstance(result.data, dict)
+        assert result.data.get("render_strategy") == "extracted_summary"
+        assert int(result.data.get("estimated_tokens", 0)) > 5_000
+
+    @pytest.mark.asyncio
+    async def test_large_html_with_query_returns_relevant_snippets(self, monkeypatch):
+        paragraphs = []
+        for idx in range(520):
+            paragraphs.append(
+                "<p>"
+                f"Background paragraph {idx} explains unrelated product behavior and "
+                "general platform guidance. "
+                + ("filler text " * 12)
+                + "</p>"
+            )
+        paragraphs.insert(
+            260,
+            (
+                "<h2>Authentication Tokens</h2>"
+                "<p>The auth token refresh endpoint rotates bearer tokens every "
+                "15 minutes and supports manual revocation for compromised sessions.</p>"
+            ),
+        )
+        html = (
+            "<html><body><main><h1>Platform Reference</h1>"
+            + "".join(paragraphs)
+            + "</main></body></html>"
+        )
+        _patch_text_fetch(monkeypatch, content=html)
+
+        result = await _execute_web_fetch(
+            "https://example.com/reference",
+            extract_text=True,
+            max_download_bytes=512_000,
+            query="auth token refresh",
+            enable_filetype_ingest_router=True,
+            ctx=None,
+        )
+
+        assert result.success is True
+        assert "<source_snippets " in result.output
+        assert "auth token refresh endpoint rotates bearer tokens every 15 minutes" in result.output
+        assert isinstance(result.data, dict)
+        assert result.data.get("render_strategy") == "query_snippets"
+        assert result.data.get("query") == "auth token refresh"
+
+    @pytest.mark.asyncio
+    async def test_medium_html_uses_model_summary_and_persists_artifact(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ):
+        sections = []
+        for idx in range(220):
+            sections.append(
+                "<p>"
+                f"Metric {idx}: release readiness remains above 97%, and rollout checks "
+                f"record {idx % 17 + 3} validation gates for each deployment wave."
+                "</p>"
+            )
+        html = (
+            "<html><body><main><h1>Operations Handbook</h1>"
+            + "".join(sections)
+            + "</main></body></html>"
+        )
+        _patch_text_fetch(
+            monkeypatch,
+            content=html,
+            url="https://example.com/ops",
+        )
+        summarizer = _FakeSummarizer(
+            "Title: Operations Handbook\n"
+            "Model summary paragraph.\n"
+            "Extracted facts and arguments:\n"
+            "- Deployment readiness stays above 97%.\n"
+            "- Validation gates are tracked for each wave."
+        )
+        tool = WebFetchTool(summarizer=summarizer)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        ctx = ToolContext(
+            workspace=workspace,
+            read_roots=[],
+            scratch_dir=scratch,
+            changelog=None,
+            subtask_id="web-summary",
+            auth_context=None,
+        )
+
+        result = await tool.execute(
+            {
+                "url": "https://example.com/ops",
+                "query": "deployment readiness",
+            },
+            ctx,
+        )
+
+        assert result.success is True
+        assert "Model summary paragraph." in result.output
+        assert "artifact_ref" in result.output
+        assert summarizer.calls == [
+            ("Operations Handbook", "https://example.com/ops", "deployment readiness")
+        ]
+        assert isinstance(result.data, dict)
+        artifact_ref = str(result.data.get("artifact_ref", ""))
+        artifact_path = Path(str(result.data.get("artifact_path", "")))
+        assert artifact_ref.startswith("af_")
+        assert artifact_path.exists()
+        assert result.data.get("artifact_content_type") == "text/markdown"
+        stored = artifact_path.read_text(encoding="utf-8")
+        assert "# Operations Handbook" in stored
 
 
 class TestWebFetchBinaryRouting:

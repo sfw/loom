@@ -45,6 +45,7 @@ from loom.state.task_state import Task, TaskStateManager, TaskStatus
 from loom.state.workspaces import WorkspaceRegistry
 from loom.tools import create_default_registry
 from loom.tools.registry import ToolRegistry
+from loom.utils.concurrency import run_blocking_io
 from loom.utils.latency import diagnostics_enabled, log_latency_event
 
 if TYPE_CHECKING:
@@ -165,6 +166,7 @@ class Engine:
         self._runner_id = f"api-{uuid.uuid4().hex[:8]}"
         self._run_lease_seconds = 30
         self._run_heartbeat_interval_seconds = 10
+        self._bind_api_tool_registry()
         telemetry_mode_input = str(
             getattr(self.config.telemetry, "configured_mode_input", ""),
         ).strip()
@@ -198,6 +200,36 @@ class Engine:
             probe_task = asyncio.create_task(self._monitor_event_loop_lag())
             self._background_tasks.add(probe_task)
             probe_task.add_done_callback(self._background_tasks.discard)
+
+    def _bind_api_tool_registry(self) -> None:
+        """Bind runtime-backed tools needed by API cowork sessions."""
+        delegate = self.tool_registry.get("delegate_task")
+        if delegate is None:
+            return
+        try:
+            from loom.tools.delegate_task import DelegateTaskTool
+        except Exception:
+            logger.debug(
+                "Unable to import DelegateTaskTool for API session binding",
+                exc_info=True,
+            )
+            return
+        if not isinstance(delegate, DelegateTaskTool):
+            return
+
+        async def _orchestrator_factory(
+            process_override: ProcessDefinition | None = None,
+        ) -> Orchestrator:
+            return self.create_task_orchestrator(process=process_override)
+
+        delegate.bind(_orchestrator_factory)
+        delegate.set_timeout_resolver(
+            lambda: int(
+                self.config_runtime_store.effective_value(
+                    "execution.delegate_task_timeout_seconds",
+                ) or 3600,
+            ),
+        )
 
     async def shutdown(self) -> None:
         """Graceful cleanup."""
@@ -569,14 +601,13 @@ class Engine:
         for task_id, worker in self._task_workers.items():
             if worker.task.done():
                 continue
-            if self.state_manager.exists(task_id):
-                task = self.state_manager.load(task_id)
-                if task.status not in {
-                    TaskStatus.PENDING,
-                    TaskStatus.PLANNING,
-                    TaskStatus.EXECUTING,
-                }:
-                    continue
+            task = await self._load_task_state(task_id)
+            if task is not None and task.status not in {
+                TaskStatus.PENDING,
+                TaskStatus.PLANNING,
+                TaskStatus.EXECUTING,
+            }:
+                continue
             active_run_count += 1
         return {
             "status": "ok",
@@ -760,6 +791,19 @@ class Engine:
             process=process,
         )
 
+    async def _task_state_exists(self, task_id: str) -> bool:
+        return bool(await run_blocking_io(self.state_manager.exists, task_id))
+
+    async def _load_task_state(self, task_id: str) -> Task | None:
+        try:
+            task = await run_blocking_io(self.state_manager.load, task_id)
+        except Exception:
+            return None
+        return task if isinstance(task, Task) else None
+
+    async def _save_task_state(self, task: Task) -> None:
+        await run_blocking_io(self.state_manager.save, task)
+
     async def submit_task(
         self,
         *,
@@ -776,7 +820,7 @@ class Engine:
             metadata = {}
         metadata["run_id"] = assigned_run_id
         task.metadata = metadata
-        self.state_manager.save(task)
+        await self._save_task_state(task)
         try:
             await self.database.update_task_metadata(task.id, metadata)
         except Exception:
@@ -821,15 +865,11 @@ class Engine:
             run_id = str(row.get("run_id", "")).strip()
             if not task_id or not run_id:
                 continue
-            if not self.state_manager.exists(task_id):
-                continue
-            try:
-                task = self.state_manager.load(task_id)
-            except Exception:
+            task = await self._load_task_state(task_id)
+            if task is None:
                 logger.warning(
                     "Failed loading state for recoverable task %s",
                     task_id,
-                    exc_info=True,
                 )
                 continue
             if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
@@ -874,15 +914,13 @@ class Engine:
         paused_count = 0
         for row in rows:
             task_id = str(row.get("id", "") or "").strip()
-            if not task_id or not self.state_manager.exists(task_id):
+            if not task_id:
                 continue
-            try:
-                task = self.state_manager.load(task_id)
-            except Exception:
+            task = await self._load_task_state(task_id)
+            if task is None:
                 logger.warning(
                     "Failed loading task state during shutdown pause: %s",
                     task_id,
-                    exc_info=True,
                 )
                 continue
 
@@ -901,7 +939,7 @@ class Engine:
             task.metadata["shutdown_paused"] = True
             task.metadata["shutdown_pause_reason"] = "desktop_shutdown"
             try:
-                self.state_manager.save(task)
+                await self._save_task_state(task)
             except Exception:
                 logger.warning(
                     "Failed saving paused task state during shutdown: %s",
@@ -972,16 +1010,11 @@ class Engine:
             if row_status in _TASK_TERMINAL_STATUSES:
                 continue
 
-            if not self.state_manager.exists(task_id):
-                continue
-
-            try:
-                task = self.state_manager.load(task_id)
-            except Exception:
+            task = await self._load_task_state(task_id)
+            if task is None:
                 logger.warning(
                     "Failed loading task state for interrupted-run reconciliation: %s",
                     task_id,
-                    exc_info=True,
                 )
                 continue
 
@@ -1028,7 +1061,7 @@ class Engine:
             task.status = TaskStatus.FAILED
             task.add_error("system", interrupted_note, resolution="Restart the run to continue.")
             try:
-                self.state_manager.save(task)
+                await self._save_task_state(task)
             except Exception:
                 logger.warning(
                     "Failed saving interrupted task state during reconciliation: %s",
@@ -1154,7 +1187,7 @@ class Engine:
                     if subtask.status.value == "running":
                         subtask.status = type(subtask.status).PENDING
                         subtask.summary = "Recovered after process restart; re-queued."
-                self.state_manager.save(task)
+                await self._save_task_state(task)
 
             result = await orchestrator.execute_task(
                 task,
@@ -1181,11 +1214,8 @@ class Engine:
                 )
         except asyncio.CancelledError:
             cancelled_task = task
-            if cancelled_task.status != TaskStatus.CANCELLED and self.state_manager.exists(task.id):
-                try:
-                    persisted_task = self.state_manager.load(task.id)
-                except Exception:
-                    persisted_task = None
+            if cancelled_task.status != TaskStatus.CANCELLED:
+                persisted_task = await self._load_task_state(task.id)
                 if persisted_task is not None and persisted_task.status == TaskStatus.CANCELLED:
                     cancelled_task = persisted_task
             if cancelled_task.status == TaskStatus.CANCELLED:
@@ -1195,7 +1225,7 @@ class Engine:
                         cancelled_task.metadata.get("cancel_reason", "") or "",
                     ).strip()
                 try:
-                    self.state_manager.save(cancelled_task)
+                    await self._save_task_state(cancelled_task)
                     await self.database.update_task_status(
                         cancelled_task.id,
                         TaskStatus.CANCELLED.value,
@@ -1244,7 +1274,7 @@ class Engine:
             logger.exception("Task run %s failed: %s", run_id, e)
             try:
                 task.status = TaskStatus.FAILED
-                self.state_manager.save(task)
+                await self._save_task_state(task)
                 await self.database.update_task_status(task.id, TaskStatus.FAILED.value)
             except Exception:
                 logger.exception("Failed persisting failure state for task %s", task.id)

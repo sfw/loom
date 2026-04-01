@@ -15,6 +15,7 @@ from loom.events.types import (
     EVENT_NAME_TO_TYPE,
     SUBTASK_BLOCKED,
     SUBTASK_COMPLETED,
+    SUBTASK_POLICY_RECONCILED,
     SUBTASK_STARTED,
     TASK_COMPLETED,
     TASK_CREATED,
@@ -24,6 +25,7 @@ from loom.events.types import (
     TASK_RUN_HEARTBEAT,
     TELEMETRY_DIAGNOSTIC,
     TOKEN_STREAMED,
+    VERIFICATION_PASSED,
 )
 from loom.events.verbosity import (
     normalize_telemetry_mode,
@@ -338,6 +340,18 @@ class TestEventBus:
 
         errors = validate_payload_shape(SUBTASK_BLOCKED, {"subtask_id": "s1"})
         assert "missing required key: reasons" in errors
+
+        errors = validate_payload_shape(
+            SUBTASK_POLICY_RECONCILED,
+            {"reconciled_subtasks": [], "reconciled_count": 0},
+        )
+        assert errors == []
+
+        errors = validate_payload_shape(
+            VERIFICATION_PASSED,
+            {"subtask_id": "s1", "tier": 1, "outcome": "pass", "reason_code": "verified"},
+        )
+        assert errors == []
 
     def test_unknown_event_type_emits_rate_limited_diagnostic(self):
         bus = EventBus()

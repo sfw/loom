@@ -1062,6 +1062,107 @@ class TestCoworkSession:
         assert turns[0].context_tokens > 0
         assert turns[0].context_messages > 0
 
+    async def test_append_tool_result_uses_fast_preview_without_semantic_compactor(
+        self,
+        workspace,
+        tools,
+    ):
+        session = CoworkSession(
+            model=MockProvider([ModelResponse(text="ok", usage=TokenUsage(total_tokens=1))]),
+            tools=tools,
+            workspace=workspace,
+        )
+
+        class _ExplodingCompactor:
+            async def compact(self, text: str, *, max_chars: int, label: str = "") -> str:
+                raise AssertionError("semantic compactor should not run for tool results")
+
+        session._compactor = _ExplodingCompactor()
+        long_text = "important evidence " * 400
+
+        await session._append_tool_result(
+            "call-fast-preview",
+            "web_fetch",
+            ToolResult.ok(long_text, data={"body": long_text}),
+        )
+
+        assert session._messages
+        payload = json.loads(str(session._messages[-1]["content"]))
+        assert str(payload["output"]).endswith("...[truncated]")
+        assert str(payload["data"]["body"]).endswith("...[truncated]")
+
+    async def test_send_parallelizes_safe_web_tool_batches(self, workspace, tools):
+        tools.exclude("web_fetch")
+        state = {"active": 0, "max_active": 0}
+
+        class _SlowWebFetchTool(Tool):
+            @property
+            def name(self) -> str:
+                return "web_fetch"
+
+            @property
+            def description(self) -> str:
+                return "Test web fetch tool."
+
+            @property
+            def parameters(self) -> dict:
+                return {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                    },
+                    "required": ["url"],
+                }
+
+            async def execute(self, args: dict, ctx) -> ToolResult:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+                try:
+                    await asyncio.sleep(0.05)
+                finally:
+                    state["active"] -= 1
+                return ToolResult.ok(
+                    f"Fetched {args.get('url', '')}",
+                    data={"url": args.get("url", "")},
+                )
+
+        tools.register(_SlowWebFetchTool())
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="wf-1",
+                        name="web_fetch",
+                        arguments={"url": "https://example.com/1"},
+                    ),
+                    ToolCall(
+                        id="wf-2",
+                        name="web_fetch",
+                        arguments={"url": "https://example.com/2"},
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=6),
+            ),
+            ModelResponse(text="done", usage=TokenUsage(total_tokens=1)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        started_ids: list[str] = []
+        async for event in session.send("fetch both"):
+            events.append(event)
+            if isinstance(event, ToolCallEvent) and event.result is None:
+                started_ids.append(event.tool_call_id)
+
+        completed = [
+            event for event in events
+            if isinstance(event, ToolCallEvent) and event.result is not None
+        ]
+        assert started_ids == ["wf-1", "wf-2"]
+        assert sorted({event.tool_call_id for event in completed}) == ["wf-1", "wf-2"]
+        assert state["max_active"] >= 2
+
 
 class TestBuildSystemPrompt:
     def test_with_workspace(self, workspace):
