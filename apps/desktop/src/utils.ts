@@ -174,8 +174,12 @@ export function isTransientRequestError(error: unknown): boolean {
     "networkerror",
     "network request failed",
     "the network connection was lost",
+    "request timed out",
     "signal timed out",
+    "timed out",
     "timeout",
+    "aborterror",
+    "aborted",
   ].some((needle) => message.includes(needle));
 }
 
