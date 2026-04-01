@@ -1012,11 +1012,11 @@ export function subscribeRunStream(
   runId: string,
   onEvent: (event: RunStreamEvent) => void,
   onError?: () => void,
-  options?: { afterId?: number },
+  options?: { afterSequence?: number },
 ): () => void {
   const params = new URLSearchParams();
-  if (options?.afterId != null && options.afterId > 0) {
-    params.set("after_id", String(options.afterId));
+  if (options?.afterSequence != null && options.afterSequence > 0) {
+    params.set("after_sequence", String(options.afterSequence));
   }
   const qs = params.toString();
   const source = new EventSource(

@@ -89,6 +89,26 @@ class ConversationStore:
             tuple(params),
         )
 
+    async def get_sessions_by_ids(self, session_ids: list[str]) -> dict[str, dict]:
+        """Return session rows keyed by session ID."""
+        clean_ids = sorted({
+            str(session_id or "").strip()
+            for session_id in session_ids
+            if str(session_id or "").strip()
+        })
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in clean_ids)
+        rows = await self._db.query(
+            f"SELECT * FROM cowork_sessions WHERE id IN ({placeholders})",
+            tuple(clean_ids),
+        )
+        return {
+            str(row.get("id", "") or "").strip(): dict(row)
+            for row in rows
+            if str(row.get("id", "") or "").strip()
+        }
+
     async def delete_session(self, session_id: str) -> None:
         """Delete a session and all related data."""
         await self._db.execute(
@@ -265,6 +285,33 @@ class ConversationStore:
         )
         return [dict(row) for row in rows]
 
+    async def list_linked_runs_for_sessions(self, session_ids: list[str]) -> dict[str, list[dict]]:
+        """Return run links grouped by session ID."""
+        clean_ids = sorted({
+            str(session_id or "").strip()
+            for session_id in session_ids
+            if str(session_id or "").strip()
+        })
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in clean_ids)
+        rows = await self._db.query(
+            f"""
+            SELECT *
+            FROM conversation_run_links
+            WHERE session_id IN ({placeholders})
+            ORDER BY created_at ASC, id ASC
+            """,
+            tuple(clean_ids),
+        )
+        grouped: dict[str, list[dict]] = {session_id: [] for session_id in clean_ids}
+        for row in rows:
+            session_id = str(row.get("session_id", "") or "").strip()
+            if not session_id:
+                continue
+            grouped.setdefault(session_id, []).append(dict(row))
+        return grouped
+
     async def list_linked_conversations(self, run_id: str) -> list[dict]:
         """Return conversation links for a run."""
         rows = await self._db.query(
@@ -277,6 +324,33 @@ class ConversationStore:
             (str(run_id or "").strip(),),
         )
         return [dict(row) for row in rows]
+
+    async def list_linked_conversations_for_runs(self, run_ids: list[str]) -> dict[str, list[dict]]:
+        """Return conversation links grouped by run/task ID."""
+        clean_ids = sorted({
+            str(run_id or "").strip()
+            for run_id in run_ids
+            if str(run_id or "").strip()
+        })
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in clean_ids)
+        rows = await self._db.query(
+            f"""
+            SELECT *
+            FROM conversation_run_links
+            WHERE run_id IN ({placeholders})
+            ORDER BY created_at ASC, id ASC
+            """,
+            tuple(clean_ids),
+        )
+        grouped: dict[str, list[dict]] = {run_id: [] for run_id in clean_ids}
+        for row in rows:
+            run_id = str(row.get("run_id", "") or "").strip()
+            if not run_id:
+                continue
+            grouped.setdefault(run_id, []).append(dict(row))
+        return grouped
 
     # ------------------------------------------------------------------
     # Search / retrieval

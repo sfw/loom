@@ -351,6 +351,14 @@ Operational notes:
   ephemeral fallback for existing files).
 - New DB creation failures are blocking by default; pass CLI flag
   `--ephemeral` to explicitly allow ephemeral fallback.
+- Loom's local SQLite runtime is explicitly tuned for the single-sidecar
+  desktop case: WAL mode, `busy_timeout=5000`, `synchronous=NORMAL`,
+  `wal_autocheckpoint=2000`, `temp_store=MEMORY`, and a small long-lived
+  read/write connection set instead of per-query connection churn.
+- Event compliance persistence is batched through an in-memory queue before
+  SQLite writes. This improves latency under bursty run/conversation traffic,
+  but it also means durability is slightly delayed by a short queue flush
+  window rather than one commit per emitted event.
 - Use `loom db status|migrate|doctor|backup` for migration operations.
 - See `docs/DB-MIGRATIONS.md` for schema authoring and upgrade policy.
 

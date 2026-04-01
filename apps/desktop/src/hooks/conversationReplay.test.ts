@@ -6,6 +6,7 @@ import {
   durableConversationSeq,
   hasOlderConversationHistory,
   hydrateConversationReplayPages,
+  isConversationStreamHealthy,
   isInitialTurnProgressEvent,
   mergeConversationEvents,
   reconcilePendingConversationTitle,
@@ -240,6 +241,12 @@ describe("conversation replay helpers", () => {
       streaming: false,
       serverReportedActive: true,
     })).toBe(true);
+  });
+
+  it("treats recent stream activity as healthy and skips the polling fallback window", () => {
+    expect(isConversationStreamHealthy(5_000, { now: 10_000 })).toBe(true);
+    expect(isConversationStreamHealthy(5_000, { now: 11_500 })).toBe(false);
+    expect(isConversationStreamHealthy(0, { now: 10_000 })).toBe(false);
   });
 
   it("preserves a pending auto-title when a stale default detail refresh arrives", () => {

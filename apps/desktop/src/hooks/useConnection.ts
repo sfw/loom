@@ -48,7 +48,7 @@ async function loadShellSnapshotWithArchived(includeArchived: boolean): Promise<
   throw lastError instanceof Error ? lastError : new Error("Failed to load Loomd.");
 }
 
-const HEALTH_CHECK_INTERVAL_MS = 5000;
+const HEALTH_CHECK_INTERVAL_MS = 15000;
 const AUTO_RECONNECT_DELAY_MS = 1500;
 
 // ---------------------------------------------------------------------------

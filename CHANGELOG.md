@@ -6,6 +6,8 @@ This changelog is generated directly from git commit history (non-merge commits)
 
 ## [Unreleased]
 
+- Refactor `loomd` desktop/runtime hot paths around SQLite: long-lived governed connections, governed durable-run lease writes, bounded durable event backpressure, direct live run/notification SSE delivery, and reduced frontend polling overlap
+- Add desktop hot-path latency diagnostics and a synthetic active-run API smoke benchmark (`scripts/active_run_latency_smoke.py`)
 - Add `loomd` sidecar entrypoint and runtime status contract for workspace-first desktop bootstrapping
 - Add workspace registry, workspace settings, and conversation/run link schema with migration coverage
 - Add workspace-first API surfaces: `/runtime`, `/workspaces`, `/conversations`, `/runs`, and grouped `/settings`

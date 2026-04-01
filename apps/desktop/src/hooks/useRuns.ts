@@ -311,7 +311,7 @@ export function useRuns(deps: {
   const runComposerRef = useRef<HTMLElement | null>(null);
   const runRefreshTimerRef = useRef<number | null>(null);
   const runMatchRefs = useRef<Array<HTMLDivElement | null>>([]);
-  const lastSeenRunEventIdRef = useRef(0);
+  const lastSeenRunSequenceRef = useRef(0);
   const lastRunStreamActivityAtRef = useRef(0);
   const nextSyntheticRunEventIdRef = useRef(-1);
   const runDetailRef = useRef<RunDetail | null>(null);
@@ -414,10 +414,10 @@ export function useRuns(deps: {
     setRunDetail(canonicalizeRunDetail(detail));
     setRunTimeline((current) => mergeRunTimelineEvents(current, timeline));
     setRunArtifacts(artifacts);
-    lastSeenRunEventIdRef.current = Math.max(
-      lastSeenRunEventIdRef.current,
+    lastSeenRunSequenceRef.current = Math.max(
+      lastSeenRunSequenceRef.current,
       timeline.reduce(
-        (maxId, row) => Math.max(maxId, Number(row.id || 0)),
+        (maxSequence, row) => Math.max(maxSequence, Number(row.sequence || 0)),
         0,
       ),
     );
@@ -481,7 +481,7 @@ export function useRuns(deps: {
       setRunLoadError("");
       setRunHistoryQuery("");
       setActiveRunMatchIndex(0);
-      lastSeenRunEventIdRef.current = 0;
+      lastSeenRunSequenceRef.current = 0;
       lastRunStreamActivityAtRef.current = 0;
       nextSyntheticRunEventIdRef.current = -1;
       pendingWorkspaceRefreshRef.current = null;
@@ -497,7 +497,7 @@ export function useRuns(deps: {
         setRunLoadError("");
         setRunHistoryQuery("");
         setActiveRunMatchIndex(0);
-        lastSeenRunEventIdRef.current = 0;
+        lastSeenRunSequenceRef.current = 0;
         lastRunStreamActivityAtRef.current = 0;
         nextSyntheticRunEventIdRef.current = -1;
       }
@@ -514,7 +514,7 @@ export function useRuns(deps: {
       setRunInstructionHistory([]);
       setRunHistoryQuery("");
       setActiveRunMatchIndex(0);
-      lastSeenRunEventIdRef.current = 0;
+      lastSeenRunSequenceRef.current = 0;
       lastRunStreamActivityAtRef.current = 0;
       nextSyntheticRunEventIdRef.current = -1;
     }
@@ -531,8 +531,8 @@ export function useRuns(deps: {
           setRunTimeline(timeline);
           setRunArtifacts(artifacts);
           setRunInstructionHistory(instructionHistory);
-          lastSeenRunEventIdRef.current = timeline.reduce(
-            (maxId, row) => Math.max(maxId, Number(row.id || 0)),
+          lastSeenRunSequenceRef.current = timeline.reduce(
+            (maxSequence, row) => Math.max(maxSequence, Number(row.sequence || 0)),
             0,
           );
           maybeRefreshWorkspaceSurfaceAfterRunLoad(selectedRunId);
@@ -585,10 +585,10 @@ export function useRuns(deps: {
             : nextSyntheticRunEventIdRef.current--,
         );
         if (timelineEvent) {
-          if (isPersistedRunTimelineEvent(timelineEvent)) {
-            lastSeenRunEventIdRef.current = Math.max(
-              lastSeenRunEventIdRef.current,
-              timelineEvent.id,
+          if (Number(timelineEvent.sequence || 0) > 0) {
+            lastSeenRunSequenceRef.current = Math.max(
+              lastSeenRunSequenceRef.current,
+              Number(timelineEvent.sequence || 0),
             );
           }
           setRunTimeline((current) => mergeRunTimelineEvents(current, [timelineEvent]));
@@ -633,7 +633,7 @@ export function useRuns(deps: {
         scheduleRunRefresh();
       },
       {
-        afterId: lastSeenRunEventIdRef.current,
+        afterSequence: lastSeenRunSequenceRef.current,
       },
     );
     return () => {
@@ -652,7 +652,7 @@ export function useRuns(deps: {
     }
     const timer = window.setInterval(() => {
       const staleForMs = Date.now() - lastRunStreamActivityAtRef.current;
-      if (lastRunStreamActivityAtRef.current > 0 && staleForMs < 8000) {
+      if (lastRunStreamActivityAtRef.current > 0 && staleForMs < 15000) {
         return;
       }
       void refreshRun(selectedRunId).catch((err) => {
@@ -660,7 +660,7 @@ export function useRuns(deps: {
           setError(err instanceof Error ? err.message : "Failed to refresh run.");
         }
       });
-    }, 5000);
+    }, 10000);
     return () => {
       window.clearInterval(timer);
     };

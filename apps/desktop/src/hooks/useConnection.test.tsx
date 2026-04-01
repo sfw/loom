@@ -78,7 +78,7 @@ describe("useConnection", () => {
     expect(result.current.connectionState).toBe("connected");
 
     await act(async () => {
-      vi.advanceTimersByTime(5000);
+      vi.advanceTimersByTime(15000);
       await flushPromises();
     });
 

@@ -324,15 +324,18 @@ class TestEventBus:
 
         async def run():
             await persister.handle(event)
+            await persister.drain(timeout=1.0)
 
         asyncio.run(run())
-        db.insert_event.assert_awaited_once()
-        kwargs = db.insert_event.await_args.kwargs
-        assert kwargs["correlation_id"] == "run:abc123"
-        assert kwargs["timestamp"] == "2026-03-06T00:00:00+00:00"
-        assert kwargs["run_id"] == "abc123"
-        assert kwargs["event_id"] == "evt-1"
-        assert kwargs["sequence"] == 7
+        db.insert_events_batch.assert_awaited_once()
+        rows = db.insert_events_batch.await_args.args[0]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["correlation_id"] == "run:abc123"
+        assert row["timestamp"] == "2026-03-06T00:00:00+00:00"
+        assert row["run_id"] == "abc123"
+        assert row["event_id"] == "evt-1"
+        assert row["sequence"] == 7
 
     def test_payload_contract_validation_reports_missing_required_keys(self):
         errors = validate_payload_shape(TASK_CREATED, {"task_id": "task-1"})
@@ -409,7 +412,7 @@ class TestEventBus:
 
     def test_event_persister_tracks_failed_persistence_attempts(self):
         class FailingDB:
-            async def insert_event(self, **kwargs):  # type: ignore[no-untyped-def]
+            async def insert_events_batch(self, rows):  # type: ignore[no-untyped-def]
                 raise RuntimeError("db unavailable")
 
         persister = EventPersister(FailingDB())
@@ -418,13 +421,14 @@ class TestEventBus:
         async def run():
             await persister.handle(event)
             await persister.handle(event)
+            await persister.drain(timeout=1.0)
 
         asyncio.run(run())
         assert persister._failed_persist_count == 2
 
     def test_event_persister_emits_persistence_failure_diagnostic(self):
         class FailingDB:
-            async def insert_event(self, **kwargs):  # type: ignore[no-untyped-def]
+            async def insert_events_batch(self, rows):  # type: ignore[no-untyped-def]
                 raise RuntimeError("db unavailable")
 
         bus = EventBus()
@@ -434,6 +438,7 @@ class TestEventBus:
 
         async def run():
             await persister.handle(event)
+            await persister.drain(timeout=1.0)
 
         asyncio.run(run())
         diagnostics = [
@@ -443,3 +448,73 @@ class TestEventBus:
         ]
         assert diagnostics
         assert diagnostics[-1].data.get("diagnostic_type") == "persistence_failure_count_snapshot"
+
+    def test_event_persister_batches_multiple_events(self):
+        class RecordingDB:
+            def __init__(self):
+                self.batches = []
+
+            async def insert_events_batch(self, rows):  # type: ignore[no-untyped-def]
+                self.batches.append(list(rows))
+
+        db = RecordingDB()
+        persister = EventPersister(db, flush_interval_seconds=0.0)
+
+        async def run():
+            await persister.handle(
+                Event(event_type=TASK_CREATED, task_id="task-1", data={"goal": "x"}),
+            )
+            await persister.handle(
+                Event(
+                    event_type=TASK_EXECUTING,
+                    task_id="task-1",
+                    data={"status": "executing"},
+                ),
+            )
+            await persister.drain(timeout=1.0)
+
+        asyncio.run(run())
+        assert len(db.batches) == 1
+        assert [row["event_type"] for row in db.batches[0]] == [TASK_CREATED, TASK_EXECUTING]
+
+    def test_event_persister_attached_to_bus_does_not_drop_durable_events_under_pressure(self):
+        class RecordingDB:
+            def __init__(self):
+                self.batches: list[list[dict[str, object]]] = []
+                self.blocking_batches: list[list[dict[str, object]]] = []
+
+            async def insert_events_batch(self, rows):  # type: ignore[no-untyped-def]
+                await asyncio.sleep(0.01)
+                self.batches.append(list(rows))
+
+            def insert_events_batch_blocking(self, rows):  # type: ignore[no-untyped-def]
+                self.blocking_batches.append(list(rows))
+
+        bus = EventBus(async_handler_queue_size=1)
+        db = RecordingDB()
+        persister = EventPersister(
+            db,
+            batch_size=1,
+            flush_interval_seconds=0.0,
+            max_queue_size=2,
+        )
+        persister.attach(bus)
+
+        async def run():
+            for index in range(5):
+                bus.emit(
+                    Event(
+                        event_type=TASK_CREATED,
+                        task_id="task-persist-pressure",
+                        data={"goal": f"goal-{index}"},
+                    ),
+                )
+            await persister.drain(timeout=1.0)
+
+        asyncio.run(run())
+        persisted = [row for batch in [*db.blocking_batches, *db.batches] for row in batch]
+        durable_rows = [row for row in persisted if row["event_type"] == TASK_CREATED]
+        assert len(durable_rows) == 5
+        assert persister.stats_snapshot()["queue_alarm_count"] >= 1
+        assert persister.stats_snapshot()["blocking_flush_count"] >= 1
+        assert persister.stats_snapshot()["queue_high_water"] <= 2

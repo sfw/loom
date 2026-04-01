@@ -163,6 +163,7 @@ export function useWorkspace(deps: {
     runtime,
     setError,
     setNotice,
+    activeTab,
     setSelectedConversationId,
     setSelectedRunId,
   } = deps;
@@ -203,6 +204,12 @@ export function useWorkspace(deps: {
   const previousSelectedConversationIdRef = useRef(selectedConversationId);
   const previousSelectedRunIdRef = useRef(selectedRunId);
   const overviewRef = useRef<WorkspaceOverview | null>(null);
+  const loadedWorkspaceArtifactsIdRef = useRef("");
+  const loadedWorkspaceInventoryIdRef = useRef("");
+  const loadedWorkspaceSettingsIdRef = useRef("");
+  const loadingWorkspaceArtifactsIdRef = useRef("");
+  const loadingWorkspaceInventoryIdRef = useRef("");
+  const loadingWorkspaceSettingsIdRef = useRef("");
 
   // ---------------------------------------------------------------------------
   // useEffectEvent handlers
@@ -225,30 +232,14 @@ export function useWorkspace(deps: {
     });
   });
 
-  const refreshWorkspaceSurface = useEffectEvent(async (workspaceId: string) => {
-    const [
-      overviewPayload,
-      workspaceSettingsPayload,
-      approvalPayload,
-      inventoryPayload,
-      artifactPayload,
-    ] = await Promise.all([
-      fetchWorkspaceOverview(workspaceId),
-      fetchWorkspaceSettings(workspaceId),
-      fetchApprovals(workspaceId),
-      fetchWorkspaceInventory(workspaceId),
-      fetchWorkspaceArtifacts(workspaceId),
-    ]);
+  const applyWorkspaceOverview = useEffectEvent((workspaceId: string, overviewPayload: WorkspaceOverview) => {
     const isCurrentWorkspace = selectedWorkspaceIdRef.current === workspaceId;
     if (!isCurrentWorkspace) {
       setWorkspaces((current) => mergeWorkspaceSummary(current, overviewPayload.workspace));
       return;
     }
+
     setOverview(overviewPayload);
-    setWorkspaceSettings(workspaceSettingsPayload);
-    setApprovalInbox(approvalPayload);
-    setInventory(inventoryPayload);
-    setWorkspaceArtifacts(artifactPayload);
     setWorkspaces((current) => mergeWorkspaceSummary(current, overviewPayload.workspace));
 
     const firstConversationId = overviewPayload.recent_conversations[0]?.id || "";
@@ -266,6 +257,108 @@ export function useWorkspace(deps: {
     });
   });
 
+  const refreshWorkspaceOverviewState = useEffectEvent(async (workspaceId: string) => {
+    const overviewPayload = await fetchWorkspaceOverview(workspaceId);
+    applyWorkspaceOverview(workspaceId, overviewPayload);
+  });
+
+  const refreshWorkspaceArtifactsState = useEffectEvent(async (workspaceId: string) => {
+    if (
+      loadedWorkspaceArtifactsIdRef.current === workspaceId
+      || loadingWorkspaceArtifactsIdRef.current === workspaceId
+    ) {
+      return;
+    }
+    loadingWorkspaceArtifactsIdRef.current = workspaceId;
+    try {
+      const artifactPayload = await fetchWorkspaceArtifacts(workspaceId);
+      if (selectedWorkspaceIdRef.current !== workspaceId) {
+        return;
+      }
+      setWorkspaceArtifacts(artifactPayload);
+      loadedWorkspaceArtifactsIdRef.current = workspaceId;
+    } finally {
+      if (loadingWorkspaceArtifactsIdRef.current === workspaceId) {
+        loadingWorkspaceArtifactsIdRef.current = "";
+      }
+    }
+  });
+
+  const refreshWorkspaceInventoryState = useEffectEvent(async (workspaceId: string) => {
+    if (
+      loadedWorkspaceInventoryIdRef.current === workspaceId
+      || loadingWorkspaceInventoryIdRef.current === workspaceId
+    ) {
+      return;
+    }
+    loadingWorkspaceInventoryIdRef.current = workspaceId;
+    try {
+      const inventoryPayload = await fetchWorkspaceInventory(workspaceId);
+      if (selectedWorkspaceIdRef.current !== workspaceId) {
+        return;
+      }
+      setInventory(inventoryPayload);
+      loadedWorkspaceInventoryIdRef.current = workspaceId;
+    } finally {
+      if (loadingWorkspaceInventoryIdRef.current === workspaceId) {
+        loadingWorkspaceInventoryIdRef.current = "";
+      }
+    }
+  });
+
+  const refreshWorkspaceSettingsState = useEffectEvent(async (workspaceId: string) => {
+    if (
+      loadedWorkspaceSettingsIdRef.current === workspaceId
+      || loadingWorkspaceSettingsIdRef.current === workspaceId
+    ) {
+      return;
+    }
+    loadingWorkspaceSettingsIdRef.current = workspaceId;
+    try {
+      const workspaceSettingsPayload = await fetchWorkspaceSettings(workspaceId);
+      if (selectedWorkspaceIdRef.current !== workspaceId) {
+        return;
+      }
+      setWorkspaceSettings(workspaceSettingsPayload);
+      loadedWorkspaceSettingsIdRef.current = workspaceId;
+    } finally {
+      if (loadingWorkspaceSettingsIdRef.current === workspaceId) {
+        loadingWorkspaceSettingsIdRef.current = "";
+      }
+    }
+  });
+
+  const refreshVisibleWorkspaceTabState = useEffectEvent(async (workspaceId: string) => {
+    if (activeTab === "overview") {
+      await refreshWorkspaceArtifactsState(workspaceId);
+      return;
+    }
+    if (activeTab === "runs") {
+      await refreshWorkspaceInventoryState(workspaceId);
+      return;
+    }
+    if (activeTab === "settings") {
+      await refreshWorkspaceSettingsState(workspaceId);
+    }
+  });
+
+  const refreshWorkspaceSurface = useEffectEvent(async (workspaceId: string) => {
+    const [
+      overviewPayload,
+      approvalPayload,
+    ] = await Promise.all([
+      fetchWorkspaceOverview(workspaceId),
+      fetchApprovals(workspaceId),
+    ]);
+    const isCurrentWorkspace = selectedWorkspaceIdRef.current === workspaceId;
+    applyWorkspaceOverview(workspaceId, overviewPayload);
+    if (!isCurrentWorkspace) {
+      return;
+    }
+    setApprovalInbox(approvalPayload);
+    await refreshVisibleWorkspaceTabState(workspaceId);
+  });
+
   const refreshApprovalInbox = useEffectEvent(async (workspaceId: string) => {
     setApprovalInbox(await fetchApprovals(workspaceId));
   });
@@ -276,7 +369,10 @@ export function useWorkspace(deps: {
     }
     notificationRefreshTimerRef.current = window.setTimeout(() => {
       notificationRefreshTimerRef.current = null;
-      void refreshWorkspaceSurface(workspaceId).catch((err) => {
+      void Promise.all([
+        refreshApprovalInbox(workspaceId),
+        refreshWorkspaceOverviewState(workspaceId),
+      ]).catch((err) => {
         if (!isTransientRequestError(err)) {
           setError(err instanceof Error ? err.message : "Failed to refresh inbox.");
         }
@@ -328,6 +424,12 @@ export function useWorkspace(deps: {
       setWorkspaceArtifacts([]);
       setWorkspaceSearchResults(null);
       setWorkspaceSettings(null);
+      loadedWorkspaceArtifactsIdRef.current = "";
+      loadedWorkspaceInventoryIdRef.current = "";
+      loadedWorkspaceSettingsIdRef.current = "";
+      loadingWorkspaceArtifactsIdRef.current = "";
+      loadingWorkspaceInventoryIdRef.current = "";
+      loadingWorkspaceSettingsIdRef.current = "";
       lastSeenNotificationStreamIdRef.current = 0;
       previousWorkspaceIdRef.current = "";
       return;
@@ -335,6 +437,12 @@ export function useWorkspace(deps: {
     const hasMatchingOverview =
       overviewRef.current?.workspace?.id === selectedWorkspaceId;
     if (connectionState !== "connected") {
+      loadedWorkspaceArtifactsIdRef.current = "";
+      loadedWorkspaceInventoryIdRef.current = "";
+      loadedWorkspaceSettingsIdRef.current = "";
+      loadingWorkspaceArtifactsIdRef.current = "";
+      loadingWorkspaceInventoryIdRef.current = "";
+      loadingWorkspaceSettingsIdRef.current = "";
       if (!hasMatchingOverview) {
         setOverview(null);
         setApprovalInbox([]);
@@ -343,6 +451,12 @@ export function useWorkspace(deps: {
         setWorkspaceArtifacts([]);
         setWorkspaceSearchResults(null);
         setWorkspaceSettings(null);
+        loadedWorkspaceArtifactsIdRef.current = "";
+        loadedWorkspaceInventoryIdRef.current = "";
+        loadedWorkspaceSettingsIdRef.current = "";
+        loadingWorkspaceArtifactsIdRef.current = "";
+        loadingWorkspaceInventoryIdRef.current = "";
+        loadingWorkspaceSettingsIdRef.current = "";
         lastSeenNotificationStreamIdRef.current = 0;
       }
       setLoadingOverview(!hasMatchingOverview);
@@ -359,6 +473,12 @@ export function useWorkspace(deps: {
       setWorkspaceArtifacts([]);
       setWorkspaceSearchResults(null);
       setWorkspaceSettings(null);
+      loadedWorkspaceArtifactsIdRef.current = "";
+      loadedWorkspaceInventoryIdRef.current = "";
+      loadedWorkspaceSettingsIdRef.current = "";
+      loadingWorkspaceArtifactsIdRef.current = "";
+      loadingWorkspaceInventoryIdRef.current = "";
+      loadingWorkspaceSettingsIdRef.current = "";
       lastSeenNotificationStreamIdRef.current = 0;
     }
     if (
@@ -386,37 +506,21 @@ export function useWorkspace(deps: {
       try {
         const [
           overviewPayload,
-          workspaceSettingsPayload,
           approvalPayload,
-          inventoryPayload,
-          artifactPayload,
         ] = await Promise.all([
           fetchWorkspaceOverview(selectedWorkspaceId),
-          fetchWorkspaceSettings(selectedWorkspaceId),
           fetchApprovals(selectedWorkspaceId),
-          fetchWorkspaceInventory(selectedWorkspaceId),
-          fetchWorkspaceArtifacts(selectedWorkspaceId),
         ]);
         if (cancelled) {
           return;
         }
-        setOverview(overviewPayload);
         setApprovalInbox(approvalPayload);
-        setInventory(inventoryPayload);
-        setWorkspaceArtifacts(artifactPayload);
         setWorkspaceSearchResults(null);
-        setWorkspaceSettings(workspaceSettingsPayload);
-        setWorkspaces((current) => mergeWorkspaceSummary(current, overviewPayload.workspace));
-        const firstConversationId = overviewPayload.recent_conversations[0]?.id || "";
-        const firstRunId = overviewPayload.recent_runs[0]?.id || "";
-
-        startTransition(() => {
-          setSelectedConversationId((current) => {
-            return current || firstConversationId;
-          });
-          setSelectedRunId((current) => {
-            return current || firstRunId;
-          });
+        applyWorkspaceOverview(selectedWorkspaceId, overviewPayload);
+        void refreshVisibleWorkspaceTabState(selectedWorkspaceId).catch((err) => {
+          if (!isTransientRequestError(err)) {
+            setError(err instanceof Error ? err.message : "Failed to load workspace details.");
+          }
         });
       } catch (err) {
         if (!cancelled) {
@@ -439,6 +543,49 @@ export function useWorkspace(deps: {
       cancelled = true;
     };
   }, [connectionState, selectedWorkspaceId]);
+
+  useEffect(() => {
+    if (connectionState !== "connected" || !selectedWorkspaceId) {
+      return;
+    }
+    if (activeTab === "overview") {
+      if (loadedWorkspaceArtifactsIdRef.current === selectedWorkspaceId) {
+        return;
+      }
+      void refreshWorkspaceArtifactsState(selectedWorkspaceId).catch((err) => {
+        if (!isTransientRequestError(err)) {
+          setError(err instanceof Error ? err.message : "Failed to load workspace artifacts.");
+        }
+      });
+      return;
+    }
+    if (activeTab === "runs") {
+      if (loadedWorkspaceInventoryIdRef.current === selectedWorkspaceId) {
+        return;
+      }
+      void refreshWorkspaceInventoryState(selectedWorkspaceId).catch((err) => {
+        if (!isTransientRequestError(err)) {
+          setError(err instanceof Error ? err.message : "Failed to load workspace inventory.");
+        }
+      });
+      return;
+    }
+    if (
+      activeTab === "settings"
+      && loadedWorkspaceSettingsIdRef.current !== selectedWorkspaceId
+    ) {
+      void refreshWorkspaceSettingsState(selectedWorkspaceId).catch((err) => {
+        if (!isTransientRequestError(err)) {
+          setError(err instanceof Error ? err.message : "Failed to load workspace settings.");
+        }
+      });
+    }
+  }, [
+    activeTab,
+    connectionState,
+    selectedWorkspaceId,
+    setError,
+  ]);
 
   useEffect(() => {
     previousSelectedConversationIdRef.current = selectedConversationId;

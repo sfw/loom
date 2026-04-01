@@ -139,6 +139,7 @@ class Engine:
         question_manager: QuestionManager | None,
         webhook_delivery: WebhookDelivery,
         learning_manager: LearningManager,
+        event_persister: EventPersister | None = None,
         runtime_role: str = "api",
     ):
         self.config = config
@@ -155,6 +156,7 @@ class Engine:
         self.config_runtime_store = config_runtime_store
         self.approval_manager = approval_manager
         self.question_manager = question_manager
+        self.event_persister = event_persister
         self.webhook_delivery = webhook_delivery
         self.learning_manager = learning_manager
         self.runtime_role = str(runtime_role or "api").strip() or "api"
@@ -241,6 +243,9 @@ class Engine:
             task.cancel()
         if self._background_tasks:
             await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+        await self.event_bus.drain(timeout=5.0)
+        if self.event_persister is not None:
+            await self.event_persister.drain(timeout=5.0)
         await self.model_router.close()
         await self.database.close()
 
@@ -1435,6 +1440,7 @@ async def create_engine(config: Config, *, runtime_role: str = "api") -> Engine:
         config_runtime_store=config_runtime_store,
         approval_manager=approval_manager,
         question_manager=question_manager,
+        event_persister=event_persister,
         webhook_delivery=webhook_delivery,
         learning_manager=learning_manager,
         runtime_role=runtime_role,

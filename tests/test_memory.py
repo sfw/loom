@@ -500,6 +500,31 @@ class TestDatabase:
         assert row is not None
         assert row["status"] == "completed"
 
+    async def test_task_run_lease_and_heartbeat_reuse_runtime_connections(self, db: Database):
+        await db.insert_task(task_id="t-lease", goal="Lease reuse test")
+        await db.insert_task_run(
+            run_id="run-lease",
+            task_id="t-lease",
+            status="queued",
+            process_name="demo",
+        )
+        initial_connection_count = int(db.stats_snapshot()["connection_open_count"])
+
+        acquired = await db.acquire_task_run_lease(
+            run_id="run-lease",
+            lease_owner="worker-A",
+            lease_seconds=30,
+        )
+        heartbeat = await db.heartbeat_task_run(
+            run_id="run-lease",
+            lease_owner="worker-A",
+            lease_seconds=30,
+        )
+
+        assert acquired is True
+        assert heartbeat is True
+        assert int(db.stats_snapshot()["connection_open_count"]) == initial_connection_count
+
     async def test_task_question_lifecycle(self, db: Database):
         await db.insert_task(task_id="t1", goal="Test")
         pending = await db.upsert_pending_task_question(

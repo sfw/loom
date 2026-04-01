@@ -10,6 +10,9 @@ import {
 } from "../api";
 import { isTransientRequestError } from "../utils";
 
+const ACTIVE_ACTIVITY_POLL_MS = 3000;
+const IDLE_ACTIVITY_POLL_MS = 10000;
+
 export interface DesktopActivityState {
   active: boolean;
   mode: "idle" | "thread" | "run" | "mixed";
@@ -74,7 +77,9 @@ export function useDesktopActivity(deps: {
       return;
     }
 
-    const intervalMs = (backendSummary?.active || localActivityActive) ? 1200 : 5000;
+    const intervalMs = (backendSummary?.active || localActivityActive)
+      ? ACTIVE_ACTIVITY_POLL_MS
+      : IDLE_ACTIVITY_POLL_MS;
     const intervalId = window.setInterval(() => {
       void refreshActivitySummary();
     }, intervalMs);

@@ -46,17 +46,17 @@ describe("conversation stream api", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
-  it("includes the last seen run event id when subscribing", () => {
+  it("includes the last seen run sequence when subscribing", () => {
     const cleanup = subscribeRunStream(
       "run-1",
       vi.fn(),
       vi.fn(),
-      { afterId: 17 },
+      { afterSequence: 17 },
     );
 
     expect(EventSourceMock).toHaveBeenCalledTimes(1);
     const firstCall = (EventSourceMock.mock.calls as unknown as Array<Array<unknown>>)[0];
-    expect(String(firstCall?.[0] || "")).toContain("after_id=17");
+    expect(String(firstCall?.[0] || "")).toContain("after_sequence=17");
 
     cleanup();
     expect(close).toHaveBeenCalledTimes(1);

@@ -20,6 +20,8 @@ from loom.cowork.session import CoworkTurn, ToolCallEvent
 from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import Event, EventBus
 from loom.events.types import (
+    APPROVAL_RECEIVED,
+    APPROVAL_REQUESTED,
     STEER_INSTRUCTION,
     TASK_COMPLETED,
     TASK_CREATED,
@@ -61,7 +63,10 @@ def event_bus():
 async def database(tmp_path):
     db = Database(str(tmp_path / "test.db"))
     await db.initialize()
-    return db
+    try:
+        yield db
+    finally:
+        await db.close()
 
 
 @pytest.fixture
@@ -812,6 +817,63 @@ class TestWorkspaceFirstEndpoints:
         assert payload["counts"]["runs"] == 1
         assert payload["counts"]["conversations"] == 1
         assert payload["recent_conversations"][0]["linked_run_ids"] == ["task-ws-2"]
+
+    @pytest.mark.asyncio
+    async def test_workspace_overview_uses_batched_relationship_queries(
+        self,
+        client,
+        tmp_path,
+        database,
+        conversation_store,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "desktop-ws-batched"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+
+        await database.insert_task(
+            task_id="task-ws-batched-1",
+            goal="Ship feature",
+            workspace_path=str(workspace_path),
+            status="completed",
+        )
+        await database.insert_task_run(
+            run_id="run-ws-batched-1",
+            task_id="task-ws-batched-1",
+            status="completed",
+            process_name="batch-process",
+        )
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="test-model",
+        )
+        await conversation_store.link_run(session_id, "task-ws-batched-1")
+
+        monkeypatch.setattr(
+            engine.database,
+            "get_latest_task_run_for_task",
+            AsyncMock(side_effect=AssertionError("per-run lookup should not be used")),
+        )
+        monkeypatch.setattr(
+            engine.conversation_store,
+            "list_linked_conversations",
+            AsyncMock(side_effect=AssertionError("per-run link lookup should not be used")),
+        )
+        monkeypatch.setattr(
+            engine.conversation_store,
+            "list_linked_runs",
+            AsyncMock(side_effect=AssertionError("per-session link lookup should not be used")),
+        )
+
+        overview_response = await client.get(f"/workspaces/{workspace['id']}/overview")
+        assert overview_response.status_code == 200
+        payload = overview_response.json()
+        assert payload["recent_runs"][0]["execution_run_id"] == "run-ws-batched-1"
+        assert payload["recent_runs"][0]["linked_conversation_ids"] == [session_id]
+        assert payload["recent_conversations"][0]["linked_run_ids"] == ["task-ws-batched-1"]
 
     @pytest.mark.asyncio
     async def test_workspace_summaries_prefer_live_terminal_status_for_active_counts(
@@ -3655,7 +3717,7 @@ class TestWorkspaceFirstEndpoints:
             data={"message": "started", "status": "executing"},
             sequence=1,
         )
-        second_id = await database.insert_event(
+        await database.insert_event(
             task_id="task-run-stream-cursor-1",
             correlation_id="corr-1",
             run_id="exec-run-1",
@@ -3681,10 +3743,267 @@ class TestWorkspaceFirstEndpoints:
                     continue
                 seen_payloads.append(json.loads(line.removeprefix("data: ")))
 
-        assert seen_ids == [second_id]
+        assert seen_ids == [2]
         assert [payload["event_type"] for payload in seen_payloads] == ["task_paused"]
         assert seen_payloads[0]["status"] == "paused"
         assert seen_payloads[0]["streaming"] is False
+
+    @pytest.mark.asyncio
+    async def test_run_stream_replays_recent_in_memory_events_before_sqlite_flush(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+        engine,
+    ):
+        workspace_path = tmp_path / "run-stream-history-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-run-stream-history-1",
+            goal="Run stream history task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+
+        first = Event(
+            event_type="task_executing",
+            task_id="task-run-stream-history-1",
+            data={"run_id": "exec-run-1", "status": "executing"},
+        )
+        second = Event(
+            event_type="task_paused",
+            task_id="task-run-stream-history-1",
+            data={"run_id": "exec-run-1", "status": "paused"},
+        )
+        engine.event_bus.emit(first)
+        engine.event_bus.emit(second)
+
+        async with client.stream(
+            "GET",
+            "/runs/task-run-stream-history-1/stream?follow=false",
+            headers={"last-event-id": str(first.data.get("sequence", 0))},
+        ) as response:
+            seen_ids: list[int] = []
+            seen_payloads: list[dict[str, object]] = []
+            async for line in response.aiter_lines():
+                if not line.strip() or line.startswith(":"):
+                    continue
+                if line.startswith("id: "):
+                    seen_ids.append(int(line.removeprefix("id: ").strip()))
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                seen_payloads.append(json.loads(line.removeprefix("data: ")))
+
+        assert seen_ids == [2]
+        assert [payload["event_type"] for payload in seen_payloads] == ["task_paused"]
+        assert seen_payloads[0]["streaming"] is False
+
+    @pytest.mark.asyncio
+    async def test_run_stream_delivers_live_events_without_requerying_sqlite(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "run-stream-live-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-run-stream-live-1",
+            goal="Run stream live task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+
+        original_query_events = engine.database.query_events
+        query_call_count = 0
+
+        async def tracking_query_events(*args, **kwargs):
+            nonlocal query_call_count
+            query_call_count += 1
+            return await original_query_events(*args, **kwargs)
+
+        monkeypatch.setattr(engine.database, "query_events", tracking_query_events)
+
+        async def emit_later():
+            await asyncio.sleep(0.02)
+            engine.event_bus.emit(
+                Event(
+                    event_type=TASK_COMPLETED,
+                    task_id="task-run-stream-live-1",
+                    data={"run_id": "exec-run-1", "status": "completed"},
+                ),
+            )
+
+        emit_task = asyncio.create_task(emit_later())
+        payload = None
+        async with client.stream(
+            "GET",
+            "/runs/task-run-stream-live-1/stream",
+        ) as response:
+            current_event = ""
+            async for line in response.aiter_lines():
+                if not line.strip() or line.startswith(":"):
+                    continue
+                if line.startswith("event: "):
+                    current_event = line.removeprefix("event: ").strip()
+                    continue
+                if current_event == "run_event" and line.startswith("data: "):
+                    payload = json.loads(line.removeprefix("data: "))
+                    break
+        await emit_task
+
+        assert payload is not None
+        assert payload["event_type"] == TASK_COMPLETED
+        assert query_call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_run_stream_overflow_recovers_from_recent_history_without_dropping_events(
+        self,
+        tmp_path,
+        database,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "run-stream-overflow-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-run-stream-overflow-1",
+            goal="Run stream overflow task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+
+        from loom.api import routes as api_routes
+
+        monkeypatch.setattr(api_routes, "_STREAM_QUEUE_MAXSIZE", 1)
+        monkeypatch.setattr(api_routes, "EventSourceResponse", lambda generator: generator)
+        request = SimpleNamespace(
+            headers={},
+            app=SimpleNamespace(state=SimpleNamespace(engine=engine)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        stream = await api_routes.stream_run_events(
+            request,
+            "task-run-stream-overflow-1",
+            follow=True,
+        )
+        assert await anext(stream) == {"comment": "open"}
+
+        engine.event_bus.emit(
+            Event(
+                event_type=TASK_EXECUTING,
+                task_id="task-run-stream-overflow-1",
+                data={"run_id": "exec-run-overflow-1", "status": "executing"},
+            ),
+        )
+        first_item = await anext(stream)
+        first_payload = json.loads(first_item["data"])
+        assert first_payload["sequence"] == 1
+
+        engine.event_bus.emit(
+            Event(
+                event_type=TASK_RUN_HEARTBEAT,
+                task_id="task-run-stream-overflow-1",
+                data={"run_id": "exec-run-overflow-1", "status": "executing"},
+            ),
+        )
+        engine.event_bus.emit(
+            Event(
+                event_type=TASK_COMPLETED,
+                task_id="task-run-stream-overflow-1",
+                data={"run_id": "exec-run-overflow-1", "status": "completed"},
+            ),
+        )
+
+        second_item = await anext(stream)
+        third_item = await anext(stream)
+        second_payload = json.loads(second_item["data"])
+        third_payload = json.loads(third_item["data"])
+
+        assert [second_payload["sequence"], third_payload["sequence"]] == [2, 3]
+        assert [second_payload["event_type"], third_payload["event_type"]] == [
+            TASK_RUN_HEARTBEAT,
+            TASK_COMPLETED,
+        ]
+        assert third_payload["terminal"] is True
+
+    @pytest.mark.asyncio
+    async def test_notification_stream_delivers_live_events_without_requerying_sqlite(
+        self,
+        tmp_path,
+        database,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "notification-stream-live-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-notification-stream-live-1",
+            goal="Notification stream live task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+
+        original_query = engine.database.query
+        query_call_count = 0
+
+        async def tracking_query(*args, **kwargs):
+            nonlocal query_call_count
+            query_call_count += 1
+            return await original_query(*args, **kwargs)
+
+        monkeypatch.setattr(engine.database, "query", tracking_query)
+        from loom.api import routes as api_routes
+
+        monkeypatch.setattr(api_routes, "EventSourceResponse", lambda generator: generator)
+        request = SimpleNamespace(
+            headers={},
+            app=SimpleNamespace(state=SimpleNamespace(engine=engine)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        async def emit_later():
+            await asyncio.sleep(0.02)
+            engine.event_bus.emit(
+                Event(
+                    event_type=APPROVAL_REQUESTED,
+                    task_id="task-notification-stream-live-1",
+                    data={"summary": "Need approval"},
+                ),
+            )
+
+        emit_task = asyncio.create_task(emit_later())
+        payload = None
+        stream = await api_routes.stream_notifications(
+            request,
+            workspace_id=workspace["id"],
+            follow=True,
+        )
+        async for item in stream:
+            if item.get("event") == "notification":
+                payload = json.loads(item["data"])
+                break
+        await emit_task
+
+        assert payload is not None
+        assert payload["event_type"] == APPROVAL_REQUESTED
+        assert query_call_count == 1
 
     @pytest.mark.asyncio
     async def test_notification_stream_respects_last_event_id_cursor(
@@ -3742,6 +4061,121 @@ class TestWorkspaceFirstEndpoints:
         assert [payload["event_type"] for payload in seen_payloads] == ["approval_received"]
         assert seen_payloads[0]["workspace_id"] == workspace["id"]
         assert seen_payloads[0]["stream_id"] == second_id
+
+    @pytest.mark.asyncio
+    async def test_notification_stream_replays_recent_in_memory_events_before_sqlite_flush(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+        engine,
+    ):
+        workspace_path = tmp_path / "notification-stream-history-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-notification-stream-history-1",
+            goal="Notification stream history task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+
+        first = Event(
+            event_type=APPROVAL_REQUESTED,
+            task_id="task-notification-stream-history-1",
+            data={"summary": "Need approval"},
+        )
+        second = Event(
+            event_type=APPROVAL_RECEIVED,
+            task_id="task-notification-stream-history-1",
+            data={"summary": "Approved"},
+        )
+        engine.event_bus.emit(first)
+        engine.event_bus.emit(second)
+
+        async with client.stream(
+            "GET",
+            f"/notifications/stream?workspace_id={workspace['id']}&follow=false",
+            headers={"last-event-id": f"event:{first.data.get('event_id', '')}"},
+        ) as response:
+            seen_ids: list[str] = []
+            seen_payloads: list[dict[str, object]] = []
+            async for line in response.aiter_lines():
+                if not line.strip() or line.startswith(":"):
+                    continue
+                if line.startswith("id: "):
+                    seen_ids.append(line.removeprefix("id: ").strip())
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                seen_payloads.append(json.loads(line.removeprefix("data: ")))
+
+        assert seen_ids == [f"event:{second.data.get('event_id', '')}"]
+        assert [payload["event_type"] for payload in seen_payloads] == [APPROVAL_RECEIVED]
+        assert seen_payloads[0]["workspace_id"] == workspace["id"]
+        assert seen_payloads[0]["stream_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_notification_stream_initial_connect_replays_recent_in_memory_events_before_sqlite_flush(  # noqa: E501
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+        engine,
+    ):
+        workspace_path = tmp_path / "notification-stream-initial-history-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-notification-stream-initial-history-1",
+            goal="Notification initial history task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+
+        first = Event(
+            event_type=APPROVAL_REQUESTED,
+            task_id="task-notification-stream-initial-history-1",
+            data={"summary": "Need approval"},
+        )
+        second = Event(
+            event_type=APPROVAL_RECEIVED,
+            task_id="task-notification-stream-initial-history-1",
+            data={"summary": "Approved"},
+        )
+        engine.event_bus.emit(first)
+        engine.event_bus.emit(second)
+
+        async with client.stream(
+            "GET",
+            f"/notifications/stream?workspace_id={workspace['id']}&follow=false",
+        ) as response:
+            seen_ids: list[str] = []
+            seen_payloads: list[dict[str, object]] = []
+            async for line in response.aiter_lines():
+                if not line.strip() or line.startswith(":"):
+                    continue
+                if line.startswith("id: "):
+                    seen_ids.append(line.removeprefix("id: ").strip())
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                seen_payloads.append(json.loads(line.removeprefix("data: ")))
+
+        assert seen_ids == [
+            f"event:{first.data.get('event_id', '')}",
+            f"event:{second.data.get('event_id', '')}",
+        ]
+        assert [payload["event_type"] for payload in seen_payloads] == [
+            APPROVAL_REQUESTED,
+            APPROVAL_RECEIVED,
+        ]
+        assert all(payload["workspace_id"] == workspace["id"] for payload in seen_payloads)
+        assert all(payload["stream_id"] is None for payload in seen_payloads)
 
 
 class TestTelemetrySettings:

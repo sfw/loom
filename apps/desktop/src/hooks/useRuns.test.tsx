@@ -423,7 +423,7 @@ describe("useRuns", () => {
       "run-1",
       expect.any(Function),
       expect.any(Function),
-      { afterId: 3 },
+      { afterSequence: 3 },
     );
 
     act(() => {
@@ -448,6 +448,80 @@ describe("useRuns", () => {
     expect(result.current.runTimeline[1]?.id).toBe(4);
     expect(result.current.runDetail?.status).toBe("paused");
     expect(result.current.runStreaming).toBe(false);
+  });
+
+  it("backs off stale-refresh polling while the run stream is healthy", async () => {
+    vi.useFakeTimers();
+    let streamEvent: ((event: any) => void) | undefined;
+    apiMocks.fetchRunDetail.mockResolvedValue({
+      id: "run-1",
+      goal: "Review the site",
+      status: "executing",
+      process_name: "seo-geo-review",
+      plan_subtasks: [],
+    });
+    apiMocks.fetchRunTimeline.mockResolvedValue([]);
+    apiMocks.fetchRunArtifacts.mockResolvedValue([]);
+    apiMocks.subscribeRunStream.mockImplementation(((
+      _runId: string,
+      onEvent: (event: unknown) => void,
+    ) => {
+      streamEvent = onEvent as (event: any) => void;
+      return () => {};
+    }) as any);
+
+    renderHook(() =>
+      useRuns({
+        selectedRunId: "run-1",
+        setSelectedRunId: vi.fn(),
+        selectedWorkspaceId: "workspace-1",
+        overview: {
+          workspace: {
+            canonical_path: "/tmp/workspace",
+          },
+          recent_runs: [],
+        } as any,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        setActiveTab: vi.fn(),
+        refreshWorkspaceSurface: vi.fn(async () => {}),
+      }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    apiMocks.fetchRunDetail.mockClear();
+    apiMocks.fetchRunTimeline.mockClear();
+    apiMocks.fetchRunArtifacts.mockClear();
+
+    act(() => {
+      streamEvent?.({
+        task_id: "run-1",
+        run_id: "exec-run-1",
+        correlation_id: "corr-1",
+        event_id: "evt-10",
+        sequence: 10,
+        timestamp: "2026-03-27T00:00:10Z",
+        event_type: "tool_call_completed",
+        source_component: "tests",
+        schema_version: 1,
+        data: {},
+        status: "executing",
+        streaming: true,
+      });
+      vi.advanceTimersByTime(10000);
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchRunDetail).not.toHaveBeenCalled();
+    expect(apiMocks.fetchRunTimeline).not.toHaveBeenCalled();
+    expect(apiMocks.fetchRunArtifacts).not.toHaveBeenCalled();
+    vi.useRealTimers();
   });
 
   it("treats successful snapshot statuses as completed terminal runs", async () => {

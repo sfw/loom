@@ -130,10 +130,20 @@ from loom.tools.registry import (
     tool_auth_required,
 )
 from loom.tools.workspace import validate_workspace
-from loom.utils.latency import log_latency_event
+from loom.utils.latency import log_latency_event, timed_block
 
 router = APIRouter()
+
+_STREAM_QUEUE_MAXSIZE = 256
 logger = logging.getLogger(__name__)
+
+
+def _latency_fields(**fields: object) -> dict[str, object]:
+    return {
+        str(key): value
+        for key, value in fields.items()
+        if value is not None and (not isinstance(value, str) or value.strip())
+    }
 
 
 def _cowork_session_cls() -> type[CoworkSession]:
@@ -1141,6 +1151,17 @@ async def _load_task_state(engine: Engine, task_id: str) -> Task | None:
     return task if isinstance(task, Task) else None
 
 
+async def _task_state_exists(engine: Engine, task_id: str) -> bool:
+    try:
+        return bool(await asyncio.to_thread(engine.state_manager.exists, task_id))
+    except Exception:
+        return False
+
+
+async def _save_task_state(engine: Engine, task: Task) -> None:
+    await asyncio.to_thread(engine.state_manager.save, task)
+
+
 async def _load_task_evidence_records(
     engine: Engine,
     task_id: str,
@@ -1880,21 +1901,134 @@ def _workspace_title_from_session(session: dict[str, Any]) -> str:
 
 
 async def _workspace_tasks(engine: Engine, workspace: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = await engine.database.list_tasks()
-    return [row for row in rows if _workspace_matches_task(workspace, row)]
+    workspace_path = str(workspace.get("canonical_path", "") or "").strip()
+    if not workspace_path:
+        return []
+    return await engine.database.list_tasks_for_workspace(workspace_path)
 
 
 async def _workspace_sessions(engine: Engine, workspace: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = await engine.conversation_store.list_sessions()
-    return [row for row in rows if _workspace_matches_path(workspace, row.get("workspace_path"))]
+    workspace_path = str(workspace.get("canonical_path", "") or "").strip()
+    if not workspace_path:
+        return []
+    return await engine.conversation_store.list_sessions(workspace=workspace_path)
+
+
+_LIVE_TASK_STATUS_CANDIDATES = {"pending", "planning", "executing", "paused"}
+
+
+def _task_workspace_scope(task_row: dict[str, Any]) -> str:
+    metadata = _json_object(task_row.get("metadata"))
+    return str(
+        metadata.get("source_workspace_root")
+        or task_row.get("workspace_path")
+        or "",
+    ).strip()
+
+
+async def _workspace_relationship_maps(
+    engine: Engine,
+    *,
+    task_rows: list[dict[str, Any]],
+    session_rows: list[dict[str, Any]],
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, list[dict[str, Any]]],
+    dict[str, list[dict[str, Any]]],
+]:
+    task_ids = [
+        str(row.get("id", "") or "").strip()
+        for row in task_rows
+        if str(row.get("id", "") or "").strip()
+    ]
+    session_ids = [
+        str(row.get("id", "") or "").strip()
+        for row in session_rows
+        if str(row.get("id", "") or "").strip()
+    ]
+    latest_runs_by_task, linked_conversations_by_run, linked_runs_by_session = await asyncio.gather(
+        engine.database.get_latest_task_runs_for_tasks(task_ids),
+        engine.conversation_store.list_linked_conversations_for_runs(task_ids),
+        engine.conversation_store.list_linked_runs_for_sessions(session_ids),
+    )
+    return latest_runs_by_task, linked_conversations_by_run, linked_runs_by_session
+
+
+async def _count_pending_approval_items(
+    engine: Engine,
+    *,
+    workspace: dict[str, Any] | None = None,
+) -> int:
+    workspace_path = str((workspace or {}).get("canonical_path", "") or "").strip()
+    pending_task_approvals = engine.approval_manager.list_pending_approvals()
+    total = 0
+    if pending_task_approvals:
+        task_rows_by_id = await engine.database.get_tasks_by_ids([
+            str(getattr(item, "task_id", "") or "").strip()
+            for item in pending_task_approvals
+        ])
+        for pending in pending_task_approvals:
+            if workspace_path:
+                task_row = task_rows_by_id.get(
+                    str(getattr(pending, "task_id", "") or "").strip(),
+                    {},
+                )
+                if _task_workspace_scope(task_row) != workspace_path:
+                    continue
+            total += 1
+
+    if workspace_path:
+        row = await engine.database.query_one(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM task_questions AS q
+            JOIN tasks AS t ON t.id = q.task_id
+            WHERE q.status = 'pending'
+              AND COALESCE(
+                    NULLIF(json_extract(COALESCE(t.metadata, '{}'), '$.source_workspace_root'), ''),
+                    t.workspace_path
+                  ) = ?
+            """,
+            (workspace_path,),
+        )
+    else:
+        row = await engine.database.query_one(
+            "SELECT COUNT(*) AS cnt FROM task_questions WHERE status = 'pending'",
+        )
+    total += int((row or {}).get("cnt", 0) or 0)
+
+    pending_conversation_approvals = engine.list_pending_conversation_approvals()
+    if pending_conversation_approvals:
+        sessions_by_id = await engine.conversation_store.get_sessions_by_ids([
+            str(item.get("conversation_id", "") or "").strip()
+            for item in pending_conversation_approvals
+            if str(item.get("conversation_id", "") or "").strip()
+        ])
+        for pending in pending_conversation_approvals:
+            if workspace_path:
+                session = sessions_by_id.get(
+                    str(pending.get("conversation_id", "") or "").strip(),
+                    {},
+                )
+                if str(session.get("workspace_path", "") or "").strip() != workspace_path:
+                    continue
+            total += 1
+
+    return total
 
 
 async def _build_conversation_summary(
     engine: Engine,
     workspace_id: str,
     session: dict[str, Any],
+    *,
+    linked_runs: list[dict[str, Any]] | None = None,
 ) -> ConversationSummaryResponse:
-    linked_runs = await engine.conversation_store.list_linked_runs(str(session.get("id", "") or ""))
+    linked_run_rows = (
+        linked_runs
+        if linked_runs is not None
+        else await engine.conversation_store.list_linked_runs(str(session.get("id", "") or ""))
+    )
     return ConversationSummaryResponse(
         id=str(session.get("id", "") or ""),
         workspace_id=workspace_id,
@@ -1908,7 +2042,7 @@ async def _build_conversation_summary(
         is_active=bool(session.get("is_active", 0)),
         linked_run_ids=[
             str(link.get("run_id", "") or "")
-            for link in linked_runs
+            for link in linked_run_rows
             if str(link.get("run_id", "") or "").strip()
         ],
     )
@@ -1918,31 +2052,47 @@ async def _build_run_summary(
     engine: Engine,
     workspace_id: str,
     task_row: dict[str, Any],
+    *,
+    latest_run: dict[str, Any] | None = None,
+    linked_conversations: list[dict[str, Any]] | None = None,
+    live_status: str | None = None,
 ) -> RunSummaryResponse:
     task_id = str(task_row.get("id", "") or "").strip()
     metadata = _json_object(task_row.get("metadata"))
-    latest_run = await engine.database.get_latest_task_run_for_task(task_id)
-    linked_conversations = await engine.conversation_store.list_linked_conversations(task_id)
+    latest_run_row = (
+        latest_run
+        if latest_run is not None
+        else await engine.database.get_latest_task_run_for_task(task_id)
+    )
+    linked_conversation_rows = (
+        linked_conversations
+        if linked_conversations is not None
+        else await engine.conversation_store.list_linked_conversations(task_id)
+    )
 
-    live_status = await _resolve_task_status(engine, task_row)
+    resolved_status = (
+        live_status
+        if live_status is not None
+        else await _resolve_task_status(engine, task_row)
+    )
 
     return RunSummaryResponse(
         id=task_id,
         workspace_id=workspace_id,
         workspace_path=str(task_row.get("workspace_path", "") or ""),
         goal=str(task_row.get("goal", "") or ""),
-        status=live_status,
+        status=resolved_status,
         created_at=str(task_row.get("created_at", "") or ""),
         updated_at=str(task_row.get("updated_at", "") or ""),
-        execution_run_id=str((latest_run or {}).get("run_id", "") or ""),
+        execution_run_id=str((latest_run_row or {}).get("run_id", "") or ""),
         process_name=str(
-            (latest_run or {}).get("process_name", "")
+            (latest_run_row or {}).get("process_name", "")
             or metadata.get("process", "")
             or "",
         ),
         linked_conversation_ids=[
             str(link.get("session_id", "") or "")
-            for link in linked_conversations
+            for link in linked_conversation_rows
             if str(link.get("session_id", "") or "").strip()
         ],
         changed_files_count=0,
@@ -1953,6 +2103,8 @@ async def _resolve_task_status(engine: Engine, task_row: dict[str, Any]) -> str:
     task_id = str(task_row.get("id", "") or "").strip()
     db_status = str(task_row.get("status", "") or "").strip().lower()
     if not task_id:
+        return db_status
+    if db_status and db_status not in _LIVE_TASK_STATUS_CANDIDATES:
         return db_status
     live_task = await _load_task_state(engine, task_id)
     if live_task is not None:
@@ -1983,10 +2135,19 @@ async def _build_workspace_summary(
         )
     for row in session_rows:
         last_activity_at = _latest_timestamp(last_activity_at, row.get("last_active_at"))
-    active_statuses = {"pending", "planning", "executing", "paused"}
-    resolved_task_statuses = await asyncio.gather(
-        *(_resolve_task_status(engine, row) for row in task_rows),
-    ) if task_rows else []
+    active_candidate_rows = [
+        row
+        for row in task_rows
+        if str(row.get("status", "") or "").strip().lower() in _LIVE_TASK_STATUS_CANDIDATES
+    ]
+    resolved_candidate_statuses = await asyncio.gather(
+        *(_resolve_task_status(engine, row) for row in active_candidate_rows),
+    ) if active_candidate_rows else []
+    resolved_status_by_task = {
+        str(row.get("id", "") or "").strip(): status
+        for row, status in zip(active_candidate_rows, resolved_candidate_statuses, strict=False)
+        if str(row.get("id", "") or "").strip()
+    }
     workspace_path = str(workspace.get("canonical_path", "") or "")
     return WorkspaceSummaryResponse(
         id=workspace_id,
@@ -2008,8 +2169,11 @@ async def _build_workspace_summary(
         run_count=len(task_rows),
         active_run_count=sum(
             1
-            for status in resolved_task_statuses
-            if status in active_statuses
+            for row in task_rows
+            if (
+                resolved_status_by_task.get(str(row.get("id", "") or "").strip())
+                or str(row.get("status", "") or "").strip().lower()
+            ) in _LIVE_TASK_STATUS_CANDIDATES
         ),
         last_activity_at=last_activity_at,
     )
@@ -2350,6 +2514,78 @@ async def _notification_payload_from_row(
         return None
     payload["stream_id"] = int(row.get("id", 0) or 0)
     return payload
+
+
+async def _resolve_notification_stream_cursor(
+    engine: Engine,
+    *,
+    after_id: int,
+    last_event_id: str,
+) -> int:
+    cursor = max(0, int(after_id))
+    header_cursor = str(last_event_id or "").strip()
+    if not header_cursor:
+        return cursor
+    if header_cursor.isdigit():
+        return max(cursor, int(header_cursor))
+    if ":" not in header_cursor:
+        return cursor
+    _, event_id = header_cursor.split(":", 1)
+    clean_event_id = str(event_id or "").strip()
+    if not clean_event_id:
+        return cursor
+    row = await engine.database.query_one(
+        "SELECT id FROM events WHERE event_id = ?",
+        (clean_event_id,),
+    )
+    if row is None:
+        return cursor
+    return max(cursor, int(row.get("id", 0) or 0))
+
+
+def _notification_resume_event_id(last_event_id: str) -> str:
+    header_cursor = str(last_event_id or "").strip()
+    if not header_cursor.startswith("event:"):
+        return ""
+    return header_cursor.removeprefix("event:").strip()
+
+
+async def _notification_history_payloads(
+    engine: Engine,
+    *,
+    relevant_events: set[str],
+    workspace_filter: str,
+    after_event_id: str,
+    seen_event_ids: set[str],
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    armed = not after_event_id
+    for event in engine.event_bus.recent_events(limit=1000):
+        if event.event_type not in relevant_events:
+            continue
+        if not should_deliver_operator(
+            event.event_type,
+            engine.effective_telemetry_mode(),
+        ):
+            continue
+        payload_data = event.data if isinstance(event.data, dict) else {}
+        event_id = str(payload_data.get("event_id", "") or "").strip()
+        if after_event_id and not armed:
+            if event_id == after_event_id:
+                armed = True
+            continue
+        payload = await _notification_payload_from_event(engine, event)
+        if payload is None:
+            continue
+        if workspace_filter and str(payload.get("workspace_id", "") or "") != workspace_filter:
+            continue
+        payload_id = str(payload.get("id", "") or "").strip()
+        if payload_id and payload_id in seen_event_ids:
+            continue
+        if payload_id:
+            seen_event_ids.add(payload_id)
+        payloads.append(payload)
+    return payloads
 
 
 def _settings_payload(engine: Engine) -> dict[str, Any]:
@@ -2928,7 +3164,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         metadata=metadata,
     )
 
-    engine.state_manager.save(task)
+    await _save_task_state(engine, task)
 
     # Persist task metadata to SQLite (source of truth for /tasks list)
     await engine.database.insert_task(
@@ -2997,7 +3233,7 @@ async def _execute_in_background(engine: Engine, task, process_def=None) -> None
         _bg_logger.exception("Task %s failed with uncaught exception: %s", task.id, e)
         try:
             task.status = TaskStatus.FAILED
-            engine.state_manager.save(task)
+            await _save_task_state(engine, task)
             await engine.database.update_task_status(task.id, TaskStatus.FAILED.value)
         except Exception:
             _bg_logger.exception("Failed to save error state for task %s", task.id)
@@ -3024,10 +3260,12 @@ async def get_task(request: Request, task_id: str):
     """Get full task state."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    task = engine.state_manager.load(task_id)
+    task = await _load_task_state(engine, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
     # Build plan response
     plan_response = None
@@ -3090,11 +3328,11 @@ async def stream_task_events(request: Request, task_id: str):
     """SSE stream of real-time task events."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
     async def event_generator():
-        queue: asyncio.Queue[Event] = asyncio.Queue()
+        queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
 
         def handler(event: Event):
             if (
@@ -3104,7 +3342,10 @@ async def stream_task_events(request: Request, task_id: str):
                     engine.effective_telemetry_mode(),
                 )
             ):
-                queue.put_nowait(event)
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    return
 
         engine.event_bus.subscribe_all(handler)
 
@@ -3141,11 +3382,11 @@ async def stream_task_tokens(request: Request, task_id: str):
     """SSE stream of raw model tokens for the active subtask."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
     async def token_generator():
-        queue: asyncio.Queue[Event] = asyncio.Queue()
+        queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
 
         def handler(event: Event):
             if (
@@ -3156,16 +3397,20 @@ async def stream_task_tokens(request: Request, task_id: str):
                     engine.effective_telemetry_mode(),
                 )
             ):
-                queue.put_nowait(event)
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    return
 
         # Also listen for terminal events to know when to stop
-        terminal_queue: asyncio.Queue[Event] = asyncio.Queue()
+        terminal_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=1)
 
         def terminal_handler(event: Event):
             if event.task_id == task_id and event.event_type in (
                 TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED,
             ):
-                terminal_queue.put_nowait(event)
+                if terminal_queue.empty():
+                    terminal_queue.put_nowait(event)
 
         engine.event_bus.subscribe(TOKEN_STREAMED, handler)
         engine.event_bus.subscribe_all(terminal_handler)
@@ -3203,9 +3448,11 @@ async def list_task_questions(request: Request, task_id: str):
     if not bool(getattr(engine.config.execution, "ask_user_api_enabled", False)):
         raise HTTPException(status_code=404, detail="Question API is disabled.")
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
-    task = engine.state_manager.load(task_id)
+    task = await _load_task_state(engine, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     if _task_execution_surface(task) != "tui":
         raise HTTPException(
             status_code=409,
@@ -3235,9 +3482,11 @@ async def answer_task_question(
     if not bool(getattr(engine.config.execution, "ask_user_api_enabled", False)):
         raise HTTPException(status_code=404, detail="Question API is disabled.")
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
-    task = engine.state_manager.load(task_id)
+    task = await _load_task_state(engine, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     if _task_execution_surface(task) != "tui":
         raise HTTPException(
             status_code=409,
@@ -3287,10 +3536,12 @@ async def steer_task(request: Request, task_id: str, body: TaskSteerRequest):
     """Inject instructions into a running task."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    task = engine.state_manager.load(task_id)
+    task = await _load_task_state(engine, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     if task.status not in (TaskStatus.EXECUTING, TaskStatus.PLANNING, TaskStatus.PAUSED):
         raise HTTPException(
             status_code=409,
@@ -3322,11 +3573,14 @@ async def cancel_task(request: Request, task_id: str):
     """Cancel a running task."""
     engine = _get_engine(request)
     task_row = await engine.database.get_task(task_id)
-    if task_row is None and not engine.state_manager.exists(task_id):
+    task_exists = await _task_state_exists(engine, task_id)
+    if task_row is None and not task_exists:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    if engine.state_manager.exists(task_id):
-        task = engine.state_manager.load(task_id)
+    if task_exists:
+        task = await _load_task_state(engine, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
         if task.status not in {
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
@@ -3334,7 +3588,7 @@ async def cancel_task(request: Request, task_id: str):
         }:
             engine.orchestrator.cancel_task(task)
             if task.status == TaskStatus.CANCELLED:
-                engine.state_manager.save(task)
+                await _save_task_state(engine, task)
                 await engine.database.update_task_status(task_id, TaskStatus.CANCELLED.value)
                 latest_run_id = ""
                 if isinstance(task.metadata, dict):
@@ -3417,10 +3671,12 @@ async def pause_task(request: Request, task_id: str):
     """Pause an active task run."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    task = engine.state_manager.load(task_id)
+    task = await _load_task_state(engine, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     if task.status not in (TaskStatus.EXECUTING, TaskStatus.PLANNING, TaskStatus.PAUSED):
         raise HTTPException(
             status_code=409,
@@ -3440,10 +3696,12 @@ async def resume_task(request: Request, task_id: str):
     """Resume a paused task run."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    task = engine.state_manager.load(task_id)
+    task = await _load_task_state(engine, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     if task.status not in (TaskStatus.PAUSED, TaskStatus.EXECUTING, TaskStatus.PLANNING):
         raise HTTPException(
             status_code=409,
@@ -3488,7 +3746,7 @@ async def approve_task(request: Request, task_id: str, body: ApprovalRequest):
     """Approve or reject a gated step."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
     # Resolve pending approval via the approval manager
@@ -3522,7 +3780,7 @@ async def submit_feedback(request: Request, task_id: str, body: FeedbackRequest)
     """Provide mid-task feedback."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
     await engine.memory_manager.store(MemoryEntry(
@@ -3548,10 +3806,12 @@ async def send_conversation_message(
     """
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    task = engine.state_manager.load(task_id)
+    task = await _load_task_state(engine, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     if task.status not in (TaskStatus.EXECUTING, TaskStatus.PLANNING):
         raise HTTPException(
             status_code=409,
@@ -3617,10 +3877,12 @@ async def list_subtasks(request: Request, task_id: str):
     """List all subtasks with status."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    task = engine.state_manager.load(task_id)
+    task = await _load_task_state(engine, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     if not task.plan:
         return []
 
@@ -3642,10 +3904,12 @@ async def get_subtask(request: Request, task_id: str, subtask_id: str):
     """Get subtask detail."""
     engine = _get_engine(request)
 
-    if not engine.state_manager.exists(task_id):
+    if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    task = engine.state_manager.load(task_id)
+    task = await _load_task_state(engine, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     subtask = task.get_subtask(subtask_id)
     if subtask is None:
         raise HTTPException(status_code=404, detail=f"Subtask not found: {subtask_id}")
@@ -3804,30 +4068,59 @@ async def archive_workspace(request: Request, workspace_id: str):
 async def get_workspace_overview(request: Request, workspace_id: str):
     """Return the workspace overview read model used by the desktop shell."""
     engine = _get_engine(request)
-    workspace = await _require_workspace(engine, workspace_id)
-    tasks = await _workspace_tasks(engine, workspace)
-    sessions = await _workspace_sessions(engine, workspace)
-    summary = await _build_workspace_summary(engine, workspace, tasks=tasks, sessions=sessions)
-    recent_conversations = [
-        await _build_conversation_summary(engine, workspace_id, row)
-        for row in sessions[:10]
-    ]
-    recent_runs = [await _build_run_summary(engine, workspace_id, row) for row in tasks[:10]]
-    pending_approvals_count = len(
-        await _list_pending_approval_items(engine, workspace_id=workspace_id),
-    )
-    return WorkspaceOverviewResponse(
-        workspace=summary,
-        recent_conversations=recent_conversations,
-        recent_runs=recent_runs,
-        pending_approvals_count=pending_approvals_count,
-        counts={
-            "workspaces": 1,
-            "conversations": len(sessions),
-            "runs": len(tasks),
-            "active_runs": summary.active_run_count,
-        },
-    )
+    with timed_block(
+        logger,
+        event="api_workspace_overview",
+        fields=_latency_fields(workspace_id=workspace_id),
+    ):
+        workspace = await _require_workspace(engine, workspace_id)
+        tasks = await _workspace_tasks(engine, workspace)
+        sessions = await _workspace_sessions(engine, workspace)
+        (
+            latest_runs_by_task,
+            linked_conversations_by_run,
+            linked_runs_by_session,
+        ) = await _workspace_relationship_maps(
+            engine,
+            task_rows=tasks,
+            session_rows=sessions,
+        )
+        summary = await _build_workspace_summary(engine, workspace, tasks=tasks, sessions=sessions)
+        recent_conversations = [
+            await _build_conversation_summary(
+                engine,
+                workspace_id,
+                row,
+                linked_runs=linked_runs_by_session.get(str(row.get("id", "") or "").strip(), []),
+            )
+            for row in sessions[:10]
+        ]
+        recent_runs = [
+            await _build_run_summary(
+                engine,
+                workspace_id,
+                row,
+                latest_run=latest_runs_by_task.get(str(row.get("id", "") or "").strip()),
+                linked_conversations=linked_conversations_by_run.get(
+                    str(row.get("id", "") or "").strip(),
+                    [],
+                ),
+            )
+            for row in tasks[:10]
+        ]
+        pending_approvals_count = await _count_pending_approval_items(engine, workspace=workspace)
+        return WorkspaceOverviewResponse(
+            workspace=summary,
+            recent_conversations=recent_conversations,
+            recent_runs=recent_runs,
+            pending_approvals_count=pending_approvals_count,
+            counts={
+                "workspaces": 1,
+                "conversations": len(sessions),
+                "runs": len(tasks),
+                "active_runs": summary.active_run_count,
+            },
+        )
 
 
 @router.get(
@@ -3934,8 +4227,13 @@ async def preview_workspace_file(
 async def list_workspace_artifacts(request: Request, workspace_id: str):
     """Return a workspace-level artifact index aggregated from existing runs."""
     engine = _get_engine(request)
-    workspace = await _require_workspace(engine, workspace_id)
-    return await _build_workspace_artifacts(engine, workspace)
+    with timed_block(
+        logger,
+        event="api_workspace_artifacts",
+        fields=_latency_fields(workspace_id=workspace_id),
+    ):
+        workspace = await _require_workspace(engine, workspace_id)
+        return await _build_workspace_artifacts(engine, workspace)
 
 
 @router.get(
@@ -3979,9 +4277,14 @@ async def list_approvals(request: Request, workspace_id: str | None = None):
     """Return a unified pending approvals/questions inbox."""
     engine = _get_engine(request)
     workspace_filter = str(workspace_id or "").strip()
-    if workspace_filter:
-        await _require_workspace(engine, workspace_filter)
-    return await _list_pending_approval_items(engine, workspace_id=workspace_filter)
+    with timed_block(
+        logger,
+        event="api_approvals_list",
+        fields=_latency_fields(workspace_id=workspace_filter or None),
+    ):
+        if workspace_filter:
+            await _require_workspace(engine, workspace_filter)
+        return await _list_pending_approval_items(engine, workspace_id=workspace_filter)
 
 
 @router.post("/approvals/{approval_item_id}/reply")
@@ -4093,29 +4396,20 @@ async def stream_notifications(
             (cursor, *notification_event_types),
         )
 
-    async def wait_for_persisted_notification_rows(
-        *,
-        cursor: int,
-        target_event_id: str,
-    ) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for attempt in range(8):
-            rows = await query_notification_rows(cursor=cursor)
-            if not target_event_id:
-                if rows:
-                    return rows
-            elif any(str(row.get("event_id", "") or "") == target_event_id for row in rows):
-                return rows
-            await asyncio.sleep(0.02 * (attempt + 1))
-        return rows
-
     async def event_generator():
         last_event_id = str(request.headers.get("last-event-id", "") or "").strip()
-        header_cursor = int(last_event_id) if last_event_id.isdigit() else 0
-        cursor = max(0, int(after_id), header_cursor)
-        queue: asyncio.Queue[Event] = asyncio.Queue()
+        cursor = await _resolve_notification_stream_cursor(
+            engine,
+            after_id=after_id,
+            last_event_id=last_event_id,
+        )
+        history_resume_event_id = _notification_resume_event_id(last_event_id)
+        seen_event_ids: set[str] = set()
+        queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+        overflowed = False
 
         def handler(event: Event):
+            nonlocal overflowed
             if (
                 event.event_type in relevant_events
                 and should_deliver_operator(
@@ -4123,7 +4417,10 @@ async def stream_notifications(
                     engine.effective_telemetry_mode(),
                 )
             ):
-                queue.put_nowait(event)
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    overflowed = True
 
         engine.event_bus.subscribe_all(handler)
         try:
@@ -4142,14 +4439,80 @@ async def stream_notifications(
                     and str(payload.get("workspace_id", "") or "") != workspace_filter
                 ):
                     continue
+                payload_id = str(payload.get("id", "") or "").strip()
+                if payload_id:
+                    seen_event_ids.add(payload_id)
+                    history_resume_event_id = payload_id
                 yield {
                     "event": "notification",
                     "id": str(row_id),
                     "data": json.dumps(payload),
                 }
+            history_payloads = await _notification_history_payloads(
+                engine,
+                relevant_events=relevant_events,
+                workspace_filter=workspace_filter,
+                after_event_id=history_resume_event_id,
+                seen_event_ids=seen_event_ids,
+            )
+            for payload in history_payloads:
+                payload_id = str(payload.get("id", "") or "").strip()
+                if payload_id:
+                    history_resume_event_id = payload_id
+                response: dict[str, str] = {
+                    "event": "notification",
+                    "data": json.dumps(payload),
+                }
+                if payload_id:
+                    response["id"] = f"event:{payload_id}"
+                yield response
             if not follow:
                 return
             while True:
+                if overflowed:
+                    overflowed = False
+                    replay_rows = await query_notification_rows(cursor=cursor)
+                    for row in replay_rows:
+                        row_id = int(row.get("id", 0) or 0)
+                        if row_id <= cursor:
+                            continue
+                        cursor = row_id
+                        payload = await _notification_payload_from_row(engine, row)
+                        if payload is None:
+                            continue
+                        if (
+                            workspace_filter
+                            and str(payload.get("workspace_id", "") or "") != workspace_filter
+                        ):
+                            continue
+                        payload_id = str(payload.get("id", "") or "").strip()
+                        if payload_id:
+                            seen_event_ids.add(payload_id)
+                            history_resume_event_id = payload_id
+                        yield {
+                            "event": "notification",
+                            "id": str(row_id),
+                            "data": json.dumps(payload),
+                        }
+                    history_payloads = await _notification_history_payloads(
+                        engine,
+                        relevant_events=relevant_events,
+                        workspace_filter=workspace_filter,
+                        after_event_id=history_resume_event_id,
+                        seen_event_ids=seen_event_ids,
+                    )
+                    for payload in history_payloads:
+                        payload_id = str(payload.get("id", "") or "").strip()
+                        if payload_id:
+                            history_resume_event_id = payload_id
+                        response: dict[str, str] = {
+                            "event": "notification",
+                            "data": json.dumps(payload),
+                        }
+                        if payload_id:
+                            response["id"] = f"event:{payload_id}"
+                        yield response
+                    continue
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=30.0)
                 except TimeoutError:
@@ -4157,44 +4520,27 @@ async def stream_notifications(
                     continue
                 if await request.is_disconnected():
                     return
-                target_event_id = str(event.data.get("event_id", "") or "").strip()
-                rows = await wait_for_persisted_notification_rows(
-                    cursor=cursor,
-                    target_event_id=target_event_id,
-                )
-                delivered = False
-                for row in rows:
-                    row_id = int(row.get("id", 0) or 0)
-                    if row_id <= cursor:
-                        continue
-                    cursor = row_id
-                    payload = await _notification_payload_from_row(engine, row)
-                    if payload is None:
-                        continue
-                    if (
-                        workspace_filter
-                        and str(payload.get("workspace_id", "") or "") != workspace_filter
-                    ):
-                        continue
-                    delivered = True
-                    yield {
-                        "event": "notification",
-                        "id": str(row_id),
-                        "data": json.dumps(payload),
-                    }
-                if not delivered:
-                    payload = await _notification_payload_from_event(engine, event)
-                    if payload is None:
-                        continue
-                    if (
-                        workspace_filter
-                        and str(payload.get("workspace_id", "") or "") != workspace_filter
-                    ):
-                        continue
-                    yield {
-                        "event": "notification",
-                        "data": json.dumps(payload),
-                    }
+                payload = await _notification_payload_from_event(engine, event)
+                if payload is None:
+                    continue
+                if (
+                    workspace_filter
+                    and str(payload.get("workspace_id", "") or "") != workspace_filter
+                ):
+                    continue
+                event_id = str(payload.get("id", "") or "").strip()
+                if event_id and event_id in seen_event_ids:
+                    continue
+                if event_id:
+                    seen_event_ids.add(event_id)
+                    history_resume_event_id = event_id
+                response: dict[str, str] = {
+                    "event": "notification",
+                    "data": json.dumps(payload),
+                }
+                if event_id:
+                    response["id"] = f"event:{event_id}"
+                yield response
         except asyncio.CancelledError:
             return
         finally:
@@ -4212,7 +4558,20 @@ async def list_workspace_conversations(request: Request, workspace_id: str):
     engine = _get_engine(request)
     workspace = await _require_workspace(engine, workspace_id)
     sessions = await _workspace_sessions(engine, workspace)
-    return [await _build_conversation_summary(engine, workspace_id, row) for row in sessions]
+    linked_runs_by_session = await engine.conversation_store.list_linked_runs_for_sessions([
+        str(row.get("id", "") or "").strip()
+        for row in sessions
+        if str(row.get("id", "") or "").strip()
+    ])
+    return [
+        await _build_conversation_summary(
+            engine,
+            workspace_id,
+            row,
+            linked_runs=linked_runs_by_session.get(str(row.get("id", "") or "").strip(), []),
+        )
+        for row in sessions
+    ]
 
 
 @router.post(
@@ -4259,19 +4618,27 @@ async def delete_conversation(request: Request, conversation_id: str):
 async def get_conversation(request: Request, conversation_id: str):
     """Return one conversation/thread with session-state metadata."""
     engine = _get_engine(request)
-    session = await engine.conversation_store.get_session(conversation_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"Conversation not found: {conversation_id}")
-    workspace = await engine.workspace_registry.get_by_path(session.get("workspace_path"))
-    workspace_id = str((workspace or {}).get("id", "") or "")
-    summary = await _build_conversation_summary(engine, workspace_id, session)
-    session_state = _json_object(session.get("session_state"))
-    return {
-        **summary.model_dump(),
-        "system_prompt": str(session.get("system_prompt", "") or ""),
-        "session_state": session_state,
-        "workspace": workspace or {},
-    }
+    with timed_block(
+        logger,
+        event="api_conversation_detail",
+        fields=_latency_fields(conversation_id=conversation_id),
+    ):
+        session = await engine.conversation_store.get_session(conversation_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Conversation not found: {conversation_id}",
+            )
+        workspace = await engine.workspace_registry.get_by_path(session.get("workspace_path"))
+        workspace_id = str((workspace or {}).get("id", "") or "")
+        summary = await _build_conversation_summary(engine, workspace_id, session)
+        session_state = _json_object(session.get("session_state"))
+        return {
+            **summary.model_dump(),
+            "system_prompt": str(session.get("system_prompt", "") or ""),
+            "session_state": session_state,
+            "workspace": workspace or {},
+        }
 
 
 @router.patch("/conversations/{conversation_id}")
@@ -4316,32 +4683,45 @@ async def get_conversation_messages(
 ):
     """Return persisted conversation turns for a thread."""
     engine = _get_engine(request)
-    session = await engine.conversation_store.get_session(conversation_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"Conversation not found: {conversation_id}")
-    if before_turn is not None:
-        turns = await engine.conversation_store.get_turns_before(
-            conversation_id,
-            before_turn=max(1, int(before_turn)),
+    with timed_block(
+        logger,
+        event="api_conversation_messages",
+        fields=_latency_fields(
+            conversation_id=conversation_id,
+            latest=latest,
+            before_turn=before_turn,
             limit=limit,
-        )
-    elif latest:
-        turns = await engine.conversation_store.get_recent_turns(
-            conversation_id,
-            limit=limit,
-        )
-    else:
-        turns = await engine.conversation_store.get_turns(
-            conversation_id,
-            offset=offset,
-            limit=limit,
-        )
-    rows: list[dict[str, Any]] = []
-    for row in turns:
-        item = dict(row)
-        item["tool_calls"] = _json_list(item.get("tool_calls"))
-        rows.append(item)
-    return rows
+        ),
+    ):
+        session = await engine.conversation_store.get_session(conversation_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Conversation not found: {conversation_id}",
+            )
+        if before_turn is not None:
+            turns = await engine.conversation_store.get_turns_before(
+                conversation_id,
+                before_turn=max(1, int(before_turn)),
+                limit=limit,
+            )
+        elif latest:
+            turns = await engine.conversation_store.get_recent_turns(
+                conversation_id,
+                limit=limit,
+            )
+        else:
+            turns = await engine.conversation_store.get_turns(
+                conversation_id,
+                offset=offset,
+                limit=limit,
+            )
+        rows: list[dict[str, Any]] = []
+        for row in turns:
+            item = dict(row)
+            item["tool_calls"] = _json_list(item.get("tool_calls"))
+            rows.append(item)
+        return rows
 
 
 @router.get("/conversations/{conversation_id}/events")
@@ -4355,49 +4735,63 @@ async def get_conversation_events(
 ):
     """Return replay-journal events for a conversation thread."""
     engine = _get_engine(request)
-    session = await engine.conversation_store.get_session(conversation_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"Conversation not found: {conversation_id}")
-    if before_turn is not None and before_seq is None:
-        return await engine.conversation_store.synthesize_chat_events_from_turns(
-            conversation_id,
-            before_turn=max(1, int(before_turn)),
+    with timed_block(
+        logger,
+        event="api_conversation_events",
+        fields=_latency_fields(
+            conversation_id=conversation_id,
+            before_seq=before_seq,
+            before_turn=before_turn,
+            after_seq=after_seq,
             limit=limit,
-        )
-    rows = await engine.conversation_store.get_chat_events(
-        conversation_id,
-        before_seq=(
-            None if before_seq is None else max(0, int(before_seq))
         ),
-        after_seq=max(0, int(after_seq)),
-        limit=limit,
-    )
-    if rows:
-        if before_seq is not None or after_seq <= 0:
-            rows = await _expand_conversation_event_page_prefix(
-                engine,
+    ):
+        session = await engine.conversation_store.get_session(conversation_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Conversation not found: {conversation_id}",
+            )
+        if before_turn is not None and before_seq is None:
+            return await engine.conversation_store.synthesize_chat_events_from_turns(
                 conversation_id,
-                rows,
+                before_turn=max(1, int(before_turn)),
                 limit=limit,
             )
-        return rows
-    if after_seq > 0 and before_seq is None:
-        # Incremental polling/refresh should return only truly new rows.
-        # Falling back to synthesized turn events here duplicates content
-        # that the client may already have from durable chat-event rows.
-        return []
-    if before_seq is not None:
-        if before_turn is None:
-            before_turn = max(1, int((int(before_seq) + 99) / 100))
-        return await engine.conversation_store.synthesize_chat_events_from_turns(
+        rows = await engine.conversation_store.get_chat_events(
             conversation_id,
-            before_turn=max(1, int(before_turn)),
+            before_seq=(
+                None if before_seq is None else max(0, int(before_seq))
+            ),
+            after_seq=max(0, int(after_seq)),
             limit=limit,
         )
-    return await engine.conversation_store.synthesize_chat_events_from_turns(
-        conversation_id,
-        limit=limit,
-    )
+        if rows:
+            if before_seq is not None or after_seq <= 0:
+                rows = await _expand_conversation_event_page_prefix(
+                    engine,
+                    conversation_id,
+                    rows,
+                    limit=limit,
+                )
+            return rows
+        if after_seq > 0 and before_seq is None:
+            # Incremental polling/refresh should return only truly new rows.
+            # Falling back to synthesized turn events here duplicates content
+            # that the client may already have from durable chat-event rows.
+            return []
+        if before_seq is not None:
+            if before_turn is None:
+                before_turn = max(1, int((int(before_seq) + 99) / 100))
+            return await engine.conversation_store.synthesize_chat_events_from_turns(
+                conversation_id,
+                before_turn=max(1, int(before_turn)),
+                limit=limit,
+            )
+        return await engine.conversation_store.synthesize_chat_events_from_turns(
+            conversation_id,
+            limit=limit,
+        )
 
 
 @router.get("/conversations/{conversation_id}/status")
@@ -4407,26 +4801,34 @@ async def get_conversation_status(
 ):
     """Return processing state for a persisted conversation thread."""
     engine = _get_engine(request)
-    session = await engine.conversation_store.get_session(conversation_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"Conversation not found: {conversation_id}")
-    processing = engine.conversation_turn_inflight(conversation_id)
-    pending_approval = engine.get_pending_conversation_approval(conversation_id)
-    pending_prompt = (
-        None
-        if processing or pending_approval is not None
-        else await _conversation_pending_prompt(engine, conversation_id)
-    )
-    return {
-        "conversation_id": conversation_id,
-        "processing": processing,
-        "stop_requested": engine.conversation_stop_requested(conversation_id),
-        "pending_inject_count": engine.conversation_pending_inject_count(conversation_id),
-        "awaiting_approval": pending_approval is not None,
-        "pending_approval": pending_approval,
-        "awaiting_user_input": pending_prompt is not None,
-        "pending_prompt": pending_prompt,
-    }
+    with timed_block(
+        logger,
+        event="api_conversation_status",
+        fields=_latency_fields(conversation_id=conversation_id),
+    ):
+        session = await engine.conversation_store.get_session(conversation_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Conversation not found: {conversation_id}",
+            )
+        processing = engine.conversation_turn_inflight(conversation_id)
+        pending_approval = engine.get_pending_conversation_approval(conversation_id)
+        pending_prompt = (
+            None
+            if processing or pending_approval is not None
+            else await _conversation_pending_prompt(engine, conversation_id)
+        )
+        return {
+            "conversation_id": conversation_id,
+            "processing": processing,
+            "stop_requested": engine.conversation_stop_requested(conversation_id),
+            "pending_inject_count": engine.conversation_pending_inject_count(conversation_id),
+            "awaiting_approval": pending_approval is not None,
+            "pending_approval": pending_approval,
+            "awaiting_user_input": pending_prompt is not None,
+            "pending_prompt": pending_prompt,
+        }
 
 
 @router.post("/conversations/{conversation_id}/messages", status_code=202)
@@ -4588,14 +4990,19 @@ async def stream_conversation_events(
         last_event_id = str(request.headers.get("last-event-id", "") or "").strip()
         header_cursor = int(last_event_id) if last_event_id.isdigit() else 0
         cursor = max(0, int(after_seq), header_cursor)
-        queue: asyncio.Queue[Event] = asyncio.Queue()
+        queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+        overflowed = False
 
         def handler(event: Event):
+            nonlocal overflowed
             if (
                 event.event_type == CONVERSATION_MESSAGE
                 and event.task_id == conversation_id
             ):
-                queue.put_nowait(event)
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    overflowed = True
 
         engine.event_bus.subscribe_all(handler)
 
@@ -4626,6 +5033,24 @@ async def stream_conversation_events(
                 return
 
             while True:
+                if overflowed:
+                    overflowed = False
+                    rows = await engine.conversation_store.get_chat_events(
+                        conversation_id,
+                        after_seq=cursor,
+                        limit=500,
+                    )
+                    for row in rows:
+                        seq = int(row.get("seq", 0) or 0)
+                        if seq <= cursor:
+                            continue
+                        cursor = seq
+                        yield {
+                            "event": "chat_event",
+                            "id": str(seq),
+                            "data": json.dumps(row),
+                        }
+                    continue
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=30.0)
                     chat_event_type = str(event.data.get("chat_event_type", "") or "")
@@ -4661,56 +5086,87 @@ async def list_workspace_runs(request: Request, workspace_id: str):
     engine = _get_engine(request)
     workspace = await _require_workspace(engine, workspace_id)
     tasks = await _workspace_tasks(engine, workspace)
-    return [await _build_run_summary(engine, workspace_id, row) for row in tasks]
+    task_ids = [
+        str(row.get("id", "") or "").strip()
+        for row in tasks
+        if str(row.get("id", "") or "").strip()
+    ]
+    latest_runs_by_task, linked_conversations_by_run = await asyncio.gather(
+        engine.database.get_latest_task_runs_for_tasks(task_ids),
+        engine.conversation_store.list_linked_conversations_for_runs(task_ids),
+    )
+    return [
+        await _build_run_summary(
+            engine,
+            workspace_id,
+            row,
+            latest_run=latest_runs_by_task.get(str(row.get("id", "") or "").strip()),
+            linked_conversations=linked_conversations_by_run.get(
+                str(row.get("id", "") or "").strip(),
+                [],
+            ),
+        )
+        for row in tasks
+    ]
 
 
 @router.get("/runs/{run_id}")
 async def get_run(request: Request, run_id: str):
     """Return one run backed by the existing task/task_run stores."""
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(run_id)
-    if task_row is None:
-        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-    workspace = await engine.workspace_registry.get_by_path(task_row.get("workspace_path"))
-    workspace_id = str((workspace or {}).get("id", "") or "")
-    summary = await _build_run_summary(engine, workspace_id, task_row)
-    latest_run = await engine.database.get_latest_task_run_for_task(run_id)
-    event_rows = await engine.database.query_events(run_id, limit=250)
+    with timed_block(
+        logger,
+        event="api_run_detail",
+        fields=_latency_fields(run_id=run_id),
+    ):
+        task_row = await engine.database.get_task(run_id)
+        if task_row is None:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+        workspace = await engine.workspace_registry.get_by_path(task_row.get("workspace_path"))
+        workspace_id = str((workspace or {}).get("id", "") or "")
+        summary = await _build_run_summary(engine, workspace_id, task_row)
+        latest_run = await engine.database.get_latest_task_run_for_task(run_id)
+        event_rows = await engine.database.query_events(run_id, limit=250)
 
-    # Include plan/subtask data from state manager when available
-    plan_data: list[dict[str, Any]] = []
-    task_obj = await _load_task_state(engine, run_id)
-    if task_obj is not None and task_obj.plan and task_obj.plan.subtasks:
-        for s in task_obj.plan.subtasks:
-            plan_data.append({
-                "id": s.id,
-                "description": s.description,
-                "status": s.status.value,
-                "depends_on": s.depends_on,
-                "phase_id": s.phase_id,
-                "summary": s.summary or "",
-                "is_critical_path": s.is_critical_path,
-                "is_synthesis": s.is_synthesis,
-            })
+        # Include plan/subtask data from state manager when available
+        plan_data: list[dict[str, Any]] = []
+        task_obj = await _load_task_state(engine, run_id)
+        if task_obj is not None and task_obj.plan and task_obj.plan.subtasks:
+            for s in task_obj.plan.subtasks:
+                plan_data.append({
+                    "id": s.id,
+                    "description": s.description,
+                    "status": s.status.value,
+                    "depends_on": s.depends_on,
+                    "phase_id": s.phase_id,
+                    "summary": s.summary or "",
+                    "is_critical_path": s.is_critical_path,
+                    "is_synthesis": s.is_synthesis,
+                })
 
-    return {
-        **summary.model_dump(),
-        "task": task_row,
-        "task_run": latest_run or {},
-        "events_count": len(event_rows),
-        "workspace": workspace or {},
-        "plan_subtasks": plan_data,
-    }
+        return {
+            **summary.model_dump(),
+            "task": task_row,
+            "task_run": latest_run or {},
+            "events_count": len(event_rows),
+            "workspace": workspace or {},
+            "plan_subtasks": plan_data,
+        }
 
 
 @router.get("/runs/{run_id}/artifacts", response_model=list[RunArtifactResponse])
 async def get_run_artifacts(request: Request, run_id: str):
     """Return durable run artifacts merged from task seals and evidence ledgers."""
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(run_id)
-    if task_row is None:
-        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-    return await _build_run_artifacts(engine, task_row)
+    with timed_block(
+        logger,
+        event="api_run_artifacts",
+        fields=_latency_fields(run_id=run_id),
+    ):
+        task_row = await engine.database.get_task(run_id)
+        if task_row is None:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+        return await _build_run_artifacts(engine, task_row)
 
 
 _RUN_TERMINAL_EVENT_TYPES = {
@@ -4719,6 +5175,63 @@ _RUN_TERMINAL_EVENT_TYPES = {
     TASK_CANCELLED,
     TASK_CANCEL_REQUESTED,
 }
+
+
+async def _resolve_run_stream_cursor(
+    engine: Engine,
+    run_id: str,
+    *,
+    after_sequence: int = 0,
+    after_id: int = 0,
+    last_event_id: str = "",
+) -> int:
+    cursor = max(0, int(after_sequence))
+    candidates: list[int] = []
+    if int(after_id) > 0:
+        candidates.append(int(after_id))
+    header_cursor = str(last_event_id or "").strip()
+    if header_cursor.startswith("seq:"):
+        suffix = header_cursor.removeprefix("seq:").strip()
+        if suffix.isdigit():
+            candidates.append(int(suffix))
+    elif header_cursor.isdigit():
+        candidates.append(int(header_cursor))
+    for candidate in candidates:
+        row = await engine.database.query_one(
+            "SELECT sequence FROM events WHERE task_id = ? AND id = ?",
+            (run_id, candidate),
+        )
+        if row is not None:
+            cursor = max(cursor, int(row.get("sequence", 0) or 0))
+        else:
+            cursor = max(cursor, candidate)
+    return cursor
+
+
+def _recent_run_history_payloads(
+    engine: Engine,
+    run_id: str,
+    *,
+    after_sequence: int,
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    seen_sequences: set[int] = set()
+    for event in engine.event_bus.recent_events(limit=1000):
+        if event.task_id != run_id:
+            continue
+        if not should_deliver_operator(
+            event.event_type,
+            engine.effective_telemetry_mode(),
+        ):
+            continue
+        payload = _run_stream_payload_from_event(event)
+        sequence = int(payload.get("sequence", 0) or 0)
+        if sequence <= after_sequence or sequence in seen_sequences:
+            continue
+        seen_sequences.add(sequence)
+        payloads.append(payload)
+    payloads.sort(key=lambda item: int(item.get("sequence", 0) or 0))
+    return payloads
 
 
 def _serialize_run_timeline_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -4762,37 +5275,20 @@ def _run_stream_payload_from_event(event: Event) -> dict[str, Any]:
         "streaming": not terminal and status != "paused",
     }
 
-
-async def _wait_for_persisted_run_rows(
-    engine: Any,
-    run_id: str,
-    *,
-    after_id: int,
-    target_sequence: int,
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for attempt in range(8):
-        rows = await engine.database.query_events(
-            run_id,
-            limit=500,
-            after_id=after_id,
-            ascending=True,
-        )
-        if any(int(row.get("sequence", 0) or 0) >= target_sequence for row in rows):
-            return rows
-        await asyncio.sleep(0.02 * (attempt + 1))
-    return rows
-
-
 @router.get("/runs/{run_id}/timeline")
 async def get_run_timeline(request: Request, run_id: str, limit: int = 5000):
     """Return persisted event-timeline rows for a run/task."""
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(run_id)
-    if task_row is None:
-        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-    rows = await engine.database.query_events(run_id, limit=limit, ascending=True)
-    return [_serialize_run_timeline_row(row) for row in rows]
+    with timed_block(
+        logger,
+        event="api_run_timeline",
+        fields=_latency_fields(run_id=run_id, limit=limit),
+    ):
+        task_row = await engine.database.get_task(run_id)
+        if task_row is None:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+        rows = await engine.database.query_events(run_id, limit=limit, ascending=True)
+        return [_serialize_run_timeline_row(row) for row in rows]
 
 
 @router.get("/runs/{run_id}/stream")
@@ -4800,6 +5296,7 @@ async def stream_run_events(
     request: Request,
     run_id: str,
     after_id: int = 0,
+    after_sequence: int = 0,
     follow: bool = True,
 ):
     """Durable-first SSE stream of real-time run events."""
@@ -4811,27 +5308,61 @@ async def stream_run_events(
     db_status = str(task_row.get("status", "") or "").strip().lower()
     is_db_terminal = db_status in ("completed", "failed", "cancelled")
 
-    if not engine.state_manager.exists(run_id) and is_db_terminal:
+    if not await _task_state_exists(engine, run_id) and is_db_terminal:
         async def inactive_generator():
             last_event_id = str(request.headers.get("last-event-id", "") or "").strip()
-            header_cursor = int(last_event_id) if last_event_id.isdigit() else 0
-            cursor = max(0, int(after_id), header_cursor)
+            cursor = await _resolve_run_stream_cursor(
+                engine,
+                run_id,
+                after_sequence=after_sequence,
+                after_id=after_id,
+                last_event_id=last_event_id,
+            )
+            replay_started = time.monotonic()
             rows = await engine.database.query_events(
                 run_id,
                 limit=500,
-                after_id=cursor,
+                after_sequence=cursor,
                 ascending=True,
             )
             for row in rows:
-                row_id = int(row.get("id", 0) or 0)
-                if row_id <= cursor:
+                sequence = int(row.get("sequence", 0) or 0)
+                if sequence <= cursor:
                     continue
-                cursor = row_id
+                cursor = sequence
                 yield {
                     "event": "run_event",
-                    "id": str(row_id),
+                    "id": str(sequence),
                     "data": json.dumps(_run_stream_payload_from_row(row)),
                 }
+            for payload in _recent_run_history_payloads(
+                engine,
+                run_id,
+                after_sequence=cursor,
+            ):
+                sequence = int(payload.get("sequence", 0) or 0)
+                if sequence <= cursor:
+                    continue
+                cursor = sequence
+                yield {
+                    "event": "run_event",
+                    "id": str(sequence),
+                    "data": json.dumps(payload),
+                }
+                if payload["terminal"] is True:
+                    log_latency_event(
+                        logger,
+                        event="api_run_stream_open",
+                        duration_seconds=time.monotonic() - replay_started,
+                        fields=_latency_fields(run_id=run_id, phase="inactive_replay"),
+                    )
+                    return
+            log_latency_event(
+                logger,
+                event="api_run_stream_open",
+                duration_seconds=time.monotonic() - replay_started,
+                fields=_latency_fields(run_id=run_id, phase="inactive_replay"),
+            )
             if not follow:
                 return
             yield {
@@ -4850,11 +5381,18 @@ async def stream_run_events(
 
     async def event_generator():
         last_event_id = str(request.headers.get("last-event-id", "") or "").strip()
-        header_cursor = int(last_event_id) if last_event_id.isdigit() else 0
-        cursor = max(0, int(after_id), header_cursor)
-        queue: asyncio.Queue[Event] = asyncio.Queue()
+        cursor = await _resolve_run_stream_cursor(
+            engine,
+            run_id,
+            after_sequence=after_sequence,
+            after_id=after_id,
+            last_event_id=last_event_id,
+        )
+        queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+        overflowed = False
 
         def handler(event: Event):
+            nonlocal overflowed
             if (
                 event.task_id == run_id
                 and should_deliver_operator(
@@ -4862,76 +5400,128 @@ async def stream_run_events(
                     engine.effective_telemetry_mode(),
                 )
             ):
-                queue.put_nowait(event)
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    overflowed = True
 
         engine.event_bus.subscribe_all(handler)
 
         try:
             yield {"comment": "open"}
+            replay_started = time.monotonic()
             replay_rows = await engine.database.query_events(
                 run_id,
                 limit=500,
-                after_id=cursor,
+                after_sequence=cursor,
                 ascending=True,
             )
             for row in replay_rows:
-                row_id = int(row.get("id", 0) or 0)
-                if row_id <= cursor:
+                sequence = int(row.get("sequence", 0) or 0)
+                if sequence <= cursor:
                     continue
-                cursor = row_id
+                cursor = sequence
                 payload = _run_stream_payload_from_row(row)
                 yield {
                     "event": "run_event",
-                    "id": str(row_id),
+                    "id": str(sequence),
                     "data": json.dumps(payload),
                 }
                 if payload["terminal"] is True:
+                    log_latency_event(
+                        logger,
+                        event="api_run_stream_open",
+                        duration_seconds=time.monotonic() - replay_started,
+                        fields=_latency_fields(run_id=run_id, phase="active_replay"),
+                    )
                     return
+            for payload in _recent_run_history_payloads(
+                engine,
+                run_id,
+                after_sequence=cursor,
+            ):
+                sequence = int(payload.get("sequence", 0) or 0)
+                if sequence <= cursor:
+                    continue
+                cursor = sequence
+                yield {
+                    "event": "run_event",
+                    "id": str(sequence),
+                    "data": json.dumps(payload),
+                }
+                if payload["terminal"] is True:
+                    log_latency_event(
+                        logger,
+                        event="api_run_stream_open",
+                        duration_seconds=time.monotonic() - replay_started,
+                        fields=_latency_fields(run_id=run_id, phase="active_replay"),
+                    )
+                    return
+            log_latency_event(
+                logger,
+                event="api_run_stream_open",
+                duration_seconds=time.monotonic() - replay_started,
+                fields=_latency_fields(run_id=run_id, phase="active_replay"),
+            )
             if not follow:
                 return
 
             while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
-                    target_sequence = int(event.data.get("sequence", 0) or 0)
-                    rows = await _wait_for_persisted_run_rows(
-                        engine,
+                if overflowed:
+                    overflowed = False
+                    replay_rows = await engine.database.query_events(
                         run_id,
-                        after_id=cursor,
-                        target_sequence=target_sequence,
+                        limit=500,
+                        after_sequence=cursor,
+                        ascending=True,
                     )
-                    if not rows:
-                        rows = await engine.database.query_events(
-                            run_id,
-                            limit=500,
-                            after_id=cursor,
-                            ascending=True,
-                        )
-                    delivered = False
-                    for row in rows:
-                        row_id = int(row.get("id", 0) or 0)
-                        if row_id <= cursor:
+                    for row in replay_rows:
+                        sequence = int(row.get("sequence", 0) or 0)
+                        if sequence <= cursor:
                             continue
-                        cursor = row_id
-                        delivered = True
+                        cursor = sequence
                         payload = _run_stream_payload_from_row(row)
                         yield {
                             "event": "run_event",
-                            "id": str(row_id),
+                            "id": str(sequence),
                             "data": json.dumps(payload),
                         }
                         if payload["terminal"] is True:
                             return
-                    if not delivered:
-                        payload = _run_stream_payload_from_event(event)
+                    for payload in _recent_run_history_payloads(
+                        engine,
+                        run_id,
+                        after_sequence=cursor,
+                    ):
+                        sequence = int(payload.get("sequence", 0) or 0)
+                        if sequence <= cursor:
+                            continue
+                        cursor = sequence
                         yield {
                             "event": "run_event",
+                            "id": str(sequence),
                             "data": json.dumps(payload),
                         }
                         if payload["terminal"] is True:
                             return
+                    continue
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
                 except TimeoutError:
                     yield {"comment": "keepalive"}
+                    continue
+                payload = _run_stream_payload_from_event(event)
+                sequence = int(payload.get("sequence", 0) or 0)
+                if sequence <= cursor:
+                    continue
+                cursor = sequence
+                yield {
+                    "event": "run_event",
+                    "id": str(sequence),
+                    "data": json.dumps(payload),
+                }
+                if payload["terminal"] is True:
+                    return
         except asyncio.CancelledError:
             return
         finally:
@@ -4949,7 +5539,7 @@ async def cancel_run(request: Request, run_id: str):
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
 
     # Try the orchestrator cancel path first (requires state_manager).
-    if engine.state_manager.exists(run_id):
+    if await _task_state_exists(engine, run_id):
         try:
             return await cancel_task(request, run_id)
         except Exception:
@@ -4984,10 +5574,11 @@ async def delete_run(request: Request, run_id: str):
     status = str(task_row.get("status", "") or "").strip().lower()
     # Force-cancel if still active
     if status not in ("completed", "failed", "cancelled"):
-        if engine.state_manager.exists(run_id):
+        if await _task_state_exists(engine, run_id):
             try:
-                task = engine.state_manager.load(run_id)
-                engine.orchestrator.cancel_task(task)
+                task = await _load_task_state(engine, run_id)
+                if task is not None:
+                    engine.orchestrator.cancel_task(task)
             except Exception:
                 pass
         await engine.database.update_task_status(run_id, "cancelled")
@@ -5041,8 +5632,10 @@ async def restart_run(request: Request, run_id: str):
         except Exception:
             logger.warning("Failed to parse persisted plan for restart %s", run_id, exc_info=True)
 
-    if engine.state_manager.exists(run_id):
-        task = engine.state_manager.load(run_id)
+    if await _task_state_exists(engine, run_id):
+        task = await _load_task_state(engine, run_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     else:
         task = Task(
             id=run_id,
@@ -5082,7 +5675,7 @@ async def restart_run(request: Request, run_id: str):
     if task is None:
         raise HTTPException(status_code=409, detail=restart_error or "Failed to restart run.")
 
-    engine.state_manager.save(task)
+    await _save_task_state(engine, task)
 
     await engine.database.execute(
         """UPDATE tasks

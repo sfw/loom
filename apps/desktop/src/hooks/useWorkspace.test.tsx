@@ -180,9 +180,9 @@ describe("useWorkspace", () => {
 
     expect(apiMocks.fetchApprovals).toHaveBeenCalledTimes(1);
     expect(apiMocks.fetchWorkspaceOverview).toHaveBeenCalledTimes(1);
-    expect(apiMocks.fetchWorkspaceSettings).toHaveBeenCalledTimes(1);
-    expect(apiMocks.fetchWorkspaceInventory).toHaveBeenCalledTimes(1);
-    expect(apiMocks.fetchWorkspaceArtifacts).toHaveBeenCalledTimes(1);
+    expect(apiMocks.fetchWorkspaceSettings).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceInventory).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceArtifacts).not.toHaveBeenCalled();
   });
 
   it("preserves the loaded workspace surface during a disconnect and refreshes on reconnect", async () => {
@@ -249,10 +249,77 @@ describe("useWorkspace", () => {
     });
 
     expect(apiMocks.fetchWorkspaceOverview).toHaveBeenCalledWith("workspace-1");
-    expect(apiMocks.fetchWorkspaceSettings).toHaveBeenCalledWith("workspace-1");
     expect(apiMocks.fetchApprovals).toHaveBeenCalledWith("workspace-1");
-    expect(apiMocks.fetchWorkspaceInventory).toHaveBeenCalledWith("workspace-1");
     expect(apiMocks.fetchWorkspaceArtifacts).toHaveBeenCalledWith("workspace-1");
+    expect(apiMocks.fetchWorkspaceSettings).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceInventory).not.toHaveBeenCalled();
+  });
+
+  it("loads only the visible workspace surface and fetches inventory lazily for the runs tab", async () => {
+    const { rerender } = renderHook(
+      ({ activeTab }: { activeTab: "threads" | "runs" }) =>
+        useWorkspace({
+          selectedWorkspaceId: "workspace-1",
+          selectedConversationId: "",
+          selectedRunId: "",
+          setSelectedWorkspaceId: vi.fn(),
+          showArchivedWorkspaces: false,
+          setShowArchivedWorkspaces: vi.fn(),
+          createParentPath: "/tmp",
+          setCreateParentPath: vi.fn(),
+          workspaces: [{
+            id: "workspace-1",
+            canonical_path: "/tmp/workspace",
+            display_name: "Workspace 1",
+            metadata: {},
+            is_archived: false,
+            sort_order: 0,
+          }] as any,
+          setWorkspaces: vi.fn(),
+          runtime: null,
+          setError: vi.fn(),
+          setNotice: vi.fn(),
+          activeTab,
+          setActiveTab: vi.fn(),
+          setSelectedConversationId: vi.fn(),
+          setSelectedRunId: vi.fn(),
+        }),
+      {
+        initialProps: {
+          activeTab: "threads",
+        },
+      },
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchWorkspaceOverview).toHaveBeenCalledTimes(1);
+    expect(apiMocks.fetchApprovals).toHaveBeenCalledTimes(1);
+    expect(apiMocks.fetchWorkspaceArtifacts).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceInventory).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceSettings).not.toHaveBeenCalled();
+
+    apiMocks.fetchWorkspaceOverview.mockClear();
+    apiMocks.fetchApprovals.mockClear();
+    apiMocks.fetchWorkspaceArtifacts.mockClear();
+    apiMocks.fetchWorkspaceInventory.mockClear();
+    apiMocks.fetchWorkspaceSettings.mockClear();
+
+    rerender({ activeTab: "runs" });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchWorkspaceInventory).toHaveBeenCalledWith("workspace-1");
+    expect(apiMocks.fetchWorkspaceOverview).not.toHaveBeenCalled();
+    expect(apiMocks.fetchApprovals).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceArtifacts).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceSettings).not.toHaveBeenCalled();
   });
 
   it("clears stale thread and run selection immediately when switching workspaces", async () => {

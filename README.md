@@ -143,6 +143,10 @@ uv run loomd \
 The Tauri desktop shell now starts `loomd` itself. It gives the sidecar a
 desktop-scoped SQLite DB, scratch dir, and log file under the app data
 directory, and picks an available loopback port starting at `127.0.0.1:9000`.
+The sidecar keeps SQLite as the default local store and is tuned for that
+single-process access pattern: WAL mode, explicit busy timeout/synchronous
+policy, a governed read/write connection model, and batched compliance-event
+flushes instead of one connection+commit per event.
 
 ## Configuration
 
@@ -267,8 +271,9 @@ LOOM_LATENCY_DIAGNOSTICS=1 uv run loom
 ```
 
 This emits low-overhead timing lines for key paths (event-loop lag probes,
-MCP discovery/refresh, process index refresh, setup discovery, and API task
-preflight timing).
+MCP discovery/refresh, process index refresh, setup discovery, API task
+preflight timing, and the main desktop hot-path endpoints such as workspace
+overview, approvals, conversation detail/history/status, and run detail/timeline/stream.
 
 Run local startup/discovery latency smoke checks:
 
@@ -279,6 +284,17 @@ uv run python scripts/latency_smoke.py --iterations 5 --workspace /path/to/works
 
 The script reports mean/p50/p95 timings for process catalog scan and tool
 registry creation with sync vs background MCP startup modes.
+
+Run a synthetic active-run API smoke benchmark for the main desktop surfaces:
+
+```bash
+uv run python scripts/active_run_latency_smoke.py
+uv run python scripts/active_run_latency_smoke.py --iterations 5 --event-count 500
+```
+
+This creates an ephemeral local runtime fixture, emits a burst of synthetic run
+events, and reports mean/p50/p95 latency plus DB/event-queue snapshots for the
+desktop-facing API hot paths.
 
 ### Database Upgrades
 

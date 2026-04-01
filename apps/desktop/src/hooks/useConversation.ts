@@ -257,6 +257,23 @@ export function shouldContinuouslySyncConversation(options: {
   );
 }
 
+export function isConversationStreamHealthy(
+  lastActivityAt: number,
+  options: {
+    now?: number;
+    healthWindowMs?: number;
+  } = {},
+): boolean {
+  const {
+    now = Date.now(),
+    healthWindowMs = CONVERSATION_STREAM_HEALTH_WINDOW_MS,
+  } = options;
+  if (lastActivityAt <= 0) {
+    return false;
+  }
+  return (now - lastActivityAt) < healthWindowMs;
+}
+
 const INITIAL_TURN_PROGRESS_EVENT_TYPES = new Set([
   "assistant_text",
   "assistant_thinking",
@@ -273,6 +290,9 @@ export function isInitialTurnProgressEvent(eventType: string): boolean {
 export function defaultConversationTitle(title: string | null | undefined): boolean {
   return /^Conversation [a-f0-9]{6,}$/.test(String(title || ""));
 }
+
+const CONVERSATION_STREAM_HEALTH_WINDOW_MS = 6000;
+const CONVERSATION_SYNC_INTERVAL_MS = 5000;
 
 export interface PendingConversationTitle {
   conversationId: string;
@@ -1555,19 +1575,22 @@ export function useConversation(deps: {
       return;
     }
 
-    void syncConversationLiveState(selectedConversationId).catch((err) => {
-      if (!isTransientRequestError(err)) {
-        setError(err instanceof Error ? err.message : "Failed to refresh conversation.");
+    const maybeSync = () => {
+      if (isConversationStreamHealthy(conversationStreamActivityAtRef.current)) {
+        return;
       }
-    });
-
-    const timer = window.setInterval(() => {
       void syncConversationLiveState(selectedConversationId).catch((err) => {
         if (!isTransientRequestError(err)) {
           setError(err instanceof Error ? err.message : "Failed to refresh conversation.");
         }
       });
-    }, 1250);
+    };
+
+    maybeSync();
+
+    const timer = window.setInterval(() => {
+      maybeSync();
+    }, CONVERSATION_SYNC_INTERVAL_MS);
     return () => {
       window.clearInterval(timer);
     };
