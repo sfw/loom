@@ -49,6 +49,15 @@ class TestDatabase:
         assert "tasks" in table_names
         assert "memory_entries" in table_names
 
+    async def test_close_open_instances_closes_leaked_databases(self, tmp_path: Path):
+        leaked = Database(tmp_path / "leaked.db")
+        await leaked.initialize()
+        assert leaked in Database._open_instances
+
+        await Database.close_open_instances()
+
+        assert leaked not in Database._open_instances
+
     async def test_initialize_migrates_legacy_events_before_sequence_indexes(
         self,
         tmp_path: Path,

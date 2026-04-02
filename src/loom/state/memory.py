@@ -11,9 +11,11 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 import aiosqlite
 
@@ -102,6 +104,8 @@ class Database:
     All access is non-blocking via aiosqlite.
     """
 
+    _open_instances: ClassVar[set[Database]] = set()
+
     def __init__(self, db_path: str | Path):
         self._db_path = str(db_path)
         self._write_db: aiosqlite.Connection | None = None
@@ -117,6 +121,7 @@ class Database:
             "batch_write_count": 0,
             "batch_row_count": 0,
         }
+        self._open_instances.add(self)
 
     async def close(self) -> None:
         """Close database connections."""
@@ -131,6 +136,27 @@ class Database:
             await write_db.close()
         for db in read_dbs:
             await db.close()
+        self._open_instances.discard(self)
+
+    @classmethod
+    async def close_open_instances(cls) -> None:
+        """Close every still-open Database instance.
+
+        Tests use this as a safety net to avoid leaking aiosqlite worker
+        threads across event-loop teardown when a test forgets to close its DB.
+        """
+        errors: list[BaseException] = []
+        for instance in list(cls._iter_open_instances()):
+            try:
+                await instance.close()
+            except BaseException as exc:  # pragma: no cover - best effort cleanup
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    @classmethod
+    def _iter_open_instances(cls) -> Iterable[Database]:
+        return tuple(cls._open_instances)
 
     async def initialize(self) -> None:
         """Initialize database schema and apply ordered migrations."""
@@ -387,6 +413,22 @@ class Database:
     async def query_one(self, sql: str, params: tuple = ()) -> dict | None:
         """Execute a read query and return the first result."""
         db = await self._get_read_db()
+        started = time.perf_counter()
+        cursor = await db.execute(sql, params)
+        row = await cursor.fetchone()
+        self._stats["read_query_count"] = int(self._stats["read_query_count"]) + 1
+        self._stats["read_query_total_ms"] = float(self._stats["read_query_total_ms"]) + (
+            (time.perf_counter() - started) * 1000.0
+        )
+        return dict(row) if row is not None else None
+
+    async def query_one_write(self, sql: str, params: tuple = ()) -> dict | None:
+        """Execute a read query on the write connection.
+
+        Use this sparingly for read-after-write paths that must observe the
+        latest committed row without depending on the pooled readers.
+        """
+        db = await self._get_write_db()
         started = time.perf_counter()
         cursor = await db.execute(sql, params)
         row = await cursor.fetchone()

@@ -920,7 +920,7 @@ class ConversationStore:
                WHERE session_id = ?""",
             (session_id, event_type, payload_json, now, session_id),
         )
-        row = await self._db.query_one(
+        row = await self._db.query_one_write(
             "SELECT seq FROM cowork_chat_events WHERE id = ?",
             (row_id,),
         )

@@ -3866,6 +3866,125 @@ class TestWorkspaceFirstEndpoints:
         assert query_call_count == 1
 
     @pytest.mark.asyncio
+    async def test_run_timeline_include_noise_false_filters_noise_events(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-timeline-noise-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-run-timeline-noise-1",
+            goal="Run timeline noise task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+        await database.insert_event(
+            task_id="task-run-timeline-noise-1",
+            correlation_id="corr-1",
+            run_id="exec-run-noise-1",
+            event_type=TASK_EXECUTING,
+            data={"status": "executing"},
+            sequence=1,
+        )
+        await database.insert_event(
+            task_id="task-run-timeline-noise-1",
+            correlation_id="corr-1",
+            run_id="exec-run-noise-1",
+            event_type=TASK_RUN_HEARTBEAT,
+            data={"status": "executing"},
+            sequence=2,
+        )
+        await database.insert_event(
+            task_id="task-run-timeline-noise-1",
+            correlation_id="corr-1",
+            run_id="exec-run-noise-1",
+            event_type="token_streamed",
+            data={"token": "hello"},
+            sequence=3,
+        )
+
+        response = await client.get(
+            "/runs/task-run-timeline-noise-1/timeline?include_noise=false&limit=10",
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert [row["event_type"] for row in payload] == [TASK_EXECUTING]
+
+    @pytest.mark.asyncio
+    async def test_run_stream_include_noise_false_filters_noise_events(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-stream-noise-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-run-stream-noise-1",
+            goal="Run stream noise task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+        await database.insert_event(
+            task_id="task-run-stream-noise-1",
+            correlation_id="corr-1",
+            run_id="exec-run-noise-1",
+            event_type=TASK_EXECUTING,
+            data={"status": "executing"},
+            sequence=1,
+        )
+        await database.insert_event(
+            task_id="task-run-stream-noise-1",
+            correlation_id="corr-1",
+            run_id="exec-run-noise-1",
+            event_type=TASK_RUN_HEARTBEAT,
+            data={"status": "executing"},
+            sequence=2,
+        )
+        await database.insert_event(
+            task_id="task-run-stream-noise-1",
+            correlation_id="corr-1",
+            run_id="exec-run-noise-1",
+            event_type="token_streamed",
+            data={"token": "hello"},
+            sequence=3,
+        )
+        await database.insert_event(
+            task_id="task-run-stream-noise-1",
+            correlation_id="corr-1",
+            run_id="exec-run-noise-1",
+            event_type=TASK_COMPLETED,
+            data={"status": "completed"},
+            sequence=4,
+        )
+
+        async with client.stream(
+            "GET",
+            "/runs/task-run-stream-noise-1/stream?include_noise=false&follow=false",
+        ) as response:
+            payloads: list[dict[str, object]] = []
+            async for line in response.aiter_lines():
+                if not line.strip() or line.startswith(":"):
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                payloads.append(json.loads(line.removeprefix("data: ")))
+
+        assert [payload["event_type"] for payload in payloads] == [
+            TASK_EXECUTING,
+            TASK_COMPLETED,
+        ]
+
+    @pytest.mark.asyncio
     async def test_run_stream_overflow_recovers_from_recent_history_without_dropping_events(
         self,
         tmp_path,

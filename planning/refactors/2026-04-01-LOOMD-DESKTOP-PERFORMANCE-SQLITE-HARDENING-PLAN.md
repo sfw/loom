@@ -32,7 +32,11 @@ Completed in this refactor pass:
    - run detail/timeline
    - run stream initial replay/open
 13. Added `scripts/active_run_latency_smoke.py` as a synthetic active-run benchmark harness for the main desktop API hot paths.
-14. No schema changes were required in this refactor pass.
+14. Desktop run surfaces now explicitly shed timeline noise:
+   - the desktop requests `include_noise=false` for run timeline loads and run SSE subscriptions
+   - `/runs/{run_id}/timeline` and `/runs/{run_id}/stream` can suppress hidden noise rows/events such as `token_streamed`, `model_invocation`, and `task_run_heartbeat`
+   - `useRuns` batches live run-stream updates per animation frame and only stores timeline rows that can actually render in the UI
+15. No schema changes were required in this refactor pass.
 
 Durability/performance tradeoff called out explicitly:
 1. `synchronous=NORMAL` in WAL mode trades a small amount of worst-case crash durability for materially lower local write latency.

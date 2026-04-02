@@ -34,12 +34,28 @@ vi.mock("../api", () => ({
 }));
 
 vi.mock("../history", () => ({
-  isRunTimelineNoise: () => false,
+  isRunTimelineNoise: (event: { event_type?: string }) => (
+    [
+      "task_run_heartbeat",
+      "token_streamed",
+      "tool_call_completed",
+      "model_invocation",
+      "compaction_policy_decision",
+    ].includes(String(event?.event_type || ""))
+  ),
   matchesWorkspaceSearch: () => true,
   runTimelineDetail: () => "",
   runTimelinePills: () => [],
   runTimelineTitle: () => "",
 }));
+
+async function flushRunStreamFrame() {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      window.requestAnimationFrame(() => resolve());
+    });
+  });
+}
 
 describe("useRuns", () => {
   beforeEach(() => {
@@ -140,7 +156,7 @@ describe("useRuns", () => {
     });
 
     expect(apiMocks.fetchRunDetail).toHaveBeenCalledWith("task-123");
-    expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("task-123");
+    expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("task-123", { includeNoise: false });
     expect(apiMocks.fetchRunArtifacts).toHaveBeenCalledWith("task-123");
     expect(refreshWorkspaceSurface).toHaveBeenCalledWith("workspace-1");
   });
@@ -257,7 +273,7 @@ describe("useRuns", () => {
     });
 
     expect(apiMocks.fetchRunDetail).toHaveBeenCalledWith("run-1");
-    expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("run-1");
+    expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("run-1", { includeNoise: false });
     expect(apiMocks.fetchRunArtifacts).toHaveBeenCalledWith("run-1");
   });
 
@@ -359,7 +375,7 @@ describe("useRuns", () => {
     });
 
     expect(apiMocks.fetchRunDetail).toHaveBeenCalledWith("run-1");
-    expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("run-1");
+    expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("run-1", { includeNoise: false });
     expect(apiMocks.fetchRunArtifacts).toHaveBeenCalledWith("run-1");
     vi.useRealTimers();
   });
@@ -423,7 +439,7 @@ describe("useRuns", () => {
       "run-1",
       expect.any(Function),
       expect.any(Function),
-      { afterSequence: 3 },
+      { afterSequence: 3, includeNoise: false },
     );
 
     act(() => {
@@ -444,10 +460,77 @@ describe("useRuns", () => {
       });
     });
 
+    await flushRunStreamFrame();
+
     expect(result.current.runTimeline).toHaveLength(2);
     expect(result.current.runTimeline[1]?.id).toBe(4);
     expect(result.current.runDetail?.status).toBe("paused");
     expect(result.current.runStreaming).toBe(false);
+  });
+
+  it("drops noisy timeline rows returned by the backend snapshot", async () => {
+    apiMocks.fetchRunDetail.mockResolvedValue({
+      id: "run-1",
+      goal: "Review the site",
+      status: "executing",
+      process_name: "seo-geo-review",
+      plan_subtasks: [],
+    });
+    apiMocks.fetchRunTimeline.mockResolvedValue([
+      {
+        id: 1,
+        task_id: "run-1",
+        run_id: "exec-run-1",
+        correlation_id: "corr-1",
+        event_id: "evt-1",
+        sequence: 1,
+        timestamp: "2026-03-27T00:00:01Z",
+        event_type: "task_run_heartbeat",
+        source_component: "tests",
+        schema_version: 1,
+        data: { status: "executing" },
+      },
+      {
+        id: 2,
+        task_id: "run-1",
+        run_id: "exec-run-1",
+        correlation_id: "corr-1",
+        event_id: "evt-2",
+        sequence: 2,
+        timestamp: "2026-03-27T00:00:02Z",
+        event_type: "task_executing",
+        source_component: "tests",
+        schema_version: 1,
+        data: { status: "executing", message: "executing" },
+      },
+    ]);
+    apiMocks.fetchRunArtifacts.mockResolvedValue([]);
+
+    const { result } = renderHook(() =>
+      useRuns({
+        selectedRunId: "run-1",
+        setSelectedRunId: vi.fn(),
+        selectedWorkspaceId: "workspace-1",
+        overview: {
+          workspace: {
+            canonical_path: "/tmp/workspace",
+          },
+          recent_runs: [],
+        } as any,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        setActiveTab: vi.fn(),
+        refreshWorkspaceSurface: vi.fn(async () => {}),
+      }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(result.current.runTimeline).toHaveLength(1);
+    expect(result.current.runTimeline[0]?.event_type).toBe("task_executing");
   });
 
   it("backs off stale-refresh polling while the run stream is healthy", async () => {
@@ -609,10 +692,10 @@ describe("useRuns", () => {
         event_id: "evt-4",
         sequence: 4,
         timestamp: "2026-03-27T00:00:04Z",
-        event_type: "tool_call_completed",
+        event_type: "tool_call_started",
         source_component: "tests",
         schema_version: 1,
-        data: { tool_name: "read_file" },
+        data: { tool_name: "read_file", path: "README.md" },
       },
     ]);
     apiMocks.fetchRunArtifacts.mockResolvedValue([]);
@@ -654,18 +737,20 @@ describe("useRuns", () => {
         event_id: "evt-4",
         sequence: 4,
         timestamp: "2026-03-27T00:00:04Z",
-        event_type: "tool_call_completed",
+        event_type: "tool_call_started",
         source_component: "tests",
         schema_version: 1,
-        data: { tool_name: "read_file" },
+        data: { tool_name: "read_file", path: "README.md" },
         status: "executing",
         streaming: true,
       });
     });
 
+    await flushRunStreamFrame();
+
     expect(result.current.runTimeline).toHaveLength(2);
     expect(result.current.runTimeline[1]?.event_id).toBe("evt-4");
-    expect(result.current.runTimeline[1]?.event_type).toBe("tool_call_completed");
+    expect(result.current.runTimeline[1]?.event_type).toBe("tool_call_started");
 
     await act(async () => {
       await result.current.refreshRun("run-1");
@@ -693,10 +778,10 @@ describe("useRuns", () => {
         event_id: "evt-238",
         sequence: 238,
         timestamp: "2026-03-27T00:03:58Z",
-        event_type: "tool_call_completed",
+        event_type: "tool_call_started",
         source_component: "tests",
         schema_version: 1,
-        data: {},
+        data: { tool_name: "read_file", path: "README.md" },
       },
     ]);
     apiMocks.fetchRunTimeline.mockResolvedValueOnce([
@@ -708,10 +793,10 @@ describe("useRuns", () => {
         event_id: "evt-238",
         sequence: 238,
         timestamp: "2026-03-27T00:03:58Z",
-        event_type: "tool_call_completed",
+        event_type: "tool_call_started",
         source_component: "tests",
         schema_version: 1,
-        data: {},
+        data: { tool_name: "read_file", path: "README.md" },
       },
     ]);
     apiMocks.fetchRunArtifacts.mockResolvedValue([]);
@@ -754,10 +839,10 @@ describe("useRuns", () => {
         event_id: "evt-239",
         sequence: 239,
         timestamp: "2026-03-27T00:03:59Z",
-        event_type: "tool_call_completed",
+        event_type: "tool_call_started",
         source_component: "tests",
         schema_version: 1,
-        data: {},
+        data: { tool_name: "read_file", path: "README.md" },
       });
       streamEvent?.({
         id: 240,
@@ -773,6 +858,8 @@ describe("useRuns", () => {
         data: {},
       });
     });
+
+    await flushRunStreamFrame();
 
     expect(result.current.runTimeline.map((row) => row.id)).toEqual([238, 239, 240]);
 
@@ -862,9 +949,10 @@ describe("useRuns", () => {
     vi.useRealTimers();
   });
 
-  it("refreshes the run and workspace surface once when a terminal stream event arrives", async () => {
+  it("refreshes the run and pushes terminal status into shared workspace state", async () => {
     vi.useFakeTimers();
     let streamEvent: ((event: any) => void) | undefined;
+    const syncRunDetail = vi.fn();
     apiMocks.fetchRunDetail.mockResolvedValue({
       id: "run-1",
       goal: "Review the site",
@@ -898,6 +986,7 @@ describe("useRuns", () => {
         setNotice: vi.fn(),
         setActiveTab: vi.fn(),
         refreshWorkspaceSurface,
+        syncRunDetail,
       }),
     );
 
@@ -935,9 +1024,13 @@ describe("useRuns", () => {
     });
 
     expect(apiMocks.fetchRunDetail).toHaveBeenCalledWith("run-1");
-    expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("run-1");
+    expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("run-1", { includeNoise: false });
     expect(apiMocks.fetchRunArtifacts).toHaveBeenCalledWith("run-1");
-    expect(refreshWorkspaceSurface).toHaveBeenCalledWith("workspace-1");
+    expect(syncRunDetail).toHaveBeenCalledWith(expect.objectContaining({
+      id: "run-1",
+      status: "completed",
+    }));
+    expect(refreshWorkspaceSurface).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 

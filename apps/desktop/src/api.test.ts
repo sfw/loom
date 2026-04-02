@@ -51,12 +51,13 @@ describe("conversation stream api", () => {
       "run-1",
       vi.fn(),
       vi.fn(),
-      { afterSequence: 17 },
+      { afterSequence: 17, includeNoise: false },
     );
 
     expect(EventSourceMock).toHaveBeenCalledTimes(1);
     const firstCall = (EventSourceMock.mock.calls as unknown as Array<Array<unknown>>)[0];
     expect(String(firstCall?.[0] || "")).toContain("after_sequence=17");
+    expect(String(firstCall?.[0] || "")).toContain("include_noise=false");
 
     cleanup();
     expect(close).toHaveBeenCalledTimes(1);
@@ -196,10 +197,10 @@ describe("request timeouts", () => {
     }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await fetchRunTimeline("run-1");
+    await fetchRunTimeline("run-1", { includeNoise: false });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining("/runs/run-1/timeline?limit=1000"),
+      expect.stringContaining("/runs/run-1/timeline?limit=1000&include_noise=false"),
       expect.objectContaining({
         signal: expect.any(AbortSignal),
       }),

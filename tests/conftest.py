@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from loom.config import Config, ExecutionConfig, MemoryConfig, ServerConfig
+from loom.state.memory import Database
 
 
 @pytest.fixture
@@ -25,3 +26,12 @@ def config(tmp_path: Path) -> Config:
         memory=MemoryConfig(database_path=str(db_path)),
         execution=ExecutionConfig(max_subtask_retries=2, max_loop_iterations=10),
     )
+
+
+@pytest.fixture(autouse=True)
+async def close_open_databases_after_test():
+    """Ensure leaked Database instances do not survive test teardown."""
+    try:
+        yield
+    finally:
+        await Database.close_open_instances()

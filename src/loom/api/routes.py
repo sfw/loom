@@ -5176,6 +5176,59 @@ _RUN_TERMINAL_EVENT_TYPES = {
     TASK_CANCEL_REQUESTED,
 }
 
+_RUN_TIMELINE_NOISE_EVENT_TYPES = {
+    "telemetry_diagnostic",
+    "telemetry_run_summary",
+    "telemetry_mode_changed",
+    "telemetry_settings_warning",
+    "webhook_delivery_attempted",
+    "webhook_delivery_succeeded",
+    "webhook_delivery_failed",
+    "webhook_delivery_dropped",
+    "db_migration_start",
+    "db_migration_applied",
+    "db_migration_verify_failed",
+    "db_migration_failed",
+    "db_schema_ready",
+    "task_run_heartbeat",
+    "compaction_policy_decision",
+    "overflow_fallback_applied",
+    "token_streamed",
+    "tool_call_completed",
+    "model_invocation",
+}
+
+
+def _should_include_run_timeline_event(
+    event_type: str,
+    data: dict[str, Any] | None = None,
+    *,
+    include_noise: bool,
+) -> bool:
+    if include_noise:
+        return True
+    normalized = str(event_type or "").strip().lower()
+    if normalized in _RUN_TIMELINE_NOISE_EVENT_TYPES:
+        return False
+    if normalized == "claim_verification_summary":
+        payload = data if isinstance(data, dict) else {}
+        extracted = int(payload.get("extracted", 0) or 0)
+        supported = int(payload.get("supported", 0) or 0)
+        partially_supported = int(payload.get("partially_supported", 0) or 0)
+        contradicted = int(payload.get("contradicted", 0) or 0)
+        insufficient = int(payload.get("insufficient_evidence", 0) or 0)
+        pruned = int(payload.get("pruned", 0) or 0)
+        if (
+            extracted <= 0
+            and supported <= 0
+            and partially_supported <= 0
+            and contradicted <= 0
+            and insufficient <= 0
+            and pruned <= 0
+        ):
+            return False
+    return True
+
 
 async def _resolve_run_stream_cursor(
     engine: Engine,
@@ -5213,6 +5266,7 @@ def _recent_run_history_payloads(
     run_id: str,
     *,
     after_sequence: int,
+    include_noise: bool = True,
 ) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     seen_sequences: set[int] = set()
@@ -5225,6 +5279,12 @@ def _recent_run_history_payloads(
         ):
             continue
         payload = _run_stream_payload_from_event(event)
+        if not _should_include_run_timeline_event(
+            str(payload.get("event_type", "") or ""),
+            payload.get("data") if isinstance(payload.get("data"), dict) else None,
+            include_noise=include_noise,
+        ):
+            continue
         sequence = int(payload.get("sequence", 0) or 0)
         if sequence <= after_sequence or sequence in seen_sequences:
             continue
@@ -5276,7 +5336,12 @@ def _run_stream_payload_from_event(event: Event) -> dict[str, Any]:
     }
 
 @router.get("/runs/{run_id}/timeline")
-async def get_run_timeline(request: Request, run_id: str, limit: int = 5000):
+async def get_run_timeline(
+    request: Request,
+    run_id: str,
+    limit: int = 5000,
+    include_noise: bool = True,
+):
     """Return persisted event-timeline rows for a run/task."""
     engine = _get_engine(request)
     with timed_block(
@@ -5288,7 +5353,17 @@ async def get_run_timeline(request: Request, run_id: str, limit: int = 5000):
         if task_row is None:
             raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
         rows = await engine.database.query_events(run_id, limit=limit, ascending=True)
-        return [_serialize_run_timeline_row(row) for row in rows]
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            serialized = _serialize_run_timeline_row(row)
+            if not _should_include_run_timeline_event(
+                str(serialized.get("event_type", "") or ""),
+                serialized.get("data") if isinstance(serialized.get("data"), dict) else None,
+                include_noise=include_noise,
+            ):
+                continue
+            payload.append(serialized)
+        return payload
 
 
 @router.get("/runs/{run_id}/stream")
@@ -5297,6 +5372,7 @@ async def stream_run_events(
     run_id: str,
     after_id: int = 0,
     after_sequence: int = 0,
+    include_noise: bool = True,
     follow: bool = True,
 ):
     """Durable-first SSE stream of real-time run events."""
@@ -5330,15 +5406,23 @@ async def stream_run_events(
                 if sequence <= cursor:
                     continue
                 cursor = sequence
+                payload = _run_stream_payload_from_row(row)
+                if not _should_include_run_timeline_event(
+                    str(payload.get("event_type", "") or ""),
+                    payload.get("data") if isinstance(payload.get("data"), dict) else None,
+                    include_noise=include_noise,
+                ):
+                    continue
                 yield {
                     "event": "run_event",
                     "id": str(sequence),
-                    "data": json.dumps(_run_stream_payload_from_row(row)),
+                    "data": json.dumps(payload),
                 }
             for payload in _recent_run_history_payloads(
                 engine,
                 run_id,
                 after_sequence=cursor,
+                include_noise=include_noise,
             ):
                 sequence = int(payload.get("sequence", 0) or 0)
                 if sequence <= cursor:
@@ -5399,6 +5483,11 @@ async def stream_run_events(
                     event.event_type,
                     engine.effective_telemetry_mode(),
                 )
+                and _should_include_run_timeline_event(
+                    event.event_type,
+                    event.data if isinstance(event.data, dict) else None,
+                    include_noise=include_noise,
+                )
             ):
                 try:
                     queue.put_nowait(event)
@@ -5422,6 +5511,12 @@ async def stream_run_events(
                     continue
                 cursor = sequence
                 payload = _run_stream_payload_from_row(row)
+                if not _should_include_run_timeline_event(
+                    str(payload.get("event_type", "") or ""),
+                    payload.get("data") if isinstance(payload.get("data"), dict) else None,
+                    include_noise=include_noise,
+                ):
+                    continue
                 yield {
                     "event": "run_event",
                     "id": str(sequence),
@@ -5439,6 +5534,7 @@ async def stream_run_events(
                 engine,
                 run_id,
                 after_sequence=cursor,
+                include_noise=include_noise,
             ):
                 sequence = int(payload.get("sequence", 0) or 0)
                 if sequence <= cursor:
@@ -5481,6 +5577,12 @@ async def stream_run_events(
                             continue
                         cursor = sequence
                         payload = _run_stream_payload_from_row(row)
+                        if not _should_include_run_timeline_event(
+                            str(payload.get("event_type", "") or ""),
+                            payload.get("data") if isinstance(payload.get("data"), dict) else None,
+                            include_noise=include_noise,
+                        ):
+                            continue
                         yield {
                             "event": "run_event",
                             "id": str(sequence),
@@ -5492,6 +5594,7 @@ async def stream_run_events(
                         engine,
                         run_id,
                         after_sequence=cursor,
+                        include_noise=include_noise,
                     ):
                         sequence = int(payload.get("sequence", 0) or 0)
                         if sequence <= cursor:
@@ -5515,6 +5618,12 @@ async def stream_run_events(
                 if sequence <= cursor:
                     continue
                 cursor = sequence
+                if not _should_include_run_timeline_event(
+                    str(payload.get("event_type", "") or ""),
+                    payload.get("data") if isinstance(payload.get("data"), dict) else None,
+                    include_noise=include_noise,
+                ):
+                    continue
                 yield {
                     "event": "run_event",
                     "id": str(sequence),

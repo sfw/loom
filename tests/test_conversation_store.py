@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -311,6 +312,46 @@ class TestConversationStore:
         assert events[0]["payload"]["text"] == "hello"
         assert events[1]["event_type"] == "assistant_text"
         assert events[1]["seq"] == 2
+
+    async def test_append_chat_event_with_concurrent_readers(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        stop = asyncio.Event()
+
+        async def reader() -> None:
+            while not stop.is_set():
+                await store.get_session(sid)
+                await store.get_chat_events(sid, limit=64)
+                await store.get_last_chat_seq(sid)
+                await asyncio.sleep(0)
+
+        readers = [asyncio.create_task(reader()) for _ in range(8)]
+        await asyncio.sleep(0)
+        try:
+            await store.append_chat_event(
+                sid,
+                "user_message",
+                {"text": "hello"},
+            )
+            for index in range(1, 33):
+                seq = await store.append_chat_event(
+                    sid,
+                    "assistant_thinking",
+                    {"text": f"chunk {index}", "streaming": True},
+                )
+                assert seq == index + 1
+            final_seq = await store.append_chat_event(
+                sid,
+                "assistant_text",
+                {"text": "done"},
+            )
+        finally:
+            stop.set()
+            await asyncio.gather(*readers)
+
+        assert final_seq == 34
+        events = await store.get_chat_events(sid, limit=40)
+        assert [row["seq"] for row in events] == list(range(1, 35))
+        assert events[-1]["event_type"] == "assistant_text"
 
     async def test_get_chat_events_before_seq(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")

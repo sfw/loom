@@ -23,6 +23,7 @@ import {
   type RunArtifact,
   type RunConversationEntry,
   type RunDetail,
+  type RunStreamEvent,
   type RunTimelineEvent,
   type WorkspaceOverview,
 } from "../api";
@@ -112,6 +113,9 @@ function mergeRunTimelineEvents(
     byIdentity.set(runTimelineEventIdentity(item), item);
   }
   for (const item of incoming) {
+    if (isRunTimelineNoise(item)) {
+      continue;
+    }
     const identity = runTimelineEventIdentity(item);
     const previous = byIdentity.get(identity);
     if (previous && isPersistedRunTimelineEvent(previous) && !isPersistedRunTimelineEvent(item)) {
@@ -127,6 +131,13 @@ function mergeRunTimelineEvents(
     } : item);
   }
   return Array.from(byIdentity.values()).sort(compareRunTimelineEvents);
+}
+
+function maxRunTimelineSequence(events: Array<Pick<RunTimelineEvent, "sequence">>): number {
+  return events.reduce(
+    (maxSequence, row) => Math.max(maxSequence, Number(row.sequence || 0)),
+    0,
+  );
 }
 
 function canonicalizeRunDetail(detail: RunDetail): RunDetail {
@@ -278,6 +289,7 @@ export function useRuns(deps: {
   setNotice: React.Dispatch<React.SetStateAction<string>>;
   setActiveTab: React.Dispatch<React.SetStateAction<ViewTab>>;
   refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
+  syncRunDetail?: (detail: RunDetail) => void;
 }): RunsState & RunsActions {
   const {
     selectedRunId,
@@ -289,6 +301,7 @@ export function useRuns(deps: {
     setNotice,
     setActiveTab,
     refreshWorkspaceSurface,
+    syncRunDetail,
   } = deps;
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
   const [runTimeline, setRunTimeline] = useState<RunTimelineEvent[]>([]);
@@ -310,11 +323,15 @@ export function useRuns(deps: {
   // Refs
   const runComposerRef = useRef<HTMLElement | null>(null);
   const runRefreshTimerRef = useRef<number | null>(null);
+  const runStreamFrameRef = useRef<number | null>(null);
   const runMatchRefs = useRef<Array<HTMLDivElement | null>>([]);
   const lastSeenRunSequenceRef = useRef(0);
   const lastRunStreamActivityAtRef = useRef(0);
   const nextSyntheticRunEventIdRef = useRef(-1);
   const runDetailRef = useRef<RunDetail | null>(null);
+  const runTimelineRef = useRef<RunTimelineEvent[]>([]);
+  const runStreamingRef = useRef(false);
+  const pendingRunStreamEventsRef = useRef<RunStreamEvent[]>([]);
   const pendingWorkspaceRefreshRef = useRef<{
     runId: string;
     workspaceId: string;
@@ -357,9 +374,7 @@ export function useRuns(deps: {
         artifact.facets,
       ),
     );
-  // Filter out noise events that add no value, then apply search
-  const meaningfulRunTimeline = runTimeline.filter((event) => !isRunTimelineNoise(event));
-  const filteredRunTimeline = meaningfulRunTimeline.filter((event) =>
+  const filteredRunTimeline = runTimeline.filter((event) =>
     matchesWorkspaceSearch(
       runHistoryQuery,
       event.event_type,
@@ -372,7 +387,7 @@ export function useRuns(deps: {
   const visibleRunArtifacts = filteredRunArtifacts;
   const visibleRunTimeline = runHistoryQuery.trim()
     ? filteredRunTimeline
-    : meaningfulRunTimeline;
+    : runTimeline;
   const totalRunMatches = filteredRunArtifacts.length + filteredRunTimeline.length;
 
   async function loadRunSnapshot(runId: string): Promise<[RunDetail, RunTimelineEvent[], RunArtifact[]]> {
@@ -381,7 +396,7 @@ export function useRuns(deps: {
       try {
         return await Promise.all([
           fetchRunDetail(runId),
-          fetchRunTimeline(runId),
+          fetchRunTimeline(runId, { includeNoise: false }),
           fetchRunArtifacts(runId),
         ]);
       } catch (error) {
@@ -410,16 +425,18 @@ export function useRuns(deps: {
 
   const refreshRun = useEffectEvent(async (runId: string) => {
     const [detail, timeline, artifacts] = await loadRunSnapshot(runId);
+    const nextDetail = canonicalizeRunDetail(detail);
+    const nextTimeline = mergeRunTimelineEvents(runTimelineRef.current, timeline);
     setRunLoadError("");
-    setRunDetail(canonicalizeRunDetail(detail));
-    setRunTimeline((current) => mergeRunTimelineEvents(current, timeline));
+    runDetailRef.current = nextDetail;
+    setRunDetail(nextDetail);
+    pushRunDetailToWorkspaceState(nextDetail);
+    runTimelineRef.current = nextTimeline;
+    setRunTimeline(nextTimeline);
     setRunArtifacts(artifacts);
     lastSeenRunSequenceRef.current = Math.max(
       lastSeenRunSequenceRef.current,
-      timeline.reduce(
-        (maxSequence, row) => Math.max(maxSequence, Number(row.sequence || 0)),
-        0,
-      ),
+      maxRunTimelineSequence(timeline),
     );
     maybeRefreshWorkspaceSurfaceAfterRunLoad(runId);
   });
@@ -433,19 +450,20 @@ export function useRuns(deps: {
     }
   });
 
-  const scheduleRunRefresh = useEffectEvent((options?: { includeWorkspaceSurface?: boolean }) => {
+  const pushRunDetailToWorkspaceState = useEffectEvent((detail: RunDetail | null) => {
+    if (!detail) {
+      return;
+    }
+    syncRunDetail?.(detail);
+  });
+
+  const scheduleRunRefresh = useEffectEvent(() => {
     if (runRefreshTimerRef.current !== null || !selectedRunId) {
       return;
     }
     runRefreshTimerRef.current = window.setTimeout(() => {
       runRefreshTimerRef.current = null;
-      const includeWorkspaceSurface = Boolean(options?.includeWorkspaceSurface);
-      void Promise.all([
-        refreshRun(selectedRunId),
-        includeWorkspaceSurface && selectedWorkspaceId
-          ? refreshWorkspaceSurface(selectedWorkspaceId)
-          : Promise.resolve(),
-      ]).catch((err) => {
+      void refreshRun(selectedRunId).catch((err) => {
         if (!isTransientRequestError(err)) {
           setError(err instanceof Error ? err.message : "Failed to refresh run.");
         }
@@ -463,16 +481,32 @@ export function useRuns(deps: {
   }, [runDetail]);
 
   useEffect(() => {
+    runTimelineRef.current = runTimeline;
+  }, [runTimeline]);
+
+  useEffect(() => {
+    runStreamingRef.current = runStreaming;
+  }, [runStreaming]);
+
+  useEffect(() => {
     return () => {
       if (runRefreshTimerRef.current !== null) {
         window.clearTimeout(runRefreshTimerRef.current);
       }
+      if (runStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(runStreamFrameRef.current);
+        runStreamFrameRef.current = null;
+      }
+      pendingRunStreamEventsRef.current = [];
     };
   }, []);
 
   // Load run detail
   useEffect(() => {
     if (!selectedRunId) {
+      runDetailRef.current = null;
+      runTimelineRef.current = [];
+      runStreamingRef.current = false;
       setRunDetail(null);
       setRunTimeline([]);
       setRunArtifacts([]);
@@ -484,12 +518,20 @@ export function useRuns(deps: {
       lastSeenRunSequenceRef.current = 0;
       lastRunStreamActivityAtRef.current = 0;
       nextSyntheticRunEventIdRef.current = -1;
+      pendingRunStreamEventsRef.current = [];
+      if (runStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(runStreamFrameRef.current);
+        runStreamFrameRef.current = null;
+      }
       pendingWorkspaceRefreshRef.current = null;
       return;
     }
     const hasMatchingRunDetail = runDetailRef.current?.id === selectedRunId;
     if (connectionState !== "connected") {
       if (!hasMatchingRunDetail) {
+        runDetailRef.current = null;
+        runTimelineRef.current = [];
+        runStreamingRef.current = false;
         setRunDetail(null);
         setRunTimeline([]);
         setRunArtifacts([]);
@@ -500,6 +542,11 @@ export function useRuns(deps: {
         lastSeenRunSequenceRef.current = 0;
         lastRunStreamActivityAtRef.current = 0;
         nextSyntheticRunEventIdRef.current = -1;
+        pendingRunStreamEventsRef.current = [];
+        if (runStreamFrameRef.current !== null) {
+          window.cancelAnimationFrame(runStreamFrameRef.current);
+          runStreamFrameRef.current = null;
+        }
       }
       setLoadingRunDetail(!hasMatchingRunDetail);
       return;
@@ -508,6 +555,9 @@ export function useRuns(deps: {
     setLoadingRunDetail(true);
     setRunLoadError("");
     if (!hasMatchingRunDetail) {
+      runDetailRef.current = null;
+      runTimelineRef.current = [];
+      runStreamingRef.current = false;
       setRunDetail(null);
       setRunTimeline([]);
       setRunArtifacts([]);
@@ -517,6 +567,11 @@ export function useRuns(deps: {
       lastSeenRunSequenceRef.current = 0;
       lastRunStreamActivityAtRef.current = 0;
       nextSyntheticRunEventIdRef.current = -1;
+      pendingRunStreamEventsRef.current = [];
+      if (runStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(runStreamFrameRef.current);
+        runStreamFrameRef.current = null;
+      }
     }
 
     void (async () => {
@@ -527,14 +582,16 @@ export function useRuns(deps: {
         ]);
         const [detail, timeline, artifacts] = snapshot;
         if (!cancelled) {
-          setRunDetail(canonicalizeRunDetail(detail));
-          setRunTimeline(timeline);
+          const nextDetail = canonicalizeRunDetail(detail);
+          const nextTimeline = mergeRunTimelineEvents([], timeline);
+          runDetailRef.current = nextDetail;
+          runTimelineRef.current = nextTimeline;
+          setRunDetail(nextDetail);
+          pushRunDetailToWorkspaceState(nextDetail);
+          setRunTimeline(nextTimeline);
           setRunArtifacts(artifacts);
           setRunInstructionHistory(instructionHistory);
-          lastSeenRunSequenceRef.current = timeline.reduce(
-            (maxSequence, row) => Math.max(maxSequence, Number(row.sequence || 0)),
-            0,
-          );
+          lastSeenRunSequenceRef.current = maxRunTimelineSequence(timeline);
           maybeRefreshWorkspaceSurfaceAfterRunLoad(selectedRunId);
         }
       } catch (err) {
@@ -543,6 +600,9 @@ export function useRuns(deps: {
           setRunLoadError(message);
           setError(message);
           if (!hasMatchingRunDetail) {
+            runDetailRef.current = null;
+            runTimelineRef.current = [];
+            runStreamingRef.current = false;
             setRunDetail(null);
             setRunTimeline([]);
             setRunArtifacts([]);
@@ -561,6 +621,105 @@ export function useRuns(deps: {
     };
   }, [connectionState, selectedRunId]);
 
+  const flushRunStreamBatch = useEffectEvent(() => {
+    if (runStreamFrameRef.current !== null) {
+      window.cancelAnimationFrame(runStreamFrameRef.current);
+      runStreamFrameRef.current = null;
+    }
+
+    const batch = pendingRunStreamEventsRef.current;
+    if (batch.length === 0) {
+      return;
+    }
+    pendingRunStreamEventsRef.current = [];
+
+    let nextTimeline = runTimelineRef.current;
+    let nextDetail = runDetailRef.current;
+    let nextStreaming = runStreamingRef.current;
+    const timelineUpdates: RunTimelineEvent[] = [];
+    let shouldRefreshRun = false;
+
+    for (const event of batch) {
+      lastRunStreamActivityAtRef.current = Date.now();
+      const sequence = Number(event.sequence || 0);
+      if (sequence > 0) {
+        lastSeenRunSequenceRef.current = Math.max(lastSeenRunSequenceRef.current, sequence);
+      }
+
+      const timelineEvent = streamEventToTimelineEvent(
+        event,
+        typeof event.id === "number" && event.id > 0
+          ? undefined
+          : nextSyntheticRunEventIdRef.current--,
+      );
+      if (timelineEvent) {
+        timelineUpdates.push(timelineEvent);
+      }
+
+      const eventType = String(event.event_type || "").trim().toLowerCase();
+      const nextStatus = normalizeRunStatus(String(event.status || ""));
+      const derivedStatus = deriveRunStatusFromStreamEvent(eventType, nextStatus);
+      if (derivedStatus && nextDetail) {
+        nextDetail = {
+          ...nextDetail,
+          status: derivedStatus,
+        };
+      }
+
+      const shouldStopStreaming =
+        event.terminal
+        || event.streaming === false
+        || eventType === "task_paused"
+        || nextStatus === "paused";
+      const shouldStartStreaming =
+        eventType === "task_resumed"
+        || eventType === "task_executing"
+        || eventType === "task_planning"
+        || nextStatus === "executing"
+        || nextStatus === "planning"
+        || nextStatus === "running";
+      if (shouldStopStreaming) {
+        nextStreaming = false;
+      } else if (shouldStartStreaming) {
+        nextStreaming = true;
+      }
+
+      if (event.terminal) {
+        shouldRefreshRun = true;
+      }
+    }
+
+    if (timelineUpdates.length > 0) {
+      nextTimeline = mergeRunTimelineEvents(nextTimeline, timelineUpdates);
+      if (nextTimeline !== runTimelineRef.current) {
+        runTimelineRef.current = nextTimeline;
+        setRunTimeline(nextTimeline);
+      }
+    }
+    if (nextDetail !== runDetailRef.current) {
+      runDetailRef.current = nextDetail;
+      setRunDetail(nextDetail);
+      pushRunDetailToWorkspaceState(nextDetail);
+    }
+    if (nextStreaming !== runStreamingRef.current) {
+      runStreamingRef.current = nextStreaming;
+      setRunStreaming(nextStreaming);
+    }
+    if (shouldRefreshRun) {
+      scheduleRunRefresh();
+    }
+  });
+
+  const queueRunStreamEvent = useEffectEvent((event: RunStreamEvent) => {
+    pendingRunStreamEventsRef.current.push(event);
+    if (runStreamFrameRef.current !== null) {
+      return;
+    }
+    runStreamFrameRef.current = window.requestAnimationFrame(() => {
+      flushRunStreamBatch();
+    });
+  });
+
   // Run stream subscription
   useEffect(() => {
     if (connectionState !== "connected") {
@@ -577,70 +736,37 @@ export function useRuns(deps: {
     const cleanup = subscribeRunStream(
       selectedRunId,
       (event) => {
-        lastRunStreamActivityAtRef.current = Date.now();
-        const timelineEvent = streamEventToTimelineEvent(
-          event,
-          typeof event.id === "number" && event.id > 0
-            ? undefined
-            : nextSyntheticRunEventIdRef.current--,
-        );
-        if (timelineEvent) {
-          if (Number(timelineEvent.sequence || 0) > 0) {
-            lastSeenRunSequenceRef.current = Math.max(
-              lastSeenRunSequenceRef.current,
-              Number(timelineEvent.sequence || 0),
-            );
-          }
-          setRunTimeline((current) => mergeRunTimelineEvents(current, [timelineEvent]));
-        }
-        const eventType = String(event.event_type || "").trim().toLowerCase();
-        const nextStatus = normalizeRunStatus(String(event.status || ""));
-        const derivedStatus = deriveRunStatusFromStreamEvent(eventType, nextStatus);
-        if (derivedStatus) {
-          setRunDetail((current) =>
-            current
-              ? {
-                  ...current,
-                  status: derivedStatus,
-                }
-              : current,
-          );
-        }
-        const shouldStopStreaming =
-          event.terminal
-          || event.streaming === false
-          || eventType === "task_paused"
-          || nextStatus === "paused";
-        const shouldStartStreaming =
-          eventType === "task_resumed"
-          || eventType === "task_executing"
-          || eventType === "task_planning"
-          || nextStatus === "executing"
-          || nextStatus === "planning"
-          || nextStatus === "running";
-        if (shouldStopStreaming) {
-          setRunStreaming(false);
-        } else if (shouldStartStreaming) {
-          setRunStreaming(true);
-        }
-        if (event.terminal) {
-          scheduleRunRefresh({ includeWorkspaceSurface: true });
-        }
+        queueRunStreamEvent(event);
       },
       () => {
         lastRunStreamActivityAtRef.current = 0;
+        runStreamingRef.current = false;
         setRunStreaming(false);
         scheduleRunRefresh();
       },
       {
         afterSequence: lastSeenRunSequenceRef.current,
+        includeNoise: false,
       },
     );
     return () => {
+      if (runStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(runStreamFrameRef.current);
+        runStreamFrameRef.current = null;
+      }
+      pendingRunStreamEventsRef.current = [];
+      runStreamingRef.current = false;
       setRunStreaming(false);
       cleanup();
     };
-  }, [connectionState, loadingRunDetail, scheduleRunRefresh, selectedRunId]);
+  }, [
+    connectionState,
+    flushRunStreamBatch,
+    loadingRunDetail,
+    queueRunStreamEvent,
+    scheduleRunRefresh,
+    selectedRunId,
+  ]);
 
   useEffect(() => {
     setRunStreaming(runIsActivelyExecuting);
@@ -745,19 +871,25 @@ export function useRuns(deps: {
             : await cancelRun(selectedRunId);
       // Optimistically update local state so UI reflects the action immediately
       if (action === "cancel" && runDetail) {
-        setRunDetail(canonicalizeRunDetail({ ...runDetail, status: "cancelled" }));
+        const nextDetail = canonicalizeRunDetail({ ...runDetail, status: "cancelled" });
+        runDetailRef.current = nextDetail;
+        setRunDetail(nextDetail);
+        pushRunDetailToWorkspaceState(nextDetail);
         setRunStreaming(false);
       } else if (action === "pause" && runDetail) {
-        setRunDetail(canonicalizeRunDetail({ ...runDetail, status: "paused" }));
+        const nextDetail = canonicalizeRunDetail({ ...runDetail, status: "paused" });
+        runDetailRef.current = nextDetail;
+        setRunDetail(nextDetail);
+        pushRunDetailToWorkspaceState(nextDetail);
         setRunStreaming(false);
       } else if (action === "resume" && runDetail) {
-        setRunDetail(canonicalizeRunDetail({ ...runDetail, status: "executing" }));
+        const nextDetail = canonicalizeRunDetail({ ...runDetail, status: "executing" });
+        runDetailRef.current = nextDetail;
+        setRunDetail(nextDetail);
+        pushRunDetailToWorkspaceState(nextDetail);
         setRunStreaming(true);
       }
-      await Promise.all([
-        refreshRun(selectedRunId),
-        selectedWorkspaceId ? refreshWorkspaceSurface(selectedWorkspaceId) : Promise.resolve(),
-      ]);
+      await refreshRun(selectedRunId);
       setNotice(response.message || `Run ${action} requested.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to ${action} run.`);

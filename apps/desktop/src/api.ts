@@ -890,10 +890,16 @@ export function fetchRunDetail(runId: string): Promise<RunDetail> {
   );
 }
 
-export function fetchRunTimeline(runId: string): Promise<RunTimelineEvent[]> {
+export function fetchRunTimeline(
+  runId: string,
+  options?: { limit?: number; includeNoise?: boolean },
+): Promise<RunTimelineEvent[]> {
   const params = new URLSearchParams({
-    limit: String(RUN_TIMELINE_REQUEST_LIMIT),
+    limit: String(options?.limit ?? RUN_TIMELINE_REQUEST_LIMIT),
   });
+  if (options?.includeNoise === false) {
+    params.set("include_noise", "false");
+  }
   return requestJson<RunTimelineEvent[]>(
     `/runs/${encodeURIComponent(runId)}/timeline?${params.toString()}`,
     { timeoutMs: HEAVY_REQUEST_TIMEOUT_MS },
@@ -1012,11 +1018,14 @@ export function subscribeRunStream(
   runId: string,
   onEvent: (event: RunStreamEvent) => void,
   onError?: () => void,
-  options?: { afterSequence?: number },
+  options?: { afterSequence?: number; includeNoise?: boolean },
 ): () => void {
   const params = new URLSearchParams();
   if (options?.afterSequence != null && options.afterSequence > 0) {
     params.set("after_sequence", String(options.afterSequence));
+  }
+  if (options?.includeNoise === false) {
+    params.set("include_noise", "false");
   }
   const qs = params.toString();
   const source = new EventSource(
