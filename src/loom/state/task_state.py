@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -156,16 +157,17 @@ class TaskStateManager:
     def __init__(self, data_dir: Path):
         self._data_dir = data_dir
 
-    def _task_dir(self, task_id: str) -> Path:
+    def _task_dir(self, task_id: str, *, create: bool = False) -> Path:
         d = self._data_dir / "tasks" / task_id
-        d.mkdir(parents=True, exist_ok=True)
+        if create:
+            d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def _state_path(self, task_id: str) -> Path:
-        return self._task_dir(task_id) / "state.yaml"
+    def _state_path(self, task_id: str, *, create: bool = False) -> Path:
+        return self._task_dir(task_id, create=create) / "state.yaml"
 
-    def _evidence_path(self, task_id: str) -> Path:
-        return self._task_dir(task_id) / "evidence-ledger.json"
+    def _evidence_path(self, task_id: str, *, create: bool = False) -> Path:
+        return self._task_dir(task_id, create=create) / "evidence-ledger.json"
 
     def create(self, task: Task) -> None:
         """Create initial state file for a new task."""
@@ -178,7 +180,7 @@ class TaskStateManager:
     def save(self, task: Task) -> None:
         """Atomic write: write to temp file, then rename."""
         task.updated_at = datetime.now().isoformat()
-        state_path = self._state_path(task.id)
+        state_path = self._state_path(task.id, create=True)
         yaml_content = self.to_yaml(task)
 
         # Atomic write
@@ -203,6 +205,12 @@ class TaskStateManager:
     def exists(self, task_id: str) -> bool:
         return self._state_path(task_id).exists()
 
+    def delete(self, task_id: str) -> None:
+        task_dir = self._data_dir / "tasks" / task_id
+        if not task_dir.exists():
+            return
+        shutil.rmtree(task_dir)
+
     def load_evidence_records(self, task_id: str) -> list[dict]:
         """Load persisted evidence records for a task.
 
@@ -221,7 +229,7 @@ class TaskStateManager:
 
     def save_evidence_records(self, task_id: str, records: list[dict]) -> None:
         """Persist evidence records atomically."""
-        evidence_path = self._evidence_path(task_id)
+        evidence_path = self._evidence_path(task_id, create=True)
         safe_records = [item for item in records if isinstance(item, dict)]
         content = json.dumps(
             safe_records,

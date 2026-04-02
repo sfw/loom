@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -182,6 +183,7 @@ class Orchestrator:
         question_manager: QuestionManager | None = None,
         learning_manager: LearningManager | None = None,
         process: ProcessDefinition | None = None,
+        snapshot_mirror_writer: Callable[[Task], Awaitable[None]] | None = None,
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -192,6 +194,7 @@ class Orchestrator:
         self._config = config
         self._learning = learning_manager
         self._process = process
+        self._snapshot_mirror_writer = snapshot_mirror_writer
         self._scheduler = Scheduler()
         self._validator = ResponseValidator()
         self._verification = VerificationGates(
@@ -2426,6 +2429,22 @@ class Orchestrator:
 
     async def _save_task_state(self, task: Task) -> None:
         await run_blocking_io(self._state.save, task)
+        if self._snapshot_mirror_writer is None:
+            return
+        try:
+            await self._snapshot_mirror_writer(task)
+        except Exception:
+            logger.debug(
+                "Failed syncing mirrored task snapshot for %s",
+                task.id,
+                exc_info=True,
+            )
+
+    def set_snapshot_mirror_writer(
+        self,
+        writer: Callable[[Task], Awaitable[None]] | None,
+    ) -> None:
+        self._snapshot_mirror_writer = writer
 
     async def _load_task_state(self, task_id: str) -> Task | None:
         try:

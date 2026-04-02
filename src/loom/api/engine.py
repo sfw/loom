@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from collections.abc import Coroutine
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -160,6 +160,13 @@ class Engine:
         self.webhook_delivery = webhook_delivery
         self.learning_manager = learning_manager
         self.runtime_role = str(runtime_role or "api").strip() or "api"
+        set_snapshot_mirror_writer = getattr(
+            self.orchestrator,
+            "set_snapshot_mirror_writer",
+            None,
+        )
+        if callable(set_snapshot_mirror_writer):
+            set_snapshot_mirror_writer(self._sync_task_row_snapshot)
         self.started_at = datetime.now(UTC).isoformat()
         self._background_tasks: set[asyncio.Task] = set()
         self._conversation_workers: dict[str, ConversationWorker] = {}
@@ -794,6 +801,7 @@ class Engine:
             question_manager=self.question_manager,
             learning_manager=self.learning_manager,
             process=process,
+            snapshot_mirror_writer=self._sync_task_row_snapshot,
         )
 
     async def _task_state_exists(self, task_id: str) -> bool:
@@ -808,6 +816,68 @@ class Engine:
 
     async def _save_task_state(self, task: Task) -> None:
         await run_blocking_io(self.state_manager.save, task)
+        await self._sync_task_row_snapshot(task)
+
+    async def _sync_task_row_snapshot(self, task: Task) -> None:
+        raw_status = getattr(task, "status", TaskStatus.FAILED)
+        status_value = (
+            raw_status.value
+            if hasattr(raw_status, "value")
+            else str(raw_status or TaskStatus.FAILED.value)
+        )
+        created_at = str(task.created_at or datetime.now(UTC).isoformat()).strip()
+        updated_at = str(task.updated_at or created_at).strip() or created_at
+        completed_at = str(task.completed_at or "").strip()
+        if not completed_at and status_value in _TASK_TERMINAL_STATUSES:
+            completed_at = updated_at
+        context_json = json.dumps(task.context, ensure_ascii=False) if task.context else None
+        plan_json = (
+            json.dumps(asdict(task.plan), ensure_ascii=False)
+            if task.plan and (
+                task.plan.subtasks
+                or int(getattr(task.plan, "version", 1) or 1) != 1
+                or str(getattr(task.plan, "last_replanned", "") or "").strip()
+            )
+            else None
+        )
+        metadata = task.metadata if isinstance(task.metadata, dict) else None
+        metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+        try:
+            await self.database.execute(
+                """INSERT INTO tasks (
+                       id, goal, context, workspace_path, status, plan,
+                       created_at, updated_at, completed_at,
+                       approval_mode, callback_url, metadata
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       goal=excluded.goal,
+                       context=excluded.context,
+                       workspace_path=excluded.workspace_path,
+                       status=excluded.status,
+                       plan=excluded.plan,
+                       created_at=excluded.created_at,
+                       updated_at=excluded.updated_at,
+                       completed_at=excluded.completed_at,
+                       approval_mode=excluded.approval_mode,
+                       callback_url=excluded.callback_url,
+                       metadata=excluded.metadata""",
+                (
+                    task.id,
+                    task.goal,
+                    context_json,
+                    task.workspace,
+                    status_value,
+                    plan_json,
+                    created_at,
+                    updated_at,
+                    completed_at or None,
+                    task.approval_mode,
+                    task.callback_url or None,
+                    metadata_json,
+                ),
+            )
+        except Exception:
+            logger.debug("Failed syncing task row snapshot for %s", task.id, exc_info=True)
 
     async def submit_task(
         self,
@@ -826,10 +896,6 @@ class Engine:
         metadata["run_id"] = assigned_run_id
         task.metadata = metadata
         await self._save_task_state(task)
-        try:
-            await self.database.update_task_metadata(task.id, metadata)
-        except Exception:
-            logger.debug("Failed updating task metadata for %s", task.id, exc_info=True)
 
         if bool(getattr(self.config.execution, "enable_durable_task_runner", False)):
             existing = await self.database.get_task_run(assigned_run_id)
@@ -952,15 +1018,6 @@ class Engine:
                     exc_info=True,
                 )
                 continue
-            try:
-                await self.database.update_task_status(task_id, TaskStatus.PAUSED.value)
-                await self.database.update_task_metadata(task_id, task.metadata)
-            except Exception:
-                logger.warning(
-                    "Failed updating paused task row during shutdown: %s",
-                    task_id,
-                    exc_info=True,
-                )
 
             run_id = ""
             if isinstance(task.metadata, dict):
@@ -1074,15 +1131,6 @@ class Engine:
                     exc_info=True,
                 )
                 continue
-
-            try:
-                await self.database.update_task_status(task_id, TaskStatus.FAILED.value)
-            except Exception:
-                logger.warning(
-                    "Failed updating interrupted task status during reconciliation: %s",
-                    task_id,
-                    exc_info=True,
-                )
 
             run_id_for_event = run_id
             if task_run is not None:
@@ -1198,14 +1246,8 @@ class Engine:
                 task,
                 reuse_existing_plan=bool(recovered and task.plan and task.plan.subtasks),
             )
-            result_id = str(getattr(result, "id", "") or task.id)
             raw_status = getattr(result, "status", TaskStatus.FAILED)
-            status_value = (
-                raw_status.value
-                if hasattr(raw_status, "value")
-                else str(raw_status or TaskStatus.FAILED.value)
-            )
-            await self.database.update_task_status(result_id, status_value)
+            await self._sync_task_row_snapshot(result)
             if lease_enabled:
                 status_map = {
                     TaskStatus.COMPLETED: "completed",
@@ -1231,10 +1273,6 @@ class Engine:
                     ).strip()
                 try:
                     await self._save_task_state(cancelled_task)
-                    await self.database.update_task_status(
-                        cancelled_task.id,
-                        TaskStatus.CANCELLED.value,
-                    )
                 except Exception:
                     logger.debug(
                         "Failed persisting cancelled task state for %s",
@@ -1280,7 +1318,6 @@ class Engine:
             try:
                 task.status = TaskStatus.FAILED
                 await self._save_task_state(task)
-                await self.database.update_task_status(task.id, TaskStatus.FAILED.value)
             except Exception:
                 logger.exception("Failed persisting failure state for task %s", task.id)
             if lease_enabled:

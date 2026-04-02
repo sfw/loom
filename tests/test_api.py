@@ -2864,6 +2864,60 @@ class TestWorkspaceFirstEndpoints:
         basic_paths = {row["path"]: row["effective"] for row in patched["basic"]}
         assert basic_paths["execution.ask_user_policy"] == "fail_closed"
 
+    @pytest.mark.asyncio
+    async def test_run_endpoints_fall_back_to_task_snapshot_when_task_row_is_missing(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-state-first-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Run State First WS",
+        )
+        assert workspace is not None
+
+        task = Task(
+            id="task-run-state-only-1",
+            goal="State-backed run",
+            status=TaskStatus.EXECUTING,
+            workspace=str(workspace_path),
+            metadata={"process": "state-first", "run_id": "exec-run-state-only-1"},
+        )
+        state_manager.save(task)
+        await database.insert_task_run(
+            run_id="exec-run-state-only-1",
+            task_id=task.id,
+            status="running",
+            process_name="state-first",
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-state-1",
+            run_id="exec-run-state-only-1",
+            event_type="task_executing",
+            data={"message": "still running"},
+            sequence=1,
+        )
+
+        detail_response = await client.get(f"/runs/{task.id}")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert detail["task"]["id"] == task.id
+        assert detail["task"]["status"] == TaskStatus.EXECUTING.value
+        assert detail["task"]["workspace_path"] == str(workspace_path)
+        assert detail["task_run"]["run_id"] == "exec-run-state-only-1"
+
+        timeline_response = await client.get(f"/runs/{task.id}/timeline")
+        assert timeline_response.status_code == 200
+        timeline = timeline_response.json()
+        assert timeline[0]["event_type"] == "task_executing"
+        assert timeline[0]["data"]["message"] == "still running"
+
         workspace_settings_patch = await client.patch(
             f"/workspaces/{workspace['id']}/settings",
             json={"overrides": {"layout": {"rail": "expanded"}}},
@@ -3101,6 +3155,9 @@ class TestWorkspaceFirstEndpoints:
             display_name="Restart Scoped WS",
         )
         assert workspace is not None
+        engine.submit_task = AsyncMock(
+            side_effect=lambda **kwargs: kwargs.get("run_id", "run-created"),
+        )
 
         create_response = await client.post(
             "/tasks",
@@ -3117,7 +3174,9 @@ class TestWorkspaceFirstEndpoints:
             },
         )
         assert create_response.status_code == 201
-        original_task_id = create_response.json()["task_id"]
+        create_payload = create_response.json()
+        original_task_id = create_payload["task_id"]
+        original_run_id = str(create_payload.get("run_id") or "run-created")
 
         original_row = await database.get_task(original_task_id)
         assert original_row is not None
@@ -3129,8 +3188,34 @@ class TestWorkspaceFirstEndpoints:
             "reference-skill": str(reference_dir.resolve()),
             "source-data/report.md": str(report_path.resolve()),
         }
+        stale_seal = {
+            "path": "source-data/report.md",
+            "sha256": "stale-seal-sha",
+            "size_bytes": len("Source report"),
+            "tool": "document_write",
+            "subtask_id": "failed-step",
+            "sealed_at": "2026-03-27T10:00:00+00:00",
+        }
+        original_metadata["run_id"] = original_run_id
+        original_metadata["artifact_seals"] = {
+            "source-data/report.md": stale_seal,
+        }
+        await database.update_task_metadata(original_task_id, original_metadata)
 
         saved_task = state_manager.load(original_task_id)
+        saved_task.metadata["run_id"] = original_run_id
+        fresh_seal = {
+            **stale_seal,
+            "sha256": "fresh-resealed-sha",
+            "sealed_at": "2026-03-27T11:00:00+00:00",
+            "tool": "edit_file",
+            "tool_call_id": "edit_file:12",
+            "resealed_after_mutation": True,
+        }
+        saved_task.metadata["artifact_seals"] = {
+            "source-data/report.md": fresh_seal,
+        }
+        saved_task.metadata["state_only_marker"] = "preserve-me"
         saved_task.plan = Plan(
             subtasks=[
                 Subtask(
@@ -3165,14 +3250,14 @@ class TestWorkspaceFirstEndpoints:
         )
 
         await database.update_task_status(original_task_id, "failed")
-        engine.submit_task = AsyncMock(side_effect=lambda **kwargs: kwargs["run_id"])
+        engine.submit_task.reset_mock()
 
         restart_response = await client.post(f"/runs/{original_task_id}/restart")
         assert restart_response.status_code == 200
         restart_payload = restart_response.json()
         assert restart_payload["task_id"] == original_task_id
         assert restart_payload["run_id"].startswith("run-")
-        assert restart_payload["run_id"] != original_metadata["run_id"]
+        assert restart_payload["run_id"] != original_run_id
 
         restarted_row = await database.get_task(original_task_id)
         assert restarted_row is not None
@@ -3191,8 +3276,15 @@ class TestWorkspaceFirstEndpoints:
             "source-data/report.md": str(report_path.resolve()),
         }
         assert restarted_metadata["run_id"] == restart_payload["run_id"]
-        assert restarted_metadata["restarted_from_run_id"] == original_metadata["run_id"]
+        assert restarted_metadata["restarted_from_run_id"] == original_run_id
         assert restarted_metadata["restart_count"] == 1
+        assert restarted_metadata["artifact_seals"]["source-data/report.md"]["sha256"] == (
+            "fresh-resealed-sha"
+        )
+        assert restarted_metadata["artifact_seals"]["source-data/report.md"]["sealed_at"] == (
+            "2026-03-27T11:00:00+00:00"
+        )
+        assert restarted_metadata["state_only_marker"] == "preserve-me"
 
         restarted_context = json.loads(str(restarted_row.get("context") or "{}"))
         assert restarted_context == {
@@ -3228,6 +3320,79 @@ class TestWorkspaceFirstEndpoints:
         canonical_paths = {row["canonical_path"] for row in workspace_list.json()}
         assert str(workspace_path.resolve()) in canonical_paths
         assert str(restarted_workspace) not in canonical_paths
+
+    @pytest.mark.asyncio
+    async def test_submit_task_syncs_finished_metadata_and_plan_back_to_task_row(
+        self,
+        engine,
+        database,
+        state_manager,
+        mock_orchestrator,
+        tmp_path,
+    ):
+        workspace_path = tmp_path / "submit-task-sync-ws"
+        workspace_path.mkdir()
+
+        async def _complete_with_resealed_output(task, reuse_existing_plan=False):
+            task.plan = Plan(
+                subtasks=[
+                    Subtask(
+                        id="write-report",
+                        description="Write the report",
+                        status=SubtaskStatus.COMPLETED,
+                        summary="Created report.md",
+                    ),
+                ],
+            )
+            task.status = TaskStatus.COMPLETED
+            task.metadata["artifact_seals"] = {
+                "report.md": {
+                    "path": "report.md",
+                    "sha256": "fresh-sync-sha",
+                    "size_bytes": 42,
+                    "tool": "document_write",
+                    "subtask_id": "write-report",
+                    "sealed_at": "2026-03-28T12:00:00+00:00",
+                    "resealed_after_mutation": True,
+                },
+            }
+            state_manager.save(task)
+            return task
+
+        mock_orchestrator.execute_task.side_effect = _complete_with_resealed_output
+        task = Task(
+            id="task-submit-sync-1",
+            goal="Sync final metadata",
+            status=TaskStatus.PENDING,
+            workspace=str(workspace_path),
+            metadata={"run_id": "exec-run-sync-1"},
+        )
+        state_manager.create(task)
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path=task.workspace,
+            status=task.status.value,
+            metadata=task.metadata,
+        )
+
+        await engine.submit_task(task=task, run_id="exec-run-sync-1")
+
+        for _ in range(40):
+            if not engine.task_run_inflight(task.id):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("task worker never finished")
+
+        updated_row = await database.get_task(task.id)
+        assert updated_row is not None
+        assert updated_row["status"] == TaskStatus.COMPLETED.value
+        updated_metadata = json.loads(str(updated_row.get("metadata") or "{}"))
+        assert updated_metadata["artifact_seals"]["report.md"]["sha256"] == "fresh-sync-sha"
+        assert updated_metadata["artifact_seals"]["report.md"]["resealed_after_mutation"] is True
+        updated_plan = json.loads(str(updated_row.get("plan") or "{}"))
+        assert updated_plan["subtasks"][0]["status"] == SubtaskStatus.COMPLETED.value
 
     @pytest.mark.asyncio
     async def test_cancel_run_stops_active_worker_without_pause(
@@ -3593,6 +3758,183 @@ class TestWorkspaceFirstEndpoints:
         assert intermediate["exists_on_disk"] is True
         assert intermediate["is_intermediate"] is True
         assert intermediate["phase_ids"] == ["phase-a"]
+
+    @pytest.mark.asyncio
+    async def test_run_artifacts_prefer_fresher_state_seals_over_stale_task_row(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+    ):
+        workspace_path = tmp_path / "run-artifacts-state-precedence-ws"
+        workspace_path.mkdir()
+        report_path = workspace_path / "report.md"
+        report_text = "# Fresh Report\n"
+        report_path.write_text(report_text, encoding="utf-8")
+        fresh_sha = hashlib.sha256(report_text.encode("utf-8")).hexdigest()
+        stale_sha = hashlib.sha256(b"stale").hexdigest()
+
+        await database.insert_task(
+            task_id="task-run-artifacts-state-precedence-1",
+            goal="Generate deliverables",
+            workspace_path=str(workspace_path),
+            status="completed",
+            metadata={
+                "artifact_seals": {
+                    "report.md": {
+                        "path": "report.md",
+                        "sha256": stale_sha,
+                        "size_bytes": 5,
+                        "tool": "document_write",
+                        "subtask_id": "finalize-report",
+                        "sealed_at": "2026-03-23T10:00:00+00:00",
+                    },
+                },
+            },
+        )
+        state_manager.save(
+            Task(
+                id="task-run-artifacts-state-precedence-1",
+                goal="Generate deliverables",
+                status=TaskStatus.COMPLETED,
+                workspace=str(workspace_path),
+                metadata={
+                    "artifact_seals": {
+                        "report.md": {
+                            "path": "report.md",
+                            "sha256": fresh_sha,
+                            "size_bytes": len(report_text.encode("utf-8")),
+                            "tool": "edit_file",
+                            "subtask_id": "finalize-report",
+                            "sealed_at": "2026-03-23T11:00:00+00:00",
+                            "resealed_after_mutation": True,
+                        },
+                    },
+                },
+            ),
+        )
+
+        response = await client.get("/runs/task-run-artifacts-state-precedence-1/artifacts")
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 1
+        assert payload[0]["path"] == "report.md"
+        assert payload[0]["sha256"] == fresh_sha
+        assert payload[0]["source"] == "seal"
+
+    @pytest.mark.asyncio
+    async def test_run_artifacts_load_from_task_snapshot_when_task_row_is_missing(
+        self,
+        client,
+        tmp_path,
+        state_manager,
+    ):
+        workspace_path = tmp_path / "run-artifacts-state-only-ws"
+        workspace_path.mkdir()
+        artifact_path = workspace_path / "report.md"
+        artifact_text = "# Snapshot Authority\n"
+        artifact_path.write_text(artifact_text, encoding="utf-8")
+        artifact_sha = hashlib.sha256(artifact_text.encode("utf-8")).hexdigest()
+
+        state_manager.save(
+            Task(
+                id="task-run-artifacts-state-only-1",
+                goal="Generate deliverables",
+                status=TaskStatus.COMPLETED,
+                workspace=str(workspace_path),
+                metadata={
+                    "artifact_seals": {
+                        "report.md": {
+                            "path": "report.md",
+                            "sha256": artifact_sha,
+                            "size_bytes": len(artifact_text.encode("utf-8")),
+                            "tool": "document_write",
+                            "subtask_id": "finalize-report",
+                            "sealed_at": "2026-03-23T12:00:00+00:00",
+                        },
+                    },
+                },
+            ),
+        )
+
+        response = await client.get("/runs/task-run-artifacts-state-only-1/artifacts")
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "path": "report.md",
+                "category": "document",
+                "source": "seal",
+                "sha256": artifact_sha,
+                "size_bytes": len(artifact_text.encode("utf-8")),
+                "exists_on_disk": True,
+                "is_intermediate": False,
+                "created_at": "2026-03-23T12:00:00+00:00",
+                "tool_name": "document_write",
+                "subtask_ids": ["finalize-report"],
+                "phase_ids": [],
+                "facets": {},
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delete_run_removes_task_snapshot_and_evidence(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+    ):
+        workspace_path = tmp_path / "delete-run-ws"
+        workspace_path.mkdir()
+        task_id = "task-run-delete-1"
+        task = Task(
+            id=task_id,
+            goal="Delete this run",
+            status=TaskStatus.COMPLETED,
+            workspace=str(workspace_path),
+            metadata={"run_id": "exec-run-delete-1"},
+        )
+        state_manager.save(task)
+        state_manager.save_evidence_records(
+            task_id,
+            [
+                {
+                    "evidence_id": "EV-DELETE-1",
+                    "task_id": task_id,
+                    "subtask_id": "cleanup",
+                    "tool": "document_write",
+                    "created_at": "2026-03-23T12:30:00+00:00",
+                },
+            ],
+        )
+        await database.insert_task(
+            task_id=task_id,
+            goal=task.goal,
+            workspace_path=task.workspace,
+            status=task.status.value,
+            metadata=task.metadata,
+        )
+        await database.insert_task_run(
+            run_id="exec-run-delete-1",
+            task_id=task_id,
+            status="completed",
+            process_name="cleanup",
+        )
+        await database.insert_event(
+            task_id=task_id,
+            correlation_id="corr-delete-1",
+            run_id="exec-run-delete-1",
+            event_type="task_completed",
+            data={"message": "done"},
+            sequence=1,
+        )
+
+        response = await client.delete(f"/runs/{task_id}")
+        assert response.status_code == 200
+        assert await database.get_task(task_id) is None
+        assert await database.get_task_run("exec-run-delete-1") is None
+        assert (state_manager._data_dir / "tasks" / task_id).exists() is False
 
     @pytest.mark.asyncio
     async def test_workspace_artifacts_aggregate_across_runs(
@@ -5581,7 +5923,7 @@ class TestBackgroundExecution:
         engine = MagicMock()
         engine.orchestrator = shared_orch
         engine.create_task_orchestrator = MagicMock(return_value=isolated_orch)
-        engine.database.update_task_status = AsyncMock()
+        engine._sync_task_row_snapshot = AsyncMock()
         engine.state_manager.save = MagicMock()
 
         task = SimpleNamespace(id="task-1", status=TaskStatus.PENDING)
@@ -5606,7 +5948,7 @@ class TestBackgroundExecution:
         engine = MagicMock()
         engine.orchestrator = shared_orch
         engine.create_task_orchestrator = MagicMock()
-        engine.database.update_task_status = AsyncMock()
+        engine._sync_task_row_snapshot = AsyncMock()
         engine.state_manager.save = MagicMock()
 
         task = SimpleNamespace(id="task-2", status=TaskStatus.PENDING)
@@ -5614,9 +5956,7 @@ class TestBackgroundExecution:
 
         engine.create_task_orchestrator.assert_not_called()
         shared_orch.execute_task.assert_awaited_once_with(task)
-        engine.database.update_task_status.assert_awaited_once_with(
-            "task-2", TaskStatus.COMPLETED.value,
-        )
+        engine._sync_task_row_snapshot.assert_awaited_once_with(result)
 
 
 class TestEngineOrchestratorFactory:
@@ -5645,3 +5985,41 @@ class TestEngineOrchestratorFactory:
 
         with pytest.raises(ValueError, match="requires missing tool"):
             engine.create_task_orchestrator(process=process_def)
+
+    @pytest.mark.asyncio
+    async def test_create_task_orchestrator_mirrors_saved_snapshots_to_task_rows(
+        self,
+        engine,
+        database,
+        tmp_path,
+    ):
+        workspace_path = tmp_path / "orchestrator-mirror-ws"
+        workspace_path.mkdir()
+        task_orch = engine.create_task_orchestrator()
+        task = Task(
+            id="task-orchestrator-mirror-1",
+            goal="Mirror my state",
+            status=TaskStatus.EXECUTING,
+            workspace=str(workspace_path),
+            metadata={"run_id": "exec-run-orchestrator-1"},
+            plan=Plan(
+                subtasks=[
+                    Subtask(
+                        id="mirror-step",
+                        description="Sync the mirror",
+                        status=SubtaskStatus.RUNNING,
+                    ),
+                ],
+            ),
+        )
+
+        await task_orch._save_task_state(task)
+
+        row = await database.get_task(task.id)
+        assert row is not None
+        assert row["status"] == TaskStatus.EXECUTING.value
+        assert row["workspace_path"] == str(workspace_path)
+        assert json.loads(str(row.get("metadata") or "{}"))["run_id"] == "exec-run-orchestrator-1"
+        assert json.loads(str(row.get("plan") or "{}"))["subtasks"][0]["status"] == (
+            SubtaskStatus.RUNNING.value
+        )

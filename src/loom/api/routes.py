@@ -11,6 +11,7 @@ import mimetypes
 import os
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1143,6 +1144,67 @@ def _task_phase_ids(task: object) -> dict[str, str]:
     return phase_ids
 
 
+def _normalized_timestamp_for_compare(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    else:
+        parsed = parsed.astimezone(UTC)
+    return parsed.isoformat()
+
+
+def _merge_artifact_seal_registries(*registries: object) -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for registry in registries:
+        if not isinstance(registry, dict):
+            continue
+        for raw_path, raw_seal in registry.items():
+            relpath = str(raw_path or "").strip()
+            if not relpath or not isinstance(raw_seal, dict):
+                continue
+            incoming = deepcopy(raw_seal)
+            current = merged.get(relpath)
+            if not isinstance(current, dict):
+                merged[relpath] = incoming
+                continue
+            current_key = (
+                _normalized_timestamp_for_compare(current.get("sealed_at")),
+                str(current.get("sha256", "") or "").strip(),
+            )
+            incoming_key = (
+                _normalized_timestamp_for_compare(incoming.get("sealed_at")),
+                str(incoming.get("sha256", "") or "").strip(),
+            )
+            if incoming_key >= current_key:
+                merged[relpath] = incoming
+    return merged
+
+
+def _merge_task_metadata(*metadata_sources: object) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    seal_registries: list[dict[str, Any]] = []
+    saw_artifact_seals = False
+    for source in metadata_sources:
+        if not isinstance(source, dict):
+            continue
+        for key, value in source.items():
+            if key == "artifact_seals":
+                saw_artifact_seals = True
+                if isinstance(value, dict):
+                    seal_registries.append(value)
+                continue
+            merged[key] = deepcopy(value)
+    if saw_artifact_seals:
+        merged["artifact_seals"] = _merge_artifact_seal_registries(*seal_registries)
+    return merged
+
+
 async def _load_task_state(engine: Engine, task_id: str) -> Task | None:
     try:
         task = await asyncio.to_thread(engine.state_manager.load, task_id)
@@ -1160,6 +1222,62 @@ async def _task_state_exists(engine: Engine, task_id: str) -> bool:
 
 async def _save_task_state(engine: Engine, task: Task) -> None:
     await asyncio.to_thread(engine.state_manager.save, task)
+    await engine._sync_task_row_snapshot(task)
+
+
+async def _persist_task_snapshot(engine: Engine, task: Task) -> None:
+    await _save_task_state(engine, task)
+
+
+def _task_row_projection_from_task(
+    task: Task,
+    *,
+    base_row: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = dict(base_row or {})
+    status_value = (
+        task.status.value
+        if hasattr(task.status, "value")
+        else str(task.status or TaskStatus.PENDING.value)
+    )
+    plan_json = (
+        json.dumps(asdict(task.plan), ensure_ascii=False)
+        if task.plan and (
+            task.plan.subtasks
+            or int(getattr(task.plan, "version", 1) or 1) != 1
+            or str(getattr(task.plan, "last_replanned", "") or "").strip()
+        )
+        else None
+    )
+    row.update({
+        "id": task.id,
+        "goal": task.goal,
+        "context": json.dumps(task.context, ensure_ascii=False) if task.context else None,
+        "workspace_path": task.workspace,
+        "status": status_value,
+        "plan": plan_json,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "completed_at": str(task.completed_at or "").strip() or None,
+        "approval_mode": task.approval_mode,
+        "callback_url": task.callback_url or None,
+        "metadata": json.dumps(task.metadata, ensure_ascii=False) if task.metadata else None,
+    })
+    return row
+
+
+async def _load_task_snapshot_projection(
+    engine: Engine,
+    task_id: str,
+) -> tuple[Task | None, dict[str, Any] | None]:
+    task, task_row = await asyncio.gather(
+        _load_task_state(engine, task_id),
+        engine.database.get_task(task_id),
+    )
+    row_dict = dict(task_row) if task_row is not None else None
+    if task is not None:
+        return task, _task_row_projection_from_task(task, base_row=row_dict)
+    return None, row_dict
 
 
 async def _load_task_evidence_records(
@@ -1181,14 +1299,17 @@ async def _build_run_artifacts(
     task_row: dict[str, Any],
 ) -> list[RunArtifactResponse]:
     task_id = str(task_row.get("id", "") or "").strip()
-    metadata = _json_object(task_row.get("metadata"))
+    loaded_task = await _load_task_state(engine, task_id)
+    metadata = _merge_task_metadata(
+        _json_object(task_row.get("metadata")),
+        loaded_task.metadata if loaded_task is not None else None,
+    )
     seals = metadata.get("artifact_seals")
     if not isinstance(seals, dict):
         seals = {}
     evidence_records = await _load_task_evidence_records(engine, task_id)
 
     phase_by_subtask: dict[str, str] = {}
-    loaded_task = await _load_task_state(engine, task_id)
     if loaded_task is not None:
         phase_by_subtask = _task_phase_ids(loaded_task)
 
@@ -2238,21 +2359,7 @@ async def _task_context(
     engine: Engine,
     task_id: str,
 ) -> tuple[dict[str, Any], str, str, str]:
-    task_row = await engine.database.get_task(task_id)
-    if task_row is None:
-        task = await _load_task_state(engine, task_id)
-    else:
-        task = None
-    if task is not None:
-        task_row = {
-            "id": task.id,
-            "goal": task.goal,
-            "workspace_path": task.workspace,
-            "status": task.status.value,
-            "created_at": task.created_at,
-            "updated_at": task.updated_at,
-            "metadata": task.metadata or None,
-        }
+    _, task_row = await _load_task_snapshot_projection(engine, task_id)
     task_row = dict(task_row or {})
     workspace_id, workspace_path, workspace_display_name = await _workspace_context_for_path(
         engine,
@@ -3165,19 +3272,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         metadata=metadata,
     )
 
-    await _save_task_state(engine, task)
-
-    # Persist task metadata to SQLite (source of truth for /tasks list)
-    await engine.database.insert_task(
-        task_id=task.id,
-        goal=task.goal,
-        workspace_path=task.workspace,
-        status=task.status.value,
-        approval_mode=task.approval_mode,
-        context=task.context or None,
-        callback_url=task.callback_url or None,
-        metadata=metadata or None,
-    )
+    await _persist_task_snapshot(engine, task)
 
     # Register webhook if callback_url provided
     if task.callback_url:
@@ -3227,15 +3322,14 @@ async def _execute_in_background(engine: Engine, task, process_def=None) -> None
 
         result = await orchestrator.execute_task(task)
         try:
-            await engine.database.update_task_status(result.id, result.status.value)
+            await engine._sync_task_row_snapshot(result)
         except Exception:
             _bg_logger.warning("Failed to sync task %s status to DB", result.id)
     except Exception as e:
         _bg_logger.exception("Task %s failed with uncaught exception: %s", task.id, e)
         try:
             task.status = TaskStatus.FAILED
-            await _save_task_state(engine, task)
-            await engine.database.update_task_status(task.id, TaskStatus.FAILED.value)
+            await _persist_task_snapshot(engine, task)
         except Exception:
             _bg_logger.exception("Failed to save error state for task %s", task.id)
 
@@ -3573,15 +3667,11 @@ async def steer_task(request: Request, task_id: str, body: TaskSteerRequest):
 async def cancel_task(request: Request, task_id: str):
     """Cancel a running task."""
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(task_id)
-    task_exists = await _task_state_exists(engine, task_id)
-    if task_row is None and not task_exists:
+    task, task_row = await _load_task_snapshot_projection(engine, task_id)
+    if task_row is None and task is None:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    if task_exists:
-        task = await _load_task_state(engine, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    if task is not None:
         if task.status not in {
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
@@ -3589,11 +3679,9 @@ async def cancel_task(request: Request, task_id: str):
         }:
             engine.orchestrator.cancel_task(task)
             if task.status == TaskStatus.CANCELLED:
-                await _save_task_state(engine, task)
-                await engine.database.update_task_status(task_id, TaskStatus.CANCELLED.value)
+                await _persist_task_snapshot(engine, task)
                 latest_run_id = ""
                 if isinstance(task.metadata, dict):
-                    await engine.database.update_task_metadata(task_id, task.metadata)
                     latest_run_id = str(task.metadata.get("run_id", "") or "").strip()
                 if latest_run_id:
                     await engine.database.complete_task_run(
@@ -3603,7 +3691,9 @@ async def cancel_task(request: Request, task_id: str):
                     )
         stop_requested = engine.stop_task_worker(task_id)
         if not stop_requested:
-            await engine.database.update_task_status(task_id, TaskStatus.CANCELLED.value)
+            if task.status != TaskStatus.CANCELLED:
+                task.status = TaskStatus.CANCELLED
+                await _persist_task_snapshot(engine, task)
             latest_run_id = ""
             if isinstance(task.metadata, dict):
                 latest_run_id = str(task.metadata.get("run_id", "") or "").strip()
@@ -3850,7 +3940,7 @@ async def get_conversation_history(request: Request, task_id: str):
     """Retrieve conversation history for a task."""
     engine = _get_engine(request)
 
-    task_row = await engine.database.get_task(task_id)
+    _task, task_row = await _load_task_snapshot_projection(engine, task_id)
     if task_row is None:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
@@ -5127,7 +5217,7 @@ async def get_run(request: Request, run_id: str):
         event="api_run_detail",
         fields=_latency_fields(run_id=run_id),
     ):
-        task_row = await engine.database.get_task(run_id)
+        task_obj, task_row = await _load_task_snapshot_projection(engine, run_id)
         if task_row is None:
             raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
         workspace = await engine.workspace_registry.get_by_path(
@@ -5140,7 +5230,6 @@ async def get_run(request: Request, run_id: str):
 
         # Include plan/subtask data from state manager when available
         plan_data: list[dict[str, Any]] = []
-        task_obj = await _load_task_state(engine, run_id)
         if task_obj is not None and task_obj.plan and task_obj.plan.subtasks:
             for s in task_obj.plan.subtasks:
                 plan_data.append({
@@ -5173,7 +5262,7 @@ async def get_run_artifacts(request: Request, run_id: str):
         event="api_run_artifacts",
         fields=_latency_fields(run_id=run_id),
     ):
-        task_row = await engine.database.get_task(run_id)
+        _task, task_row = await _load_task_snapshot_projection(engine, run_id)
         if task_row is None:
             raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
         return await _build_run_artifacts(engine, task_row)
@@ -5361,7 +5450,7 @@ async def get_run_timeline(
         event="api_run_timeline",
         fields=_latency_fields(run_id=run_id, limit=limit),
     ):
-        task_row = await engine.database.get_task(run_id)
+        _task, task_row = await _load_task_snapshot_projection(engine, run_id)
         if task_row is None:
             raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
         rows = await engine.database.query_events(run_id, limit=limit, ascending=True)
@@ -5389,14 +5478,14 @@ async def stream_run_events(
 ):
     """Durable-first SSE stream of real-time run events."""
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(run_id)
+    task, task_row = await _load_task_snapshot_projection(engine, run_id)
     if task_row is None:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
 
-    db_status = str(task_row.get("status", "") or "").strip().lower()
-    is_db_terminal = db_status in ("completed", "failed", "cancelled")
+    resolved_status = str(task_row.get("status", "") or "").strip().lower()
+    is_terminal = resolved_status in ("completed", "failed", "cancelled")
 
-    if not await _task_state_exists(engine, run_id) and is_db_terminal:
+    if task is None and is_terminal:
         async def inactive_generator():
             last_event_id = str(request.headers.get("last-event-id", "") or "").strip()
             cursor = await _resolve_run_stream_cursor(
@@ -5467,7 +5556,7 @@ async def stream_run_events(
                     "event_type": "run_snapshot",
                     "task_id": run_id,
                     "timestamp": _now_iso(),
-                    "status": db_status,
+                    "status": resolved_status,
                     "terminal": True,
                     "streaming": False,
                 }),
@@ -5655,12 +5744,12 @@ async def stream_run_events(
 async def cancel_run(request: Request, run_id: str):
     """Cancel a run through the existing task cancellation surface."""
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(run_id)
+    task, task_row = await _load_task_snapshot_projection(engine, run_id)
     if task_row is None:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
 
     # Try the orchestrator cancel path first (requires state_manager).
-    if await _task_state_exists(engine, run_id):
+    if task is not None:
         try:
             return await cancel_task(request, run_id)
         except Exception:
@@ -5688,21 +5777,29 @@ async def delete_run(request: Request, run_id: str):
     can clean up, then delete the database rows.
     """
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(run_id)
+    task, task_row = await _load_task_snapshot_projection(engine, run_id)
     if task_row is None:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
 
     status = str(task_row.get("status", "") or "").strip().lower()
     # Force-cancel if still active
     if status not in ("completed", "failed", "cancelled"):
-        if await _task_state_exists(engine, run_id):
-            try:
-                task = await _load_task_state(engine, run_id)
-                if task is not None:
-                    engine.orchestrator.cancel_task(task)
-            except Exception:
-                pass
-        await engine.database.update_task_status(run_id, "cancelled")
+        try:
+            cancel_result = await cancel_run(request, run_id)
+        except Exception:
+            cancel_result = None
+        if engine.task_run_inflight(run_id):
+            for _ in range(100):
+                if not engine.task_run_inflight(run_id):
+                    break
+                await asyncio.sleep(0.01)
+        if engine.task_run_inflight(run_id):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Run {run_id} is still shutting down; retry deletion shortly.",
+            )
+        if isinstance(cancel_result, dict):
+            status = str(cancel_result.get("task_status", "") or status).strip().lower()
 
     await engine.database.execute(
         "DELETE FROM events WHERE task_id=?", (run_id,),
@@ -5713,6 +5810,10 @@ async def delete_run(request: Request, run_id: str):
     await engine.database.execute(
         "DELETE FROM tasks WHERE id=?", (run_id,),
     )
+    try:
+        await asyncio.to_thread(engine.state_manager.delete, run_id)
+    except Exception:
+        logger.warning("Failed deleting task snapshot for %s", run_id, exc_info=True)
     return {"status": "ok", "message": f"Run {run_id} deleted."}
 
 
@@ -5720,7 +5821,7 @@ async def delete_run(request: Request, run_id: str):
 async def restart_run(request: Request, run_id: str):
     """Restart a terminal run in place, resuming from saved task state."""
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(run_id)
+    task, task_row = await _load_task_snapshot_projection(engine, run_id)
     if task_row is None:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     status = str(task_row.get("status", "") or "").strip().lower()
@@ -5729,19 +5830,18 @@ async def restart_run(request: Request, run_id: str):
             status_code=409,
             detail=f"Cannot restart a run with status '{status}'.",
         )
-    metadata = _json_object(task_row.get("metadata"))
+    row_metadata = _json_object(task_row.get("metadata"))
     context = _json_object(task_row.get("context"))
     goal = str(task_row.get("goal", "") or "").strip() or "Untitled run"
     run_workspace = str(task_row.get("workspace_path", "") or "").strip()
-    source_workspace_root = str(metadata.get("source_workspace_root", "") or "").strip()
+    source_workspace_root = str(row_metadata.get("source_workspace_root", "") or "").strip()
     process_name = (
         str(task_row.get("process_name", "") or "").strip()
-        or str(metadata.get("process", "") or "").strip()
+        or str(row_metadata.get("process", "") or "").strip()
         or None
     )
     approval_mode = str(task_row.get("approval_mode", "") or "auto").strip()
     callback_url = str(task_row.get("callback_url", "") or "").strip() or None
-    previous_run_id = str(metadata.get("run_id", "") or "").strip()
     next_run_id = f"run-{uuid.uuid4().hex[:12]}"
     persisted_plan = Plan()
     raw_plan = task_row.get("plan")
@@ -5753,11 +5853,7 @@ async def restart_run(request: Request, run_id: str):
         except Exception:
             logger.warning("Failed to parse persisted plan for restart %s", run_id, exc_info=True)
 
-    if await _task_state_exists(engine, run_id):
-        task = await _load_task_state(engine, run_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-    else:
+    if task is None:
         task = Task(
             id=run_id,
             goal=goal,
@@ -5767,18 +5863,29 @@ async def restart_run(request: Request, run_id: str):
             approval_mode=approval_mode,
             callback_url=callback_url or "",
             context=context,
-            metadata=metadata,
+            metadata=row_metadata,
             created_at=str(task_row.get("created_at", "") or ""),
             updated_at=str(task_row.get("updated_at", "") or ""),
             completed_at=str(task_row.get("completed_at", "") or ""),
         )
 
+    merged_metadata = _merge_task_metadata(
+        row_metadata,
+        task.metadata if isinstance(task.metadata, dict) else None,
+    )
     task.goal = goal
     task.workspace = run_workspace
     task.approval_mode = approval_mode
     task.callback_url = callback_url or ""
     task.context = context
-    task.metadata = dict(metadata)
+    task.metadata = merged_metadata
+    source_workspace_root = str(task.metadata.get("source_workspace_root", "") or "").strip()
+    process_name = (
+        str(process_name or "").strip()
+        or str(task.metadata.get("process", "") or "").strip()
+        or None
+    )
+    previous_run_id = str(task.metadata.get("run_id", "") or "").strip()
     for key in (
         "cancel_reason",
         "paused_from_status",
@@ -5796,34 +5903,7 @@ async def restart_run(request: Request, run_id: str):
     if task is None:
         raise HTTPException(status_code=409, detail=restart_error or "Failed to restart run.")
 
-    await _save_task_state(engine, task)
-
-    await engine.database.execute(
-        """UPDATE tasks
-           SET goal=?,
-               context=?,
-               workspace_path=?,
-               status=?,
-               plan=?,
-               approval_mode=?,
-               callback_url=?,
-               metadata=?,
-               updated_at=?,
-               completed_at=NULL
-           WHERE id=?""",
-        (
-            task.goal,
-            json.dumps(task.context, ensure_ascii=False) if task.context else None,
-            task.workspace,
-            TaskStatus.PENDING.value,
-            json.dumps(asdict(task.plan), ensure_ascii=False),
-            task.approval_mode,
-            task.callback_url or None,
-            json.dumps(task.metadata, ensure_ascii=False) if task.metadata else None,
-            _now_iso(),
-            task.id,
-        ),
-    )
+    await _persist_task_snapshot(engine, task)
 
     process = await engine._resolve_process_definition(
         process_name=process_name or "",
