@@ -129,9 +129,22 @@ export default function AppShell() {
     setNotice,
   } = useAppActions();
 
-  const ws = selectedWorkspaceSummary;
+  const overviewWorkspace = (
+    overview?.workspace
+    && selectedWorkspaceId
+    && overview.workspace.id === selectedWorkspaceId
+  )
+    ? overview.workspace
+    : null;
+  const ws = overviewWorkspace ?? selectedWorkspaceSummary;
   const activeRuns = ws?.active_run_count ?? 0;
-  const totalActiveRuns = workspaces.reduce((sum, workspace) => sum + (workspace.active_run_count ?? 0), 0);
+  const totalActiveRuns = workspaces.reduce((sum, workspace) => (
+    sum + (
+      overviewWorkspace && workspace.id === overviewWorkspace.id
+        ? (overviewWorkspace.active_run_count ?? 0)
+        : (workspace.active_run_count ?? 0)
+    )
+  ), 0);
   const pendingApprovals = approvalInbox.length;
   const conversationCount = overview?.recent_conversations?.length ?? 0;
   const runCount = overview?.recent_runs?.length ?? 0;

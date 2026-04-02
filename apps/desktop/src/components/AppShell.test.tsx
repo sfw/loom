@@ -184,6 +184,25 @@ describe("AppShell close confirmation", () => {
     await waitFor(() => expect(mockApp.setActiveTab).toHaveBeenCalledWith("overview"));
   });
 
+  it("uses the selected workspace overview count for the running chip when the list summary drifts", () => {
+    mockApp.selectedWorkspaceSummary.active_run_count = 2;
+    mockApp.overview = {
+      workspace: {
+        ...mockApp.selectedWorkspaceSummary,
+        active_run_count: 1,
+      },
+      recent_conversations: [],
+      recent_runs: [],
+      pending_approvals_count: 0,
+      counts: {},
+    };
+
+    render(<AppShell />);
+
+    expect(screen.getByText("1 running")).toBeInTheDocument();
+    expect(screen.queryByText("2 running")).not.toBeInTheDocument();
+  });
+
   it("keeps the shell visible and shows a reconnect banner when cached data exists", () => {
     mockApp.connectionState = "failed";
 

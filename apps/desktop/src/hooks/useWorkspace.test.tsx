@@ -550,6 +550,102 @@ describe("useWorkspace", () => {
     expect(apiMocks.fetchWorkspaceOverview).not.toHaveBeenCalled();
   });
 
+  it("resyncs a drifted selected workspace active run count from the updated overview", async () => {
+    apiMocks.fetchWorkspaceOverview.mockResolvedValue({
+      workspace: {
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+        display_name: "Workspace 1",
+        active_run_count: 1,
+        run_count: 1,
+        last_activity_at: "2026-03-27T00:01:00Z",
+      },
+      recent_conversations: [],
+      recent_runs: [{
+        id: "run-1",
+        workspace_id: "workspace-1",
+        workspace_path: "/tmp/workspace",
+        goal: "Run 1",
+        status: "executing",
+        created_at: "2026-03-27T00:00:00Z",
+        updated_at: "2026-03-27T00:01:00Z",
+        execution_run_id: "exec-1",
+        process_name: "ad-hoc",
+        linked_conversation_ids: [],
+        changed_files_count: 0,
+      }],
+      pending_approvals_count: 0,
+      counts: {},
+    });
+
+    const { result } = renderHook(() => {
+      const [workspaces, setWorkspaces] = useState([{
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+        display_name: "Workspace 1",
+        metadata: {},
+        is_archived: false,
+        sort_order: 0,
+        active_run_count: 2,
+        conversation_count: 0,
+        run_count: 1,
+        last_activity_at: "2026-03-27T00:01:00Z",
+      }] as any);
+      return useWorkspace({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "run-1",
+        setSelectedWorkspaceId: vi.fn(),
+        showArchivedWorkspaces: false,
+        setShowArchivedWorkspaces: vi.fn(),
+        createParentPath: "/tmp",
+        setCreateParentPath: vi.fn(),
+        workspaces,
+        setWorkspaces,
+        runtime: null,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        activeTab: "overview",
+        setActiveTab: vi.fn(),
+        setSelectedConversationId: vi.fn(),
+        setSelectedRunId: vi.fn(),
+      });
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    act(() => {
+      result.current.syncRunDetail({
+        id: "run-1",
+        workspace_id: "workspace-1",
+        workspace_path: "/tmp/workspace",
+        goal: "Run 1",
+        status: "planning",
+        created_at: "2026-03-27T00:00:00Z",
+        updated_at: "2026-03-27T00:02:00Z",
+        execution_run_id: "exec-1",
+        process_name: "ad-hoc",
+        linked_conversation_ids: [],
+        changed_files_count: 0,
+        task: {},
+        task_run: {},
+        events_count: 0,
+        plan_subtasks: [],
+        workspace: {
+          id: "workspace-1",
+          canonical_path: "/tmp/workspace",
+          display_name: "Workspace 1",
+        },
+      } as any);
+    });
+
+    expect(result.current.overview?.workspace.active_run_count).toBe(1);
+    expect(result.current.selectedWorkspaceSummary?.active_run_count).toBe(1);
+  });
+
   it("upserts conversation summaries locally without a workspace refetch", async () => {
     apiMocks.fetchWorkspaceOverview.mockResolvedValue({
       workspace: {

@@ -528,6 +528,72 @@ describe("useRuns", () => {
     expect(result.current.runStreaming).toBe(false);
   });
 
+  it("ignores non-run stream status values when updating the run badge state", async () => {
+    let streamEvent: ((event: any) => void) | undefined;
+    apiMocks.fetchRunDetail.mockResolvedValue({
+      id: "run-1",
+      goal: "Review the site",
+      status: "executing",
+      process_name: "seo-geo-review",
+      plan_subtasks: [],
+    });
+    apiMocks.fetchRunTimeline.mockResolvedValue([]);
+    apiMocks.fetchRunArtifacts.mockResolvedValue([]);
+    apiMocks.subscribeRunStream.mockImplementation(((
+      _runId: string,
+      onEvent: (event: unknown) => void,
+    ) => {
+      streamEvent = onEvent as (event: any) => void;
+      return () => {};
+    }) as any);
+
+    const { result } = renderHook(() =>
+      useRuns({
+        selectedRunId: "run-1",
+        setSelectedRunId: vi.fn(),
+        selectedWorkspaceId: "workspace-1",
+        overview: {
+          workspace: {
+            canonical_path: "/tmp/workspace",
+          },
+          recent_runs: [],
+        } as any,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        setActiveTab: vi.fn(),
+        refreshWorkspaceSurface: vi.fn(async () => {}),
+      }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    act(() => {
+      streamEvent?.({
+        id: 4,
+        task_id: "run-1",
+        run_id: "exec-run-1",
+        correlation_id: "corr-1",
+        event_id: "evt-4",
+        sequence: 4,
+        timestamp: "2026-03-27T00:00:04Z",
+        event_type: "task_note",
+        source_component: "tests",
+        schema_version: 1,
+        data: { status: "ok", message: "keep going" },
+        status: "ok",
+        streaming: true,
+      });
+    });
+
+    await flushRunStreamFrame();
+
+    expect(result.current.runDetail?.status).toBe("executing");
+    expect(result.current.normalizedRunStatus).toBe("executing");
+  });
+
   it("drops noisy timeline rows returned by the backend snapshot", async () => {
     apiMocks.fetchRunDetail.mockResolvedValue({
       id: "run-1",

@@ -939,6 +939,7 @@ export function useWorkspace(deps: {
     const nextActive = isRunActiveStatus(normalizedStatus);
     const activeRunCountDelta = nextActive === previousActive ? 0 : nextActive ? 1 : -1;
     const runCountDelta = existingRun ? 0 : 1;
+    let nextOverviewWorkspace: WorkspaceOverview["workspace"] | null = null;
 
     if (currentOverview?.workspace?.id === workspaceId) {
       const nextRows = sortRunRows([
@@ -965,6 +966,7 @@ export function useWorkspace(deps: {
         },
         recent_runs: nextRows,
       };
+      nextOverviewWorkspace = nextOverview.workspace;
       overviewRef.current = nextOverview;
       setOverview(nextOverview);
     }
@@ -973,19 +975,25 @@ export function useWorkspace(deps: {
       workspace.id === workspaceId
         ? {
             ...workspace,
-            active_run_count: Math.max(
-              0,
-              Number(workspace.active_run_count || 0) + activeRunCountDelta,
-            ),
-            run_count: Math.max(
-              0,
-              Number(workspace.run_count || 0) + runCountDelta,
-            ),
-            last_activity_at: latestTimestamp(
-              workspace.last_activity_at,
-              nextRow.updated_at,
-              nextRow.created_at,
-            ),
+            active_run_count: nextOverviewWorkspace
+              ? Number(nextOverviewWorkspace.active_run_count || 0)
+              : Math.max(
+                0,
+                Number(workspace.active_run_count || 0) + activeRunCountDelta,
+              ),
+            run_count: nextOverviewWorkspace
+              ? Number(nextOverviewWorkspace.run_count || 0)
+              : Math.max(
+                0,
+                Number(workspace.run_count || 0) + runCountDelta,
+              ),
+            last_activity_at: nextOverviewWorkspace
+              ? String(nextOverviewWorkspace.last_activity_at || "")
+              : latestTimestamp(
+                workspace.last_activity_at,
+                nextRow.updated_at,
+                nextRow.created_at,
+              ),
           }
         : workspace
     )));
@@ -1003,6 +1011,7 @@ export function useWorkspace(deps: {
       : null;
     const activeRunCountDelta = existingRun && isRunActiveStatus(existingRun.status) ? -1 : 0;
     const runCountDelta = existingRun ? -1 : 0;
+    let nextOverviewWorkspace: WorkspaceOverview["workspace"] | null = null;
 
     if (currentOverview?.workspace?.id === nextWorkspaceId && existingRun) {
       const nextRows = currentOverview.recent_runs.filter((run) => run.id !== runId);
@@ -1021,6 +1030,7 @@ export function useWorkspace(deps: {
         },
         recent_runs: nextRows,
       };
+      nextOverviewWorkspace = nextOverview.workspace;
       overviewRef.current = nextOverview;
       setOverview(nextOverview);
     }
@@ -1029,14 +1039,18 @@ export function useWorkspace(deps: {
       workspace.id === nextWorkspaceId
         ? {
             ...workspace,
-            active_run_count: Math.max(
-              0,
-              Number(workspace.active_run_count || 0) + activeRunCountDelta,
-            ),
-            run_count: Math.max(
-              0,
-              Number(workspace.run_count || 0) + runCountDelta,
-            ),
+            active_run_count: nextOverviewWorkspace
+              ? Number(nextOverviewWorkspace.active_run_count || 0)
+              : Math.max(
+                0,
+                Number(workspace.active_run_count || 0) + activeRunCountDelta,
+              ),
+            run_count: nextOverviewWorkspace
+              ? Number(nextOverviewWorkspace.run_count || 0)
+              : Math.max(
+                0,
+                Number(workspace.run_count || 0) + runCountDelta,
+              ),
           }
         : workspace
     )));

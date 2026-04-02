@@ -215,8 +215,22 @@ function deriveRunStatusFromStreamEvent(
   eventType: string,
   nextStatus: string,
 ): string {
-  if (nextStatus) {
-    return normalizeRunStatus(nextStatus);
+  const normalizedNextStatus = normalizeRunStatus(nextStatus);
+  if (
+    normalizedNextStatus
+    && [
+      "pending",
+      "planning",
+      "executing",
+      "running",
+      "paused",
+      "completed",
+      "failed",
+      "cancelled",
+      "waiting_approval",
+    ].includes(normalizedNextStatus)
+  ) {
+    return normalizedNextStatus;
   }
   switch (eventType) {
     case "task_paused":
