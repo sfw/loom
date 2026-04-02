@@ -145,6 +145,29 @@ describe("history helpers", () => {
     expect(isRunTimelineNoise(claimSummary)).toBe(true);
   });
 
+  it("shows retry-scheduled model events instead of hiding them as noise", () => {
+    const retryEvent: RunTimelineEvent = {
+      ...runEvent,
+      event_type: "model_invocation",
+      data: {
+        subtask_id: "planning",
+        model: "gpt-test",
+        phase: "done",
+        retry_scheduled: true,
+        retry_resume_at_ms: 10000,
+        retry_delay_seconds: 8,
+        http_status: 429,
+        model_error_code: "engine_overloaded_error",
+      },
+    };
+
+    expect(isRunTimelineNoise(retryEvent)).toBe(false);
+    expect(runTimelineTitle(retryEvent)).toBe("Retry scheduled for planning");
+    expect(runTimelineDetail(retryEvent, 2000)).toBe(
+      "gpt-test · retry in 8s · HTTP 429 · engine_overloaded_error",
+    );
+  });
+
   it("normalizes conversation prompts and drops invalid ones", () => {
     expect(normalizeConversationPrompt(null)).toBeNull();
     expect(

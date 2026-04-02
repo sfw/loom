@@ -112,6 +112,9 @@ const NOISE_EVENT_TYPES = new Set([
 ]);
 
 export function isRunTimelineNoise(event: RunTimelineEvent): boolean {
+  if (event.event_type === "model_invocation" && event.data.retry_scheduled === true) {
+    return false;
+  }
   if (event.event_type === "claim_verification_summary") {
     const d = event.data;
     const extracted = typeof d.extracted === "number" ? Number(d.extracted) : 0;
@@ -158,6 +161,26 @@ function _toolName(data: Record<string, unknown>): string {
 
 function _subtaskLabel(data: Record<string, unknown>): string {
   return _str(data.subtask_id) || _str(data.phase_id) || "";
+}
+
+function _retryCountdownLabel(
+  data: Record<string, unknown>,
+  nowMs: number,
+): string {
+  const resumeAtMs =
+    typeof data.retry_resume_at_ms === "number" ? Number(data.retry_resume_at_ms) : NaN;
+  if (Number.isFinite(resumeAtMs) && resumeAtMs > 0) {
+    const remainingSeconds = Math.max(0, Math.ceil((resumeAtMs - nowMs) / 1000));
+    return remainingSeconds > 0 ? `retry in ${remainingSeconds}s` : "retrying now";
+  }
+  const delaySeconds =
+    typeof data.retry_delay_seconds === "number" ? Number(data.retry_delay_seconds) : NaN;
+  if (Number.isFinite(delaySeconds) && delaySeconds > 0) {
+    return delaySeconds >= 10
+      ? `retry in ${Math.round(delaySeconds)}s`
+      : `retry in ${delaySeconds.toFixed(1)}s`;
+  }
+  return "retry scheduled";
 }
 
 export function runTimelineTitle(event: RunTimelineEvent): string {
@@ -224,6 +247,9 @@ export function runTimelineTitle(event: RunTimelineEvent): string {
 
     // --- Model invocation ---
     case "model_invocation":
+      if (d.retry_scheduled === true) {
+        return sub ? `Retry scheduled for ${sub}` : "Model retry scheduled";
+      }
       return sub ? `Model call for ${sub}` : "Model call";
 
     // --- Approval / user interaction ---
@@ -271,7 +297,7 @@ export function runTimelineTitle(event: RunTimelineEvent): string {
   }
 }
 
-export function runTimelineDetail(event: RunTimelineEvent): string {
+export function runTimelineDetail(event: RunTimelineEvent, nowMs: number = Date.now()): string {
   const d = event.data;
   const args = (typeof d.args === "object" && d.args !== null ? d.args : {}) as Record<string, unknown>;
 
@@ -364,6 +390,13 @@ export function runTimelineDetail(event: RunTimelineEvent): string {
 
     // --- Model invocation ---
     case "model_invocation": {
+      if (d.retry_scheduled === true) {
+        const status = typeof d.http_status === "number" ? `HTTP ${d.http_status}` : "";
+        const errorCode = _str(d.model_error_code);
+        const model = _str(d.model);
+        const countdown = _retryCountdownLabel(d, nowMs);
+        return [model, countdown, status, errorCode].filter(Boolean).join(" · ");
+      }
       const model = _str(d.model);
       const phase = _str(d.phase);
       const tokens = typeof d.request_est_tokens === "number" ? `~${d.request_est_tokens} tokens` : "";

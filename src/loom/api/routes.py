@@ -2251,11 +2251,12 @@ async def _task_context(
             "status": task.status.value,
             "created_at": task.created_at,
             "updated_at": task.updated_at,
+            "metadata": task.metadata or None,
         }
     task_row = dict(task_row or {})
     workspace_id, workspace_path, workspace_display_name = await _workspace_context_for_path(
         engine,
-        task_row.get("workspace_path"),
+        _task_workspace_group_root(task_row),
     )
     return task_row, workspace_id, workspace_path, workspace_display_name
 
@@ -5122,7 +5123,9 @@ async def get_run(request: Request, run_id: str):
         task_row = await engine.database.get_task(run_id)
         if task_row is None:
             raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-        workspace = await engine.workspace_registry.get_by_path(task_row.get("workspace_path"))
+        workspace = await engine.workspace_registry.get_by_path(
+            _task_workspace_group_root(task_row),
+        )
         workspace_id = str((workspace or {}).get("id", "") or "")
         summary = await _build_run_summary(engine, workspace_id, task_row)
         latest_run = await engine.database.get_latest_task_run_for_task(run_id)
@@ -5208,10 +5211,12 @@ def _should_include_run_timeline_event(
     if include_noise:
         return True
     normalized = str(event_type or "").strip().lower()
+    payload = data if isinstance(data, dict) else {}
+    if normalized == "model_invocation" and bool(payload.get("retry_scheduled")):
+        return True
     if normalized in _RUN_TIMELINE_NOISE_EVENT_TYPES:
         return False
     if normalized == "claim_verification_summary":
-        payload = data if isinstance(data, dict) else {}
         extracted = int(payload.get("extracted", 0) or 0)
         supported = int(payload.get("supported", 0) or 0)
         partially_supported = int(payload.get("partially_supported", 0) or 0)

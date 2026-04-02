@@ -23,7 +23,11 @@ from loom.models.request_diagnostics import (
     collect_request_diagnostics,
     collect_response_diagnostics,
 )
-from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.models.retry import (
+    ModelRetryPolicy,
+    build_model_retry_event_payload,
+    call_with_model_retry,
+)
 from loom.processes.phase_alignment import infer_phase_id_for_subtask
 from loom.read_scope import (
     resolve_read_path_map_from_metadata,
@@ -212,11 +216,36 @@ async def plan_task(
             "error": str(error),
         })
 
+    def _on_retry_scheduled(
+        attempt: int,
+        max_attempts: int,
+        error: BaseException,
+        remaining: int,
+        delay_seconds: float,
+    ) -> None:
+        orchestrator._emit(MODEL_INVOCATION, task.id, {
+            "subtask_id": "planning",
+            "model": model.name,
+            "phase": "done",
+            "operation": "complete",
+            "invocation_attempt": attempt,
+            "invocation_max_attempts": max_attempts,
+            "retry_queue_remaining": remaining,
+            "origin": request_diag.origin if request_diag else "",
+            "error_type": type(error).__name__,
+            "error": str(error),
+            **build_model_retry_event_payload(
+                error,
+                delay_seconds=delay_seconds,
+            ),
+        })
+
     try:
         response = await call_with_model_retry(
             _invoke_model,
             policy=policy,
             on_failure=_on_failure,
+            on_retry_scheduled=_on_retry_scheduled,
         )
     except Exception as e:
         logger.warning(
@@ -351,10 +380,37 @@ async def replan_task(
                     "structural_max_attempts": max_structural_attempts,
                 })
 
+            def _on_replanner_retry_scheduled(
+                attempt: int,
+                max_attempts: int,
+                error: BaseException,
+                remaining: int,
+                delay_seconds: float,
+            ) -> None:
+                orchestrator._emit(MODEL_INVOCATION, task.id, {
+                    "subtask_id": failed_subtask_id or "replanning",
+                    "model": model.name,
+                    "phase": "done",
+                    "operation": "complete",
+                    "invocation_attempt": attempt,
+                    "invocation_max_attempts": max_attempts,
+                    "retry_queue_remaining": remaining,
+                    "origin": request_diag.origin if request_diag else "",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "structural_attempt": structural_attempt,
+                    "structural_max_attempts": max_structural_attempts,
+                    **build_model_retry_event_payload(
+                        error,
+                        delay_seconds=delay_seconds,
+                    ),
+                })
+
             response = await call_with_model_retry(
                 _invoke_replanner,
                 policy=policy,
                 on_failure=_on_replanner_failure,
+                on_retry_scheduled=_on_replanner_retry_scheduled,
             )
             orchestrator._emit(MODEL_INVOCATION, task.id, {
                 "subtask_id": failed_subtask_id or "replanning",

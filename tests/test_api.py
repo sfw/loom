@@ -22,6 +22,7 @@ from loom.events.bus import Event, EventBus
 from loom.events.types import (
     APPROVAL_RECEIVED,
     APPROVAL_REQUESTED,
+    MODEL_INVOCATION,
     STEER_INSTRUCTION,
     TASK_COMPLETED,
     TASK_CREATED,
@@ -2864,11 +2865,73 @@ class TestWorkspaceFirstEndpoints:
         recent_runs = overview.json()["recent_runs"]
         assert any(row["id"] == payload["task_id"] for row in recent_runs)
 
+        detail = await client.get(f"/runs/{payload['task_id']}")
+        assert detail.status_code == 200
+        detail_payload = detail.json()
+        assert detail_payload["workspace_id"] == workspace["id"]
+        assert detail_payload["workspace"]["id"] == workspace["id"]
+        assert detail_payload["workspace"]["canonical_path"] == str(workspace_path.resolve())
+        assert detail_payload["workspace_path"] == str(task_workspace)
+
         workspace_list = await client.get("/workspaces")
         assert workspace_list.status_code == 200
         canonical_paths = {row["canonical_path"] for row in workspace_list.json()}
         assert str(workspace_path.resolve()) in canonical_paths
         assert str(task_workspace) not in canonical_paths
+
+    @pytest.mark.asyncio
+    async def test_auto_subfolder_task_questions_use_parent_workspace_context(
+        self,
+        client,
+        tmp_path,
+        database,
+        memory_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "auto-subfolder-approval-ws"
+        workspace_path.mkdir()
+        scoped_run_path = workspace_path / "scoped-run"
+        scoped_run_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Auto Subfolder Approval WS",
+        )
+        assert workspace is not None
+
+        await database.insert_task(
+            task_id="task-auto-subfolder-question-1",
+            goal="Need operator guidance",
+            workspace_path=str(scoped_run_path),
+            status="executing",
+            metadata={
+                "source_workspace_root": str(workspace_path.resolve()),
+                "run_workspace_relative": "scoped-run",
+                "run_workspace_mode": "scoped_subfolder",
+            },
+        )
+        await memory_manager.upsert_pending_task_question(
+            question_id="q_auto_subfolder_1",
+            task_id="task-auto-subfolder-question-1",
+            subtask_id="ask-user",
+            request_payload={
+                "question": "Keep going?",
+                "question_type": "single_choice",
+                "options": [
+                    {"id": "yes", "label": "Yes"},
+                    {"id": "no", "label": "No"},
+                ],
+                "context_note": "Need a quick confirmation.",
+            },
+        )
+
+        response = await client.get(f"/approvals?workspace_id={workspace['id']}")
+
+        assert response.status_code == 200
+        rows = response.json()
+        question_item = next(row for row in rows if row["kind"] == "task_question")
+        assert question_item["task_id"] == "task-auto-subfolder-question-1"
+        assert question_item["workspace_id"] == workspace["id"]
+        assert question_item["workspace_path"] == str(workspace_path.resolve())
 
     @pytest.mark.asyncio
     async def test_auto_subfolder_process_launch_loads_process_from_parent_workspace(
@@ -3915,6 +3978,66 @@ class TestWorkspaceFirstEndpoints:
         assert response.status_code == 200
         payload = response.json()
         assert [row["event_type"] for row in payload] == [TASK_EXECUTING]
+
+    @pytest.mark.asyncio
+    async def test_run_timeline_include_noise_false_keeps_retry_scheduled_model_events(
+        self,
+        client,
+        tmp_path,
+        database,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-timeline-model-retry-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        await database.insert_task(
+            task_id="task-run-model-retry-1",
+            goal="Run model retry task",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+        await database.insert_event(
+            task_id="task-run-model-retry-1",
+            correlation_id="corr-1",
+            run_id="exec-run-model-retry-1",
+            event_type=TASK_EXECUTING,
+            data={"status": "executing"},
+            sequence=1,
+        )
+        await database.insert_event(
+            task_id="task-run-model-retry-1",
+            correlation_id="corr-1",
+            run_id="exec-run-model-retry-1",
+            event_type=MODEL_INVOCATION,
+            data={
+                "phase": "done",
+                "retry_scheduled": True,
+                "retry_delay_seconds": 8.0,
+                "http_status": 429,
+                "model_error_code": "engine_overloaded_error",
+            },
+            sequence=2,
+        )
+        await database.insert_event(
+            task_id="task-run-model-retry-1",
+            correlation_id="corr-1",
+            run_id="exec-run-model-retry-1",
+            event_type=TOKEN_STREAMED,
+            data={"token": "hello"},
+            sequence=3,
+        )
+
+        response = await client.get(
+            "/runs/task-run-model-retry-1/timeline?include_noise=false&limit=10",
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert [row["event_type"] for row in payload] == [
+            TASK_EXECUTING,
+            MODEL_INVOCATION,
+        ]
 
     @pytest.mark.asyncio
     async def test_run_stream_include_noise_false_filters_noise_events(

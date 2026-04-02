@@ -22,7 +22,11 @@ from loom.models.request_diagnostics import (
     collect_request_diagnostics,
     collect_response_diagnostics,
 )
-from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.models.retry import (
+    ModelRetryPolicy,
+    build_model_retry_event_payload,
+    call_with_model_retry,
+)
 from loom.recovery.questions import QuestionRequest
 from loom.state.evidence import (
     extract_evidence_records,
@@ -321,12 +325,46 @@ async def run_subtask(
                     },
                 )
 
+            def _on_invocation_retry_scheduled(
+                attempt: int,
+                max_attempts: int,
+                error: BaseException,
+                remaining: int,
+                delay_seconds: float,
+            ) -> None:
+                runner._emit_model_event(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    model_name=model.name,
+                    phase="done",
+                    details={
+                        "origin": request_diag.origin if request_diag else "",
+                        "iteration": iteration + 1,
+                        "operation": operation,
+                        "invocation_attempt": attempt,
+                        "invocation_max_attempts": max_attempts,
+                        "retry_queue_remaining": remaining,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "overflow_error_detected": (
+                            runner._is_model_request_overflow_error(error)
+                        ),
+                        "overflow_fallback_attempted": overflow_fallback_attempted,
+                        **build_model_retry_event_payload(
+                            error,
+                            delay_seconds=delay_seconds,
+                        ),
+                        **(overflow_fallback_report or {}),
+                    },
+                )
+
             try:
                 session.response = await call_with_model_retry(
                     _invoke_model,
                     policy=policy,
                     should_retry=_should_retry_invocation,
                     on_failure=_on_invocation_failure,
+                    on_retry_scheduled=_on_invocation_retry_scheduled,
                 )
             except Exception as e:
                 session.interruption_reason = (

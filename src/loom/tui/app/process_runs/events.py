@@ -154,11 +154,18 @@ def format_process_progress_event(
             except (TypeError, ValueError):
                 return 0
 
+        def _float_value(value: object) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
         request_bytes = _int_value(event_data.get("request_bytes"))
         request_tokens = _int_value(event_data.get("request_est_tokens"))
         message_count = _int_value(event_data.get("message_count"))
         assistant_tool_calls = _int_value(event_data.get("assistant_tool_calls"))
         origin = str(event_data.get("origin", "")).strip()
+        retry_scheduled = bool(event_data.get("retry_scheduled"))
 
         details: list[str] = []
         if request_tokens > 0:
@@ -201,6 +208,25 @@ def format_process_progress_event(
             if details:
                 return f"Thinking on {label} ({', '.join(details)})..."
             return f"Thinking on {label}..."
+        if retry_scheduled:
+            retry_delay_seconds = _float_value(event_data.get("retry_delay_seconds"))
+            status_code = _int_value(event_data.get("http_status"))
+            error_code = str(event_data.get("model_error_code", "")).strip()
+            retry_text = "retry scheduled"
+            if retry_delay_seconds > 0:
+                if retry_delay_seconds >= 10:
+                    retry_text = f"retrying in {round(retry_delay_seconds)}s"
+                else:
+                    retry_text = f"retrying in {retry_delay_seconds:.1f}s"
+            reason_parts: list[str] = []
+            if model_name:
+                reason_parts.append(model_name)
+            if status_code > 0:
+                reason_parts.append(f"HTTP {status_code}")
+            if error_code:
+                reason_parts.append(error_code)
+            suffix = f" ({', '.join(reason_parts)})" if reason_parts else ""
+            return f"Model backpressure on {label}; {retry_text}{suffix}."
         if phase == "done":
             return None
         return None

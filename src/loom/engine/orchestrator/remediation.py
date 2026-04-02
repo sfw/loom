@@ -34,7 +34,11 @@ from loom.models.request_diagnostics import (
     collect_request_diagnostics,
     collect_response_diagnostics,
 )
-from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.models.retry import (
+    ModelRetryPolicy,
+    build_model_retry_event_payload,
+    call_with_model_retry,
+)
 from loom.recovery.errors import ErrorCategory, categorize_error
 from loom.recovery.retry import AttemptRecord, RetryStrategy
 from loom.state.evidence import merge_evidence_records
@@ -1870,11 +1874,37 @@ async def _plan_failure_resolution(
             "retry_strategy": strategy.value,
         })
 
+    def _on_retry_scheduled(
+        attempt: int,
+        max_attempts: int,
+        error: BaseException,
+        remaining: int,
+        delay_seconds: float,
+    ) -> None:
+        self._emit(MODEL_INVOCATION, task.id, {
+            "subtask_id": subtask.id,
+            "model": model.name,
+            "phase": "done",
+            "operation": "failure_resolution_plan",
+            "invocation_attempt": attempt,
+            "invocation_max_attempts": max_attempts,
+            "retry_queue_remaining": remaining,
+            "origin": request_diag.origin if request_diag else "",
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "retry_strategy": strategy.value,
+            **build_model_retry_event_payload(
+                error,
+                delay_seconds=delay_seconds,
+            ),
+        })
+
     try:
         response = await call_with_model_retry(
             _invoke_model,
             policy=policy,
             on_failure=_on_failure,
+            on_retry_scheduled=_on_retry_scheduled,
         )
     except Exception as e:
         logger.debug(
