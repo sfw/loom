@@ -21,6 +21,7 @@ import {
   subscribeNotificationsStream,
   type ApprovalFeedItem,
   type NotificationEvent,
+  type RunDetail,
   type RuntimeStatus,
   type WorkspaceArtifact,
   type WorkspaceInventory,
@@ -30,6 +31,7 @@ import {
   type WorkspaceSummary,
 } from "../api";
 import { matchesWorkspaceSearch } from "../history";
+import { isRunActiveStatus, normalizeRunStatus } from "../runStatus";
 import {
   defaultWorkspaceName,
   isTransientRequestError,
@@ -122,6 +124,7 @@ export interface WorkspaceActions {
   refreshWorkspaceList: (preferredWorkspaceId?: string) => Promise<void>;
   refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
   refreshApprovalInbox: (workspaceId: string) => Promise<void>;
+  syncRunDetail: (detail: RunDetail) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +364,91 @@ export function useWorkspace(deps: {
 
   const refreshApprovalInbox = useEffectEvent(async (workspaceId: string) => {
     setApprovalInbox(await fetchApprovals(workspaceId));
+  });
+
+  const syncRunDetail = useEffectEvent((detail: RunDetail) => {
+    const workspaceId = String(detail.workspace_id || detail.workspace?.id || "").trim();
+    const normalizedStatus = normalizeRunStatus(detail.status);
+    const linkedConversationIds = Array.isArray(detail.linked_conversation_ids)
+      ? detail.linked_conversation_ids
+      : [];
+    if (!workspaceId || !normalizedStatus) {
+      return;
+    }
+
+    const currentOverview = overviewRef.current;
+    let nextOverview = currentOverview;
+    let activeRunCountDelta = 0;
+
+    if (currentOverview?.workspace?.id === workspaceId) {
+      const existingRun = currentOverview.recent_runs.find((run) => run.id === detail.id);
+      if (existingRun) {
+        const previousActive = isRunActiveStatus(existingRun.status);
+        const nextActive = isRunActiveStatus(normalizedStatus);
+        activeRunCountDelta = nextActive === previousActive ? 0 : nextActive ? 1 : -1;
+        const nextUpdatedAt = detail.updated_at || existingRun.updated_at;
+        const nextLastActivityAt =
+          nextUpdatedAt && nextUpdatedAt > (currentOverview.workspace.last_activity_at || "")
+            ? nextUpdatedAt
+            : currentOverview.workspace.last_activity_at;
+        nextOverview = {
+          ...currentOverview,
+          workspace: {
+            ...currentOverview.workspace,
+            active_run_count: Math.max(
+              0,
+              Number(currentOverview.workspace.active_run_count || 0) + activeRunCountDelta,
+            ),
+            last_activity_at: nextLastActivityAt,
+          },
+          recent_runs: currentOverview.recent_runs.map((run) => (
+            run.id === detail.id
+              ? {
+                  ...run,
+                  goal: detail.goal || run.goal,
+                  status: normalizedStatus,
+                  created_at: detail.created_at || run.created_at,
+                  updated_at: nextUpdatedAt,
+                  execution_run_id: detail.execution_run_id || run.execution_run_id,
+                  process_name: detail.process_name || run.process_name,
+                  linked_conversation_ids:
+                    linkedConversationIds.length > 0
+                      ? linkedConversationIds
+                      : run.linked_conversation_ids,
+                  changed_files_count:
+                    typeof detail.changed_files_count === "number"
+                      ? detail.changed_files_count
+                      : run.changed_files_count,
+                }
+              : run
+          )),
+        };
+        overviewRef.current = nextOverview;
+        setOverview(nextOverview);
+      }
+    }
+
+    if (activeRunCountDelta === 0) {
+      return;
+    }
+
+    setWorkspaces((current) => current.map((workspace) => {
+      if (workspace.id !== workspaceId) {
+        return workspace;
+      }
+      const nextUpdatedAt = detail.updated_at || workspace.last_activity_at;
+      return {
+        ...workspace,
+        active_run_count: Math.max(
+          0,
+          Number(workspace.active_run_count || 0) + activeRunCountDelta,
+        ),
+        last_activity_at:
+          nextUpdatedAt && nextUpdatedAt > (workspace.last_activity_at || "")
+            ? nextUpdatedAt
+            : workspace.last_activity_at,
+      };
+    }));
   });
 
   const scheduleNotificationRefresh = useEffectEvent((workspaceId: string) => {
@@ -1067,5 +1155,6 @@ export function useWorkspace(deps: {
     refreshWorkspaceList,
     refreshWorkspaceSurface,
     refreshApprovalInbox,
+    syncRunDetail,
   };
 }

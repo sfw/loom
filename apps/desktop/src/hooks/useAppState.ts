@@ -489,6 +489,7 @@ export function useAppState(): AppState & AppActions {
     setNotice,
     setActiveTab,
     refreshWorkspaceSurface: workspace.refreshWorkspaceSurface,
+    syncRunDetail: workspace.syncRunDetail,
   });
 
   const desktopActivity = useDesktopActivity({
