@@ -4296,13 +4296,15 @@ async def reply_approval(
 ):
     """Resolve a unified approval/question item."""
     engine = _get_engine(request)
-    parts = [part for part in str(approval_item_id or "").split(":") if part]
-    if len(parts) < 3:
+    raw_parts = [str(part or "").strip() for part in str(approval_item_id or "").split(":")]
+    if not raw_parts:
         raise HTTPException(status_code=404, detail="Approval item not found.")
 
-    kind = parts[0]
+    kind = raw_parts[0]
     if kind == "conversation":
-        conversation_id, approval_id = parts[1], parts[2]
+        if len(raw_parts) < 3 or not raw_parts[1] or not raw_parts[2]:
+            raise HTTPException(status_code=404, detail="Approval item not found.")
+        conversation_id, approval_id = raw_parts[1], raw_parts[2]
         decision = _normalize_conversation_approval_decision(body.decision)
         resolved = engine.resolve_conversation_approval(
             conversation_id,
@@ -4320,7 +4322,10 @@ async def reply_approval(
         }
 
     if kind == "task":
-        task_id, subtask_id = parts[1], parts[2]
+        if len(raw_parts) < 2 or not raw_parts[1]:
+            raise HTTPException(status_code=404, detail="Approval item not found.")
+        task_id = raw_parts[1]
+        subtask_id = raw_parts[2] if len(raw_parts) >= 3 else ""
         approved = str(body.decision or "").strip().lower() not in {"deny", "reject", "false"}
         resolved = engine.approval_manager.resolve_approval(task_id, subtask_id, approved)
         if not resolved:
@@ -4343,7 +4348,9 @@ async def reply_approval(
         }
 
     if kind == "question":
-        task_id, question_id = parts[1], parts[2]
+        if len(raw_parts) < 3 or not raw_parts[1] or not raw_parts[2]:
+            raise HTTPException(status_code=404, detail="Approval item not found.")
+        task_id, question_id = raw_parts[1], raw_parts[2]
         manager = getattr(engine, "question_manager", None)
         if manager is None:
             raise HTTPException(status_code=404, detail="Question manager is not available.")

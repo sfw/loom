@@ -89,6 +89,10 @@ export function useInbox(deps: {
   const [approvalReplyDrafts, setApprovalReplyDrafts] = useState<Record<string, string>>({});
   const [replyingApprovalId, setReplyingApprovalId] = useState("");
 
+  function isApprovalReplyNotFound(error: unknown): boolean {
+    return error instanceof Error && /^\s*404\b/.test(error.message);
+  }
+
   // ---------------------------------------------------------------------------
   // Handlers
   // ---------------------------------------------------------------------------
@@ -107,6 +111,16 @@ export function useInbox(deps: {
     setReplyingApprovalId(item.id);
     setError("");
     setNotice("");
+    const refreshCurrentContext = async () => {
+      await Promise.all([
+        item.conversation_id && item.conversation_id === selectedConversationId
+          ? refreshConversation(item.conversation_id)
+          : Promise.resolve(),
+        item.task_id && item.task_id === selectedRunId
+          ? refreshRun(item.task_id)
+          : Promise.resolve(),
+      ]);
+    };
     try {
       await replyApproval(item.id, {
         ...body,
@@ -117,16 +131,19 @@ export function useInbox(deps: {
         ...current,
         [item.id]: "",
       }));
-      await Promise.all([
-        item.conversation_id && item.conversation_id === selectedConversationId
-          ? refreshConversation(item.conversation_id)
-          : Promise.resolve(),
-        item.task_id && item.task_id === selectedRunId
-          ? refreshRun(item.task_id)
-          : Promise.resolve(),
-      ]);
+      await refreshCurrentContext();
       setNotice(`${item.title} updated.`);
     } catch (err) {
+      if (isApprovalReplyNotFound(err)) {
+        removeApprovalItem(item.id, item.workspace_id || selectedWorkspaceId);
+        setApprovalReplyDrafts((current) => ({
+          ...current,
+          [item.id]: "",
+        }));
+        await refreshCurrentContext();
+        setNotice(`${item.title} was already resolved.`);
+        return;
+      }
       setError(err instanceof Error ? err.message : "Failed to reply to approval.");
     } finally {
       setReplyingApprovalId("");

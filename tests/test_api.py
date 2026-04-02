@@ -1018,6 +1018,56 @@ class TestWorkspaceFirstEndpoints:
         assert refreshed.json() == []
 
     @pytest.mark.asyncio
+    async def test_reply_task_approval_without_subtask_id(
+        self,
+        client,
+        engine,
+        tmp_path,
+        database,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "approval-no-subtask-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Approval No Subtask WS",
+        )
+        assert workspace is not None
+
+        await database.insert_task(
+            task_id="task-approval-no-subtask",
+            goal="Review top-level action",
+            workspace_path=str(workspace_path),
+            status="executing",
+        )
+        approval_waiter = asyncio.create_task(
+            engine.approval_manager.request_approval(
+                ApprovalRequest(
+                    task_id="task-approval-no-subtask",
+                    subtask_id="",
+                    reason="Review whole-run action",
+                    proposed_action="Approve top-level continuation",
+                    risk_level="medium",
+                ),
+            ),
+        )
+        await asyncio.sleep(0.05)
+
+        list_response = await client.get(f"/approvals?workspace_id={workspace['id']}")
+        assert list_response.status_code == 200
+        task_item = next(row for row in list_response.json() if row["kind"] == "task_approval")
+        assert task_item["id"] == "task:task-approval-no-subtask"
+
+        task_reply = await client.post(
+            f"/approvals/{task_item['id']}/reply",
+            json={"decision": "approve", "reason": "Proceed."},
+        )
+        assert task_reply.status_code == 200
+        assert task_reply.json()["task_id"] == "task-approval-no-subtask"
+        assert task_reply.json()["subtask_id"] == ""
+        assert await approval_waiter is True
+
+    @pytest.mark.asyncio
     async def test_workspace_overview_counts_pending_conversation_approvals(
         self,
         client,

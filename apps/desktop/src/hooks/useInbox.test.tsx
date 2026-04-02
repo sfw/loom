@@ -193,4 +193,64 @@ describe("useInbox", () => {
     expect(refreshRun).not.toHaveBeenCalled();
     expect(setNotice).toHaveBeenCalledWith("Thread approval updated.");
   });
+
+  it("removes stale approvals locally when the server says they are gone", async () => {
+    vi.mocked(replyApproval).mockRejectedValue(new Error("404 Not Found"));
+
+    const removeApprovalItem = vi.fn();
+    const refreshRun = vi.fn(async () => {});
+    const setError = vi.fn();
+    const setNotice = vi.fn();
+
+    const { result } = renderHook(() =>
+      useInbox({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "run-1",
+        setSelectedWorkspaceId: vi.fn(),
+        setSelectedConversationId: vi.fn(),
+        setSelectedRunId: vi.fn(),
+        setActiveTab: vi.fn(),
+        setRunProcess: vi.fn(),
+        setError,
+        setNotice,
+        removeApprovalItem,
+        refreshConversation: vi.fn(async () => {}),
+        refreshRun,
+        queueWorkspaceFileOpen: vi.fn(),
+        focusRunComposer: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.handleReplyApproval({
+        id: "task:run-1:subtask-1",
+        kind: "task_approval",
+        status: "pending",
+        created_at: "2026-03-31T18:00:00Z",
+        title: "Run approval",
+        summary: "Approve run step",
+        workspace_id: "workspace-1",
+        workspace_path: "/tmp/workspace",
+        workspace_display_name: "Workspace 1",
+        task_id: "run-1",
+        run_id: "run-1",
+        conversation_id: "",
+        subtask_id: "subtask-1",
+        question_id: "",
+        approval_id: "",
+        tool_name: "",
+        risk_level: "medium",
+        request_payload: {},
+        metadata: {},
+      }, {
+        decision: "approve",
+      });
+    });
+
+    expect(removeApprovalItem).toHaveBeenCalledWith("task:run-1:subtask-1", "workspace-1");
+    expect(refreshRun).toHaveBeenCalledWith("run-1");
+    expect(setNotice).toHaveBeenCalledWith("Run approval was already resolved.");
+    expect(setError).not.toHaveBeenCalledWith("404 Not Found");
+  });
 });

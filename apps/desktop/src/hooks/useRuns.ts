@@ -216,8 +216,12 @@ function deriveRunStatusFromStreamEvent(
   nextStatus: string,
 ): string {
   const normalizedNextStatus = normalizeRunStatus(nextStatus);
+  const canTrustStreamStatus =
+    eventType === "run_snapshot"
+    || eventType.startsWith("task_");
   if (
-    normalizedNextStatus
+    canTrustStreamStatus
+    && normalizedNextStatus
     && [
       "pending",
       "planning",
