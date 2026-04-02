@@ -998,6 +998,27 @@ export function useRuns(deps: {
         || selectedRunSummary?.process_name
         || "";
       const fallbackGoal = runDetail?.goal || selectedRunSummary?.goal || "";
+      if (runDetail && nextRunId === selectedRunId) {
+        const executionRunId = String(created.run_id || "").trim();
+        const nextDetail = canonicalizeRunDetail({
+          ...runDetail,
+          status: optimisticStatus,
+          execution_run_id: executionRunId || runDetail.execution_run_id,
+          updated_at: new Date().toISOString(),
+          task_run: {
+            ...(runDetail.task_run || {}),
+            status: optimisticStatus,
+            run_id: executionRunId
+              || String(runDetail.task_run?.run_id || "").trim(),
+            task_id: nextRunId,
+          },
+        });
+        runDetailRef.current = nextDetail;
+        setRunDetail(nextDetail);
+        pushRunDetailToWorkspaceState(nextDetail);
+        runStreamingRef.current = isRunActiveStatus(optimisticStatus);
+        setRunStreaming(isRunActiveStatus(optimisticStatus));
+      }
       if (nextRunId && selectedWorkspaceId && overview?.workspace.canonical_path) {
         pushRunDetailToWorkspaceState(buildOptimisticRunSummary({
           runId: nextRunId,

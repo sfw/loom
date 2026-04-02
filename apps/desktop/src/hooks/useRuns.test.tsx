@@ -334,6 +334,88 @@ describe("useRuns", () => {
     expect(setNotice).toHaveBeenCalledWith("Relaunched as task-123.");
   });
 
+  it("updates the selected run detail immediately when restart keeps the same task id", async () => {
+    apiMocks.fetchRunDetail.mockResolvedValue({
+      id: "task-123",
+      goal: "Review the site",
+      status: "failed",
+      process_name: "seo-geo-review",
+      execution_run_id: "run-abc",
+      created_at: "2026-04-01T21:00:00Z",
+      updated_at: "2026-04-01T21:05:00Z",
+      task: {},
+      task_run: {
+        run_id: "run-abc",
+        status: "failed",
+      },
+      events_count: 3,
+      workspace: {
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+      },
+      plan_subtasks: [],
+    });
+    apiMocks.fetchRunTimeline.mockResolvedValue([]);
+    apiMocks.fetchRunArtifacts.mockResolvedValue([]);
+    apiMocks.restartRun.mockResolvedValue({
+      task_id: "task-123",
+      run_id: "run-retry-2",
+      status: "pending",
+      message: "Restarted run task-123.",
+    });
+
+    const setSelectedRunId = vi.fn();
+    const setError = vi.fn();
+    const setNotice = vi.fn();
+    const setActiveTab = vi.fn();
+    const syncRunDetail = vi.fn();
+
+    const { result } = renderHook(() =>
+      useRuns({
+        selectedRunId: "task-123",
+        setSelectedRunId,
+        selectedWorkspaceId: "workspace-1",
+        overview: {
+          workspace: {
+            canonical_path: "/tmp/workspace",
+          },
+          recent_runs: [],
+        } as any,
+        setError,
+        setNotice,
+        setActiveTab,
+        refreshWorkspaceSurface: vi.fn(async () => {}),
+        syncRunDetail,
+      }),
+    );
+
+    await waitFor(() => {
+      expect(result.current.runDetail?.status).toBe("failed");
+    });
+
+    syncRunDetail.mockClear();
+
+    await act(async () => {
+      await result.current.handleRestartRun();
+    });
+
+    expect(result.current.runDetail?.status).toBe("pending");
+    expect(result.current.runDetail?.execution_run_id).toBe("run-retry-2");
+    expect(result.current.runDetail?.task_run).toEqual(expect.objectContaining({
+      run_id: "run-retry-2",
+      status: "pending",
+      task_id: "task-123",
+    }));
+    expect(result.current.runStreaming).toBe(false);
+    expect(syncRunDetail).toHaveBeenCalledWith(expect.objectContaining({
+      id: "task-123",
+      status: "pending",
+      execution_run_id: "run-retry-2",
+    }));
+    expect(setSelectedRunId).toHaveBeenCalledWith("task-123");
+    expect(setActiveTab).toHaveBeenCalledWith("runs");
+  });
+
   it("refreshes the selected run when the live stream errors", async () => {
     vi.useFakeTimers();
     let streamError: (() => void) | undefined;
