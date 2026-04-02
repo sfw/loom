@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import socket
+import time
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
@@ -54,8 +55,23 @@ MAX_BINARY_SUMMARY_CHARS = 3_600
 FETCH_TIMEOUT = 30.0
 MAX_FETCH_ATTEMPTS = 3
 FETCH_RETRY_BASE_DELAY = 0.4
-RETRYABLE_HTTP_STATUS = frozenset({403, 408, 425, 429, 500, 502, 503, 504})
-DEFAULT_WEB_USER_AGENT = "Loom/1.0 (+https://github.com/sfw/loom)"
+RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+DEFAULT_WEB_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
+ANTI_BOT_STATUS = frozenset({403, 429, 999})
+ANTI_BOT_HOST_SUFFIXES = (
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "tiktok.com",
+    "twitter.com",
+    "x.com",
+)
+ANTI_BOT_COOLDOWN_SECONDS = 10 * 60
+_HOST_ANTI_BOT_COOLDOWNS: dict[str, float] = {}
 DIRECT_TEXT_TOKEN_LIMIT = 5_000
 SUMMARY_TEXT_TOKEN_LIMIT = 20_000
 TEXT_QUERY_CHUNK_TOKENS = 500
@@ -270,6 +286,10 @@ def _build_request_headers() -> dict[str, str]:
             "text/plain;q=0.8,*/*;q=0.7"
         ),
         "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
@@ -278,6 +298,67 @@ def _build_request_headers() -> dict[str, str]:
 def _should_retry_status(status_code: int) -> bool:
     """Return True if an HTTP status is likely transient."""
     return status_code in RETRYABLE_HTTP_STATUS
+
+
+def _normalized_host(host: str) -> str:
+    return str(host or "").strip().lower().rstrip(".")
+
+
+def _host_matches_suffix(host: str, suffix: str) -> bool:
+    normalized_host = _normalized_host(host)
+    normalized_suffix = _normalized_host(suffix)
+    return normalized_host == normalized_suffix or normalized_host.endswith(
+        f".{normalized_suffix}"
+    )
+
+
+def _anti_bot_host_key(host: str) -> str:
+    normalized_host = _normalized_host(host)
+    if not normalized_host:
+        return ""
+    for suffix in ANTI_BOT_HOST_SUFFIXES:
+        if _host_matches_suffix(normalized_host, suffix):
+            return suffix
+    return normalized_host
+
+
+def _should_apply_anti_bot_cooldown(host: str, status_code: int) -> bool:
+    normalized_host = _normalized_host(host)
+    if not normalized_host:
+        return False
+    if status_code == 999:
+        return True
+    return status_code in {403, 429} and any(
+        _host_matches_suffix(normalized_host, suffix)
+        for suffix in ANTI_BOT_HOST_SUFFIXES
+    )
+
+
+def _record_anti_bot_cooldown(host: str) -> None:
+    key = _anti_bot_host_key(host)
+    if not key:
+        return
+    _HOST_ANTI_BOT_COOLDOWNS[key] = time.monotonic() + ANTI_BOT_COOLDOWN_SECONDS
+
+
+def _anti_bot_cooldown_remaining(host: str) -> float:
+    key = _anti_bot_host_key(host)
+    if not key:
+        return 0.0
+    expires_at = float(_HOST_ANTI_BOT_COOLDOWNS.get(key, 0.0) or 0.0)
+    remaining = expires_at - time.monotonic()
+    if remaining <= 0:
+        _HOST_ANTI_BOT_COOLDOWNS.pop(key, None)
+        return 0.0
+    return remaining
+
+
+def _format_anti_bot_cooldown_message(host: str, remaining_seconds: float) -> str:
+    rounded = max(1, int(round(remaining_seconds)))
+    return (
+        f"Host temporarily cooling down after anti-bot denial: {host} "
+        f"(retry in ~{rounded}s)"
+    )
 
 
 def _hidden_int_arg(
@@ -304,10 +385,13 @@ async def _get_with_retries(
     stream: bool = False,
 ) -> httpx.Response:
     """GET URL with bounded retries for transient failures."""
+    host = urlparse(url).hostname or ""
     for attempt in range(MAX_FETCH_ATTEMPTS):
         try:
             request = client.build_request("GET", url, headers=headers)
             response = await client.send(request, stream=stream)
+            if _should_apply_anti_bot_cooldown(host, response.status_code):
+                return response
             if (
                 _should_retry_status(response.status_code)
                 and attempt < MAX_FETCH_ATTEMPTS - 1
@@ -400,6 +484,13 @@ async def _execute_web_fetch(
     safe, reason = is_safe_url(url)
     if not safe:
         return ToolResult.fail(reason)
+
+    host = urlparse(url).hostname or ""
+    cooldown_remaining = _anti_bot_cooldown_remaining(host)
+    if cooldown_remaining > 0:
+        return ToolResult.fail(
+            _format_anti_bot_cooldown_message(host, cooldown_remaining)
+        )
 
     try:
         headers = _build_request_headers()
@@ -642,6 +733,16 @@ async def _execute_web_fetch(
             return ToolResult.ok(output, data=data)
     except httpx.HTTPStatusError as e:
         target = str(e.request.url) if e.request else url
+        target_host = ""
+        if e.request is not None:
+            target_host = str(e.request.url.host or "")
+        if not target_host:
+            target_host = urlparse(target).hostname or host
+        if _should_apply_anti_bot_cooldown(target_host, e.response.status_code):
+            _record_anti_bot_cooldown(target_host)
+            return ToolResult.fail(
+                f"Anti-bot denied (HTTP {e.response.status_code}): {target}"
+            )
         return ToolResult.fail(f"HTTP {e.response.status_code}: {target}")
     except httpx.TimeoutException:
         return ToolResult.fail(f"Timeout fetching: {url}")

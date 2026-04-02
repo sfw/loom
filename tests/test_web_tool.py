@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 
+import loom.tools.web as web_tool_module
 from loom.tools.registry import ToolContext, ToolResult
 from loom.tools.web import (
     DEFAULT_WEB_USER_AGENT,
@@ -163,8 +165,13 @@ class TestWebRequestDefaults:
         monkeypatch.delenv("LOOM_WEB_USER_AGENT", raising=False)
         headers = _build_request_headers()
         assert headers["User-Agent"] == DEFAULT_WEB_USER_AGENT
+        assert headers["User-Agent"].startswith("Mozilla/5.0")
         assert "Accept" in headers
         assert "Accept-Language" in headers
+        assert headers["Upgrade-Insecure-Requests"] == "1"
+        assert headers["Sec-Fetch-Dest"] == "document"
+        assert headers["Sec-Fetch-Mode"] == "navigate"
+        assert headers["Sec-Fetch-Site"] == "none"
 
     def test_build_request_headers_env_override(self, monkeypatch):
         monkeypatch.setenv("LOOM_WEB_USER_AGENT", "MyAgent/9.9")
@@ -172,7 +179,7 @@ class TestWebRequestDefaults:
         assert headers["User-Agent"] == "MyAgent/9.9"
 
     def test_retryable_status_codes(self):
-        assert _should_retry_status(403)
+        assert not _should_retry_status(403)
         assert _should_retry_status(429)
         assert _should_retry_status(503)
         assert not _should_retry_status(404)
@@ -318,6 +325,51 @@ class _FakeSummarizer:
 
 
 class TestWebFetchTextTiers:
+    @pytest.mark.asyncio
+    async def test_anti_bot_denial_enters_host_cooldown(self, monkeypatch):
+        web_tool_module._HOST_ANTI_BOT_COOLDOWNS.clear()
+        calls = {"count": 0}
+
+        async def _fake_get_with_retries(client, target_url, headers=None, stream=False):
+            del client, headers, stream
+            calls["count"] += 1
+            request = httpx.Request("GET", target_url)
+            response = httpx.Response(999, request=request)
+            raise httpx.HTTPStatusError(
+                "blocked by anti-bot",
+                request=request,
+                response=response,
+            )
+
+        monkeypatch.setattr("loom.tools.web.httpx.AsyncClient", _FakeAsyncClient)
+        monkeypatch.setattr("loom.tools.web._get_with_retries", _fake_get_with_retries)
+
+        first = await _execute_web_fetch(
+            "https://www.linkedin.com/in/example-person/",
+            extract_text=True,
+            max_download_bytes=32_000,
+            enable_filetype_ingest_router=True,
+            ctx=None,
+        )
+
+        assert first.success is False
+        assert "Anti-bot denied (HTTP 999)" in first.error
+        assert calls["count"] == 1
+
+        second = await _execute_web_fetch(
+            "https://www.linkedin.com/in/example-person/",
+            extract_text=True,
+            max_download_bytes=32_000,
+            enable_filetype_ingest_router=True,
+            ctx=None,
+        )
+
+        assert second.success is False
+        assert "Host temporarily cooling down after anti-bot denial" in second.error
+        assert calls["count"] == 1
+
+        web_tool_module._HOST_ANTI_BOT_COOLDOWNS.clear()
+
     @pytest.mark.asyncio
     async def test_small_html_returns_cleaned_markdown_payload(self, monkeypatch):
         html = """
