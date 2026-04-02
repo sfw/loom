@@ -516,6 +516,133 @@ export function summarizeMessage(message: ConversationMessage): string {
   return "No content";
 }
 
+export interface ConversationTurnSeparatorStats {
+  tool_count: number;
+  tokens: number;
+  model: string;
+  tokens_per_second: number;
+  latency_ms: number;
+  total_time_ms: number;
+  context_tokens: number;
+  context_messages: number;
+  omitted_messages: number;
+  recall_index_used: boolean;
+}
+
+function coerceConversationTurnInt(value: unknown, defaultValue = 0): number {
+  const numeric = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim()
+      ? Number(value)
+      : Number.NaN;
+  if (!Number.isFinite(numeric)) {
+    return defaultValue;
+  }
+  return Math.max(0, Math.trunc(numeric));
+}
+
+function coerceConversationTurnFloat(value: unknown, defaultValue = 0): number {
+  const numeric = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim()
+      ? Number(value)
+      : Number.NaN;
+  if (!Number.isFinite(numeric)) {
+    return defaultValue;
+  }
+  return Math.max(0, numeric);
+}
+
+function coerceConversationTurnBool(value: unknown, defaultValue = false): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      return defaultValue;
+    }
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["1", "true", "yes", "y", "on"].includes(normalized)) {
+      return true;
+    }
+    if (["0", "false", "no", "n", "off"].includes(normalized)) {
+      return false;
+    }
+  }
+  return defaultValue;
+}
+
+export function normalizeConversationTurnSeparatorPayload(
+  payload: Record<string, unknown>,
+): ConversationTurnSeparatorStats {
+  return {
+    tool_count: coerceConversationTurnInt(payload.tool_count, 0),
+    tokens: coerceConversationTurnInt(payload.tokens, 0),
+    model: typeof payload.model === "string" ? payload.model.trim() : "",
+    tokens_per_second: coerceConversationTurnFloat(payload.tokens_per_second, 0),
+    latency_ms: coerceConversationTurnInt(payload.latency_ms, 0),
+    total_time_ms: coerceConversationTurnInt(payload.total_time_ms, 0),
+    context_tokens: coerceConversationTurnInt(payload.context_tokens, 0),
+    context_messages: coerceConversationTurnInt(payload.context_messages, 0),
+    omitted_messages: coerceConversationTurnInt(payload.omitted_messages, 0),
+    recall_index_used: coerceConversationTurnBool(payload.recall_index_used, false),
+  };
+}
+
+export function formatConversationTurnSeparatorDuration(durationMs: number): string {
+  if (durationMs >= 1000) {
+    return `${(durationMs / 1000).toFixed(1)}s`;
+  }
+  return `${durationMs}ms`;
+}
+
+export function conversationTurnSeparatorParts(
+  stats: ConversationTurnSeparatorStats,
+): string[] {
+  const parts: string[] = [];
+  if (stats.tool_count > 0) {
+    const suffix = stats.tool_count === 1 ? "" : "s";
+    parts.push(`${stats.tool_count.toLocaleString()} tool${suffix}`);
+  }
+  parts.push(`${stats.tokens.toLocaleString()} tokens`);
+  if (stats.tokens_per_second > 0) {
+    parts.push(`${stats.tokens_per_second.toFixed(1)} tok/s`);
+  }
+  if (stats.latency_ms > 0) {
+    parts.push(`${formatConversationTurnSeparatorDuration(stats.latency_ms)} latency`);
+  }
+  if (stats.total_time_ms > 0) {
+    parts.push(`${formatConversationTurnSeparatorDuration(stats.total_time_ms)} total`);
+  }
+  if (stats.context_tokens > 0) {
+    parts.push(`ctx ${stats.context_tokens.toLocaleString()} tok`);
+  }
+  if (stats.context_messages > 0) {
+    parts.push(`${stats.context_messages.toLocaleString()} ctx msg`);
+  }
+  if (stats.omitted_messages > 0) {
+    parts.push(`${stats.omitted_messages.toLocaleString()} archived`);
+  }
+  if (stats.recall_index_used) {
+    parts.push("recall-index");
+  }
+  if (stats.model) {
+    parts.push(stats.model);
+  }
+  return parts;
+}
+
+export function summarizeConversationTurnSeparator(
+  payload: Record<string, unknown>,
+): string {
+  return conversationTurnSeparatorParts(
+    normalizeConversationTurnSeparatorPayload(payload),
+  ).join(" · ");
+}
+
 function summarizeConversationEvent(event: ConversationStreamEvent): string {
   const payload = event.payload;
   if (event.event_type === "user_message") {
@@ -551,7 +678,7 @@ function summarizeConversationEvent(event: ConversationStreamEvent): string {
     return String(payload.instruction || "").trim() || "Steering instruction queued";
   }
   if (event.event_type === "turn_separator") {
-    return `${String(payload.tokens || 0)} tokens · ${String(payload.tool_count || 0)} tools`;
+    return summarizeConversationTurnSeparator(payload);
   }
   if (event.event_type === "turn_interrupted") {
     return String(payload.message || "Conversation turn interrupted");
@@ -715,8 +842,12 @@ export function conversationEventPills(event: ConversationStreamEvent): string[]
     }
   }
   if (event.event_type === "turn_separator") {
-    pills.push(`${String(payload.tokens || 0)} tokens`);
-    pills.push(`${String(payload.tool_count || 0)} tools`);
+    const stats = normalizeConversationTurnSeparatorPayload(payload);
+    pills.push(`${stats.tokens.toLocaleString()} tokens`);
+    if (stats.tool_count > 0) {
+      const suffix = stats.tool_count === 1 ? "" : "s";
+      pills.push(`${stats.tool_count.toLocaleString()} tool${suffix}`);
+    }
   }
   if (event.event_type === "content_indicator") {
     const blocks = Array.isArray(payload.content_blocks) ? payload.content_blocks.length : 0;

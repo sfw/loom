@@ -269,6 +269,38 @@ describe("ThreadsTab", () => {
     expect(screen.queryByText("2 matches")).not.toBeInTheDocument();
   });
 
+  it("renders detailed turn-separator stats without surfacing NaN values", () => {
+    mockApp.visibleConversationEvents = [
+      makeEvent(1, "assistant_text", { text: "All set." }),
+      makeEvent(2, "turn_separator", {
+        tokens: "not-a-number",
+        tool_count: "1",
+        tokens_per_second: "12.34",
+        latency_ms: "1500",
+        total_time_ms: "2600",
+        context_tokens: "64000",
+        context_messages: "22",
+        omitted_messages: "3",
+        recall_index_used: "true",
+        model: "gpt-5.4",
+      }),
+    ];
+
+    render(<ThreadsTab />);
+
+    expect(screen.getByText("0 tokens")).toBeInTheDocument();
+    expect(screen.getByText("1 tool")).toBeInTheDocument();
+    expect(screen.getByText("12.3 tok/s")).toBeInTheDocument();
+    expect(screen.getByText("1.5s latency")).toBeInTheDocument();
+    expect(screen.getByText("2.6s total")).toBeInTheDocument();
+    expect(screen.getByText("ctx 64,000 tok")).toBeInTheDocument();
+    expect(screen.getByText("22 ctx msg")).toBeInTheDocument();
+    expect(screen.getByText("3 archived")).toBeInTheDocument();
+    expect(screen.getByText("recall-index")).toBeInTheDocument();
+    expect(screen.getByText("gpt-5.4")).toBeInTheDocument();
+    expect(screen.queryByText(/NaN tokens/i)).not.toBeInTheDocument();
+  });
+
   it("renders markdown correctly when assistant text arrives in tiny streamed chunks", () => {
     mockApp.visibleConversationEvents = [
       makeEvent(1, "assistant_text", { text: "# Heading 1" }),

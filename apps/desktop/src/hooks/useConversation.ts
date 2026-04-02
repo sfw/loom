@@ -35,6 +35,7 @@ import {
   conversationEventPills,
   conversationEventTitle,
   matchesWorkspaceSearch,
+  normalizeConversationTurnSeparatorPayload,
   normalizeConversationPrompt,
   summarizeMessage,
 } from "../history";
@@ -1137,9 +1138,12 @@ export function useConversation(deps: {
       }
 
       if (event.event_type === "turn_separator") {
-        const tokens = Number(event.payload.tokens || 0);
-        const toolCount = Number(event.payload.tool_count || 0);
-        nextLastTurnStats = { tokens, tool_count: toolCount, visible: true };
+        const stats = normalizeConversationTurnSeparatorPayload(event.payload);
+        nextLastTurnStats = {
+          tokens: stats.tokens,
+          tool_count: stats.tool_count,
+          visible: true,
+        };
         nextConversationStreaming = false;
         nextStreamingText = "";
         nextStreamingThinking = "";

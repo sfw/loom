@@ -37,10 +37,12 @@ import {
   type ConversationTimelineItem,
 } from "@/conversationTimeline";
 import {
+  conversationTurnSeparatorParts,
   conversationApprovalPreview,
   conversationEventDetail,
   conversationEventPills,
   conversationEventTitle,
+  normalizeConversationTurnSeparatorPayload,
   summarizeMessage,
 } from "../history";
 import {
@@ -1524,18 +1526,19 @@ const TimelineRowContent = React.memo(function TimelineRowContent({
 
 function ConversationEventCard({ event }: { event: ConversationStreamEvent }) {
   if (event.event_type === "turn_separator") {
-    const tokens = Number(event.payload.tokens || 0);
-    const toolCount = Number(event.payload.tool_count || 0);
+    const stats = normalizeConversationTurnSeparatorPayload(event.payload);
+    const parts = conversationTurnSeparatorParts(stats);
     return (
       <div className="flex items-center justify-center gap-3 py-2">
         <div className="h-px flex-1 bg-zinc-800" />
-        <div className="flex items-center gap-2 text-[10px] text-zinc-600">
-          <Zap size={10} />
-          <span className="tabular-nums">{tokens.toLocaleString()} tokens</span>
-          <span>·</span>
-          <span className="tabular-nums">
-            {toolCount} tool{toolCount !== 1 ? "s" : ""}
-          </span>
+        <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-[10px] text-zinc-600">
+          <Zap size={10} className="shrink-0" />
+          {parts.map((part, index) => (
+            <React.Fragment key={`${part}-${index}`}>
+              {index > 0 && <span aria-hidden="true">·</span>}
+              <span className="tabular-nums">{part}</span>
+            </React.Fragment>
+          ))}
         </div>
         <div className="h-px flex-1 bg-zinc-800" />
       </div>

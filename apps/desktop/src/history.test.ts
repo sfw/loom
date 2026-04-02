@@ -100,6 +100,34 @@ describe("history helpers", () => {
     ]);
   });
 
+  it("sanitizes and expands turn-separator conversation stats", () => {
+    const turnSeparatorEvent: ConversationStreamEvent = {
+      ...askUserEvent,
+      event_type: "turn_separator",
+      payload: {
+        tokens: "not-a-number",
+        tool_count: "1",
+        tokens_per_second: "12.34",
+        latency_ms: "1500",
+        total_time_ms: "2600",
+        context_tokens: "64000",
+        context_messages: "22",
+        omitted_messages: "3",
+        recall_index_used: "true",
+        model: "gpt-5.4",
+      },
+    };
+
+    expect(conversationEventTitle(turnSeparatorEvent)).toBe("Turn completed");
+    expect(conversationEventDetail(turnSeparatorEvent)).toBe(
+      "1 tool · 0 tokens · 12.3 tok/s · 1.5s latency · 2.6s total · ctx 64,000 tok · 22 ctx msg · 3 archived · recall-index · gpt-5.4",
+    );
+    expect(conversationEventPills(turnSeparatorEvent)).toEqual([
+      "0 tokens",
+      "1 tool",
+    ]);
+  });
+
   it("treats empty claim verification summaries as noise", () => {
     const claimSummary: RunTimelineEvent = {
       ...runEvent,
