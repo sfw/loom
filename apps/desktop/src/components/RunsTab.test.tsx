@@ -1,6 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import RunsTab from "./RunsTab";
 
@@ -14,6 +14,10 @@ vi.mock("@/context/AppContext", () => ({
 }));
 
 describe("RunsTab", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   beforeEach(() => {
     mockApp = {
       filteredRuns: [],
@@ -53,9 +57,11 @@ describe("RunsTab", () => {
       handleRunControl: vi.fn(async () => {}),
       handleDeleteRun: vi.fn(async () => {}),
       handleRestartRun: vi.fn(async () => {}),
+      handleRefreshWorkspaceFiles: vi.fn(async () => {}),
       handleSendRunMessage: vi.fn(async () => {}),
       handleOpenWorkspaceFile: vi.fn(async () => {}),
       refreshRun: vi.fn(async () => {}),
+      refreshWorkspaceArtifacts: vi.fn(async () => {}),
       stepRunMatch: vi.fn(),
       selectedWorkspaceId: "workspace-1",
       workspaceSearchQuery: "",
@@ -69,7 +75,6 @@ describe("RunsTab", () => {
       replyingApprovalId: "",
       handleReplyApproval: vi.fn(async () => {}),
       loadedWorkspaceFileEntries: [],
-      loadWorkspaceDirectory: vi.fn(async () => {}),
       workspaceArtifacts: [],
       recentWorkspaceArtifacts: [],
       setActiveTab: vi.fn(),
@@ -232,6 +237,30 @@ describe("RunsTab", () => {
     expect(
       screen.getAllByText("Decision-grade investment workflow for public equities and private companies.").length,
     ).toBeGreaterThan(0);
+  });
+
+  it("refreshes launcher context when the runs tab mounts and when the window regains focus", () => {
+    vi.useFakeTimers();
+
+    render(<RunsTab />);
+
+    expect(mockApp.handleRefreshWorkspaceFiles.mock.calls.length).toBeGreaterThan(0);
+    expect(mockApp.refreshWorkspaceArtifacts).toHaveBeenLastCalledWith(
+      "workspace-1",
+      { force: true },
+    );
+
+    mockApp.handleRefreshWorkspaceFiles.mockClear();
+    mockApp.refreshWorkspaceArtifacts.mockClear();
+
+    vi.advanceTimersByTime(1001);
+    window.dispatchEvent(new Event("focus"));
+
+    expect(mockApp.handleRefreshWorkspaceFiles).toHaveBeenCalledTimes(1);
+    expect(mockApp.refreshWorkspaceArtifacts).toHaveBeenCalledWith(
+      "workspace-1",
+      { force: true },
+    );
   });
 
   it("shows an Instructions section with timestamped instruction history", () => {
@@ -489,6 +518,30 @@ describe("RunsTab", () => {
     expect(suggestions[0]).toHaveTextContent("research");
   });
 
+  it("filters out stale artifact suggestions when the artifact is no longer on disk", () => {
+    mockApp.workspaceArtifacts = [
+      {
+        path: "renamed-folder/report.md",
+        category: "document",
+        source: "seal",
+        sha256: "",
+        size_bytes: 2048,
+        exists_on_disk: false,
+        is_intermediate: false,
+        created_at: "2026-03-28T10:00:00Z",
+        tool_name: "",
+        subtask_ids: [],
+        phase_ids: [],
+        facets: {},
+      },
+    ];
+
+    render(<RunsTab />);
+
+    expect(screen.queryByText("report.md")).not.toBeInTheDocument();
+    expect(screen.queryByText("recent output")).not.toBeInTheDocument();
+  });
+
   it("prioritizes folders ahead of files in workspace context suggestions", async () => {
     const user = userEvent.setup();
     mockApp.loadedWorkspaceFileEntries = [
@@ -523,6 +576,53 @@ describe("RunsTab", () => {
 
     expect(suggestions[0]).toHaveTextContent("research");
     expect(suggestions[1]).toHaveTextContent("research-summary.md");
+  });
+
+  it("drops attached paths that disappear after a background refresh", async () => {
+    const user = userEvent.setup();
+    mockApp.workspaceArtifacts = [
+      {
+        path: "old-name/report.md",
+        category: "document",
+        source: "seal",
+        sha256: "",
+        size_bytes: 2048,
+        exists_on_disk: true,
+        is_intermediate: false,
+        created_at: "2026-03-28T10:00:00Z",
+        tool_name: "",
+        subtask_ids: [],
+        phase_ids: [],
+        facets: {},
+      },
+    ];
+
+    const { rerender } = render(<RunsTab />);
+
+    await user.click(screen.getByRole("button", { name: /report\.md/i }));
+    expect(screen.getByText("old-name/report.md")).toBeInTheDocument();
+
+    mockApp.workspaceArtifacts = [
+      {
+        path: "old-name/report.md",
+        category: "document",
+        source: "seal",
+        sha256: "",
+        size_bytes: 2048,
+        exists_on_disk: false,
+        is_intermediate: false,
+        created_at: "2026-03-28T10:00:00Z",
+        tool_name: "",
+        subtask_ids: [],
+        phase_ids: [],
+        facets: {},
+      },
+    ];
+
+    rerender(<RunsTab />);
+
+    expect(screen.queryByText("old-name/report.md")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /report\.md/i })).not.toBeInTheDocument();
   });
 
   it("shows more suggested context items by default inside a scrollable pane", () => {

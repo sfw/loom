@@ -24,6 +24,7 @@ import {
   type ConversationSummary,
   type NotificationEvent,
   type RunDetail,
+  type RunSummary,
   type RuntimeStatus,
   type WorkspaceArtifact,
   type WorkspaceInventory,
@@ -125,6 +126,12 @@ export interface WorkspaceActions {
   focusSearch: () => void;
   refreshWorkspaceList: (preferredWorkspaceId?: string) => Promise<void>;
   refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
+  refreshWorkspaceArtifacts: (
+    workspaceId: string,
+    options?: {
+      force?: boolean;
+    },
+  ) => Promise<void>;
   refreshApprovalInbox: (workspaceId: string) => Promise<void>;
   syncConversationSummary: (
     detail: ConversationSummary | ConversationDetail,
@@ -150,7 +157,7 @@ export interface WorkspaceActions {
     },
   ) => void;
   removeApprovalItem: (itemId: string, workspaceId?: string) => void;
-  syncRunDetail: (detail: RunDetail) => void;
+  syncRunDetail: (detail: RunSummary | RunDetail) => void;
   removeRunSummary: (runId: string, workspaceId?: string) => void;
 }
 
@@ -390,10 +397,14 @@ export function useWorkspace(deps: {
     };
   }
 
-  function buildRunRow(detail: RunDetail, normalizedStatus: string): WorkspaceRunRow {
+  function buildRunRow(detail: RunSummary | RunDetail, normalizedStatus: string): WorkspaceRunRow {
+    const detailWorkspace =
+      "workspace" in detail && detail.workspace && typeof detail.workspace === "object"
+        ? detail.workspace
+        : null;
     return {
-      id: detail.id,
-      workspace_id: String(detail.workspace_id || detail.workspace?.id || "").trim(),
+      id: String(detail.id || "").trim(),
+      workspace_id: String(detail.workspace_id || detailWorkspace?.id || "").trim(),
       workspace_path: String(detail.workspace_path || "").trim(),
       goal: String(detail.goal || "").trim(),
       status: normalizedStatus,
@@ -545,9 +556,15 @@ export function useWorkspace(deps: {
     applyWorkspaceOverview(workspaceId, overviewPayload);
   });
 
-  const refreshWorkspaceArtifactsState = useEffectEvent(async (workspaceId: string) => {
+  const refreshWorkspaceArtifactsState = useEffectEvent(async (
+    workspaceId: string,
+    options?: {
+      force?: boolean;
+    },
+  ) => {
+    const force = options?.force === true;
     if (
-      loadedWorkspaceArtifactsIdRef.current === workspaceId
+      (!force && loadedWorkspaceArtifactsIdRef.current === workspaceId)
       || loadingWorkspaceArtifactsIdRef.current === workspaceId
     ) {
       return;
@@ -643,6 +660,15 @@ export function useWorkspace(deps: {
     }
     setApprovalInbox(approvalPayload);
     await refreshVisibleWorkspaceTabState(workspaceId);
+  });
+
+  const refreshWorkspaceArtifacts = useEffectEvent(async (
+    workspaceId: string,
+    options?: {
+      force?: boolean;
+    },
+  ) => {
+    await refreshWorkspaceArtifactsState(workspaceId, options);
   });
 
   const refreshApprovalInbox = useEffectEvent(async (workspaceId: string) => {
@@ -884,17 +910,30 @@ export function useWorkspace(deps: {
     patchPendingApprovalCount(nextWorkspaceId, -1);
   });
 
-  const syncRunDetail = useEffectEvent((detail: RunDetail) => {
-    const workspaceId = String(detail.workspace_id || detail.workspace?.id || "").trim();
+  const syncRunDetail = useEffectEvent((detail: RunSummary | RunDetail) => {
+    const currentOverview = overviewRef.current;
+    const currentWorkspaceRun = currentOverview?.recent_runs.find((run) => run.id === detail.id);
+    const detailWorkspace =
+      "workspace" in detail && detail.workspace && typeof detail.workspace === "object"
+        ? detail.workspace
+        : null;
+    const workspaceId = String(
+      detail.workspace_id
+      || detailWorkspace?.id
+      || (
+        currentOverview?.workspace?.id
+        && currentWorkspaceRun
+          ? currentOverview.workspace.id
+          : ""
+      ),
+    ).trim();
     const normalizedStatus = normalizeRunStatus(detail.status);
     if (!workspaceId || !normalizedStatus) {
       return;
     }
-
-    const currentOverview = overviewRef.current;
     const nextRow = buildRunRow(detail, normalizedStatus);
     const existingRun = currentOverview?.workspace?.id === workspaceId
-      ? currentOverview.recent_runs.find((run) => run.id === detail.id)
+      ? (currentWorkspaceRun || null)
       : null;
     const previousActive = existingRun ? isRunActiveStatus(existingRun.status) : false;
     const nextActive = isRunActiveStatus(normalizedStatus);
@@ -1875,6 +1914,7 @@ export function useWorkspace(deps: {
     focusSearch,
     refreshWorkspaceList,
     refreshWorkspaceSurface,
+    refreshWorkspaceArtifacts,
     refreshApprovalInbox,
     syncConversationSummary,
     setConversationProcessing,

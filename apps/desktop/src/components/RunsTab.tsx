@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect, useCallback, useDeferredValue, lazy, Suspense, type FormEvent } from "react";
+import { useState, useMemo, useRef, useEffect, useEffectEvent, useCallback, useDeferredValue, lazy, Suspense, type FormEvent } from "react";
 
 const Markdown = lazy(() => import("react-markdown"));
 import {
@@ -630,9 +630,10 @@ export default function RunsTab() {
     handleOpenWorkspaceFile,
     handleReplyApproval,
     handleRestartRun,
+    handleRefreshWorkspaceFiles,
     handleRunControl,
     handleSendRunMessage,
-    loadWorkspaceDirectory,
+    refreshWorkspaceArtifacts,
     refreshRun,
     setActiveTab,
     setApprovalReplyDrafts,
@@ -650,9 +651,11 @@ export default function RunsTab() {
   const [processQuery, setProcessQuery] = useState("");
   const [attachQuery, setAttachQuery] = useState("");
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
+  const lastLauncherContextRefreshAtRef = useRef(0);
 
   const recentWorkspaceArtifacts = useMemo(
     () => [...workspaceArtifacts]
+      .filter((artifact) => artifact.exists_on_disk)
       .sort((left, right) => {
         const leftTime = Date.parse(left.created_at || "");
         const rightTime = Date.parse(right.created_at || "");
@@ -798,16 +801,56 @@ export default function RunsTab() {
       .slice(0, query ? 24 : 18);
   }, [attachQuery, attachedPaths, attachablePathOptions]);
 
-  useEffect(() => {
-    if (!selectedRunId && selectedWorkspaceId) {
-      void loadWorkspaceDirectory(selectedWorkspaceId, "");
+  const refreshLauncherContext = useEffectEvent((force = false) => {
+    if (selectedRunId || !selectedWorkspaceId) {
+      return;
     }
-  }, [loadWorkspaceDirectory, selectedRunId, selectedWorkspaceId]);
+    const now = Date.now();
+    if (!force && (now - lastLauncherContextRefreshAtRef.current) < 1000) {
+      return;
+    }
+    lastLauncherContextRefreshAtRef.current = now;
+    void Promise.allSettled([
+      handleRefreshWorkspaceFiles(),
+      refreshWorkspaceArtifacts(selectedWorkspaceId, { force: true }),
+    ]);
+  });
+
+  useEffect(() => {
+    if (selectedRunId || !selectedWorkspaceId) {
+      return undefined;
+    }
+    refreshLauncherContext(true);
+
+    function handleWindowFocus() {
+      refreshLauncherContext();
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        refreshLauncherContext();
+      }
+    }
+
+    window.addEventListener("focus", handleWindowFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("focus", handleWindowFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [refreshLauncherContext, selectedRunId, selectedWorkspaceId]);
 
   useEffect(() => {
     setAttachedPaths([]);
     setAttachQuery("");
   }, [selectedWorkspaceId]);
+
+  useEffect(() => {
+    setAttachedPaths((current) => {
+      const next = current.filter((path) => attachablePathLookup.has(path));
+      return next.length === current.length ? current : next;
+    });
+  }, [attachablePathLookup]);
 
   function toggleAttachedPath(path: string) {
     setAttachedPaths((current) =>
@@ -1482,6 +1525,12 @@ function RunDetailView({
   const deferredRunHistoryQuery = useDeferredValue(runHistoryQuery);
   const deferredActivitySearch = useDeferredValue(activitySearch);
   const [showFullActivity, setShowFullActivity] = useState(false);
+  const [timelineNowMs, setTimelineNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setTimelineNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
   // Build plan graph: prefer authoritative plan_subtasks from API, fall back to timeline extraction
   const planNodes = useMemo(() => {
     const apiPlan = runDetail.plan_subtasks;
@@ -1555,12 +1604,12 @@ function RunDetailView({
       const needle = deferredActivitySearch.toLowerCase();
       events = events.filter((e) => {
         const title = runTimelineTitle(e).toLowerCase();
-        const detail = runTimelineDetail(e).toLowerCase();
+        const detail = runTimelineDetail(e, timelineNowMs).toLowerCase();
         return title.includes(needle) || detail.includes(needle) || e.event_type.includes(needle);
       });
     }
     return events;
-  }, [visibleRunTimeline, hiddenCategories, deferredActivitySearch]);
+  }, [visibleRunTimeline, hiddenCategories, deferredActivitySearch, timelineNowMs]);
   const hasActivityFilter = Boolean(
     deferredRunHistoryQuery.trim() || deferredActivitySearch.trim(),
   );
@@ -2204,7 +2253,7 @@ function RunDetailView({
             >
               {displayedActivity.map((event, index) => {
                 const title = runTimelineTitle(event);
-                const detail = runTimelineDetail(event);
+                const detail = runTimelineDetail(event, timelineNowMs);
                 const { files, duration, metrics } = extractEventHighlights(event);
                 const refIndex = displayableRunArtifacts.length + activityIndexOffset + index;
                 const hasStructured = files.length > 0 || duration || metrics.length > 0;

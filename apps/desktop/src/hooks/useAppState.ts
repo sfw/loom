@@ -400,6 +400,12 @@ export interface AppActions {
   stepRunMatch: (delta: number) => void;
   refreshWorkspaceList: (preferredWorkspaceId?: string) => Promise<void>;
   refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
+  refreshWorkspaceArtifacts: (
+    workspaceId: string,
+    options?: {
+      force?: boolean;
+    },
+  ) => Promise<void>;
   refreshApprovalInbox: (workspaceId: string) => Promise<void>;
   syncConversationSummary: (
     detail: ConversationDetail | ConversationSummary,
@@ -704,6 +710,7 @@ export function useAppState(): AppState & AppActions {
     focusSearch: workspace.focusSearch,
     refreshWorkspaceList: workspace.refreshWorkspaceList,
     refreshWorkspaceSurface: workspace.refreshWorkspaceSurface,
+    refreshWorkspaceArtifacts: workspace.refreshWorkspaceArtifacts,
     refreshApprovalInbox: workspace.refreshApprovalInbox,
     syncConversationSummary: workspace.syncConversationSummary,
     setConversationProcessing: workspace.setConversationProcessing,
