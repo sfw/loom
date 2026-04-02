@@ -1044,7 +1044,7 @@ export function useRuns(deps: {
   function focusRunComposer() {
     setActiveTab("runs");
     // scrollToSection inlined
-    runComposerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    runComposerRef.current?.scrollIntoView({ behavior: "auto", block: "start" });
     window.setTimeout(() => {
       const target = runComposerRef.current?.querySelector("textarea");
       if (target instanceof HTMLTextAreaElement) {
@@ -1055,7 +1055,7 @@ export function useRuns(deps: {
 
   function scrollRunMatchIntoView(index: number) {
     const target = runMatchRefs.current[index];
-    target?.scrollIntoView({ behavior: "smooth", block: "center" });
+    target?.scrollIntoView({ behavior: "auto", block: "center" });
   }
 
   function stepRunMatch(delta: number) {

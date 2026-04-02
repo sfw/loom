@@ -382,6 +382,41 @@ describe("RunsTab", () => {
     expect(screen.getByText("list_directory → path-300.txt")).toBeInTheDocument();
   });
 
+  it("keeps the run activity timeline on instant scrolling to avoid desktop scroll animation crashes", () => {
+    mockApp.selectedRunId = "run-abc";
+    mockApp.runDetail = {
+      id: "run-abc",
+      goal: "Review the site",
+      status: "executing",
+      process_name: "",
+      plan_subtasks: [],
+    };
+    mockApp.visibleRunTimeline = [
+      {
+        id: 1,
+        task_id: "run-abc",
+        run_id: "exec-run-1",
+        correlation_id: "corr-1",
+        event_id: "evt-1",
+        sequence: 1,
+        timestamp: "2026-03-28T16:00:00Z",
+        event_type: "tool_call_started",
+        source_component: "tests",
+        schema_version: 1,
+        data: {
+          tool_name: "list_directory",
+          args: {
+            path: "path-1.txt",
+          },
+        },
+      },
+    ];
+
+    const { container } = render(<RunsTab />);
+
+    expect(container.querySelector(".scroll-smooth")).toBeNull();
+  });
+
   it("groups processes into custom, installed, and built-in sections", () => {
     mockApp.overview = {
       workspace: { canonical_path: "/tmp/workspace" },

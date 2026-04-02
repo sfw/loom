@@ -217,7 +217,10 @@ function ScrollButton({ direction, scrollRef }: { direction: "up" | "down"; scro
     const tick = () => {
       const el = scrollRef.current;
       if (!el) return;
-      el.scrollBy({ top: direction === "up" ? -speedRef.current : speedRef.current });
+      el.scrollBy({
+        top: direction === "up" ? -speedRef.current : speedRef.current,
+        behavior: "auto",
+      });
       speedRef.current = Math.min(speedRef.current + 20, 400);
       intervalRef.current = window.setTimeout(tick, 80);
     };
@@ -2249,7 +2252,7 @@ function RunDetailView({
             <div
               ref={activityScrollRef}
               onScroll={handleActivityScroll}
-              className="space-y-1.5 max-h-[60vh] overflow-y-auto rounded-lg scroll-smooth"
+              className="space-y-1.5 max-h-[60vh] overflow-y-auto rounded-lg"
             >
               {displayedActivity.map((event, index) => {
                 const title = runTimelineTitle(event);
