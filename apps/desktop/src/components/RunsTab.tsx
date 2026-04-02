@@ -1327,13 +1327,13 @@ function RunLoadingView({
           <ArrowLeft size={12} />
           Back to launcher
         </button>
-        <div className="flex items-center gap-3">
+        <div className="flex items-start gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#6b7a5e]/15">
             {loading ? <Loader2 className="h-5 w-5 animate-spin text-[#a3b396]" /> : <AlertTriangle className="h-5 w-5 text-amber-400" />}
           </div>
-          <div className="min-w-0">
-            <h2 className="truncate text-lg font-semibold text-zinc-100">{title}</h2>
-            <p className="truncate text-xs text-zinc-500">
+          <div className="min-w-0 flex-1">
+            <h2 className="text-lg font-semibold leading-snug text-zinc-100 whitespace-pre-wrap break-words">{title}</h2>
+            <p className="mt-1 text-xs text-zinc-500 break-words">
               {processName ? `${processName} • ` : ""}{runId}
             </p>
           </div>
@@ -1673,7 +1673,7 @@ function RunDetailView({
   return (
     <div className="flex h-full flex-col overflow-hidden bg-[#0f0f12]">
       {/* --- Header bar --- */}
-      <header className="flex items-center gap-3 border-b border-zinc-800/60 px-5 py-3 shrink-0 bg-zinc-900/50">
+      <header className="flex items-start gap-3 border-b border-zinc-800/60 px-5 py-3 shrink-0 bg-zinc-900/50">
         <button
           type="button"
           onClick={() => setSelectedRunId("")}
@@ -1683,8 +1683,8 @@ function RunDetailView({
           <ArrowLeft size={16} />
         </button>
 
-        <div className="flex-1 min-w-0">
-          <p className="text-sm font-semibold text-zinc-100 truncate">
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold leading-relaxed text-zinc-100 whitespace-pre-wrap break-words">
             {runDetail.goal || "Untitled run"}
           </p>
           <div className="flex items-center gap-2 mt-0.5">

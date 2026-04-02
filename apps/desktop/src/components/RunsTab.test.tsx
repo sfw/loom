@@ -97,6 +97,23 @@ describe("RunsTab", () => {
     expect(screen.queryByText("Launch a Run")).not.toBeInTheDocument();
   });
 
+  it("wraps long run goals in the selected run header instead of truncating them", () => {
+    const goal = "We are a film and TV production house that will be attending Banff World Media Festival in 2026 and need the entire prompt visible in the run header";
+    mockApp.selectedRunId = "run-abc";
+    mockApp.runDetail = {
+      id: "run-abc",
+      goal,
+      status: "failed",
+      process_name: "ad-hoc",
+      plan_subtasks: [],
+    };
+
+    render(<RunsTab />);
+
+    expect(screen.getByText(goal)).toHaveClass("whitespace-pre-wrap", "break-words");
+    expect(screen.getByText(goal)).not.toHaveClass("truncate");
+  });
+
   it("does not mount tool-call payloads until the row is expanded", async () => {
     const user = userEvent.setup();
     mockApp.selectedRunId = "run-abc";
