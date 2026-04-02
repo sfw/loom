@@ -24,6 +24,7 @@ import {
   type RunArtifact,
   type RunConversationEntry,
   type RunDetail,
+  type RunSummary,
   type RunStreamEvent,
   type RunTimelineEvent,
   type WorkspaceOverview,
@@ -148,6 +149,31 @@ function canonicalizeRunDetail(detail: RunDetail): RunDetail {
     : detail;
 }
 
+function buildOptimisticRunSummary(params: {
+  runId: string;
+  executionRunId?: string;
+  workspaceId: string;
+  workspacePath: string;
+  goal: string;
+  processName: string;
+  status: string;
+}): RunSummary {
+  const timestamp = new Date().toISOString();
+  return {
+    id: params.runId,
+    workspace_id: params.workspaceId,
+    workspace_path: params.workspacePath,
+    goal: params.goal,
+    status: params.status,
+    created_at: timestamp,
+    updated_at: timestamp,
+    execution_run_id: String(params.executionRunId || "").trim(),
+    process_name: params.processName,
+    linked_conversation_ids: [],
+    changed_files_count: 0,
+  };
+}
+
 function streamEventToTimelineEvent(event: {
   id?: number;
   task_id: string;
@@ -241,7 +267,7 @@ export interface RunsState {
   runCanPause: boolean;
   runCanResume: boolean;
   runCanMessage: boolean;
-  selectedRunSummary: RunDetail | { id: string; goal: string; status: string; created_at: string; updated_at: string; process_name: string; linked_conversation_ids: string[] } | null;
+  selectedRunSummary: RunDetail | RunSummary | null;
   filteredRunArtifacts: RunArtifact[];
   filteredRunTimeline: RunTimelineEvent[];
   visibleRunArtifacts: RunArtifact[];
@@ -290,7 +316,7 @@ export function useRuns(deps: {
   setNotice: React.Dispatch<React.SetStateAction<string>>;
   setActiveTab: React.Dispatch<React.SetStateAction<ViewTab>>;
   refreshWorkspaceSurface?: (workspaceId: string) => Promise<void>;
-  syncRunDetail?: (detail: RunDetail) => void;
+  syncRunDetail?: (detail: RunSummary | RunDetail) => void;
   removeRunSummary?: (runId: string, workspaceId?: string) => void;
 }): RunsState & RunsActions {
   const {
@@ -467,7 +493,7 @@ export function useRuns(deps: {
     }
   });
 
-  const pushRunDetailToWorkspaceState = useEffectEvent((detail: RunDetail | null) => {
+  const pushRunDetailToWorkspaceState = useEffectEvent((detail: RunSummary | RunDetail | null) => {
     if (!detail) {
       return;
     }
@@ -842,15 +868,28 @@ export function useRuns(deps: {
     setError("");
     setNotice("");
     try {
+      const processName = runProcess.trim();
       const created = await createTask({
         goal,
         workspace: overview.workspace.canonical_path,
-        process: runProcess.trim() || undefined,
+        process: processName || undefined,
         approval_mode: runApprovalMode || "auto",
         context: extraContext,
         auto_subfolder: true,
       });
       const nextRunId = created.task_id || created.run_id;
+      const optimisticStatus = normalizeRunStatus(created.status) || "planning";
+      if (nextRunId && selectedWorkspaceId) {
+        pushRunDetailToWorkspaceState(buildOptimisticRunSummary({
+          runId: nextRunId,
+          executionRunId: created.run_id,
+          workspaceId: selectedWorkspaceId,
+          workspacePath: overview.workspace.canonical_path,
+          goal,
+          processName,
+          status: optimisticStatus,
+        }));
+      }
       startTransition(() => {
         setSelectedRunId(nextRunId);
         setActiveTab("runs");
@@ -935,6 +974,23 @@ export function useRuns(deps: {
     try {
       const created = await restartRun(selectedRunId);
       const nextRunId = created.task_id || created.run_id;
+      const optimisticStatus = normalizeRunStatus(created.status) || "planning";
+      const fallbackProcessName =
+        runDetail?.process_name
+        || selectedRunSummary?.process_name
+        || "";
+      const fallbackGoal = runDetail?.goal || selectedRunSummary?.goal || "";
+      if (nextRunId && selectedWorkspaceId && overview?.workspace.canonical_path) {
+        pushRunDetailToWorkspaceState(buildOptimisticRunSummary({
+          runId: nextRunId,
+          executionRunId: created.run_id,
+          workspaceId: selectedWorkspaceId,
+          workspacePath: overview.workspace.canonical_path,
+          goal: fallbackGoal,
+          processName: fallbackProcessName,
+          status: optimisticStatus,
+        }));
+      }
       startTransition(() => {
         setSelectedRunId(nextRunId);
         setActiveTab("runs");

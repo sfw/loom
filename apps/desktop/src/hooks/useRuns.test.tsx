@@ -149,6 +149,14 @@ describe("useRuns", () => {
     expect(setNotice).toHaveBeenCalledWith("Launched run task-123.");
     expect(setError).not.toHaveBeenCalledWith("Load failed");
     expect(refreshWorkspaceSurface).not.toHaveBeenCalled();
+    expect(syncRunDetail).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      id: "task-123",
+      workspace_id: "workspace-1",
+      workspace_path: "/tmp/workspace",
+      process_name: "seo-geo-review",
+      execution_run_id: "run-abc",
+      status: "executing",
+    }));
 
     rerender({ selectedRunId: "task-123" });
 
@@ -160,10 +168,11 @@ describe("useRuns", () => {
     expect(apiMocks.fetchRunDetail).toHaveBeenCalledWith("task-123");
     expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("task-123", { includeNoise: false });
     expect(apiMocks.fetchRunArtifacts).toHaveBeenCalledWith("task-123");
-    expect(syncRunDetail).toHaveBeenCalledWith(expect.objectContaining({
+    expect(syncRunDetail).toHaveBeenLastCalledWith(expect.objectContaining({
       id: "task-123",
       status: "executing",
     }));
+    expect(syncRunDetail).toHaveBeenCalledTimes(2);
     expect(refreshWorkspaceSurface).not.toHaveBeenCalled();
   });
 
