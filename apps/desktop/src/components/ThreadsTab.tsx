@@ -9,7 +9,11 @@ import React, {
 } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { useApp } from "@/context/AppContext";
+import {
+  shallowEqual,
+  useAppActions,
+  useAppSelector,
+} from "@/context/AppContext";
 import {
   deleteConversation,
   type ConversationApproval,
@@ -185,55 +189,88 @@ function conversationInputHistory(
 
 export default function ThreadsTab() {
   const {
-    selectedConversationId,
-    conversationDetail,
-    loadingConversationDetail,
-    conversationLoadError,
-    conversationStatus,
-    conversationStreaming,
-    conversationIsProcessing,
     conversationAwaitingApproval,
     conversationAwaitingInput,
+    conversationComposerMessage,
+    conversationDetail,
+    conversationHistoryQuery,
+    conversationInjectMessage,
+    conversationIsProcessing,
+    conversationLoadError,
+    conversationPhaseLabel,
+    conversationStatus,
+    conversationStreaming,
+    hasOlderMessages,
+    lastTurnStats,
+    loadingConversationDetail,
+    loadingOlderMessages,
+    overview,
     pendingConversationApproval,
     pendingConversationPrompt,
+    queuedMessages,
     quickReplyOptions,
-    conversationPhaseLabel,
-    visibleConversationMessages,
-    visibleConversationEvents,
-    conversationComposerMessage,
-    setConversationComposerMessage,
-    sendingConversationMessage,
-    conversationInjectMessage,
-    setConversationInjectMessage,
+    selectedConversationId,
+    selectedWorkspaceId,
     sendingConversationInject,
-    handleSendConversationMessage,
-    handleInjectConversationInstruction,
-    handleResolveConversationApproval,
-    handleQuickConversationReply,
-    handleStopConversationTurn,
+    sendingConversationMessage,
     streamingText,
     streamingThinking,
     streamingToolCalls,
-    lastTurnStats,
-    conversationHistoryQuery,
-    setConversationHistoryQuery,
-    queuedMessages,
-    editQueuedMessage,
-    cancelQueuedMessage,
-    setSelectedConversationId,
-    selectedWorkspaceId,
-    overview,
-    refreshWorkspaceSurface,
-    setSelectedWorkspaceFilePath,
-    setActiveTab,
+    visibleConversationEvents,
+    visibleConversationMessages,
     workspaceFilesByDirectory,
-    hasOlderMessages,
-    loadingOlderMessages,
+  } = useAppSelector((state) => ({
+    conversationAwaitingApproval: state.conversationAwaitingApproval,
+    conversationAwaitingInput: state.conversationAwaitingInput,
+    conversationComposerMessage: state.conversationComposerMessage,
+    conversationDetail: state.conversationDetail,
+    conversationHistoryQuery: state.conversationHistoryQuery,
+    conversationInjectMessage: state.conversationInjectMessage,
+    conversationIsProcessing: state.conversationIsProcessing,
+    conversationLoadError: state.conversationLoadError,
+    conversationPhaseLabel: state.conversationPhaseLabel,
+    conversationStatus: state.conversationStatus,
+    conversationStreaming: state.conversationStreaming,
+    hasOlderMessages: state.hasOlderMessages,
+    lastTurnStats: state.lastTurnStats,
+    loadingConversationDetail: state.loadingConversationDetail,
+    loadingOlderMessages: state.loadingOlderMessages,
+    overview: state.overview,
+    pendingConversationApproval: state.pendingConversationApproval,
+    pendingConversationPrompt: state.pendingConversationPrompt,
+    queuedMessages: state.queuedMessages,
+    quickReplyOptions: state.quickReplyOptions,
+    selectedConversationId: state.selectedConversationId,
+    selectedWorkspaceId: state.selectedWorkspaceId,
+    sendingConversationInject: state.sendingConversationInject,
+    sendingConversationMessage: state.sendingConversationMessage,
+    streamingText: state.streamingText,
+    streamingThinking: state.streamingThinking,
+    streamingToolCalls: state.streamingToolCalls,
+    visibleConversationEvents: state.visibleConversationEvents,
+    visibleConversationMessages: state.visibleConversationMessages,
+    workspaceFilesByDirectory: state.workspaceFilesByDirectory,
+  }), shallowEqual);
+  const {
+    cancelQueuedMessage,
+    editQueuedMessage,
+    handleInjectConversationInstruction,
+    handleQuickConversationReply,
+    handleResolveConversationApproval,
+    handleSendConversationMessage,
+    handleStopConversationTurn,
     loadOlderMessages,
+    removeConversationSummary,
     retryConversationLoad,
+    setActiveTab,
+    setConversationComposerMessage,
+    setConversationHistoryQuery,
+    setConversationInjectMessage,
     setError,
     setNotice,
-  } = useApp();
+    setSelectedConversationId,
+    setSelectedWorkspaceFilePath,
+  } = useAppActions();
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const timelineContainerRef = useRef<HTMLDivElement>(null);
@@ -921,10 +958,8 @@ export default function ThreadsTab() {
               }
               try {
                 await deleteConversation(selectedConversationId);
+                removeConversationSummary(selectedConversationId, selectedWorkspaceId);
                 setSelectedConversationId("");
-                if (selectedWorkspaceId) {
-                  await refreshWorkspaceSurface(selectedWorkspaceId);
-                }
                 setNotice("Thread deleted.");
               } catch (err) {
                 setError(err instanceof Error ? err.message : "Failed to delete thread.");

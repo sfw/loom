@@ -7,7 +7,11 @@ import {
   ChevronUp,
   Shield,
 } from "lucide-react";
-import { useApp } from "@/context/AppContext";
+import {
+  shallowEqual,
+  useAppActions,
+  useAppSelector,
+} from "@/context/AppContext";
 import { cn } from "@/lib/utils";
 import type { ProcessInfo } from "@/api";
 
@@ -16,18 +20,25 @@ type LaunchMode = "adhoc" | "process";
 export default function RunLauncher() {
   const {
     runGoal,
-    setRunGoal,
     runProcess,
-    setRunProcess,
     runApprovalMode,
-    setRunApprovalMode,
     launchingRun,
     selectedWorkspaceId,
-    overview,
     inventory,
+  } = useAppSelector((state) => ({
+    runGoal: state.runGoal,
+    runProcess: state.runProcess,
+    runApprovalMode: state.runApprovalMode,
+    launchingRun: state.launchingRun,
+    selectedWorkspaceId: state.selectedWorkspaceId,
+    inventory: state.inventory,
+  }), shallowEqual);
+  const {
+    setRunGoal,
+    setRunProcess,
+    setRunApprovalMode,
     handleLaunchRun,
-    setActiveTab,
-  } = useApp();
+  } = useAppActions();
 
   const [launchMode, setLaunchMode] = useState<LaunchMode>("adhoc");
   const [showAdvanced, setShowAdvanced] = useState(false);

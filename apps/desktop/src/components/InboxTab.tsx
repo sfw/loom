@@ -1,4 +1,8 @@
-import { useApp } from "@/context/AppContext";
+import {
+  shallowEqual,
+  useAppActions,
+  useAppSelector,
+} from "@/context/AppContext";
 import { cn } from "@/lib/utils";
 import {
   formatDate,
@@ -24,12 +28,17 @@ function kindBadge(kind: string) {
 
 function ApprovalCard({ item }: { item: ApprovalFeedItem }) {
   const {
-    approvalReplyDrafts,
+    draftText,
+    isReplying,
+  } = useAppSelector((state) => ({
+    draftText: state.approvalReplyDrafts[item.id] || "",
+    isReplying: state.replyingApprovalId === item.id,
+  }), shallowEqual);
+  const {
     setApprovalReplyDrafts,
-    replyingApprovalId,
     handleReplyApproval,
     handleSelectApprovalContext,
-  } = useApp();
+  } = useAppActions();
 
   const badge = kindBadge(item.kind);
   const isQuestion = item.kind === "task_question";
@@ -37,9 +46,6 @@ function ApprovalCard({ item }: { item: ApprovalFeedItem }) {
   const options = approvalQuestionOptions(item);
   const questionType = approvalQuestionType(item);
   const contextNote = approvalQuestionContext(item);
-  const draftText = approvalReplyDrafts[item.id] || "";
-  const isReplying = replyingApprovalId === item.id;
-
   return (
     <div className="rounded-xl border border-zinc-800/60 bg-zinc-900/50 p-4 transition-colors hover:border-zinc-700/60">
       {/* Header row: badge + timestamp */}
@@ -235,7 +241,9 @@ function ApprovalCard({ item }: { item: ApprovalFeedItem }) {
 }
 
 export default function InboxTab() {
-  const { filteredApprovalItems } = useApp();
+  const { filteredApprovalItems } = useAppSelector((state) => ({
+    filteredApprovalItems: state.filteredApprovalItems,
+  }), shallowEqual);
 
   return (
     <div className="flex h-full flex-col overflow-hidden">

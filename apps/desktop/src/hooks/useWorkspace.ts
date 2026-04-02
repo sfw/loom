@@ -20,6 +20,8 @@ import {
   patchWorkspace,
   subscribeNotificationsStream,
   type ApprovalFeedItem,
+  type ConversationDetail,
+  type ConversationSummary,
   type NotificationEvent,
   type RunDetail,
   type RuntimeStatus,
@@ -124,8 +126,36 @@ export interface WorkspaceActions {
   refreshWorkspaceList: (preferredWorkspaceId?: string) => Promise<void>;
   refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
   refreshApprovalInbox: (workspaceId: string) => Promise<void>;
+  syncConversationSummary: (
+    detail: ConversationSummary | ConversationDetail,
+    options?: {
+      incrementCount?: boolean;
+      processing?: boolean;
+      workspaceId?: string;
+    },
+  ) => void;
+  setConversationProcessing: (
+    conversationId: string,
+    processing: boolean,
+    options?: {
+      lastActiveAt?: string;
+      workspaceId?: string;
+    },
+  ) => void;
+  removeConversationSummary: (conversationId: string, workspaceId?: string) => void;
+  applyApprovalItem: (
+    item: ApprovalFeedItem,
+    options?: {
+      incrementCount?: boolean;
+    },
+  ) => void;
+  removeApprovalItem: (itemId: string, workspaceId?: string) => void;
   syncRunDetail: (detail: RunDetail) => void;
+  removeRunSummary: (runId: string, workspaceId?: string) => void;
 }
+
+type WorkspaceConversationRow = WorkspaceState["workspaceConversationRows"][number];
+type WorkspaceRunRow = WorkspaceState["workspaceRunRows"][number];
 
 // ---------------------------------------------------------------------------
 // Hook
@@ -197,12 +227,33 @@ export function useWorkspace(deps: {
   const [searchingWorkspace, setSearchingWorkspace] = useState(false);
 
   // Refs
+  const approvalInboxRef = useRef<ApprovalFeedItem[]>([]);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const inboxSectionRef = useRef<HTMLElement | null>(null);
   const workspaceSearchTimerRef = useRef<number | null>(null);
   const notificationRefreshTimerRef = useRef<number | null>(null);
+  const notificationRepairRef = useRef<{
+    approvals: boolean;
+    overview: boolean;
+    workspaceId: string;
+  }>({
+    approvals: false,
+    overview: false,
+    workspaceId: "",
+  });
   const lastSeenNotificationStreamIdRef = useRef(0);
   const previousWorkspaceIdRef = useRef("");
+  const previousWorkspaceDraftSourceRef = useRef<{
+    id: string;
+    name: string;
+    note: string;
+    tags: string;
+  }>({
+    id: "",
+    name: "",
+    note: "",
+    tags: "",
+  });
   const selectedWorkspaceIdRef = useRef(selectedWorkspaceId);
   const previousSelectedConversationIdRef = useRef(selectedConversationId);
   const previousSelectedRunIdRef = useRef(selectedRunId);
@@ -259,6 +310,235 @@ export function useWorkspace(deps: {
       });
     });
   });
+
+  function latestTimestamp(...values: Array<string | null | undefined>): string {
+    let latest = "";
+    for (const value of values) {
+      const nextValue = String(value || "").trim();
+      if (nextValue && nextValue > latest) {
+        latest = nextValue;
+      }
+    }
+    return latest;
+  }
+
+  function sortConversationRows(rows: WorkspaceConversationRow[]): WorkspaceConversationRow[] {
+    return rows
+      .slice()
+      .sort((left, right) =>
+        latestTimestamp(right.last_active_at, right.started_at)
+          .localeCompare(latestTimestamp(left.last_active_at, left.started_at)),
+      );
+  }
+
+  function sortRunRows(rows: WorkspaceRunRow[]): WorkspaceRunRow[] {
+    return rows
+      .slice()
+      .sort((left, right) =>
+        latestTimestamp(right.updated_at, right.created_at)
+          .localeCompare(latestTimestamp(left.updated_at, left.created_at)),
+      );
+  }
+
+  function sortWorkspaceSummaries(rows: WorkspaceSummary[]): WorkspaceSummary[] {
+    return rows
+      .slice()
+      .sort((left, right) => {
+        if (left.sort_order !== right.sort_order) {
+          return left.sort_order - right.sort_order;
+        }
+        const activityCompare = latestTimestamp(
+          right.last_activity_at,
+          right.updated_at,
+          right.created_at,
+        ).localeCompare(latestTimestamp(
+          left.last_activity_at,
+          left.updated_at,
+          left.created_at,
+        ));
+        if (activityCompare !== 0) {
+          return activityCompare;
+        }
+        return String(left.display_name || "").localeCompare(String(right.display_name || ""));
+      });
+  }
+
+  function buildConversationRow(
+    detail: ConversationSummary | ConversationDetail,
+    options?: {
+      processing?: boolean;
+      workspaceId?: string;
+    },
+  ): WorkspaceConversationRow {
+    return {
+      id: detail.id,
+      workspace_id: String(options?.workspaceId || detail.workspace_id || "").trim(),
+      workspace_path: String(detail.workspace_path || "").trim(),
+      model_name: String(detail.model_name || "").trim(),
+      title: String(detail.title || "").trim(),
+      turn_count: Number(detail.turn_count || 0),
+      total_tokens: Number(detail.total_tokens || 0),
+      last_active_at: String(detail.last_active_at || "").trim(),
+      started_at: String(detail.started_at || "").trim(),
+      is_active:
+        typeof options?.processing === "boolean"
+          ? options.processing
+          : Boolean("is_active" in detail && detail.is_active),
+      linked_run_ids: Array.isArray(detail.linked_run_ids)
+        ? detail.linked_run_ids.filter(Boolean)
+        : [],
+    };
+  }
+
+  function buildRunRow(detail: RunDetail, normalizedStatus: string): WorkspaceRunRow {
+    return {
+      id: detail.id,
+      workspace_id: String(detail.workspace_id || detail.workspace?.id || "").trim(),
+      workspace_path: String(detail.workspace_path || "").trim(),
+      goal: String(detail.goal || "").trim(),
+      status: normalizedStatus,
+      created_at: String(detail.created_at || "").trim(),
+      updated_at: String(detail.updated_at || "").trim(),
+      execution_run_id: String(detail.execution_run_id || "").trim(),
+      process_name: String(detail.process_name || "").trim(),
+      linked_conversation_ids: Array.isArray(detail.linked_conversation_ids)
+        ? detail.linked_conversation_ids.filter(Boolean)
+        : [],
+      changed_files_count: Number(detail.changed_files_count || 0),
+    };
+  }
+
+  function notificationPayloadValue(
+    payload: Record<string, unknown>,
+    ...keys: string[]
+  ): string {
+    for (const key of keys) {
+      const value = String(payload[key] || "").trim();
+      if (value) {
+        return value;
+      }
+    }
+    return "";
+  }
+
+  function approvalItemFromNotification(event: NotificationEvent): ApprovalFeedItem | null {
+    const payload = event.payload && typeof event.payload === "object"
+      ? event.payload as Record<string, unknown>
+      : {};
+    const workspaceId = String(event.workspace_id || "").trim();
+    if (!workspaceId) {
+      return null;
+    }
+
+    if (event.kind === "conversation_approval") {
+      const approvalId = String(event.approval_id || payload.approval_id || "").trim();
+      const conversationId = String(event.conversation_id || payload.conversation_id || "").trim();
+      if (!approvalId || !conversationId) {
+        return null;
+      }
+      const argsPayload = payload.args && typeof payload.args === "object"
+        ? payload.args as Record<string, unknown>
+        : payload;
+      const toolName = String(payload.tool_name || "").trim();
+      return {
+        id: `conversation:${conversationId}:${approvalId}`,
+        kind: "conversation_approval",
+        status: "pending",
+        created_at: String(event.created_at || "").trim(),
+        title: toolName ? `${toolName} approval` : String(event.title || "Tool approval").trim(),
+        summary:
+          notificationPayloadValue(argsPayload, "command", "path", "question", "text")
+          || String(event.summary || "").trim(),
+        workspace_id: workspaceId,
+        workspace_path: String(event.workspace_path || "").trim(),
+        workspace_display_name: String(event.workspace_display_name || "").trim(),
+        task_id: "",
+        run_id: "",
+        conversation_id: conversationId,
+        subtask_id: "",
+        question_id: "",
+        approval_id: approvalId,
+        tool_name: toolName,
+        risk_level: notificationPayloadValue(payload, "risk_level"),
+        request_payload: argsPayload,
+        metadata: {},
+      };
+    }
+
+    if (event.kind === "task_question") {
+      const questionId = notificationPayloadValue(payload, "question_id");
+      const taskId = String(event.task_id || "").trim();
+      if (!taskId || !questionId) {
+        return null;
+      }
+      return {
+        id: `question:${taskId}:${questionId}`,
+        kind: "task_question",
+        status: "pending",
+        created_at: String(event.created_at || "").trim(),
+        title: notificationPayloadValue(payload, "question") || String(event.title || "").trim(),
+        summary:
+          notificationPayloadValue(payload, "context_note")
+          || String(event.summary || "").trim(),
+        workspace_id: workspaceId,
+        workspace_path: String(event.workspace_path || "").trim(),
+        workspace_display_name: String(event.workspace_display_name || "").trim(),
+        task_id: taskId,
+        run_id: taskId,
+        conversation_id: "",
+        subtask_id: notificationPayloadValue(payload, "subtask_id"),
+        question_id: questionId,
+        approval_id: "",
+        tool_name: "",
+        risk_level: "",
+        request_payload: payload,
+        metadata: {},
+      };
+    }
+
+    if (event.kind === "task_approval") {
+      const taskId = String(event.task_id || "").trim();
+      if (!taskId) {
+        return null;
+      }
+      const subtaskId = notificationPayloadValue(payload, "subtask_id");
+      return {
+        id: subtaskId ? `task:${taskId}:${subtaskId}` : `task:${taskId}`,
+        kind: "task_approval",
+        status: "pending",
+        created_at: String(event.created_at || "").trim(),
+        title:
+          notificationPayloadValue(payload, "proposed_action", "reason")
+          || String(event.title || "").trim(),
+        summary:
+          notificationPayloadValue(payload, "reason", "proposed_action")
+          || String(event.summary || "").trim(),
+        workspace_id: workspaceId,
+        workspace_path: String(event.workspace_path || "").trim(),
+        workspace_display_name: String(event.workspace_display_name || "").trim(),
+        task_id: taskId,
+        run_id: taskId,
+        conversation_id: "",
+        subtask_id: subtaskId,
+        question_id: "",
+        approval_id: "",
+        tool_name: notificationPayloadValue(payload, "tool_name"),
+        risk_level: notificationPayloadValue(payload, "risk_level"),
+        request_payload: {
+          reason: notificationPayloadValue(payload, "reason"),
+          proposed_action: notificationPayloadValue(payload, "proposed_action"),
+          details:
+            payload.details && typeof payload.details === "object"
+              ? payload.details as Record<string, unknown>
+              : {},
+          auto_approve_timeout: payload.auto_approve_timeout,
+        },
+        metadata: {},
+      };
+    }
+
+    return null;
+  }
 
   const refreshWorkspaceOverviewState = useEffectEvent(async (workspaceId: string) => {
     const overviewPayload = await fetchWorkspaceOverview(workspaceId);
@@ -345,6 +625,9 @@ export function useWorkspace(deps: {
     }
   });
 
+  // Heavy recovery path: use for bootstrap, reconnect/manual refresh, or
+  // explicit stale-repair cases when local patches cannot reliably derive
+  // the affected workspace state.
   const refreshWorkspaceSurface = useEffectEvent(async (workspaceId: string) => {
     const [
       overviewPayload,
@@ -366,106 +649,482 @@ export function useWorkspace(deps: {
     setApprovalInbox(await fetchApprovals(workspaceId));
   });
 
-  const syncRunDetail = useEffectEvent((detail: RunDetail) => {
-    const workspaceId = String(detail.workspace_id || detail.workspace?.id || "").trim();
-    const normalizedStatus = normalizeRunStatus(detail.status);
-    const linkedConversationIds = Array.isArray(detail.linked_conversation_ids)
-      ? detail.linked_conversation_ids
-      : [];
-    if (!workspaceId || !normalizedStatus) {
+  const patchPendingApprovalCount = useEffectEvent((workspaceId: string, delta: number) => {
+    if (!workspaceId || delta === 0) {
       return;
     }
-
-    const currentOverview = overviewRef.current;
-    let nextOverview = currentOverview;
-    let activeRunCountDelta = 0;
-
-    if (currentOverview?.workspace?.id === workspaceId) {
-      const existingRun = currentOverview.recent_runs.find((run) => run.id === detail.id);
-      if (existingRun) {
-        const previousActive = isRunActiveStatus(existingRun.status);
-        const nextActive = isRunActiveStatus(normalizedStatus);
-        activeRunCountDelta = nextActive === previousActive ? 0 : nextActive ? 1 : -1;
-        const nextUpdatedAt = detail.updated_at || existingRun.updated_at;
-        const nextLastActivityAt =
-          nextUpdatedAt && nextUpdatedAt > (currentOverview.workspace.last_activity_at || "")
-            ? nextUpdatedAt
-            : currentOverview.workspace.last_activity_at;
-        nextOverview = {
-          ...currentOverview,
-          workspace: {
-            ...currentOverview.workspace,
-            active_run_count: Math.max(
-              0,
-              Number(currentOverview.workspace.active_run_count || 0) + activeRunCountDelta,
-            ),
-            last_activity_at: nextLastActivityAt,
-          },
-          recent_runs: currentOverview.recent_runs.map((run) => (
-            run.id === detail.id
-              ? {
-                  ...run,
-                  goal: detail.goal || run.goal,
-                  status: normalizedStatus,
-                  created_at: detail.created_at || run.created_at,
-                  updated_at: nextUpdatedAt,
-                  execution_run_id: detail.execution_run_id || run.execution_run_id,
-                  process_name: detail.process_name || run.process_name,
-                  linked_conversation_ids:
-                    linkedConversationIds.length > 0
-                      ? linkedConversationIds
-                      : run.linked_conversation_ids,
-                  changed_files_count:
-                    typeof detail.changed_files_count === "number"
-                      ? detail.changed_files_count
-                      : run.changed_files_count,
-                }
-              : run
-          )),
-        };
-        overviewRef.current = nextOverview;
-        setOverview(nextOverview);
+    if (overviewRef.current?.workspace?.id !== workspaceId) {
+      return;
+    }
+    setOverview((current) => {
+      if (!current || current.workspace.id !== workspaceId) {
+        return current;
       }
+      const nextOverview = {
+        ...current,
+        pending_approvals_count: Math.max(
+          0,
+          Number(current.pending_approvals_count || 0) + delta,
+        ),
+      };
+      overviewRef.current = nextOverview;
+      return nextOverview;
+    });
+  });
+
+  const syncConversationSummary = useEffectEvent((
+    detail: ConversationSummary | ConversationDetail,
+    options?: {
+      incrementCount?: boolean;
+      processing?: boolean;
+      workspaceId?: string;
+    },
+  ) => {
+    const workspaceId = String(options?.workspaceId || detail.workspace_id || "").trim();
+    if (!workspaceId) {
+      return;
     }
 
-    if (activeRunCountDelta === 0) {
-      return;
+    const nextRow = buildConversationRow(detail, {
+      processing: options?.processing,
+      workspaceId,
+    });
+    const currentOverview = overviewRef.current;
+    const isCurrentWorkspace = currentOverview?.workspace?.id === workspaceId;
+    const existingConversation = isCurrentWorkspace
+      ? currentOverview.recent_conversations.find((conversation) => conversation.id === nextRow.id)
+      : null;
+    const conversationCountDelta =
+      existingConversation || options?.incrementCount === false ? 0 : 1;
+    const nextLastActivityAt = latestTimestamp(
+      nextRow.last_active_at,
+      nextRow.started_at,
+      currentOverview?.workspace.last_activity_at,
+    );
+
+    if (isCurrentWorkspace && currentOverview) {
+      const nextRows = sortConversationRows([
+        nextRow,
+        ...currentOverview.recent_conversations.filter((conversation) => conversation.id !== nextRow.id),
+      ]);
+      const nextOverview = {
+        ...currentOverview,
+        workspace: {
+          ...currentOverview.workspace,
+          conversation_count: Math.max(
+            nextRows.length,
+            Number(currentOverview.workspace.conversation_count || 0) + conversationCountDelta,
+          ),
+          last_activity_at: nextLastActivityAt,
+        },
+        recent_conversations: nextRows,
+      };
+      overviewRef.current = nextOverview;
+      setOverview(nextOverview);
     }
 
     setWorkspaces((current) => current.map((workspace) => {
       if (workspace.id !== workspaceId) {
         return workspace;
       }
-      const nextUpdatedAt = detail.updated_at || workspace.last_activity_at;
       return {
         ...workspace,
-        active_run_count: Math.max(
+        conversation_count: Math.max(
           0,
-          Number(workspace.active_run_count || 0) + activeRunCountDelta,
+          Number(workspace.conversation_count || 0) + conversationCountDelta,
         ),
-        last_activity_at:
-          nextUpdatedAt && nextUpdatedAt > (workspace.last_activity_at || "")
-            ? nextUpdatedAt
-            : workspace.last_activity_at,
+        last_activity_at: latestTimestamp(
+          workspace.last_activity_at,
+          nextRow.last_active_at,
+          nextRow.started_at,
+        ),
       };
     }));
   });
 
-  const scheduleNotificationRefresh = useEffectEvent((workspaceId: string) => {
-    if (!workspaceId || notificationRefreshTimerRef.current !== null) {
+  const setConversationProcessing = useEffectEvent((
+    conversationId: string,
+    processing: boolean,
+    options?: {
+      lastActiveAt?: string;
+      workspaceId?: string;
+    },
+  ) => {
+    const workspaceId = String(options?.workspaceId || selectedWorkspaceIdRef.current || "").trim();
+    if (!workspaceId || !conversationId) {
+      return;
+    }
+
+    const currentOverview = overviewRef.current;
+    if (currentOverview?.workspace?.id !== workspaceId) {
+      return;
+    }
+
+    const existingConversation = currentOverview.recent_conversations.find(
+      (conversation) => conversation.id === conversationId,
+    );
+    if (!existingConversation) {
+      return;
+    }
+
+    const nextRow = {
+      ...existingConversation,
+      is_active: processing,
+      last_active_at: latestTimestamp(
+        existingConversation.last_active_at,
+        options?.lastActiveAt,
+      ),
+    };
+    const nextOverview = {
+      ...currentOverview,
+      workspace: {
+        ...currentOverview.workspace,
+        last_activity_at: latestTimestamp(
+          currentOverview.workspace.last_activity_at,
+          nextRow.last_active_at,
+        ),
+      },
+      recent_conversations: sortConversationRows([
+        nextRow,
+        ...currentOverview.recent_conversations.filter((conversation) => conversation.id !== conversationId),
+      ]),
+    };
+    overviewRef.current = nextOverview;
+    setOverview(nextOverview);
+    setWorkspaces((current) => current.map((workspace) => (
+      workspace.id === workspaceId
+        ? {
+            ...workspace,
+            last_activity_at: latestTimestamp(
+              workspace.last_activity_at,
+              nextRow.last_active_at,
+            ),
+          }
+        : workspace
+    )));
+  });
+
+  const removeConversationSummary = useEffectEvent((conversationId: string, workspaceId?: string) => {
+    const nextWorkspaceId = String(workspaceId || selectedWorkspaceIdRef.current || "").trim();
+    if (!nextWorkspaceId || !conversationId) {
+      return;
+    }
+
+    const currentOverview = overviewRef.current;
+    const isCurrentWorkspace = currentOverview?.workspace?.id === nextWorkspaceId;
+    const existingConversation = isCurrentWorkspace
+      ? currentOverview.recent_conversations.find((conversation) => conversation.id === conversationId)
+      : null;
+    const conversationCountDelta = existingConversation ? -1 : 0;
+
+    if (isCurrentWorkspace && currentOverview && existingConversation) {
+      const nextRows = currentOverview.recent_conversations.filter(
+        (conversation) => conversation.id !== conversationId,
+      );
+      const nextOverview = {
+        ...currentOverview,
+        workspace: {
+          ...currentOverview.workspace,
+          conversation_count: Math.max(
+            nextRows.length,
+            Number(currentOverview.workspace.conversation_count || 0) - 1,
+          ),
+        },
+        recent_conversations: nextRows,
+      };
+      overviewRef.current = nextOverview;
+      setOverview(nextOverview);
+    }
+
+    setWorkspaces((current) => current.map((workspace) => (
+      workspace.id === nextWorkspaceId
+        ? {
+            ...workspace,
+            conversation_count: Math.max(
+              0,
+              Number(workspace.conversation_count || 0) + conversationCountDelta,
+            ),
+          }
+        : workspace
+    )));
+  });
+
+  const applyApprovalItem = useEffectEvent((
+    item: ApprovalFeedItem,
+    options?: {
+      incrementCount?: boolean;
+    },
+  ) => {
+    const workspaceId = String(item.workspace_id || "").trim();
+    if (!workspaceId || workspaceId !== selectedWorkspaceIdRef.current) {
+      return;
+    }
+    const exists = approvalInboxRef.current.some((currentItem) => currentItem.id === item.id);
+    setApprovalInbox((current) => (
+      [
+        item,
+        ...current.filter((currentItem) => currentItem.id !== item.id),
+      ].sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")))
+    ));
+    if (!exists && options?.incrementCount !== false) {
+      patchPendingApprovalCount(workspaceId, 1);
+    }
+  });
+
+  const removeApprovalItem = useEffectEvent((itemId: string, workspaceId?: string) => {
+    const nextWorkspaceId = String(workspaceId || selectedWorkspaceIdRef.current || "").trim();
+    if (!itemId || nextWorkspaceId !== selectedWorkspaceIdRef.current) {
+      return;
+    }
+    const exists = approvalInboxRef.current.some((currentItem) => currentItem.id === itemId);
+    if (!exists) {
+      return;
+    }
+    setApprovalInbox((current) => current.filter((currentItem) => currentItem.id !== itemId));
+    patchPendingApprovalCount(nextWorkspaceId, -1);
+  });
+
+  const syncRunDetail = useEffectEvent((detail: RunDetail) => {
+    const workspaceId = String(detail.workspace_id || detail.workspace?.id || "").trim();
+    const normalizedStatus = normalizeRunStatus(detail.status);
+    if (!workspaceId || !normalizedStatus) {
+      return;
+    }
+
+    const currentOverview = overviewRef.current;
+    const nextRow = buildRunRow(detail, normalizedStatus);
+    const existingRun = currentOverview?.workspace?.id === workspaceId
+      ? currentOverview.recent_runs.find((run) => run.id === detail.id)
+      : null;
+    const previousActive = existingRun ? isRunActiveStatus(existingRun.status) : false;
+    const nextActive = isRunActiveStatus(normalizedStatus);
+    const activeRunCountDelta = nextActive === previousActive ? 0 : nextActive ? 1 : -1;
+    const runCountDelta = existingRun ? 0 : 1;
+
+    if (currentOverview?.workspace?.id === workspaceId) {
+      const nextRows = sortRunRows([
+        nextRow,
+        ...currentOverview.recent_runs.filter((run) => run.id !== detail.id),
+      ]);
+      const nextOverview = {
+        ...currentOverview,
+        workspace: {
+          ...currentOverview.workspace,
+          active_run_count: Math.max(
+            0,
+            Number(currentOverview.workspace.active_run_count || 0) + activeRunCountDelta,
+          ),
+          run_count: Math.max(
+            nextRows.length,
+            Number(currentOverview.workspace.run_count || 0) + runCountDelta,
+          ),
+          last_activity_at: latestTimestamp(
+            currentOverview.workspace.last_activity_at,
+            nextRow.updated_at,
+            nextRow.created_at,
+          ),
+        },
+        recent_runs: nextRows,
+      };
+      overviewRef.current = nextOverview;
+      setOverview(nextOverview);
+    }
+
+    setWorkspaces((current) => current.map((workspace) => (
+      workspace.id === workspaceId
+        ? {
+            ...workspace,
+            active_run_count: Math.max(
+              0,
+              Number(workspace.active_run_count || 0) + activeRunCountDelta,
+            ),
+            run_count: Math.max(
+              0,
+              Number(workspace.run_count || 0) + runCountDelta,
+            ),
+            last_activity_at: latestTimestamp(
+              workspace.last_activity_at,
+              nextRow.updated_at,
+              nextRow.created_at,
+            ),
+          }
+        : workspace
+    )));
+  });
+
+  const removeRunSummary = useEffectEvent((runId: string, workspaceId?: string) => {
+    const nextWorkspaceId = String(workspaceId || selectedWorkspaceIdRef.current || "").trim();
+    if (!nextWorkspaceId || !runId) {
+      return;
+    }
+
+    const currentOverview = overviewRef.current;
+    const existingRun = currentOverview?.workspace?.id === nextWorkspaceId
+      ? currentOverview.recent_runs.find((run) => run.id === runId)
+      : null;
+    const activeRunCountDelta = existingRun && isRunActiveStatus(existingRun.status) ? -1 : 0;
+    const runCountDelta = existingRun ? -1 : 0;
+
+    if (currentOverview?.workspace?.id === nextWorkspaceId && existingRun) {
+      const nextRows = currentOverview.recent_runs.filter((run) => run.id !== runId);
+      const nextOverview = {
+        ...currentOverview,
+        workspace: {
+          ...currentOverview.workspace,
+          active_run_count: Math.max(
+            0,
+            Number(currentOverview.workspace.active_run_count || 0) + activeRunCountDelta,
+          ),
+          run_count: Math.max(
+            nextRows.length,
+            Number(currentOverview.workspace.run_count || 0) - 1,
+          ),
+        },
+        recent_runs: nextRows,
+      };
+      overviewRef.current = nextOverview;
+      setOverview(nextOverview);
+    }
+
+    setWorkspaces((current) => current.map((workspace) => (
+      workspace.id === nextWorkspaceId
+        ? {
+            ...workspace,
+            active_run_count: Math.max(
+              0,
+              Number(workspace.active_run_count || 0) + activeRunCountDelta,
+            ),
+            run_count: Math.max(
+              0,
+              Number(workspace.run_count || 0) + runCountDelta,
+            ),
+          }
+        : workspace
+    )));
+  });
+
+  const appendNotification = useEffectEvent((event: NotificationEvent) => {
+    setNotifications((current) => {
+      const deduped = current.filter((item) => item.id !== event.id);
+      return [event, ...deduped].slice(0, 8);
+    });
+  });
+
+  const scheduleNotificationRepair = useEffectEvent((workspaceId: string, repair: {
+    approvals?: boolean;
+    overview?: boolean;
+  }) => {
+    if (!workspaceId) {
+      return;
+    }
+    const pending = notificationRepairRef.current;
+    if (pending.workspaceId && pending.workspaceId !== workspaceId) {
+      pending.workspaceId = workspaceId;
+      pending.approvals = false;
+      pending.overview = false;
+    }
+    pending.workspaceId = workspaceId;
+    pending.approvals ||= Boolean(repair.approvals);
+    pending.overview ||= Boolean(repair.overview);
+    if (notificationRefreshTimerRef.current !== null) {
       return;
     }
     notificationRefreshTimerRef.current = window.setTimeout(() => {
       notificationRefreshTimerRef.current = null;
+      const nextRepair = notificationRepairRef.current;
+      notificationRepairRef.current = {
+        approvals: false,
+        overview: false,
+        workspaceId: "",
+      };
       void Promise.all([
-        refreshApprovalInbox(workspaceId),
-        refreshWorkspaceOverviewState(workspaceId),
+        nextRepair.approvals && nextRepair.workspaceId
+          ? refreshApprovalInbox(nextRepair.workspaceId)
+          : Promise.resolve(),
+        nextRepair.overview && nextRepair.workspaceId
+          ? refreshWorkspaceOverviewState(nextRepair.workspaceId)
+          : Promise.resolve(),
       ]).catch((err) => {
         if (!isTransientRequestError(err)) {
           setError(err instanceof Error ? err.message : "Failed to refresh inbox.");
         }
       });
     }, 150);
+  });
+
+  const applyNotificationEvent = useEffectEvent((event: NotificationEvent) => {
+    appendNotification(event);
+    const workspaceId = String(event.workspace_id || "").trim();
+    if (!workspaceId) {
+      return;
+    }
+
+    if (event.event_type === "approval_requested" || event.event_type === "ask_user_requested") {
+      const item = approvalItemFromNotification(event);
+      if (item) {
+        applyApprovalItem(item);
+      } else if (event.event_type === "approval_requested") {
+        patchPendingApprovalCount(workspaceId, 1);
+        scheduleNotificationRepair(workspaceId, { approvals: true });
+      } else {
+        scheduleNotificationRepair(workspaceId, { approvals: true });
+      }
+      return;
+    }
+
+    if (
+      event.event_type === "approval_received"
+      || event.event_type === "approval_rejected"
+      || event.event_type === "approval_timed_out"
+      || event.event_type === "ask_user_answered"
+      || event.event_type === "ask_user_cancelled"
+      || event.event_type === "ask_user_timeout"
+    ) {
+      let itemId = "";
+      if (event.kind === "conversation_approval" && event.conversation_id && event.approval_id) {
+        itemId = `conversation:${event.conversation_id}:${event.approval_id}`;
+      } else if (event.kind === "task_question") {
+        const questionId = notificationPayloadValue(
+          event.payload as Record<string, unknown>,
+          "question_id",
+        );
+        if (event.task_id && questionId) {
+          itemId = `question:${event.task_id}:${questionId}`;
+        }
+      } else if (event.kind === "task_approval" && event.task_id) {
+        const subtaskId = notificationPayloadValue(
+          event.payload as Record<string, unknown>,
+          "subtask_id",
+        );
+        itemId = subtaskId ? `task:${event.task_id}:${subtaskId}` : `task:${event.task_id}`;
+      }
+
+      if (!itemId) {
+        const payload = event.payload && typeof event.payload === "object"
+          ? event.payload as Record<string, unknown>
+          : {};
+        itemId = approvalInboxRef.current.find((item) => (
+          item.workspace_id === workspaceId
+          && (
+            (event.approval_id && item.approval_id === event.approval_id)
+            || (
+              notificationPayloadValue(payload, "question_id")
+              && item.question_id === notificationPayloadValue(payload, "question_id")
+            )
+            || (event.task_id && item.task_id === event.task_id && item.kind === event.kind)
+          )
+        ))?.id || "";
+      }
+
+      if (itemId) {
+        removeApprovalItem(itemId, workspaceId);
+      } else if (event.event_type.startsWith("approval_")) {
+        patchPendingApprovalCount(workspaceId, -1);
+        scheduleNotificationRepair(workspaceId, { approvals: true });
+      } else {
+        scheduleNotificationRepair(workspaceId, { approvals: true });
+      }
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -484,14 +1143,40 @@ export function useWorkspace(deps: {
     };
   }, []);
 
-  // Sync workspace name/tags/note drafts when selection or workspaces change
+  // Sync workspace drafts from the selected summary without clobbering dirty local edits.
   useEffect(() => {
     const selectedWorkspace = workspaces.find((workspace) => workspace.id === selectedWorkspaceId);
-    setWorkspaceNameDraft(selectedWorkspace?.display_name || "");
-    setWorkspaceTagsDraft(workspaceTagsFromMetadata(selectedWorkspace?.metadata).join(", "));
-    setWorkspaceNoteDraft(workspaceNoteFromMetadata(selectedWorkspace?.metadata));
-    setWorkspaceFileTreeMode("all");
-    setWorkspaceImportFolderDraft("");
+    const nextSource = {
+      id: selectedWorkspaceId,
+      name: selectedWorkspace?.display_name || "",
+      tags: workspaceTagsFromMetadata(selectedWorkspace?.metadata).join(", "),
+      note: workspaceNoteFromMetadata(selectedWorkspace?.metadata),
+    };
+    const previousSource = previousWorkspaceDraftSourceRef.current;
+    const selectedWorkspaceChanged = previousSource.id !== nextSource.id;
+
+    setWorkspaceNameDraft((current) => (
+      selectedWorkspaceChanged || current === previousSource.name
+        ? nextSource.name
+        : current
+    ));
+    setWorkspaceTagsDraft((current) => (
+      selectedWorkspaceChanged || current === previousSource.tags
+        ? nextSource.tags
+        : current
+    ));
+    setWorkspaceNoteDraft((current) => (
+      selectedWorkspaceChanged || current === previousSource.note
+        ? nextSource.note
+        : current
+    ));
+
+    if (selectedWorkspaceChanged) {
+      setWorkspaceFileTreeMode("all");
+      setWorkspaceImportFolderDraft("");
+    }
+
+    previousWorkspaceDraftSourceRef.current = nextSource;
   }, [selectedWorkspaceId, workspaces]);
 
   // Load workspace overview on selection change
@@ -502,6 +1187,10 @@ export function useWorkspace(deps: {
   useEffect(() => {
     overviewRef.current = overview;
   }, [overview]);
+
+  useEffect(() => {
+    approvalInboxRef.current = approvalInbox;
+  }, [approvalInbox]);
 
   useEffect(() => {
     if (!selectedWorkspaceId) {
@@ -730,6 +1419,11 @@ export function useWorkspace(deps: {
   useEffect(() => {
     if (!selectedWorkspaceId) {
       setNotifications([]);
+      notificationRepairRef.current = {
+        approvals: false,
+        overview: false,
+        workspaceId: "",
+      };
       return;
     }
     if (notificationRefreshTimerRef.current !== null) {
@@ -745,14 +1439,13 @@ export function useWorkspace(deps: {
             event.stream_id,
           );
         }
-        setNotifications((current) => {
-          const deduped = current.filter((item) => item.id !== event.id);
-          return [event, ...deduped].slice(0, 8);
-        });
-        scheduleNotificationRefresh(selectedWorkspaceId);
+        applyNotificationEvent(event);
       },
       () => {
-        scheduleNotificationRefresh(selectedWorkspaceId);
+        scheduleNotificationRepair(selectedWorkspaceId, {
+          approvals: true,
+          overview: true,
+        });
       },
       {
         afterId: lastSeenNotificationStreamIdRef.current,
@@ -763,9 +1456,14 @@ export function useWorkspace(deps: {
         window.clearTimeout(notificationRefreshTimerRef.current);
         notificationRefreshTimerRef.current = null;
       }
+      notificationRepairRef.current = {
+        approvals: false,
+        overview: false,
+        workspaceId: "",
+      };
       cleanup();
     };
-  }, [scheduleNotificationRefresh, selectedWorkspaceId]);
+  }, [selectedWorkspaceId]);
 
   // ---------------------------------------------------------------------------
   // Computed values
@@ -1003,12 +1701,26 @@ export function useWorkspace(deps: {
       const updated = await patchWorkspace(selectedWorkspaceId, {
         archived: nextArchived,
       });
-      await refreshWorkspaceList(nextArchived && !showArchivedWorkspaces ? "" : updated.id);
-      if (!nextArchived || showArchivedWorkspaces) {
-        await refreshWorkspaceSurface(updated.id);
-      } else {
-        setOverview(null);
-        setWorkspaceSettings(null);
+      const nextVisibleWorkspaces = sortWorkspaceSummaries(
+        mergeWorkspaceSummary(workspaces, updated).filter((workspace) =>
+          showArchivedWorkspaces || !workspace.is_archived,
+        ),
+      );
+      setWorkspaces(nextVisibleWorkspaces);
+      if (overview?.workspace.id === updated.id) {
+        setOverview((current) => (
+          current
+            ? {
+                ...current,
+                workspace: updated,
+              }
+            : current
+        ));
+      }
+      if (nextArchived && !showArchivedWorkspaces) {
+        startTransition(() => {
+          setSelectedWorkspaceId(nextVisibleWorkspaces.find((workspace) => workspace.id !== updated.id)?.id || "");
+        });
       }
       setNotice(
         nextArchived
@@ -1044,8 +1756,17 @@ export function useWorkspace(deps: {
       const updated = await patchWorkspace(selectedWorkspaceId, {
         sort_order: nextSortOrder,
       });
-      await refreshWorkspaceList(updated.id);
-      await refreshWorkspaceSurface(updated.id);
+      setWorkspaces((current) => sortWorkspaceSummaries(mergeWorkspaceSummary(current, updated)));
+      if (overview?.workspace.id === updated.id) {
+        setOverview((current) => (
+          current
+            ? {
+                ...current,
+                workspace: updated,
+              }
+            : current
+        ));
+      }
       setNotice(
         nextPinned
           ? `Pinned workspace ${updated.display_name} to the top.`
@@ -1155,6 +1876,12 @@ export function useWorkspace(deps: {
     refreshWorkspaceList,
     refreshWorkspaceSurface,
     refreshApprovalInbox,
+    syncConversationSummary,
+    setConversationProcessing,
+    removeConversationSummary,
+    applyApprovalItem,
+    removeApprovalItem,
     syncRunDetail,
+    removeRunSummary,
   };
 }

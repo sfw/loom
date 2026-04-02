@@ -3,6 +3,7 @@ import {
   type FormEvent,
   useEffect,
   useEffectEvent,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -288,8 +289,9 @@ export function useRuns(deps: {
   setError: React.Dispatch<React.SetStateAction<string>>;
   setNotice: React.Dispatch<React.SetStateAction<string>>;
   setActiveTab: React.Dispatch<React.SetStateAction<ViewTab>>;
-  refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
+  refreshWorkspaceSurface?: (workspaceId: string) => Promise<void>;
   syncRunDetail?: (detail: RunDetail) => void;
+  removeRunSummary?: (runId: string, workspaceId?: string) => void;
 }): RunsState & RunsActions {
   const {
     selectedRunId,
@@ -300,8 +302,8 @@ export function useRuns(deps: {
     setError,
     setNotice,
     setActiveTab,
-    refreshWorkspaceSurface,
     syncRunDetail,
+    removeRunSummary,
   } = deps;
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
   const [runTimeline, setRunTimeline] = useState<RunTimelineEvent[]>([]);
@@ -332,29 +334,46 @@ export function useRuns(deps: {
   const runTimelineRef = useRef<RunTimelineEvent[]>([]);
   const runStreamingRef = useRef(false);
   const pendingRunStreamEventsRef = useRef<RunStreamEvent[]>([]);
-  const pendingWorkspaceRefreshRef = useRef<{
-    runId: string;
-    workspaceId: string;
-  } | null>(null);
 
   // ---------------------------------------------------------------------------
   // Computed values
   // ---------------------------------------------------------------------------
 
-  const normalizedRunStatus = normalizeRunStatus(runDetail?.status);
-  const runIsActivelyExecuting = isRunActiveStatus(normalizedRunStatus);
-  const runIsTerminal = isRunTerminalStatus(normalizedRunStatus);
-  const runCanPause = canPauseRunStatus(normalizedRunStatus);
-  const runCanResume = canResumeRunStatus(normalizedRunStatus);
-  const runCanMessage = canMessageRunStatus(normalizedRunStatus);
-  const workspaceRunRows = overview?.recent_runs || [];
-  const selectedRunSummary =
+  const normalizedRunStatus = useMemo(
+    () => normalizeRunStatus(runDetail?.status),
+    [runDetail?.status],
+  );
+  const runIsActivelyExecuting = useMemo(
+    () => isRunActiveStatus(normalizedRunStatus),
+    [normalizedRunStatus],
+  );
+  const runIsTerminal = useMemo(
+    () => isRunTerminalStatus(normalizedRunStatus),
+    [normalizedRunStatus],
+  );
+  const runCanPause = useMemo(
+    () => canPauseRunStatus(normalizedRunStatus),
+    [normalizedRunStatus],
+  );
+  const runCanResume = useMemo(
+    () => canResumeRunStatus(normalizedRunStatus),
+    [normalizedRunStatus],
+  );
+  const runCanMessage = useMemo(
+    () => canMessageRunStatus(normalizedRunStatus),
+    [normalizedRunStatus],
+  );
+  const workspaceRunRows = useMemo(
+    () => overview?.recent_runs || [],
+    [overview?.recent_runs],
+  );
+  const selectedRunSummary = useMemo(() => (
     runDetail
     || workspaceRunRows.find((run) => run.id === selectedRunId)
-    || null;
-  const filteredRunArtifacts = runArtifacts
+    || null
+  ), [runDetail, selectedRunId, workspaceRunRows]);
+  const filteredRunArtifacts = useMemo(() => runArtifacts
     .filter((artifact) => {
-      // Filter out meaningless entries like ".", "./", or "subfolder/."
       const p = artifact.path.trim().replace(/\\/g, "/");
       if (!p) return false;
       const parts = p.split("/").filter(Boolean);
@@ -373,8 +392,8 @@ export function useRuns(deps: {
         artifact.subtask_ids.join(" "),
         artifact.facets,
       ),
-    );
-  const filteredRunTimeline = runTimeline.filter((event) =>
+    ), [runArtifacts, runHistoryQuery]);
+  const filteredRunTimeline = useMemo(() => runTimeline.filter((event) =>
     matchesWorkspaceSearch(
       runHistoryQuery,
       event.event_type,
@@ -383,12 +402,20 @@ export function useRuns(deps: {
       event.data,
       runTimelinePills(event).join(" "),
     ),
+  ), [runHistoryQuery, runTimeline]);
+  const visibleRunArtifacts = useMemo(
+    () => filteredRunArtifacts,
+    [filteredRunArtifacts],
   );
-  const visibleRunArtifacts = filteredRunArtifacts;
-  const visibleRunTimeline = runHistoryQuery.trim()
-    ? filteredRunTimeline
-    : runTimeline;
-  const totalRunMatches = filteredRunArtifacts.length + filteredRunTimeline.length;
+  const visibleRunTimeline = useMemo(() => (
+    runHistoryQuery.trim()
+      ? filteredRunTimeline
+      : runTimeline
+  ), [filteredRunTimeline, runHistoryQuery, runTimeline]);
+  const totalRunMatches = useMemo(
+    () => filteredRunArtifacts.length + filteredRunTimeline.length,
+    [filteredRunArtifacts.length, filteredRunTimeline.length],
+  );
 
   async function loadRunSnapshot(runId: string): Promise<[RunDetail, RunTimelineEvent[], RunArtifact[]]> {
     let lastError: unknown = null;
@@ -414,15 +441,6 @@ export function useRuns(deps: {
   // useEffectEvent handlers
   // ---------------------------------------------------------------------------
 
-  const maybeRefreshWorkspaceSurfaceAfterRunLoad = useEffectEvent((runId: string) => {
-    const pending = pendingWorkspaceRefreshRef.current;
-    if (!pending || pending.runId !== runId || !pending.workspaceId) {
-      return;
-    }
-    pendingWorkspaceRefreshRef.current = null;
-    void refreshWorkspaceSurface(pending.workspaceId).catch(() => {});
-  });
-
   const refreshRun = useEffectEvent(async (runId: string) => {
     const [detail, timeline, artifacts] = await loadRunSnapshot(runId);
     const nextDetail = canonicalizeRunDetail(detail);
@@ -438,7 +456,6 @@ export function useRuns(deps: {
       lastSeenRunSequenceRef.current,
       maxRunTimelineSequence(timeline),
     );
-    maybeRefreshWorkspaceSurfaceAfterRunLoad(runId);
   });
 
   const refreshRunInstructionHistory = useEffectEvent(async (runId: string) => {
@@ -523,7 +540,6 @@ export function useRuns(deps: {
         window.cancelAnimationFrame(runStreamFrameRef.current);
         runStreamFrameRef.current = null;
       }
-      pendingWorkspaceRefreshRef.current = null;
       return;
     }
     const hasMatchingRunDetail = runDetailRef.current?.id === selectedRunId;
@@ -592,7 +608,6 @@ export function useRuns(deps: {
           setRunArtifacts(artifacts);
           setRunInstructionHistory(instructionHistory);
           lastSeenRunSequenceRef.current = maxRunTimelineSequence(timeline);
-          maybeRefreshWorkspaceSurfaceAfterRunLoad(selectedRunId);
         }
       } catch (err) {
         if (!cancelled) {
@@ -733,6 +748,9 @@ export function useRuns(deps: {
     if (loadingRunDetail) {
       return;
     }
+    if (runDetailRef.current?.id !== selectedRunId) {
+      return;
+    }
     const cleanup = subscribeRunStream(
       selectedRunId,
       (event) => {
@@ -761,10 +779,7 @@ export function useRuns(deps: {
     };
   }, [
     connectionState,
-    flushRunStreamBatch,
     loadingRunDetail,
-    queueRunStreamEvent,
-    scheduleRunRefresh,
     selectedRunId,
   ]);
 
@@ -790,7 +805,7 @@ export function useRuns(deps: {
     return () => {
       window.clearInterval(timer);
     };
-  }, [refreshRun, runIsTerminal, selectedRunId, setError]);
+  }, [runIsTerminal, selectedRunId, setError]);
 
   // Run match scroll tracking
   useEffect(() => {
@@ -836,9 +851,6 @@ export function useRuns(deps: {
         auto_subfolder: true,
       });
       const nextRunId = created.task_id || created.run_id;
-      pendingWorkspaceRefreshRef.current = selectedWorkspaceId
-        ? { runId: nextRunId, workspaceId: selectedWorkspaceId }
-        : null;
       startTransition(() => {
         setSelectedRunId(nextRunId);
         setActiveTab("runs");
@@ -905,10 +917,8 @@ export function useRuns(deps: {
     setNotice("");
     try {
       const response = await deleteRun(selectedRunId);
+      removeRunSummary?.(selectedRunId, selectedWorkspaceId);
       setSelectedRunId("");
-      if (selectedWorkspaceId) {
-        await refreshWorkspaceSurface(selectedWorkspaceId);
-      }
       setNotice(response.message || "Run deleted.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete run.");
@@ -925,9 +935,6 @@ export function useRuns(deps: {
     try {
       const created = await restartRun(selectedRunId);
       const nextRunId = created.task_id || created.run_id;
-      pendingWorkspaceRefreshRef.current = selectedWorkspaceId
-        ? { runId: nextRunId, workspaceId: selectedWorkspaceId }
-        : null;
       startTransition(() => {
         setSelectedRunId(nextRunId);
         setActiveTab("runs");

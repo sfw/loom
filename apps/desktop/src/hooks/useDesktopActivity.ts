@@ -1,6 +1,7 @@
 import {
   useEffect,
   useEffectEvent,
+  useMemo,
   useState,
 } from "react";
 
@@ -70,7 +71,7 @@ export function useDesktopActivity(deps: {
     }
 
     void refreshActivitySummary();
-  }, [connectionState, refreshActivitySummary]);
+  }, [connectionState]);
 
   useEffect(() => {
     if (connectionState !== "connected") {
@@ -90,7 +91,6 @@ export function useDesktopActivity(deps: {
     backendSummary?.active,
     connectionState,
     localActivityActive,
-    refreshActivitySummary,
   ]);
 
   const activeConversationCount = Math.max(
@@ -128,15 +128,25 @@ export function useDesktopActivity(deps: {
         : `${activeRunCount} active runs`,
     );
   }
+  const label = labelParts.length > 0 ? labelParts.join(" · ") : "Idle";
 
-  return {
+  return useMemo(() => ({
     active,
     mode,
     activeConversationCount,
     activeRunCount,
     sourceCount,
-    label: labelParts.length > 0 ? labelParts.join(" · ") : "Idle",
+    label,
     updatedAt: backendSummary?.updated_at || "",
     backendConnected,
-  };
+  }), [
+    active,
+    activeConversationCount,
+    activeRunCount,
+    backendConnected,
+    backendSummary?.updated_at,
+    label,
+    mode,
+    sourceCount,
+  ]);
 }

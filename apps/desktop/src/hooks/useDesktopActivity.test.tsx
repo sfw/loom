@@ -40,7 +40,7 @@ describe("useDesktopActivity", () => {
     );
 
     await waitFor(() => {
-      expect(apiMocks.fetchActivitySummary).toHaveBeenCalled();
+      expect(apiMocks.fetchActivitySummary).toHaveBeenCalledTimes(1);
     });
 
     expect(result.current.active).toBe(true);
@@ -72,6 +72,8 @@ describe("useDesktopActivity", () => {
     await waitFor(() => {
       expect(result.current.backendConnected).toBe(true);
     });
+
+    expect(apiMocks.fetchActivitySummary).toHaveBeenCalledTimes(1);
 
     expect(result.current.active).toBe(true);
     expect(result.current.mode).toBe("mixed");

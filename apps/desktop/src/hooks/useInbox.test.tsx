@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+import { replyApproval } from "../api";
 import { useInbox } from "./useInbox";
 
 vi.mock("../api", () => ({
@@ -26,8 +27,7 @@ describe("useInbox", () => {
         setRunProcess: vi.fn(),
         setError: vi.fn(),
         setNotice: vi.fn(),
-        refreshWorkspaceSurface: vi.fn(async () => {}),
-        refreshApprovalInbox: vi.fn(async () => {}),
+        removeApprovalItem: vi.fn(),
         refreshConversation: vi.fn(async () => {}),
         refreshRun: vi.fn(async () => {}),
         queueWorkspaceFileOpen: vi.fn(),
@@ -67,8 +67,7 @@ describe("useInbox", () => {
         setRunProcess: vi.fn(),
         setError: vi.fn(),
         setNotice: vi.fn(),
-        refreshWorkspaceSurface: vi.fn(async () => {}),
-        refreshApprovalInbox: vi.fn(async () => {}),
+        removeApprovalItem: vi.fn(),
         refreshConversation: vi.fn(async () => {}),
         refreshRun: vi.fn(async () => {}),
         queueWorkspaceFileOpen: vi.fn(),
@@ -110,8 +109,7 @@ describe("useInbox", () => {
         setRunProcess: vi.fn(),
         setError: vi.fn(),
         setNotice,
-        refreshWorkspaceSurface: vi.fn(async () => {}),
-        refreshApprovalInbox: vi.fn(async () => {}),
+        removeApprovalItem: vi.fn(),
         refreshConversation: vi.fn(async () => {}),
         refreshRun: vi.fn(async () => {}),
         queueWorkspaceFileOpen,
@@ -134,5 +132,65 @@ describe("useInbox", () => {
     expect(setSelectedRunId).toHaveBeenCalledWith("run-123");
     expect(setActiveTab).toHaveBeenCalledWith("files");
     expect(setNotice).toHaveBeenCalledWith("Opened context for artifact reports/auth-report.md.");
+  });
+
+  it("removes the approval locally and only refreshes the active detail pane", async () => {
+    vi.mocked(replyApproval).mockResolvedValue({ ok: true } as any);
+
+    const removeApprovalItem = vi.fn();
+    const refreshConversation = vi.fn(async () => {});
+    const refreshRun = vi.fn(async () => {});
+    const setNotice = vi.fn();
+
+    const { result } = renderHook(() =>
+      useInbox({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "conversation-1",
+        selectedRunId: "run-stale",
+        setSelectedWorkspaceId: vi.fn(),
+        setSelectedConversationId: vi.fn(),
+        setSelectedRunId: vi.fn(),
+        setActiveTab: vi.fn(),
+        setRunProcess: vi.fn(),
+        setError: vi.fn(),
+        setNotice,
+        removeApprovalItem,
+        refreshConversation,
+        refreshRun,
+        queueWorkspaceFileOpen: vi.fn(),
+        focusRunComposer: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.handleReplyApproval({
+        id: "approval-item-1",
+        kind: "conversation_approval",
+        status: "pending",
+        created_at: "2026-03-31T18:00:00Z",
+        title: "Thread approval",
+        summary: "Approve tool use",
+        workspace_id: "workspace-1",
+        workspace_path: "/tmp/workspace",
+        workspace_display_name: "Workspace 1",
+        task_id: "",
+        run_id: "",
+        conversation_id: "conversation-1",
+        subtask_id: "",
+        question_id: "",
+        approval_id: "approval-1",
+        tool_name: "shell",
+        risk_level: "medium",
+        request_payload: {},
+        metadata: {},
+      }, {
+        decision: "approve",
+      });
+    });
+
+    expect(removeApprovalItem).toHaveBeenCalledWith("approval-item-1", "workspace-1");
+    expect(refreshConversation).toHaveBeenCalledWith("conversation-1");
+    expect(refreshRun).not.toHaveBeenCalled();
+    expect(setNotice).toHaveBeenCalledWith("Thread approval updated.");
   });
 });

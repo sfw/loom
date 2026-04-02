@@ -1,5 +1,9 @@
 import { useState } from "react";
-import { useApp } from "@/context/AppContext";
+import {
+  shallowEqual,
+  useAppActions,
+  useAppSelector,
+} from "@/context/AppContext";
 import { cn } from "@/lib/utils";
 import { defaultWorkspaceName } from "@/utils";
 import { createWorkspace } from "@/api";
@@ -18,13 +22,15 @@ async function pickFolder(): Promise<string | null> {
 }
 
 export default function WorkspaceModal() {
+  const { showNewWorkspace } = useAppSelector((state) => ({
+    showNewWorkspace: state.showNewWorkspace,
+  }), shallowEqual);
   const {
-    showNewWorkspace,
     setShowNewWorkspace,
     refreshWorkspaceList,
     setError,
     setNotice,
-  } = useApp();
+  } = useAppActions();
 
   const [importing, setImporting] = useState(false);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);

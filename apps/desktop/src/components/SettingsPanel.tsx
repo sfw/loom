@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { useApp } from "@/context/AppContext";
+import {
+  shallowEqual,
+  useAppSelector,
+} from "@/context/AppContext";
 import { cn } from "@/lib/utils";
 import {
   Sun,
@@ -57,7 +60,11 @@ function applyTheme(preference: ThemePreference) {
 // ---------------------------------------------------------------------------
 
 export default function SettingsPanel() {
-  const { runtime, models, settings } = useApp();
+  const { runtime, models, settings } = useAppSelector((state) => ({
+    runtime: state.runtime,
+    models: state.models,
+    settings: state.settings,
+  }), shallowEqual);
 
   // ---- Theme state ----
   const [theme, setThemeState] = useState<ThemePreference>(getStoredTheme);

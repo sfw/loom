@@ -10,7 +10,10 @@ const mockUnlisten = vi.fn();
 const mockConfirm = vi.fn<(message: string, options?: { title?: string; kind?: string }) => Promise<boolean>>(async () => false);
 
 vi.mock("@/context/AppContext", () => ({
+  shallowEqual: (left: unknown, right: unknown) => left === right,
   useApp: () => mockApp,
+  useAppActions: () => mockApp,
+  useAppSelector: (selector: (state: any) => unknown) => selector(mockApp),
 }));
 
 vi.mock("./Sidebar", () => ({ default: () => <div>Sidebar</div> }));

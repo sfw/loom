@@ -94,6 +94,7 @@ export function useConnection(deps: {
   const [runtimeManaged, setRuntimeManaged] = useState(false);
   const loadInFlightRef = useRef(false);
   const healthCheckInFlightRef = useRef(false);
+  const lastArchivedVisibilityRef = useRef(showArchivedWorkspaces);
 
   // Bootstrap runtime and load initial shell data
   useEffect(() => {
@@ -146,7 +147,7 @@ export function useConnection(deps: {
       cancelled = true;
       loadInFlightRef.current = false;
     };
-  }, [showArchivedWorkspaces, connectionAttempt]);
+  }, [connectionAttempt]);
 
   useEffect(() => {
     if (connectionState !== "failed" || loadInFlightRef.current) {
@@ -181,6 +182,35 @@ export function useConnection(deps: {
     }
   });
 
+  const refreshWorkspaceSummaries = useEffectEvent(async () => {
+    if (connectionState !== "connected" || loadInFlightRef.current) {
+      return;
+    }
+
+    const workspaceRows = await fetchWorkspaces(showArchivedWorkspaces);
+    setWorkspaces(workspaceRows);
+    startTransition(() => {
+      setSelectedWorkspaceId((currentId) => {
+        const stillValid = workspaceRows.some((workspace) => workspace.id === currentId);
+        return stillValid ? currentId : (workspaceRows[0]?.id || "");
+      });
+    });
+  });
+
+  useEffect(() => {
+    if (connectionState !== "connected") {
+      lastArchivedVisibilityRef.current = showArchivedWorkspaces;
+      return;
+    }
+    if (lastArchivedVisibilityRef.current === showArchivedWorkspaces) {
+      return;
+    }
+    lastArchivedVisibilityRef.current = showArchivedWorkspaces;
+    void refreshWorkspaceSummaries().catch((err) => {
+      setError(err instanceof Error ? err.message : "Failed to refresh workspaces.");
+    });
+  }, [connectionState, setError, showArchivedWorkspaces]);
+
   useEffect(() => {
     if (connectionState !== "connected") {
       return;
@@ -193,7 +223,7 @@ export function useConnection(deps: {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [connectionState, refreshConnectionHealth]);
+  }, [connectionState]);
 
   function retryConnection() {
     setConnectionState("connecting");

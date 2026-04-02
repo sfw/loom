@@ -2,6 +2,7 @@ import {
   startTransition,
   type FormEvent,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -130,30 +131,57 @@ export function useCommandPalette(deps: {
   // Computed values
   // ---------------------------------------------------------------------------
 
-  const trimmedCommandDraft = commandDraft.trim();
-  const normalizedCommandDraft = trimmedCommandDraft.toLowerCase();
-  const commandSearchTerm = normalizedCommandDraft.startsWith("search ")
-    ? trimmedCommandDraft.slice(7).trim()
-    : trimmedCommandDraft;
-  const commandOptions = buildCommandOptions(commandDraft);
-  const pinnedPaletteEntries = buildPinnedPaletteEntries();
-  const commandPaletteEntriesComputed = buildCommandPaletteEntries(commandOptions);
-  const resultPaletteEntries = buildResultPaletteEntries(commandSearchResults);
-  const paletteEntries = buildPaletteEntries(
+  const trimmedCommandDraft = useMemo(() => commandDraft.trim(), [commandDraft]);
+  const normalizedCommandDraft = useMemo(
+    () => trimmedCommandDraft.toLowerCase(),
+    [trimmedCommandDraft],
+  );
+  const commandSearchTerm = useMemo(() => (
+    normalizedCommandDraft.startsWith("search ")
+      ? trimmedCommandDraft.slice(7).trim()
+      : trimmedCommandDraft
+  ), [normalizedCommandDraft, trimmedCommandDraft]);
+  const commandOptions = useMemo(
+    () => buildCommandOptions(commandDraft),
+    [commandDraft],
+  );
+  const pinnedPaletteEntries = useMemo(() => buildPinnedPaletteEntries(), []);
+  const commandPaletteEntriesComputed = useMemo(
+    () => buildCommandPaletteEntries(commandOptions),
+    [commandOptions],
+  );
+  const resultPaletteEntries = useMemo(
+    () => buildResultPaletteEntries(commandSearchResults),
+    [commandSearchResults],
+  );
+  const paletteEntries = useMemo(() => buildPaletteEntries(
     commandDraft,
     recentPaletteEntries,
     commandPaletteEntriesComputed,
     resultPaletteEntries,
     pinnedPaletteEntries,
-  );
-  const paletteSections = buildPaletteSections(
+  ), [
+    commandDraft,
+    commandPaletteEntriesComputed,
+    pinnedPaletteEntries,
+    recentPaletteEntries,
+    resultPaletteEntries,
+  ]);
+  const paletteSections = useMemo(() => buildPaletteSections(
     commandDraft,
     recentPaletteEntries,
     commandPaletteEntriesComputed,
     resultPaletteEntries,
     pinnedPaletteEntries,
     commandSearchResults,
-  );
+  ), [
+    commandDraft,
+    commandPaletteEntriesComputed,
+    commandSearchResults,
+    pinnedPaletteEntries,
+    recentPaletteEntries,
+    resultPaletteEntries,
+  ]);
 
   // ---------------------------------------------------------------------------
   // Effects

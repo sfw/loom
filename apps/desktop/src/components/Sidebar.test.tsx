@@ -8,7 +8,10 @@ import { createConversation, patchConversation } from "@/api";
 let mockApp: any;
 
 vi.mock("@/context/AppContext", () => ({
+  shallowEqual: (left: unknown, right: unknown) => left === right,
   useApp: () => mockApp,
+  useAppActions: () => mockApp,
+  useAppSelector: (selector: (state: any) => unknown) => selector(mockApp),
 }));
 
 vi.mock("@/api", () => ({
@@ -158,6 +161,7 @@ describe("Sidebar", () => {
         backendConnected: false,
       },
       models: [],
+      syncConversationSummary: vi.fn(),
       refreshWorkspaceSurface: vi.fn(async () => {}),
       refreshConversation: vi.fn(async () => {}),
       handleArchiveWorkspace: vi.fn(async () => {}),
@@ -340,7 +344,7 @@ describe("Sidebar", () => {
     mockApp.selectedConversationId = "";
     mockApp.conversationDetail = null;
     mockApp.overview.recent_conversations = [];
-    mockApp.refreshWorkspaceSurface = vi.fn(() => new Promise(() => {}));
+    mockApp.syncConversationSummary = vi.fn();
 
     render(<Sidebar />);
 
@@ -350,6 +354,10 @@ describe("Sidebar", () => {
     expect(createConversation).toHaveBeenCalledWith("workspace-1", {});
     expect(mockApp.setSelectedConversationId).toHaveBeenCalledWith("conversation-created");
     expect(mockApp.setActiveTab).toHaveBeenCalledWith("threads");
-    expect(mockApp.refreshWorkspaceSurface).toHaveBeenCalledWith("workspace-1");
+    expect(mockApp.syncConversationSummary).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "conversation-created" }),
+      expect.objectContaining({ incrementCount: true, workspaceId: "workspace-1" }),
+    );
+    expect(mockApp.refreshWorkspaceSurface).not.toHaveBeenCalled();
   });
 });

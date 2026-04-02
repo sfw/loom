@@ -3,6 +3,7 @@ import {
   type FormEvent,
   useEffect,
   useEffectEvent,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -23,6 +24,7 @@ import {
   type ConversationDetail,
   type ConversationMessage,
   type ConversationPrompt,
+  type ConversationSummary,
   type ConversationStatus,
   type ConversationStreamEvent,
   type ModelInfo,
@@ -441,6 +443,23 @@ export function useConversation(deps: {
   setNotice: React.Dispatch<React.SetStateAction<string>>;
   setActiveTab: React.Dispatch<React.SetStateAction<import("../utils").ViewTab>>;
   refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
+  syncConversationSummary: (
+    detail: ConversationSummary | ConversationDetail,
+    options?: {
+      incrementCount?: boolean;
+      processing?: boolean;
+      workspaceId?: string;
+    },
+  ) => void;
+  setConversationProcessing: (
+    conversationId: string,
+    processing: boolean,
+    options?: {
+      lastActiveAt?: string;
+      workspaceId?: string;
+    },
+  ) => void;
+  removeApprovalItem: (itemId: string, workspaceId?: string) => void;
 }): ConversationState & ConversationActions {
   const {
     selectedConversationId,
@@ -452,6 +471,9 @@ export function useConversation(deps: {
     setNotice,
     setActiveTab,
     refreshWorkspaceSurface,
+    syncConversationSummary,
+    setConversationProcessing,
+    removeApprovalItem,
   } = deps;
   const [conversationDetail, setConversationDetail] = useState<ConversationDetail | null>(null);
   const [loadingConversationDetail, setLoadingConversationDetail] = useState(false);
@@ -555,6 +577,10 @@ export function useConversation(deps: {
       ? pendingConversationTitleRef.current
       : null;
     setConversationDetail(reconciled.detail);
+    syncConversationSummary(reconciled.detail, {
+      processing: Boolean(conversationStatusRef.current?.processing ?? reconciled.detail.is_active),
+      workspaceId: selectedWorkspaceId,
+    });
   }
 
   function maybeApplyOptimisticConversationTitle(rawText: string) {
@@ -576,10 +602,10 @@ export function useConversation(deps: {
       if (selectedConversationId === conversationId) {
         applyIncomingConversationDetail(updatedDetail);
       }
-      if (workspaceId) {
-        return refreshWorkspaceSurface(workspaceId);
-      }
-      return Promise.resolve();
+      syncConversationSummary(updatedDetail, {
+        processing: Boolean(conversationStatusRef.current?.processing ?? updatedDetail.is_active),
+        workspaceId,
+      });
     }).catch(() => {
       autoTitledRef.current = false;
       pendingConversationTitleRef.current = null;
@@ -596,49 +622,72 @@ export function useConversation(deps: {
   // Computed values
   // ---------------------------------------------------------------------------
 
-  const conversationIsProcessing = Boolean(
-    conversationStatus?.processing || conversationTurnPending,
+  const conversationIsProcessing = useMemo(
+    () => Boolean(conversationStatus?.processing || conversationTurnPending),
+    [conversationStatus?.processing, conversationTurnPending],
   );
-  const pendingConversationApproval = conversationStatus?.pending_approval || null;
-  const conversationAwaitingApproval = Boolean(
+  const pendingConversationApproval = useMemo(
+    () => conversationStatus?.pending_approval || null,
+    [conversationStatus?.pending_approval],
+  );
+  const conversationAwaitingApproval = useMemo(() => Boolean(
     conversationStatus?.awaiting_approval && pendingConversationApproval,
+  ), [conversationStatus?.awaiting_approval, pendingConversationApproval]);
+  const pendingConversationPrompt = useMemo(
+    () => conversationStatus?.pending_prompt || null,
+    [conversationStatus?.pending_prompt],
   );
-  const pendingConversationPrompt = conversationStatus?.pending_prompt || null;
-  const conversationAwaitingInput = Boolean(
+  const conversationAwaitingInput = useMemo(() => Boolean(
     conversationStatus?.awaiting_user_input && pendingConversationPrompt,
-  );
-  const conversationPhaseLabel = conversationAwaitingApproval
-    ? "Awaiting approval"
-    : conversationIsProcessing
-      ? "Running"
-      : conversationAwaitingInput
-        ? "Awaiting input"
-        : conversationStreaming
-          ? "Live"
-          : "Idle";
-  const quickReplyOptions =
+  ), [conversationStatus?.awaiting_user_input, pendingConversationPrompt]);
+  const conversationPhaseLabel = useMemo(() => (
+    conversationAwaitingApproval
+      ? "Awaiting approval"
+      : conversationIsProcessing
+        ? "Running"
+        : conversationAwaitingInput
+          ? "Awaiting input"
+          : conversationStreaming
+            ? "Live"
+            : "Idle"
+  ), [
+    conversationAwaitingApproval,
+    conversationAwaitingInput,
+    conversationIsProcessing,
+    conversationStreaming,
+  ]);
+  const quickReplyOptions = useMemo(() => (
     conversationAwaitingInput
     && pendingConversationPrompt
     && pendingConversationPrompt.question_type === "single_choice"
       ? pendingConversationPrompt.options
-      : [];
-  const workspaceConversationRows = overview?.recent_conversations || [];
-  const selectedConversationSummary =
+      : []
+  ), [conversationAwaitingInput, pendingConversationPrompt]);
+  const workspaceConversationRows = useMemo(
+    () => overview?.recent_conversations || [],
+    [overview?.recent_conversations],
+  );
+  const selectedConversationSummary = useMemo(() => (
     conversationDetail
     || workspaceConversationRows.find((conversation) => conversation.id === selectedConversationId)
-    || null;
-  const selectedConversationServerActive = Boolean(
+    || null
+  ), [conversationDetail, selectedConversationId, workspaceConversationRows]);
+  const selectedConversationServerActive = useMemo(() => Boolean(
     selectedConversationSummary
     && "is_active" in selectedConversationSummary
     && selectedConversationSummary.is_active,
-  );
-  const selectedConversationRunIds = selectedConversationSummary
-    ? ("linked_run_ids" in selectedConversationSummary ? selectedConversationSummary.linked_run_ids : [])
-    : [];
-  const allConversationEvents = optimisticConversationEvents.length > 0
-    ? [...conversationEvents, ...optimisticConversationEvents]
-    : conversationEvents;
-  const filteredConversationEvents = allConversationEvents.filter((event) =>
+  ), [selectedConversationSummary]);
+  const selectedConversationRunIds = useMemo(() => (
+    selectedConversationSummary
+      ? ("linked_run_ids" in selectedConversationSummary ? selectedConversationSummary.linked_run_ids : [])
+      : []
+  ), [selectedConversationSummary]);
+  const allConversationEvents = useMemo(() => (
+    optimisticConversationEvents.length > 0
+      ? [...conversationEvents, ...optimisticConversationEvents]
+      : conversationEvents
+  ), [conversationEvents, optimisticConversationEvents]);
+  const filteredConversationEvents = useMemo(() => allConversationEvents.filter((event) =>
     matchesWorkspaceSearch(
       conversationHistoryQuery,
       event.event_type,
@@ -647,8 +696,8 @@ export function useConversation(deps: {
       event.payload,
       conversationEventPills(event).join(" "),
     ),
-  );
-  const filteredConversationMessages = conversationMessages.filter((message) =>
+  ), [allConversationEvents, conversationHistoryQuery]);
+  const filteredConversationMessages = useMemo(() => conversationMessages.filter((message) =>
     matchesWorkspaceSearch(
       conversationHistoryQuery,
       message.role,
@@ -657,14 +706,21 @@ export function useConversation(deps: {
       message.tool_call_id,
       summarizeMessage(message),
     ),
+  ), [conversationHistoryQuery, conversationMessages]);
+  const visibleConversationEvents = useMemo(() => (
+    conversationHistoryQuery.trim()
+      ? filteredConversationEvents
+      : allConversationEvents
+  ), [allConversationEvents, conversationHistoryQuery, filteredConversationEvents]);
+  const visibleConversationMessages = useMemo(() => (
+    conversationHistoryQuery.trim()
+      ? filteredConversationMessages
+      : conversationMessages
+  ), [conversationHistoryQuery, conversationMessages, filteredConversationMessages]);
+  const totalConversationMatches = useMemo(
+    () => filteredConversationEvents.length + filteredConversationMessages.length,
+    [filteredConversationEvents.length, filteredConversationMessages.length],
   );
-  const visibleConversationEvents = conversationHistoryQuery.trim()
-    ? filteredConversationEvents
-    : allConversationEvents;
-  const visibleConversationMessages = conversationHistoryQuery.trim()
-    ? filteredConversationMessages
-    : conversationMessages;
-  const totalConversationMatches = filteredConversationEvents.length + filteredConversationMessages.length;
 
   useEffect(() => {
     conversationMessagesRef.current = conversationMessages;
@@ -739,6 +795,10 @@ export function useConversation(deps: {
     }
     if (detail != null) {
       applyIncomingConversationDetail(detail);
+    } else if (status != null) {
+      setConversationProcessing(conversationId, Boolean(status.processing), {
+        workspaceId: selectedWorkspaceId,
+      });
     }
     setConversationLoadError("");
     setConversationStreamReady(true);
@@ -768,6 +828,9 @@ export function useConversation(deps: {
     }
     if (status != null) {
       setConversationStatus(status);
+      setConversationProcessing(conversationId, Boolean(status.processing), {
+        workspaceId: selectedWorkspaceId,
+      });
     }
     // Sync turn pending state from server — clears stale "Processing" indicators
     setLoadingConversationDetail(false);
@@ -787,9 +850,6 @@ export function useConversation(deps: {
     setConversationLoadError("");
     try {
       await refreshConversation(selectedConversationId);
-      if (selectedWorkspaceId) {
-        await refreshWorkspaceSurface(selectedWorkspaceId);
-      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to load conversation.";
       setConversationLoadError(message);
@@ -851,19 +911,13 @@ export function useConversation(deps: {
     await hydrateConversationReplay();
   }
 
-  const scheduleConversationRefresh = useEffectEvent((options?: { includeWorkspaceSurface?: boolean }) => {
+  const scheduleConversationRefresh = useEffectEvent(() => {
     if (conversationRefreshTimerRef.current !== null || !selectedConversationId) {
       return;
     }
     conversationRefreshTimerRef.current = window.setTimeout(() => {
       conversationRefreshTimerRef.current = null;
-      const includeWorkspaceSurface = Boolean(options?.includeWorkspaceSurface);
-      void Promise.all([
-        refreshConversation(selectedConversationId),
-        includeWorkspaceSurface && selectedWorkspaceId
-          ? refreshWorkspaceSurface(selectedWorkspaceId)
-          : Promise.resolve(),
-      ]).catch((err) => {
+      void refreshConversation(selectedConversationId).catch((err) => {
         if (!isTransientRequestError(err)) {
           setError(err instanceof Error ? err.message : "Failed to refresh conversation.");
         }
@@ -926,6 +980,9 @@ export function useConversation(deps: {
 
       if (status != null) {
         setConversationStatus(status);
+        setConversationProcessing(conversationId, Boolean(status.processing), {
+          workspaceId: selectedWorkspaceId,
+        });
       }
       setConversationStreamReady(true);
 
@@ -965,7 +1022,6 @@ export function useConversation(deps: {
     let nextTurnPending = conversationTurnPendingRef.current;
     let queuedNextMessage: { id: string; text: string } | null = null;
     let shouldRefreshConversation = false;
-    let shouldRefreshWorkspaceSurface = false;
     let autoTitleCandidate = "";
 
     const seenEventKeys = new Set(nextEvents.map((event) => conversationEventKey(event)));
@@ -1097,7 +1153,10 @@ export function useConversation(deps: {
           nextQueuedMessages = nextQueuedMessages.filter((message) => message.id !== nextMessage.id);
         }
         shouldRefreshConversation = true;
-        shouldRefreshWorkspaceSurface = true;
+        setConversationProcessing(selectedConversationId, false, {
+          lastActiveAt: event.created_at,
+          workspaceId: selectedWorkspaceId,
+        });
 
         const detail = conversationDetailRef.current;
         if (
@@ -1128,7 +1187,10 @@ export function useConversation(deps: {
         nextLastTurnStats = null;
         nextQueuedMessages = [];
         shouldRefreshConversation = true;
-        shouldRefreshWorkspaceSurface = true;
+        setConversationProcessing(selectedConversationId, false, {
+          lastActiveAt: event.created_at,
+          workspaceId: selectedWorkspaceId,
+        });
       }
 
       if (event.event_type === "user_message") {
@@ -1156,6 +1218,10 @@ export function useConversation(deps: {
           awaiting_user_input: false,
           pending_prompt: null,
         };
+        setConversationProcessing(selectedConversationId, true, {
+          lastActiveAt: event.created_at,
+          workspaceId: selectedWorkspaceId,
+        });
       }
 
       if (event.event_type === "steering_instruction") {
@@ -1216,6 +1282,10 @@ export function useConversation(deps: {
             awaiting_user_input: true,
             pending_prompt: pendingPrompt,
           };
+          setConversationProcessing(selectedConversationId, false, {
+            lastActiveAt: event.created_at,
+            workspaceId: selectedWorkspaceId,
+          });
         }
       }
 
@@ -1281,9 +1351,7 @@ export function useConversation(deps: {
       void submitConversationMessage(queuedNextMessage.text);
     }
     if (shouldRefreshConversation) {
-      scheduleConversationRefresh({
-        includeWorkspaceSurface: shouldRefreshWorkspaceSurface,
-      });
+      scheduleConversationRefresh();
     }
   });
 
@@ -1458,6 +1526,16 @@ export function useConversation(deps: {
             && !status.awaiting_user_input
             && !status.awaiting_approval,
           );
+          if (detail != null) {
+            syncConversationSummary(detail, {
+              processing: isActive,
+              workspaceId: selectedWorkspaceId,
+            });
+          } else {
+            setConversationProcessing(selectedConversationId, isActive, {
+              workspaceId: selectedWorkspaceId,
+            });
+          }
           setConversationTurnPending(isActive);
           setConversationStreaming(false);
           if (hasOlder) {
@@ -1553,8 +1631,6 @@ export function useConversation(deps: {
   }, [
     connectionState,
     conversationStreamReady,
-    queueConversationStreamEvent,
-    scheduleConversationRefresh,
     selectedConversationId,
   ]);
 
@@ -1603,7 +1679,6 @@ export function useConversation(deps: {
     selectedConversationId,
     selectedConversationServerActive,
     setError,
-    syncConversationLiveState,
   ]);
 
   // Conversation match scroll tracking
@@ -1637,7 +1712,11 @@ export function useConversation(deps: {
         model_name: newConversationModel.trim(),
         system_prompt: newConversationPrompt.trim(),
       });
-      await refreshWorkspaceSurface(selectedWorkspaceId);
+      syncConversationSummary(created, {
+        incrementCount: true,
+        processing: false,
+        workspaceId: selectedWorkspaceId,
+      });
       startTransition(() => {
         setSelectedConversationId(created.id);
       });
@@ -1727,6 +1806,10 @@ export function useConversation(deps: {
           awaiting_user_input: false,
           pending_prompt: null,
         }));
+        setConversationProcessing(selectedConversationId, true, {
+          lastActiveAt: createdAt,
+          workspaceId: selectedWorkspaceId,
+        });
         await sendConversationMessage(
           selectedConversationId,
           message,
@@ -1778,6 +1861,9 @@ export function useConversation(deps: {
           awaiting_user_input: current?.awaiting_user_input || false,
           pending_prompt: current?.pending_prompt || null,
         }));
+        setConversationProcessing(selectedConversationId, false, {
+          workspaceId: selectedWorkspaceId,
+        });
       }
       setError(
         err instanceof Error
@@ -1882,6 +1968,13 @@ export function useConversation(deps: {
         pending_prompt: null,
       }));
       setConversationTurnPending(true);
+      removeApprovalItem(
+        `conversation:${selectedConversationId}:${pendingApproval.approval_id}`,
+        selectedWorkspaceId,
+      );
+      setConversationProcessing(selectedConversationId, true, {
+        workspaceId: selectedWorkspaceId,
+      });
       
     } catch (err) {
       setError(

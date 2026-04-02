@@ -186,6 +186,105 @@ describe("useWorkspace", () => {
     expect(apiMocks.fetchWorkspaceArtifacts).not.toHaveBeenCalled();
   });
 
+  it("patches approval notifications into inbox state before any repair refresh", async () => {
+    vi.useFakeTimers();
+    let notificationEvent: ((event: any) => void) | undefined;
+    apiMocks.subscribeNotificationsStream.mockImplementation(((
+      _workspaceId: string,
+      onEvent: (event: unknown) => void,
+    ) => {
+      notificationEvent = onEvent as (event: any) => void;
+      return () => {};
+    }) as any);
+
+    const { result } = renderHook(() => {
+      const [workspaces, setWorkspaces] = useState([{
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+        display_name: "Workspace 1",
+        metadata: {},
+        is_archived: false,
+        sort_order: 0,
+        conversation_count: 0,
+        run_count: 0,
+        active_run_count: 0,
+      }] as any);
+      return useWorkspace({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "",
+        setSelectedWorkspaceId: vi.fn(),
+        showArchivedWorkspaces: false,
+        setShowArchivedWorkspaces: vi.fn(),
+        createParentPath: "/tmp",
+        setCreateParentPath: vi.fn(),
+        workspaces,
+        setWorkspaces,
+        runtime: null,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        activeTab: "overview",
+        setActiveTab: vi.fn(),
+        setSelectedConversationId: vi.fn(),
+        setSelectedRunId: vi.fn(),
+      });
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    apiMocks.fetchApprovals.mockClear();
+    apiMocks.fetchWorkspaceOverview.mockClear();
+
+    act(() => {
+      notificationEvent?.({
+        id: "evt-approval-1",
+        stream_id: 11,
+        event_type: "approval_requested",
+        created_at: "2026-03-27T00:00:00Z",
+        workspace_id: "workspace-1",
+        workspace_path: "/tmp/workspace",
+        workspace_display_name: "Workspace 1",
+        task_id: "task-1",
+        conversation_id: "",
+        approval_id: "",
+        kind: "task_approval",
+        title: "Deploy approval",
+        summary: "Need approval",
+        payload: {
+          proposed_action: "Deploy release",
+          reason: "Production deployment",
+          tool_name: "deploy",
+          risk_level: "high",
+          subtask_id: "subtask-1",
+        },
+      });
+    });
+
+    expect(result.current.approvalInbox).toEqual([
+      expect.objectContaining({
+        id: "task:task-1:subtask-1",
+        title: "Deploy release",
+        summary: "Production deployment",
+        tool_name: "deploy",
+      }),
+    ]);
+    expect(result.current.overview?.pending_approvals_count).toBe(1);
+
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchApprovals).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceOverview).not.toHaveBeenCalled();
+  });
+
   it("preserves the loaded workspace surface during a disconnect and refreshes on reconnect", async () => {
     const initialProps: { connectionState: "connected" | "failed" } = {
       connectionState: "connected",
@@ -354,6 +453,165 @@ describe("useWorkspace", () => {
     expect(result.current.overview?.workspace.active_run_count).toBe(0);
     expect(result.current.selectedWorkspaceSummary?.active_run_count).toBe(0);
     expect(apiMocks.fetchWorkspaceOverview).not.toHaveBeenCalled();
+  });
+
+  it("upserts conversation summaries locally without a workspace refetch", async () => {
+    apiMocks.fetchWorkspaceOverview.mockResolvedValue({
+      workspace: {
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+        display_name: "Workspace 1",
+        conversation_count: 0,
+        last_activity_at: "2026-03-27T00:00:00Z",
+      },
+      recent_conversations: [],
+      recent_runs: [],
+      pending_approvals_count: 0,
+      counts: {},
+    });
+
+    const { result } = renderHook(() => {
+      const [workspaces, setWorkspaces] = useState([{
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+        display_name: "Workspace 1",
+        metadata: {},
+        is_archived: false,
+        sort_order: 0,
+        conversation_count: 0,
+        run_count: 0,
+        active_run_count: 0,
+        last_activity_at: "2026-03-27T00:00:00Z",
+      }] as any);
+      return useWorkspace({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "",
+        setSelectedWorkspaceId: vi.fn(),
+        showArchivedWorkspaces: false,
+        setShowArchivedWorkspaces: vi.fn(),
+        createParentPath: "/tmp",
+        setCreateParentPath: vi.fn(),
+        workspaces,
+        setWorkspaces,
+        runtime: null,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        activeTab: "threads",
+        setActiveTab: vi.fn(),
+        setSelectedConversationId: vi.fn(),
+        setSelectedRunId: vi.fn(),
+      });
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    apiMocks.fetchWorkspaceOverview.mockClear();
+
+    act(() => {
+      result.current.syncConversationSummary({
+        id: "conversation-1",
+        workspace_id: "workspace-1",
+        workspace_path: "/tmp/workspace",
+        model_name: "gpt-5.4-mini",
+        title: "Fresh thread",
+        turn_count: 1,
+        total_tokens: 42,
+        last_active_at: "2026-03-27T00:05:00Z",
+        started_at: "2026-03-27T00:05:00Z",
+        is_active: true,
+        linked_run_ids: [],
+      }, {
+        incrementCount: true,
+        processing: true,
+      });
+    });
+
+    expect(result.current.overview?.recent_conversations[0]).toEqual(expect.objectContaining({
+      id: "conversation-1",
+      title: "Fresh thread",
+      is_active: true,
+    }));
+    expect(result.current.overview?.workspace.conversation_count).toBe(1);
+    expect(result.current.selectedWorkspaceSummary?.conversation_count).toBe(1);
+    expect(apiMocks.fetchWorkspaceOverview).not.toHaveBeenCalled();
+  });
+
+  it("preserves dirty workspace drafts and file-tree mode across unrelated summary churn", async () => {
+    const { result, rerender } = renderHook(
+      ({ workspaces }: { workspaces: any[] }) =>
+        useWorkspace({
+          selectedWorkspaceId: "workspace-1",
+          selectedConversationId: "",
+          selectedRunId: "",
+          setSelectedWorkspaceId: vi.fn(),
+          showArchivedWorkspaces: false,
+          setShowArchivedWorkspaces: vi.fn(),
+          createParentPath: "/tmp",
+          setCreateParentPath: vi.fn(),
+          workspaces,
+          setWorkspaces: vi.fn(),
+          runtime: null,
+          setError: vi.fn(),
+          setNotice: vi.fn(),
+          activeTab: "files",
+          setActiveTab: vi.fn(),
+          setSelectedConversationId: vi.fn(),
+          setSelectedRunId: vi.fn(),
+        }),
+      {
+        initialProps: {
+          workspaces: [{
+            id: "workspace-1",
+            canonical_path: "/tmp/workspace",
+            display_name: "Workspace 1",
+            metadata: {
+              note: "Original note",
+              tags: ["alpha"],
+            },
+            is_archived: false,
+            sort_order: 0,
+            conversation_count: 0,
+            run_count: 0,
+            active_run_count: 0,
+            last_activity_at: "2026-03-27T00:00:00Z",
+          }],
+        },
+      },
+    );
+
+    act(() => {
+      result.current.setWorkspaceNameDraft("Locally edited name");
+      result.current.setWorkspaceNoteDraft("Locally edited note");
+      result.current.setWorkspaceTagsDraft("alpha, beta");
+      result.current.setWorkspaceFileTreeMode("recent");
+    });
+
+    rerender({
+      workspaces: [{
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+        display_name: "Workspace 1",
+        metadata: {
+          note: "Original note",
+          tags: ["alpha"],
+        },
+        is_archived: false,
+        sort_order: 0,
+        conversation_count: 1,
+        run_count: 0,
+        active_run_count: 0,
+        last_activity_at: "2026-03-27T00:05:00Z",
+      }],
+    });
+
+    expect(result.current.workspaceNameDraft).toBe("Locally edited name");
+    expect(result.current.workspaceNoteDraft).toBe("Locally edited note");
+    expect(result.current.workspaceTagsDraft).toBe("alpha, beta");
+    expect(result.current.workspaceFileTreeMode).toBe("recent");
   });
 
   it("loads only the visible workspace surface and fetches inventory lazily for the runs tab", async () => {

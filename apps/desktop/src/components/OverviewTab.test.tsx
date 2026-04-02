@@ -7,7 +7,10 @@ import OverviewTab from "./OverviewTab";
 let mockApp: any;
 
 vi.mock("@/context/AppContext", () => ({
+  shallowEqual: (left: unknown, right: unknown) => left === right,
   useApp: () => mockApp,
+  useAppActions: () => mockApp,
+  useAppSelector: (selector: (state: any) => unknown) => selector(mockApp),
 }));
 
 describe("OverviewTab", () => {

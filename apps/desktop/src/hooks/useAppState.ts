@@ -6,6 +6,7 @@ import type {
   ConversationDetail,
   ConversationMessage,
   ConversationPrompt,
+  ConversationSummary,
   ConversationStatus,
   ConversationStreamEvent,
   ModelInfo,
@@ -122,6 +123,8 @@ export interface AppState {
   conversationEvents: ConversationStreamEvent[];
   conversationStatus: ConversationStatus | null;
   conversationStreaming: boolean;
+  hasOlderMessages: boolean;
+  loadingOlderMessages: boolean;
 
   // Live streaming state
   streamingText: string;
@@ -398,12 +401,32 @@ export interface AppActions {
   refreshWorkspaceList: (preferredWorkspaceId?: string) => Promise<void>;
   refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
   refreshApprovalInbox: (workspaceId: string) => Promise<void>;
+  syncConversationSummary: (
+    detail: ConversationDetail | ConversationSummary,
+    options?: {
+      incrementCount?: boolean;
+      processing?: boolean;
+      workspaceId?: string;
+    },
+  ) => void;
+  setConversationProcessing: (
+    conversationId: string,
+    processing: boolean,
+    options?: {
+      lastActiveAt?: string;
+      workspaceId?: string;
+    },
+  ) => void;
+  removeConversationSummary: (conversationId: string, workspaceId?: string) => void;
+  applyApprovalItem: (item: ApprovalFeedItem, options?: { incrementCount?: boolean }) => void;
+  removeApprovalItem: (itemId: string, workspaceId?: string) => void;
   refreshConversation: (conversationId: string) => Promise<void>;
   retryConversationLoad: () => Promise<void>;
   loadOlderMessages: () => Promise<void>;
   hasOlderMessages: boolean;
   loadingOlderMessages: boolean;
   refreshRun: (runId: string) => Promise<void>;
+  removeRunSummary: (runId: string, workspaceId?: string) => void;
   loadWorkspaceDirectory: (workspaceId: string, directory?: string) => Promise<void>;
 }
 
@@ -474,6 +497,9 @@ export function useAppState(): AppState & AppActions {
     setNotice,
     setActiveTab,
     refreshWorkspaceSurface: workspace.refreshWorkspaceSurface,
+    syncConversationSummary: workspace.syncConversationSummary,
+    setConversationProcessing: workspace.setConversationProcessing,
+    removeApprovalItem: workspace.removeApprovalItem,
   });
 
   // -----------------------------------------------------------------------
@@ -488,8 +514,8 @@ export function useAppState(): AppState & AppActions {
     setError,
     setNotice,
     setActiveTab,
-    refreshWorkspaceSurface: workspace.refreshWorkspaceSurface,
     syncRunDetail: workspace.syncRunDetail,
+    removeRunSummary: workspace.removeRunSummary,
   });
 
   const desktopActivity = useDesktopActivity({
@@ -533,8 +559,7 @@ export function useAppState(): AppState & AppActions {
     setRunProcess: runs.setRunProcess,
     setError,
     setNotice,
-    refreshWorkspaceSurface: workspace.refreshWorkspaceSurface,
-    refreshApprovalInbox: workspace.refreshApprovalInbox,
+    removeApprovalItem: workspace.removeApprovalItem,
     refreshConversation: conversation.refreshConversation,
     refreshRun: runs.refreshRun,
     queueWorkspaceFileOpen: files.queueWorkspaceFileOpen,
@@ -680,6 +705,11 @@ export function useAppState(): AppState & AppActions {
     refreshWorkspaceList: workspace.refreshWorkspaceList,
     refreshWorkspaceSurface: workspace.refreshWorkspaceSurface,
     refreshApprovalInbox: workspace.refreshApprovalInbox,
+    syncConversationSummary: workspace.syncConversationSummary,
+    setConversationProcessing: workspace.setConversationProcessing,
+    removeConversationSummary: workspace.removeConversationSummary,
+    applyApprovalItem: workspace.applyApprovalItem,
+    removeApprovalItem: workspace.removeApprovalItem,
 
     // Conversation
     conversationDetail: conversation.conversationDetail,
@@ -790,6 +820,7 @@ export function useAppState(): AppState & AppActions {
     handlePrefillStarterRun: runs.handlePrefillStarterRun,
     focusRunComposer: runs.focusRunComposer,
     refreshRun: runs.refreshRun,
+    removeRunSummary: workspace.removeRunSummary,
     scrollRunMatchIntoView: runs.scrollRunMatchIntoView,
     stepRunMatch: runs.stepRunMatch,
 

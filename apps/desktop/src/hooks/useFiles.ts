@@ -1,6 +1,7 @@
 import {
   useEffect,
   useEffectEvent,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -190,23 +191,38 @@ export function useFiles(deps: {
   // Computed values
   // ---------------------------------------------------------------------------
 
-  const normalizedWorkspaceFileFilterQuery = workspaceFileFilterQuery.trim();
-  const loadedWorkspaceFileEntries = Object.values(workspaceFilesByDirectory).flat();
-  const matchedWorkspaceDirectories = normalizedWorkspaceFileFilterQuery
-    ? loadedWorkspaceFileEntries
-        .filter((entry) =>
-          entry.is_dir
-          && matchesWorkspaceSearch(
-            workspaceFileFilterQuery,
-            entry.path,
-            entry.name,
-            entry.extension,
-          ),
-        )
-        .map((entry) => entry.path)
-    : [];
-  const locallyVisibleWorkspaceFilePaths = new Set<string>();
-  if (normalizedWorkspaceFileFilterQuery) {
+  const normalizedWorkspaceFileFilterQuery = useMemo(
+    () => workspaceFileFilterQuery.trim(),
+    [workspaceFileFilterQuery],
+  );
+  const loadedWorkspaceFileEntries = useMemo(
+    () => Object.values(workspaceFilesByDirectory).flat(),
+    [workspaceFilesByDirectory],
+  );
+  const matchedWorkspaceDirectories = useMemo(() => (
+    normalizedWorkspaceFileFilterQuery
+      ? loadedWorkspaceFileEntries
+          .filter((entry) =>
+            entry.is_dir
+            && matchesWorkspaceSearch(
+              workspaceFileFilterQuery,
+              entry.path,
+              entry.name,
+              entry.extension,
+            ),
+          )
+          .map((entry) => entry.path)
+      : []
+  ), [
+    loadedWorkspaceFileEntries,
+    normalizedWorkspaceFileFilterQuery,
+    workspaceFileFilterQuery,
+  ]);
+  const locallyVisibleWorkspaceFilePaths = useMemo(() => {
+    const visiblePaths = new Set<string>();
+    if (!normalizedWorkspaceFileFilterQuery) {
+      return visiblePaths;
+    }
     for (const entry of loadedWorkspaceFileEntries) {
       const directMatch = matchesWorkspaceSearch(
         workspaceFileFilterQuery,
@@ -220,95 +236,129 @@ export function useFiles(deps: {
       if (!directMatch && !insideMatchedDirectory) {
         continue;
       }
-      locallyVisibleWorkspaceFilePaths.add(entry.path);
+      visiblePaths.add(entry.path);
       for (const directory of ancestorDirectories(entry.path)) {
-        locallyVisibleWorkspaceFilePaths.add(directory);
+        visiblePaths.add(directory);
       }
     }
-  }
-  const rootWorkspaceFiles = workspaceFilesByDirectory[""] || [];
-  const selectedWorkspaceFileEntry = Object.values(workspaceFilesByDirectory)
-    .flat()
-    .find((entry) => entry.path === selectedWorkspaceFilePath) || null;
-  const selectedWorkspaceFileIsEditable = Boolean(
+    return visiblePaths;
+  }, [
+    loadedWorkspaceFileEntries,
+    matchedWorkspaceDirectories,
+    normalizedWorkspaceFileFilterQuery,
+    workspaceFileFilterQuery,
+  ]);
+  const rootWorkspaceFiles = useMemo(
+    () => workspaceFilesByDirectory[""] || [],
+    [workspaceFilesByDirectory],
+  );
+  const selectedWorkspaceFileEntry = useMemo(() => (
+    loadedWorkspaceFileEntries.find((entry) => entry.path === selectedWorkspaceFilePath) || null
+  ), [loadedWorkspaceFileEntries, selectedWorkspaceFilePath]);
+  const selectedWorkspaceFileIsEditable = useMemo(() => Boolean(
     selectedWorkspaceFileEntry
       && !selectedWorkspaceFileEntry.is_dir
       && workspaceFilePreview?.preview_kind === "text"
       && !workspaceFilePreview.error
       && !workspaceFilePreview.truncated,
+  ), [selectedWorkspaceFileEntry, workspaceFilePreview]);
+  const selectedWorkspaceFileEditorHasChanges = useMemo(() => (
+    selectedWorkspaceFileIsEditable
+      && workspaceFileEditorDraft !== (workspaceFilePreview?.text_content || "")
+  ), [
+    workspaceFileEditorDraft,
+    selectedWorkspaceFileIsEditable,
+    workspaceFilePreview?.text_content,
+  ]);
+  const selectedWorkspaceFileEditHint = useMemo(() => (
+    !selectedWorkspaceFileEntry || selectedWorkspaceFileEntry.is_dir
+      ? ""
+      : workspaceFilePreview?.preview_kind === "document"
+        ? "Document previews are extracted text and stay read-only in the desktop app."
+        : workspaceFilePreview?.preview_kind === "image"
+          ? "Image previews are metadata-only for now."
+          : workspaceFilePreview?.preview_kind === "table"
+            ? "Structured table previews stay read-only for now."
+            : workspaceFilePreview?.preview_kind === "unsupported"
+              ? "Binary files should be opened externally."
+              : workspaceFilePreview?.truncated
+                ? "Large text previews stay read-only to avoid accidental partial saves."
+                : ""
+  ), [selectedWorkspaceFileEntry, workspaceFilePreview]);
+  const selectedFileArtifactHistory = useMemo(() => (
+    selectedWorkspaceFilePath
+      ? workspaceArtifacts
+          .filter((artifact) => artifact.path === selectedWorkspaceFilePath)
+          .sort((left, right) => {
+            const leftTime = Date.parse(left.created_at || "");
+            const rightTime = Date.parse(right.created_at || "");
+            if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
+              return rightTime - leftTime;
+            }
+            return left.path.localeCompare(right.path);
+          })
+      : []
+  ), [selectedWorkspaceFilePath, workspaceArtifacts]);
+  const selectedFileLatestArtifact = useMemo(
+    () => selectedFileArtifactHistory[0] || null,
+    [selectedFileArtifactHistory],
   );
-  const selectedWorkspaceFileEditorHasChanges = selectedWorkspaceFileIsEditable
-    && workspaceFileEditorDraft !== (workspaceFilePreview?.text_content || "");
-  const selectedWorkspaceFileEditHint = !selectedWorkspaceFileEntry || selectedWorkspaceFileEntry.is_dir
-    ? ""
-    : workspaceFilePreview?.preview_kind === "document"
-      ? "Document previews are extracted text and stay read-only in the desktop app."
-      : workspaceFilePreview?.preview_kind === "image"
-        ? "Image previews are metadata-only for now."
-        : workspaceFilePreview?.preview_kind === "table"
-          ? "Structured table previews stay read-only for now."
-          : workspaceFilePreview?.preview_kind === "unsupported"
-            ? "Binary files should be opened externally."
-            : workspaceFilePreview?.truncated
-              ? "Large text previews stay read-only to avoid accidental partial saves."
-              : "";
-  const selectedFileArtifactHistory = selectedWorkspaceFilePath
-    ? workspaceArtifacts
-        .filter((artifact) => artifact.path === selectedWorkspaceFilePath)
-        .sort((left, right) => {
-          const leftTime = Date.parse(left.created_at || "");
-          const rightTime = Date.parse(right.created_at || "");
-          if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
-            return rightTime - leftTime;
-          }
-          return left.path.localeCompare(right.path);
-        })
-    : [];
-  const selectedFileLatestArtifact = selectedFileArtifactHistory[0] || null;
-  const selectedFileRunIds = Array.from(new Set(
+  const selectedFileRunIds = useMemo(() => Array.from(new Set(
     selectedFileArtifactHistory.flatMap((artifact) => artifact.run_ids || []).filter(Boolean),
-  ));
-  const selectedFileRelatedConversations = selectedFileRunIds.length > 0
-    ? workspaceConversationRows.filter((conversation) =>
-        conversation.linked_run_ids.some((runId) => selectedFileRunIds.includes(runId)),
-      )
-    : [];
-  const contextualArtifacts = selectedRunId
-    ? workspaceArtifacts.filter((artifact) =>
-        artifact.latest_run_id === selectedRunId || artifact.run_ids.includes(selectedRunId),
-      )
-    : selectedConversationRunIds.length > 0
-      ? workspaceArtifacts.filter((artifact) =>
-          artifact.run_ids.some((runId) => selectedConversationRunIds.includes(runId)),
+  )), [selectedFileArtifactHistory]);
+  const selectedFileRelatedConversations = useMemo(() => (
+    selectedFileRunIds.length > 0
+      ? workspaceConversationRows.filter((conversation) =>
+          conversation.linked_run_ids.some((runId) => selectedFileRunIds.includes(runId)),
         )
-      : [];
-  const contextualFilePaths = new Set(
+      : []
+  ), [selectedFileRunIds, workspaceConversationRows]);
+  const contextualArtifacts = useMemo(() => (
+    selectedRunId
+      ? workspaceArtifacts.filter((artifact) =>
+          artifact.latest_run_id === selectedRunId || artifact.run_ids.includes(selectedRunId),
+        )
+      : selectedConversationRunIds.length > 0
+        ? workspaceArtifacts.filter((artifact) =>
+            artifact.run_ids.some((runId) => selectedConversationRunIds.includes(runId)),
+          )
+        : []
+  ), [selectedConversationRunIds, selectedRunId, workspaceArtifacts]);
+  const contextualFilePaths = useMemo(() => new Set(
     [
       ...contextualArtifacts.map((artifact) => artifact.path),
       ...(selectedRunId ? runArtifacts.map((artifact) => artifact.path) : []),
     ].filter(Boolean),
-  );
-  const contextualDirectoryCounts = new Map<string, number>();
-  for (const path of contextualFilePaths) {
-    for (const directory of ancestorDirectories(path)) {
-      contextualDirectoryCounts.set(directory, (contextualDirectoryCounts.get(directory) || 0) + 1);
+  ), [contextualArtifacts, runArtifacts, selectedRunId]);
+  const contextualDirectoryCounts = useMemo(() => {
+    const directoryCounts = new Map<string, number>();
+    for (const path of contextualFilePaths) {
+      for (const directory of ancestorDirectories(path)) {
+        directoryCounts.set(directory, (directoryCounts.get(directory) || 0) + 1);
+      }
     }
-  }
-  const recentFilePaths = new Set(
+    return directoryCounts;
+  }, [contextualFilePaths]);
+  const recentFilePaths = useMemo(() => new Set(
     recentWorkspaceArtifacts.map((artifact) => artifact.path).filter(Boolean),
-  );
-  const recentDirectoryCounts = new Map<string, number>();
-  for (const path of recentFilePaths) {
-    for (const directory of ancestorDirectories(path)) {
-      recentDirectoryCounts.set(directory, (recentDirectoryCounts.get(directory) || 0) + 1);
+  ), [recentWorkspaceArtifacts]);
+  const recentDirectoryCounts = useMemo(() => {
+    const directoryCounts = new Map<string, number>();
+    for (const path of recentFilePaths) {
+      for (const directory of ancestorDirectories(path)) {
+        directoryCounts.set(directory, (directoryCounts.get(directory) || 0) + 1);
+      }
     }
-  }
-  const activeFilesLabel = selectedRunId
-    ? "Selected run"
-    : selectedConversationSummary
-      ? "Selected thread"
-      : "";
-  const visibleRootWorkspaceFiles = rootWorkspaceFiles.filter((entry) => {
+    return directoryCounts;
+  }, [recentFilePaths]);
+  const activeFilesLabel = useMemo(() => (
+    selectedRunId
+      ? "Selected run"
+      : selectedConversationSummary
+        ? "Selected thread"
+        : ""
+  ), [selectedConversationSummary, selectedRunId]);
+  const visibleRootWorkspaceFiles = useMemo(() => rootWorkspaceFiles.filter((entry) => {
     if (
       normalizedWorkspaceFileFilterQuery
       && !locallyVisibleWorkspaceFilePaths.has(entry.path)
@@ -326,7 +376,16 @@ export function useFiles(deps: {
     return entry.is_dir
       ? (recentDirectoryCounts.get(entry.path) || 0) > 0
       : recentFilePaths.has(entry.path);
-  });
+  }), [
+    contextualDirectoryCounts,
+    contextualFilePaths,
+    locallyVisibleWorkspaceFilePaths,
+    normalizedWorkspaceFileFilterQuery,
+    recentDirectoryCounts,
+    recentFilePaths,
+    rootWorkspaceFiles,
+    workspaceFileTreeMode,
+  ]);
 
   // ---------------------------------------------------------------------------
   // Effects

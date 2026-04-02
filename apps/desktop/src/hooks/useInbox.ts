@@ -61,8 +61,7 @@ export function useInbox(deps: {
   setRunProcess: React.Dispatch<React.SetStateAction<string>>;
   setError: React.Dispatch<React.SetStateAction<string>>;
   setNotice: React.Dispatch<React.SetStateAction<string>>;
-  refreshWorkspaceSurface: (workspaceId: string) => Promise<void>;
-  refreshApprovalInbox: (workspaceId: string) => Promise<void>;
+  removeApprovalItem: (itemId: string, workspaceId?: string) => void;
   refreshConversation: (conversationId: string) => Promise<void>;
   refreshRun: (runId: string) => Promise<void>;
   queueWorkspaceFileOpen: (workspaceId: string, path: string) => void;
@@ -79,8 +78,7 @@ export function useInbox(deps: {
     setRunProcess,
     setError,
     setNotice,
-    refreshWorkspaceSurface,
-    refreshApprovalInbox,
+    removeApprovalItem,
     refreshConversation,
     refreshRun,
     queueWorkspaceFileOpen,
@@ -114,13 +112,12 @@ export function useInbox(deps: {
         ...body,
         source: "desktop",
       });
+      removeApprovalItem(item.id, item.workspace_id || selectedWorkspaceId);
       setApprovalReplyDrafts((current) => ({
         ...current,
         [item.id]: "",
       }));
       await Promise.all([
-        selectedWorkspaceId ? refreshWorkspaceSurface(selectedWorkspaceId) : Promise.resolve(),
-        selectedWorkspaceId ? refreshApprovalInbox(selectedWorkspaceId) : Promise.resolve(),
         item.conversation_id && item.conversation_id === selectedConversationId
           ? refreshConversation(item.conversation_id)
           : Promise.resolve(),

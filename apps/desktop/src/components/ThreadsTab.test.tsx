@@ -3,11 +3,19 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import ThreadsTab from "./ThreadsTab";
+import { deleteConversation } from "@/api";
 
 let mockApp: any;
 
 vi.mock("@/context/AppContext", () => ({
+  shallowEqual: (left: unknown, right: unknown) => left === right,
   useApp: () => mockApp,
+  useAppActions: () => mockApp,
+  useAppSelector: (selector: (state: any) => unknown) => selector(mockApp),
+}));
+
+vi.mock("@/api", () => ({
+  deleteConversation: vi.fn(),
 }));
 
 function makeEvent(seq: number, eventType: string, payload: Record<string, unknown>) {
@@ -24,6 +32,7 @@ function makeEvent(seq: number, eventType: string, payload: Record<string, unkno
 
 describe("ThreadsTab", () => {
   beforeEach(() => {
+    vi.mocked(deleteConversation).mockResolvedValue(undefined as never);
     mockApp = {
       selectedConversationId: "conversation-1",
       overview: {
@@ -109,6 +118,7 @@ describe("ThreadsTab", () => {
       hasOlderMessages: false,
       loadingOlderMessages: false,
       loadOlderMessages: vi.fn(async () => {}),
+      removeConversationSummary: vi.fn(),
       retryConversationLoad: vi.fn(async () => {}),
       setError: vi.fn(),
       setNotice: vi.fn(),
@@ -200,6 +210,25 @@ describe("ThreadsTab", () => {
 
     expect(screen.getByText("Opening thread...")).toBeInTheDocument();
     expect(mockApp.setSelectedConversationId).not.toHaveBeenCalledWith("");
+  });
+
+  it("deletes the selected thread by patching local workspace state instead of refreshing the workspace", async () => {
+    const user = userEvent.setup();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<ThreadsTab />);
+
+    await user.click(screen.getByRole("button", { name: /delete/i }));
+
+    await waitFor(() => {
+      expect(deleteConversation).toHaveBeenCalledWith("conversation-1");
+    });
+    expect(mockApp.removeConversationSummary).toHaveBeenCalledWith("conversation-1", "workspace-1");
+    expect(mockApp.setSelectedConversationId).toHaveBeenCalledWith("");
+    expect(mockApp.setNotice).toHaveBeenCalledWith("Thread deleted.");
+    expect(mockApp.refreshWorkspaceSurface).not.toHaveBeenCalled();
+
+    confirmSpy.mockRestore();
   });
 
   it("renders replay events as the canonical thread transcript without persisted reasoning rows", async () => {

@@ -9,7 +9,11 @@ import {
   Circle,
   ArrowRight,
 } from "lucide-react";
-import { useApp } from "@/context/AppContext";
+import {
+  shallowEqual,
+  useAppActions,
+  useAppSelector,
+} from "@/context/AppContext";
 import { formatDate } from "@/utils";
 import { notificationSummary } from "@/history";
 import { cn } from "@/lib/utils";
@@ -26,16 +30,26 @@ export default function OverviewTab() {
     selectedWorkspaceNote,
     recentNotifications,
     recentWorkspaceArtifacts,
-    approvalInbox,
+  } = useAppSelector((state) => ({
+    overview: state.overview,
+    loadingOverview: state.loadingOverview,
+    selectedWorkspaceSummary: state.selectedWorkspaceSummary,
+    noWorkspacesRegistered: state.noWorkspacesRegistered,
+    selectedWorkspaceIsEmpty: state.selectedWorkspaceIsEmpty,
+    selectedWorkspaceTags: state.selectedWorkspaceTags,
+    selectedWorkspaceNote: state.selectedWorkspaceNote,
+    recentNotifications: state.recentNotifications,
+    recentWorkspaceArtifacts: state.recentWorkspaceArtifacts,
+  }), shallowEqual);
+  const {
     setActiveTab,
     handleOpenWorkspaceFile,
     focusConversationComposer,
     focusRunComposer,
-    handlePrefillStarterWorkspace,
     setSelectedConversationId,
     setSelectedRunId,
     setShowNewWorkspace,
-  } = useApp();
+  } = useAppActions();
 
   const openRunLauncher = () => {
     setSelectedRunId("");

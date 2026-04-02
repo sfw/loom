@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useApp } from "@/context/AppContext";
+import {
+  shallowEqual,
+  useAppActions,
+  useAppSelector,
+} from "@/context/AppContext";
 import { createConversation, patchConversation } from "@/api";
 import { cn } from "@/lib/utils";
 import { normalizeRunStatus } from "@/runStatus";
@@ -101,29 +105,44 @@ function runStatusDotClass(status: string): string {
 export default function Sidebar() {
   const {
     activeTab,
-    setActiveTab,
-    workspaces,
-    selectedWorkspaceId,
-    selectedConversationId,
-    setSelectedWorkspaceId,
-    setSelectedConversationId,
-    setSelectedRunId,
-    showArchivedWorkspaces,
-    setShowArchivedWorkspaces,
-    setShowNewWorkspace,
-    runtime,
     connectionState,
-    overview,
     conversationDetail,
     conversationIsProcessing,
-    models,
     desktopActivity,
-    refreshWorkspaceSurface,
-    refreshConversation,
+    models,
+    overview,
+    runtime,
+    selectedConversationId,
+    selectedWorkspaceId,
+    showArchivedWorkspaces,
+    workspaces,
+  } = useAppSelector((state) => ({
+    activeTab: state.activeTab,
+    connectionState: state.connectionState,
+    conversationDetail: state.conversationDetail,
+    conversationIsProcessing: state.conversationIsProcessing,
+    desktopActivity: state.desktopActivity,
+    models: state.models,
+    overview: state.overview,
+    runtime: state.runtime,
+    selectedConversationId: state.selectedConversationId,
+    selectedWorkspaceId: state.selectedWorkspaceId,
+    showArchivedWorkspaces: state.showArchivedWorkspaces,
+    workspaces: state.workspaces,
+  }), shallowEqual);
+  const {
     handleArchiveWorkspace,
+    refreshConversation,
+    setActiveTab,
     setError,
     setNotice,
-  } = useApp();
+    setSelectedConversationId,
+    setSelectedRunId,
+    setSelectedWorkspaceId,
+    setShowArchivedWorkspaces,
+    setShowNewWorkspace,
+    syncConversationSummary,
+  } = useAppActions();
   const runtimeConnectionState =
     connectionState || (runtime?.ready ? "connected" : "connecting");
 
@@ -229,22 +248,20 @@ export default function Sidebar() {
     setError("");
     try {
       const created = await createConversation(selectedWorkspaceId, {});
+      syncConversationSummary(created, {
+        incrementCount: true,
+        processing: false,
+        workspaceId: selectedWorkspaceId,
+      });
       setSelectedConversationId(created.id);
       setActiveTab("threads");
       setNotice(`Started conversation ${created.title || created.id.slice(0, 8)}`);
-      void refreshWorkspaceSurface(selectedWorkspaceId).catch((err) => {
-        if (err instanceof Error) {
-          setError(err.message);
-          return;
-        }
-        setError("Failed to refresh workspace.");
-      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create conversation.");
     } finally {
       setCreatingConversation(false);
     }
-  }, [selectedWorkspaceId, creatingConversation, setActiveTab, setSelectedConversationId, refreshWorkspaceSurface, setError, setNotice]);
+  }, [selectedWorkspaceId, creatingConversation, setActiveTab, setSelectedConversationId, setError, setNotice, syncConversationSummary]);
 
   const handleAdvancedCreateConversation = useCallback(async () => {
     if (!selectedWorkspaceId || creatingConversation) return;
@@ -255,25 +272,23 @@ export default function Sidebar() {
         model_name: newConvModel.trim() || undefined,
         system_prompt: newConvPrompt.trim() || undefined,
       });
+      syncConversationSummary(created, {
+        incrementCount: true,
+        processing: false,
+        workspaceId: selectedWorkspaceId,
+      });
       setSelectedConversationId(created.id);
       setActiveTab("threads");
       setShowNewConvPopover(false);
       setNewConvModel("");
       setNewConvPrompt("");
       setNotice(`Started conversation ${created.title || created.id.slice(0, 8)}`);
-      void refreshWorkspaceSurface(selectedWorkspaceId).catch((err) => {
-        if (err instanceof Error) {
-          setError(err.message);
-          return;
-        }
-        setError("Failed to refresh workspace.");
-      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create conversation.");
     } finally {
       setCreatingConversation(false);
     }
-  }, [selectedWorkspaceId, creatingConversation, newConvModel, newConvPrompt, setActiveTab, setSelectedConversationId, refreshWorkspaceSurface, setError, setNotice]);
+  }, [selectedWorkspaceId, creatingConversation, newConvModel, newConvPrompt, setActiveTab, setSelectedConversationId, setError, setNotice, syncConversationSummary]);
 
   const handleRevealWorkspace = useCallback((_path: string) => {
     // This is a convenience action — in Tauri it would open the folder
@@ -646,10 +661,16 @@ export default function Sidebar() {
                                         const trimmed = renameText.trim();
                                         if (trimmed && trimmed !== conv.title) {
                                           try {
-                                            await patchConversation(conv.id, { title: trimmed });
-                                            await refreshConversation(conv.id);
-                                            if (selectedWorkspaceId) {
-                                              await refreshWorkspaceSurface(selectedWorkspaceId);
+                                            const updatedConversation = await patchConversation(conv.id, { title: trimmed });
+                                            syncConversationSummary(updatedConversation, {
+                                              processing:
+                                                conv.id === selectedConversationId
+                                                  ? conversationIsProcessing
+                                                  : updatedConversation.is_active,
+                                              workspaceId: updatedConversation.workspace_id || selectedWorkspaceId,
+                                            });
+                                            if (conv.id === selectedConversationId) {
+                                              await refreshConversation(conv.id);
                                             }
                                           } catch (err) {
                                             setError(err instanceof Error ? err.message : "Failed to rename thread.");
@@ -666,10 +687,16 @@ export default function Sidebar() {
                                       const trimmed = renameText.trim();
                                       if (trimmed && trimmed !== conv.title) {
                                         try {
-                                          await patchConversation(conv.id, { title: trimmed });
-                                          await refreshConversation(conv.id);
-                                          if (selectedWorkspaceId) {
-                                            await refreshWorkspaceSurface(selectedWorkspaceId);
+                                          const updatedConversation = await patchConversation(conv.id, { title: trimmed });
+                                          syncConversationSummary(updatedConversation, {
+                                            processing:
+                                              conv.id === selectedConversationId
+                                                ? conversationIsProcessing
+                                                : updatedConversation.is_active,
+                                            workspaceId: updatedConversation.workspace_id || selectedWorkspaceId,
+                                          });
+                                          if (conv.id === selectedConversationId) {
+                                            await refreshConversation(conv.id);
                                           }
                                         } catch (err) {
                                           setError(err instanceof Error ? err.message : "Failed to rename thread.");

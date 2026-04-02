@@ -1,4 +1,4 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useRuns } from "./useRuns";
@@ -98,6 +98,7 @@ describe("useRuns", () => {
     const refreshWorkspaceSurface = vi.fn(async () => {
       throw new Error("Load failed");
     });
+    const syncRunDetail = vi.fn();
 
     const { result, rerender } = renderHook(
       ({ selectedRunId }: { selectedRunId: string }) =>
@@ -115,6 +116,7 @@ describe("useRuns", () => {
           setNotice,
           setActiveTab,
           refreshWorkspaceSurface,
+          syncRunDetail,
         }),
       {
         initialProps: {
@@ -158,7 +160,11 @@ describe("useRuns", () => {
     expect(apiMocks.fetchRunDetail).toHaveBeenCalledWith("task-123");
     expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("task-123", { includeNoise: false });
     expect(apiMocks.fetchRunArtifacts).toHaveBeenCalledWith("task-123");
-    expect(refreshWorkspaceSurface).toHaveBeenCalledWith("workspace-1");
+    expect(syncRunDetail).toHaveBeenCalledWith(expect.objectContaining({
+      id: "task-123",
+      status: "executing",
+    }));
+    expect(refreshWorkspaceSurface).not.toHaveBeenCalled();
   });
 
   it("opens the newly created run by task id and does not block launch on workspace refresh failures", async () => {
@@ -378,6 +384,51 @@ describe("useRuns", () => {
     expect(apiMocks.fetchRunTimeline).toHaveBeenCalledWith("run-1", { includeNoise: false });
     expect(apiMocks.fetchRunArtifacts).toHaveBeenCalledWith("run-1");
     vi.useRealTimers();
+  });
+
+  it("subscribes to the run stream once after boot load settles", async () => {
+    apiMocks.fetchRunDetail.mockResolvedValue({
+      id: "run-1",
+      goal: "Review the site",
+      status: "executing",
+      process_name: "seo-geo-review",
+      linked_conversation_ids: [],
+      plan_subtasks: [],
+    });
+    apiMocks.fetchRunTimeline.mockResolvedValue([]);
+    apiMocks.fetchRunArtifacts.mockResolvedValue([]);
+
+    const { rerender } = renderHook(() =>
+      useRuns({
+        selectedRunId: "run-1",
+        connectionState: "connected",
+        setSelectedRunId: vi.fn(),
+        selectedWorkspaceId: "workspace-1",
+        overview: {
+          workspace: {
+            canonical_path: "/tmp/workspace",
+          },
+          recent_runs: [],
+        } as any,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        setActiveTab: vi.fn(),
+        syncRunDetail: vi.fn(),
+      }),
+    );
+
+    await waitFor(() => {
+      expect(apiMocks.subscribeRunStream).toHaveBeenCalledTimes(1);
+    });
+
+    rerender();
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.subscribeRunStream).toHaveBeenCalledTimes(1);
   });
 
   it("subscribes after the latest loaded timeline row and appends streamed rows", async () => {

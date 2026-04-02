@@ -26,7 +26,12 @@ import {
   Package,
   FolderTree,
 } from "lucide-react";
-import { useApp } from "@/context/AppContext";
+import {
+  shallowEqual,
+  useAppActions,
+  useApp,
+  useAppSelector,
+} from "@/context/AppContext";
 import type { RunTimelineEvent } from "@/api";
 import {
   approvalQuestionContext,
@@ -545,67 +550,126 @@ function isHiddenLaunchPath(path: string): boolean {
 
 export default function RunsTab() {
   const {
-    filteredRuns,
-    selectedRunId,
-    setSelectedRunId,
-    selectedRunSummary,
-    runDetail,
-    runTimeline,
-    runArtifacts,
-    runInstructionHistory,
-    runStreaming,
-    loadingRunDetail,
-    runLoadError,
-    runIsTerminal,
-    runCanPause,
-    runCanResume,
-    runCanMessage,
-    visibleRunTimeline,
-    visibleRunArtifacts,
-    runHistoryQuery,
-    setRunHistoryQuery,
     activeRunMatchIndex,
-    totalRunMatches,
-    runGoal,
-    setRunGoal,
-    runProcess,
-    setRunProcess,
-    runApprovalMode,
-    setRunApprovalMode,
-    launchingRun,
-    runOperatorMessage,
-    setRunOperatorMessage,
-    sendingRunMessage,
-    runActionPending,
-    runMatchRefs,
-    handleLaunchRun,
-    handleRunControl,
-    handleDeleteRun,
-    handleRestartRun,
-    handleSendRunMessage,
-    refreshRun,
-    stepRunMatch,
-    selectedWorkspaceId,
-    workspaceSearchQuery,
-    overview,
-    inventory,
     approvalInbox,
     approvalReplyDrafts,
-    setApprovalReplyDrafts,
-    replyingApprovalId,
-    handleReplyApproval,
-    handleOpenWorkspaceFile,
-    setActiveTab,
+    filteredRuns,
+    inventory,
+    launchingRun,
     loadedWorkspaceFileEntries,
+    loadingRunDetail,
+    overview,
+    replyingApprovalId,
+    runActionPending,
+    runApprovalMode,
+    runArtifacts,
+    runCanMessage,
+    runCanPause,
+    runCanResume,
+    runDetail,
+    runGoal,
+    runHistoryQuery,
+    runInstructionHistory,
+    runIsTerminal,
+    runLoadError,
+    runMatchRefs,
+    runOperatorMessage,
+    runProcess,
+    runStreaming,
+    runTimeline,
+    selectedRunId,
+    selectedRunSummary,
+    selectedWorkspaceId,
+    sendingRunMessage,
+    totalRunMatches,
+    visibleRunArtifacts,
+    visibleRunTimeline,
+    workspaceArtifacts,
+    workspaceSearchQuery,
+  } = useAppSelector((state) => ({
+    activeRunMatchIndex: state.activeRunMatchIndex,
+    approvalInbox: state.approvalInbox,
+    approvalReplyDrafts: state.approvalReplyDrafts,
+    filteredRuns: state.filteredRuns,
+    inventory: state.inventory,
+    launchingRun: state.launchingRun,
+    loadedWorkspaceFileEntries: state.loadedWorkspaceFileEntries,
+    loadingRunDetail: state.loadingRunDetail,
+    overview: state.overview,
+    replyingApprovalId: state.replyingApprovalId,
+    runActionPending: state.runActionPending,
+    runApprovalMode: state.runApprovalMode,
+    runArtifacts: state.runArtifacts,
+    runCanMessage: state.runCanMessage,
+    runCanPause: state.runCanPause,
+    runCanResume: state.runCanResume,
+    runDetail: state.runDetail,
+    runGoal: state.runGoal,
+    runHistoryQuery: state.runHistoryQuery,
+    runInstructionHistory: state.runInstructionHistory,
+    runIsTerminal: state.runIsTerminal,
+    runLoadError: state.runLoadError,
+    runMatchRefs: state.runMatchRefs,
+    runOperatorMessage: state.runOperatorMessage,
+    runProcess: state.runProcess,
+    runStreaming: state.runStreaming,
+    runTimeline: state.runTimeline,
+    selectedRunId: state.selectedRunId,
+    selectedRunSummary: state.selectedRunSummary,
+    selectedWorkspaceId: state.selectedWorkspaceId,
+    sendingRunMessage: state.sendingRunMessage,
+    totalRunMatches: state.totalRunMatches,
+    visibleRunArtifacts: state.visibleRunArtifacts,
+    visibleRunTimeline: state.visibleRunTimeline,
+    workspaceArtifacts: state.workspaceArtifacts,
+    workspaceSearchQuery: state.workspaceSearchQuery,
+  }), shallowEqual);
+  const {
+    handleDeleteRun,
+    handleLaunchRun,
+    handleOpenWorkspaceFile,
+    handleReplyApproval,
+    handleRestartRun,
+    handleRunControl,
+    handleSendRunMessage,
     loadWorkspaceDirectory,
-    recentWorkspaceArtifacts,
-  } = useApp();
+    refreshRun,
+    setActiveTab,
+    setApprovalReplyDrafts,
+    setRunApprovalMode,
+    setRunGoal,
+    setRunHistoryQuery,
+    setRunOperatorMessage,
+    setRunProcess,
+    setSelectedRunId,
+    stepRunMatch,
+  } = useAppActions();
 
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activitySearch, setActivitySearch] = useState("");
   const [processQuery, setProcessQuery] = useState("");
   const [attachQuery, setAttachQuery] = useState("");
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
+
+  const recentWorkspaceArtifacts = useMemo(
+    () => [...workspaceArtifacts]
+      .sort((left, right) => {
+        const leftTime = Date.parse(left.created_at || "");
+        const rightTime = Date.parse(right.created_at || "");
+        if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
+          return rightTime - leftTime;
+        }
+        if (left.latest_run_id && !right.latest_run_id) {
+          return -1;
+        }
+        if (!left.latest_run_id && right.latest_run_id) {
+          return 1;
+        }
+        return left.path.localeCompare(right.path);
+      })
+      .slice(0, 24),
+    [workspaceArtifacts],
+  );
 
   const highlightQuery = runHistoryQuery || workspaceSearchQuery || "";
   const processes = inventory?.processes || [];

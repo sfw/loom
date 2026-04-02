@@ -1,5 +1,9 @@
 import { useEffect, useRef } from "react";
-import { useApp } from "@/context/AppContext";
+import {
+  shallowEqual,
+  useAppActions,
+  useAppSelector,
+} from "@/context/AppContext";
 import { highlightText } from "@/utils";
 import { getRuntimeBaseUrl } from "@/api";
 import {
@@ -24,37 +28,106 @@ import SettingsPanel from "./SettingsPanel";
 import WorkspaceModal from "./WorkspaceModal";
 import { cn } from "@/lib/utils";
 
+function CommandPaletteOverlay() {
+  const {
+    activeCommandIndex,
+    commandDraft,
+    commandInputRef,
+    commandPaletteOpen,
+    paletteEntries,
+    paletteSections,
+    searchingCommandPalette,
+  } = useAppSelector((state) => ({
+    activeCommandIndex: state.activeCommandIndex,
+    commandDraft: state.commandDraft,
+    commandInputRef: state.commandInputRef,
+    commandPaletteOpen: state.commandPaletteOpen,
+    paletteEntries: state.paletteEntries,
+    paletteSections: state.paletteSections,
+    searchingCommandPalette: state.searchingCommandPalette,
+  }), shallowEqual);
+  const {
+    executePaletteEntry,
+    handleCommandInputKeyDown,
+    handleCommandSubmit,
+    setCommandDraft,
+    setCommandPaletteOpen,
+  } = useAppActions();
+
+  if (!commandPaletteOpen) {
+    return null;
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center pt-[18vh] bg-black/55 backdrop-blur-sm"
+      onClick={() => setCommandPaletteOpen(false)}
+    >
+      <div
+        className="w-[540px] max-h-[400px] bg-[#111114] border border-zinc-800 rounded-xl shadow-2xl flex flex-col overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <form onSubmit={handleCommandSubmit} className="border-b border-zinc-800">
+          <input
+            ref={commandInputRef}
+            autoFocus
+            type="text"
+            value={commandDraft}
+            onChange={(e) => setCommandDraft(e.target.value)}
+            onKeyDown={handleCommandInputKeyDown}
+            placeholder="Search workspaces, threads, runs, files..."
+            className="w-full bg-transparent px-4 py-3 text-sm text-zinc-100 placeholder-zinc-600 outline-none"
+          />
+        </form>
+        <CommandPalette
+          open={commandPaletteOpen}
+          commandDraft={commandDraft}
+          searching={searchingCommandPalette}
+          activeIndex={activeCommandIndex}
+          paletteEntries={paletteEntries}
+          paletteSections={paletteSections}
+          onSelect={executePaletteEntry}
+          renderHighlight={highlightText}
+        />
+      </div>
+    </div>
+  );
+}
+
 export default function AppShell() {
   const {
     activeTab,
-    setActiveTab,
-    workspaces,
-    selectedWorkspaceSummary,
-    selectedWorkspaceId,
-    commandPaletteOpen,
-    setCommandPaletteOpen,
-    commandDraft,
-    setCommandDraft,
-    commandInputRef,
-    handleCommandInputKeyDown,
-    handleCommandSubmit,
-    paletteEntries,
-    paletteSections,
-    activeCommandIndex,
-    executePaletteEntry,
-    searchingCommandPalette,
-    focusCommandBar,
-    showNewWorkspace,
-    error,
-    notice,
-    setError,
-    setNotice,
-    runtime,
-    overview,
     approvalInbox,
     connectionState,
+    error,
+    notice,
+    overview,
+    runtime,
+    selectedWorkspaceId,
+    selectedWorkspaceSummary,
+    showNewWorkspace,
+    workspaces,
+  } = useAppSelector((state) => ({
+    activeTab: state.activeTab,
+    approvalInbox: state.approvalInbox,
+    connectionState: state.connectionState,
+    error: state.error,
+    notice: state.notice,
+    overview: state.overview,
+    runtime: state.runtime,
+    selectedWorkspaceId: state.selectedWorkspaceId,
+    selectedWorkspaceSummary: state.selectedWorkspaceSummary,
+    showNewWorkspace: state.showNewWorkspace,
+    workspaces: state.workspaces,
+  }), shallowEqual);
+  const {
+    focusCommandBar,
     retryConnection,
-  } = useApp();
+    setActiveTab,
+    setCommandPaletteOpen,
+    setError,
+    setNotice,
+  } = useAppActions();
 
   const ws = selectedWorkspaceSummary;
   const activeRuns = ws?.active_run_count ?? 0;
@@ -299,41 +372,7 @@ export default function AppShell() {
         </div>
       </main>
 
-      {/* Command Palette */}
-      {commandPaletteOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-start justify-center pt-[18vh] bg-black/55 backdrop-blur-sm"
-          onClick={() => setCommandPaletteOpen(false)}
-        >
-          <div
-            className="w-[540px] max-h-[400px] bg-[#111114] border border-zinc-800 rounded-xl shadow-2xl flex flex-col overflow-hidden"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <form onSubmit={handleCommandSubmit} className="border-b border-zinc-800">
-              <input
-                ref={commandInputRef}
-                autoFocus
-                type="text"
-                value={commandDraft}
-                onChange={(e) => setCommandDraft(e.target.value)}
-                onKeyDown={handleCommandInputKeyDown}
-                placeholder="Search workspaces, threads, runs, files..."
-                className="w-full bg-transparent px-4 py-3 text-sm text-zinc-100 placeholder-zinc-600 outline-none"
-              />
-            </form>
-            <CommandPalette
-              open={commandPaletteOpen}
-              commandDraft={commandDraft}
-              searching={searchingCommandPalette}
-              activeIndex={activeCommandIndex}
-              paletteEntries={paletteEntries}
-              paletteSections={paletteSections}
-              onSelect={executePaletteEntry}
-              renderHighlight={highlightText}
-            />
-          </div>
-        </div>
-      )}
+      <CommandPaletteOverlay />
 
       {/* Workspace modal */}
       {showNewWorkspace && <WorkspaceModal />}

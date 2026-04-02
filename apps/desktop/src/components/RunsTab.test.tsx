@@ -7,7 +7,10 @@ import RunsTab from "./RunsTab";
 let mockApp: any;
 
 vi.mock("@/context/AppContext", () => ({
+  shallowEqual: (left: unknown, right: unknown) => left === right,
   useApp: () => mockApp,
+  useAppActions: () => mockApp,
+  useAppSelector: (selector: (state: any) => unknown) => selector(mockApp),
 }));
 
 describe("RunsTab", () => {
@@ -67,6 +70,7 @@ describe("RunsTab", () => {
       handleReplyApproval: vi.fn(async () => {}),
       loadedWorkspaceFileEntries: [],
       loadWorkspaceDirectory: vi.fn(async () => {}),
+      workspaceArtifacts: [],
       recentWorkspaceArtifacts: [],
       setActiveTab: vi.fn(),
     };
@@ -409,7 +413,7 @@ describe("RunsTab", () => {
         extension: "md",
       },
     ];
-    mockApp.recentWorkspaceArtifacts = [
+    mockApp.workspaceArtifacts = [
       {
         path: ".hidden/report.md",
         category: "document",
@@ -457,7 +461,7 @@ describe("RunsTab", () => {
         extension: "md",
       },
     ];
-    mockApp.recentWorkspaceArtifacts = [
+    mockApp.workspaceArtifacts = [
       {
         path: "research/final-gap-analysis.md",
         category: "document",
