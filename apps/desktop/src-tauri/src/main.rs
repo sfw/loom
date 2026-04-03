@@ -24,9 +24,10 @@ fn desktop_bootstrap(
 
 #[tauri::command]
 fn desktop_sidecar_status(
+    app_handle: tauri::AppHandle,
     state: tauri::State<'_, SidecarState>,
 ) -> Result<SidecarStatusResponse, String> {
-    state.status()
+    state.status(&app_handle)
 }
 
 #[tauri::command]

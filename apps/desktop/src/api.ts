@@ -474,6 +474,34 @@ interface DesktopBootstrapResponse {
   managed_by_desktop: boolean;
 }
 
+export interface DesktopRuntimeMetadata {
+  mode: string;
+  enabled_extras: string[];
+  loom_version: string | null;
+  python_version: string | null;
+  python_request: string | null;
+  uv_version: string | null;
+  entry_module: string | null;
+  python_home: string | null;
+  python_executable: string | null;
+  environment_root: string | null;
+  site_packages: string | null;
+  repo_root: string | null;
+}
+
+export interface DesktopSidecarStatus {
+  running: boolean;
+  managed_by_desktop: boolean;
+  base_url: string;
+  pid: number | null;
+  database_path: string;
+  scratch_dir: string;
+  workspace_default_path: string;
+  log_path: string;
+  runtime: DesktopRuntimeMetadata | null;
+  runtime_error: string | null;
+}
+
 export interface ConversationStreamEvent {
   id: number;
   session_id: string;
@@ -610,6 +638,10 @@ export async function bootstrapDesktopRuntime(): Promise<boolean> {
     }
   }
   return false;
+}
+
+export async function fetchDesktopSidecarStatus(): Promise<DesktopSidecarStatus | null> {
+  return await tryInvokeDesktopCommand<DesktopSidecarStatus>("desktop_sidecar_status");
 }
 
 export function fetchRuntimeStatus(): Promise<RuntimeStatus> {

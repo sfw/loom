@@ -16,7 +16,6 @@ import {
   WifiOff,
   RefreshCw,
   Loader2,
-  Terminal,
 } from "lucide-react";
 import CommandPalette from "../CommandPalette";
 import Sidebar from "./Sidebar";
@@ -245,15 +244,15 @@ export default function AppShell() {
               <h2 className="text-lg font-bold text-zinc-100 mb-2">Cannot reach Loomd</h2>
               <p className="text-sm text-zinc-500 mb-4 leading-relaxed">
                 Could not connect to <span className="font-mono text-zinc-400">{getRuntimeBaseUrl()}</span>.
-                Make sure the runtime is running.
+                The desktop app should start its bundled runtime automatically.
               </p>
 
               <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 px-4 py-3 mb-5 text-left">
-                <p className="text-xs font-medium text-zinc-400 mb-2">Start the runtime with:</p>
-                <div className="flex items-center gap-2 rounded-md bg-zinc-950 px-3 py-2">
-                  <Terminal size={13} className="shrink-0 text-zinc-600" />
-                  <code className="text-xs text-zinc-300 font-mono">uv run loomd</code>
-                </div>
+                <p className="text-xs font-medium text-zinc-400 mb-2">Troubleshooting</p>
+                <p className="text-[11px] leading-relaxed text-zinc-500">
+                  Check the desktop log for a startup error. In development, you can still run{" "}
+                  <code className="font-mono text-zinc-300">uv run loomd</code> manually or point the UI at a custom runtime.
+                </p>
                 <p className="text-[10.5px] text-zinc-600 mt-2">
                   Or set <span className="font-mono">VITE_LOOMD_URL</span> if the runtime is on a different host/port.
                 </p>

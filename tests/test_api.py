@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from loom.api.engine import Engine
+from loom.api.server import LOCAL_CORS_ORIGIN_REGEX, create_app
 from loom.config import Config, ExecutionConfig, ProcessConfig, TelemetryConfig
 from loom.config_runtime import ConfigRuntimeStore
 from loom.cowork.session import CoworkTurn, ToolCallEvent
@@ -189,6 +191,23 @@ async def client(app):
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
     await app.state.engine.shutdown()
+
+
+def test_create_app_allows_packaged_desktop_origins() -> None:
+    app = create_app()
+    middleware = next(
+        layer
+        for layer in app.user_middleware
+        if layer.cls.__name__ == "CORSMiddleware"
+    )
+    assert middleware.kwargs["allow_origin_regex"] == LOCAL_CORS_ORIGIN_REGEX
+
+    allowed = re.compile(LOCAL_CORS_ORIGIN_REGEX)
+    assert allowed.match("http://127.0.0.1:1420")
+    assert allowed.match("http://localhost:1420")
+    assert allowed.match("https://tauri.localhost")
+    assert allowed.match("tauri://localhost")
+    assert not allowed.match("https://example.com")
 
 
 def _make_task(

@@ -8,6 +8,7 @@ import {
 
 import {
   bootstrapDesktopRuntime,
+  fetchDesktopSidecarStatus,
   fetchModels,
   fetchRuntimeStatus,
   fetchSettings,
@@ -50,6 +51,7 @@ async function loadShellSnapshotWithArchived(includeArchived: boolean): Promise<
 
 const HEALTH_CHECK_INTERVAL_MS = 15000;
 const AUTO_RECONNECT_DELAY_MS = 1500;
+const HEALTH_CHECK_FAILURE_THRESHOLD = 3;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -95,6 +97,7 @@ export function useConnection(deps: {
   const loadInFlightRef = useRef(false);
   const healthCheckInFlightRef = useRef(false);
   const lastArchivedVisibilityRef = useRef(showArchivedWorkspaces);
+  const consecutiveHealthFailuresRef = useRef(0);
 
   // Bootstrap runtime and load initial shell data
   useEffect(() => {
@@ -119,6 +122,7 @@ export function useConnection(deps: {
         setModels(modelRows);
         setWorkspaces(workspaceRows);
         setSettings(settingsPayload);
+        consecutiveHealthFailuresRef.current = 0;
         setError("");
         setConnectionState("connected");
         setCreateParentPath((current) => current || runtimeSnapshot.workspace_default_path || "");
@@ -173,8 +177,28 @@ export function useConnection(deps: {
     healthCheckInFlightRef.current = true;
     try {
       const runtimeSnapshot = await fetchRuntimeStatus();
+      consecutiveHealthFailuresRef.current = 0;
       setRuntime(runtimeSnapshot);
     } catch {
+      consecutiveHealthFailuresRef.current += 1;
+
+      const sidecarStatus = runtimeManaged
+        ? await fetchDesktopSidecarStatus()
+        : null;
+      const sidecarStillRunning = Boolean(
+        runtimeManaged
+        && sidecarStatus?.managed_by_desktop
+        && sidecarStatus.running,
+      );
+
+      if (sidecarStillRunning) {
+        return;
+      }
+
+      if (consecutiveHealthFailuresRef.current < HEALTH_CHECK_FAILURE_THRESHOLD) {
+        return;
+      }
+
       setConnectionState("failed");
       setError("Lost connection to Loomd. Reconnecting...");
     } finally {
@@ -226,6 +250,7 @@ export function useConnection(deps: {
   }, [connectionState]);
 
   function retryConnection() {
+    consecutiveHealthFailuresRef.current = 0;
     setConnectionState("connecting");
     setError("");
     setConnectionAttempt((c) => c + 1);

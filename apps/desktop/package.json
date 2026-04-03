@@ -6,10 +6,15 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "tsc && vite build",
+    "bundle:python": "env UV_CACHE_DIR=../../.uv-cache uv run python ../../scripts/build_macos_desktop_bundle_resources.py --python-version 3.11.14 --output-dir src-tauri/target/macos-bundle-resources",
+    "bundle:dmg": "bash ../../scripts/build_macos_desktop_dmg.sh --app-bundle \"src-tauri/target/release/bundle/macos/Loom Desktop.app\" --output \"src-tauri/target/release/bundle/dmg/Loom Desktop.dmg\" --volume-name \"Loom Desktop\"",
+    "bundle:dmg:open": "bash ../../scripts/build_macos_desktop_dmg.sh --app-bundle \"src-tauri/target/release/bundle/macos/Loom Desktop.app\" --output \"src-tauri/target/release/bundle/dmg/Loom Desktop.dmg\" --volume-name \"Loom Desktop\" --open",
+    "icons:sync": "tauri icon src-tauri/icons/source/loom-iOS-Default-1024x1024@2x.png --output src-tauri/icons",
+    "package:macos": "pnpm exec tauri build --bundles app --ci --no-sign && pnpm bundle:dmg:open",
     "test": "vitest run",
     "preview": "vite preview --host 127.0.0.1 --port 1420",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build --bundles app"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",

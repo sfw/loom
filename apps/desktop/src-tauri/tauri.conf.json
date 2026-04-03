@@ -5,7 +5,7 @@
   "identifier": "com.sfw.loom.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm icons:sync && pnpm build && pnpm bundle:python",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist"
   },
@@ -25,6 +25,15 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": []
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "target/macos-bundle-resources/python": "python",
+      "target/macos-bundle-resources/loom-env": "loom-env",
+      "target/macos-bundle-resources/loom-desktop-bundle.json": "loom-desktop-bundle.json"
+    }
   }
 }

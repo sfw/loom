@@ -152,6 +152,14 @@ single-process access pattern: WAL mode, explicit busy timeout/synchronous
 policy, a governed read/write connection model, and batched compliance-event
 flushes instead of one connection+commit per event.
 
+macOS desktop builds now bundle a private Python runtime plus a locked Loom
+environment inside the app bundle. Build-time assembly runs from repo state via
+`pnpm --dir apps/desktop tauri:build`, while runtime state stays external under
+the desktop app-data directory instead of the signed bundle. See
+[docs/DESKTOP-MACOS-PACKAGING.md](docs/DESKTOP-MACOS-PACKAGING.md) for the
+current build inputs, bundled extras, smoke checks, acceptance checklist, and
+signing notes.
+
 ## Configuration
 
 On first launch, Loom's built-in setup wizard walks you through provider selection, model configuration, and role assignment — all inside the TUI. The wizard writes `~/.loom/loom.toml` for you. Run `/setup` from inside the TUI at any time to reconfigure, or `uv run loom setup` from the CLI.

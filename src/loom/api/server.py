@@ -10,6 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from loom import __version__
 from loom.config import Config
 
+LOCAL_CORS_ORIGIN_REGEX = (
+    r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|"
+    r"https://tauri\.localhost|"
+    r"tauri://localhost)$"
+)
+
 
 def create_app(config: Config | None = None, *, runtime_role: str = "api") -> FastAPI:
     """Create and configure the FastAPI application.
@@ -48,7 +54,7 @@ def create_app(config: Config | None = None, *, runtime_role: str = "api") -> Fa
     # CORS — local only for V1
     app.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+        allow_origin_regex=LOCAL_CORS_ORIGIN_REGEX,
         allow_methods=["*"],
         allow_headers=["*"],
     )
