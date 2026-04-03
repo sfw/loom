@@ -5,7 +5,13 @@ from __future__ import annotations
 import hashlib
 
 from loom.state.migrations.runner import MigrationStep
-from loom.state.migrations.steps import events_v2, task_questions, validity_lineage, workspaces_v1
+from loom.state.migrations.steps import (
+    data_authority_unification,
+    events_v2,
+    task_questions,
+    validity_lineage,
+    workspaces_v1,
+)
 
 
 def _checksum(payload: str) -> str:
@@ -40,5 +46,12 @@ MIGRATIONS: tuple[MigrationStep, ...] = (
         checksum=_checksum("20260323_004_workspaces_v1/workspaces_v1"),
         apply=workspaces_v1.apply,
         verify=workspaces_v1.verify,
+    ),
+    MigrationStep(
+        id="20260402_005_data_authority_unification",
+        description="Add task snapshot freshness and cowork checkpoint/journal coverage columns.",
+        checksum=_checksum("20260402_005_data_authority_unification/data_authority_unification"),
+        apply=data_authority_unification.apply,
+        verify=data_authority_unification.verify,
     ),
 )

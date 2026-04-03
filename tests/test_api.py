@@ -1831,22 +1831,29 @@ class TestWorkspaceFirstEndpoints:
             model_name="chat-model",
         )
 
-        original_get_chat_events = engine.conversation_store.get_chat_events
+        original_get_transcript_page = engine.conversation_store.get_transcript_page
         original_subscribe_all = engine.event_bus.subscribe_all
         call_order: list[str] = []
 
-        async def tracking_get_chat_events(
+        async def tracking_get_transcript_page(
             session_id_arg: str,
             *,
             before_seq: int | None = None,
+            before_turn: int | None = None,
             after_seq: int | None = None,
             limit: int = 200,
         ):
-            if session_id_arg == session_id and before_seq is None and (after_seq or 0) == 0:
+            if (
+                session_id_arg == session_id
+                and before_seq is None
+                and before_turn is None
+                and (after_seq or 0) == 0
+            ):
                 call_order.append("replay")
-            return await original_get_chat_events(
+            return await original_get_transcript_page(
                 session_id_arg,
                 before_seq=before_seq,
+                before_turn=before_turn,
                 after_seq=after_seq,
                 limit=limit,
             )
@@ -1857,8 +1864,8 @@ class TestWorkspaceFirstEndpoints:
 
         monkeypatch.setattr(
             engine.conversation_store,
-            "get_chat_events",
-            tracking_get_chat_events,
+            "get_transcript_page",
+            tracking_get_transcript_page,
         )
         monkeypatch.setattr(engine.event_bus, "subscribe_all", tracking_subscribe_all)
 
@@ -2274,7 +2281,10 @@ class TestWorkspaceFirstEndpoints:
         )
         assert latest_response.status_code == 200
         latest_rows = latest_response.json()
-        assert [row["seq"] for row in latest_rows] == [1, 2]
+        assert len(latest_rows) == 10
+        assert latest_rows[0]["turn_number"] == 241
+        assert latest_rows[-1]["turn_number"] == 250
+        assert latest_rows[-1]["payload"]["text"] == "message 250"
 
         older_without_turn_response = await client.get(
             f"/conversations/{session_id}/events?before_seq=1&limit=10",
@@ -2323,7 +2333,7 @@ class TestWorkspaceFirstEndpoints:
         assert [row["turn_number"] for row in rows] == [1, 2, 3, 4]
 
     @pytest.mark.asyncio
-    async def test_conversation_status_reports_pending_ask_user_prompt(
+    async def test_conversation_status_ignores_journal_only_pending_prompt(
         self,
         client,
         tmp_path,
@@ -2362,9 +2372,8 @@ class TestWorkspaceFirstEndpoints:
         response = await client.get(f"/conversations/{session_id}/status")
         assert response.status_code == 200
         payload = response.json()
-        assert payload["awaiting_user_input"] is True
-        assert payload["pending_prompt"]["question"] == "Which language should we use?"
-        assert payload["pending_prompt"]["options"][0]["label"] == "Python"
+        assert payload["awaiting_user_input"] is False
+        assert payload["pending_prompt"] is None
 
         await conversation_store.append_chat_event(
             session_id,
@@ -2376,6 +2385,103 @@ class TestWorkspaceFirstEndpoints:
         payload = response.json()
         assert payload["awaiting_user_input"] is False
         assert payload["pending_prompt"] is None
+
+    @pytest.mark.asyncio
+    async def test_conversation_events_ignore_uncovered_partial_journal_rows(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-events-coverage-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        await conversation_store.append_turn(session_id, 1, "user", "older covered")
+        await conversation_store.append_turn(session_id, 2, "assistant", "assistant newer")
+        await conversation_store.append_turn(session_id, 3, "user", "fresh uncovered")
+        await conversation_store.append_turn(session_id, 4, "assistant", "fresh answer")
+
+        await conversation_store.append_chat_event(
+            session_id,
+            "user_message",
+            {"text": "older covered"},
+            journal_through_turn=1,
+        )
+        await conversation_store.append_chat_event(
+            session_id,
+            "assistant_text",
+            {"text": "stale partial row"},
+        )
+
+        response = await client.get(f"/conversations/{session_id}/events?limit=20")
+        assert response.status_code == 200
+        rows = response.json()
+
+        assert any(
+            row.get("turn_number") == 4
+            and row.get("event_type") == "assistant_text"
+            and row.get("payload", {}).get("text") == "fresh answer"
+            for row in rows
+        )
+        assert all(
+            row.get("payload", {}).get("text") != "stale partial row"
+            for row in rows
+        )
+
+    @pytest.mark.asyncio
+    async def test_conversation_events_do_not_trust_legacy_journal_without_coverage(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-events-legacy-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        await conversation_store.append_turn(session_id, 1, "user", "older covered")
+        await conversation_store.append_turn(session_id, 2, "assistant", "assistant newer")
+        await conversation_store.append_turn(session_id, 3, "user", "fresh uncovered")
+        await conversation_store.append_turn(session_id, 4, "assistant", "fresh answer")
+
+        await conversation_store.append_chat_event(
+            session_id,
+            "user_message",
+            {"text": "older covered"},
+        )
+        await conversation_store.append_chat_event(
+            session_id,
+            "assistant_text",
+            {"text": "legacy partial row"},
+        )
+
+        response = await client.get(f"/conversations/{session_id}/events?limit=20")
+        assert response.status_code == 200
+        rows = response.json()
+
+        assert any(
+            row.get("turn_number") == 4
+            and row.get("event_type") == "assistant_text"
+            and row.get("payload", {}).get("text") == "fresh answer"
+            for row in rows
+        )
+        assert all(
+            row.get("payload", {}).get("text") != "legacy partial row"
+            for row in rows
+        )
 
     @pytest.mark.asyncio
     async def test_conversation_status_synthesizes_pending_prompt_from_turns(
@@ -5807,6 +5913,46 @@ class TestTaskPauseResume:
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
         mock_orchestrator.resume_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pause_run_uses_canonical_task_state_when_task_row_missing(
+        self,
+        client,
+        state_manager,
+        mock_orchestrator,
+    ):
+        _make_task(state_manager, status=TaskStatus.EXECUTING)
+        response = await client.post("/runs/test-1/pause")
+        assert response.status_code == 200
+        assert response.json()["task_status"] == TaskStatus.PAUSED.value
+        mock_orchestrator.pause_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_run_uses_canonical_task_state_when_task_row_missing(
+        self,
+        client,
+        state_manager,
+        mock_orchestrator,
+    ):
+        _make_task(state_manager, status=TaskStatus.PAUSED)
+        response = await client.post("/runs/test-1/resume")
+        assert response.status_code == 200
+        assert response.json()["task_status"] == TaskStatus.EXECUTING.value
+        mock_orchestrator.resume_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_message_uses_canonical_task_state_when_task_row_missing(
+        self,
+        client,
+        state_manager,
+    ):
+        _make_task(state_manager, status=TaskStatus.EXECUTING)
+        response = await client.post(
+            "/runs/test-1/message",
+            json={"role": "user", "message": "Please continue."},
+        )
+        assert response.status_code == 200
+        assert response.json()["task_id"] == "test-1"
 
     @pytest.mark.asyncio
     async def test_pause_invalid_status(self, client, state_manager):

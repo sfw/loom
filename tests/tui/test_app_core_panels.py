@@ -858,17 +858,14 @@ class TestQuitConfirmation:
             workspace=Path("/tmp"),
         )
         app._confirm_exit = AsyncMock(return_value=True)
-        app._store = MagicMock()
-        app._store.update_session = AsyncMock()
+        app._persist_process_run_ui_state = AsyncMock()
         app._session = SimpleNamespace(session_id="sess-123")
         app.exit = MagicMock()
 
         await app.action_quit()
 
         app._confirm_exit.assert_awaited_once()
-        app._store.update_session.assert_awaited_once_with(
-            "sess-123", is_active=False,
-        )
+        app._persist_process_run_ui_state.assert_awaited_once_with(is_active=False)
         app.exit.assert_called_once()
 
     @pytest.mark.asyncio
@@ -881,15 +878,14 @@ class TestQuitConfirmation:
             workspace=Path("/tmp"),
         )
         app._confirm_exit = AsyncMock(return_value=False)
-        app._store = MagicMock()
-        app._store.update_session = AsyncMock()
+        app._persist_process_run_ui_state = AsyncMock()
         app._session = SimpleNamespace(session_id="sess-123")
         app.exit = MagicMock()
 
         await app.action_quit()
 
         app._confirm_exit.assert_awaited_once()
-        app._store.update_session.assert_not_called()
+        app._persist_process_run_ui_state.assert_not_awaited()
         app.exit.assert_not_called()
 
     @pytest.mark.asyncio

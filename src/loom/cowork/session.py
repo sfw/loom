@@ -635,6 +635,11 @@ class CoworkSession:
         return self._session_state
 
     @property
+    def persisted_turn_count(self) -> int:
+        """Latest committed conversation-turn boundary for this session."""
+        return int(self._message_counter)
+
+    @property
     def stop_requested(self) -> bool:
         """Return True when a cooperative stop has been requested."""
         return self._stop_requested.is_set()
@@ -1230,15 +1235,44 @@ class CoworkSession:
             raise ValueError(f"Session not found: {session_id}")
 
         self._session_id = session_id
-        self._total_tokens = session.get("total_tokens", 0)
-        self._turn_counter = session.get("turn_count", 0)
+        self._total_tokens = int(session.get("total_tokens", 0) or 0)
 
         # Restore message counter from DB to avoid collisions
         self._message_counter = await self._store.get_turn_count(session_id)
+        self._turn_counter = await self._store.get_user_turn_count(session_id)
 
-        # Restore session state
+        checkpoint_through_turn = int(session.get("session_state_through_turn", 0) or 0)
+
+        # Restore session state from the latest valid checkpoint, then replay any
+        # fresher canonical turns so stale cowork_sessions rows cannot mask them.
         self._session_state = SessionState.from_json(session.get("session_state"))
+        if not self._session_state.session_id:
+            self._session_state = SessionState(
+                workspace=str(session.get("workspace_path", "") or ""),
+                model_name=str(session.get("model_name", self._model.name) or self._model.name),
+                session_id=session_id,
+            )
         self._session_state.session_id = session_id
+        self._session_state.workspace = str(
+            self._session_state.workspace
+            or session.get("workspace_path", "")
+            or "",
+        )
+        self._session_state.model_name = str(
+            self._session_state.model_name
+            or session.get("model_name", self._model.name)
+            or self._model.name,
+        )
+        self._session_state.turn_count = self._turn_counter
+        self._session_state.total_tokens = self._total_tokens
+
+        if self._message_counter > checkpoint_through_turn:
+            newer_turns = await self._store.get_turns_after(
+                session_id,
+                after_turn=checkpoint_through_turn,
+                limit=max(self._message_counter, 1),
+            )
+            self._replay_session_state_from_turn_rows(newer_turns)
 
         # Load recent turns into in-memory cache
         recent = await self._store.resume_session(session_id)
@@ -1256,6 +1290,20 @@ class CoworkSession:
         await self._hydrate_memory_snapshot()
         if self._memory_indexer is not None and self._message_counter > 0:
             self._memory_indexer.enqueue_up_to_turn(self._message_counter)
+
+    def _replay_session_state_from_turn_rows(self, rows: list[dict[str, Any]]) -> None:
+        """Advance semantic session state from canonical turns past a stale checkpoint."""
+        if not rows:
+            return
+        for row in rows:
+            if str(row.get("role", "") or "").strip().lower() != "user":
+                continue
+            content = str(row.get("content", "") or "").strip()
+            if not content:
+                continue
+            self._session_state.set_focus(content.split("\n")[0])
+        self._session_state.turn_count = self._turn_counter
+        self._session_state.total_tokens = self._total_tokens
 
     # ------------------------------------------------------------------
     # Context management
@@ -2699,11 +2747,10 @@ class CoworkSession:
         if self._store is None or not self._session_id:
             return
         try:
-            await self._store.update_session(
+            await self._store.write_session_checkpoint(
                 session_id=self._session_id,
-                total_tokens=self._total_tokens,
-                turn_count=self._turn_counter,
                 session_state=self._session_state.to_dict(),
+                through_turn=self._message_counter,
             )
         except Exception as e:
             logger.warning("Persist metadata failed: %s", e)

@@ -253,6 +253,95 @@ class TestDatabase:
         )
         assert tables
 
+    async def test_initialize_upgrades_pre_data_authority_fixture(self, tmp_path: Path):
+        db_path = tmp_path / "pre-data-authority.db"
+        prior_steps = MIGRATIONS[:4]
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    goal TEXT NOT NULL,
+                    context TEXT,
+                    workspace_path TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    plan TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    completed_at TEXT,
+                    approval_mode TEXT NOT NULL DEFAULT 'auto',
+                    callback_url TEXT,
+                    metadata TEXT
+                );
+                CREATE TABLE cowork_sessions (
+                    id TEXT PRIMARY KEY,
+                    workspace_path TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    system_prompt TEXT,
+                    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_active_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    total_tokens INTEGER DEFAULT 0,
+                    turn_count INTEGER DEFAULT 0,
+                    session_state TEXT,
+                    is_active INTEGER DEFAULT 1
+                );
+                CREATE TABLE conversation_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_number INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT,
+                    tool_calls TEXT,
+                    tool_call_id TEXT,
+                    tool_name TEXT,
+                    token_count INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE cowork_chat_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE schema_migrations (
+                    id TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    checksum TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+            for step in prior_steps:
+                await conn.execute(
+                    """INSERT INTO schema_migrations (id, applied_at, duration_ms, checksum, notes)
+                       VALUES (?, datetime('now'), 1, ?, 'legacy bootstrap')""",
+                    (step.id, step.checksum),
+                )
+            await conn.commit()
+
+        db = Database(db_path)
+        await db.initialize()
+
+        async with aiosqlite.connect(db_path) as conn:
+            task_columns = {
+                row[1]
+                for row in await (await conn.execute("PRAGMA table_info(tasks)")).fetchall()
+            }
+            session_columns = {
+                row[1]
+                for row in await (
+                    await conn.execute("PRAGMA table_info(cowork_sessions)")
+                ).fetchall()
+            }
+
+        assert "state_snapshot_updated_at" in task_columns
+        assert "session_state_through_turn" in session_columns
+        assert "chat_journal_through_turn" in session_columns
+        assert "chat_journal_through_seq" in session_columns
+
     async def test_initialize_rolls_back_on_failed_migration(self, tmp_path: Path, monkeypatch):
         db_path = tmp_path / "rollback.db"
 

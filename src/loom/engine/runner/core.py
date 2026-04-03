@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -195,6 +196,7 @@ class SubtaskRunner:
         config: Config,
         event_bus: EventBus | None = None,
         question_manager: QuestionManager | None = None,
+        task_snapshot_writer: Callable[[Task], Awaitable[None]] | None = None,
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -206,6 +208,7 @@ class SubtaskRunner:
         self._validator = ResponseValidator()
         self._event_bus = event_bus
         self._question_manager = question_manager
+        self._task_snapshot_writer = task_snapshot_writer
         settings = RunnerSettings.from_config(config, runner_defaults=self)
         self._max_tool_iterations = settings.max_tool_iterations
         self._max_subtask_wall_clock_seconds = settings.max_subtask_wall_clock_seconds
@@ -383,7 +386,13 @@ class SubtaskRunner:
                 return "tui"
         return normalize_tool_execution_surface(raw_surface, default="api")
 
-    def _set_waiting_for_user_input(
+    async def _persist_task_snapshot(self, task: Task) -> None:
+        if self._task_snapshot_writer is not None:
+            await self._task_snapshot_writer(task)
+            return
+        await asyncio.to_thread(self._state.save, task)
+
+    async def _set_waiting_for_user_input(
         self,
         *,
         task: Task,
@@ -400,7 +409,7 @@ class SubtaskRunner:
             "requested_at": datetime.now().isoformat(),
         }
         try:
-            self._state.save(task)
+            await self._persist_task_snapshot(task)
         except Exception:
             logger.debug(
                 "Failed to persist awaiting_user_input marker for %s/%s",
@@ -409,7 +418,7 @@ class SubtaskRunner:
                 exc_info=True,
             )
 
-    def _clear_waiting_for_user_input(
+    async def _clear_waiting_for_user_input(
         self,
         *,
         task: Task,
@@ -430,7 +439,7 @@ class SubtaskRunner:
         metadata.pop("awaiting_user_input", None)
         task.metadata = metadata
         try:
-            self._state.save(task)
+            await self._persist_task_snapshot(task)
         except Exception:
             logger.debug(
                 "Failed clearing awaiting_user_input marker for %s",
@@ -514,7 +523,7 @@ class SubtaskRunner:
                 subtask.id,
                 exc_info=True,
             )
-        self._record_task_clarification_decision(
+        await self._record_task_clarification_decision(
             task=task,
             subtask=subtask,
             request=request,
@@ -528,7 +537,7 @@ class SubtaskRunner:
             return value
         return f"{value[: max(0, limit - 1)].rstrip()}…"
 
-    def _record_task_clarification_decision(
+    async def _record_task_clarification_decision(
         self,
         *,
         task: Task,
@@ -562,7 +571,7 @@ class SubtaskRunner:
         metadata["clarification_history"] = history[-20:]
         task.metadata = metadata
         try:
-            self._state.save(task)
+            await self._persist_task_snapshot(task)
         except Exception:
             logger.debug(
                 "Failed persisting clarification decision to task state for %s/%s",

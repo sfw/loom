@@ -356,6 +356,61 @@ class TestCLI:
         assert doctor_result.exit_code == 0
         assert "Doctor passed" in doctor_result.output
 
+    def test_db_doctor_warns_on_legacy_uncovered_chat_journal(self, tmp_path):
+        from loom.state.memory import Database
+
+        db_path = tmp_path / "loom.db"
+        database = Database(db_path)
+        asyncio.run(database.initialize())
+
+        async def _seed() -> None:
+            await database.execute(
+                """
+                INSERT INTO cowork_sessions (
+                    id,
+                    workspace_path,
+                    model_name,
+                    started_at,
+                    last_active_at
+                ) VALUES (?, ?, ?, datetime('now'), datetime('now'))
+                """,
+                ("sess-1", "/tmp/ws", "mock"),
+            )
+            await database.execute(
+                """
+                INSERT INTO conversation_turns (session_id, turn_number, role, content, token_count)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("sess-1", 1, "user", "hello", 1),
+            )
+            await database.execute(
+                """
+                INSERT INTO cowork_chat_events (session_id, seq, event_type, payload)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("sess-1", 1, "assistant_text", "{\"text\":\"legacy\"}"),
+            )
+            await database.close()
+
+        asyncio.run(_seed())
+
+        cfg_path = tmp_path / "loom.toml"
+        cfg_path.write_text(
+            "[memory]\n"
+            f"database_path = \"{db_path}\"\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+
+        doctor_result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "db", "doctor"],
+            catch_exceptions=False,
+        )
+        assert doctor_result.exit_code == 0
+        assert "Doctor passed with warnings" in doctor_result.output
+        assert "coverage markers" in doctor_result.output
+
     def test_db_migrate_bootstraps_database(self, tmp_path):
         db_path = tmp_path / "loom.db"
         cfg_path = tmp_path / "loom.toml"

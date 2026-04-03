@@ -1116,7 +1116,7 @@ async def handle_failure(
         # All retries exhausted.
         # Critical-path failures abort the remaining plan.
         if subtask.is_critical_path:
-            if orchestrator._should_auto_replan_critical_path_scope_failure(
+            if await orchestrator._should_auto_replan_critical_path_scope_failure(
                 task=task,
                 subtask=subtask,
                 verification=verification,

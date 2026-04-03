@@ -41,14 +41,14 @@ def apply_chat_render_cap(
     trimmed = total - max_rows
     replay_events = replay_events[-max_rows:]
     trim_total += trimmed
-    if history_source == "journal":
+    if history_source != "legacy":
         first = replay_events[0] if replay_events else {}
         try:
             seq = int(first.get("seq", 0) or 0)
         except (TypeError, ValueError):
             seq = 0
         oldest_seq = seq if seq > 0 else oldest_seq
-    elif history_source == "legacy":
+    else:
         turns = [
             turn
             for turn in (event_cursor_turn(event) for event in replay_events)
@@ -263,6 +263,7 @@ async def append_chat_replay_event(
     payload: dict,
     *,
     turn_number: int | None = None,
+    journal_through_turn: int | None = None,
     persist: bool = True,
     render: bool = False,
 ) -> None:
@@ -286,6 +287,7 @@ async def append_chat_replay_event(
                 session_id,
                 event["event_type"],
                 event["payload"],
+                journal_through_turn=journal_through_turn,
             )
             event["seq"] = seq
             if not self._chat_history_source:
@@ -323,15 +325,7 @@ async def hydrate_chat_history_for_active_session(self) -> None:
     parse_failures = 0
     source = ""
     start = time.monotonic()
-    source_pref = (
-        "journal"
-        if self._chat_resume_use_event_journal()
-        else (
-            "legacy"
-            if self._chat_resume_enable_legacy_fallback()
-            else "none"
-        )
-    )
+    source_pref = "transcript"
     logger.info(
         "chat_hydrate_started session=%s source=%s page_size=%s",
         session_id,
@@ -339,54 +333,38 @@ async def hydrate_chat_history_for_active_session(self) -> None:
         page_size,
     )
 
-    if self._chat_resume_use_event_journal():
+    try:
+        events = await _load_transcript_page(
+            self,
+            session_id,
+            limit=page_size,
+        )
+    except Exception as e:
+        logger.warning(
+            "chat_hydrate_failed session=%s source=transcript error_class=%s",
+            session_id,
+            e.__class__.__name__,
+        )
+        events = []
+    if events:
+        source = "transcript"
+        first = events[0]
         try:
-            events = await self._store.get_chat_events(
-                session_id,
-                limit=page_size,
+            self._chat_history_oldest_seq = int(first.get("seq", 0) or 0)
+        except (TypeError, ValueError):
+            self._chat_history_oldest_seq = None
+        turns = [
+            turn
+            for turn in (
+                self._chat_event_cursor_turn(event)
+                for event in events
             )
-        except Exception as e:
-            logger.warning(
-                "chat_hydrate_failed session=%s source=journal error_class=%s",
-                session_id,
-                e.__class__.__name__,
-            )
-            events = []
-        if events:
-            source = "journal"
-            first = events[0]
-            try:
-                self._chat_history_oldest_seq = int(first.get("seq", 0) or 0)
-            except (TypeError, ValueError):
-                self._chat_history_oldest_seq = None
-            parse_failures = sum(
-                1 for row in events if bool(row.get("payload_parse_error", False))
-            )
-
-    if not events and self._chat_resume_enable_legacy_fallback():
-        try:
-            events = await self._store.synthesize_chat_events_from_turns(
-                session_id,
-                limit=page_size,
-            )
-        except Exception as e:
-            logger.warning(
-                "chat_hydrate_failed session=%s source=legacy error_class=%s",
-                session_id,
-                e.__class__.__name__,
-            )
-            events = []
-        if events:
-            source = "legacy"
-            turns = [
-                turn
-                for turn in (
-                    self._chat_event_cursor_turn(event)
-                    for event in events
-                )
-                if turn is not None
-            ]
-            self._chat_history_oldest_turn = min(turns) if turns else None
+            if turn is not None
+        ]
+        self._chat_history_oldest_turn = min(turns) if turns else None
+        parse_failures = sum(
+            1 for row in events if bool(row.get("payload_parse_error", False))
+        )
 
     self._chat_replay_events = events
     self._chat_history_source = source
@@ -423,19 +401,20 @@ async def load_older_chat_history(self) -> bool:
         source or "none",
         page_size,
     )
-    if source == "journal":
+    if source == "transcript":
         before_seq = self._chat_history_oldest_seq
         if before_seq is None or before_seq <= 1:
             return False
         try:
-            older = await self._store.get_chat_events(
+            older = await _load_transcript_page(
+                self,
                 session_id,
                 before_seq=before_seq,
                 limit=page_size,
             )
         except Exception as e:
             logger.warning(
-                "chat_hydrate_failed session=%s source=journal "
+                "chat_hydrate_failed session=%s source=transcript "
                 "mode=older error_class=%s",
                 session_id,
                 e.__class__.__name__,
@@ -449,38 +428,6 @@ async def load_older_chat_history(self) -> bool:
                 pass
             parse_failures = sum(
                 1 for row in older if bool(row.get("payload_parse_error", False))
-            )
-    elif source == "legacy":
-        before_turn = self._chat_history_oldest_turn
-        if before_turn is None or before_turn <= 1:
-            return False
-        try:
-            older = await self._store.synthesize_chat_events_from_turns(
-                session_id,
-                before_turn=before_turn,
-                limit=page_size,
-            )
-        except Exception as e:
-            logger.warning(
-                "chat_hydrate_failed session=%s source=legacy "
-                "mode=older error_class=%s",
-                session_id,
-                e.__class__.__name__,
-            )
-            return False
-        if older:
-            turns = [
-                turn
-                for turn in (
-                    self._chat_event_cursor_turn(event)
-                    for event in older
-                )
-                if turn is not None
-            ]
-            self._chat_history_oldest_turn = (
-                min(turns)
-                if turns
-                else self._chat_history_oldest_turn
             )
     else:
         return False
@@ -502,6 +449,53 @@ async def load_older_chat_history(self) -> bool:
         elapsed_ms,
     )
     return True
+
+
+async def _load_transcript_page(
+    self,
+    session_id: str,
+    *,
+    before_seq: int | None = None,
+    before_turn: int | None = None,
+    after_seq: int = 0,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    getter = getattr(self._store, "get_transcript_page", None)
+    if callable(getter):
+        try:
+            return await getter(
+                session_id,
+                before_seq=before_seq,
+                before_turn=before_turn,
+                after_seq=after_seq,
+                limit=limit,
+            )
+        except TypeError:
+            logger.debug(
+                "chat_transcript_loader_fallback session=%s reason=type_error",
+                session_id,
+                exc_info=True,
+            )
+
+    if before_turn is not None and before_seq is None:
+        synth = getattr(self._store, "synthesize_chat_events_from_turns", None)
+        if callable(synth):
+            return await synth(
+                session_id,
+                before_turn=before_turn,
+                limit=limit,
+            )
+        return []
+
+    get_chat_events = getattr(self._store, "get_chat_events", None)
+    if not callable(get_chat_events):
+        return []
+    return await get_chat_events(
+        session_id,
+        before_seq=before_seq,
+        after_seq=(None if after_seq <= 0 else after_seq),
+        limit=limit,
+    )
 
 async def new_session(self) -> None:
     """Create a fresh session, replacing the current one."""

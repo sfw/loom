@@ -117,17 +117,74 @@ def db_doctor(ctx: click.Context) -> None:
         click.echo("Doctor: database file does not exist yet.")
         return
 
-    async def _run() -> None:
+    async def _run() -> list[str]:
         import aiosqlite
 
+        warnings: list[str] = []
         async with aiosqlite.connect(db_path) as conn:
             await verify_schema(conn, steps=MIGRATIONS)
+            stale_checkpoint_row = await (
+                await conn.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM cowork_sessions s
+                    WHERE COALESCE(s.session_state_through_turn, 0) >
+                        COALESCE((
+                            SELECT MAX(t.turn_number)
+                            FROM conversation_turns t
+                            WHERE t.session_id = s.id
+                        ), 0)
+                    """,
+                )
+            ).fetchone()
+            stale_checkpoint_count = int(
+                (stale_checkpoint_row[0] if stale_checkpoint_row else 0) or 0,
+            )
+            if stale_checkpoint_count > 0:
+                raise RuntimeError(
+                    "Doctor found cowork session checkpoints that advertise turns past "
+                    "the committed conversation log."
+                )
+
+            legacy_journal_row = await (
+                await conn.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM cowork_sessions s
+                    WHERE (COALESCE(s.chat_journal_through_turn, 0) = 0
+                        OR COALESCE(s.chat_journal_through_seq, 0) = 0)
+                      AND EXISTS (
+                          SELECT 1
+                          FROM cowork_chat_events e
+                          WHERE e.session_id = s.id
+                      )
+                      AND EXISTS (
+                          SELECT 1
+                          FROM conversation_turns t
+                          WHERE t.session_id = s.id
+                      )
+                    """,
+                )
+            ).fetchone()
+            legacy_journal_count = int((legacy_journal_row[0] if legacy_journal_row else 0) or 0)
+            if legacy_journal_count > 0:
+                warnings.append(
+                    "Some cowork transcripts still lack explicit coverage markers; "
+                    "legacy journal rows will synthesize from canonical turns for "
+                    "uncovered ranges."
+                )
+        return warnings
 
     try:
-        asyncio.run(_run())
+        warnings = asyncio.run(_run())
     except Exception as e:
         click.echo(f"Doctor failed: {e}", err=True)
         sys.exit(1)
+    if warnings:
+        click.echo(f"Doctor passed with warnings: {db_path}")
+        for item in warnings:
+            click.echo(f"- {item}")
+        return
     click.echo(f"Doctor passed: {db_path}")
 
 

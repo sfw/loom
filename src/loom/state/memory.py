@@ -112,6 +112,7 @@ class Database:
         self._read_dbs: list[aiosqlite.Connection] = []
         self._read_index = 0
         self._lifecycle_lock = asyncio.Lock()
+        self._write_tx_lock = asyncio.Lock()
         self._stats: dict[str, float | int] = {
             "connection_open_count": 0,
             "read_query_count": 0,
@@ -397,6 +398,25 @@ class Database:
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
             batch=True,
         )
+
+    async def run_write_transaction(self, callback) -> object:
+        """Run a callback inside one write-connection transaction."""
+        db = await self._get_write_db()
+        started = time.perf_counter()
+        async with self._write_tx_lock:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                result = await callback(db)
+            except Exception:
+                await db.rollback()
+                raise
+            await db.commit()
+        self._record_write_stats(
+            row_count=1,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            batch=True,
+        )
+        return result
 
     async def query(self, sql: str, params: tuple = ()) -> list[dict]:
         """Execute a read query and return results as dicts."""

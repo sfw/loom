@@ -611,7 +611,12 @@ async def _persist_process_run_ui_state(
     if not payload:
         return
     try:
-        await store.update_session(session_id, **payload)
+        ui_state = payload.get("session_state", {}).get("ui_state", {})
+        await store.patch_session_state_metadata(
+            session_id,
+            ui_state=ui_state if isinstance(ui_state, dict) else {},
+            is_active=is_active,
+        )
     except Exception as e:
         logger.debug("Failed to persist process UI state: %s", e)
 

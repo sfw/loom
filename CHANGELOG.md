@@ -6,6 +6,9 @@ This changelog is generated directly from git commit history (non-merge commits)
 
 ## [Unreleased]
 
+- Unify task/cowork data authority boundaries: canonical task snapshots now gate run-control writes, cowork semantics come from `conversation_turns`, transcript replay is journal-coverage-aware, and cowork session checkpoints record the turn boundary they cover
+- Add DB migration `20260402_005_data_authority_unification` for task snapshot freshness plus cowork checkpoint/journal coverage metadata
+- Tighten cowork projection discipline: session checkpoints now derive counters from committed turns, non-semantic session metadata patches no longer rewrite checkpoint state, and `loom db doctor` warns on uncovered legacy transcript journals
 - Refactor `loomd` desktop/runtime hot paths around SQLite: long-lived governed connections, governed durable-run lease writes, bounded durable event backpressure, direct live run/notification SSE delivery, and reduced frontend polling overlap
 - Add desktop hot-path latency diagnostics and a synthetic active-run API smoke benchmark (`scripts/active_run_latency_smoke.py`)
 - Add `loomd` sidecar entrypoint and runtime status contract for workspace-first desktop bootstrapping

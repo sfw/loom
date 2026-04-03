@@ -1181,7 +1181,7 @@ def _apply_finalization_outcome(self, task: Task) -> None:
 def _finalize_task(self, task: Task) -> Task:
     """Finalize task: set status, emit events, and persist synchronously."""
     _apply_finalization_outcome(self, task)
-    self._state.save(task)
+    self._save_task_state_sync(task)
     return task
 
 

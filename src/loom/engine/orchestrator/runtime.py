@@ -26,7 +26,7 @@ def initialize_task_run_id(orchestrator, task: Task) -> str:
         run_id = f"run-{uuid.uuid4().hex[:12]}"
         metadata["run_id"] = run_id
         task.metadata = metadata
-        orchestrator._state.save(task)
+        orchestrator._save_task_state_sync(task)
     orchestrator._active_run_id = run_id
     return run_id
 

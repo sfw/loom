@@ -128,6 +128,7 @@ from loom.state.task_state import Plan, Subtask, SubtaskStatus, Task, TaskStatus
 from loom.state.workspaces import canonicalize_workspace_path
 from loom.tools.ask_user import normalize_ask_user_args
 from loom.tools.registry import (
+    ToolResult,
     normalize_tool_auth_mode,
     normalize_tool_execution_surface,
     normalize_tool_execution_surfaces,
@@ -1587,8 +1588,7 @@ async def _task_state_exists(engine: Engine, task_id: str) -> bool:
 
 
 async def _save_task_state(engine: Engine, task: Task) -> None:
-    await asyncio.to_thread(engine.state_manager.save, task)
-    await engine._sync_task_row_snapshot(task)
+    await engine._save_task_state(task)
 
 
 async def _persist_task_snapshot(engine: Engine, task: Task) -> None:
@@ -1624,6 +1624,7 @@ def _task_row_projection_from_task(
         "plan": plan_json,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
+        "state_snapshot_updated_at": task.updated_at,
         "completed_at": str(task.completed_at or "").strip() or None,
         "approval_mode": task.approval_mode,
         "callback_url": task.callback_url or None,
@@ -3207,11 +3208,14 @@ async def _append_conversation_replay_event(
     conversation_id: str,
     event_type: str,
     payload: dict[str, Any],
+    *,
+    journal_through_turn: int | None = None,
 ) -> None:
     seq = await engine.conversation_store.append_chat_event(
         conversation_id,
         event_type,
         payload,
+        journal_through_turn=journal_through_turn,
     )
     # Emit through event bus for instant SSE delivery
     engine.event_bus.emit(Event(
@@ -3267,6 +3271,29 @@ def _conversation_pending_prompt_from_event(event: dict[str, Any]) -> dict[str, 
         return None
 
     tool_call_id = str(payload.get("tool_call_id", "") or "").strip()
+    if tool_call_id:
+        prompt = {**prompt, "tool_call_id": tool_call_id}
+    return prompt
+
+
+def _conversation_pending_prompt_from_turn(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract a pending ask_user prompt from the canonical turn log."""
+    if str(row.get("role", "") or "").strip().lower() != "tool":
+        return None
+    if str(row.get("tool_name", "") or "").strip() != "ask_user":
+        return None
+    result = ToolResult.from_json(str(row.get("content", "") or ""))
+    if not result.success or not isinstance(result.data, dict):
+        return None
+    if "awaiting_input" in result.data and not bool(result.data.get("awaiting_input", False)):
+        return None
+    prompt = (
+        _normalize_ask_user_prompt_payload(result.data)
+        or _normalize_ask_user_prompt_payload(getattr(result, "args", None))
+    )
+    if prompt is None:
+        return None
+    tool_call_id = str(row.get("tool_call_id", "") or "").strip()
     if tool_call_id:
         prompt = {**prompt, "tool_call_id": tool_call_id}
     return prompt
@@ -3331,17 +3358,11 @@ async def _conversation_pending_prompt(
     conversation_id: str,
 ) -> dict[str, Any] | None:
     """Return the last unresolved ask_user prompt for a conversation."""
-    rows = await engine.conversation_store.get_chat_events(conversation_id, limit=64)
-    if not rows:
-        rows = await engine.conversation_store.synthesize_chat_events_from_turns(
-            conversation_id,
-            limit=64,
-        )
-
+    rows = await engine.conversation_store.get_recent_turns(conversation_id, limit=64)
     for row in reversed(rows):
-        if str(row.get("event_type", "") or "") == "user_message":
+        if str(row.get("role", "") or "").strip().lower() == "user":
             return None
-        prompt = _conversation_pending_prompt_from_event(row)
+        prompt = _conversation_pending_prompt_from_turn(row)
         if prompt is not None:
             return prompt
     return None
@@ -3467,6 +3488,9 @@ async def _run_cowork_turn_for_api(
                         "omitted_messages": int(event.omitted_messages),
                         "recall_index_used": bool(event.recall_index_used),
                     },
+                    journal_through_turn=int(
+                        getattr(session, "persisted_turn_count", 0) or 0
+                    ),
                 )
     except CoworkStopRequestedError as exc:
         await _append_conversation_replay_event(
@@ -4143,6 +4167,7 @@ async def pause_task(request: Request, task_id: str):
         )
 
     engine.orchestrator.pause_task(task)
+    await _persist_task_snapshot(engine, task)
     return {
         "status": "ok",
         "message": f"Task {task_id} paused.",
@@ -4168,6 +4193,7 @@ async def resume_task(request: Request, task_id: str):
         )
 
     engine.orchestrator.resume_task(task)
+    await _persist_task_snapshot(engine, task)
     if bool(getattr(engine.config.execution, "enable_durable_task_runner", False)):
         metadata = task.metadata if isinstance(task.metadata, dict) else {}
         run_id = str(metadata.get("run_id", "") or "").strip()
@@ -5120,9 +5146,10 @@ async def patch_conversation(
         raise HTTPException(status_code=404, detail=f"Conversation not found: {conversation_id}")
 
     if body.title is not None:
-        state = dict(_json_object(session.get("session_state")))
-        state["title"] = body.title
-        await engine.conversation_store.update_session(conversation_id, session_state=state)
+        await engine.conversation_store.patch_session_state_metadata(
+            conversation_id,
+            title=body.title,
+        )
 
     # Re-fetch and return the updated detail using the same shape as GET.
     session = await engine.conversation_store.get_session(conversation_id)
@@ -5218,22 +5245,20 @@ async def get_conversation_events(
                 status_code=404,
                 detail=f"Conversation not found: {conversation_id}",
             )
-        if before_turn is not None and before_seq is None:
-            return await engine.conversation_store.synthesize_chat_events_from_turns(
-                conversation_id,
-                before_turn=max(1, int(before_turn)),
-                limit=limit,
-            )
-        rows = await engine.conversation_store.get_chat_events(
+        rows = await engine.conversation_store.get_transcript_page(
             conversation_id,
             before_seq=(
                 None if before_seq is None else max(0, int(before_seq))
             ),
+            before_turn=before_turn,
             after_seq=max(0, int(after_seq)),
             limit=limit,
         )
         if rows:
-            if before_seq is not None or after_seq <= 0:
+            if (
+                (before_seq is not None or after_seq <= 0)
+                and all("turn_number" not in row for row in rows)
+            ):
                 rows = await _expand_conversation_event_page_prefix(
                     engine,
                     conversation_id,
@@ -5246,18 +5271,7 @@ async def get_conversation_events(
             # Falling back to synthesized turn events here duplicates content
             # that the client may already have from durable chat-event rows.
             return []
-        if before_seq is not None:
-            if before_turn is None:
-                before_turn = max(1, int((int(before_seq) + 99) / 100))
-            return await engine.conversation_store.synthesize_chat_events_from_turns(
-                conversation_id,
-                before_turn=max(1, int(before_turn)),
-                limit=limit,
-            )
-        return await engine.conversation_store.synthesize_chat_events_from_turns(
-            conversation_id,
-            limit=limit,
-        )
+        return []
 
 
 @router.get("/conversations/{conversation_id}/status")
@@ -5476,12 +5490,12 @@ async def stream_conversation_events(
             yield {"comment": "open"}
             # Subscribe first, then replay durable rows so we don't miss
             # events emitted between the initial query and subscription setup.
-            rows = await engine.conversation_store.get_chat_events(
+            rows = await engine.conversation_store.get_transcript_page(
                 conversation_id,
                 after_seq=cursor,
                 limit=500,
             )
-            if cursor <= 0 and rows:
+            if cursor <= 0 and rows and all("turn_number" not in row for row in rows):
                 rows = await _expand_conversation_event_page_prefix(
                     engine,
                     conversation_id,
@@ -5501,7 +5515,7 @@ async def stream_conversation_events(
             while True:
                 if overflowed:
                     overflowed = False
-                    rows = await engine.conversation_store.get_chat_events(
+                    rows = await engine.conversation_store.get_transcript_page(
                         conversation_id,
                         after_seq=cursor,
                         limit=500,
@@ -6323,8 +6337,7 @@ async def restart_run(request: Request, run_id: str):
 async def pause_run(request: Request, run_id: str):
     """Pause a run through the existing task pause surface."""
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(run_id)
-    if task_row is None:
+    if not await _task_state_exists(engine, run_id):
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     return await pause_task(request, run_id)
 
@@ -6333,8 +6346,7 @@ async def pause_run(request: Request, run_id: str):
 async def resume_run(request: Request, run_id: str):
     """Resume a run through the existing task resume surface."""
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(run_id)
-    if task_row is None:
+    if not await _task_state_exists(engine, run_id):
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     return await resume_task(request, run_id)
 
@@ -6343,8 +6355,7 @@ async def resume_run(request: Request, run_id: str):
 async def send_run_message(request: Request, run_id: str, body: ConversationMessageRequest):
     """Send an operator message to a run via the task conversation surface."""
     engine = _get_engine(request)
-    task_row = await engine.database.get_task(run_id)
-    if task_row is None:
+    if not await _task_state_exists(engine, run_id):
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     return await send_conversation_message(request, run_id, body)
 

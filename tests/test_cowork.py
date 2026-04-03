@@ -949,6 +949,48 @@ class TestCoworkSession:
         )
         assert indexed
 
+    async def test_resume_replays_canonical_turns_past_stale_session_checkpoint(
+        self,
+        tmp_path: Path,
+    ):
+        database = Database(tmp_path / "stale-checkpoint.db")
+        await database.initialize()
+        store = ConversationStore(database)
+        sid = await store.create_session(workspace=str(tmp_path), model_name="mock")
+
+        await store.append_turn(sid, 1, "user", "Old focus")
+        await store.update_session(
+            sid,
+            total_tokens=5,
+            turn_count=1,
+            session_state={
+                "session_id": sid,
+                "workspace": str(tmp_path),
+                "model_name": "mock",
+                "turn_count": 1,
+                "total_tokens": 5,
+                "current_focus": "Old focus",
+            },
+            session_state_through_turn=1,
+        )
+        await store.append_turn(sid, 2, "assistant", "Old answer")
+        await store.append_turn(sid, 3, "user", "Fresh followup")
+
+        session = CoworkSession(
+            model=MockProvider([ModelResponse(text="ok", usage=TokenUsage(total_tokens=1))]),
+            tools=create_default_registry(),
+            workspace=tmp_path,
+            system_prompt="test",
+            store=store,
+        )
+
+        await session.resume(sid)
+
+        assert session.persisted_turn_count == 3
+        assert session.session_state.turn_count == 2
+        assert session.session_state.current_focus == "Fresh followup"
+        assert session.messages[-1]["content"] == "Fresh followup"
+
     async def test_send_retries_transient_model_failure(self, workspace, tools):
         provider = MockProvider([
             RuntimeError("transient model failure"),

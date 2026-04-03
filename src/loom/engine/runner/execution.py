@@ -686,7 +686,7 @@ async def run_subtask(
                                     else:
                                         session.ask_user_questions_asked += 1
                                         session.last_ask_user_requested_at = now
-                                        runner._set_waiting_for_user_input(
+                                        await runner._set_waiting_for_user_input(
                                             task=task,
                                             subtask=subtask,
                                             request=request,
@@ -702,7 +702,7 @@ async def run_subtask(
                                                 check_task_control=_check_task_control,
                                             )
                                         finally:
-                                            runner._clear_waiting_for_user_input(
+                                            await runner._clear_waiting_for_user_input(
                                                 task=task,
                                                 question_id=request.question_id,
                                             )

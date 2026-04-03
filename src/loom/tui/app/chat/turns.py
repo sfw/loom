@@ -292,6 +292,7 @@ async def run_interaction(self, message: str) -> None:
                     "omitted_messages": int(event.omitted_messages),
                     "recall_index_used": bool(event.recall_index_used),
                 },
+                journal_through_turn=self._session.persisted_turn_count,
             )
             events_panel.add_event(
                 _now_str(), "turn",

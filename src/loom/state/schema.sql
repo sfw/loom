@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     plan TEXT,                                   -- JSON serialized plan
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    state_snapshot_updated_at TEXT,
     completed_at TEXT,
     approval_mode TEXT NOT NULL DEFAULT 'auto',
     callback_url TEXT,
@@ -111,6 +112,9 @@ CREATE TABLE IF NOT EXISTS cowork_sessions (
     total_tokens INTEGER DEFAULT 0,
     turn_count INTEGER DEFAULT 0,
     session_state TEXT,                              -- JSON: structured session state
+    session_state_through_turn INTEGER NOT NULL DEFAULT 0,
+    chat_journal_through_turn INTEGER NOT NULL DEFAULT 0,
+    chat_journal_through_seq INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER DEFAULT 1
 );
 

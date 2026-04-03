@@ -5222,7 +5222,7 @@ class TestProcessSlashCommands:
         state = SessionState(session_id="sess-123", workspace="/tmp", model_name="m")
         app._session = SimpleNamespace(session_id="sess-123", session_state=state)
         app._store = MagicMock()
-        app._store.update_session = AsyncMock()
+        app._store.patch_session_state_metadata = AsyncMock()
         app._process_runs = {
             "abc123": SimpleNamespace(
                 run_id="abc123",
@@ -5245,9 +5245,9 @@ class TestProcessSlashCommands:
 
         await app._persist_process_run_ui_state()
 
-        app._store.update_session.assert_awaited_once()
-        payload = app._store.update_session.await_args.kwargs["session_state"]
-        tabs = payload["ui_state"]["process_tabs"]
+        app._store.patch_session_state_metadata.assert_awaited_once()
+        payload = app._store.patch_session_state_metadata.await_args.kwargs["ui_state"]
+        tabs = payload["process_tabs"]
         assert tabs["active_run_id"] == "abc123"
         assert tabs["runs"][0]["process_name"] == "market-research"
         assert tabs["runs"][0]["goal"] == "Analyze EPCOR"

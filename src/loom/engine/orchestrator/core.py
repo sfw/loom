@@ -291,6 +291,7 @@ class Orchestrator:
             config=config,
             event_bus=event_bus,
             question_manager=self._question,
+            task_snapshot_writer=self._save_task_state,
         )
 
     async def execute_task(
@@ -321,7 +322,7 @@ class Orchestrator:
                 )
                 task.plan = plan
                 reused_plan_replanned = False
-                if self._should_replan_resumed_existing_plan(task):
+                if await self._should_replan_resumed_existing_plan(task):
                     self._run_budget.observe_replan()
                     reused_plan_replanned = await self._replan_task(
                         task,
@@ -2130,7 +2131,7 @@ class Orchestrator:
             f"{verification.tier}{suffix_text} with no feedback."
         )
 
-    def _should_replan_resumed_existing_plan(self, task: Task) -> bool:
+    async def _should_replan_resumed_existing_plan(self, task: Task) -> bool:
         """Replan once when resuming a failed task with pending work."""
         decisions = [str(item or "").strip() for item in task.decisions_log]
         if "Resumed execution from prior task state." not in decisions:
@@ -2152,7 +2153,7 @@ class Orchestrator:
         metadata["resume_preflight_replan_count"] = prior_count + 1
         task.metadata = metadata
         try:
-            self._state.save(task)
+            await self._save_task_state(task)
         except Exception:
             logger.debug(
                 "Failed persisting resume preflight replan marker for %s",
@@ -2188,7 +2189,7 @@ class Orchestrator:
                 lines.append(f"- {item}")
         return "\n".join(lines)
 
-    def _should_auto_replan_critical_path_scope_failure(
+    async def _should_auto_replan_critical_path_scope_failure(
         self,
         *,
         task: Task,
@@ -2224,7 +2225,7 @@ class Orchestrator:
         metadata["critical_path_scope_replans"] = tracker
         task.metadata = metadata
         try:
-            self._state.save(task)
+            await self._save_task_state(task)
         except Exception:
             logger.debug(
                 "Failed persisting critical-path adaptive replan marker for %s/%s",
@@ -2439,6 +2440,36 @@ class Orchestrator:
                 task.id,
                 exc_info=True,
             )
+
+    async def _sync_task_snapshot_projection(self, task: Task) -> None:
+        if self._snapshot_mirror_writer is None:
+            return
+        try:
+            await self._snapshot_mirror_writer(task)
+        except Exception:
+            logger.debug(
+                "Failed syncing mirrored task snapshot for %s",
+                task.id,
+                exc_info=True,
+            )
+
+    def _save_task_state_sync(self, task: Task) -> None:
+        self._state.save(task)
+        if self._snapshot_mirror_writer is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(self._sync_task_snapshot_projection(task))
+            except Exception:
+                logger.debug(
+                    "Failed syncing mirrored task snapshot for %s",
+                    task.id,
+                    exc_info=True,
+                )
+            return
+        loop.create_task(self._sync_task_snapshot_projection(task))
 
     def set_snapshot_mirror_writer(
         self,
@@ -2702,7 +2733,6 @@ class Orchestrator:
             task.metadata = {}
         task.metadata["cancel_reason"] = "cancel_requested"
         task.status = TaskStatus.CANCELLED
-        self._state.save(task)
         self._emit(TASK_CANCEL_REQUESTED, task.id, {
             "requested": True,
             "path": "orchestrator",
@@ -2721,7 +2751,6 @@ class Orchestrator:
             task.metadata = {}
         task.metadata["paused_from_status"] = task.status.value
         task.status = TaskStatus.PAUSED
-        self._state.save(task)
         self._emit(TASK_PAUSED, task.id, {
             "requested": True,
             "status": task.status.value,
@@ -2744,7 +2773,6 @@ class Orchestrator:
             task.status = TaskStatus.PLANNING
         else:
             task.status = TaskStatus.EXECUTING
-        self._state.save(task)
         self._emit(TASK_RESUMED, task.id, {
             "requested": True,
             "status": task.status.value,

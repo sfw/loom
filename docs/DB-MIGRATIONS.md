@@ -28,6 +28,12 @@ Current desktop/workspace-first tables added through migrations include:
 - `workspace_settings`
 - `conversation_run_links`
 
+Recent authority/freshness metadata added through migrations includes:
+
+- `tasks.state_snapshot_updated_at` for mirrored task-row freshness
+- `cowork_sessions.session_state_through_turn` for checkpoint trust boundaries
+- `cowork_sessions.chat_journal_through_turn` / `chat_journal_through_seq` for transcript coverage
+
 `schema_migrations` stores:
 - `id`
 - `applied_at`
@@ -56,7 +62,7 @@ Use the `loom db` command group:
 
 - `uv run loom db status`: show applied and pending migrations
 - `uv run loom db migrate`: apply pending migrations
-- `uv run loom db doctor`: run schema verification checks
+- `uv run loom db doctor`: run schema verification plus authority/projection sanity checks
 - `uv run loom db backup [--output <path>]`: create DB backup copy via SQLite
   online backup API
 
@@ -66,6 +72,14 @@ Recommended recovery flow:
 2. `uv run loom db doctor`
 3. `uv run loom db migrate`
 4. Retry normal Loom startup
+
+When doctor/migrate succeeds after the authority-unification migration, old DBs keep
+their existing data and gain explicit freshness/coverage markers rather than requiring
+database deletion or clean-state rebuilds.
+
+Doctor warnings now also flag cowork sessions that still have legacy chat-journal rows
+without explicit coverage metadata, so operators can distinguish "schema is valid" from
+"all projections are fully covered".
 
 ## Required Workflow for Schema Changes
 

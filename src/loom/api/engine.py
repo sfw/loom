@@ -846,9 +846,9 @@ class Engine:
             await self.database.execute(
                 """INSERT INTO tasks (
                        id, goal, context, workspace_path, status, plan,
-                       created_at, updated_at, completed_at,
+                       created_at, updated_at, state_snapshot_updated_at, completed_at,
                        approval_mode, callback_url, metadata
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        goal=excluded.goal,
                        context=excluded.context,
@@ -857,6 +857,7 @@ class Engine:
                        plan=excluded.plan,
                        created_at=excluded.created_at,
                        updated_at=excluded.updated_at,
+                       state_snapshot_updated_at=excluded.state_snapshot_updated_at,
                        completed_at=excluded.completed_at,
                        approval_mode=excluded.approval_mode,
                        callback_url=excluded.callback_url,
@@ -869,6 +870,7 @@ class Engine:
                     status_value,
                     plan_json,
                     created_at,
+                    updated_at,
                     updated_at,
                     completed_at or None,
                     task.approval_mode,
