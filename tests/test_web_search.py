@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 
 from loom.tools.registry import ToolContext
 from loom.tools.web_search import (
+    BING_URL,
     DEFAULT_SEARCH_USER_AGENT,
     WebSearchTool,
     _build_search_headers,
     _clean_ddg_url,
     _is_retryable_search_status,
+    _parse_bing_html,
     _parse_ddg_html,
+    _search_ddg,
     _strip_tags,
 )
 
@@ -87,6 +91,21 @@ class TestParseDdgHtml:
         assert results == []
 
 
+class TestParseBingHtml:
+    def test_parses_bing_result_blocks(self):
+        html = """
+        <li class="b_algo">
+          <h2><a href="https://example.com/page">Example Result</a></h2>
+          <div><p>Example snippet from Bing.</p></div>
+        </li>
+        """
+        results = _parse_bing_html(html, max_results=5)
+        assert len(results) == 1
+        assert results[0]["title"] == "Example Result"
+        assert results[0]["url"] == "https://example.com/page"
+        assert "Bing" in results[0]["snippet"]
+
+
 class TestWebSearchTool:
     async def test_empty_query(self, tool, ctx):
         result = await tool.execute({"query": ""}, ctx)
@@ -113,7 +132,12 @@ class TestSearchRequestDefaults:
         monkeypatch.delenv("LOOM_WEB_USER_AGENT", raising=False)
         headers = _build_search_headers()
         assert headers["User-Agent"] == DEFAULT_SEARCH_USER_AGENT
+        assert headers["User-Agent"].startswith("Mozilla/5.0")
         assert "Referer" in headers
+        assert headers["Upgrade-Insecure-Requests"] == "1"
+        assert headers["Sec-Fetch-Dest"] == "document"
+        assert headers["Sec-Fetch-Mode"] == "navigate"
+        assert headers["Sec-Fetch-Site"] == "same-origin"
 
     def test_build_search_headers_env_override(self, monkeypatch):
         monkeypatch.setenv("LOOM_WEB_USER_AGENT", "MyAgent/9.9")
@@ -121,7 +145,61 @@ class TestSearchRequestDefaults:
         assert headers["User-Agent"] == "MyAgent/9.9"
 
     def test_retryable_search_status_codes(self):
-        assert _is_retryable_search_status(403)
-        assert _is_retryable_search_status(429)
+        assert not _is_retryable_search_status(403)
+        assert not _is_retryable_search_status(429)
         assert _is_retryable_search_status(503)
         assert not _is_retryable_search_status(404)
+
+
+class _FakeAsyncClient:
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        del exc_type, exc, tb
+        return False
+
+
+class TestSearchFallbacks:
+    @pytest.mark.asyncio
+    async def test_search_falls_back_to_bing_when_duckduckgo_unavailable(self, monkeypatch):
+        calls: list[tuple[str, str]] = []
+        bing_html = """
+        <li class="b_algo">
+          <h2><a href="https://example.com/blink49">Blink49 Studios</a></h2>
+          <div><p>Studio overview page.</p></div>
+        </li>
+        """
+
+        async def _fake_query_search_endpoint(
+            client,
+            method,
+            endpoint,
+            query,
+            *,
+            deadline,
+            referer,
+        ):
+            del client, query, deadline, referer
+            calls.append((method, endpoint))
+            if "duckduckgo" in endpoint:
+                raise httpx.TimeoutException("duckduckgo timed out")
+            if endpoint == BING_URL:
+                return bing_html
+            raise AssertionError(f"Unexpected endpoint: {endpoint}")
+
+        monkeypatch.setattr("loom.tools.web_search.httpx.AsyncClient", _FakeAsyncClient)
+        monkeypatch.setattr(
+            "loom.tools.web_search._query_search_endpoint",
+            _fake_query_search_endpoint,
+        )
+
+        results = await _search_ddg("blink49", 5)
+
+        assert results
+        assert results[0]["title"] == "Blink49 Studios"
+        assert any("duckduckgo" in endpoint for _, endpoint in calls)
+        assert any(endpoint == BING_URL for _, endpoint in calls)
