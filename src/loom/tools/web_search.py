@@ -26,6 +26,21 @@ MAX_SEARCH_ATTEMPTS = 2
 SEARCH_RETRY_BASE_DELAY = 0.4
 RETRYABLE_SEARCH_STATUS = frozenset({408, 425, 500, 502, 503, 504})
 DEFAULT_SEARCH_USER_AGENT = DEFAULT_WEB_USER_AGENT
+SEARCH_CACHE_TTL_SECONDS = 5 * 60
+SEARCH_CACHE_MAX_ENTRIES = 128
+DDG_COOLDOWN_SECONDS = 10 * 60
+DDG_ANTI_BOT_STATUS = frozenset({202, 403, 418, 429})
+DDG_MAX_CONCURRENT_SEARCHES = 1
+
+_SEARCH_RESULT_CACHE: dict[tuple[str, int], tuple[float, list[dict]]] = {}
+_SEARCH_INFLIGHT: dict[tuple[str, int], asyncio.Future[list[dict]]] = {}
+_SEARCH_CACHE_LOCK = asyncio.Lock()
+_DDG_COOLDOWN_UNTIL = 0.0
+_DDG_REQUEST_SEMAPHORE = asyncio.Semaphore(DDG_MAX_CONCURRENT_SEARCHES)
+
+
+class SearchProviderCooldownError(Exception):
+    """Raised when a search provider is temporarily cooling down."""
 
 
 class WebSearchTool(Tool):
@@ -96,65 +111,85 @@ class WebSearchTool(Tool):
 
 async def _search_ddg(query: str, max_results: int) -> list[dict]:
     """Search web providers and parse HTML results."""
+    cache_key = _search_cache_key(query, max_results)
+    cached = await _load_cached_search_result(cache_key)
+    if cached is not None:
+        return cached
+
+    inflight, owner = await _reserve_search_inflight(cache_key)
+    if not owner:
+        return await inflight
+
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=httpx.Timeout(SEARCH_TIMEOUT),
     ) as client:
-        errors: list[str] = []
-        any_successful_response = False
-        overall_deadline = time.monotonic() + SEARCH_TOTAL_BUDGET_SECONDS
-        providers = (
-            {
-                "name": "duckduckgo",
-                "referer": "https://duckduckgo.com/",
-                "parser": _parse_ddg_html,
-                "endpoints": (
-                    ("POST", DDG_URL),
-                    ("GET", DDG_URL),
-                    ("GET", DDG_FALLBACK_URL),
-                ),
-            },
-            {
-                "name": "bing",
-                "referer": "https://www.bing.com/",
-                "parser": _parse_bing_html,
-                "endpoints": (("GET", BING_URL),),
-            },
-        )
+        try:
+            errors: list[str] = []
+            any_successful_response = False
+            overall_deadline = time.monotonic() + SEARCH_TOTAL_BUDGET_SECONDS
+            providers = (
+                {
+                    "name": "duckduckgo",
+                    "referer": "https://duckduckgo.com/",
+                    "parser": _parse_ddg_html,
+                    "endpoints": (
+                        ("POST", DDG_URL),
+                        ("GET", DDG_FALLBACK_URL),
+                    ),
+                },
+                {
+                    "name": "bing",
+                    "referer": "https://www.bing.com/",
+                    "parser": _parse_bing_html,
+                    "endpoints": (("GET", BING_URL),),
+                },
+            )
 
-        for provider in providers:
-            if time.monotonic() >= overall_deadline:
-                raise httpx.TimeoutException("Search deadline exceeded.")
-            parser = provider["parser"]
-            referer = str(provider["referer"] or "")
-            endpoints = tuple(provider["endpoints"])
-            provider_name = str(provider["name"] or "search")
+            for provider in providers:
+                if time.monotonic() >= overall_deadline:
+                    raise httpx.TimeoutException("Search deadline exceeded.")
+                parser = provider["parser"]
+                referer = str(provider["referer"] or "")
+                endpoints = tuple(provider["endpoints"])
+                provider_name = str(provider["name"] or "search")
 
-            for method, endpoint in endpoints:
                 try:
-                    html = await _query_search_endpoint(
+                    parsed = await _search_provider(
                         client=client,
-                        method=method,
-                        endpoint=endpoint,
+                        provider_name=provider_name,
+                        parser=parser,
+                        endpoints=endpoints,
                         query=query,
+                        max_results=max_results,
                         deadline=overall_deadline,
                         referer=referer,
                     )
+                except SearchProviderCooldownError as e:
+                    errors.append(f"{provider_name}: {e}")
+                    continue
                 except Exception as e:
-                    errors.append(f"{provider_name} {endpoint}: {e}")
+                    errors.append(f"{provider_name}: {e}")
                     if time.monotonic() >= overall_deadline:
                         raise httpx.TimeoutException("Search deadline exceeded.") from e
                     continue
 
                 any_successful_response = True
-                parsed = parser(html, max_results)
                 if parsed:
+                    await _store_cached_search_result(cache_key, parsed)
+                    _resolve_search_inflight(cache_key, parsed, exc=None)
                     return parsed
 
-        if errors and not any_successful_response:
-            raise RuntimeError("All search providers failed: " + "; ".join(errors))
+            if errors and not any_successful_response:
+                raise RuntimeError("All search providers failed: " + "; ".join(errors))
 
-    return []
+            result: list[dict] = []
+            await _store_cached_search_result(cache_key, result)
+            _resolve_search_inflight(cache_key, result, exc=None)
+            return result
+        except Exception as e:
+            _resolve_search_inflight(cache_key, None, exc=e)
+            raise
 
 
 def _build_search_headers(*, referer: str = "https://duckduckgo.com/") -> dict[str, str]:
@@ -188,6 +223,175 @@ def _request_timeout_remaining(deadline: float) -> float:
     return max(1.0, min(SEARCH_TIMEOUT, remaining))
 
 
+def _search_cache_key(query: str, max_results: int) -> tuple[str, int]:
+    normalized_query = " ".join(str(query or "").casefold().split())
+    return normalized_query, int(max_results)
+
+
+def _copy_results(results: list[dict]) -> list[dict]:
+    return [dict(item) for item in results]
+
+
+async def _load_cached_search_result(
+    cache_key: tuple[str, int],
+) -> list[dict] | None:
+    now = time.monotonic()
+    async with _SEARCH_CACHE_LOCK:
+        entry = _SEARCH_RESULT_CACHE.get(cache_key)
+        if entry is None:
+            return None
+        expires_at, results = entry
+        if expires_at <= now:
+            _SEARCH_RESULT_CACHE.pop(cache_key, None)
+            return None
+        return _copy_results(results)
+
+
+async def _reserve_search_inflight(
+    cache_key: tuple[str, int],
+) -> tuple[asyncio.Future[list[dict]], bool]:
+    async with _SEARCH_CACHE_LOCK:
+        inflight = _SEARCH_INFLIGHT.get(cache_key)
+        if inflight is not None:
+            return inflight, False
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[list[dict]] = loop.create_future()
+        _SEARCH_INFLIGHT[cache_key] = future
+        return future, True
+
+
+async def _store_cached_search_result(
+    cache_key: tuple[str, int],
+    results: list[dict],
+) -> None:
+    async with _SEARCH_CACHE_LOCK:
+        _SEARCH_RESULT_CACHE[cache_key] = (
+            time.monotonic() + SEARCH_CACHE_TTL_SECONDS,
+            _copy_results(results),
+        )
+        if len(_SEARCH_RESULT_CACHE) > SEARCH_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                _SEARCH_RESULT_CACHE.items(),
+                key=lambda item: item[1][0],
+            )[0]
+            _SEARCH_RESULT_CACHE.pop(oldest_key, None)
+
+
+def _resolve_search_inflight(
+    cache_key: tuple[str, int],
+    results: list[dict] | None,
+    *,
+    exc: Exception | None,
+) -> None:
+    future = _SEARCH_INFLIGHT.pop(cache_key, None)
+    if future is None or future.done():
+        return
+    if exc is not None:
+        future.set_exception(exc)
+        future.exception()
+        return
+    future.set_result(_copy_results(results or []))
+
+
+def _ddg_cooldown_remaining() -> float:
+    remaining = _DDG_COOLDOWN_UNTIL - time.monotonic()
+    return max(0.0, remaining)
+
+
+def _record_ddg_cooldown() -> None:
+    global _DDG_COOLDOWN_UNTIL
+    until = time.monotonic() + DDG_COOLDOWN_SECONDS
+    if until > _DDG_COOLDOWN_UNTIL:
+        _DDG_COOLDOWN_UNTIL = until
+
+
+def _format_ddg_cooldown_message(remaining_seconds: float) -> str:
+    rounded = max(1, int(round(remaining_seconds)))
+    return f"DuckDuckGo cooling down after rate limiting (retry in ~{rounded}s)"
+
+
+async def _search_provider(
+    *,
+    client: httpx.AsyncClient,
+    provider_name: str,
+    parser,
+    endpoints: tuple[tuple[str, str], ...],
+    query: str,
+    max_results: int,
+    deadline: float,
+    referer: str,
+) -> list[dict]:
+    if provider_name == "duckduckgo":
+        async with _DDG_REQUEST_SEMAPHORE:
+            cooldown_remaining = _ddg_cooldown_remaining()
+            if cooldown_remaining > 0:
+                raise SearchProviderCooldownError(
+                    _format_ddg_cooldown_message(cooldown_remaining)
+                )
+            return await _search_provider_endpoints(
+                client=client,
+                provider_name=provider_name,
+                parser=parser,
+                endpoints=endpoints,
+                query=query,
+                max_results=max_results,
+                deadline=deadline,
+                referer=referer,
+            )
+    return await _search_provider_endpoints(
+        client=client,
+        provider_name=provider_name,
+        parser=parser,
+        endpoints=endpoints,
+        query=query,
+        max_results=max_results,
+        deadline=deadline,
+        referer=referer,
+    )
+
+
+async def _search_provider_endpoints(
+    *,
+    client: httpx.AsyncClient,
+    provider_name: str,
+    parser,
+    endpoints: tuple[tuple[str, str], ...],
+    query: str,
+    max_results: int,
+    deadline: float,
+    referer: str,
+) -> list[dict]:
+    errors: list[str] = []
+    any_successful_response = False
+    for method, endpoint in endpoints:
+        try:
+            html = await _query_search_endpoint(
+                client=client,
+                method=method,
+                endpoint=endpoint,
+                query=query,
+                deadline=deadline,
+                referer=referer,
+                provider_name=provider_name,
+            )
+        except SearchProviderCooldownError:
+            raise
+        except Exception as e:
+            errors.append(f"{endpoint}: {e}")
+            if time.monotonic() >= deadline:
+                raise httpx.TimeoutException("Search deadline exceeded.") from e
+            continue
+
+        any_successful_response = True
+        parsed = parser(html, max_results)
+        if parsed:
+            return parsed
+
+    if errors and not any_successful_response:
+        raise RuntimeError("; ".join(errors))
+    return []
+
+
 async def _query_search_endpoint(
     client: httpx.AsyncClient,
     method: str,
@@ -196,6 +400,7 @@ async def _query_search_endpoint(
     *,
     deadline: float,
     referer: str,
+    provider_name: str,
 ) -> str:
     """Query an HTML search endpoint with a bounded overall deadline."""
     method = method.upper()
@@ -216,6 +421,15 @@ async def _query_search_endpoint(
                     params={"q": query},
                     headers=headers,
                     timeout=timeout,
+                )
+
+            if (
+                provider_name == "duckduckgo"
+                and response.status_code in DDG_ANTI_BOT_STATUS
+            ):
+                _record_ddg_cooldown()
+                raise SearchProviderCooldownError(
+                    f"DuckDuckGo denied search request (HTTP {response.status_code})"
                 )
 
             if (

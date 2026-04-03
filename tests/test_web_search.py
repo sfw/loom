@@ -7,16 +7,22 @@ from pathlib import Path
 import httpx
 import pytest
 
+import loom.tools.web_search as web_search_module
 from loom.tools.registry import ToolContext
 from loom.tools.web_search import (
+    _SEARCH_INFLIGHT,
+    _SEARCH_RESULT_CACHE,
     BING_URL,
+    DDG_COOLDOWN_SECONDS,
     DEFAULT_SEARCH_USER_AGENT,
     WebSearchTool,
     _build_search_headers,
     _clean_ddg_url,
+    _ddg_cooldown_remaining,
     _is_retryable_search_status,
     _parse_bing_html,
     _parse_ddg_html,
+    _record_ddg_cooldown,
     _search_ddg,
     _strip_tags,
 )
@@ -164,6 +170,15 @@ class _FakeAsyncClient:
 
 
 class TestSearchFallbacks:
+    @pytest.fixture(autouse=True)
+    def _reset_search_state(self):
+        _SEARCH_RESULT_CACHE.clear()
+        _SEARCH_INFLIGHT.clear()
+        yield
+        _SEARCH_RESULT_CACHE.clear()
+        _SEARCH_INFLIGHT.clear()
+        web_search_module._DDG_COOLDOWN_UNTIL = 0.0
+
     @pytest.mark.asyncio
     async def test_search_falls_back_to_bing_when_duckduckgo_unavailable(self, monkeypatch):
         calls: list[tuple[str, str]] = []
@@ -182,8 +197,9 @@ class TestSearchFallbacks:
             *,
             deadline,
             referer,
+            provider_name,
         ):
-            del client, query, deadline, referer
+            del client, query, deadline, referer, provider_name
             calls.append((method, endpoint))
             if "duckduckgo" in endpoint:
                 raise httpx.TimeoutException("duckduckgo timed out")
@@ -203,3 +219,129 @@ class TestSearchFallbacks:
         assert results[0]["title"] == "Blink49 Studios"
         assert any("duckduckgo" in endpoint for _, endpoint in calls)
         assert any(endpoint == BING_URL for _, endpoint in calls)
+
+    @pytest.mark.asyncio
+    async def test_search_caches_identical_query_results(self, monkeypatch):
+        calls: list[tuple[str, str]] = []
+        bing_html = """
+        <li class="b_algo">
+          <h2><a href="https://example.com/cached">Cached Result</a></h2>
+          <div><p>Cached snippet.</p></div>
+        </li>
+        """
+
+        async def _fake_query_search_endpoint(
+            client,
+            method,
+            endpoint,
+            query,
+            *,
+            deadline,
+            referer,
+            provider_name,
+        ):
+            del client, query, deadline, referer, provider_name
+            calls.append((method, endpoint))
+            if "duckduckgo" in endpoint:
+                raise httpx.TimeoutException("duckduckgo timed out")
+            if endpoint == BING_URL:
+                return bing_html
+            raise AssertionError(f"Unexpected endpoint: {endpoint}")
+
+        monkeypatch.setattr("loom.tools.web_search.httpx.AsyncClient", _FakeAsyncClient)
+        monkeypatch.setattr(
+            "loom.tools.web_search._query_search_endpoint",
+            _fake_query_search_endpoint,
+        )
+
+        first = await _search_ddg("cached query", 5)
+        second = await _search_ddg("cached   query", 5)
+
+        assert first == second
+        assert len([endpoint for _, endpoint in calls if endpoint == BING_URL]) == 1
+
+    @pytest.mark.asyncio
+    async def test_search_skips_duckduckgo_during_cooldown(self, monkeypatch):
+        calls: list[tuple[str, str]] = []
+        bing_html = """
+        <li class="b_algo">
+          <h2><a href="https://example.com/bing-only">Bing Result</a></h2>
+          <div><p>Bing snippet.</p></div>
+        </li>
+        """
+
+        async def _fake_query_search_endpoint(
+            client,
+            method,
+            endpoint,
+            query,
+            *,
+            deadline,
+            referer,
+            provider_name,
+        ):
+            del client, query, deadline, referer, provider_name
+            calls.append((method, endpoint))
+            if endpoint == BING_URL:
+                return bing_html
+            raise AssertionError(f"Unexpected endpoint during cooldown: {endpoint}")
+
+        monkeypatch.setattr("loom.tools.web_search.httpx.AsyncClient", _FakeAsyncClient)
+        monkeypatch.setattr(
+            "loom.tools.web_search._query_search_endpoint",
+            _fake_query_search_endpoint,
+        )
+
+        _record_ddg_cooldown()
+        assert 0 < _ddg_cooldown_remaining() <= DDG_COOLDOWN_SECONDS
+
+        results = await _search_ddg("bing during cooldown", 5)
+
+        assert results
+        assert results[0]["title"] == "Bing Result"
+        assert calls == [("GET", BING_URL)]
+
+    @pytest.mark.asyncio
+    async def test_ddg_rate_limit_enters_cooldown_and_falls_back_to_bing(self, monkeypatch):
+        calls: list[tuple[str, str]] = []
+        bing_html = """
+        <li class="b_algo">
+          <h2><a href="https://example.com/after-cooldown">Recovered Result</a></h2>
+          <div><p>Recovered snippet.</p></div>
+        </li>
+        """
+
+        async def _fake_query_search_endpoint(
+            client,
+            method,
+            endpoint,
+            query,
+            *,
+            deadline,
+            referer,
+            provider_name,
+        ):
+            del client, query, deadline, referer
+            calls.append((method, endpoint))
+            if provider_name == "duckduckgo":
+                web_search_module._record_ddg_cooldown()
+                raise web_search_module.SearchProviderCooldownError(
+                    "DuckDuckGo denied search request (HTTP 429)"
+                )
+            if endpoint == BING_URL:
+                return bing_html
+            raise AssertionError(f"Unexpected endpoint: {endpoint}")
+
+        monkeypatch.setattr("loom.tools.web_search.httpx.AsyncClient", _FakeAsyncClient)
+        monkeypatch.setattr(
+            "loom.tools.web_search._query_search_endpoint",
+            _fake_query_search_endpoint,
+        )
+
+        results = await _search_ddg("rate limited query", 5)
+
+        assert results
+        assert results[0]["title"] == "Recovered Result"
+        assert any("duckduckgo" in endpoint for _, endpoint in calls)
+        assert any(endpoint == BING_URL for _, endpoint in calls)
+        assert _ddg_cooldown_remaining() > 0
