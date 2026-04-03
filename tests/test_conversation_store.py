@@ -635,3 +635,31 @@ class TestConversationStore:
         assert payload["success"] is False
         assert payload["error"] == "Malformed tool result payload"
         assert "not-json" in payload["output"]
+
+    async def test_get_transcript_page_after_seq_uses_durable_journal_rows_only(
+        self, store: ConversationStore,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+
+        await store.append_turn(sid, 1, "user", "covered user")
+        await store.append_turn(sid, 2, "assistant", "covered assistant")
+        await store.append_turn(sid, 3, "user", "fresh uncovered user")
+
+        first_seq = await store.append_chat_event(
+            sid,
+            "user_message",
+            {"text": "covered user"},
+            journal_through_turn=1,
+        )
+        second_seq = await store.append_chat_event(
+            sid,
+            "user_message",
+            {"text": "fresh uncovered user"},
+        )
+
+        rows = await store.get_transcript_page(sid, after_seq=first_seq, limit=10)
+
+        assert [(row["seq"], row["event_type"]) for row in rows] == [
+            (second_seq, "user_message"),
+        ]
+        assert all("turn_number" not in row for row in rows)

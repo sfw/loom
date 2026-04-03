@@ -1327,6 +1327,17 @@ class ConversationStore:
         if session is None:
             return []
 
+        if after_seq > 0 and before_seq is None:
+            # Incremental consumers already have the historical transcript. For
+            # live catch-up, return only durable chat-event rows so a just-sent
+            # turn is not replayed once from the journal and again from
+            # synthesized conversation turns while journal coverage lags.
+            return await self.get_chat_events(
+                session_id,
+                after_seq=max(0, int(after_seq)),
+                limit=safe_limit,
+            )
+
         covered_turn = max(0, int(session.get("chat_journal_through_turn", 0) or 0))
         covered_seq = max(0, int(session.get("chat_journal_through_seq", 0) or 0))
         if covered_turn <= 0 or covered_seq <= 0:
