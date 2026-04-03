@@ -121,6 +121,10 @@ The workspace-first desktop direction uses a local `loomd` sidecar by default,
 not Docker. `loomd` reuses the existing Python engine and exposes a stable
 desktop bootstrap contract:
 
+The current desktop shell is macOS-only for now. The TUI, CLI, API, and MCP
+surfaces remain cross-platform, but desktop runtime ownership and packaging are
+only hardened for macOS at this stage.
+
 - `GET /runtime`
 - `GET /workspaces`
 - `GET /workspaces/{id}/overview`

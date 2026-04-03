@@ -82,3 +82,25 @@ jobs:
         run: uv run python -c "from loom.tools.treesitter import is_available; assert is_available(), 'tree-sitter backend unavailable'"
       - name: Run tree-sitter tests
         run: uv run pytest -q tests/test_treesitter.py
+
+  test-desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10.8.0"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install desktop dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run desktop frontend tests
+        run: pnpm --dir apps/desktop test
+      - name: Build desktop frontend
+        run: pnpm --dir apps/desktop build
+      - name: Run desktop Rust tests
+        working-directory: apps/desktop/src-tauri
+        run: cargo test

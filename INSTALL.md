@@ -77,6 +77,12 @@ roles = ["executor", "planner"]
 
 ## Install Loom
 
+## Desktop Scope
+
+The Tauri desktop shell is currently macOS-only. Loom itself still supports
+CLI/TUI/API workflows on macOS, Linux, and Windows, but the desktop app's
+runtime ownership and packaging are only hardened for macOS right now.
+
 ### From Source (using uv -- recommended)
 
 ```bash

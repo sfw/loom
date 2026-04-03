@@ -188,6 +188,7 @@ async def client(app):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    await app.state.engine.shutdown()
 
 
 def _make_task(
