@@ -11,6 +11,7 @@ import mimetypes
 import os
 import time
 import uuid
+from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -47,6 +48,8 @@ from loom.api.schemas import (
     ProcessInfoResponse,
     ProgressResponse,
     RunArtifactResponse,
+    RunFailureAnalysisResponse,
+    RunFailureRemediationResponse,
     RunSummaryResponse,
     RuntimeStatusResponse,
     SettingsPatchRequest,
@@ -623,6 +626,369 @@ def _trim_snippet(value: object, *, limit: int = 220) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + "..."
+
+
+_FAILURE_REASON_FAMILIES: dict[str, str] = {
+    "auth_preflight_failed": "auth",
+    "blocked_pending_subtasks": "scheduler",
+    "coverage_below_threshold": "contract_failure",
+    "dev_browser_check_failed": "product_verification",
+    "dev_build_failed": "product_verification",
+    "dev_contract_failed": "product_verification",
+    "dev_report_contract_violation": "verification_infra",
+    "dev_test_failed": "product_verification",
+    "dev_verifier_capability_unavailable": "verification_infra",
+    "dev_verifier_timeout": "verification_infra",
+    "forbidden_output_path": "policy",
+    "hard_invariant_failed": "contract_failure",
+    "infra_verifier_error": "verification_infra",
+    "manifest_input_policy_violation": "policy",
+    "parse_inconclusive": "unconfirmed_data",
+    "policy_remediation_required": "policy",
+    "recommendation_unconfirmed": "unconfirmed_data",
+    "unconfirmed_critical_path": "unconfirmed_data",
+    "uncaught_exception": "runtime",
+}
+
+
+def _event_payload_text(value: object, *, limit: int = 320) -> str:
+    return _trim_snippet(value, limit=limit)
+
+
+def _first_nonempty_line(text: object, *, limit: int = 280) -> str:
+    for line in str(text or "").splitlines():
+        compact = _event_payload_text(line, limit=limit)
+        if compact:
+            return compact
+    return ""
+
+
+def _latest_event(
+    events: list[dict[str, Any]],
+    *,
+    event_types: set[str],
+    subtask_id: str = "",
+) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if str(event.get("event_type", "") or "") not in event_types:
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        if subtask_id and str(data.get("subtask_id", "") or "").strip() != subtask_id:
+            continue
+        return event
+    return None
+
+
+def _reason_family(reason_code: str, task_reason: str) -> str:
+    normalized = str(reason_code or "").strip().lower()
+    if normalized:
+        family = _FAILURE_REASON_FAMILIES.get(normalized, "")
+        if family:
+            return family
+        if normalized.startswith("dev_"):
+            return "product_verification"
+    task_reason_normalized = str(task_reason or "").strip().lower()
+    if task_reason_normalized == "blocked_pending_subtasks":
+        return "scheduler"
+    if task_reason_normalized == "uncaught_exception":
+        return "runtime"
+    if task_reason_normalized == "blocking_remediation_unresolved":
+        return "remediation"
+    return "verification"
+
+
+def _plan_label_lookup(task_obj: Task | None) -> dict[str, str]:
+    if task_obj is None or task_obj.plan is None:
+        return {}
+    lookup: dict[str, str] = {}
+    for subtask in task_obj.plan.subtasks:
+        subtask_id = str(getattr(subtask, "id", "") or "").strip()
+        label = str(getattr(subtask, "description", "") or "").strip()
+        if subtask_id:
+            lookup[subtask_id] = label or subtask_id
+    return lookup
+
+
+def _build_tool_failure_detail(
+    failed_tool_events: list[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    if not failed_tool_events:
+        return "", []
+    errors: list[tuple[str, str]] = []
+    for event in failed_tool_events:
+        data = event.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        tool_name = str(data.get("tool", "") or "").strip() or "tool"
+        error = _event_payload_text(data.get("error", ""), limit=220)
+        if error:
+            errors.append((tool_name, error))
+    if not errors:
+        return "", []
+
+    counts = Counter(errors)
+    (tool_name, top_error), top_count = counts.most_common(1)[0]
+    evidence = [
+        f"{tool}: {error}" if count == 1 else f"{tool}: {error} ({count}x)"
+        for (tool, error), count in counts.most_common(2)
+    ]
+    lowered = top_error.lower()
+    if "http 999" in lowered or "anti-bot denied" in lowered:
+        repeat_prefix = (
+            "Repeated attempts"
+            if len(failed_tool_events) > 1 or top_count > 1
+            else "The fetch attempt"
+        )
+        return (
+            f"{repeat_prefix} to read the target site were denied with HTTP 999, "
+            "which usually means the site blocked the requests as automated traffic.",
+            evidence,
+        )
+    if "http 403" in lowered or "forbidden" in lowered:
+        repeat_prefix = (
+            "Repeated attempts"
+            if len(failed_tool_events) > 1 or top_count > 1
+            else "The fetch attempt"
+        )
+        return (
+            f"{repeat_prefix} to read the target site were denied with an access-control response "
+            f"({tool_name}: {top_error}).",
+            evidence,
+        )
+    if len(failed_tool_events) > 1 or top_count > 1:
+        return (
+            f"Repeated tool failures prevented recovery; the most common error was "
+            f"{tool_name}: {top_error}.",
+            evidence,
+        )
+    return (f"The final tool failure was {tool_name}: {top_error}.", evidence)
+
+
+def _build_run_failure_analysis(
+    *,
+    resolved_status: str,
+    task_obj: Task | None,
+    event_rows: list[dict[str, Any]],
+) -> RunFailureAnalysisResponse | None:
+    if str(resolved_status or "").strip().lower() != "failed":
+        return None
+
+    events = [_serialize_run_timeline_row(row) for row in event_rows]
+    if not events:
+        return RunFailureAnalysisResponse(
+            headline="Run failed.",
+            summary=(
+                "The run ended in a failed state, but no persisted failure events "
+                "were available."
+            ),
+            reason_family="runtime",
+            remediation=RunFailureRemediationResponse(),
+        )
+
+    task_failed = _latest_event(events, event_types={"task_failed"}) or {}
+    task_failed_data = (
+        dict(task_failed.get("data", {}))
+        if isinstance(task_failed.get("data"), dict)
+        else {}
+    )
+    telemetry_summary = _latest_event(events, event_types={"telemetry_run_summary"}) or {}
+    telemetry_data = (
+        dict(telemetry_summary.get("data", {}))
+        if isinstance(telemetry_summary.get("data"), dict)
+        else {}
+    )
+    label_lookup = _plan_label_lookup(task_obj)
+
+    failed_subtasks = [
+        str(item or "").strip()
+        for item in (task_failed_data.get("failed_subtasks", []) or [])
+        if str(item or "").strip()
+    ]
+    blocked_subtasks = task_failed_data.get("blocked_subtasks", []) or []
+    blocked_subtask_ids = [
+        str(item.get("subtask_id", "") or "").strip()
+        for item in blocked_subtasks
+        if isinstance(item, dict) and str(item.get("subtask_id", "") or "").strip()
+    ]
+    latest_subtask_failed = _latest_event(events, event_types={"subtask_failed"})
+    latest_subtask_failed_data = (
+        dict(latest_subtask_failed.get("data", {}))
+        if isinstance(latest_subtask_failed and latest_subtask_failed.get("data"), dict)
+        else {}
+    )
+    failing_subtask_id = (
+        (failed_subtasks[-1] if failed_subtasks else "")
+        or (blocked_subtask_ids[0] if blocked_subtask_ids else "")
+        or str(latest_subtask_failed_data.get("subtask_id", "") or "").strip()
+    )
+    failing_subtask_label = label_lookup.get(failing_subtask_id, failing_subtask_id)
+
+    verification_terminal = _latest_event(
+        events,
+        event_types={"verification_failed", "verification_outcome"},
+        subtask_id=failing_subtask_id,
+    ) or {}
+    verification_data = (
+        dict(verification_terminal.get("data", {}))
+        if isinstance(verification_terminal.get("data"), dict)
+        else {}
+    )
+    subtask_failed_event = _latest_event(
+        events,
+        event_types={"subtask_failed"},
+        subtask_id=failing_subtask_id,
+    ) or latest_subtask_failed or {}
+    subtask_failed_data = (
+        dict(subtask_failed_event.get("data", {}))
+        if isinstance(subtask_failed_event.get("data"), dict)
+        else {}
+    )
+
+    primary_reason_code = (
+        str(verification_data.get("reason_code", "") or "").strip()
+        or str(subtask_failed_data.get("reason_code", "") or "").strip()
+        or str(task_failed_data.get("reason", "") or "").strip()
+    )
+    task_reason = str(task_failed_data.get("reason", "") or "").strip()
+    feedback = (
+        _first_nonempty_line(subtask_failed_data.get("feedback", ""), limit=320)
+        or _first_nonempty_line(task_failed_data.get("message", ""), limit=320)
+        or _first_nonempty_line(task_failed_data.get("error", ""), limit=320)
+    )
+
+    failed_tool_events = [
+        event
+        for event in events
+        if str(event.get("event_type", "") or "") == "tool_call_completed"
+        and isinstance(event.get("data"), dict)
+        and not bool(dict(event.get("data", {})).get("success", False))
+        and (
+            not failing_subtask_id
+            or str(dict(event.get("data", {})).get("subtask_id", "") or "").strip()
+            == failing_subtask_id
+        )
+    ]
+    technical_detail, tool_evidence = _build_tool_failure_detail(failed_tool_events)
+
+    verification_reason_counts = telemetry_data.get("verification_reason_counts", {})
+    if not isinstance(verification_reason_counts, dict):
+        verification_reason_counts = {}
+    remediation_counts = telemetry_data.get("remediation_lifecycle_counts", {})
+    if not isinstance(remediation_counts, dict):
+        remediation_counts = {}
+
+    queued_count = int(remediation_counts.get("queued", 0) or 0)
+    attempt_count = int(remediation_counts.get("attempt", 0) or 0)
+    resolved_count = int(remediation_counts.get("resolved", 0) or 0)
+    failed_count = int(remediation_counts.get("failed", 0) or 0)
+    expired_count = int(remediation_counts.get("expired", 0) or 0)
+
+    remediation_attempted = any(
+        count > 0
+        for count in (queued_count, attempt_count, resolved_count, failed_count, expired_count)
+    )
+    why_not_remedied = ""
+    if primary_reason_code == "hard_invariant_failed":
+        why_not_remedied = (
+            "This was treated as a hard invariant verification failure, so Loom did not "
+            "queue follow-up remediation and the run stopped after retries were exhausted."
+        )
+    elif resolved_count > 0:
+        why_not_remedied = (
+            "Remediation recovered some failures, but the final blocking issue "
+            "remained unresolved."
+        )
+    elif queued_count > 0 and not resolved_count:
+        why_not_remedied = (
+            "Follow-up remediation was queued, but it did not resolve the blocking issue "
+            "before the run ended."
+        )
+    elif attempt_count > 0 and not resolved_count:
+        why_not_remedied = "Remediation was attempted, but it never satisfied the verifier."
+    elif task_reason == "blocked_pending_subtasks":
+        why_not_remedied = (
+            "The run stalled with blocked pending subtasks, so Loom had no safe automatic path "
+            "to continue."
+        )
+    elif task_reason == "blocking_remediation_unresolved":
+        why_not_remedied = (
+            "A blocking remediation item remained unresolved, so the run was "
+            "terminated."
+        )
+    elif task_reason == "uncaught_exception":
+        why_not_remedied = "The orchestrator hit an uncaught exception and stopped the run."
+
+    reason_family = _reason_family(primary_reason_code, task_reason)
+    headline = feedback or "The run ended in a failed state."
+    if failing_subtask_label:
+        headline = (
+            f"{failing_subtask_label} failed. {headline}"
+            if feedback and not headline.lower().startswith(failing_subtask_label.lower())
+            else headline
+        )
+
+    summary_parts = [part for part in (feedback, technical_detail, why_not_remedied) if part]
+    summary = " ".join(summary_parts) or "The run failed without a more specific explanation."
+
+    evidence: list[str] = []
+    if failing_subtask_label:
+        evidence.append(f"Failing subtask: {failing_subtask_label}")
+    if primary_reason_code:
+        evidence.append(f"Verifier reason: {primary_reason_code}")
+    if tool_evidence:
+        evidence.extend(tool_evidence[:2])
+    if verification_reason_counts:
+        top_reason, top_count = max(
+            (
+                (str(reason or "").strip(), int(count or 0))
+                for reason, count in verification_reason_counts.items()
+                if str(reason or "").strip()
+            ),
+            key=lambda item: item[1],
+            default=("", 0),
+        )
+        if top_reason:
+            evidence.append(f"Most frequent verifier result: {top_reason} ({top_count})")
+
+    next_actions: list[str] = []
+    summary_lower = summary.lower()
+    if "http 999" in summary_lower or "linkedin" in summary_lower:
+        next_actions = [
+            "Use authenticated or browser-backed fetches for the blocked site.",
+            "Relax the LinkedIn coverage requirement or allow alternate contact channels.",
+        ]
+    elif reason_family == "product_verification":
+        next_actions = [
+            "Inspect the failing verification feedback and rerun after fixing the "
+            "underlying product issue.",
+        ]
+    elif reason_family == "policy":
+        next_actions = [
+            "Adjust the process contract or write scope so the task can satisfy "
+            "policy constraints.",
+        ]
+
+    return RunFailureAnalysisResponse(
+        headline=_event_payload_text(headline, limit=260),
+        summary=_event_payload_text(summary, limit=700),
+        failing_subtask_id=failing_subtask_id,
+        failing_subtask_label=failing_subtask_label,
+        primary_reason_code=primary_reason_code,
+        reason_family=reason_family,
+        technical_detail=_event_payload_text(technical_detail, limit=320),
+        evidence=evidence[:4],
+        next_actions=next_actions[:3],
+        remediation=RunFailureRemediationResponse(
+            attempted=remediation_attempted,
+            queued=queued_count > 0,
+            resolved=resolved_count > 0,
+            failed=failed_count > 0,
+            expired=expired_count > 0,
+            why_not_remedied=_event_payload_text(why_not_remedied, limit=320),
+        ),
+    )
 
 
 def _recent_conversation_search_text(
@@ -2177,6 +2543,7 @@ async def _build_run_summary(
     latest_run: dict[str, Any] | None = None,
     linked_conversations: list[dict[str, Any]] | None = None,
     live_status: str | None = None,
+    failure_analysis: RunFailureAnalysisResponse | None = None,
 ) -> RunSummaryResponse:
     task_id = str(task_row.get("id", "") or "").strip()
     metadata = _json_object(task_row.get("metadata"))
@@ -2217,6 +2584,7 @@ async def _build_run_summary(
             if str(link.get("session_id", "") or "").strip()
         ],
         changed_files_count=0,
+        failure_analysis=failure_analysis,
     )
 
 
@@ -5224,9 +5592,22 @@ async def get_run(request: Request, run_id: str):
             _task_workspace_group_root(task_row),
         )
         workspace_id = str((workspace or {}).get("id", "") or "")
-        summary = await _build_run_summary(engine, workspace_id, task_row)
         latest_run = await engine.database.get_latest_task_run_for_task(run_id)
-        event_rows = await engine.database.query_events(run_id, limit=250)
+        event_rows = await engine.database.query_events(run_id, limit=1000, ascending=True)
+        resolved_status = await _resolve_task_status(engine, task_row)
+        failure_analysis = _build_run_failure_analysis(
+            resolved_status=resolved_status,
+            task_obj=task_obj,
+            event_rows=event_rows,
+        )
+        summary = await _build_run_summary(
+            engine,
+            workspace_id,
+            task_row,
+            latest_run=latest_run,
+            live_status=resolved_status,
+            failure_analysis=failure_analysis,
+        )
 
         # Include plan/subtask data from state manager when available
         plan_data: list[dict[str, Any]] = []

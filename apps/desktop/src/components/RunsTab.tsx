@@ -1453,6 +1453,7 @@ function RunDetailView({
   setActivitySearch,
 }: RunDetailViewProps) {
   const runStatus = String(runDetail.status || "").trim().toLowerCase();
+  const failureAnalysis = runDetail.failure_analysis ?? null;
   const liveAnimationsEnabled = runStatus === "executing" || runStatus === "planning" || runStatus === "running";
   const displayableRunArtifacts = useMemo(
     () => visibleRunArtifacts.filter((artifact) => isDisplayableArtifactPath(artifact.path)),
@@ -1773,6 +1774,72 @@ function RunDetailView({
 
       {/* --- Scrollable body --- */}
       <div className="flex-1 overflow-y-auto px-6 py-5 space-y-8">
+        {runStatus === "failed" && failureAnalysis && (
+          <section className="rounded-2xl border border-red-500/20 bg-red-500/[0.06] p-4">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-xl bg-red-500/10 p-2 text-red-300">
+                <AlertTriangle size={16} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-sm font-semibold text-red-100">Why This Failed</h3>
+                  {failureAnalysis.primary_reason_code && (
+                    <span className="rounded-full border border-red-400/20 bg-red-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-red-200">
+                      {failureAnalysis.primary_reason_code}
+                    </span>
+                  )}
+                  {failureAnalysis.remediation.attempted && (
+                    <span className="rounded-full border border-amber-400/20 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-200">
+                      remediation attempted
+                    </span>
+                  )}
+                </div>
+                {failureAnalysis.headline && (
+                  <p className="mt-2 text-sm leading-6 text-zinc-100">
+                    {failureAnalysis.headline}
+                  </p>
+                )}
+                {failureAnalysis.summary && (
+                  <p className="mt-2 text-xs leading-5 text-zinc-300">
+                    {failureAnalysis.summary}
+                  </p>
+                )}
+                {failureAnalysis.remediation.why_not_remedied && (
+                  <p className="mt-2 text-xs leading-5 text-zinc-400">
+                    {failureAnalysis.remediation.why_not_remedied}
+                  </p>
+                )}
+                {failureAnalysis.evidence.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {failureAnalysis.evidence.map((item) => (
+                      <span
+                        key={item}
+                        className="rounded-full border border-zinc-700/80 bg-zinc-900/70 px-2.5 py-1 text-[11px] text-zinc-300"
+                      >
+                        {item}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {failureAnalysis.next_actions.length > 0 && (
+                  <div className="mt-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+                      Suggested Next Steps
+                    </p>
+                    <ul className="mt-2 space-y-1.5 text-xs leading-5 text-zinc-300">
+                      {failureAnalysis.next_actions.map((item) => (
+                        <li key={item} className="flex items-start gap-2">
+                          <span className="mt-[7px] h-1 w-1 rounded-full bg-zinc-500" />
+                          <span>{item}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
         {/* ============================================================= */}
         {/* Section 1: Plan / Subtasks                                     */}
         {/* ============================================================= */}

@@ -81,6 +81,29 @@ export interface RunSummary {
   process_name: string;
   linked_conversation_ids: string[];
   changed_files_count: number;
+  failure_analysis?: RunFailureAnalysis | null;
+}
+
+export interface RunFailureRemediation {
+  attempted: boolean;
+  queued: boolean;
+  resolved: boolean;
+  failed: boolean;
+  expired: boolean;
+  why_not_remedied: string;
+}
+
+export interface RunFailureAnalysis {
+  headline: string;
+  summary: string;
+  failing_subtask_id: string;
+  failing_subtask_label: string;
+  primary_reason_code: string;
+  reason_family: string;
+  technical_detail: string;
+  evidence: string[];
+  next_actions: string[];
+  remediation: RunFailureRemediation;
 }
 
 export interface WorkspaceOverview {

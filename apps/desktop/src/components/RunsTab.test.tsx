@@ -114,6 +114,49 @@ describe("RunsTab", () => {
     expect(screen.getByText(goal)).not.toHaveClass("truncate");
   });
 
+  it("shows a failure analysis card above the plan for failed runs", () => {
+    mockApp.selectedRunId = "run-abc";
+    mockApp.runDetail = {
+      id: "run-abc",
+      goal: "Investigate delegate contacts",
+      status: "failed",
+      process_name: "ad-hoc",
+      failure_analysis: {
+        headline: "Verification required more LinkedIn coverage than the run could produce.",
+        summary: "Verification required >75% of profiles to have LinkedIn information, but 0% had it. Repeated attempts to fetch profile pages hit HTTP 999.",
+        failing_subtask_id: "discover-contact-channels",
+        failing_subtask_label: "Discover contact channels",
+        primary_reason_code: "hard_invariant_failed",
+        reason_family: "contract_failure",
+        technical_detail: "Repeated attempts to read the target site were denied with HTTP 999.",
+        evidence: [
+          "Failing subtask: Discover contact channels",
+          "Verifier reason: hard_invariant_failed",
+        ],
+        next_actions: [
+          "Use authenticated or browser-backed fetches for the blocked site.",
+        ],
+        remediation: {
+          attempted: true,
+          queued: false,
+          resolved: false,
+          failed: false,
+          expired: false,
+          why_not_remedied: "This was treated as a hard invariant verification failure, so Loom did not queue follow-up remediation.",
+        },
+      },
+      plan_subtasks: [],
+    };
+
+    render(<RunsTab />);
+
+    expect(screen.getByText("Why This Failed")).toBeInTheDocument();
+    expect(screen.getByText(/Verification required more LinkedIn coverage/i)).toBeInTheDocument();
+    expect(screen.getByText(/0% had it/i)).toBeInTheDocument();
+    expect(screen.getByText("hard_invariant_failed")).toBeInTheDocument();
+    expect(screen.getByText(/did not queue follow-up remediation/i)).toBeInTheDocument();
+  });
+
   it("does not mount tool-call payloads until the row is expanded", async () => {
     const user = userEvent.setup();
     mockApp.selectedRunId = "run-abc";

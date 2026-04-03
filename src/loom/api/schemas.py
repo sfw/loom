@@ -293,6 +293,30 @@ class ConversationSummaryResponse(BaseModel):
     linked_run_ids: list[str] = Field(default_factory=list)
 
 
+class RunFailureRemediationResponse(BaseModel):
+    attempted: bool = False
+    queued: bool = False
+    resolved: bool = False
+    failed: bool = False
+    expired: bool = False
+    why_not_remedied: str = ""
+
+
+class RunFailureAnalysisResponse(BaseModel):
+    headline: str = ""
+    summary: str = ""
+    failing_subtask_id: str = ""
+    failing_subtask_label: str = ""
+    primary_reason_code: str = ""
+    reason_family: str = ""
+    technical_detail: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+    remediation: RunFailureRemediationResponse = Field(
+        default_factory=RunFailureRemediationResponse,
+    )
+
+
 class RunSummaryResponse(BaseModel):
     id: str
     workspace_id: str
@@ -305,6 +329,7 @@ class RunSummaryResponse(BaseModel):
     process_name: str = ""
     linked_conversation_ids: list[str] = Field(default_factory=list)
     changed_files_count: int = 0
+    failure_analysis: RunFailureAnalysisResponse | None = None
 
 
 class RunArtifactResponse(BaseModel):

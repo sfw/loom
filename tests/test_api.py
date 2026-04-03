@@ -2926,6 +2926,145 @@ class TestWorkspaceFirstEndpoints:
         assert workspace_settings_patch.json()["overrides"]["layout"]["rail"] == "expanded"
 
     @pytest.mark.asyncio
+    async def test_run_detail_includes_failure_analysis_for_verification_driven_failures(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-failure-analysis-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Run Failure Analysis WS",
+        )
+        assert workspace is not None
+
+        task = Task(
+            id="task-run-failure-analysis-1",
+            goal="Collect delegate contact channels",
+            status=TaskStatus.FAILED,
+            workspace=str(workspace_path),
+            metadata={"process": "ad-hoc"},
+            plan=Plan(subtasks=[
+                Subtask(
+                    id="discover-contact-channels",
+                    description="Discover contact channels",
+                    status=SubtaskStatus.FAILED,
+                ),
+            ]),
+        )
+        state_manager.save(task)
+
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path=str(workspace_path),
+            status="failed",
+            metadata={"process": "ad-hoc"},
+        )
+        await database.insert_task_run(
+            run_id="exec-run-failure-analysis-1",
+            task_id=task.id,
+            status="failed",
+            process_name="ad-hoc",
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-failure-analysis-1",
+            run_id="exec-run-failure-analysis-1",
+            event_type="verification_failed",
+            data={
+                "subtask_id": "discover-contact-channels",
+                "reason_code": "hard_invariant_failed",
+                "outcome": "fail",
+            },
+            sequence=1,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-failure-analysis-1",
+            run_id="exec-run-failure-analysis-1",
+            event_type="tool_call_completed",
+            data={
+                "subtask_id": "discover-contact-channels",
+                "tool": "web_fetch",
+                "success": False,
+                "error": "Anti-bot denied (HTTP 999): https://www.linkedin.com/in/example-1/",
+            },
+            sequence=2,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-failure-analysis-1",
+            run_id="exec-run-failure-analysis-1",
+            event_type="tool_call_completed",
+            data={
+                "subtask_id": "discover-contact-channels",
+                "tool": "web_fetch",
+                "success": False,
+                "error": "Anti-bot denied (HTTP 999): https://www.linkedin.com/in/example-2/",
+            },
+            sequence=3,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-failure-analysis-1",
+            run_id="exec-run-failure-analysis-1",
+            event_type="subtask_failed",
+            data={
+                "subtask_id": "discover-contact-channels",
+                "feedback": (
+                    "Verification required >75% of profiles to have LinkedIn "
+                    "information, but 0% had it."
+                ),
+                "reason_code": "hard_invariant_failed",
+            },
+            sequence=4,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-failure-analysis-1",
+            run_id="exec-run-failure-analysis-1",
+            event_type="telemetry_run_summary",
+            data={
+                "verification_reason_counts": {"hard_invariant_failed": 1},
+                "remediation_lifecycle_counts": {
+                    "queued": 0,
+                    "attempt": 0,
+                    "resolved": 0,
+                    "failed": 0,
+                    "expired": 0,
+                },
+            },
+            sequence=5,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-failure-analysis-1",
+            run_id="exec-run-failure-analysis-1",
+            event_type="task_failed",
+            data={
+                "failed_subtasks": ["discover-contact-channels"],
+                "reason": "subtask_failure",
+            },
+            sequence=6,
+        )
+
+        response = await client.get(f"/runs/{task.id}")
+        assert response.status_code == 200
+        detail = response.json()
+        failure = detail["failure_analysis"]
+        assert failure["failing_subtask_id"] == "discover-contact-channels"
+        assert failure["failing_subtask_label"] == "Discover contact channels"
+        assert failure["primary_reason_code"] == "hard_invariant_failed"
+        assert "0% had it" in failure["summary"]
+        assert "HTTP 999" in failure["summary"]
+        assert "hard invariant verification failure" in failure["remediation"]["why_not_remedied"]
+
+    @pytest.mark.asyncio
     async def test_auto_subfolder_run_stays_grouped_under_parent_workspace(
         self,
         client,
