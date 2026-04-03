@@ -814,7 +814,7 @@ export default function RunsTab() {
     }
     lastLauncherContextRefreshAtRef.current = now;
     void Promise.allSettled([
-      handleRefreshWorkspaceFiles(),
+      handleRefreshWorkspaceFiles({ silent: true }),
       refreshWorkspaceArtifacts(selectedWorkspaceId, { force: true }),
     ]);
   });

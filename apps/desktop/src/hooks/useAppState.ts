@@ -378,7 +378,7 @@ export interface AppActions {
   handleRevealWorkspaceFile: () => Promise<void>;
   handleSaveWorkspaceFile: () => Promise<void>;
   handleResetWorkspaceFileEditor: () => void;
-  handleRefreshWorkspaceFiles: () => Promise<void>;
+  handleRefreshWorkspaceFiles: (options?: { silent?: boolean }) => Promise<void>;
   handleExpandActiveWorkspaceFiles: () => Promise<void>;
   handleExpandRecentWorkspaceFiles: () => Promise<void>;
   toggleWorkspaceDirectory: (path: string) => void;

@@ -304,7 +304,7 @@ describe("RunsTab", () => {
 
     render(<RunsTab />);
 
-    expect(mockApp.handleRefreshWorkspaceFiles.mock.calls.length).toBeGreaterThan(0);
+    expect(mockApp.handleRefreshWorkspaceFiles).toHaveBeenCalledWith({ silent: true });
     expect(mockApp.refreshWorkspaceArtifacts).toHaveBeenLastCalledWith(
       "workspace-1",
       { force: true },
@@ -316,7 +316,7 @@ describe("RunsTab", () => {
     vi.advanceTimersByTime(1001);
     window.dispatchEvent(new Event("focus"));
 
-    expect(mockApp.handleRefreshWorkspaceFiles).toHaveBeenCalledTimes(1);
+    expect(mockApp.handleRefreshWorkspaceFiles).toHaveBeenCalledWith({ silent: true });
     expect(mockApp.refreshWorkspaceArtifacts).toHaveBeenCalledWith(
       "workspace-1",
       { force: true },

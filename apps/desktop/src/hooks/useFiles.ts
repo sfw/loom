@@ -93,7 +93,7 @@ export interface FilesActions {
   handleRevealWorkspaceFile: () => Promise<void>;
   handleSaveWorkspaceFile: () => Promise<void>;
   handleResetWorkspaceFileEditor: () => void;
-  handleRefreshWorkspaceFiles: () => Promise<void>;
+  handleRefreshWorkspaceFiles: (options?: { silent?: boolean }) => Promise<void>;
   handleExpandActiveWorkspaceFiles: () => Promise<void>;
   handleExpandRecentWorkspaceFiles: () => Promise<void>;
   toggleWorkspaceDirectory: (path: string) => void;
@@ -615,13 +615,16 @@ export function useFiles(deps: {
     setError("");
   }
 
-  async function handleRefreshWorkspaceFiles() {
+  async function handleRefreshWorkspaceFiles(options?: { silent?: boolean }) {
     if (!selectedWorkspaceId) {
       return;
     }
+    const silent = options?.silent === true;
     setRefreshingWorkspaceFiles(true);
-    setError("");
-    setNotice("");
+    if (!silent) {
+      setError("");
+      setNotice("");
+    }
     const directories = Array.from(
       new Set(["", ...Object.keys(workspaceFilesByDirectory), ...expandedWorkspaceDirectories]),
     ).sort((left, right) => {
@@ -664,7 +667,7 @@ export function useFiles(deps: {
           if (isNotFoundRequestError(err)) {
             setSelectedWorkspaceFilePath("");
             setWorkspaceFilePreview(null);
-          } else {
+          } else if (!silent) {
             setWorkspaceFilePreview(null);
             setError(err instanceof Error ? err.message : "Failed to load file preview.");
           }
@@ -673,7 +676,9 @@ export function useFiles(deps: {
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to reload workspace files.");
+      if (!silent) {
+        setError(err instanceof Error ? err.message : "Failed to reload workspace files.");
+      }
     } finally {
       setRefreshingWorkspaceFiles(false);
     }

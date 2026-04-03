@@ -197,4 +197,25 @@ describe("useFiles", () => {
     expect(result.current.workspaceFilePreview).toBeNull();
     expect(result.current.workspaceFilesByDirectory[""]).toHaveLength(0);
   });
+
+  it("suppresses global errors during silent background refreshes", async () => {
+    const setError = vi.fn();
+
+    apiMocks.fetchWorkspaceFiles.mockResolvedValueOnce([rootFile]);
+    apiMocks.fetchWorkspaceFiles.mockRejectedValueOnce(
+      new Error("Request timed out after 20000ms"),
+    );
+
+    const { result } = renderHook(() => useFiles(buildDeps({ setError })));
+
+    await waitFor(() => {
+      expect(result.current.workspaceFilesByDirectory[""]).toHaveLength(1);
+    });
+
+    await act(async () => {
+      await result.current.handleRefreshWorkspaceFiles({ silent: true });
+    });
+
+    expect(setError).not.toHaveBeenCalledWith("Request timed out after 20000ms");
+  });
 });
