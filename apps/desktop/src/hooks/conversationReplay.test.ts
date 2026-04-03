@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  appendStreamingThinkingChunk,
   conversationEventKey,
   defaultConversationTitle,
   durableConversationSeq,
@@ -115,6 +116,20 @@ describe("conversation replay helpers", () => {
     expect(isInitialTurnProgressEvent("tool_call_started")).toBe(true);
     expect(isInitialTurnProgressEvent("tool_call_completed")).toBe(true);
     expect(isInitialTurnProgressEvent("user_message")).toBe(false);
+  });
+
+  it("preserves readable paragraph breaks between distinct live feedback chunks", () => {
+    expect(
+      appendStreamingThinkingChunk(
+        "Let me search for blink49 and the Banff festival specifically:",
+        "Let me try a broader search.",
+      ),
+    ).toBe(
+      "Let me search for blink49 and the Banff festival specifically:\n\nLet me try a broader search.",
+    );
+    expect(
+      appendStreamingThinkingChunk("step one", " and step two"),
+    ).toBe("step one and step two");
   });
 
   it("detects older history from either turns or durable event pages", () => {

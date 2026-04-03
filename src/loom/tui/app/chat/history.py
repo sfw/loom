@@ -83,6 +83,9 @@ def render_chat_event(self, event: dict, *, source: str = "unknown") -> bool:
                 markup=self._coerce_bool(payload.get("markup", False)),
             )
             return True
+        if event_type == "assistant_thinking":
+            chat.add_live_feedback(str(payload.get("text", "") or ""))
+            return True
         if event_type in {"tool_call_started", "tool_call_completed"}:
             args = payload.get("args", {})
             if not isinstance(args, dict):

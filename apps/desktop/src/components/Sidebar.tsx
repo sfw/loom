@@ -5,6 +5,7 @@ import {
   useAppSelector,
 } from "@/context/AppContext";
 import { createConversation, patchConversation } from "@/api";
+import loomMark from "@/assets/loom-mark.png";
 import { cn } from "@/lib/utils";
 import { normalizeRunStatus } from "@/runStatus";
 import { formatDate, workspaceTagsFromMetadata, type ViewTab } from "@/utils";
@@ -352,9 +353,11 @@ export default function Sidebar() {
       {/* Brand */}
       <div className="flex items-center justify-between gap-3 px-4 pt-4 pb-2">
         <div className="flex min-w-0 items-center gap-2.5">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#6b7a5e] shadow-[0_0_20px_rgba(138,154,123,0.16)]">
-            <span className="text-xs font-bold text-white leading-none">L</span>
-          </div>
+          <img
+            src={loomMark}
+            alt="Loom logo"
+            className="h-7 w-7 shrink-0 rounded-[10px] object-cover shadow-[0_0_20px_rgba(9,194,231,0.18)]"
+          />
           <span className="truncate text-[15px] font-semibold tracking-tight text-zinc-100">Loom</span>
         </div>
         <div className="shrink-0">

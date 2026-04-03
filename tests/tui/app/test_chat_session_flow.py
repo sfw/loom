@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from loom.cowork.session import CoworkTurn
 from loom.tui.app.chat import history, session, steering, turns
 
 
@@ -43,3 +47,55 @@ def test_steering_and_turn_helpers() -> None:
     assert directive.id == "abc123"
     assert turns.delegate_target_for_tool_call("run_tool", {"name": "read_file"}) == "read_file"
     assert turns.delegate_progress_title("run_tool") == "Delegated progress (run_tool)"
+
+
+@pytest.mark.asyncio
+async def test_run_interaction_renders_live_feedback_chunks() -> None:
+    class FakeSession:
+        persisted_turn_count = 0
+
+        async def send_streaming(self, _message: str):
+            yield ("thinking", "First pass.")
+            yield ("thinking", "Second pass.")
+            yield CoworkTurn(
+                text="Final answer.",
+                tool_calls=[],
+                tokens_used=12,
+                model="test-model",
+            )
+
+    chat = MagicMock()
+    status = SimpleNamespace(state="", total_tokens=0)
+    events_panel = MagicMock()
+
+    def _query_one(selector: str, *_args, **_kwargs):
+        if selector == "#chat-log":
+            return chat
+        if selector == "#status-bar":
+            return status
+        if selector == "#events-panel":
+            return events_panel
+        raise AssertionError(f"Unexpected selector: {selector}")
+
+    app = SimpleNamespace(
+        _session=FakeSession(),
+        _total_tokens=0,
+        query_one=_query_one,
+        _sync_pending_inject_apply_state=AsyncMock(),
+        _append_chat_replay_event=AsyncMock(),
+        _update_files_panel=MagicMock(),
+    )
+
+    await turns.run_interaction(app, "hello")
+
+    chat.add_live_feedback.assert_any_call("First pass.")
+    chat.add_live_feedback.assert_any_call("Second pass.")
+    chat.add_model_text.assert_called_once_with("Final answer.")
+    app._append_chat_replay_event.assert_any_call(
+        "assistant_thinking",
+        {"text": "First pass.", "streaming": True},
+    )
+    app._append_chat_replay_event.assert_any_call(
+        "assistant_thinking",
+        {"text": "Second pass.", "streaming": True},
+    )

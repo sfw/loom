@@ -255,6 +255,8 @@ describe("Sidebar", () => {
 
     render(<Sidebar />);
 
+    expect(screen.getByAltText("Loom logo")).toBeInTheDocument();
+
     const activityBar = screen.getByTestId("desktop-activity-bar");
     expect(activityBar).toHaveAttribute("data-active", "true");
     expect(activityBar).toHaveAttribute("data-mode", "mixed");

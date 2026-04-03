@@ -260,6 +260,39 @@ export function shouldContinuouslySyncConversation(options: {
   );
 }
 
+export function appendStreamingThinkingChunk(
+  current: string,
+  chunk: string,
+): string {
+  const normalizedChunk = String(chunk || "").replace(/\r\n?/g, "\n");
+  if (!normalizedChunk) {
+    return current;
+  }
+  if (!current) {
+    return normalizedChunk;
+  }
+
+  const currentTail = current.slice(-1);
+  const chunkHead = normalizedChunk[0] || "";
+  if (!chunkHead) {
+    return current;
+  }
+
+  if (/\s/.test(currentTail) || /\s/.test(chunkHead)) {
+    return `${current}${normalizedChunk}`;
+  }
+
+  if (/^[,.;:!?)}\]]/.test(normalizedChunk)) {
+    return `${current}${normalizedChunk}`;
+  }
+
+  if (/[a-z0-9]/.test(currentTail) && /[a-z]/.test(chunkHead)) {
+    return `${current}${normalizedChunk}`;
+  }
+
+  return `${current}\n\n${normalizedChunk}`;
+}
+
 export function isConversationStreamHealthy(
   lastActivityAt: number,
   options: {
@@ -1060,7 +1093,10 @@ export function useConversation(deps: {
         nextConversationStreaming = true;
         const text = String(event.payload.text || "");
         if (text) {
-          nextStreamingThinking += text;
+          nextStreamingThinking = appendStreamingThinkingChunk(
+            nextStreamingThinking,
+            text,
+          );
         }
       }
 
