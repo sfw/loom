@@ -1,25 +1,80 @@
-"""Tests for the SearXNG-backed web search tool."""
+"""Tests for the auth-free web search tool."""
 
 from __future__ import annotations
 
-import random
+import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 import loom.tools.web_search as web_search_module
+from loom.state.memory import Database
+from loom.state.search_provider_state import SearchProviderStateStore
 from loom.tools.registry import ToolContext
-from loom.tools.search_mesh import (
-    DrifterDiscovery,
-    SearchEndpoint,
-    SearchEndpointError,
-    SearchMesh,
-    SearchMeshClient,
+from loom.tools.search_backend import (
+    SearchBackend,
+    SearchBackendClient,
+    SearchProvider,
+    SearchProviderError,
     SearchRegistry,
-    SearchResponseValidationError,
-    _normalize_searx_results,
+    _infer_search_locale,
+    _parse_bing_html,
+    _parse_duckduckgo_html,
 )
 from loom.tools.web_search import WebSearchTool
+
+BING_HTML = """
+<html>
+  <body>
+    <ol>
+      <li class="b_algo">
+        <div class="b_tpcn">
+          <a class="tilk" href="https://www.bing.com/ck/a?!&&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9zaXRl">
+            example.com
+          </a>
+        </div>
+        <h2>
+          <a href="https://www.bing.com/ck/a?!&&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9iaW5nLWRvY3M">
+            <strong>Bing Docs</strong>
+          </a>
+        </h2>
+        <div class="b_caption"><p>Primary provider result.</p></div>
+      </li>
+      <li class="b_algo">
+        <h2>
+          <a href="https://www.bing.com/ck/a?!&&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9zZWNvbmQ">
+            Second Result
+          </a>
+        </h2>
+        <div class="b_caption"><p>Second snippet.</p></div>
+      </li>
+    </ol>
+  </body>
+</html>
+"""
+
+DDG_HTML = """
+<html>
+  <body>
+    <div class="results">
+      <div class="result">
+        <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fddg-result">
+          DDG Result
+        </a>
+        <a class="result__snippet">Fallback provider result.</a>
+      </div>
+    </div>
+  </body>
+</html>
+"""
+
+
+@pytest.fixture
+async def db(tmp_path: Path) -> Database:
+    database = Database(tmp_path / "search.db")
+    await database.initialize()
+    return database
 
 
 @pytest.fixture
@@ -32,9 +87,25 @@ def ctx(tmp_path: Path) -> ToolContext:
     return ToolContext(workspace=tmp_path)
 
 
+class _Response:
+    def __init__(self, *, status_code: int = 200, text: str = "") -> None:
+        self.status_code = status_code
+        self.text = text
+        self.request = httpx.Request("GET", "https://example.com/search")
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}",
+                request=self.request,
+                response=httpx.Response(self.status_code, request=self.request),
+            )
+
+
 class _FakeAsyncClient:
-    def __init__(self, *args, **kwargs):
-        del args, kwargs
+    def __init__(self, responses: dict[str, list[object]], call_log: list[dict[str, object]]):
+        self._responses = responses
+        self._call_log = call_log
 
     async def __aenter__(self):
         return self
@@ -43,284 +114,273 @@ class _FakeAsyncClient:
         del exc_type, exc, tb
         return False
 
+    async def get(self, url, *, params=None, headers=None, **kwargs):
+        del kwargs
+        provider = "bing" if "bing.com" in url else "duckduckgo"
+        self._call_log.append(
+            {"provider": provider, "url": url, "params": params or {}, "headers": headers or {}}
+        )
+        queue = self._responses[provider]
+        if not queue:
+            raise AssertionError(f"No queued response for provider {provider}")
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
-class _NoopDiscovery:
-    def __init__(self):
-        self.calls = 0
 
-    async def ensure_fresh(self, client, *, force: bool = False) -> int:
-        del client, force
-        self.calls += 1
-        return 0
+class _DirectHttpClient:
+    def __init__(self, response: _Response):
+        self._response = response
+        self.calls: list[dict[str, object]] = []
 
-
-class _ScenarioMeshClient:
-    def __init__(self, outcomes: dict[str, list[object]]):
-        self._outcomes = outcomes
-        self.calls: list[tuple[str, str, int]] = []
-
-    async def search(self, http_client, endpoint, *, query: str, max_results: int):
-        del http_client
-        self.calls.append((endpoint.url, query, max_results))
-        outcome = self._outcomes[endpoint.url].pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
+    async def get(self, url, *, params=None, headers=None, **kwargs):
+        del kwargs
+        self.calls.append({"url": url, "params": params or {}, "headers": headers or {}})
+        return self._response
 
 
 class TestSearchRegistry:
-    @pytest.mark.asyncio
-    async def test_dynamic_selection_prioritizes_analytics_false_pool(self):
-        registry = SearchRegistry(rng=random.Random(7))
-        await registry.add_endpoint(
-            "https://tracked.example",
-            endpoint_type="dynamic",
-            analytics=True,
-            latency=0.05,
-        )
-        await registry.add_endpoint(
-            "https://private.example",
-            endpoint_type="dynamic",
-            analytics=False,
-            latency=0.9,
-        )
+    def test_registry_orders_duckduckgo_before_bing(self):
+        registry = SearchRegistry()
 
-        selected = await registry.get_next("dynamic")
-
-        assert selected is not None
-        assert selected.url == "https://private.example"
-
-    @pytest.mark.asyncio
-    async def test_circuit_breaker_reopens_as_half_open_after_cooldown(self):
-        now = {"value": 100.0}
-        registry = SearchRegistry(
-            static_endpoints=["https://internal.search.example"],
-            rng=random.Random(11),
-            now_fn=lambda: now["value"],
-        )
-
-        first = await registry.get_next("static")
-        assert first is not None
-        await registry.report_failure(first.url, status_code=429)
-
-        blocked = await registry.get_next("static")
-        assert blocked is None
-
-        now["value"] += first.cooldown_seconds + 1
-        probe = await registry.get_next("static")
-
-        assert probe is not None
-        assert probe.state == "half-open"
-        snapshot = await registry.snapshot("static")
-        assert snapshot[0].probe_in_flight is True
-
-        await registry.report_success(probe.url, latency=0.2)
-        snapshot = await registry.snapshot("static")
-        assert snapshot[0].state == "closed"
-        assert snapshot[0].probe_in_flight is False
-        assert snapshot[0].failure_count == 0
+        assert [provider.name for provider in registry.ordered_providers()] == [
+            "duckduckgo",
+            "bing",
+        ]
 
 
-class TestDrifterDiscovery:
-    def test_parse_instances_filters_to_json_online_fast_google_instances(self):
-        registry = SearchRegistry(rng=random.Random(3))
-        discovery = DrifterDiscovery(registry, rng=random.Random(3))
-        payload = {
-            "instances": {
-                "https://good.example": {
-                    "json": True,
-                    "analytics": False,
-                    "http": {"status_code": 200},
-                    "timing": {
-                        "search": {"success_percentage": 100.0, "all": {"value": 0.8}},
-                        "engines": {"google": {"all": {"value": 1.2}}},
-                    },
-                },
-                "https://slow-google.example": {
-                    "json": True,
-                    "analytics": False,
-                    "http": {"status_code": 200},
-                    "timing": {
-                        "search": {"success_percentage": 100.0, "all": {"value": 0.6}},
-                        "engines": {"google": {"all": {"value": 2.2}}},
-                    },
-                },
-                "https://offline.example": {
-                    "json": True,
-                    "analytics": False,
-                    "http": {"status_code": 503},
-                    "timing": {
-                        "search": {"success_percentage": 100.0, "all": {"value": 0.4}},
-                        "engines": {"google": {"all": {"value": 1.0}}},
-                    },
-                },
-                "https://html-only.example": {
-                    "json": False,
-                    "analytics": False,
-                    "http": {"status_code": 200},
-                    "timing": {
-                        "search": {"success_percentage": 100.0, "all": {"value": 0.4}},
-                        "engines": {"google": {"all": {"value": 1.0}}},
-                    },
-                },
-            }
-        }
-
-        endpoints = discovery.parse_instances(payload)
-
-        assert [endpoint.url for endpoint in endpoints] == ["https://good.example"]
-        assert endpoints[0].analytics is False
-        assert endpoints[0].latency == pytest.approx(0.8)
-
-
-class TestSearchMeshClient:
-    def test_normalize_searx_results_validates_and_limits_results(self):
-        payload = {
-            "results": [
-                {
-                    "title": "Example",
-                    "url": "https://example.com/1",
-                    "content": "First snippet",
-                },
-                {
-                    "title": "Second",
-                    "url": "https://example.com/2",
-                    "content": "Second snippet",
-                },
-            ]
-        }
-
-        results = _normalize_searx_results(payload, max_results=1)
+class TestParsers:
+    def test_parse_bing_html_extracts_ranked_results(self):
+        results = _parse_bing_html(BING_HTML, max_results=1)
 
         assert results == [
             {
-                "title": "Example",
-                "url": "https://example.com/1",
-                "snippet": "First snippet",
+                "title": "Bing Docs",
+                "url": "https://example.com/bing-docs",
+                "snippet": "Primary provider result.",
             }
         ]
 
-    def test_normalize_searx_results_rejects_missing_results_list(self):
-        with pytest.raises(SearchResponseValidationError):
-            _normalize_searx_results({"answer": "nope"}, max_results=5)
+    def test_parse_duckduckgo_html_decodes_redirect_links(self):
+        results = _parse_duckduckgo_html(DDG_HTML, max_results=1)
 
-    @pytest.mark.asyncio
-    async def test_client_raises_validation_error_for_non_json_payload(self, monkeypatch):
-        client = SearchMeshClient(rng=random.Random(5))
-        endpoint = SearchEndpoint(url="https://mesh.example", endpoint_type="dynamic")
-
-        class _Response:
-            status_code = 200
-
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                raise ValueError("not json")
-
-        class _HttpClient:
-            async def get(self, *args, **kwargs):
-                del args, kwargs
-                return _Response()
-
-        with pytest.raises(SearchResponseValidationError):
-            await client.search(_HttpClient(), endpoint, query="loom", max_results=5)
-
-
-class TestSearchMesh:
-    @pytest.mark.asyncio
-    async def test_mesh_falls_back_from_static_to_dynamic_endpoint(self, monkeypatch):
-        registry = SearchRegistry(
-            static_endpoints=["https://internal.search.example"],
-            rng=random.Random(13),
-        )
-        await registry.add_endpoint(
-            "https://public.search.example",
-            endpoint_type="dynamic",
-            analytics=False,
-            latency=0.6,
-        )
-        discovery = _NoopDiscovery()
-        client = _ScenarioMeshClient(
+        assert results == [
             {
-                "https://internal.search.example": [
-                    SearchEndpointError(
-                        "HTTP 429",
-                        endpoint_url="https://internal.search.example",
-                        status_code=429,
-                    )
-                ],
-                "https://public.search.example": [
-                    (
-                        [
-                            {
-                                "title": "Recovered",
-                                "url": "https://example.com/recovered",
-                                "snippet": "Dynamic fallback worked.",
-                            }
-                        ],
-                        0.45,
-                    )
-                ],
+                "title": "DDG Result",
+                "url": "https://example.com/ddg-result",
+                "snippet": "Fallback provider result.",
             }
-        )
-        monkeypatch.setattr("loom.tools.search_mesh.httpx.AsyncClient", _FakeAsyncClient)
-        mesh = SearchMesh(registry=registry, discovery=discovery, client=client)
-
-        results = await mesh.search("loom search mesh", 5)
-
-        assert results[0]["title"] == "Recovered"
-        assert discovery.calls == 1
-        assert [call[0] for call in client.calls] == [
-            "https://internal.search.example",
-            "https://public.search.example",
         ]
-        static_snapshot = await registry.snapshot("static")
-        assert static_snapshot[0].state == "open"
+
+
+class TestProviderStateStore:
+    @pytest.mark.asyncio
+    async def test_store_enforces_interval_then_cooldown(self, db: Database):
+        now = {"value": 100.0}
+        store = SearchProviderStateStore(db, now_fn=lambda: now["value"])
+        policy = SearchProvider(
+            name="duckduckgo",
+            search_url="https://html.duckduckgo.com/html/",
+            priority=100,
+            min_interval_seconds=3.0,
+            cooldown_seconds=10.0,
+        ).to_policy()
+        await store.sync_policies([policy])
+
+        first = await store.request_dispatch(
+            policy,
+            lease_owner="lease-1",
+            lease_ttl_seconds=5.0,
+        )
+        assert first.status == "dispatch_now"
+
+        await store.mark_success("duckduckgo", lease_owner="lease-1")
+        second = await store.request_dispatch(
+            policy,
+            lease_owner="lease-2",
+            lease_ttl_seconds=5.0,
+        )
+        assert second.status == "wait"
+        assert second.retry_at == pytest.approx(103.0)
+
+        now["value"] = 103.1
+        third = await store.request_dispatch(
+            policy,
+            lease_owner="lease-3",
+            lease_ttl_seconds=5.0,
+        )
+        assert third.status == "dispatch_now"
+
+        await store.mark_failure(
+            policy,
+            lease_owner="lease-3",
+            status_code=429,
+            soft_block=False,
+        )
+        blocked = await store.request_dispatch(
+            policy,
+            lease_owner="lease-4",
+            lease_ttl_seconds=5.0,
+        )
+        assert blocked.status == "cooldown"
+        assert blocked.retry_at == pytest.approx(113.1)
+
+
+class TestSearchBackendClient:
+    @pytest.mark.asyncio
+    async def test_client_uses_canada_locale_hints_for_canadian_queries(self):
+        client = SearchBackendClient()
+        provider = SearchProvider(
+            name="bing",
+            search_url="https://www.bing.com/search",
+            priority=50,
+            min_interval_seconds=0.5,
+            cooldown_seconds=120.0,
+        )
+        http_client = _DirectHttpClient(_Response(text=BING_HTML))
+
+        results = await client.search(
+            http_client,
+            provider,
+            query="Canadian technology podcast top 10 2025",
+            max_results=5,
+        )
+
+        assert results[0]["title"] == "Bing Docs"
+        assert http_client.calls[0]["params"]["cc"] == "CA"
+        assert http_client.calls[0]["params"]["mkt"] == "en-CA"
+        assert http_client.calls[0]["headers"]["Accept-Language"].startswith("en-CA")
 
     @pytest.mark.asyncio
-    async def test_mesh_caches_identical_queries(self, monkeypatch):
-        registry = SearchRegistry(rng=random.Random(17))
-        await registry.add_endpoint(
-            "https://public.search.example",
-            endpoint_type="dynamic",
-            analytics=False,
-            latency=0.5,
+    async def test_client_raises_for_anti_bot_page(self):
+        client = SearchBackendClient()
+        provider = SearchProvider(
+            name="bing",
+            search_url="https://www.bing.com/search",
+            priority=50,
+            min_interval_seconds=0.5,
+            cooldown_seconds=120.0,
         )
-        discovery = _NoopDiscovery()
-        client = _ScenarioMeshClient(
-            {
-                "https://public.search.example": [
-                    (
-                        [
-                            {
-                                "title": "Cached",
-                                "url": "https://example.com/cached",
-                                "snippet": "Only fetched once.",
-                            }
-                        ],
-                        0.2,
-                    )
-                ]
-            }
+        http_client = _DirectHttpClient(
+            _Response(text="<html><body>captcha required</body></html>")
         )
-        monkeypatch.setattr("loom.tools.search_mesh.httpx.AsyncClient", _FakeAsyncClient)
-        mesh = SearchMesh(registry=registry, discovery=discovery, client=client)
 
-        first = await mesh.search("cache me", 5)
-        second = await mesh.search("cache   me", 5)
+        with pytest.raises(SearchProviderError):
+            await client.search(http_client, provider, query="loom", max_results=5)
+
+
+class TestSearchBackend:
+    @pytest.mark.asyncio
+    async def test_backend_uses_duckduckgo_first(self, monkeypatch, db: Database):
+        now = {"time": 100.0, "mono": 1000.0}
+        store = SearchProviderStateStore(db, now_fn=lambda: now["time"])
+        registry = SearchRegistry()
+        await store.sync_policies(
+            [provider.to_policy() for provider in registry.ordered_providers()]
+        )
+        backend = SearchBackend(registry=registry, store=store)
+        call_log: list[dict[str, object]] = []
+        responses = {
+            "duckduckgo": [_Response(text=DDG_HTML)],
+            "bing": [_Response(text=BING_HTML)],
+        }
+
+        monkeypatch.setattr(
+            "loom.tools.search_backend.httpx.AsyncClient",
+            lambda: _FakeAsyncClient(responses, call_log),
+        )
+        monkeypatch.setattr("loom.tools.search_backend.time.time", lambda: now["time"])
+        monkeypatch.setattr(
+            "loom.tools.search_backend.time.monotonic",
+            lambda: now["mono"],
+        )
+
+        results = await backend.search(
+            "Blink49 Studios Canada television production",
+            5,
+            runtime_deadline=now["mono"] + 20.0,
+        )
+
+        assert results[0]["title"] == "DDG Result"
+        assert [entry["provider"] for entry in call_log] == ["duckduckgo"]
+
+    @pytest.mark.asyncio
+    async def test_backend_falls_back_to_bing_when_ddg_wait_exceeds_runtime_budget(
+        self,
+        monkeypatch,
+        db: Database,
+    ):
+        now = {"time": 100.0, "mono": 1000.0}
+        store = SearchProviderStateStore(db, now_fn=lambda: now["time"])
+        registry = SearchRegistry()
+        await store.sync_policies(
+            [provider.to_policy() for provider in registry.ordered_providers()]
+        )
+        await db.execute(
+            "UPDATE search_provider_state SET next_allowed_at = ? WHERE provider = ?",
+            (111.0, "duckduckgo"),
+        )
+        backend = SearchBackend(registry=registry, store=store)
+        call_log: list[dict[str, object]] = []
+        responses = {
+            "duckduckgo": [_Response(text=DDG_HTML)],
+            "bing": [_Response(text=BING_HTML)],
+        }
+
+        monkeypatch.setattr(
+            "loom.tools.search_backend.httpx.AsyncClient",
+            lambda: _FakeAsyncClient(responses, call_log),
+        )
+        monkeypatch.setattr("loom.tools.search_backend.time.time", lambda: now["time"])
+        monkeypatch.setattr(
+            "loom.tools.search_backend.time.monotonic",
+            lambda: now["mono"],
+        )
+
+        results = await backend.search(
+            "banana pancakes recipe",
+            5,
+            runtime_deadline=now["mono"] + 8.0,
+        )
+
+        assert results[0]["title"] == "Bing Docs"
+        assert [entry["provider"] for entry in call_log] == ["bing"]
+
+    @pytest.mark.asyncio
+    async def test_backend_caches_identical_queries(self, monkeypatch, db: Database):
+        store = SearchProviderStateStore(db)
+        registry = SearchRegistry()
+        await store.sync_policies(
+            [provider.to_policy() for provider in registry.ordered_providers()]
+        )
+        backend = SearchBackend(registry=registry, store=store)
+        call_log: list[dict[str, object]] = []
+        responses = {
+            "duckduckgo": [_Response(text=DDG_HTML)],
+            "bing": [_Response(text=BING_HTML)],
+        }
+
+        monkeypatch.setattr(
+            "loom.tools.search_backend.httpx.AsyncClient",
+            lambda: _FakeAsyncClient(responses, call_log),
+        )
+
+        first = await backend.search("cache me", 5, runtime_deadline=time.monotonic() + 20.0)
+        second = await backend.search("cache   me", 5, runtime_deadline=time.monotonic() + 20.0)
 
         assert first == second
-        assert len(client.calls) == 1
+        assert len(call_log) == 1
 
 
 class TestWebSearchTool:
     @pytest.fixture(autouse=True)
-    def _reset_mesh(self):
-        previous = web_search_module._SEARCH_MESH
-        web_search_module._SEARCH_MESH = None
+    def _reset_backend(self):
+        previous = dict(web_search_module._SEARCH_BACKENDS)
+        web_search_module._SEARCH_BACKENDS.clear()
         yield
-        web_search_module._SEARCH_MESH = previous
+        web_search_module._SEARCH_BACKENDS.clear()
+        web_search_module._SEARCH_BACKENDS.update(previous)
 
     async def test_empty_query(self, tool, ctx):
         result = await tool.execute({"query": ""}, ctx)
@@ -336,12 +396,18 @@ class TestWebSearchTool:
     def test_timeout(self, tool):
         assert tool.timeout_seconds == 30
 
+    def test_infer_search_locale_defaults_to_us(self):
+        locale = _infer_search_locale("python httpx documentation")
+        assert locale.country_code == "US"
+        assert locale.bing_market == "en-US"
+
     @pytest.mark.asyncio
-    async def test_tool_formats_mesh_results(self, tool, ctx, monkeypatch):
-        class _Mesh:
-            async def search(self, query: str, max_results: int):
+    async def test_tool_formats_backend_results(self, tool, ctx, monkeypatch):
+        class _Backend:
+            async def search(self, query: str, max_results: int, *, runtime_deadline: float):
                 assert query == "loom"
                 assert max_results == 2
+                assert runtime_deadline > 0
                 return [
                     {
                         "title": "Loom Docs",
@@ -355,7 +421,10 @@ class TestWebSearchTool:
                     },
                 ]
 
-        monkeypatch.setattr("loom.tools.web_search.get_search_mesh", lambda: _Mesh())
+        monkeypatch.setattr(
+            "loom.tools.web_search.get_search_backend",
+            lambda config=None: _Backend(),
+        )
 
         result = await tool.execute({"query": "loom", "max_results": 2}, ctx)
 

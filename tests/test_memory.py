@@ -38,6 +38,7 @@ class TestDatabase:
         assert "memory_entries" in table_names
         assert "events" in table_names
         assert "learned_patterns" in table_names
+        assert "search_provider_state" in table_names
 
     async def test_initialize_idempotent(self, db: Database):
         # Calling initialize again should not error
@@ -341,6 +342,119 @@ class TestDatabase:
         assert "session_state_through_turn" in session_columns
         assert "chat_journal_through_turn" in session_columns
         assert "chat_journal_through_seq" in session_columns
+
+    async def test_initialize_upgrades_pre_search_provider_state_fixture(self, tmp_path: Path):
+        db_path = tmp_path / "pre-search-provider-state.db"
+        prior_steps = MIGRATIONS[:5]
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    goal TEXT NOT NULL,
+                    context TEXT,
+                    workspace_path TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    plan TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    state_snapshot_updated_at TEXT,
+                    completed_at TEXT,
+                    approval_mode TEXT NOT NULL DEFAULT 'auto',
+                    callback_url TEXT,
+                    metadata TEXT
+                );
+                CREATE TABLE workspaces (
+                    id TEXT PRIMARY KEY,
+                    canonical_path TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    workspace_type TEXT NOT NULL DEFAULT 'local',
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    last_opened_at TEXT,
+                    is_archived INTEGER NOT NULL DEFAULT 0,
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE workspace_settings (
+                    workspace_id TEXT PRIMARY KEY,
+                    settings_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE cowork_sessions (
+                    id TEXT PRIMARY KEY,
+                    workspace_path TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    system_prompt TEXT,
+                    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_active_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    total_tokens INTEGER DEFAULT 0,
+                    turn_count INTEGER DEFAULT 0,
+                    session_state TEXT,
+                    session_state_through_turn INTEGER NOT NULL DEFAULT 0,
+                    chat_journal_through_turn INTEGER NOT NULL DEFAULT 0,
+                    chat_journal_through_seq INTEGER NOT NULL DEFAULT 0,
+                    is_active INTEGER DEFAULT 1
+                );
+                CREATE TABLE conversation_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_number INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT,
+                    tool_calls TEXT,
+                    tool_call_id TEXT,
+                    tool_name TEXT,
+                    token_count INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE cowork_chat_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE conversation_run_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    link_type TEXT NOT NULL DEFAULT 'origin',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE schema_migrations (
+                    id TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    checksum TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+            for step in prior_steps:
+                await conn.execute(
+                    """INSERT INTO schema_migrations (id, applied_at, duration_ms, checksum, notes)
+                       VALUES (?, datetime('now'), 1, ?, 'legacy bootstrap')""",
+                    (step.id, step.checksum),
+                )
+            await conn.commit()
+
+        db = Database(db_path)
+        await db.initialize()
+
+        async with aiosqlite.connect(db_path) as conn:
+            search_columns = {
+                row[1]
+                for row in await (
+                    await conn.execute("PRAGMA table_info(search_provider_state)")
+                ).fetchall()
+            }
+
+        assert "provider" in search_columns
+        assert "next_allowed_at" in search_columns
+        assert "lease_expires_at" in search_columns
 
     async def test_initialize_rolls_back_on_failed_migration(self, tmp_path: Path, monkeypatch):
         db_path = tmp_path / "rollback.db"

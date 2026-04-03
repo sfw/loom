@@ -8,6 +8,7 @@ from loom.state.migrations.runner import MigrationStep
 from loom.state.migrations.steps import (
     data_authority_unification,
     events_v2,
+    search_provider_state_v1,
     task_questions,
     validity_lineage,
     workspaces_v1,
@@ -53,5 +54,12 @@ MIGRATIONS: tuple[MigrationStep, ...] = (
         checksum=_checksum("20260402_005_data_authority_unification/data_authority_unification"),
         apply=data_authority_unification.apply,
         verify=data_authority_unification.verify,
+    ),
+    MigrationStep(
+        id="20260403_006_search_provider_state_v1",
+        description="Add authoritative auth-free search provider pacing state table.",
+        checksum=_checksum("20260403_006_search_provider_state_v1/search_provider_state_v1"),
+        apply=search_provider_state_v1.apply,
+        verify=search_provider_state_v1.verify,
     ),
 )

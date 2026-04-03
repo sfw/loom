@@ -6,6 +6,8 @@ This changelog is generated directly from git commit history (non-merge commits)
 
 ## [Unreleased]
 
+- Add DB migration `20260403_006_search_provider_state_v1` for authoritative auth-free search provider pacing/cooldown state
+- Refactor `web_search` around shared SQLite-backed provider authority: `DuckDuckGo` is now the primary auth-free provider, provider pacing is coordinated across Loom runs, and DDG waits are skipped when they would violate the tool runtime budget
 - Unify task/cowork data authority boundaries: canonical task snapshots now gate run-control writes, cowork semantics come from `conversation_turns`, transcript replay is journal-coverage-aware, and cowork session checkpoints record the turn boundary they cover
 - Add DB migration `20260402_005_data_authority_unification` for task snapshot freshness plus cowork checkpoint/journal coverage metadata
 - Tighten cowork projection discipline: session checkpoints now derive counters from committed turns, non-semantic session metadata patches no longer rewrite checkpoint state, and `loom db doctor` warns on uncovered legacy transcript journals

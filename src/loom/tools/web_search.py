@@ -1,33 +1,37 @@
-"""Web search tool backed by the Search Mesh orchestrator."""
+"""Web search tool backed by auth-free search providers."""
 
 from __future__ import annotations
 
-import os
+import time
+from pathlib import Path
 
 import httpx
 
+from loom.config import Config, load_config
 from loom.tools.registry import Tool, ToolContext, ToolResult
-from loom.tools.search_mesh import (
+from loom.tools.search_backend import (
     DEFAULT_MAX_RESULTS,
     MAX_RESULTS,
-    DrifterDiscovery,
-    SearchMesh,
-    SearchMeshClient,
-    SearchMeshError,
+    SearchBackend,
+    SearchBackendClient,
+    SearchBackendError,
     SearchRegistry,
 )
 
-_SEARCH_MESH: SearchMesh | None = None
+_SEARCH_BACKENDS: dict[str, SearchBackend] = {}
 
 
 class WebSearchTool(Tool):
-    """Search the internet using the SearXNG search mesh."""
+    """Search the internet using auth-free search providers."""
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._config = config
 
     name = "web_search"
     description = (
         "Search the internet for information. Returns titles, URLs, and "
-        "snippets from search results. Uses a resilient SearXNG search mesh "
-        "with static and dynamically discovered endpoints."
+        "snippets from search results. Uses Bing HTML first and falls back "
+        "to DuckDuckGo HTML with request throttling and caching."
     )
     parameters = {
         "type": "object",
@@ -64,10 +68,14 @@ class WebSearchTool(Tool):
         max_results = max(1, min(max_results, MAX_RESULTS))
 
         try:
-            results = await get_search_mesh().search(query, max_results)
+            results = await get_search_backend(self._config).search(
+                query,
+                max_results,
+                runtime_deadline=time.monotonic() + float(self.timeout_seconds),
+            )
         except httpx.TimeoutException:
             return ToolResult.fail("Search timed out.")
-        except SearchMeshError as e:
+        except SearchBackendError as e:
             return ToolResult.fail(f"Search error: {e}")
         except Exception as e:
             return ToolResult.fail(f"Search error: {e}")
@@ -94,22 +102,22 @@ class WebSearchTool(Tool):
         )
 
 
-def get_search_mesh() -> SearchMesh:
-    global _SEARCH_MESH
-    if _SEARCH_MESH is None:
-        _SEARCH_MESH = _build_search_mesh_from_env()
-    return _SEARCH_MESH
+def get_search_backend(config: Config | None = None) -> SearchBackend:
+    resolved = config or load_config()
+    db_path = str(resolved.database_path)
+    backend = _SEARCH_BACKENDS.get(db_path)
+    if backend is not None:
+        return backend
+    backend = _build_search_backend(resolved.database_path)
+    _SEARCH_BACKENDS[db_path] = backend
+    return backend
 
 
-def _build_search_mesh_from_env() -> SearchMesh:
-    registry = SearchRegistry(static_endpoints=_read_static_endpoint_env())
-    discovery = DrifterDiscovery(registry)
-    client = SearchMeshClient()
-    return SearchMesh(registry=registry, discovery=discovery, client=client)
-
-
-def _read_static_endpoint_env() -> list[str]:
-    raw = os.environ.get("LOOM_SEARCH_STATIC_ENDPOINTS", "").strip()
-    if not raw:
-        return []
-    return [item.strip() for item in raw.split(",") if item.strip()]
+def _build_search_backend(database_path: str | Path) -> SearchBackend:
+    registry = SearchRegistry()
+    client = SearchBackendClient()
+    return SearchBackend(
+        registry=registry,
+        client=client,
+        database_path=str(database_path),
+    )

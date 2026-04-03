@@ -101,6 +101,29 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
 );
 
+CREATE TABLE IF NOT EXISTS search_provider_state (
+    provider TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 0,
+    min_interval_seconds REAL NOT NULL DEFAULT 0,
+    next_allowed_at REAL NOT NULL DEFAULT 0,
+    cooldown_until REAL NOT NULL DEFAULT 0,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at REAL NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    soft_block_count INTEGER NOT NULL DEFAULT 0,
+    last_status_code INTEGER,
+    last_started_at REAL NOT NULL DEFAULT 0,
+    last_finished_at REAL NOT NULL DEFAULT 0,
+    last_success_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_provider_enabled_priority
+    ON search_provider_state(enabled, priority DESC, provider);
+CREATE INDEX IF NOT EXISTS idx_search_provider_retry_windows
+    ON search_provider_state(cooldown_until, next_allowed_at, lease_expires_at);
+
 -- Cowork sessions
 CREATE TABLE IF NOT EXISTS cowork_sessions (
     id TEXT PRIMARY KEY,

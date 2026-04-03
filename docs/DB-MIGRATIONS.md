@@ -27,12 +27,14 @@ Current desktop/workspace-first tables added through migrations include:
 - `workspaces`
 - `workspace_settings`
 - `conversation_run_links`
+- `search_provider_state`
 
 Recent authority/freshness metadata added through migrations includes:
 
 - `tasks.state_snapshot_updated_at` for mirrored task-row freshness
 - `cowork_sessions.session_state_through_turn` for checkpoint trust boundaries
 - `cowork_sessions.chat_journal_through_turn` / `chat_journal_through_seq` for transcript coverage
+- `search_provider_state.next_allowed_at` / `cooldown_until` / `lease_expires_at` for auth-free web search pacing authority
 
 `schema_migrations` stores:
 - `id`
@@ -80,6 +82,11 @@ database deletion or clean-state rebuilds.
 Doctor warnings now also flag cowork sessions that still have legacy chat-journal rows
 without explicit coverage metadata, so operators can distinguish "schema is valid" from
 "all projections are fully covered".
+
+Auth-free web search provider pacing now also relies on the authoritative
+`search_provider_state` table rather than process-local cooldown state. When the
+search backend is upgraded, existing DBs keep their data and gain shared
+provider pacing metadata instead of requiring any manual reset.
 
 ## Required Workflow for Schema Changes
 
