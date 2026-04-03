@@ -207,6 +207,52 @@ class TestConversationStore:
         await store.append_turn(sid, 2, "assistant", "Hi")
         assert await store.get_turn_count(sid) == 2
 
+    async def test_append_chat_event_waits_for_inflight_write_commit(
+        self,
+        store: ConversationStore,
+        db: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        write_db = await db._get_write_db()
+        original_commit = write_db.commit
+        first_commit_started = asyncio.Event()
+        allow_first_commit = asyncio.Event()
+        commit_calls = 0
+
+        async def gated_commit():
+            nonlocal commit_calls
+            commit_calls += 1
+            if commit_calls == 1:
+                first_commit_started.set()
+                await asyncio.wait_for(allow_first_commit.wait(), timeout=1.0)
+            return await original_commit()
+
+        monkeypatch.setattr(write_db, "commit", gated_commit)
+
+        append_turn_task = asyncio.create_task(
+            store.append_turn(sid, 1, "user", "Hello"),
+        )
+        await asyncio.wait_for(first_commit_started.wait(), timeout=1.0)
+
+        append_event_task = asyncio.create_task(
+            store.append_chat_event(sid, "assistant_text", {"text": "Hi there"}),
+        )
+        await asyncio.sleep(0)
+        allow_first_commit.set()
+
+        await asyncio.wait_for(append_turn_task, timeout=1.0)
+        seq = await asyncio.wait_for(append_event_task, timeout=1.0)
+
+        turns = await store.get_turns(sid)
+        events = await store.get_chat_events(sid)
+        assert len(turns) == 1
+        assert turns[0]["role"] == "user"
+        assert seq == 1
+        assert len(events) == 1
+        assert events[0]["event_type"] == "assistant_text"
+        assert events[0]["payload"]["text"] == "Hi there"
+
     async def test_link_run_round_trip(self, store: ConversationStore, db: Database):
         sid = await store.create_session(workspace="/tmp", model_name="m")
         await db.insert_task(

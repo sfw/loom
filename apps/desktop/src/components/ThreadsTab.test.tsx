@@ -460,6 +460,72 @@ describe("ThreadsTab", () => {
     expect(screen.getByText("ripgrep_search")).toBeInTheDocument();
   });
 
+  it("prefers the settled persisted transcript when live replay would merge repeated user turns", () => {
+    mockApp.visibleConversationEvents = [
+      makeEvent(1, "user_message", { text: "tell me again" }),
+      makeEvent(2, "user_message", { text: "tell me again" }),
+      makeEvent(3, "assistant_text", { text: "Based on my research, here's the easiest" }),
+      makeEvent(4, "turn_separator", { tokens: 42, tool_count: 0 }),
+    ];
+    mockApp.visibleConversationMessages = [
+      {
+        id: 1,
+        session_id: "conversation-1",
+        turn_number: 1,
+        role: "user",
+        content: "tell me again",
+        tool_calls: [],
+        tool_call_id: null,
+        tool_name: null,
+        token_count: 3,
+        created_at: "2026-03-27T00:00:00Z",
+      },
+      {
+        id: 2,
+        session_id: "conversation-1",
+        turn_number: 2,
+        role: "assistant",
+        content: "Earlier answer",
+        tool_calls: [],
+        tool_call_id: null,
+        tool_name: null,
+        token_count: 2,
+        created_at: "2026-03-27T00:00:01Z",
+      },
+      {
+        id: 3,
+        session_id: "conversation-1",
+        turn_number: 3,
+        role: "user",
+        content: "tell me again",
+        tool_calls: [],
+        tool_call_id: null,
+        tool_name: null,
+        token_count: 3,
+        created_at: "2026-03-27T00:00:02Z",
+      },
+      {
+        id: 4,
+        session_id: "conversation-1",
+        turn_number: 4,
+        role: "assistant",
+        content: "Based on my research, here's the easiest way to get a meeting with Blink49 at Banff.",
+        tool_calls: [],
+        tool_call_id: null,
+        tool_name: null,
+        token_count: 12,
+        created_at: "2026-03-27T00:00:03Z",
+      },
+    ];
+
+    render(<ThreadsTab />);
+
+    expect(screen.queryByText("tell me againtell me again")).not.toBeInTheDocument();
+    expect(screen.getAllByText("tell me again")).toHaveLength(2);
+    expect(screen.getByText(/Based on my research, here's the easiest way/)).toBeInTheDocument();
+    expect(screen.getByText("Earlier answer")).toBeInTheDocument();
+  });
+
   it("keeps showing the live settled turn until persisted messages catch up", () => {
     mockApp.visibleConversationEvents = [
       makeEvent(1, "user_message", { text: "hello" }),
@@ -615,6 +681,35 @@ describe("ThreadsTab", () => {
     expect(screen.getByText("Live")).toBeInTheDocument();
     expect(screen.getByText("Working through the numbers now")).toBeInTheDocument();
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
+  });
+
+  it("renders live feedback in a bounded scroll panel with preserved paragraph breaks", () => {
+    mockApp.conversationStatus = {
+      conversation_id: "conversation-1",
+      processing: true,
+    };
+    mockApp.conversationStreaming = true;
+    mockApp.conversationIsProcessing = true;
+    mockApp.conversationPhaseLabel = "Running";
+    mockApp.visibleConversationEvents = [
+      makeEvent(1, "user_message", { text: "hello" }),
+    ];
+    mockApp.streamingThinking = [
+      "Let me search for blink49 and the Banff festival specifically:",
+      "",
+      "Let me try a broader search.",
+    ].join("\n");
+    mockApp.streamingText = "Working through the numbers now";
+
+    const { container } = render(<ThreadsTab />);
+
+    expect(screen.getByText("Live Feedback")).toBeInTheDocument();
+    expect(screen.getByText("Let me search for blink49 and the Banff festival specifically:")).toBeInTheDocument();
+    expect(screen.getByText("Let me try a broader search.")).toBeInTheDocument();
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    expect(screen.getByText("Working through the numbers now")).toBeInTheDocument();
+    expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
+    expect(container.querySelector(".max-h-52.overflow-y-auto")).not.toBeNull();
   });
 
   it("renders optimistic outgoing user bubbles immediately with a sending state", () => {

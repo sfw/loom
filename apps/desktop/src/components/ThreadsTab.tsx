@@ -31,6 +31,7 @@ import {
   buildConversationTimelineItems,
   buildConversationTimelineWindow,
   canUseDeferredConversationTranscript,
+  historicalConversationTimelineCoversLatestLiveAssistant,
   historicalConversationTimelineCoversLiveTail,
   estimateConversationTimelineItemHeight,
   shouldDeferConversationTranscript,
@@ -102,6 +103,45 @@ function ThinkingIndicator({
         {live && (
           <span className="text-[10px] text-zinc-700/80 tabular-nums">{formatElapsed(elapsed)}</span>
         )}
+      </div>
+    </div>
+  );
+}
+
+function LiveFeedbackPanel({
+  text,
+  markdownComponents,
+}: {
+  text: string;
+  markdownComponents: Parameters<typeof Markdown>[0]["components"];
+}) {
+  return (
+    <div className="rounded-xl border border-[#8a9a7b]/20 bg-[#11150f] px-4 py-3 shadow-[inset_0_1px_0_rgba(163,179,150,0.06)]">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="inline-flex items-center gap-2 rounded-full border border-[#8a9a7b]/25 bg-[#8a9a7b]/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#a3b396]">
+          <span className="h-1.5 w-1.5 rounded-full bg-[#a3b396] animate-pulse" />
+          Live Feedback
+        </div>
+        <span className="text-[10px] text-zinc-500">Streaming</span>
+      </div>
+      <div className="max-h-52 overflow-y-auto pr-1">
+        <div className={cn(
+          "prose prose-invert prose-sm max-w-none",
+          "prose-p:my-2 prose-p:leading-relaxed",
+          "prose-headings:mb-2 prose-headings:mt-3 prose-headings:font-semibold prose-headings:text-zinc-200",
+          "prose-h1:text-lg prose-h2:text-base prose-h3:text-sm",
+          "prose-code:rounded prose-code:bg-zinc-800 prose-code:px-1 prose-code:py-0.5 prose-code:text-xs prose-code:text-[#bec8b4] prose-code:before:content-none prose-code:after:content-none",
+          "prose-pre:rounded-lg prose-pre:border prose-pre:border-zinc-800 prose-pre:bg-zinc-900 prose-pre:text-xs",
+          "prose-a:text-[#a3b396] prose-a:no-underline hover:prose-a:underline",
+          "prose-strong:text-zinc-200 prose-em:text-zinc-300",
+          "prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5",
+          "prose-blockquote:border-[#8a9a7b]/30 prose-blockquote:text-zinc-400",
+          "prose-hr:border-zinc-800",
+          "prose-th:text-zinc-300 prose-td:text-zinc-400",
+          "text-[13px] leading-6 text-zinc-300",
+        )}>
+          <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{text}</Markdown>
+        </div>
       </div>
     </div>
   );
@@ -438,9 +478,15 @@ export default function ThreadsTab() {
       historicalTimelineItems,
     );
   }, [historicalTimelineItems, timelineItems]);
+  const historicalAssistantReady = useMemo(() => (
+    historicalConversationTimelineCoversLatestLiveAssistant(
+      timelineItems,
+      historicalTimelineItems,
+    )
+  ), [historicalTimelineItems, timelineItems]);
   const prefersHistoricalTranscript = !conversationIsProcessing
     && !conversationStreaming
-    && historicalTimelineReady
+    && (historicalTimelineReady || historicalAssistantReady)
     && transcriptSourceMessages.length > 0;
   const transcriptTimelineItems = prefersHistoricalTranscript
     ? (historicalTimelineItems.length > 0 ? historicalTimelineItems : timelineItems)
@@ -458,6 +504,10 @@ export default function ThreadsTab() {
     [archiveDisabled, archivedTimelineVisibleCount, transcriptTimelineItems],
   );
   const latestRenderedTimelineItem = renderedTimelineItems[renderedTimelineItems.length - 1];
+  const showLiveFeedback = Boolean(
+    conversationIsProcessing
+    && streamingThinking.trim(),
+  );
   const showLiveAssistantDraft = Boolean(
     conversationIsProcessing
     && streamingText.trim()
@@ -1074,7 +1124,14 @@ export default function ThreadsTab() {
         ))}
 
         {/* ===== Live thinking placeholder ===== */}
-        {conversationIsProcessing && !showLiveAssistantDraft && (
+        {showLiveFeedback && (
+          <LiveFeedbackPanel
+            text={streamingThinking}
+            markdownComponents={markdownComponents}
+          />
+        )}
+
+        {conversationIsProcessing && !showLiveFeedback && !showLiveAssistantDraft && (
           <div className="space-y-2">
             <ThinkingIndicator />
           </div>

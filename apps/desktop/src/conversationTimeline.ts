@@ -268,6 +268,7 @@ function appendConversationTimelineItem(
     const previous = items[items.length - 1];
     if (
       previous?.kind === "text"
+      && role === "assistant"
       && previous.role === role
       && previous.deliveryState === deliveryState
     ) {
@@ -621,6 +622,32 @@ export function historicalConversationTimelineCoversLiveTail(
   }
 
   return true;
+}
+
+export function historicalConversationTimelineCoversLatestLiveAssistant(
+  liveItems: ConversationTimelineItem[],
+  historicalItems: ConversationTimelineItem[],
+): boolean {
+  const latestLiveAssistant = [...liveItems]
+    .reverse()
+    .find((item) => item.kind === "text" && item.role === "assistant");
+  const latestHistoricalAssistant = [...historicalItems]
+    .reverse()
+    .find((item) => item.kind === "text" && item.role === "assistant");
+
+  if (
+    latestLiveAssistant?.kind !== "text"
+    || latestHistoricalAssistant?.kind !== "text"
+  ) {
+    return false;
+  }
+
+  const liveText = normalizeConversationText(latestLiveAssistant.text);
+  const historicalText = normalizeConversationText(latestHistoricalAssistant.text);
+  if (!liveText || !historicalText) {
+    return false;
+  }
+  return historicalText.includes(liveText);
 }
 
 export function estimateConversationTimelineItemHeight(

@@ -334,53 +334,61 @@ class Database:
         """Return lightweight connection/query counters for perf diagnostics."""
         return dict(self._stats)
 
-    async def execute(self, sql: str, params: tuple = ()) -> None:
-        """Execute a write query."""
+    async def _run_locked_write(
+        self,
+        operation,
+        *,
+        row_count: int,
+        batch: bool = False,
+    ) -> object:
+        """Serialize writes on the shared write connection and commit once."""
         db = await self._get_write_db()
         started = time.perf_counter()
-        await db.execute(sql, params)
-        await db.commit()
+        async with self._write_tx_lock:
+            result = await operation(db)
+            await db.commit()
         self._record_write_stats(
-            row_count=1,
+            row_count=row_count,
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            batch=batch,
+        )
+        return result
+
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        """Execute a write query."""
+        await self._run_locked_write(
+            lambda db: db.execute(sql, params),
+            row_count=1,
         )
 
     async def execute_returning_id(self, sql: str, params: tuple = ()) -> int:
         """Execute an insert and return the lastrowid."""
-        db = await self._get_write_db()
-        started = time.perf_counter()
-        cursor = await db.execute(sql, params)
-        await db.commit()
-        self._record_write_stats(
+        cursor = await self._run_locked_write(
+            lambda db: db.execute(sql, params),
             row_count=1,
-            elapsed_ms=(time.perf_counter() - started) * 1000.0,
         )
         return cursor.lastrowid
 
     async def execute_rowcount(self, sql: str, params: tuple = ()) -> int:
         """Execute a write query and return the affected row count."""
-        db = await self._get_write_db()
-        started = time.perf_counter()
-        cursor = await db.execute(sql, params)
-        await db.commit()
-        self._record_write_stats(
+        cursor = await self._run_locked_write(
+            lambda db: db.execute(sql, params),
             row_count=1,
-            elapsed_ms=(time.perf_counter() - started) * 1000.0,
         )
         return int(cursor.rowcount or 0)
 
     async def execute_many_returning_ids(self, sql: str, params_list: list[tuple]) -> list[int]:
         """Execute multiple inserts in a single transaction and return lastrowids."""
-        db = await self._get_write_db()
-        started = time.perf_counter()
-        ids = []
-        for params in params_list:
-            cursor = await db.execute(sql, params)
-            ids.append(cursor.lastrowid)
-        await db.commit()
-        self._record_write_stats(
+        async def _operation(db: aiosqlite.Connection) -> list[int]:
+            ids = []
+            for params in params_list:
+                cursor = await db.execute(sql, params)
+                ids.append(cursor.lastrowid)
+            return ids
+
+        ids = await self._run_locked_write(
+            _operation,
             row_count=len(params_list),
-            elapsed_ms=(time.perf_counter() - started) * 1000.0,
             batch=True,
         )
         return ids
@@ -389,13 +397,9 @@ class Database:
         """Execute multiple writes in a single committed transaction."""
         if not params_list:
             return
-        db = await self._get_write_db()
-        started = time.perf_counter()
-        await db.executemany(sql, params_list)
-        await db.commit()
-        self._record_write_stats(
+        await self._run_locked_write(
+            lambda db: db.executemany(sql, params_list),
             row_count=len(params_list),
-            elapsed_ms=(time.perf_counter() - started) * 1000.0,
             batch=True,
         )
 

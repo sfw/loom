@@ -6,6 +6,7 @@ import {
   buildHistoricalConversationTimelineItems,
   buildConversationMessageFallbackItems,
   buildConversationTimelineItems,
+  historicalConversationTimelineCoversLatestLiveAssistant,
   historicalConversationTimelineCoversLiveTail,
   buildConversationTimelineWindow,
   canUseDeferredConversationTranscript,
@@ -45,7 +46,7 @@ function makeMessage(
 }
 
 describe("conversationTimeline", () => {
-  it("collapses contiguous transcript text and pairs tool lifecycle rows", () => {
+  it("keeps user messages distinct, collapses assistant chunks, and pairs tool lifecycle rows", () => {
     const items = buildConversationTimelineItems([
       makeEvent(1, "user_message", { text: "hello " }),
       makeEvent(2, "user_message", { text: "there" }),
@@ -63,10 +64,11 @@ describe("conversationTimeline", () => {
       }),
     ]);
 
-    expect(items).toHaveLength(3);
-    expect(items[0]).toMatchObject({ kind: "text", text: "hello there" });
-    expect(items[1]).toMatchObject({ kind: "text", text: "hi friend" });
-    expect(items[2]).toMatchObject({
+    expect(items).toHaveLength(4);
+    expect(items[0]).toMatchObject({ kind: "text", role: "user", text: "hello " });
+    expect(items[1]).toMatchObject({ kind: "text", role: "user", text: "there" });
+    expect(items[2]).toMatchObject({ kind: "text", role: "assistant", text: "hi friend" });
+    expect(items[3]).toMatchObject({
       kind: "tool",
       startedPayload: { tool_name: "search", tool_call_id: "tool-1" },
       completedPayload: { tool_name: "search", tool_call_id: "tool-1", success: true },
@@ -399,6 +401,31 @@ describe("conversationTimeline", () => {
     expect(historicalConversationTimelineCoversLiveTail(
       liveItems,
       freshHistoricalItems,
+    )).toBe(true);
+  });
+
+  it("detects when the latest persisted assistant reply covers a partial live replay answer", () => {
+    const liveItems = buildConversationTimelineItems([
+      makeEvent(1, "user_message", { text: "tell me again" }),
+      makeEvent(2, "user_message", { text: "tell me again" }),
+      makeEvent(3, "assistant_text", { text: "Based on my research, here's the easiest" }),
+      makeEvent(4, "turn_separator", { tokens: 42, tool_count: 0 }),
+    ]);
+    const historicalItems = buildConversationMessageTimelineItems([
+      makeMessage(1, "user", "tell me again", "2026-03-29T12:00:00Z"),
+      makeMessage(2, "assistant", "Earlier answer", "2026-03-29T12:00:01Z"),
+      makeMessage(3, "user", "tell me again", "2026-03-29T12:00:02Z"),
+      makeMessage(
+        4,
+        "assistant",
+        "Based on my research, here's the easiest way to get a meeting with Blink49 at Banff.",
+        "2026-03-29T12:00:03Z",
+      ),
+    ]);
+
+    expect(historicalConversationTimelineCoversLatestLiveAssistant(
+      liveItems,
+      historicalItems,
     )).toBe(true);
   });
 
