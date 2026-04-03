@@ -1227,6 +1227,44 @@ class TestWorkspaceRefresh:
         assert isinstance(stream, dict)
         assert stream.get("status") == "completed"
 
+    def test_render_chat_event_tool_completion_updates_existing_widget(self):
+        from loom.tui.app import LoomApp
+        from loom.tui.widgets.chat_log import ChatLog
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = ChatLog()
+        mounted: list = []
+        chat.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        chat._scroll_to_end = lambda: None
+        app.query_one = MagicMock(return_value=chat)
+
+        assert app._render_chat_event({
+            "event_type": "tool_call_started",
+            "payload": {
+                "tool_name": "web_search",
+                "tool_call_id": "call_3",
+                "args": {"query": "blink49 canada"},
+            },
+        })
+        assert app._render_chat_event({
+            "event_type": "tool_call_completed",
+            "payload": {
+                "tool_name": "web_search",
+                "tool_call_id": "call_3",
+                "args": {"query": "blink49 canada"},
+                "success": True,
+                "elapsed_ms": 280,
+                "output": "1. Blink49\n   https://blink49.com",
+            },
+        })
+
+        assert len(mounted) == 1
+        assert getattr(mounted[0], "_success", None) is True
+
     def test_render_chat_event_turn_interrupted_rehydrates(self):
         from loom.tui.app import LoomApp
 
@@ -1246,6 +1284,26 @@ class TestWorkspaceRefresh:
             },
         })
         chat.add_info.assert_called_once_with("Stopped current chat execution.", markup=True)
+
+    def test_render_chat_event_assistant_thinking_rehydrates(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        assert app._render_chat_event({
+            "event_type": "assistant_thinking",
+            "payload": {
+                "text": "Looking up more context.",
+                "streaming": True,
+            },
+        })
+        chat.add_live_feedback.assert_called_once_with("Looking up more context.")
 
     @pytest.mark.asyncio
     async def test_switch_session_clears_files_panel(self, monkeypatch):

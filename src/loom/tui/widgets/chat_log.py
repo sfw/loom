@@ -7,6 +7,7 @@ import asyncio
 from rich.markdown import Markdown as RichMarkdown
 from rich.style import Style
 from textual import events
+from textual._context import NoActiveAppError
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
@@ -52,6 +53,61 @@ class LinkAwareStatic(Static):
         self._open_link(href)
 
 
+class LiveMarkdownWidget(VerticalScroll):
+    """Scrollable live-rendered Markdown panel used for streaming updates."""
+
+    def __init__(self, *, title: str = "Live", classes: str | None = None) -> None:
+        self._body = LinkAwareStatic("", classes="live-markdown-body", expand=True)
+        super().__init__(self._body, classes=classes)
+        self.border_title = title
+        # Preserve the old ChatLog test contract that expected an expandable widget.
+        self.expand = True
+
+    def update(self, content: object = "") -> None:
+        self._body.update(content)
+        try:
+            self.scroll_end(animate=False, immediate=True)
+        except NoActiveAppError:
+            pass
+
+    def finalize(
+        self,
+        *,
+        title: str | None = None,
+        flatten: bool = False,
+    ) -> None:
+        """Freeze live styling once streaming has completed."""
+        self.remove_class("is-live")
+        if flatten:
+            self.add_class("is-flattened")
+        self.border_title = title
+
+
+def append_live_feedback_chunk(current: str, chunk: str) -> str:
+    """Join live-feedback chunks without breaking word-by-word streams."""
+    normalized_chunk = str(chunk or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized_chunk:
+        return current
+    if not current:
+        return normalized_chunk
+
+    current_tail = current[-1:]
+    chunk_head = normalized_chunk[:1]
+    if not chunk_head:
+        return current
+
+    if current_tail.isspace() or chunk_head.isspace():
+        return f"{current}{normalized_chunk}"
+
+    if chunk_head in ",.;:!?)}]":
+        return f"{current}{normalized_chunk}"
+
+    if current_tail.isalnum() and chunk_head.islower():
+        return f"{current}{normalized_chunk}"
+
+    return f"{current}\n\n{normalized_chunk}"
+
+
 class ChatLog(VerticalScroll):
     """Scrollable chat log that holds Markdown/text messages and tool widgets.
 
@@ -77,6 +133,31 @@ class ChatLog(VerticalScroll):
         width: 100%;
         max-width: 140;
     }
+    ChatLog LiveMarkdownWidget {
+        margin: 0 0 1 0;
+        padding: 0 1;
+        width: 100%;
+        max-width: 140;
+        height: auto;
+        max-height: 12;
+        border: round $surface-lighten-1;
+        background: $panel;
+        scrollbar-size: 1 1;
+    }
+    ChatLog LiveMarkdownWidget.is-live {
+        border: round $primary-darken-1;
+        background: $surface;
+    }
+    ChatLog LiveMarkdownWidget.is-flattened {
+        margin: 0;
+        padding: 0;
+        max-height: 999;
+        border: none;
+        background: transparent;
+    }
+    ChatLog .live-markdown-body {
+        width: 100%;
+    }
     ChatLog .turn-separator {
         margin: 1 0;
         color: $text-muted;
@@ -96,15 +177,19 @@ class ChatLog(VerticalScroll):
         self._auto_scroll = True
         self._scroll_end_pending = False
         self._stream_buffer: list[str] = []
-        self._stream_widget: Static | None = None
+        self._stream_widget: LiveMarkdownWidget | Static | None = None
         self._stream_text: str = ""
         self._stream_flush_interval_s = 0.12
         self._stream_flush_timer_pending = False
+        self._feedback_widget: LiveMarkdownWidget | None = None
+        self._feedback_text: str = ""
+        self._tool_call_widgets: dict[str, ToolCallWidget] = {}
         self._delegate_widgets: dict[str, DelegateProgressWidget] = {}
         self._keyed_info_widgets: dict[str, Static] = {}
 
     def add_user_message(self, text: str) -> None:
         """Append a user message to the chat."""
+        self._finalize_live_feedback()
         self._flush_and_reset_stream()
         self.mount(
             Static(
@@ -121,6 +206,7 @@ class ChatLog(VerticalScroll):
         `markup=True` keeps Rich markup behavior for system/error lines.
         Normal model output is rendered as Markdown.
         """
+        self._finalize_live_feedback()
         self._flush_and_reset_stream()
         if markup:
             widget = Static(text, classes="model-text", expand=True, markup=True)
@@ -139,13 +225,17 @@ class ChatLog(VerticalScroll):
         Buffers chunks and flushes to the widget periodically to avoid
         O(n^2) string concatenation on every chunk.
         """
+        self._finalize_live_feedback()
         self._stream_buffer.append(text)
         mounted_new_widget = False
         flushed_now = False
 
         if self._stream_widget is None:
             self._stream_text = ""
-            self._stream_widget = LinkAwareStatic("", classes="model-text", expand=True)
+            self._stream_widget = LiveMarkdownWidget(
+                title="Live",
+                classes="model-text live-response is-live",
+            )
             self.mount(self._stream_widget)
             mounted_new_widget = True
 
@@ -192,19 +282,47 @@ class ChatLog(VerticalScroll):
         if not self._stream_buffer or self._stream_widget is None:
             return False
         self._stream_text += "".join(self._stream_buffer)
-        self._stream_widget.update(self._stream_text)
+        self._stream_widget.update(RichMarkdown(self._stream_text))
         self._stream_buffer.clear()
         return True
 
     def _flush_and_reset_stream(self) -> None:
         """Flush any buffered stream data and reset stream state."""
         self._flush_stream_buffer()
-        # Convert streamed plain text into Markdown once the message segment ends.
         if self._stream_widget is not None and self._stream_text:
-            self._stream_widget.update(RichMarkdown(self._stream_text))
+            if isinstance(self._stream_widget, LiveMarkdownWidget):
+                self._stream_widget.finalize(flatten=True)
+            else:
+                self._stream_widget.update(RichMarkdown(self._stream_text))
         self._stream_widget = None
         self._stream_text = ""
         self._stream_flush_timer_pending = False
+
+    def add_live_feedback(self, text: str) -> None:
+        """Append model live-feedback chunks into a dedicated scroll panel."""
+        chunk = str(text or "")
+        if not chunk.strip():
+            return
+        self._flush_and_reset_stream()
+        if self._feedback_widget is None:
+            self._feedback_text = ""
+            self._feedback_widget = LiveMarkdownWidget(
+                title="Live Feedback",
+                classes="model-text live-feedback is-live",
+            )
+            self.mount(self._feedback_widget)
+        self._feedback_text = append_live_feedback_chunk(self._feedback_text, chunk)
+        self._feedback_widget.update(RichMarkdown(self._feedback_text))
+        self._scroll_to_end()
+
+    def _finalize_live_feedback(self) -> None:
+        """Freeze any active live-feedback panel before rendering new content."""
+        if self._feedback_widget is None:
+            return
+        if self._feedback_text:
+            self._feedback_widget.finalize(title="Feedback")
+        self._feedback_widget = None
+        self._feedback_text = ""
 
     def add_tool_call(
         self,
@@ -218,15 +336,31 @@ class ChatLog(VerticalScroll):
         error: str = "",
     ) -> None:
         """Append a tool call widget."""
+        self._finalize_live_feedback()
+        key = str(tool_call_id or "").strip()
+        existing = self._tool_call_widgets.get(key) if key else None
+        if existing is not None:
+            existing.update_state(
+                args=args,
+                success=success,
+                elapsed_ms=elapsed_ms,
+                output=output,
+                error=error,
+            )
+            self._scroll_to_end()
+            return
         self._flush_and_reset_stream()
-        self.mount(ToolCallWidget(
+        widget = ToolCallWidget(
             tool_name,
             args,
             success=success,
             elapsed_ms=elapsed_ms,
             output=output,
             error=error,
-        ))
+        )
+        self.mount(widget)
+        if key:
+            self._tool_call_widgets[key] = widget
         self._scroll_to_end()
 
     def add_delegate_progress_section(
@@ -243,6 +377,7 @@ class ChatLog(VerticalScroll):
         key = str(tool_call_id or "").strip()
         if not key:
             return
+        self._finalize_live_feedback()
         existing = self._delegate_widgets.get(key)
         if existing is not None:
             existing.restore_state(status=status, elapsed_ms=elapsed_ms, lines=lines)
@@ -304,7 +439,10 @@ class ChatLog(VerticalScroll):
         self._stream_widget = None
         self._stream_text = ""
         self._stream_flush_timer_pending = False
+        self._feedback_widget = None
+        self._feedback_text = ""
         self._scroll_end_pending = False
+        self._tool_call_widgets.clear()
         self.clear_delegate_progress_sections()
         self._keyed_info_widgets.clear()
 
@@ -338,6 +476,7 @@ class ChatLog(VerticalScroll):
         recall_index_used: bool = False,
     ) -> None:
         """Add a turn separator line with stats."""
+        self._finalize_live_feedback()
         self._flush_and_reset_stream()
         parts: list[str] = []
         if tool_count:
@@ -373,6 +512,7 @@ class ChatLog(VerticalScroll):
 
     def add_info(self, text: str, *, markup: bool = True) -> Static:
         """Add an informational message (e.g. welcome text)."""
+        self._finalize_live_feedback()
         self._flush_and_reset_stream()
         widget = Static(text, classes="info-msg", expand=True, markup=markup)
         self.mount(widget)
@@ -385,6 +525,7 @@ class ChatLog(VerticalScroll):
         if not key:
             self.add_info(text, markup=markup)
             return
+        self._finalize_live_feedback()
         self._flush_and_reset_stream()
         widget = self._keyed_info_widgets.get(key)
         if widget is None or not widget.is_attached:
@@ -401,6 +542,7 @@ class ChatLog(VerticalScroll):
         Shows styled placeholders for images and documents that the model
         is processing, since terminals cannot display actual images.
         """
+        self._finalize_live_feedback()
         self._flush_and_reset_stream()
         from loom.content import DocumentBlock, ImageBlock
 
