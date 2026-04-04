@@ -15,6 +15,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -27,6 +28,8 @@ ToolAuthMode = Literal["no_auth", "optional_auth", "required_auth"]
 _VALID_TOOL_AUTH_MODES = frozenset({"no_auth", "optional_auth", "required_auth"})
 ToolExecutionSurface = Literal["tui", "api", "cli"]
 _VALID_TOOL_EXECUTION_SURFACES = frozenset({"tui", "api", "cli"})
+ToolAvailabilityState = Literal["available", "degraded", "unavailable"]
+_VALID_TOOL_AVAILABILITY_STATES = frozenset({"available", "degraded", "unavailable"})
 _DEFAULT_TOOL_EXECUTION_SURFACE: ToolExecutionSurface = "tui"
 _DEFAULT_TOOL_EXECUTION_SURFACES: tuple[ToolExecutionSurface, ...] = (
     "tui",
@@ -98,6 +101,55 @@ def tool_auth_required(tool: object) -> bool:
     if mode != "no_auth":
         return True
     return bool(getattr(tool, "auth_requirements", []))
+
+
+@dataclass(frozen=True)
+class ToolAvailabilityReason:
+    """One concrete reason explaining current tool availability."""
+
+    code: str
+    message: str = ""
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "code": str(self.code or "").strip().lower(),
+            "message": str(self.message or "").strip(),
+            "metadata": dict(self.metadata or {}),
+        }
+
+
+@dataclass(frozen=True)
+class ToolAvailabilityStatus:
+    """Runtime availability snapshot for one tool."""
+
+    state: ToolAvailabilityState = "available"
+    reasons: tuple[ToolAvailabilityReason, ...] = ()
+    checked_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        normalized = str(self.state or "").strip().lower()
+        if normalized not in _VALID_TOOL_AVAILABILITY_STATES:
+            normalized = "unavailable"
+        object.__setattr__(self, "state", normalized)
+        if not self.checked_at:
+            object.__setattr__(self, "checked_at", datetime.now(UTC).isoformat())
+        object.__setattr__(self, "reasons", tuple(self.reasons or ()))
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+
+    @property
+    def runnable(self) -> bool:
+        return self.state in {"available", "degraded"}
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "state": self.state,
+            "runnable": self.runnable,
+            "checked_at": self.checked_at,
+            "reasons": [reason.to_dict() for reason in self.reasons],
+            "metadata": dict(self.metadata or {}),
+        }
 
 
 @dataclass
@@ -267,6 +319,36 @@ class Tool(ABC):
     def supported_execution_surfaces(self) -> tuple[ToolExecutionSurface, ...]:
         """Declared execution surfaces where this tool is valid."""
         return _DEFAULT_TOOL_EXECUTION_SURFACES
+
+    def availability(
+        self,
+        *,
+        execution_surface: object = _DEFAULT_TOOL_EXECUTION_SURFACE,
+    ) -> ToolAvailabilityStatus:
+        """Return current runtime availability for this tool."""
+        surface = normalize_tool_execution_surface(
+            execution_surface,
+            default=_DEFAULT_TOOL_EXECUTION_SURFACE,
+        )
+        if not tool_supports_execution_surface(self, surface):
+            return ToolAvailabilityStatus(
+                state="unavailable",
+                reasons=(
+                    ToolAvailabilityReason(
+                        code="surface_not_supported",
+                        message=(
+                            f"Tool '{self.name}' is not available on execution surface "
+                            f"'{surface}'."
+                        ),
+                        metadata={"execution_surface": surface},
+                    ),
+                ),
+                metadata={"execution_surface": surface},
+            )
+        return ToolAvailabilityStatus(
+            state="available",
+            metadata={"execution_surface": surface},
+        )
 
     @abstractmethod
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
@@ -833,6 +915,160 @@ class ToolRegistry:
         with self._tools_lock:
             return self._tools.pop(name, None) is not None
 
+    def _resolved_tool_items(
+        self,
+        *,
+        auth_context: Any = None,
+        execution_surface: str | None = None,
+    ) -> list[tuple[str, Tool]]:
+        requested_surface = self._requested_execution_surface(execution_surface)
+        if auth_context is not None and self._mcp_discovery_hook is not None:
+            with self._tools_lock:
+                non_mcp_items = [
+                    (name, tool)
+                    for name, tool in self._tools.items()
+                    if not name.startswith("mcp.")
+                    and (
+                        not requested_surface
+                        or tool_supports_execution_surface(tool, requested_surface)
+                    )
+                ]
+            discovered = self._discover_mcp_view(
+                auth_context=auth_context,
+                background_on_expiry=True,
+            )
+            mcp_items = [
+                (name, discovered[name])
+                for name in sorted(discovered.keys())
+                if (
+                    not requested_surface
+                    or tool_supports_execution_surface(discovered[name], requested_surface)
+                )
+            ]
+            return sorted([*non_mcp_items, *mcp_items], key=lambda item: item[0])
+
+        if not self._has_registered_mcp_tools():
+            self._maybe_refresh_mcp(background=True)
+        with self._tools_lock:
+            items = list(self._tools.items())
+        filtered = [
+            (name, tool)
+            for name, tool in items
+            if (
+                not requested_surface
+                or tool_supports_execution_surface(tool, requested_surface)
+            )
+        ]
+        return sorted(filtered, key=lambda item: item[0])
+
+    @staticmethod
+    def _unavailable_status_from_exception(
+        *,
+        name: str,
+        execution_surface: str,
+        error: Exception,
+    ) -> ToolAvailabilityStatus:
+        return ToolAvailabilityStatus(
+            state="unavailable",
+            reasons=(
+                ToolAvailabilityReason(
+                    code="availability_check_failed",
+                    message=(
+                        f"Failed to evaluate runtime availability for tool '{name}': {error}"
+                    ),
+                    metadata={"exception_type": type(error).__name__},
+                ),
+            ),
+            metadata={"execution_surface": execution_surface},
+        )
+
+    def _tool_availability(
+        self,
+        *,
+        name: str,
+        tool: Tool,
+        execution_surface: str,
+    ) -> ToolAvailabilityStatus:
+        try:
+            status = tool.availability(execution_surface=execution_surface)
+        except Exception as e:
+            return self._unavailable_status_from_exception(
+                name=name,
+                execution_surface=execution_surface,
+                error=e,
+            )
+        if isinstance(status, ToolAvailabilityStatus):
+            return status
+        return ToolAvailabilityStatus(
+            state="unavailable",
+            reasons=(
+                ToolAvailabilityReason(
+                    code="availability_check_failed",
+                    message=f"Tool '{name}' returned an invalid availability payload.",
+                ),
+            ),
+            metadata={"execution_surface": execution_surface},
+        )
+
+    def availability(
+        self,
+        name: str,
+        *,
+        auth_context: Any = None,
+        execution_surface: str | None = None,
+    ) -> ToolAvailabilityStatus | None:
+        """Return runtime availability for one tool when it is registered."""
+        requested_surface = self._requested_execution_surface(execution_surface)
+        surface = requested_surface or _DEFAULT_TOOL_EXECUTION_SURFACE
+        for candidate_name, tool in self._resolved_tool_items(
+            auth_context=auth_context,
+            execution_surface=requested_surface,
+        ):
+            if candidate_name != name:
+                continue
+            return self._tool_availability(
+                name=candidate_name,
+                tool=tool,
+                execution_surface=surface,
+            )
+        with self._tools_lock:
+            fallback = self._tools.get(name)
+        if fallback is not None:
+            return self._tool_availability(
+                name=name,
+                tool=fallback,
+                execution_surface=surface,
+            )
+        return None
+
+    def availability_rows(
+        self,
+        *,
+        auth_context: Any = None,
+        execution_surface: str | None = None,
+        runnable_only: bool = False,
+    ) -> list[dict[str, object]]:
+        """Return runtime availability rows for registered/discovered tools."""
+        requested_surface = self._requested_execution_surface(execution_surface)
+        surface = requested_surface or _DEFAULT_TOOL_EXECUTION_SURFACE
+        rows: list[dict[str, object]] = []
+        for name, tool in self._resolved_tool_items(
+            auth_context=auth_context,
+            execution_surface=None,
+        ):
+            status = self._tool_availability(
+                name=name,
+                tool=tool,
+                execution_surface=surface,
+            )
+            if runnable_only and not status.runnable:
+                continue
+            rows.append({
+                "name": name,
+                **status.to_dict(),
+            })
+        return rows
+
     @staticmethod
     def _requested_execution_surface(value: object) -> str:
         text = str(value or "").strip().lower()
@@ -1082,98 +1318,47 @@ class ToolRegistry:
         *,
         auth_context: Any = None,
         execution_surface: str | None = None,
+        runnable_only: bool = False,
     ) -> list[dict]:
         """Return all tool schemas for model consumption."""
         requested_surface = self._requested_execution_surface(execution_surface)
-        if auth_context is not None and self._mcp_discovery_hook is not None:
-            with self._tools_lock:
-                non_mcp_schemas = [
-                    tool.schema()
-                    for name, tool in self._tools.items()
-                    if not name.startswith("mcp.")
-                    and (
-                        not requested_surface
-                        or tool_supports_execution_surface(tool, requested_surface)
-                    )
-                ]
-            discovered = self._discover_mcp_view(
-                auth_context=auth_context,
-                background_on_expiry=True,
+        surface = requested_surface or _DEFAULT_TOOL_EXECUTION_SURFACE
+        schemas: list[dict] = []
+        for name, tool in self._resolved_tool_items(
+            auth_context=auth_context,
+            execution_surface=requested_surface,
+        ):
+            status = self._tool_availability(
+                name=name,
+                tool=tool,
+                execution_surface=surface,
             )
-            mcp_schemas = [
-                discovered[name].schema()
-                for name in sorted(discovered.keys())
-                if (
-                    not requested_surface
-                    or tool_supports_execution_surface(
-                        discovered[name],
-                        requested_surface,
-                    )
-                )
-            ]
-            return [*non_mcp_schemas, *mcp_schemas]
-        # Keep reads responsive: only trigger MCP refresh when no MCP tools
-        # have been loaded yet.
-        if not self._has_registered_mcp_tools():
-            self._maybe_refresh_mcp(background=True)
-        with self._tools_lock:
-            tools = list(self._tools.values())
-        return [
-            tool.schema()
-            for tool in tools
-            if (
-                not requested_surface
-                or tool_supports_execution_surface(tool, requested_surface)
-            )
-        ]
+            if runnable_only and not status.runnable:
+                continue
+            schemas.append(tool.schema())
+        return schemas
 
     def list_tools(
         self,
         *,
         auth_context: Any = None,
         execution_surface: str | None = None,
+        runnable_only: bool = False,
     ) -> list[str]:
         """Return registered tool names."""
         requested_surface = self._requested_execution_surface(execution_surface)
-        if auth_context is not None and self._mcp_discovery_hook is not None:
-            with self._tools_lock:
-                non_mcp_tools = [
-                    name
-                    for name, tool in self._tools.items()
-                    if not name.startswith("mcp.")
-                    and (
-                        not requested_surface
-                        or tool_supports_execution_surface(tool, requested_surface)
-                    )
-                ]
-            discovered = self._discover_mcp_view(
-                auth_context=auth_context,
-                background_on_expiry=True,
+        surface = requested_surface or _DEFAULT_TOOL_EXECUTION_SURFACE
+        names: list[str] = []
+        for name, tool in self._resolved_tool_items(
+            auth_context=auth_context,
+            execution_surface=requested_surface,
+        ):
+            status = self._tool_availability(
+                name=name,
+                tool=tool,
+                execution_surface=surface,
             )
-            return [
-                *non_mcp_tools,
-                *[
-                    name
-                    for name in sorted(discovered.keys())
-                    if (
-                        not requested_surface
-                        or tool_supports_execution_surface(
-                            discovered[name],
-                            requested_surface,
-                        )
-                    )
-                ],
-            ]
-        # Keep reads responsive: only trigger MCP refresh when no MCP tools
-        # have been loaded yet.
-        if not self._has_registered_mcp_tools():
-            self._maybe_refresh_mcp(background=True)
-        with self._tools_lock:
-            return [
-                name
-                for name, tool in self._tools.items()
-                if (
-                    not requested_surface
-                    or tool_supports_execution_surface(tool, requested_surface)
-                )
-            ]
+            if runnable_only and not status.runnable:
+                continue
+            names.append(name)
+        return names

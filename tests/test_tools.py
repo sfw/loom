@@ -24,6 +24,8 @@ from loom.tools.file_ops import (
 from loom.tools.git import GitCommandTool, check_git_safety, parse_subcommand
 from loom.tools.registry import (
     Tool,
+    ToolAvailabilityReason,
+    ToolAvailabilityStatus,
     ToolContext,
     ToolRegistry,
     ToolResult,
@@ -167,6 +169,46 @@ class TestRegistry:
         cli_names = set(registry.list_tools(execution_surface="cli"))
         assert "ask_user" in tui_names
         assert "ask_user" not in cli_names
+
+    def test_runnable_only_filters_unavailable_tools(self):
+        class _UnavailableTool(Tool):
+            __loom_register__ = False
+
+            @property
+            def name(self) -> str:
+                return "unavailable_tool"
+
+            @property
+            def description(self) -> str:
+                return "Unavailable tool"
+
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+
+            def availability(self, *, execution_surface: object = "tui") -> ToolAvailabilityStatus:
+                return ToolAvailabilityStatus(
+                    state="unavailable",
+                    reasons=(
+                        ToolAvailabilityReason(
+                            code="binary_not_found",
+                            message="Missing binary",
+                        ),
+                    ),
+                )
+
+            async def execute(self, args: dict, _ctx: ToolContext) -> ToolResult:
+                del args
+                return ToolResult.fail("should not run")
+
+        registry = ToolRegistry()
+        registry.register(ReadFileTool())
+        registry.register(_UnavailableTool())
+
+        assert "unavailable_tool" in registry.list_tools()
+        assert "unavailable_tool" not in registry.list_tools(runnable_only=True)
+        schemas = registry.all_schemas(runnable_only=True)
+        assert {schema["name"] for schema in schemas} == {"read_file"}
 
     def test_discover_tools_finds_all_builtins(self):
         classes = discover_tools()

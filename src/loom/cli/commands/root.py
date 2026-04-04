@@ -25,6 +25,7 @@ from loom.runtime.capabilities import (
     optional_addon_status_by_key,
     optional_addon_statuses,
 )
+from loom.tools import create_default_registry
 
 
 @click.group(invoke_without_command=True)
@@ -464,6 +465,34 @@ def doctor(ctx: click.Context, required_addons: tuple[str, ...]) -> None:
                 click.echo(f"  Detail: {status.detail}")
     else:
         click.echo("No optional addons registered.")
+
+    click.echo()
+    click.echo("Tool Availability")
+    if config_error:
+        click.echo("- Status: skipped because configuration is invalid")
+    else:
+        registry = create_default_registry(config)
+        availability_rows = registry.availability_rows(execution_surface="cli")
+        unavailable_rows = [
+            row for row in availability_rows if not bool(row.get("runnable", False))
+        ]
+        degraded_rows = [
+            row
+            for row in availability_rows
+            if str(row.get("state", "") or "").strip().lower() == "degraded"
+        ]
+        click.echo(f"- Registered tools: {len(availability_rows)}")
+        click.echo(f"- Runnable tools: {len(availability_rows) - len(unavailable_rows)}")
+        click.echo(f"- Degraded tools: {len(degraded_rows)}")
+        click.echo(f"- Unavailable tools: {len(unavailable_rows)}")
+        for row in unavailable_rows[:12]:
+            name = str(row.get("name", "") or "").strip()
+            reasons = row.get("reasons", [])
+            detail = ""
+            if isinstance(reasons, list) and reasons:
+                first = reasons[0] if isinstance(reasons[0], dict) else {}
+                detail = str(first.get("message", "") or "").strip()
+            click.echo(f"  - {name}: {detail or 'unavailable'}")
 
     missing_required: list[str] = []
     for raw_key in required_addons:

@@ -139,6 +139,7 @@ async def run_subtask(
             available_tools=runner._tools.all_schemas(
                 auth_context=auth_context,
                 execution_surface=execution_surface,
+                runnable_only=True,
             ),
             evidence_ledger_summary=evidence_summary,
         )
@@ -226,6 +227,7 @@ async def run_subtask(
                 tool_schemas = runner._tools.all_schemas(
                     auth_context=auth_context,
                     execution_surface=execution_surface,
+                    runnable_only=True,
                 )
             operation = "stream" if streaming else "complete"
             session.response = None
@@ -409,6 +411,7 @@ async def run_subtask(
                     runner._tools.all_schemas(
                         auth_context=auth_context,
                         execution_surface=execution_surface,
+                        runnable_only=True,
                     ),
                 )
                 if not validation.valid:

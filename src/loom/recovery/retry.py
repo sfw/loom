@@ -159,14 +159,33 @@ class RetryManager:
                 "- Update only rows/claims that currently lack evidence."
             )
         elif strategy == RetryStrategy.UNCONFIRMED_DATA:
-            lines.append(
-                "\nTARGETED RETRY PLAN:\n"
-                "- Resolve verification findings using process remediation guidance.\n"
-                "- Preserve already validated findings.\n"
-                "- Confirm unsupported claims with evidence or relabel them as "
-                "unverified according to process policy.\n"
-                "- Avoid broad reruns when only targeted remediation is needed."
-            )
+            reason_code = str(getattr(attempts[-1], "reason_code", "") or "").strip().lower()
+            capability_unavailable_reason_codes = {
+                "tool_capability_unavailable",
+                "provider_binary_not_found",
+                "provider_binary_unsupported",
+                "provider_auth_unavailable",
+                "tool_runtime_capability_unavailable",
+            }
+            if reason_code in capability_unavailable_reason_codes:
+                lines.append(
+                    "\nTARGETED RETRY PLAN:\n"
+                    "- A tool path failed because the required runtime capability "
+                    "is unavailable in this environment.\n"
+                    "- Do not reuse the unavailable tool or provider on the next attempt.\n"
+                    "- Replan around the same subtask objective using other available "
+                    "tools or a different method.\n"
+                    "- Preserve already validated work and avoid restarting solved steps."
+                )
+            else:
+                lines.append(
+                    "\nTARGETED RETRY PLAN:\n"
+                    "- Resolve verification findings using process remediation guidance.\n"
+                    "- Preserve already validated findings.\n"
+                    "- Confirm unsupported claims with evidence or relabel them as "
+                    "unverified according to process policy.\n"
+                    "- Avoid broad reruns when only targeted remediation is needed."
+                )
         elif (
             strategy == RetryStrategy.GENERIC
             and attempts
@@ -254,6 +273,13 @@ class RetryManager:
             "missing_precedent_transactions",
             "csv_schema_mismatch",
         }
+        capability_unavailable_reason_codes = {
+            "tool_capability_unavailable",
+            "provider_binary_not_found",
+            "provider_binary_unsupported",
+            "provider_auth_unavailable",
+            "tool_runtime_capability_unavailable",
+        }
 
         # Prefer structured verification contract when available.
         policy_decision = resolve_policy_decision(
@@ -281,6 +307,8 @@ class RetryManager:
             "dev_verifier_timeout",
         }:
             return RetryStrategy.VERIFIER_PARSE, missing_targets
+        if reason_code in capability_unavailable_reason_codes:
+            return RetryStrategy.UNCONFIRMED_DATA, missing_targets
         if policy_decision.action == "pass_with_warnings":
             return RetryStrategy.UNCONFIRMED_DATA, missing_targets
         if policy_decision.action == "retry_targeted":
@@ -324,6 +352,8 @@ class RetryManager:
         }:
             return RetryStrategy.EVIDENCE_GAP, missing_targets
         if reason_code in unconfirmed_reason_codes:
+            return RetryStrategy.UNCONFIRMED_DATA, missing_targets
+        if reason_code in capability_unavailable_reason_codes:
             return RetryStrategy.UNCONFIRMED_DATA, missing_targets
         if "unconfirmed" in reason_code or "remediation" in reason_code:
             return RetryStrategy.UNCONFIRMED_DATA, missing_targets

@@ -284,7 +284,7 @@ def sanitize_deliverable_name(value: str, *, fallback: str) -> str:
 def available_tool_names(self) -> list[str]:
     """Return sorted available tool names from the active registry."""
     try:
-        tools = self._tools.list_tools()
+        tools = self._tools.list_tools(runnable_only=True)
     except Exception:
         return []
     names = sorted({

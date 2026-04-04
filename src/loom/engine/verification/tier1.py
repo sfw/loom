@@ -375,9 +375,12 @@ class DeterministicVerifier:
         if hard_failures:
             reason_code = self._hard_failure_reason_code(hard_failures)
             severity_class = (
-                "hard_invariant"
-                if reason_code == "hard_invariant_failed"
-                else "semantic"
+                severity_class_for_reason_code(reason_code)
+                or (
+                    "hard_invariant"
+                    if reason_code == "hard_invariant_failed"
+                    else "semantic"
+                )
             )
             feedback = self._build_feedback(hard_failures)
         elif recoverable_placeholder_failures:
@@ -443,6 +446,13 @@ class DeterministicVerifier:
             )
             if disposition is not None:
                 return disposition
+        capability_disposition = self._classify_runtime_tool_capability_failure(
+            tool_name=tool_name,
+            tool_result_data=tool_result_data,
+            error=detail,
+        )
+        if capability_disposition is not None:
+            return capability_disposition
         if self._is_advisory_tool_failure(tool_name, detail):
             return ToolFailureDisposition(advisory=True, detail=detail)
         return ToolFailureDisposition(advisory=False, detail=detail)
@@ -529,6 +539,45 @@ class DeterministicVerifier:
                 )
 
         return None
+
+    @staticmethod
+    def _classify_runtime_tool_capability_failure(
+        *,
+        tool_name: str,
+        tool_result_data: object,
+        error: str,
+    ) -> ToolFailureDisposition | None:
+        data = tool_result_data if isinstance(tool_result_data, dict) else {}
+        error_code = str(data.get("error_code", "") or "").strip().lower()
+        reason_code = str(data.get("reason_code", "") or "").strip().lower()
+        if not reason_code:
+            if error_code == "binary_not_found":
+                if tool_name in {"openai_codex", "claude_code", "opencode"}:
+                    reason_code = "provider_binary_not_found"
+                else:
+                    reason_code = "tool_runtime_capability_unavailable"
+            elif error_code == "unsupported_version":
+                reason_code = "provider_binary_unsupported"
+            elif error_code in {
+                "feature_disabled",
+                "provider_not_allowed",
+                "network_disabled",
+                "unsupported_mode_combination",
+                "binary_not_executable",
+            }:
+                reason_code = "tool_capability_unavailable"
+        if not reason_code:
+            return None
+        return ToolFailureDisposition(
+            advisory=False,
+            detail=format_development_failure_detail(
+                reason_code=reason_code,
+                capability=f"tool:{tool_name}",
+                detail=error or error_code,
+            ),
+            reason_code=reason_code,
+            capability=f"tool:{tool_name}",
+        )
 
     @classmethod
     def _hard_failure_reason_code(cls, hard_failures: list[Check]) -> str:

@@ -410,7 +410,10 @@ class TestSessionApproval:
 
     async def test_wp_cli_confirmation_flag_is_ignored_from_model(self, workspace, monkeypatch):
         """Model cannot self-confirm wp_cli high-risk operations in headless mode."""
-        monkeypatch.setattr("loom.tools.wp_cli.shutil.which", lambda _: "/usr/bin/wp")
+        monkeypatch.setattr(
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
+            lambda _: "/usr/bin/wp",
+        )
         tools = create_default_registry(
             Config(execution=ExecutionConfig(enable_wp_tools=True)),
         )

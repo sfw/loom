@@ -44,7 +44,7 @@ from loom.state.memory import Database, MemoryManager
 from loom.state.task_state import Task, TaskStateManager, TaskStatus
 from loom.state.workspaces import WorkspaceRegistry
 from loom.tools import create_default_registry
-from loom.tools.registry import ToolRegistry
+from loom.tools.registry import ToolRegistry, normalize_tool_execution_surface
 from loom.utils.concurrency import run_blocking_io
 from loom.utils.latency import diagnostics_enabled, log_latency_event
 
@@ -582,11 +582,41 @@ class Engine:
         """Recompute effective config after runtime config mutations."""
         effective = self.config_runtime_store.effective_config()
         self.config = effective
+        self.tool_registry = create_default_registry(
+            effective,
+            mcp_startup_mode="background",
+        )
+        self._bind_api_tool_registry()
+        process = None
+        if isinstance(getattr(self.orchestrator, "__dict__", None), dict):
+            process = self.orchestrator.__dict__.get("_process")
+        self.orchestrator = Orchestrator(
+            model_router=self.model_router,
+            tool_registry=self.tool_registry,
+            memory_manager=self.memory_manager,
+            prompt_assembler=self.prompt_assembler,
+            state_manager=self.state_manager,
+            event_bus=self.event_bus,
+            config=self.config,
+            approval_manager=self.approval_manager,
+            question_manager=self.question_manager,
+            learning_manager=self.learning_manager,
+            process=process,
+            snapshot_mirror_writer=self._sync_task_row_snapshot,
+            execution_surface=normalize_tool_execution_surface(
+                self.runtime_role,
+                default="api",
+            ),
+        )
         return effective
 
     def runtime_status_snapshot(self) -> dict[str, object]:
         """Return desktop/client-friendly runtime contract information."""
         config_source = self.config_runtime_store.source_path()
+        execution_surface = normalize_tool_execution_surface(
+            self.runtime_role,
+            default="api",
+        )
         return {
             "status": "ok",
             "ready": True,
@@ -599,6 +629,9 @@ class Engine:
             "host": str(self.config.server.host),
             "port": int(self.config.server.port),
             "workspace_default_path": str(self.config.workspace.default_path),
+            "tool_availability": self.tool_registry.availability_rows(
+                execution_surface=execution_surface,
+            ),
         }
 
     async def activity_summary_snapshot(self) -> dict[str, object]:
@@ -802,6 +835,10 @@ class Engine:
             learning_manager=self.learning_manager,
             process=process,
             snapshot_mirror_writer=self._sync_task_row_snapshot,
+            execution_surface=normalize_tool_execution_surface(
+                self.runtime_role,
+                default="api",
+            ),
         )
 
     async def _task_state_exists(self, task_id: str) -> bool:
@@ -1462,6 +1499,10 @@ async def create_engine(config: Config, *, runtime_role: str = "api") -> Engine:
         approval_manager=approval_manager,
         question_manager=question_manager,
         learning_manager=learning_manager,
+        execution_surface=normalize_tool_execution_surface(
+            runtime_role,
+            default="api",
+        ),
     )
 
     engine = Engine(

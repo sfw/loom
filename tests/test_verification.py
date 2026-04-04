@@ -249,6 +249,24 @@ class TestDeterministicVerifier:
         assert result.severity_class == "semantic"
 
     @pytest.mark.asyncio
+    async def test_tool_capability_failure_uses_infra_reason_code(self):
+        v = DeterministicVerifier()
+        tc = MockToolCallRecord(
+            tool="openai_codex",
+            args={"prompt": "Parse CSV"},
+            result=ToolResult(
+                success=False,
+                output="",
+                error="Binary not found: codex",
+                data={"error_code": "binary_not_found"},
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert result.reason_code == "provider_binary_not_found"
+        assert result.severity_class == "infra"
+
+    @pytest.mark.asyncio
     async def test_development_balanced_policy_downgrades_runtime_probe_timeout(self):
         process = _make_process(
             static_checks={"tool_success_policy": "development_balanced"},

@@ -101,6 +101,7 @@ def _bind_hybrid_fallback_tools(registry: ToolRegistry) -> None:
             for schema in registry.all_schemas(
                 auth_context=auth_context,
                 execution_surface=execution_surface,
+                runnable_only=True,
             ):
                 name = str(schema.get("name", "")).strip()
                 if not name:
@@ -302,6 +303,13 @@ def _instantiate_tool(tool_cls: type[Tool], config: Config | None) -> Tool | Non
                     "on",
                 ) or "on",
             ),
+            binary_overrides=dict(
+                getattr(
+                    config.execution,
+                    "tool_binary_overrides",
+                    {},
+                ) or {},
+            ),
         )
 
     if class_name == "WpCliTool":
@@ -314,11 +322,25 @@ def _instantiate_tool(tool_cls: type[Tool], config: Config | None) -> Tool | Non
                     True,
                 ),
             ),
+            binary_overrides=dict(
+                getattr(
+                    config.execution,
+                    "tool_binary_overrides",
+                    {},
+                ) or {},
+            ),
         )
 
     if class_name in {"WpEnvTool", "WpScaffoldBlockTool", "WpQualityGateTool"}:
         return tool_cls(
             enabled=_software_dev_family_enabled(config, family="wordpress"),
+            binary_overrides=dict(
+                getattr(
+                    config.execution,
+                    "tool_binary_overrides",
+                    {},
+                ) or {},
+            ),
         )
 
     if class_name == "FactCheckerTool":

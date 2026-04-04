@@ -199,6 +199,10 @@ class ToolInfo(BaseModel):
     auth_required: bool = False
     auth_requirements: list[dict[str, Any]] = Field(default_factory=list)
     execution_surfaces: list[str] = Field(default_factory=list)
+    availability_state: str = "available"
+    runnable: bool = True
+    availability_checked_at: str = ""
+    availability_reasons: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ContentBlockResponse(BaseModel):
@@ -251,6 +255,7 @@ class RuntimeStatusResponse(BaseModel):
     host: str = ""
     port: int = 0
     workspace_default_path: str = ""
+    tool_availability: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ActivitySummaryResponse(BaseModel):

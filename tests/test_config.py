@@ -464,6 +464,7 @@ enable_agent_tools = true
 enable_wp_tools = true
 wp_high_risk_requires_confirmation = false
 agent_tools_allowed_providers = ["codex", "opencode"]
+tool_binary_overrides = { codex = "/opt/homebrew/bin/codex", wp = "/usr/local/bin/wp" }
 agent_tools_max_timeout_seconds = 2400
 agent_tools_default_network_mode = "off"
 """)
@@ -473,6 +474,10 @@ agent_tools_default_network_mode = "off"
         assert config.execution.enable_wp_tools is True
         assert config.execution.wp_high_risk_requires_confirmation is False
         assert config.execution.agent_tools_allowed_providers == ["codex", "opencode"]
+        assert config.execution.tool_binary_overrides == {
+            "codex": "/opt/homebrew/bin/codex",
+            "wp": "/usr/local/bin/wp",
+        }
         assert config.execution.agent_tools_max_timeout_seconds == 2400
         assert config.execution.agent_tools_default_network_mode == "off"
 

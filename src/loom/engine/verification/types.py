@@ -41,8 +41,12 @@ _REASON_CODE_SEVERITY: dict[str, str] = {
     "dev_verifier_capability_unavailable": "infra",
     "dev_verifier_timeout": "infra",
     "hard_invariant_failed": "hard_invariant",
+    "provider_binary_not_found": "infra",
+    "provider_binary_unsupported": "infra",
     "parse_inconclusive": "inconclusive",
     "infra_verifier_error": "infra",
+    "tool_capability_unavailable": "infra",
+    "tool_runtime_capability_unavailable": "infra",
 }
 
 def severity_class_for_reason_code(reason_code: str | None) -> str:

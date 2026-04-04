@@ -303,7 +303,12 @@ class TestCoworkSession:
 
         assert provider.tool_payloads
         first_call = provider.tool_payloads[0] or []
-        assert len(first_call) == len(tools.all_schemas())
+        assert len(first_call) == len(
+            tools.all_schemas(
+                execution_surface="tui",
+                runnable_only=True,
+            ),
+        )
 
     async def test_hybrid_unknown_tool_error_suggests_list_tools(self, workspace, tools):
         provider = MockProvider([

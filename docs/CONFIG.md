@@ -127,6 +127,7 @@ state separate from the default CLI/TUI database and scratch paths.
 | `enable_wp_tools` | `bool` | `true` | Enable WordPress development tools (`wp_cli`, `wp_env`, scaffolding, quality gate). |
 | `wp_high_risk_requires_confirmation` | `bool` | `true` | Require explicit confirmation for high-risk WordPress operations. |
 | `agent_tools_allowed_providers` | `list[string]` | `["codex","claude_code","opencode"]` | Restrict which external agent providers are exposed. |
+| `tool_binary_overrides` | `map[string,string]` | `{}` | Optional explicit binary paths/commands keyed by tool/provider/binary name (for example `codex`, `wp`, `npx`). |
 | `agent_tools_max_timeout_seconds` | `int` | `1800` | Max allowed timeout for coding-agent tool calls. |
 | `agent_tools_default_network_mode` | `string` | `"on"` | Default network mode for coding-agent tool calls (`on` or `off`). |
 

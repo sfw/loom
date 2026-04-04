@@ -229,6 +229,71 @@ class TestCLI:
         assert "Tree-sitter Addon (treesitter): installed" in result.output
         assert "Doctor passed" in result.output
 
+    def test_doctor_reports_tool_availability_details(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        self._patch_doctor_side_effects(monkeypatch, tmp_path)
+        cfg_path = tmp_path / "loom.toml"
+        db_path = tmp_path / "loom.db"
+        cfg_path.write_text(
+            "[models.local]\n"
+            "provider = \"ollama\"\n"
+            "model = \"llama3\"\n"
+            "roles = [\"executor\", \"planner\", \"verifier\"]\n"
+            "[memory]\n"
+            f"database_path = \"{db_path}\"\n",
+            encoding="utf-8",
+        )
+        statuses = self._doctor_statuses()
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_statuses",
+            lambda: statuses,
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_status_by_key",
+            lambda key: next((status for status in statuses if status.key == key), None),
+        )
+
+        class _Registry:
+            def availability_rows(self, **_kwargs):
+                return [
+                    {
+                        "name": "shell_execute",
+                        "state": "available",
+                        "runnable": True,
+                        "reasons": [],
+                    },
+                    {
+                        "name": "openai_codex",
+                        "state": "unavailable",
+                        "runnable": False,
+                        "reasons": [
+                            {"message": "Binary not found: codex"},
+                        ],
+                    },
+                ]
+
+        monkeypatch.setattr(
+            "loom.cli.commands.root.create_default_registry",
+            lambda *_args, **_kwargs: _Registry(),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "doctor"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "Tool Availability" in result.output
+        assert "Registered tools: 2" in result.output
+        assert "Runnable tools: 1" in result.output
+        assert "Unavailable tools: 1" in result.output
+        assert "openai_codex: Binary not found: codex" in result.output
+
     def test_doctor_requires_installed_addon(self, monkeypatch, tmp_path: Path) -> None:
         self._patch_doctor_side_effects(monkeypatch, tmp_path)
         status = OptionalAddonStatus(

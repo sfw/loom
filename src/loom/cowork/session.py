@@ -2143,6 +2143,7 @@ class CoworkSession:
             self._tools.list_tools(
                 auth_context=self._auth_context,
                 execution_surface="tui",
+                runnable_only=True,
             ),
         )
         mcp_aliases = {
@@ -2173,6 +2174,7 @@ class CoworkSession:
             self._tools.list_tools(
                 auth_context=self._auth_context,
                 execution_surface="tui",
+                runnable_only=True,
             ),
         )
         if not available:
@@ -2258,11 +2260,13 @@ class CoworkSession:
             return self._tools.all_schemas(
                 auth_context=self._auth_context,
                 execution_surface="tui",
+                runnable_only=True,
             )
 
         all_schemas = self._tools.all_schemas(
             auth_context=self._auth_context,
             execution_surface="tui",
+            runnable_only=True,
         )
         if not all_schemas:
             return []
@@ -2372,6 +2376,7 @@ class CoworkSession:
         schemas = self._tools.all_schemas(
             auth_context=auth_context,
             execution_surface=execution_surface,
+            runnable_only=True,
         )
         rows: list[dict] = []
         for schema in schemas:

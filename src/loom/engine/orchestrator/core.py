@@ -62,7 +62,7 @@ from loom.state.task_state import (
     TaskStateManager,
     TaskStatus,
 )
-from loom.tools.registry import ToolRegistry
+from loom.tools.registry import ToolRegistry, normalize_tool_execution_surface
 from loom.tools.workspace import ChangeLog
 from loom.utils.concurrency import run_blocking_io
 
@@ -184,6 +184,7 @@ class Orchestrator:
         learning_manager: LearningManager | None = None,
         process: ProcessDefinition | None = None,
         snapshot_mirror_writer: Callable[[Task], Awaitable[None]] | None = None,
+        execution_surface: str = "tui",
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -195,6 +196,7 @@ class Orchestrator:
         self._learning = learning_manager
         self._process = process
         self._snapshot_mirror_writer = snapshot_mirror_writer
+        self._execution_surface = normalize_tool_execution_surface(execution_surface)
         self._scheduler = Scheduler()
         self._validator = ResponseValidator()
         self._verification = VerificationGates(
@@ -268,14 +270,20 @@ class Orchestrator:
 
             required_tools = list(getattr(process.tools, "required", []) or [])
             if required_tools:
-                available = set(self._tools.list_tools())
+                available = set(self._tools.list_tools(
+                    runnable_only=True,
+                    execution_surface=self._execution_surface,
+                ))
                 missing = sorted(
                     tool_name
                     for tool_name in required_tools
                     if tool_name not in available
                 )
                 if missing:
-                    joined = ", ".join(missing)
+                    joined = ", ".join(
+                        self._format_required_tool_unavailability(tool_name)
+                        for tool_name in missing
+                    )
                     raise ValueError(
                         f"Process '{process.name}' requires missing tool(s): {joined}"
                     )
@@ -293,6 +301,24 @@ class Orchestrator:
             question_manager=self._question,
             task_snapshot_writer=self._save_task_state,
         )
+
+    def _format_required_tool_unavailability(self, tool_name: str) -> str:
+        status = self._tools.availability(
+            tool_name,
+            execution_surface=self._execution_surface,
+        )
+        if status is None:
+            return f"{tool_name} (not registered for this runtime)"
+        reasons = getattr(status, "reasons", ()) or ()
+        if reasons:
+            first = reasons[0]
+            message = str(getattr(first, "message", "") or "").strip()
+            code = str(getattr(first, "code", "") or "").strip().lower()
+            detail = message or code or str(status.state or "").strip().lower()
+            if detail:
+                return f"{tool_name} ({detail})"
+        state = str(getattr(status, "state", "") or "").strip().lower()
+        return f"{tool_name} ({state or 'unavailable'})"
 
     async def execute_task(
         self,

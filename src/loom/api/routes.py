@@ -2681,6 +2681,10 @@ def _tool_info_rows(engine: Engine) -> list[ToolInfo]:
     for schema in engine.tool_registry.all_schemas():
         name = str(schema.get("name", "") or "").strip()
         tool = engine.tool_registry.get(name) if name else None
+        availability = engine.tool_registry.availability(
+            name,
+            execution_surface=engine.runtime_role,
+        )
         auth_requirements = getattr(tool, "auth_requirements", [])
         if not isinstance(auth_requirements, list):
             auth_requirements = []
@@ -2696,6 +2700,18 @@ def _tool_info_rows(engine: Engine) -> list[ToolInfo]:
                 execution_surfaces=list(normalize_tool_execution_surfaces(
                     schema.get("x_supported_execution_surfaces", []),
                 )),
+                availability_state=(
+                    availability.state if availability is not None else "unavailable"
+                ),
+                runnable=bool(availability.runnable) if availability is not None else False,
+                availability_checked_at=(
+                    availability.checked_at if availability is not None else ""
+                ),
+                availability_reasons=(
+                    [reason.to_dict() for reason in availability.reasons]
+                    if availability is not None
+                    else []
+                ),
             ),
         )
     return rows

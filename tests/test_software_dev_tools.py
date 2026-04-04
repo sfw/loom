@@ -66,7 +66,7 @@ class TestProviderAgentTools:
         ctx: ToolContext,
     ):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: None,
         )
         tool = tool_cls(enabled=True)
@@ -74,6 +74,64 @@ class TestProviderAgentTools:
         assert not result.success
         assert result.data["error_code"] == "binary_not_found"
         assert binary_name in str(result.error or "")
+
+    async def test_codex_availability_uses_configured_binary_override(
+        self,
+        monkeypatch,
+        ctx: ToolContext,
+    ):
+        monkeypatch.setattr(
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
+            lambda value: "/custom/codex" if value == "custom-codex" else None,
+        )
+        tool = OpenAICodexTool(
+            enabled=True,
+            binary_overrides={"codex": "custom-codex"},
+        )
+        status = tool.availability(execution_surface="cli")
+        assert status.runnable is True
+        assert status.metadata["binary_path"] == "/custom/codex"
+
+    async def test_codex_execute_uses_configured_binary_override(
+        self,
+        monkeypatch,
+        ctx: ToolContext,
+    ):
+        monkeypatch.setattr(
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
+            lambda value: "/custom/codex" if value == "custom-codex" else None,
+        )
+        seen_argv: list[list[str]] = []
+
+        async def _fake_run(argv, **_kwargs):
+            seen_argv.append(list(argv))
+            if "--version" in argv:
+                return CommandRunResult(
+                    exit_code=0,
+                    stdout="codex 1.2.3",
+                    stderr="",
+                    duration_ms=12,
+                    timed_out=False,
+                    truncated=False,
+                )
+            return CommandRunResult(
+                exit_code=0,
+                stdout="ok",
+                stderr="",
+                duration_ms=42,
+                timed_out=False,
+                truncated=False,
+            )
+
+        monkeypatch.setattr("loom.tools.tooling_common.provider_agent_tool.run_command", _fake_run)
+
+        tool = OpenAICodexTool(
+            enabled=True,
+            binary_overrides={"codex": "custom-codex"},
+        )
+        result = await tool.execute({"prompt": "Summarize repo"}, ctx)
+        assert result.success
+        assert seen_argv[-1][0] == "/custom/codex"
 
     async def test_rejects_unsupported_off_network_mode(self, ctx: ToolContext):
         tool = ClaudeCodeTool(enabled=True)
@@ -89,7 +147,7 @@ class TestProviderAgentTools:
 
     async def test_executes_with_mocked_runner(self, monkeypatch, ctx: ToolContext):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/codex",
         )
 
@@ -131,7 +189,7 @@ class TestProviderAgentTools:
         ctx: ToolContext,
     ):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/codex",
         )
         seen_argv: list[list[str]] = []
@@ -178,7 +236,7 @@ class TestProviderAgentTools:
 
     async def test_codex_can_disable_skip_git_repo_check_flag(self, monkeypatch, ctx: ToolContext):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/codex",
         )
         seen_argv: list[list[str]] = []
@@ -219,7 +277,7 @@ class TestProviderAgentTools:
 
     async def test_opencode_uses_supported_flags_only(self, monkeypatch, ctx: ToolContext):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/opencode",
         )
         seen_argv: list[list[str]] = []
@@ -264,7 +322,7 @@ class TestProviderAgentTools:
 
     async def test_json_mode_parses_jsonl_payloads(self, monkeypatch, ctx: ToolContext):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/opencode",
         )
 
@@ -317,7 +375,7 @@ class TestProviderAgentTools:
 
     async def test_timeout_maps_to_timeout_error_code(self, monkeypatch, ctx: ToolContext):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/codex",
         )
 
@@ -354,7 +412,7 @@ class TestProviderAgentTools:
 
     async def test_rejects_unsupported_version(self, monkeypatch, ctx: ToolContext):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/codex",
         )
         monkeypatch.setitem(
@@ -396,7 +454,7 @@ class TestProviderAgentTools:
 
     async def test_claude_code_uses_permission_mode_flags(self, monkeypatch, ctx: ToolContext):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/claude",
         )
         seen_argv: list[list[str]] = []
@@ -442,7 +500,7 @@ class TestProviderAgentTools:
         ctx: ToolContext,
     ):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/claude",
         )
         seen_argv: list[list[str]] = []
@@ -487,7 +545,7 @@ class TestProviderAgentTools:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic")
         monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/claude",
         )
         captured_env: dict[str, str] = {}
@@ -523,7 +581,7 @@ class TestProviderAgentTools:
 
     async def test_failure_error_includes_stderr_detail(self, monkeypatch, ctx: ToolContext):
         monkeypatch.setattr(
-            "loom.tools.tooling_common.provider_agent_tool.shutil.which",
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
             lambda _: "/usr/bin/codex",
         )
 
@@ -574,7 +632,10 @@ class TestProviderAgentTools:
 
 class TestWpCliTool:
     async def test_high_risk_requires_confirmation(self, monkeypatch, ctx: ToolContext):
-        monkeypatch.setattr("loom.tools.wp_cli.shutil.which", lambda _: "/usr/bin/wp")
+        monkeypatch.setattr(
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
+            lambda _: "/usr/bin/wp",
+        )
         tool = WpCliTool(enabled=True, high_risk_requires_confirmation=True)
         result = await tool.execute(
             {
@@ -588,7 +649,10 @@ class TestWpCliTool:
         assert result.data["error_code"] == "high_risk_confirmation_required"
 
     async def test_plugin_list_runs(self, monkeypatch, ctx: ToolContext):
-        monkeypatch.setattr("loom.tools.wp_cli.shutil.which", lambda _: "/usr/bin/wp")
+        monkeypatch.setattr(
+            "loom.tools.tooling_common.binary_resolution.shutil.which",
+            lambda _: "/usr/bin/wp",
+        )
 
         async def _fake_run(*_args, **_kwargs):
             return CommandRunResult(

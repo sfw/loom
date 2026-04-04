@@ -280,6 +280,7 @@ class ExecutionConfig:
     agent_tools_allowed_providers: list[str] = field(
         default_factory=lambda: ["codex", "claude_code", "opencode"],
     )
+    tool_binary_overrides: dict[str, str] = field(default_factory=dict)
     agent_tools_max_timeout_seconds: int = 1800
     agent_tools_default_network_mode: str = "on"  # on | off
 
@@ -702,6 +703,20 @@ def _string_list_from(source: dict, key: str, default: list[str]) -> list[str]:
     return cleaned or list(default)
 
 
+def _string_map_from(source: dict, key: str) -> dict[str, str]:
+    """Parse dict[str, str] from config, dropping empty keys/values."""
+    raw = source.get(key, {})
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for item_key, item_value in raw.items():
+        clean_key = str(item_key or "").strip()
+        clean_value = str(item_value or "").strip()
+        if clean_key and clean_value:
+            cleaned[clean_key] = clean_value
+    return cleaned
+
+
 def load_config(path: Path | None = None) -> Config:
     """Load configuration from a TOML file.
 
@@ -1083,6 +1098,7 @@ def load_config(path: Path | None = None) -> Config:
             "agent_tools_allowed_providers",
             ExecutionConfig().agent_tools_allowed_providers,
         ),
+        tool_binary_overrides=_string_map_from(exec_data, "tool_binary_overrides"),
         agent_tools_max_timeout_seconds=_int_from(
             exec_data,
             "agent_tools_max_timeout_seconds",

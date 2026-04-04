@@ -52,7 +52,7 @@ from loom.state.task_state import (
 )
 from loom.state.workspaces import WorkspaceRegistry
 from loom.tools import create_default_registry
-from loom.tools.registry import ToolResult
+from loom.tools.registry import ToolAvailabilityReason, ToolAvailabilityStatus, ToolResult
 
 # --- Test Fixtures ---
 
@@ -641,6 +641,8 @@ class TestSystemEndpoints:
         assert data["ready"] is True
         assert data["runtime_role"] == "api"
         assert "database_path" in data
+        assert "tool_availability" in data
+        assert isinstance(data["tool_availability"], list)
 
     @pytest.mark.asyncio
     async def test_activity_summary_reports_global_backend_work(
@@ -750,6 +752,9 @@ class TestSystemEndpoints:
         assert "auth_required" in tools[0]
         assert "auth_requirements" in tools[0]
         assert "execution_surfaces" in tools[0]
+        assert "availability_state" in tools[0]
+        assert "runnable" in tools[0]
+        assert "availability_reasons" in tools[0]
         ask_user = next((row for row in tools if row.get("name") == "ask_user"), None)
         assert isinstance(ask_user, dict)
         assert ask_user.get("execution_surfaces") == ["tui"]
@@ -6290,6 +6295,99 @@ class TestEngineOrchestratorFactory:
 
         with pytest.raises(ValueError, match="requires missing tool"):
             engine.create_task_orchestrator(process=process_def)
+
+    def test_create_task_orchestrator_reports_required_tool_unavailability_reason(
+        self,
+        engine,
+        monkeypatch,
+    ):
+        process_def = SimpleNamespace(
+            name="process",
+            tools=SimpleNamespace(
+                excluded=[],
+                required=["openai_codex"],
+            ),
+        )
+        registry = MagicMock()
+        registry.list_tools.return_value = []
+        registry.availability.return_value = ToolAvailabilityStatus(
+            state="unavailable",
+            reasons=(
+                ToolAvailabilityReason(
+                    code="binary_not_found",
+                    message="Binary not found: codex",
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            "loom.api.engine.create_default_registry",
+            lambda *_args, **_kwargs: registry,
+        )
+
+        with pytest.raises(ValueError, match="Binary not found: codex"):
+            engine.create_task_orchestrator(process=process_def)
+
+        registry.list_tools.assert_called_once_with(
+            runnable_only=True,
+            execution_surface="api",
+        )
+        registry.availability.assert_called_once_with(
+            "openai_codex",
+            execution_surface="api",
+        )
+
+    def test_refresh_config_from_runtime_store_rebuilds_runtime_tooling(
+        self,
+        engine,
+        monkeypatch,
+        tmp_path,
+    ):
+        refreshed_config = Config(
+            execution=ExecutionConfig(
+                ask_user_v2_enabled=True,
+                ask_user_runtime_blocking_enabled=True,
+                ask_user_durable_state_enabled=True,
+                ask_user_api_enabled=True,
+                tool_binary_overrides={"codex": "/custom/codex"},
+            ),
+            source_path=str(tmp_path / "updated-loom.toml"),
+        )
+        monkeypatch.setattr(
+            engine.config_runtime_store,
+            "effective_config",
+            lambda: refreshed_config,
+        )
+
+        refreshed_registry = MagicMock()
+        refreshed_registry.get.return_value = None
+        monkeypatch.setattr(
+            "loom.api.engine.create_default_registry",
+            lambda *_args, **_kwargs: refreshed_registry,
+        )
+
+        created: dict[str, object] = {}
+
+        def _fake_orchestrator(**kwargs):
+            created.update(kwargs)
+            return SimpleNamespace(
+                _process=kwargs.get("process"),
+                _tools=kwargs.get("tool_registry"),
+                _config=kwargs.get("config"),
+                _prompts=kwargs.get("prompt_assembler"),
+            )
+
+        monkeypatch.setattr("loom.api.engine.Orchestrator", _fake_orchestrator)
+        engine.orchestrator = SimpleNamespace(_process="BASE_PROCESS")
+
+        result = engine.refresh_config_from_runtime_store()
+
+        assert result is refreshed_config
+        assert engine.config is refreshed_config
+        assert engine.tool_registry is refreshed_registry
+        assert engine.orchestrator._tools is refreshed_registry
+        assert engine.orchestrator._config is refreshed_config
+        assert created["execution_surface"] == "api"
+        assert created["process"] == "BASE_PROCESS"
 
     @pytest.mark.asyncio
     async def test_create_task_orchestrator_mirrors_saved_snapshots_to_task_rows(
