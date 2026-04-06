@@ -2233,7 +2233,7 @@ class TestProcessSlashCommands:
         assert policy.get("mode") == "llm_first"
         assert (
             policy.get("static_checks", {}).get("tool_success_policy")
-            == "safety_integrity_only"
+            == "method_resilient"
         )
         assert policy.get("semantic_checks") == []
         assert policy.get("output_contract") == {}
@@ -2345,7 +2345,7 @@ class TestProcessSlashCommands:
         assert policy.get("mode") == "static_first"
         assert (
             policy.get("static_checks", {}).get("tool_success_policy")
-            == "safety_integrity_only"
+            == "method_resilient"
         )
         assert policy.get("static_checks", {}).get("phase_scope") == "global"
         assert policy.get("semantic_checks") == [{"name": "coverage"}]

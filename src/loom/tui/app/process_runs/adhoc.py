@@ -778,9 +778,9 @@ def adhoc_default_verification_policy(intent: str = "research") -> dict[str, Any
     return {
         "mode": "llm_first",
         "static_checks": {
-            # Keep safety/integrity failures hard while avoiding brittle
-            # hard-fails from incidental tool errors during remediation.
-            "tool_success_policy": "safety_integrity_only",
+            # Keep safety/integrity failures hard while treating ordinary
+            # tool/runtime faults as recoverable method failures to retry.
+            "tool_success_policy": "method_resilient",
         },
         "semantic_checks": [],
         "output_contract": {},

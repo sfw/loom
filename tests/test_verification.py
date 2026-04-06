@@ -191,8 +191,8 @@ class TestDeterministicVerifier:
         )
 
     @pytest.mark.asyncio
-    async def test_adhoc_process_defaults_to_safety_integrity_policy(self):
-        process = _make_process(tags=["adhoc"])
+    async def test_adhoc_process_defaults_to_method_resilient_policy(self):
+        process = _make_process(tags=["adhoc"], version="adhoc-1")
         v = DeterministicVerifier(process=process)
         tc = MockToolCallRecord(
             tool="edit_file",
@@ -202,11 +202,44 @@ class TestDeterministicVerifier:
             ),
         )
         result = await v.verify(_make_subtask(), "output", [tc], None)
-        assert result.passed
+        assert not result.passed
+        assert result.reason_code == "tool_method_failed"
         assert any(
-            c.name == "tool_edit_file_advisory" and c.passed
+            c.name == "tool_edit_file_success" and not c.passed
             for c in result.checks
         )
+
+    @pytest.mark.asyncio
+    async def test_method_resilient_policy_classifies_write_permission_failure(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "method_resilient"},
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="write_file",
+            args={"path": "report.md"},
+            result=ToolResult.fail("Permission denied"),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert result.reason_code == "tool_write_retryable"
+        assert result.severity_class == "infra"
+
+    @pytest.mark.asyncio
+    async def test_method_resilient_policy_classifies_web_upstream_failure(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "method_resilient"},
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="web_fetch",
+            args={"url": "https://example.com/missing"},
+            result=ToolResult.fail("HTTP 404: https://example.com/missing"),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert not result.passed
+        assert result.reason_code == "tool_upstream_unavailable"
+        assert result.severity_class == "infra"
 
     @pytest.mark.asyncio
     async def test_adhoc_process_honors_explicit_all_tools_hard_policy(self):
@@ -2780,7 +2813,7 @@ class TestDeterministicVerifierRegexRules:
         tool_call = MockToolCallRecord(
             tool="write_file",
             args={"path": "report.md"},
-            result=ToolResult.fail("Permission denied"),
+            result=ToolResult.fail("Safety violation: path escapes workspace root"),
         )
         result = await verifier.verify(
             _make_subtask(),

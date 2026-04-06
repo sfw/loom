@@ -85,8 +85,18 @@ class DeterministicVerifier:
     _TOOL_SUCCESS_POLICIES = frozenset({
         "all_tools_hard",
         "development_balanced",
+        "method_resilient",
         "safety_integrity_only",
     })
+    _WRITE_RETRYABLE_TOOLS = frozenset({
+        "write_file",
+        "edit_file",
+        "document_write",
+        "spreadsheet",
+        "move_file",
+        "delete_file",
+    })
+    _WEB_TOOLS = frozenset({"web_fetch", "web_fetch_html", "web_search"})
     _PLACEHOLDER_RULE_HEURISTIC_MARKERS = (
         "placeholder",
         "todo",
@@ -446,6 +456,13 @@ class DeterministicVerifier:
             )
             if disposition is not None:
                 return disposition
+        structured_reason_code = self._reason_code_from_failure_detail(detail)
+        if structured_reason_code:
+            return ToolFailureDisposition(
+                advisory=False,
+                detail=detail,
+                reason_code=structured_reason_code,
+            )
         capability_disposition = self._classify_runtime_tool_capability_failure(
             tool_name=tool_name,
             tool_result_data=tool_result_data,
@@ -453,6 +470,17 @@ class DeterministicVerifier:
         )
         if capability_disposition is not None:
             return capability_disposition
+        if self._tool_success_policy != "safety_integrity_only":
+            method_disposition = self._classify_recoverable_method_failure(
+                tool_name=tool_name,
+                tool_result_data=tool_result_data,
+                error=detail,
+            )
+            if method_disposition is not None and (
+                self._tool_success_policy == "method_resilient"
+                or tool_name not in self._ADVISORY_TOOL_FAILURES
+            ):
+                return method_disposition
         if self._is_advisory_tool_failure(tool_name, detail):
             return ToolFailureDisposition(advisory=True, detail=detail)
         return ToolFailureDisposition(advisory=False, detail=detail)
@@ -578,6 +606,148 @@ class DeterministicVerifier:
             reason_code=reason_code,
             capability=f"tool:{tool_name}",
         )
+
+    @classmethod
+    def _classify_recoverable_method_failure(
+        cls,
+        *,
+        tool_name: str,
+        tool_result_data: object,
+        error: str,
+    ) -> ToolFailureDisposition | None:
+        if not error:
+            return None
+        if cls._is_hard_safety_or_integrity_failure(error):
+            return None
+        data = tool_result_data if isinstance(tool_result_data, dict) else {}
+        error_code = str(data.get("error_code", "") or "").strip().lower()
+        lowered = str(error or "").strip().lower()
+        reason_code = ""
+
+        if tool_name in cls._WRITE_RETRYABLE_TOOLS:
+            if error_code in {
+                "path_outside_workspace",
+                "path_exists",
+                "command_failed",
+                "timeout_exceeded",
+                "tool_runtime_error",
+                "invalid_arguments",
+            }:
+                reason_code = "tool_write_retryable"
+            elif any(
+                marker in lowered
+                for marker in (
+                    "permission denied",
+                    "operation not permitted",
+                    "read-only file system",
+                    "not writable",
+                    "failed to write",
+                    "failed to save",
+                    "disk full",
+                    "resource busy",
+                    "text file busy",
+                    "i/o error",
+                    "io error",
+                )
+            ):
+                reason_code = "tool_write_retryable"
+
+        if not reason_code and (
+            tool_name in cls._WEB_TOOLS
+            or any(
+                marker in lowered
+                for marker in (
+                    "http ",
+                    "status code",
+                    "connection failed",
+                    "connection reset",
+                    "connection refused",
+                    "temporarily unavailable",
+                    "service unavailable",
+                    "bad gateway",
+                    "gateway timeout",
+                    "rate limit",
+                    "rate-limited",
+                )
+            )
+        ):
+            status_code = _extract_http_status(error)
+            if status_code is not None:
+                if status_code in {408, 425, 429, 500, 502, 503, 504, 521, 522}:
+                    reason_code = "tool_transient_failure"
+                elif 400 <= status_code < 600:
+                    reason_code = "tool_upstream_unavailable"
+            elif any(
+                marker in lowered
+                for marker in (
+                    "timeout",
+                    "timed out",
+                    "connection failed",
+                    "connection reset",
+                    "connection refused",
+                    "temporarily unavailable",
+                    "service unavailable",
+                    "bad gateway",
+                    "gateway timeout",
+                    "rate limit",
+                    "rate-limited",
+                )
+            ):
+                reason_code = "tool_transient_failure"
+
+        if not reason_code and error_code in {
+            "timeout_exceeded",
+            "command_failed",
+            "tool_runtime_error",
+            "invalid_arguments",
+        }:
+            if error_code == "timeout_exceeded":
+                reason_code = "tool_transient_failure"
+            elif error_code == "invalid_arguments":
+                reason_code = "tool_method_failed"
+            else:
+                reason_code = "tool_runtime_retryable"
+
+        if not reason_code and any(
+            marker in lowered
+            for marker in (
+                "timeout",
+                "timed out",
+                "traceback",
+                "command failed",
+                "runtime error",
+                "failed:",
+                "exception",
+            )
+        ):
+            reason_code = "tool_runtime_retryable"
+
+        if not reason_code:
+            reason_code = "tool_method_failed"
+        return ToolFailureDisposition(
+            advisory=False,
+            detail=format_development_failure_detail(
+                reason_code=reason_code,
+                capability=f"tool:{tool_name}",
+                detail=error or error_code,
+            ),
+            reason_code=reason_code,
+            capability=f"tool:{tool_name}",
+        )
+
+    @staticmethod
+    def _reason_code_from_failure_detail(error: str | None) -> str:
+        detail = str(error or "").strip()
+        if not detail:
+            return ""
+        match = re.search(
+            r"\breason_code\b\s*[:=]\s*([a-z0-9_]+)",
+            detail,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip().lower()
 
     @classmethod
     def _hard_failure_reason_code(cls, hard_failures: list[Check]) -> str:
@@ -1104,14 +1274,11 @@ class DeterministicVerifier:
         hard_fail_markers = (
             "blocked host:",
             "safety violation:",
-            "only http:// and https:// urls are allowed",
-            "no url provided",
-            "no search query provided",
-            "permission denied",
-            "operation not permitted",
-            "read-only file system",
             "outside writable roots",
             "path escapes",
+            "forbidden_output_path",
+            "artifact_seal_invalid",
+            "manifest_input_policy_violation",
         )
         return any(marker in text for marker in hard_fail_markers)
 

@@ -612,6 +612,17 @@ class TestProcessDefinition:
         assert defn.is_adhoc_process() is True
         assert defn.verification_policy_payload()["mode"] == "static_first"
 
+    def test_adhoc_process_defaults_to_method_resilient_tool_policy(self):
+        defn = ProcessDefinition(
+            name="research-adhoc",
+            version="adhoc-2",
+            tags=["adhoc"],
+        )
+
+        assert defn.verifier_tool_success_policy(include_adhoc_fallback=True) == (
+            "method_resilient"
+        )
+
     def test_verifier_capability_contracts_normalize_optional_and_required_checks(self):
         defn = ProcessDefinition(
             name="build-process",
@@ -2409,6 +2420,23 @@ verification:
         assert "missing_targets" in metadata_fields
         assert "unverified_claim_count" in metadata_fields
         assert "verified_claim_count" in metadata_fields
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "research-report",
+            "marketing-strategy",
+            "market-research",
+            "competitive-intel",
+            "consulting-engagement",
+            "investment-analysis",
+        ],
+    )
+    def test_research_style_builtins_use_method_resilient_tool_policy(self, name: str):
+        loader = ProcessLoader()
+        defn = loader.load(name)
+
+        assert defn.verifier_tool_success_policy() == "method_resilient"
 
     def test_loader_rejects_unregistered_verification_helper(self, tmp_path):
         yaml_content = """\

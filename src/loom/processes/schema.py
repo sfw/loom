@@ -617,11 +617,12 @@ class ProcessDefinition:
         if policy in {
             "all_tools_hard",
             "development_balanced",
+            "method_resilient",
             "safety_integrity_only",
         }:
             return policy
         if include_adhoc_fallback and self.is_adhoc_process():
-            return "safety_integrity_only"
+            return "method_resilient"
         return "all_tools_hard"
 
     def verification_policy_payload(self) -> dict[str, Any]:

@@ -618,6 +618,52 @@ class TestInterruptedRunReconciliation:
         assert await_args["process_name"] == "seo-geo-review"
         assert await_args["recovered"] is False
 
+    @pytest.mark.asyncio
+    async def test_resume_run_spawns_worker_when_task_run_is_running_but_worker_missing(
+        self,
+        client,
+        engine,
+        database,
+        state_manager,
+    ):
+        def _resume_task_side_effect(task):
+            if task.status == TaskStatus.PAUSED:
+                task.status = TaskStatus.EXECUTING
+                state_manager.save(task)
+
+        engine.orchestrator.resume_task.side_effect = _resume_task_side_effect
+        task = _make_task(
+            state_manager,
+            task_id="run-resume-stale-1",
+            goal="Resume stale paused run",
+            status=TaskStatus.PAUSED,
+            metadata={"run_id": "exec-run-resume-stale-1", "process": "seo-geo-review"},
+        )
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path="/tmp/workspace",
+            status=TaskStatus.PAUSED.value,
+            metadata=task.metadata,
+        )
+        await database.insert_task_run(
+            run_id="exec-run-resume-stale-1",
+            task_id=task.id,
+            status="running",
+            process_name="seo-geo-review",
+        )
+        engine.submit_task = AsyncMock(return_value="exec-run-resume-stale-1")  # type: ignore[method-assign]
+        engine._resolve_process_definition = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        response = await client.post("/runs/run-resume-stale-1/resume")
+
+        assert response.status_code == 200
+        engine.submit_task.assert_awaited_once()
+        await_args = engine.submit_task.await_args.kwargs
+        assert await_args["run_id"] == "exec-run-resume-stale-1"
+        assert await_args["process_name"] == "seo-geo-review"
+        assert await_args["recovered"] is False
+
 
 # --- Health & System ---
 
@@ -3194,6 +3240,11 @@ class TestWorkspaceFirstEndpoints:
         assert "0% had it" in failure["summary"]
         assert "HTTP 999" in failure["summary"]
         assert "hard invariant verification failure" in failure["remediation"]["why_not_remedied"]
+
+    def test_reason_family_maps_method_failures_to_unconfirmed_data(self):
+        from loom.api.routes import _reason_family
+
+        assert _reason_family("tool_upstream_unavailable", "") == "unconfirmed_data"
 
     @pytest.mark.asyncio
     async def test_auto_subfolder_run_stays_grouped_under_parent_workspace(

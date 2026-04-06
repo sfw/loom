@@ -46,6 +46,11 @@ _REASON_CODE_SEVERITY: dict[str, str] = {
     "parse_inconclusive": "inconclusive",
     "infra_verifier_error": "infra",
     "tool_capability_unavailable": "infra",
+    "tool_method_failed": "semantic",
+    "tool_transient_failure": "infra",
+    "tool_upstream_unavailable": "infra",
+    "tool_write_retryable": "infra",
+    "tool_runtime_retryable": "infra",
     "tool_runtime_capability_unavailable": "infra",
 }
 

@@ -656,6 +656,65 @@ Use these questions to decide:
   phases, acceptance criteria, and semantic checks to keep the other mode
   represented.
 
+### Choosing `tool_success_policy`
+
+`verification.policy.static_checks.tool_success_policy` controls how Loom
+interprets tool failures during verification and recovery. Choose it based on
+whether a failed tool call should be treated as a blocked objective, an
+alternate route to success, or a true product failure.
+
+Recommended policy selection:
+
+- `method_resilient`:
+  Best default for research, analysis, consulting, strategy, data-processing,
+  and other operational packages where most tool failures should trigger retry
+  or replanning rather than hard failure. This policy treats ordinary method
+  failures such as transient website outages, parser/runtime failures, missing
+  optional upstreams, or retryable write issues as recoverable route failures.
+- `development_balanced`:
+  Best for software and build/test packages where product-facing failures like
+  broken builds, failed tests, or invalid runtime behavior must remain
+  blocking, while verifier harness issues and missing optional capabilities can
+  still be downgraded appropriately.
+- `safety_integrity_only`:
+  Use only when you intentionally want ordinary tool failures to be advisory
+  unless they implicate safety, policy, or integrity. This is more permissive
+  than `method_resilient` and does not actively push the runtime to treat
+  ordinary tool failures as replan-worthy method failures.
+- `all_tools_hard`:
+  Use only for packages that truly require every tool failure to block the run.
+  This is rarely the right choice for networked, research-heavy, or operational
+  packages.
+
+Example research/analysis baseline:
+
+```yaml
+verification:
+  policy:
+    mode: llm_first
+    static_checks:
+      tool_success_policy: method_resilient
+```
+
+With `method_resilient`, ordinary failures such as "website unavailable",
+"document write failed for a retryable non-policy reason", or "this parser/tool
+path broke" are treated as method failures that should give Loom opportunities
+to retry or replan through alternate routes. Hard failures should be reserved
+for major faults such as safety violations, policy denials, integrity breaches,
+or true exhaustion of viable methods.
+
+Migration guidance for existing packages:
+
+- If a package currently uses `safety_integrity_only` but you want Loom to
+  retry or replan around ordinary tool failures, change it to
+  `method_resilient`.
+- Keep `development_balanced` for software implementation, test, build, and
+  runtime-verification packages.
+- Keep `safety_integrity_only` only if advisory treatment for ordinary tool
+  failures is intentional.
+- Review external packages that operate over the network or third-party tools.
+  Those are the most likely to benefit from `method_resilient`.
+
 ### Development-focused verification policies
 
 Packages that produce or verify software should not rely on a purely

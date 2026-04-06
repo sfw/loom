@@ -647,6 +647,11 @@ _FAILURE_REASON_FAMILIES: dict[str, str] = {
     "parse_inconclusive": "unconfirmed_data",
     "policy_remediation_required": "policy",
     "recommendation_unconfirmed": "unconfirmed_data",
+    "tool_method_failed": "unconfirmed_data",
+    "tool_runtime_retryable": "unconfirmed_data",
+    "tool_transient_failure": "unconfirmed_data",
+    "tool_upstream_unavailable": "unconfirmed_data",
+    "tool_write_retryable": "unconfirmed_data",
     "unconfirmed_critical_path": "unconfirmed_data",
     "uncaught_exception": "runtime",
 }
@@ -4215,8 +4220,14 @@ async def resume_task(request: Request, task_id: str):
         run_id = str(metadata.get("run_id", "") or "").strip()
         task_run = await engine.database.get_task_run(run_id) if run_id else None
         task_run_status = str((task_run or {}).get("status", "") or "").strip().lower()
-        should_spawn_worker = task.status in (TaskStatus.EXECUTING, TaskStatus.PLANNING) and (
-            task_run is None or task_run_status == "queued"
+        worker_inflight = engine.task_run_inflight(task.id)
+        should_spawn_worker = (
+            task.status in (TaskStatus.EXECUTING, TaskStatus.PLANNING)
+            and not worker_inflight
+            and (
+                task_run is None
+                or task_run_status in {"queued", "running"}
+            )
         )
         if should_spawn_worker:
             process_name = str(

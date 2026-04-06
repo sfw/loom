@@ -40,6 +40,11 @@ _TARGETED_RETRY_REASON_CODES = frozenset({
     "missing_evidence",
     "insufficient_evidence_targets",
     "missing_precedent_transactions",
+    "tool_method_failed",
+    "tool_transient_failure",
+    "tool_upstream_unavailable",
+    "tool_write_retryable",
+    "tool_runtime_retryable",
 })
 _INCONCLUSIVE_REASON_CODES = frozenset({
     "claim_inconclusive",
