@@ -140,6 +140,11 @@ REPEATED_TOOL_BATCH_SYSTEM_HINT = (
     "existing tool outputs. Only call another tool if arguments change and you "
     "briefly justify why.]"
 )
+MISSING_FINAL_ANSWER_SYSTEM_HINT = (
+    "[System: You have already completed tool work for this turn. Do not end the "
+    "turn silently. Give the user a direct answer now using the tool results you "
+    "already have. Do not call more tools unless absolutely necessary.]"
+)
 DEFAULT_TOOL_RESULT_OUTPUT_CHARS = 3_000
 HEAVY_TOOL_RESULT_OUTPUT_CHARS = 1_200
 _HEAVY_OUTPUT_TOOLS = frozenset({
@@ -826,6 +831,7 @@ class CoworkSession:
         last_tool_batch_signature = ""
         identical_tool_batch_streak = 0
         repeated_tool_batch_recovery_hints_used = 0
+        missing_final_answer_recovery_used = False
 
         for _ in range(MAX_TOOL_ITERATIONS):
             await self._await_if_paused(stage="model_request")
@@ -930,6 +936,23 @@ class CoworkSession:
                 if ask_user_pending:
                     break
             else:
+                if not str(response.text or "").strip() and all_tool_events:
+                    if not missing_final_answer_recovery_used:
+                        missing_final_answer_recovery_used = True
+                        self._messages.append({
+                            "role": "system",
+                            "content": MISSING_FINAL_ANSWER_SYSTEM_HINT,
+                        })
+                        await self._persist_turn(
+                            "system",
+                            content=MISSING_FINAL_ANSWER_SYSTEM_HINT,
+                        )
+                        continue
+                    fallback = self._build_missing_final_answer_fallback(all_tool_events)
+                    self._messages.append({"role": "assistant", "content": fallback})
+                    await self._persist_turn("assistant", content=fallback)
+                    text_parts.append(fallback)
+                    break
                 self._messages.append({"role": "assistant", "content": response.text or ""})
                 await self._persist_turn("assistant", content=response.text or "")
                 if self._should_retry_with_hybrid_fallback(
@@ -1029,6 +1052,7 @@ class CoworkSession:
         last_tool_batch_signature = ""
         identical_tool_batch_streak = 0
         repeated_tool_batch_recovery_hints_used = 0
+        missing_final_answer_recovery_used = False
 
         for _ in range(MAX_TOOL_ITERATIONS):
             await self._await_if_paused(stage="stream_model_request")
@@ -1158,6 +1182,23 @@ class CoworkSession:
                 if ask_user_pending:
                     break
             else:
+                if not str(response_text or "").strip() and all_tool_events:
+                    if not missing_final_answer_recovery_used:
+                        missing_final_answer_recovery_used = True
+                        self._messages.append({
+                            "role": "system",
+                            "content": MISSING_FINAL_ANSWER_SYSTEM_HINT,
+                        })
+                        await self._persist_turn(
+                            "system",
+                            content=MISSING_FINAL_ANSWER_SYSTEM_HINT,
+                        )
+                        continue
+                    fallback = self._build_missing_final_answer_fallback(all_tool_events)
+                    self._messages.append({"role": "assistant", "content": fallback})
+                    await self._persist_turn("assistant", content=fallback)
+                    all_text_parts.append(fallback)
+                    break
                 self._messages.append({"role": "assistant", "content": response_text or ""})
                 await self._persist_turn("assistant", content=response_text or "")
                 if self._should_retry_with_hybrid_fallback(
@@ -2603,6 +2644,38 @@ class CoworkSession:
             "I stopped because the model repeated identical tool calls without making "
             "progress. I can continue once we change the query or tool arguments."
         )
+
+    def _build_missing_final_answer_fallback(
+        self,
+        tool_events: list[ToolCallEvent],
+    ) -> str:
+        """Return a deterministic fallback when tool work completes without an answer."""
+        completed = [
+            event
+            for event in tool_events
+            if event.result is not None
+        ]
+        if not completed:
+            return (
+                "I completed the turn but failed to produce a final answer. "
+                "Please ask me to summarize the completed work."
+            )
+
+        lines = [
+            "I completed the tool work but failed to produce a final answer.",
+            "Latest gathered results:",
+        ]
+        for event in completed[-3:]:
+            if event.result is None:
+                continue
+            preview_source = event.result.output or event.result.error or ""
+            preview, _ = _compact_preview(preview_source, 220)
+            if preview:
+                lines.append(f"- {event.name}: {preview}")
+            else:
+                lines.append(f"- {event.name}: completed")
+        lines.append("Please ask me to restate or refine this summary if needed.")
+        return "\n".join(lines)
 
     @staticmethod
     def _tool_output_limit(tool_name: str) -> int:

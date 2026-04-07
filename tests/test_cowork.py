@@ -1086,6 +1086,107 @@ class TestCoworkSession:
         # Two executions, then recovery hint, then deterministic stop.
         assert len(turns[0].tool_calls) == 2
 
+    async def test_send_streaming_recovers_when_tool_turn_ends_without_final_text(
+        self,
+        workspace,
+        tools,
+    ):
+        class _EchoTool(Tool):
+            @property
+            def name(self) -> str:
+                return "echo_tool"
+
+            @property
+            def description(self) -> str:
+                return "Return deterministic test output."
+
+            @property
+            def parameters(self) -> dict:
+                return {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                }
+
+            async def execute(self, args: dict, ctx) -> ToolResult:
+                return ToolResult.ok(f"tool result: {args.get('value', '')}")
+
+        tools.register(_EchoTool())
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="echo-1",
+                    name="echo_tool",
+                    arguments={"value": "hello"},
+                )],
+                usage=TokenUsage(total_tokens=3),
+            ),
+            ModelResponse(text="", usage=TokenUsage(total_tokens=1)),
+            ModelResponse(text="Final recommendation.", usage=TokenUsage(total_tokens=2)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        async for event in session.send_streaming("use the tool then answer"):
+            events.append(event)
+
+        turns = [event for event in events if isinstance(event, CoworkTurn)]
+        assert len(turns) == 1
+        assert turns[0].text == "Final recommendation."
+        assert provider._call_count == 3
+
+    async def test_send_recovers_with_fallback_when_tool_turn_still_has_no_final_text(
+        self,
+        workspace,
+        tools,
+    ):
+        class _EchoTool(Tool):
+            @property
+            def name(self) -> str:
+                return "echo_tool"
+
+            @property
+            def description(self) -> str:
+                return "Return deterministic test output."
+
+            @property
+            def parameters(self) -> dict:
+                return {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                }
+
+            async def execute(self, args: dict, ctx) -> ToolResult:
+                return ToolResult.ok(f"tool result: {args.get('value', '')}")
+
+        tools.register(_EchoTool())
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="echo-1",
+                    name="echo_tool",
+                    arguments={"value": "world"},
+                )],
+                usage=TokenUsage(total_tokens=3),
+            ),
+            ModelResponse(text="", usage=TokenUsage(total_tokens=1)),
+            ModelResponse(text="", usage=TokenUsage(total_tokens=1)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        async for event in session.send("use the tool then answer"):
+            events.append(event)
+
+        turns = [event for event in events if isinstance(event, CoworkTurn)]
+        assert len(turns) == 1
+        assert "failed to produce a final answer" in turns[0].text.lower()
+        assert "echo_tool" in turns[0].text
+        assert "tool result: world" in turns[0].text
+
     async def test_send_estimates_tokens_when_usage_missing(self, workspace, tools):
         provider = MockProvider([
             ModelResponse(
