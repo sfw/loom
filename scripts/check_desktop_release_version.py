@@ -53,7 +53,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--tag",
-        help="Release tag to validate, e.g. desktop-v0.1.0 or refs/tags/desktop-v0.1.0.",
+        help="Release tag to validate, e.g. desktop-v0.3.0 or refs/tags/desktop-v0.3.0.",
     )
     parser.add_argument(
         "--tag-prefix",

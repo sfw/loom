@@ -1270,7 +1270,7 @@ mod tests {
                     String::from("pdf"),
                     String::from("treesitter"),
                 ],
-                loom_version: String::from("0.2.2"),
+                loom_version: String::from("0.3.0"),
                 python_version: String::from("3.11.14"),
                 python_request: String::from("3.11.14"),
                 python_home_relative_path: String::from("python"),
@@ -1284,7 +1284,7 @@ mod tests {
 
         let runtime = resolve_packaged_runtime_from(&dir).unwrap();
         assert_eq!(runtime.enabled_extras, vec!["browser", "mcp", "pdf", "treesitter"]);
-        assert_eq!(runtime.loom_version, "0.2.2");
+        assert_eq!(runtime.loom_version, "0.3.0");
         assert_eq!(runtime.python_version, "3.11.14");
         assert_eq!(runtime.python_request, "3.11.14");
         assert_eq!(runtime.uv_version, "uv 0.10.12");
@@ -1316,7 +1316,7 @@ mod tests {
                 String::from("pdf"),
                 String::from("treesitter"),
             ],
-            loom_version: String::from("0.2.2"),
+            loom_version: String::from("0.3.0"),
             python_version: String::from("3.11.14"),
             python_request: String::from("3.11.14"),
             uv_version: String::from("uv 0.10.12"),

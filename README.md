@@ -4,9 +4,9 @@
 
 ![Loom hero](docs/images/loom2.png)
 
-**Local-ready LLM execution harness** for complex tasks.
+**Desktop and terminal LLM execution harness** for complex tasks.
 
-Loom decomposes goals, drives execution through verified steps, routes between thinking and acting models, and keeps work on track with structured state instead of chat history. Use it via TUI, CLI, API, or MCP with local, cloud, or mixed local/cloud models.
+Loom decomposes goals, drives execution through verified steps, routes between thinking and acting models, and keeps work on track with structured state instead of chat history. Use it via the macOS desktop app, TUI, CLI, API, or MCP with local, cloud, or mixed local/cloud models.
 
 Bring Kimi, Minimax, GLM, Claude, or any OpenAI-compatible model and Loom supplies the harness: tool calling, structured planning, parallel execution, independent verification, and persistent memory.
 
@@ -32,11 +32,15 @@ Loom breaks complex work into smaller, solvable units, runs them in sequence, an
 
 Loom is local-ready and supports local models natively, so you get privacy, control, and lower operating cost. It is not limited to local inference: you can use cloud models too, and apply Loom to far more than coding, including research, analysis, and operational workflows.
 
-## Two Ways to Work
+## Ways to Work
 
-**Interactive** (`uv run loom`) -- Work with a model in a rich terminal UI. You talk, the model responds and uses tools, you see what it's doing in real time. Streaming text, inline diffs, per-tool-call approval, session persistence, conversation recall, and slash commands for control.
+**Desktop app** (macOS, workspace-first) -- Open a local workspace and manage Loom through a native shell backed by `loomd`. The desktop app gives you workspace overview, threads, runs, approval inbox, file browsing/editing, search, and runtime/settings panels in one place.
 
-**Autonomous** (`uv run loom run`) -- Give Loom a goal, walk away. It decomposes the work into subtasks with a dependency graph, runs independent subtasks in parallel, verifies each result with an independent model, and replans when things go wrong.
+**Interactive TUI** (`uv run loom`) -- Work with a model in a rich terminal UI. You talk, the model responds and uses tools, you see what it's doing in real time. Streaming text, inline diffs, per-tool-call approval, session persistence, conversation recall, and slash commands for control.
+
+**Autonomous runs** (`uv run loom run`) -- Give Loom a goal, walk away. It decomposes the work into subtasks with a dependency graph, runs independent subtasks in parallel, verifies each result with an independent model, and replans when things go wrong.
+
+**Programmatic integration** (`uv run loom serve`, `uv run loom mcp-serve`) -- Expose the same engine to scripts, dashboards, external agents, and IDEs over REST, SSE, or MCP.
 
 ```
                     +----------------------------+
@@ -76,16 +80,21 @@ It also ships research helpers (academic search, archives, citations, fact check
 
 If you're new, start with:
 
-1. `uv sync` to install dependencies.
-2. `uv run loom -w /path/to/workspace` to launch the TUI and run setup.
-3. `/run <goal>` inside the TUI for your first harnessed task.
-4. `uv run loom run "<goal>" -w /path/to/workspace` for autonomous execution.
+1. `uv sync` to install the Python runtime.
+2. Choose an interface:
+   - TUI: `uv run loom -w /path/to/workspace`
+   - API/runtime only: `uv run loom serve` or `uv run loomd`
+   - Desktop app dev shell (macOS): `pnpm install` then `pnpm desktop:tauri:dev`
+3. Run your first task:
+   - TUI: `/run <goal>`
+   - CLI: `uv run loom run "<goal>" -w /path/to/workspace`
+   - Desktop: add a workspace, then launch a thread or run from the app shell
 
 ```bash
 # Install
 uv sync          # or: pip install -e .
 
-# Launch — the setup wizard runs automatically on first start
+# Launch the TUI — the setup wizard runs automatically on first start
 uv run loom -w /path/to/workspace
 
 # With a process definition (explicit run command)
@@ -111,11 +120,34 @@ uv run loom run "Analyze Q3 financials and flag anomalies" -w /tmp/analysis
 # Start the API server (for programmatic access)
 uv run loom serve
 
-# Start the desktop sidecar runtime
+# Start the desktop sidecar/runtime directly
 uv run loomd
+
+# Desktop app development shell (macOS)
+pnpm install
+pnpm desktop:tauri:dev
 ```
 
-## Desktop Sidecar
+See also:
+
+- [Tutorial](docs/tutorial.html)
+- [Configuration reference](docs/CONFIG.md)
+- [macOS desktop packaging](docs/DESKTOP-MACOS-PACKAGING.md)
+
+## Desktop App and Sidecar
+
+Loom Desktop is a workspace-first macOS shell built with Tauri and React on top
+of the existing Python engine. It is not a second implementation of Loom; it
+uses the same runtime, models, tools, memory, and run orchestration as the TUI
+and API surfaces.
+
+Today the desktop UI is focused on:
+
+- workspace registration and overview
+- thread creation, streaming, approvals, and replay
+- autonomous run launch, monitoring, pause/resume, restart, and operator messaging
+- file browsing, previewing, editing, importing, and artifact context
+- approval inbox, notifications, command palette, and runtime/settings inspection
 
 The workspace-first desktop direction uses a local `loomd` sidecar by default,
 not Docker. `loomd` reuses the existing Python engine and exposes a stable
@@ -144,7 +176,7 @@ uv run loomd \
   --workspace-default-path ~/projects
 ```
 
-The Tauri desktop shell now starts `loomd` itself. It gives the sidecar a
+The Tauri desktop shell starts `loomd` itself. It gives the sidecar a
 desktop-scoped SQLite DB, scratch dir, and log file under the app data
 directory, and picks an available loopback port starting at `127.0.0.1:9000`.
 The sidecar keeps SQLite as the default local store and is tuned for that
@@ -162,7 +194,11 @@ signing notes.
 
 ## Configuration
 
-On first launch, Loom's built-in setup wizard walks you through provider selection, model configuration, and role assignment — all inside the TUI. The wizard writes `~/.loom/loom.toml` for you. Run `/setup` from inside the TUI at any time to reconfigure, or `uv run loom setup` from the CLI.
+On first launch, Loom's built-in setup wizard walks you through provider selection, model configuration, and role assignment inside the TUI. The wizard writes `~/.loom/loom.toml` for you. Run `/setup` from inside the TUI at any time to reconfigure, or `uv run loom setup` from the CLI.
+
+The desktop app reads the same Loom config and model registry, but manages its
+own runtime-owned SQLite DB, scratch dir, and logs under the desktop app-data
+directory so it does not collide with the default CLI/TUI state paths.
 
 You can also create the config manually. Loom reads `loom.toml` from the current directory or `~/.loom/loom.toml`:
 
@@ -449,6 +485,7 @@ In the TUI, use `/learned` to open an interactive review screen for learned beha
 
 ## Interfaces
 
+- **Desktop App** (macOS) -- workspace-first native shell with overview, threads, runs, files, approval inbox, command palette, notifications, and runtime/settings panels. The app starts and owns a local `loomd` sidecar automatically.
 - **Interactive TUI** (`uv run loom`) -- rich terminal interface with chat panel, sidebar, diff viewer, tool approval modals, event log, and setup wizard. Includes session persistence/recall, task delegation, process discovery (`/processes`), in-process orchestration (`/run <goal|@goal-file [goal]|close [run-id-prefix]>`), direct process commands (`/<process-name> <goal>`), learned-pattern review (`/learned`), MCP config controls (`/mcp ...`), auth profile controls (`/auth ...`), and click-to-open workspace previews for Markdown/code/JSON/CSV/HTML/diff/Office/PDF/images. `Ctrl+W` closes the active process-run tab with confirmation. `/run` executes in-process and does not require `uv run loom serve`; `/run problem.md` and `/run @problem.md optional-goal` load file content into planning context.
 - **REST API** -- 20 endpoints for task CRUD, SSE streaming, steering, approval, feedback, memory search
 - **MCP server** -- Model Context Protocol integration so other agents can use Loom as a tool
@@ -461,6 +498,7 @@ uv run loom cowork             Alias for the interactive TUI
 uv run loom setup              Run the configuration wizard (CLI fallback)
 uv run loom run GOAL           Autonomous task execution (server-backed) with `/run`-equivalent process resolution
 uv run loom serve              Start the API server
+uv run loomd                   Start the desktop/API sidecar runtime directly
 uv run loom status ID          Check task status
 uv run loom cancel ID          Cancel a running task
 uv run loom models             List configured models
@@ -508,20 +546,28 @@ src/loom/
   state/                 Task state, SQLite memory archive, conversation store
   tools/                 30 built-in tools with auto-discovery, safety, changelog + tree-sitter backend
   tui/                   Textual TUI: chat, sidebar, diff viewer, modals, events
+
+apps/desktop/
+  src/                   React desktop shell (overview, threads, runs, files, settings)
+  src-tauri/             Tauri host, sidecar ownership, packaging config
 ```
 
 ## Development
 
 ```bash
 uv sync --extra dev     # or: pip install -e ".[dev]"
+pnpm install            # desktop app dependencies
 pytest                  # full test suite
 ruff check src/ tests/  # lint
+pnpm desktop:test       # desktop frontend tests
 ```
 
 ## Requirements
 
 - Python 3.11+
 - A model backend: [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), any OpenAI-compatible API, or [Anthropic/Claude](https://console.anthropic.com)
+- For desktop development: `pnpm` + a Rust toolchain
+- Packaged desktop builds are currently macOS-only
 
 ## License
 

@@ -8,6 +8,12 @@ This guide shows how to connect external agents (Claude Code, custom scripts, cr
 
 This document covers both modes.
 
+If you are running Loom Desktop on macOS, that app is using the same local
+runtime family via `loomd`. External agents can target a manually started
+`loom serve`/`loomd` instance on loopback, but the packaged desktop-managed
+runtime is meant to stay machine-local rather than serve as a shared remote
+deployment target.
+
 ## Architecture
 
 ```

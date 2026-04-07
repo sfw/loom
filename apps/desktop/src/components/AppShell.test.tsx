@@ -105,7 +105,7 @@ describe("AppShell close confirmation", () => {
       notice: "",
       setError: vi.fn(),
       setNotice: vi.fn(),
-      runtime: { ready: true, version: "0.2.2" },
+      runtime: { ready: true, version: "0.3.0" },
       overview: {
         workspace: null,
         recent_conversations: [],

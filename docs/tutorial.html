@@ -411,6 +411,7 @@
   <a href="#first-task">Your First Task</a>
   <a href="#streaming">Streaming Events</a>
   <a href="#steering">Steering Tasks</a>
+  <a href="#desktop">Desktop App</a>
   <a href="#tui">Interactive TUI</a>
   <div class="section-label">Features</div>
   <a href="#processes">Process Definitions</a>
@@ -433,7 +434,7 @@
 <!-- ======================== INTRO ======================== -->
 <section id="intro">
   <h1>Loom Tutorial</h1>
-  <p class="subtitle">Build, run, and monitor tasks with local LLMs -- from installation to production.</p>
+  <p class="subtitle">Build, run, and monitor tasks with local LLMs from the desktop app, terminal, or API.</p>
 
   <div class="diagram">
     <span class="highlight">Goal</span> <span class="flow">&rarr;</span> <span class="highlight">Planner</span> <span class="flow">&rarr;</span> <span class="dim">[</span><span class="highlight">Subtask 1</span><span class="dim">]</span> <span class="flow">&rarr;</span> <span class="dim">[</span><span class="highlight">Subtask 2</span><span class="dim">]</span> <span class="flow">&rarr;</span> <span class="dim">...</span> <span class="flow">&rarr;</span> <span class="highlight">Done</span>
@@ -465,6 +466,11 @@
   </div>
 
   <p>Loom is local-first and can run fully on your machine. It also supports mixed local/cloud setups with <strong>Ollama</strong>, <strong>LM Studio</strong>, <strong>Anthropic/Claude</strong>, or any <strong>OpenAI-compatible API</strong>.</p>
+
+  <div class="callout callout-info">
+    <strong>Choose your surface</strong>
+    Use the macOS desktop app for a workspace-first operator view, the TUI for the cross-platform terminal workflow, or the REST/MCP runtime for automation and agent integrations.
+  </div>
 </section>
 
 <!-- ======================== INSTALL ======================== -->
@@ -499,7 +505,7 @@
 
 <span class="cmt"># Verify</span>
 <span class="cmd">uv run loom</span> <span class="flag">--version</span>
-<span class="cmt"># loom, version 0.2.2</span></code></pre>
+<span class="cmt"># loom, version 0.3.0</span></code></pre>
 
   <details class="accordion">
     <summary>Alternative: Install with pip</summary>
@@ -514,6 +520,11 @@
   <div class="callout callout-info">
     <strong>Optional extras</strong>
     Install MCP server support with <code>uv sync --extra mcp</code> or <code>pip install -e ".[mcp]"</code>.
+  </div>
+
+  <div class="callout callout-info">
+    <strong>Desktop app development</strong>
+    Loom Desktop currently targets macOS. Source builds also need <code>pnpm</code> and a Rust toolchain because the UI is a Tauri + React app layered over the Python runtime.
   </div>
 </section>
 
@@ -752,7 +763,7 @@
 <h3>Verify it's running</h3>
 <pre><code><span class="cmt"># In another terminal:</span>
 <span class="cmd">curl</span> http://localhost:9000/health
-<span class="cmt"># {"status":"ok","version":"0.2.2"}</span>
+<span class="cmt"># {"status":"ok","version":"0.3.0"}</span>
 
 <span class="cmt"># Check configured models:</span>
 <span class="cmd">curl</span> http://localhost:9000/models
@@ -765,6 +776,11 @@
   <div class="callout callout-success">
     <strong>Interactive API docs</strong>
     Open <code>http://localhost:9000/docs</code> in your browser for the auto-generated Swagger UI.
+  </div>
+
+  <div class="callout callout-info">
+    <strong>Desktop vs server runtime</strong>
+    Use <code>loom serve</code> when you want to run the full REST server yourself. Use <code>uv run loomd</code> for the desktop-oriented local sidecar. If you are running Loom Desktop, the app usually starts <code>loomd</code> for you.
   </div>
 </section>
 
@@ -912,11 +928,51 @@
   <pre><code><span class="cmd">curl</span> <span class="flag">-X DELETE</span> http://localhost:9000/tasks/<span class="str">TASK_ID</span></code></pre>
 </section>
 
+<!-- ======================== DESKTOP ======================== -->
+<section id="desktop">
+  <h2>Desktop App</h2>
+
+  <p>Loom Desktop is the workspace-first native shell for Loom. It runs on macOS today and starts a local <code>loomd</code> sidecar automatically, so the desktop UI, runtime, and persistence all stay on the same machine.</p>
+
+  <h3>What the desktop app is for</h3>
+  <p>The desktop shell is built around operational workflows: add a workspace, inspect its overview, jump between recent threads and runs, review approvals, browse or edit files, and monitor runtime/model settings without leaving the app.</p>
+
+  <table>
+    <tr><th>Area</th><th>What you can do</th></tr>
+    <tr><td><code>Overview</code></td><td>See workspace health, active runs, pending approvals, recent threads, recent runs, and recent files</td></tr>
+    <tr><td><code>Threads</code></td><td>Start interactive conversations, stream replies, handle approvals, and replay rich event history</td></tr>
+    <tr><td><code>Runs</code></td><td>Launch ad-hoc or process-backed runs, pause/resume/restart them, inspect run timelines, and send operator messages</td></tr>
+    <tr><td><code>Files</code></td><td>Browse the workspace tree, preview docs/code/data files, edit text files, import files, and jump from run artifacts back to source files</td></tr>
+    <tr><td><code>Settings</code></td><td>Inspect runtime info, models, and grouped config settings exposed by the runtime registry</td></tr>
+  </table>
+
+  <h3>Run the desktop shell from source</h3>
+  <pre><code><span class="cmt"># From the repo root</span>
+<span class="cmd">uv sync</span>
+<span class="cmd">pnpm install</span>
+
+<span class="cmt"># Launch the Tauri desktop shell (macOS)</span>
+<span class="cmd">pnpm</span> desktop:tauri:dev</code></pre>
+
+  <p>The Tauri shell bootstraps a local <code>loomd</code> process for you. In development, you can still point the UI at a manually started runtime if you need to debug the backend separately.</p>
+
+  <pre><code><span class="cmt"># Optional: run the desktop/API sidecar directly</span>
+<span class="cmd">uv run loomd</span>
+
+<span class="cmt"># Optional: point the desktop frontend at an existing runtime</span>
+<span class="cmd">VITE_LOOMD_URL</span>=http://127.0.0.1:9000 <span class="cmd">pnpm</span> desktop:tauri:dev</code></pre>
+
+  <div class="callout callout-info">
+    <strong>Packaged desktop builds</strong>
+    The packaged desktop path bundles a private Python runtime and locked Loom environment inside the app bundle, while runtime state stays outside the signed bundle under the app-data directory. See <code>docs/DESKTOP-MACOS-PACKAGING.md</code> for build, smoke-test, and release details.
+  </div>
+</section>
+
 <!-- ======================== TUI ======================== -->
 <section id="tui">
   <h2>Interactive TUI</h2>
 
-  <p>Loom's default interface is a rich terminal UI built with <strong>Textual</strong>. It runs the model directly &mdash; no server needed. Just run <code>loom</code>.</p>
+  <p>The TUI is Loom's cross-platform terminal interface, built with <strong>Textual</strong>. It runs the model directly &mdash; no separate server process is required for the normal terminal workflow. Just run <code>loom</code>.</p>
 
   <pre><code><span class="cmt"># Launch the interactive TUI (default command)</span>
 <span class="cmd">loom</span> <span class="flag">-w</span> /path/to/project

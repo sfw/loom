@@ -54,13 +54,13 @@ describe("useConnection", () => {
     apiMocks.fetchRuntimeStatus
       .mockResolvedValueOnce({
         ready: true,
-        version: "0.2.2",
+        version: "0.3.0",
         workspace_default_path: "/tmp/workspaces",
       })
       .mockRejectedValueOnce(new Error("offline"))
       .mockResolvedValue({
         ready: true,
-        version: "0.2.2",
+        version: "0.3.0",
         workspace_default_path: "/tmp/workspaces",
       });
     apiMocks.bootstrapDesktopRuntime.mockResolvedValue(true);
@@ -108,7 +108,7 @@ describe("useConnection", () => {
     apiMocks.fetchRuntimeStatus
       .mockResolvedValueOnce({
         ready: true,
-        version: "0.2.2",
+        version: "0.3.0",
         workspace_default_path: "/tmp/workspaces",
       })
       .mockRejectedValueOnce(new Error("offline"))
@@ -116,7 +116,7 @@ describe("useConnection", () => {
       .mockRejectedValueOnce(new Error("offline"))
       .mockResolvedValue({
         ready: true,
-        version: "0.2.2",
+        version: "0.3.0",
         workspace_default_path: "/tmp/workspaces",
       });
 

@@ -96,7 +96,7 @@ describe("Sidebar", () => {
       showArchivedWorkspaces: false,
       setShowArchivedWorkspaces: vi.fn(),
       setShowNewWorkspace: vi.fn(),
-      runtime: { ready: true, version: "0.2.2" },
+      runtime: { ready: true, version: "0.3.0" },
       connectionState: "connected",
       approvalInbox: [],
       overview: {
@@ -268,7 +268,7 @@ describe("Sidebar", () => {
 
     render(<Sidebar />);
 
-    expect(screen.getByText("Disconnected · 0.2.2")).toBeInTheDocument();
+    expect(screen.getByText("Disconnected · 0.3.0")).toBeInTheDocument();
   });
 
   it("updates workspace chevrons when the selected workspace changes", () => {

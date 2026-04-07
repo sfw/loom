@@ -6,6 +6,8 @@ This changelog is generated directly from git commit history (non-merge commits)
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-07
+
 - Add DB migration `20260403_006_search_provider_state_v1` for authoritative auth-free search provider pacing/cooldown state
 - Refactor `web_search` around shared SQLite-backed provider authority: `DuckDuckGo` is now the primary auth-free provider, provider pacing is coordinated across Loom runs, and DDG waits are skipped when they would violate the tool runtime budget
 - Unify task/cowork data authority boundaries: canonical task snapshots now gate run-control writes, cowork semantics come from `conversation_turns`, transcript replay is journal-coverage-aware, and cowork session checkpoints record the turn boundary they cover
