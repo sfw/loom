@@ -50,7 +50,7 @@ def test_steering_and_turn_helpers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_interaction_renders_live_feedback_chunks() -> None:
+async def test_run_interaction_suppresses_live_feedback_chunks() -> None:
     class FakeSession:
         persisted_turn_count = 0
 
@@ -88,14 +88,7 @@ async def test_run_interaction_renders_live_feedback_chunks() -> None:
 
     await turns.run_interaction(app, "hello")
 
-    chat.add_live_feedback.assert_any_call("First pass.")
-    chat.add_live_feedback.assert_any_call("Second pass.")
     chat.add_model_text.assert_called_once_with("Final answer.")
-    app._append_chat_replay_event.assert_any_call(
-        "assistant_thinking",
-        {"text": "First pass.", "streaming": True},
-    )
-    app._append_chat_replay_event.assert_any_call(
-        "assistant_thinking",
-        {"text": "Second pass.", "streaming": True},
-    )
+    chat.add_live_feedback.assert_not_called()
+    replay_event_types = [call.args[0] for call in app._append_chat_replay_event.await_args_list]
+    assert "assistant_thinking" not in replay_event_types

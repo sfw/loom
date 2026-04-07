@@ -170,6 +170,15 @@ class ChatLog(VerticalScroll):
         max-width: 140;
         color: $text-muted;
     }
+    ChatLog .approval-prompt {
+        margin: 1 0 0 0;
+        padding: 1 2;
+        width: 100%;
+        max-width: 140;
+        border: round $warning;
+        background: $surface;
+        color: $text;
+    }
     """
 
     def __init__(self, **kwargs) -> None:
@@ -519,8 +528,58 @@ class ChatLog(VerticalScroll):
         self._scroll_to_end()
         return widget
 
+    def add_approval_prompt(
+        self,
+        prompt_id: str,
+        tool_name: str,
+        args_preview: str,
+        *,
+        risk_info: dict | None = None,
+    ) -> None:
+        """Surface an active approval request at the bottom of the chat."""
+        key = str(prompt_id or "").strip()
+        if not key:
+            return
+
+        risk_label = "[#e0af68]Approval required[/]"
+        if isinstance(risk_info, dict):
+            risk_level = str(risk_info.get("risk_level", "") or "").strip().upper()
+            action_class = str(risk_info.get("action_class", "") or "").strip()
+            details = " ".join(part for part in [risk_level, action_class] if part).strip()
+            if details:
+                risk_label = f"[#f7768e]{details}[/]"
+
+        preview = str(args_preview or "").strip()
+        lines = [
+            f"{risk_label} [bold #7dcfff]{tool_name}[/]",
+        ]
+        if preview:
+            escaped_preview = preview.replace("[", "\\[")
+            lines.append(f"[dim]{escaped_preview}[/dim]")
+        lines.append(
+            "[#9ece6a]y[/] Yes  [#7dcfff]a[/] Always allow  "
+            "[#f7768e]n[/] No  [dim]Esc[/dim] Cancel"
+        )
+        self.upsert_info_line_with_classes(
+            key,
+            "\n".join(lines),
+            markup=True,
+            classes="info-msg approval-prompt",
+        )
+
     def upsert_info_line(self, line_id: str, text: str, *, markup: bool = True) -> None:
         """Insert or update a keyed informational line in place."""
+        self.upsert_info_line_with_classes(line_id, text, markup=markup)
+
+    def upsert_info_line_with_classes(
+        self,
+        line_id: str,
+        text: str,
+        *,
+        markup: bool = True,
+        classes: str = "info-msg",
+    ) -> None:
+        """Insert or update a keyed informational line in place with classes."""
         key = str(line_id or "").strip()
         if not key:
             self.add_info(text, markup=markup)
@@ -529,12 +588,28 @@ class ChatLog(VerticalScroll):
         self._flush_and_reset_stream()
         widget = self._keyed_info_widgets.get(key)
         if widget is None or not widget.is_attached:
-            widget = Static(text, classes="info-msg", expand=True, markup=markup)
+            widget = Static(text, classes=classes, expand=True, markup=markup)
             self.mount(widget)
             self._keyed_info_widgets[key] = widget
         else:
             widget.update(text)
         self._scroll_to_end()
+
+    def clear_info_line(self, line_id: str) -> None:
+        """Remove a keyed informational line if it exists."""
+        key = str(line_id or "").strip()
+        if not key:
+            return
+        widget = self._keyed_info_widgets.pop(key, None)
+        if widget is None:
+            return
+        try:
+            widget.remove()
+        except Exception:
+            try:
+                widget.display = False
+            except Exception:
+                pass
 
     def add_content_indicator(self, content_blocks: list) -> None:
         """Display inline indicators for multimodal content blocks.

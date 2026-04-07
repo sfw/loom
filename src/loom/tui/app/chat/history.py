@@ -84,7 +84,8 @@ def render_chat_event(self, event: dict, *, source: str = "unknown") -> bool:
             )
             return True
         if event_type == "assistant_thinking":
-            chat.add_live_feedback(str(payload.get("text", "") or ""))
+            # Older sessions may contain assistant-thinking replay rows, but the
+            # desktop chat no longer renders a second live/thinking panel.
             return True
         if event_type in {"tool_call_started", "tool_call_completed"}:
             args = payload.get("args", {})

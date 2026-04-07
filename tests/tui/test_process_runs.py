@@ -1285,7 +1285,7 @@ class TestWorkspaceRefresh:
         })
         chat.add_info.assert_called_once_with("Stopped current chat execution.", markup=True)
 
-    def test_render_chat_event_assistant_thinking_rehydrates(self):
+    def test_render_chat_event_assistant_thinking_is_ignored(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -1303,7 +1303,7 @@ class TestWorkspaceRefresh:
                 "streaming": True,
             },
         })
-        chat.add_live_feedback.assert_called_once_with("Looking up more context.")
+        chat.add_live_feedback.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_switch_session_clears_files_panel(self, monkeypatch):

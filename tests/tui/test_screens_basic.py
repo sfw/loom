@@ -98,6 +98,46 @@ class TestToolApprovalScreen:
 
 class TestApprovalCallback:
     @pytest.mark.asyncio
+    async def test_approval_callback_surfaces_prompt_in_chat(self):
+        from loom.cowork.approval import ApprovalDecision
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        chat = MagicMock()
+        callbacks: list = []
+
+        def _push_screen(_screen, callback):
+            callbacks.append(callback)
+
+        def _query_one(selector, *_args, **_kwargs):
+            assert selector == "#chat-log"
+            return chat
+
+        app.push_screen = _push_screen
+        app.query_one = _query_one
+
+        pending = asyncio.create_task(
+            app._approval_callback("shell_execute", {"command": "echo 1"}),
+        )
+        await asyncio.sleep(0)
+
+        chat.add_approval_prompt.assert_called_once()
+        prompt_id, tool_name, preview = chat.add_approval_prompt.call_args.args
+        assert prompt_id.startswith("approval:")
+        assert tool_name == "shell_execute"
+        assert preview == "echo 1"
+
+        callbacks[0]("approve")
+        result = await asyncio.wait_for(pending, timeout=1)
+
+        assert result == ApprovalDecision.APPROVE
+        chat.clear_info_line.assert_called_once_with(prompt_id)
+
+    @pytest.mark.asyncio
     async def test_approval_callback_events_are_not_clobbered_by_overlap(self):
         from loom.cowork.approval import ApprovalDecision
         from loom.tui.app import LoomApp

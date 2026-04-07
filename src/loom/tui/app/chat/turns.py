@@ -129,14 +129,10 @@ async def run_interaction(self, message: str) -> None:
         elif isinstance(event, tuple) and len(event) == 2 and event[0] == "thinking":
             thinking_text = str(event[1] or "")
             if thinking_text:
-                chat.add_live_feedback(thinking_text)
-                await self._append_chat_replay_event(
-                    "assistant_thinking",
-                    {
-                        "text": thinking_text,
-                        "streaming": True,
-                    },
-                )
+                # Desktop chat intentionally suppresses separate assistant-thinking
+                # panels so the primary streaming response remains the only live
+                # surface during a turn.
+                continue
 
         elif isinstance(event, ToolCallEvent):
             if event.result is None:
