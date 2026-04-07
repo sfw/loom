@@ -1,12 +1,14 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
 import {
+  createTask,
   fetchConversationEvents,
   fetchConversationMessages,
   fetchRunDetail,
   fetchRuntimeStatus,
   fetchRunTimeline,
   fetchWorkspaceFiles,
+  restartRun,
   subscribeConversationStream,
   subscribeNotificationsStream,
   subscribeRunStream,
@@ -188,6 +190,59 @@ describe("request timeouts", () => {
     await eventsAssertion;
     expect(abortMessages).toHaveLength(2);
     expect(abortMessages.every((message) => message.includes("20000ms"))).toBe(true);
+  });
+
+  it("uses the launch timeout budget for creating runs", async () => {
+    vi.useFakeTimers();
+    let abortMessage = "";
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+      const signal = init?.signal as AbortSignal | undefined;
+      signal?.addEventListener("abort", () => {
+        const reason = signal.reason;
+        abortMessage = String(reason instanceof Error ? reason.message : reason || "");
+        reject(reason);
+      }, { once: true });
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const request = createTask({
+      goal: "Launch a run",
+      workspace: "/tmp/workspace",
+    });
+    const assertion = expect(request).rejects.toThrow("Request timed out after 60000ms");
+
+    await vi.advanceTimersByTimeAsync(20000);
+    expect(abortMessage).toBe("");
+
+    await vi.advanceTimersByTimeAsync(40000);
+
+    await assertion;
+    expect(abortMessage).toContain("60000ms");
+  });
+
+  it("uses the launch timeout budget for restarting runs", async () => {
+    vi.useFakeTimers();
+    let abortMessage = "";
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+      const signal = init?.signal as AbortSignal | undefined;
+      signal?.addEventListener("abort", () => {
+        const reason = signal.reason;
+        abortMessage = String(reason instanceof Error ? reason.message : reason || "");
+        reject(reason);
+      }, { once: true });
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const request = restartRun("run-1");
+    const assertion = expect(request).rejects.toThrow("Request timed out after 60000ms");
+
+    await vi.advanceTimersByTimeAsync(20000);
+    expect(abortMessage).toBe("");
+
+    await vi.advanceTimersByTimeAsync(40000);
+
+    await assertion;
+    expect(abortMessage).toContain("60000ms");
   });
 
   it("requests a capped run timeline payload", async () => {

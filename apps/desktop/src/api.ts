@@ -545,6 +545,7 @@ let runtimeBaseUrl = (() => {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
 const HEAVY_REQUEST_TIMEOUT_MS = 20000;
+const RUN_LAUNCH_REQUEST_TIMEOUT_MS = 60000;
 const RUN_TIMELINE_REQUEST_LIMIT = 1000;
 
 type RequestJsonInit = RequestInit & {
@@ -975,6 +976,7 @@ export function createTask(body: TaskCreateRequest): Promise<TaskCreateResponse>
     headers: {
       "content-type": "application/json",
     },
+    timeoutMs: RUN_LAUNCH_REQUEST_TIMEOUT_MS,
   });
 }
 
@@ -1005,6 +1007,7 @@ export function deleteRun(runId: string): Promise<RunActionResponse> {
 export function restartRun(runId: string): Promise<TaskCreateResponse> {
   return requestJson<TaskCreateResponse>(`/runs/${encodeURIComponent(runId)}/restart`, {
     method: "POST",
+    timeoutMs: RUN_LAUNCH_REQUEST_TIMEOUT_MS,
   });
 }
 
