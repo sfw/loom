@@ -145,7 +145,7 @@ from loom.config_runtime import (
     ConfigPersistDisabledError,
     list_entries,
 )
-from loom.content import serialize_block
+from loom.content import deserialize_block, serialize_block
 from loom.content_utils import extract_docx_text, extract_pptx_text, get_image_dimensions
 from loom.cowork.approval import ApprovalDecision as CoworkApprovalDecision
 from loom.cowork.approval import ToolApprover
@@ -193,7 +193,11 @@ from loom.mcp.config import (
 from loom.oauth.engine import OAuthEngine, OAuthEngineError, OAuthProviderConfig
 from loom.processes.run_workspace import provision_scoped_run_workspace
 from loom.processes.schema import ProcessLoader
-from loom.read_scope import build_attached_read_scope, iter_context_workspace_paths
+from loom.read_scope import (
+    build_attached_read_scope,
+    iter_context_workspace_paths,
+    normalize_workspace_relative_read_path,
+)
 from loom.state.memory import MemoryEntry
 from loom.state.task_state import Plan, Subtask, SubtaskStatus, Task, TaskStatus
 from loom.state.workspaces import canonicalize_workspace_path
@@ -549,6 +553,231 @@ def _json_list(raw_value: object) -> list[Any]:
     except Exception:
         return []
     return list(parsed) if isinstance(parsed, list) else []
+
+
+def _is_hidden_workspace_relpath(relpath: str) -> bool:
+    return any(
+        segment.startswith(".")
+        for segment in str(relpath or "").replace("\\", "/").split("/")
+        if segment
+    )
+
+
+def _resolve_conversation_workspace_root(session: dict[str, Any] | None) -> Path | None:
+    if not isinstance(session, dict):
+        return None
+    raw = str(session.get("workspace", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser().resolve(strict=False)
+    except Exception:
+        return None
+
+
+def _validate_workspace_attachment_path(
+    relpath: str,
+    *,
+    workspace_root: Path | None,
+    expect_dir: bool | None = None,
+) -> str | None:
+    if _is_hidden_workspace_relpath(relpath):
+        return "hidden workspace paths cannot be attached"
+    if workspace_root is None or not workspace_root.exists() or not workspace_root.is_dir():
+        return None
+    try:
+        candidate = (workspace_root / relpath).resolve(strict=False)
+        candidate.relative_to(workspace_root)
+    except Exception:
+        return "path must stay within the workspace root"
+    if not candidate.exists():
+        return "path does not exist in the workspace"
+    if expect_dir is True and not candidate.is_dir():
+        return "path must reference a folder"
+    if expect_dir is False and not candidate.is_file():
+        return "path must reference a file"
+    return None
+
+
+def _normalize_attachment_source_path(
+    value: object,
+    *,
+    workspace_root: Path | None,
+    scratch_root: Path | None,
+    block_type: str,
+    media_type: str,
+) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        candidate = Path(raw).expanduser()
+    except Exception:
+        return ""
+    if not candidate.is_absolute():
+        return ""
+    try:
+        resolved = candidate.resolve(strict=False)
+    except Exception:
+        return ""
+    allowed_roots = [
+        root.resolve(strict=False)
+        for root in (workspace_root, scratch_root)
+        if root is not None
+    ]
+    if not allowed_roots:
+        return ""
+    try:
+        if not any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots):
+            return ""
+    except Exception:
+        return ""
+    if not resolved.exists() or not resolved.is_file():
+        return ""
+    normalized_media_type = str(media_type or "").strip().lower()
+    guessed_media_type, _ = mimetypes.guess_type(str(resolved))
+    if block_type == "image":
+        if not normalized_media_type.startswith("image/"):
+            return ""
+        if guessed_media_type and not guessed_media_type.startswith("image/"):
+            return ""
+    if block_type == "document":
+        if normalized_media_type != "application/pdf":
+            return ""
+        if resolved.suffix.lower() != ".pdf":
+            return ""
+    return str(resolved)
+
+
+def _normalize_conversation_content_blocks(
+    raw_blocks: object,
+    *,
+    workspace_root: Path | None,
+    scratch_root: Path | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if not isinstance(raw_blocks, list):
+        return [], []
+
+    normalized: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, item in enumerate(raw_blocks):
+        if not isinstance(item, dict):
+            errors.append(f"content_blocks[{index}] must be an object")
+            continue
+        try:
+            payload = serialize_block(deserialize_block(item))
+        except Exception:
+            errors.append(f"content_blocks[{index}] is not a valid content block")
+            continue
+        if not isinstance(payload, dict):
+            errors.append(f"content_blocks[{index}] is not a valid content block")
+            continue
+
+        btype = str(payload.get("type", "") or "").strip().lower()
+        if btype == "text":
+            if str(payload.get("text", "") or "").strip():
+                normalized.append(payload)
+            else:
+                errors.append(f"content_blocks[{index}] text blocks must not be empty")
+            continue
+        if btype in {"image", "document"}:
+            normalized_path = _normalize_attachment_source_path(
+                payload.get("source_path"),
+                workspace_root=workspace_root,
+                scratch_root=scratch_root,
+                block_type=btype,
+                media_type=str(payload.get("media_type", "") or ""),
+            )
+            if normalized_path:
+                payload["source_path"] = normalized_path
+                normalized.append(payload)
+            else:
+                errors.append(
+                    "content_blocks["
+                    f"{index}"
+                    "] must reference an existing file inside the workspace or scratch directory",
+                )
+            continue
+        errors.append(f"content_blocks[{index}] has unsupported type '{btype or 'unknown'}'")
+    return normalized, errors
+
+
+def _normalize_conversation_message_context(
+    body: ConversationMessageRequest,
+    *,
+    workspace_root: Path | None,
+    scratch_root: Path | None,
+) -> tuple[dict[str, Any], list[str]]:
+    context: dict[str, Any] = {}
+    errors: list[str] = []
+    for key in ("workspace_paths", "workspace_files", "workspace_directories"):
+        raw_values = getattr(body, key, [])
+        if not isinstance(raw_values, list):
+            continue
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        expect_dir = None
+        if key == "workspace_files":
+            expect_dir = False
+        elif key == "workspace_directories":
+            expect_dir = True
+        for index, item in enumerate(raw_values):
+            normalized = normalize_workspace_relative_read_path(item)
+            if not normalized:
+                errors.append(f"{key}[{index}] must be a workspace-relative path")
+                continue
+            validation_error = _validate_workspace_attachment_path(
+                normalized,
+                workspace_root=workspace_root,
+                expect_dir=expect_dir,
+            )
+            if validation_error:
+                errors.append(f"{key}[{index}] {validation_error}")
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            cleaned.append(normalized)
+        if cleaned:
+            context[key] = cleaned
+
+    merged_workspace_paths: list[str] = []
+    merged_seen: set[str] = set()
+    for key in ("workspace_paths", "workspace_directories", "workspace_files"):
+        for path in context.get(key, []):
+            if path in merged_seen:
+                continue
+            merged_seen.add(path)
+            merged_workspace_paths.append(path)
+    if merged_workspace_paths:
+        context["workspace_paths"] = merged_workspace_paths
+
+    content_blocks, block_errors = _normalize_conversation_content_blocks(
+        body.content_blocks,
+        workspace_root=workspace_root,
+        scratch_root=scratch_root,
+    )
+    errors.extend(block_errors)
+    if content_blocks:
+        context["content_blocks"] = content_blocks
+
+    return context, errors
+
+
+def _conversation_context_indicator_payload(context: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+    payload: dict[str, Any] = {}
+    for key in (
+        "workspace_paths",
+        "workspace_files",
+        "workspace_directories",
+        "content_blocks",
+    ):
+        value = context.get(key)
+        if isinstance(value, list) and value:
+            payload[key] = value
+    return payload
 
 
 def _now_iso() -> str:
@@ -1336,6 +1565,86 @@ def _list_workspace_directory(
             ),
         )
     return rows
+
+
+def _search_workspace_paths(
+    workspace: dict[str, Any],
+    *,
+    query: str,
+    limit: int,
+    scan_limit: int = 8000,
+) -> list[WorkspaceFileEntryResponse]:
+    workspace_root = _workspace_root_path(workspace)
+    if not workspace_root.exists() or not workspace_root.is_dir():
+        return []
+
+    clean_query = str(query or "").strip().lower()
+    candidates: list[tuple[int, int, int, str, WorkspaceFileEntryResponse]] = []
+    scanned = 0
+
+    def maybe_add(path: Path, *, is_dir: bool) -> None:
+        nonlocal scanned
+        scanned += 1
+        if scanned > scan_limit:
+            return
+        try:
+            relpath = _safe_workspace_relpath(workspace_root, path)
+            stat = path.stat()
+        except Exception:
+            return
+
+        if _is_hidden_workspace_relpath(relpath):
+            return
+        name = path.name
+        normalized_relpath = relpath.lower()
+        normalized_name = name.lower()
+        if clean_query:
+            if normalized_name.startswith(clean_query):
+                rank = 0
+            elif clean_query in normalized_name:
+                rank = 1
+            elif normalized_relpath.startswith(clean_query):
+                rank = 2
+            elif clean_query in normalized_relpath:
+                rank = 3
+            else:
+                return
+        else:
+            rank = 4
+
+        candidates.append((
+            rank,
+            0 if is_dir else 1,
+            relpath.count("/"),
+            relpath,
+            WorkspaceFileEntryResponse(
+                path=relpath,
+                name=name,
+                is_dir=is_dir,
+                size_bytes=0 if is_dir else int(stat.st_size or 0),
+                modified_at=datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+                extension="" if is_dir else path.suffix.lower(),
+            ),
+        ))
+
+    for root, dirnames, filenames in os.walk(workspace_root):
+        dirnames[:] = [dirname for dirname in dirnames if not dirname.startswith(".")]
+        filenames = [filename for filename in filenames if not filename.startswith(".")]
+        dirnames.sort(key=str.lower)
+        filenames.sort(key=str.lower)
+        for dirname in dirnames:
+            if scanned >= scan_limit:
+                break
+            maybe_add(Path(root) / dirname, is_dir=True)
+        for filename in filenames:
+            if scanned >= scan_limit:
+                break
+            maybe_add(Path(root) / filename, is_dir=False)
+        if scanned >= scan_limit:
+            break
+
+    candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    return [row for *_meta, row in candidates[: max(1, int(limit or 20))]]
 
 
 def _search_workspace_files(
@@ -3594,17 +3903,32 @@ async def _run_cowork_turn_for_api(
     conversation_id: str,
     session: CoworkSession,
     user_message: str,
+    message_context: dict[str, Any] | None = None,
 ) -> None:
     try:
         await session.resume(conversation_id)
+        context_payload = _conversation_context_indicator_payload(message_context)
         await _append_conversation_replay_event(
             engine,
             conversation_id,
             "user_message",
-            {"text": user_message},
+            {
+                "text": user_message,
+                **context_payload,
+            },
         )
+        if context_payload:
+            await _append_conversation_replay_event(
+                engine,
+                conversation_id,
+                "content_indicator",
+                context_payload,
+            )
         streamed_text = False
-        async for event in session.send_streaming(user_message):
+        async for event in session.send_streaming(
+            user_message,
+            message_metadata=context_payload,
+        ):
             if isinstance(event, tuple) and len(event) == 2 and event[0] == "thinking":
                 thinking_text = str(event[1] or "")
                 if thinking_text:
@@ -7118,6 +7442,26 @@ async def preview_workspace_file(
 
 
 @router.get(
+    "/workspaces/{workspace_id}/paths/search",
+    response_model=list[WorkspaceFileEntryResponse],
+)
+async def search_workspace_paths(
+    request: Request,
+    workspace_id: str,
+    q: str = "",
+    limit: int = 20,
+):
+    """Search files and directories for thread attachment/mention pickers."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    return _search_workspace_paths(
+        workspace,
+        query=q,
+        limit=max(1, min(int(limit or 20), 50)),
+    )
+
+
+@router.get(
     "/workspaces/{workspace_id}/artifacts",
     response_model=list[WorkspaceArtifactResponse],
 )
@@ -7624,6 +7968,7 @@ async def get_conversation_messages(
         rows: list[dict[str, Any]] = []
         for row in turns:
             item = dict(row)
+            item["metadata"] = _json_object(item.get("metadata"))
             item["tool_calls"] = _json_list(item.get("tool_calls"))
             rows.append(item)
         return rows
@@ -7736,8 +8081,17 @@ async def post_conversation_message(
         raise HTTPException(status_code=404, detail=f"Conversation not found: {conversation_id}")
 
     message = str(body.message or "").strip()
-    if not message:
-        raise HTTPException(status_code=422, detail="message is required")
+    workspace_root = _resolve_conversation_workspace_root(session)
+    scratch_root = engine.config.scratch_path
+    message_context, message_context_errors = _normalize_conversation_message_context(
+        body,
+        workspace_root=workspace_root,
+        scratch_root=scratch_root,
+    )
+    if message_context_errors:
+        raise HTTPException(status_code=422, detail="; ".join(message_context_errors))
+    if not message and not message_context:
+        raise HTTPException(status_code=422, detail="message or attachments are required")
 
     if engine.conversation_turn_inflight(conversation_id):
         raise HTTPException(
@@ -7755,6 +8109,7 @@ async def post_conversation_message(
                 conversation_id=conversation_id,
                 session=cowork_session,
                 user_message=message,
+                message_context=message_context,
             ),
         )
     except RuntimeError as exc:

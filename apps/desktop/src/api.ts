@@ -507,12 +507,36 @@ export interface ConversationDetail extends ConversationSummary {
   workspace: WorkspaceSummary;
 }
 
+export interface ConversationContentBlock {
+  type: string;
+  text?: string;
+  source_path?: string;
+  media_type?: string;
+  width?: number;
+  height?: number;
+  size_bytes?: number;
+  page_count?: number;
+  page_range?: number[];
+  extracted_text?: string;
+  text_fallback?: string;
+  thinking?: string;
+  signature?: string;
+}
+
+export interface ConversationMessageAttachments {
+  workspace_paths?: string[];
+  workspace_files?: string[];
+  workspace_directories?: string[];
+  content_blocks?: ConversationContentBlock[];
+}
+
 export interface ConversationMessage {
   id: number;
   session_id: string;
   turn_number: number;
   role: string;
   content: string | null;
+  metadata?: Record<string, unknown>;
   tool_calls: Array<Record<string, unknown>>;
   tool_call_id: string | null;
   tool_name: string | null;
@@ -1271,6 +1295,20 @@ export function fetchWorkspaceSearch(
   );
 }
 
+export function fetchWorkspacePathSuggestions(
+  workspaceId: string,
+  query: string,
+  limit = 20,
+): Promise<WorkspaceFileEntry[]> {
+  const params = new URLSearchParams({
+    q: query,
+    limit: String(limit),
+  });
+  return requestJson<WorkspaceFileEntry[]>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/paths/search?${params.toString()}`,
+  );
+}
+
 export function fetchGlobalSearch(
   query: string,
   limitPerGroup = 5,
@@ -1398,12 +1436,21 @@ export function sendConversationMessage(
   conversationId: string,
   message: string,
   role = "user",
+  attachments?: ConversationMessageAttachments,
 ): Promise<ConversationActionResponse> {
+  const body = {
+    message,
+    role,
+    workspace_paths: attachments?.workspace_paths || [],
+    workspace_files: attachments?.workspace_files || [],
+    workspace_directories: attachments?.workspace_directories || [],
+    content_blocks: attachments?.content_blocks || [],
+  };
   return requestJson<ConversationActionResponse>(
     `/conversations/${encodeURIComponent(conversationId)}/messages`,
     {
       method: "POST",
-      body: JSON.stringify({ message, role }),
+      body: JSON.stringify(body),
       headers: {
         "content-type": "application/json",
       },
@@ -1730,5 +1777,18 @@ export async function revealWorkspaceFile(
   await mod.invoke("desktop_reveal_workspace_file", {
     workspacePath,
     relativePath,
+  });
+}
+
+export async function writeScratchFile(
+  scratchDir: string,
+  suggestedName: string,
+  bytes: Uint8Array,
+): Promise<string> {
+  const mod = await import("@tauri-apps/api/core");
+  return await mod.invoke<string>("desktop_write_scratch_file", {
+    scratchDir,
+    suggestedName,
+    bytes: Array.from(bytes),
   });
 }

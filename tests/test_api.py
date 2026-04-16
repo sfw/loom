@@ -2524,6 +2524,38 @@ class TestWorkspaceFirstEndpoints:
         assert table_payload["table"]["rows"][0] == ["alpha", "done"]
 
     @pytest.mark.asyncio
+    async def test_workspace_path_search_skips_hidden_entries(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "workspace-path-search-ws"
+        (workspace_path / "src").mkdir(parents=True)
+        (workspace_path / ".git").mkdir()
+        (workspace_path / "src" / "app.tsx").write_text("export {};\n", encoding="utf-8")
+        (workspace_path / ".env").write_text("SECRET=1\n", encoding="utf-8")
+        (workspace_path / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Workspace Path Search WS",
+        )
+        assert workspace is not None
+
+        response = await client.get(
+            f"/workspaces/{workspace['id']}/paths/search",
+            params={"q": "", "limit": 20},
+        )
+        assert response.status_code == 200
+        paths = [row["path"] for row in response.json()]
+        assert "src" in paths
+        assert "src/app.tsx" in paths
+        assert ".env" not in paths
+        assert ".git" not in paths
+        assert ".git/config" not in paths
+
+    @pytest.mark.asyncio
     async def test_workspace_file_preview_rejects_escape_path(
         self,
         client,
@@ -2617,7 +2649,12 @@ class TestWorkspaceFirstEndpoints:
             async def resume(self, session_id: str) -> None:
                 self._session_id = session_id
 
-            async def send_streaming(self, user_message: str):
+            async def send_streaming(
+                self,
+                user_message: str,
+                *,
+                message_metadata: dict[str, object] | None = None,
+            ):
                 turn_count = await self._store.get_turn_count(self._session_id)
                 await self._store.append_turn(
                     self._session_id,
@@ -2667,6 +2704,168 @@ class TestWorkspaceFirstEndpoints:
         event_types = [row["event_type"] for row in events]
         assert "user_message" in event_types
         assert "assistant_text" in event_types
+
+    @pytest.mark.asyncio
+    async def test_post_conversation_message_persists_attachment_metadata_and_indicator(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "chat-attachments-ws"
+        workspace_path.mkdir()
+        (workspace_path / "src").mkdir()
+        (workspace_path / "src" / "app.tsx").write_text(
+            "export const app = true;\n",
+            encoding="utf-8",
+        )
+        (workspace_path / "docs").mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        scratch_image = engine.config.scratch_path / "pasted-image.png"
+        scratch_image.parent.mkdir(parents=True, exist_ok=True)
+        scratch_image.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        engine.model_router.add_provider(
+            "chat-model",
+            SimpleNamespace(name="chat-model", roles=["executor"], tier=1),
+        )
+        captured: dict[str, object] = {}
+
+        class FakeCoworkSession:
+            def __init__(self, *args, store=None, session_id="", **kwargs):
+                self._store = store
+                self._session_id = session_id
+
+            async def resume(self, session_id: str) -> None:
+                self._session_id = session_id
+
+            async def send_streaming(
+                self,
+                user_message: str,
+                *,
+                message_metadata: dict[str, object] | None = None,
+            ):
+                captured["message_metadata"] = dict(message_metadata or {})
+                turn_count = await self._store.get_turn_count(self._session_id)
+                await self._store.append_turn(
+                    self._session_id,
+                    turn_count + 1,
+                    "user",
+                    user_message,
+                    metadata=dict(message_metadata or {}),
+                )
+                await self._store.append_turn(
+                    self._session_id,
+                    turn_count + 2,
+                    "assistant",
+                    "Attachment-aware reply",
+                )
+                yield CoworkTurn(
+                    text="Attachment-aware reply",
+                    tool_calls=[],
+                    tokens_used=12,
+                    model="chat-model",
+                    latency_ms=10,
+                    total_time_ms=20,
+                    tokens_per_second=1.2,
+                    context_tokens=0,
+                    context_messages=0,
+                    omitted_messages=0,
+                    recall_index_used=False,
+                )
+
+        monkeypatch.setattr("loom.api.routes._cowork_session_cls", lambda: FakeCoworkSession)
+
+        response = await client.post(
+            f"/conversations/{session_id}/messages",
+            json={
+                "message": "Please review this screenshot",
+                "role": "user",
+                "workspace_paths": ["src/app.tsx", "docs"],
+                "workspace_files": ["src/app.tsx"],
+                "workspace_directories": ["docs"],
+                "content_blocks": [{
+                    "type": "image",
+                    "source_path": str(scratch_image),
+                    "media_type": "image/png",
+                    "text_fallback": "Screenshot",
+                }],
+            },
+        )
+        assert response.status_code == 202
+
+        for _ in range(20):
+            turns = await conversation_store.get_turns(session_id, limit=10)
+            if len(turns) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("background conversation attachment turn did not persist expected turns")
+
+        assert captured["message_metadata"] == {
+            "workspace_paths": ["src/app.tsx", "docs"],
+            "workspace_files": ["src/app.tsx"],
+            "workspace_directories": ["docs"],
+            "content_blocks": [{
+                "type": "image",
+                "source_path": str(scratch_image),
+                "media_type": "image/png",
+                "width": 0,
+                "height": 0,
+                "size_bytes": 0,
+                "text_fallback": "Screenshot",
+            }],
+        }
+        assert json.loads(turns[-2]["metadata"])["workspace_paths"] == ["src/app.tsx", "docs"]
+        events = await conversation_store.get_chat_events(session_id)
+        assert "content_indicator" in [row["event_type"] for row in events]
+
+    @pytest.mark.asyncio
+    async def test_post_conversation_message_rejects_invalid_explicit_context_attachments(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-attachments-invalid-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+        outside_image = tmp_path / "outside.png"
+        outside_image.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        response = await client.post(
+            f"/conversations/{session_id}/messages",
+            json={
+                "message": "Please inspect this",
+                "role": "user",
+                "workspace_paths": ["../secret.txt"],
+                "content_blocks": [{
+                    "type": "image",
+                    "source_path": str(outside_image),
+                    "media_type": "image/png",
+                    "text_fallback": "Screenshot",
+                }],
+            },
+        )
+
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert "workspace_paths[0]" in detail
+        assert "content_blocks[0]" in detail
 
     @pytest.mark.asyncio
     async def test_post_conversation_message_builds_workspace_auth_context_for_cowork_session(
@@ -2726,7 +2925,12 @@ class TestWorkspaceFirstEndpoints:
             async def resume(self, session_id: str) -> None:
                 self._session_id = session_id
 
-            async def send_streaming(self, user_message: str):
+            async def send_streaming(
+                self,
+                user_message: str,
+                *,
+                message_metadata: dict[str, object] | None = None,
+            ):
                 turn_count = await self._store.get_turn_count(self._session_id)
                 await self._store.append_turn(
                     self._session_id,
@@ -2820,7 +3024,12 @@ class TestWorkspaceFirstEndpoints:
             async def resume(self, session_id: str) -> None:
                 return None
 
-            async def send_streaming(self, user_message: str):
+            async def send_streaming(
+                self,
+                user_message: str,
+                *,
+                message_metadata: dict[str, object] | None = None,
+            ):
                 await stop_flag.wait()
                 return
                 yield  # pragma: no cover
@@ -3716,7 +3925,12 @@ class TestWorkspaceFirstEndpoints:
             async def resume(self, session_id: str) -> None:
                 return None
 
-            async def send_streaming(self, user_message: str):
+            async def send_streaming(
+                self,
+                user_message: str,
+                *,
+                message_metadata: dict[str, object] | None = None,
+            ):
                 start = ToolCallEvent(
                     name="shell_execute",
                     args={"command": "touch risky.txt"},
@@ -3836,7 +4050,12 @@ class TestWorkspaceFirstEndpoints:
             async def resume(self, session_id: str) -> None:
                 return None
 
-            async def send_streaming(self, user_message: str):
+            async def send_streaming(
+                self,
+                user_message: str,
+                *,
+                message_metadata: dict[str, object] | None = None,
+            ):
                 start = ToolCallEvent(
                     name="shell_execute",
                     args={"command": "rm -rf not-actually"},
@@ -3943,7 +4162,12 @@ class TestWorkspaceFirstEndpoints:
             async def resume(self, session_id: str) -> None:
                 return None
 
-            async def send_streaming(self, user_message: str):
+            async def send_streaming(
+                self,
+                user_message: str,
+                *,
+                message_metadata: dict[str, object] | None = None,
+            ):
                 await injected.wait()
                 observed["instruction"] = self._pending.pop(0)
                 yield CoworkTurn(

@@ -6,6 +6,7 @@ import type {
   AccountUpdateRequest,
   AuthDraftSyncResult,
   ConversationApproval,
+  ConversationMessageAttachments,
   ConversationDetail,
   ConversationMessage,
   ConversationPrompt,
@@ -376,7 +377,10 @@ export interface AppActions {
   handleRestartRun: () => Promise<void>;
   handleSendRunMessage: (event: import("react").FormEvent<HTMLFormElement>) => Promise<void>;
   handleSendConversationMessage: (event: import("react").FormEvent<HTMLFormElement>) => Promise<void>;
-  submitConversationMessage: (rawMessage: string) => Promise<void>;
+  submitConversationMessage: (
+    rawMessage: string,
+    attachments?: ConversationMessageAttachments,
+  ) => Promise<boolean>;
   handleQuickConversationReply: (optionLabel: string) => Promise<void>;
   handleInjectConversationInstruction: (event: import("react").FormEvent<HTMLFormElement>) => Promise<void>;
   handleResolveConversationApproval: (decision: "approve" | "approve_all" | "deny") => Promise<void>;

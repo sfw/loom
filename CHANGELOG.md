@@ -6,6 +6,8 @@ This changelog is generated directly from git commit history (non-merge commits)
 
 ## [Unreleased]
 
+- Add DB migration `20260416_007_conversation_turn_metadata_v1` so thread user turns can durably persist explicit attachment/context metadata across resumes
+- Add explicit conversation-turn attachment metadata plumbing for desktop thread file mentions and pasted-image attachments
 - Refactor MCP + auth usability around a shared account authority: new MCP OAuth writes now use Loom secret refs with fingerprinted server identity, workspace-defined remote servers expose approval/trust state, and the desktop app now has a dedicated Integrations tab with management-grade MCP/account state plus guided account connect/routing actions
 
 ## [0.3.0] - 2026-04-07

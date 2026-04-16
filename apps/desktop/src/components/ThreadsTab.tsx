@@ -15,15 +15,27 @@ import {
   useAppSelector,
 } from "@/context/AppContext";
 import {
+  fetchWorkspacePathSuggestions,
   deleteConversation,
+  writeScratchFile,
+  type ConversationMessageAttachments,
   type ConversationApproval,
+  type ConversationContentBlock,
   type ConversationDetail,
   type ConversationMessage,
   type ConversationPrompt,
   type ConversationStreamEvent,
+  type WorkspaceFileEntry,
 } from "@/api";
 import { cn } from "@/lib/utils";
 import { formatDate } from "@/utils";
+import {
+  buildWorkspaceAttachmentOptions,
+  isHiddenWorkspaceAttachmentPath,
+  rankWorkspaceAttachmentSuggestions,
+  workspaceAttachmentName,
+  type WorkspaceAttachmentOption,
+} from "@/workspacePathAttachments";
 import {
   appendConversationTimelineItems,
   buildHistoricalConversationTimelineItems,
@@ -64,6 +76,9 @@ import {
   Clock,
   Copy,
   MessageSquare,
+  FileText,
+  FolderOpen,
+  ImageIcon,
 } from "lucide-react";
 import { useVirtualizedList } from "@/hooks/useVirtualizedList";
 
@@ -202,6 +217,82 @@ function toolCardArgsPreview(
 }
 
 type ComposerAction = "send" | "inject" | "redirect" | "stop";
+type AttachedWorkspacePath = WorkspaceFileEntry;
+type PastedImageAttachment = {
+  id: string;
+  dataUrl: string;
+  name: string;
+  sourcePath: string;
+  mediaType: string;
+  sizeBytes: number;
+  width: number;
+  height: number;
+};
+
+function detectPathMention(
+  text: string,
+  caret: number,
+): { start: number; end: number; query: string } | null {
+  const safeCaret = Math.max(0, Math.min(caret, text.length));
+  const before = text.slice(0, safeCaret);
+  const match = before.match(/(^|[\s([{"'])@([^\s`]*)$/);
+  if (!match) {
+    return null;
+  }
+  const query = match[2] ?? "";
+  const start = safeCaret - query.length - 1;
+  if (start < 0) {
+    return null;
+  }
+  return { start, end: safeCaret, query };
+}
+
+function attachmentHasPayload(attachments: ConversationMessageAttachments): boolean {
+  return Boolean(
+    attachments.workspace_paths?.length
+    || attachments.workspace_files?.length
+    || attachments.workspace_directories?.length
+    || attachments.content_blocks?.length,
+  );
+}
+
+async function readFileAsDataUrl(file: File): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read pasted image."));
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function measureImageDimensions(dataUrl: string): Promise<{ width: number; height: number }> {
+  return await new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onerror = () => reject(new Error("Failed to decode pasted image."));
+    image.onload = () => {
+      resolve({
+        width: image.naturalWidth || 0,
+        height: image.naturalHeight || 0,
+      });
+    };
+    image.src = dataUrl;
+  });
+}
+
+function pastedImageFilename(file: File): string {
+  const provided = file.name?.trim();
+  if (provided) {
+    return provided;
+  }
+  const extension = file.type === "image/jpeg"
+    ? "jpg"
+    : file.type === "image/gif"
+      ? "gif"
+      : file.type === "image/webp"
+        ? "webp"
+        : "png";
+  return `pasted-image.${extension}`;
+}
 
 function conversationInputHistory(
   detail: ConversationDetail | null,
@@ -258,8 +349,10 @@ export default function ThreadsTab() {
     streamingText,
     streamingThinking,
     streamingToolCalls,
+    runtime,
     visibleConversationEvents,
     visibleConversationMessages,
+    workspaceArtifacts,
     workspaceFilesByDirectory,
   } = useAppSelector((state) => ({
     conversationAwaitingApproval: state.conversationAwaitingApproval,
@@ -289,8 +382,10 @@ export default function ThreadsTab() {
     streamingText: state.streamingText,
     streamingThinking: state.streamingThinking,
     streamingToolCalls: state.streamingToolCalls,
+    runtime: state.runtime,
     visibleConversationEvents: state.visibleConversationEvents,
     visibleConversationMessages: state.visibleConversationMessages,
+    workspaceArtifacts: state.workspaceArtifacts,
     workspaceFilesByDirectory: state.workspaceFilesByDirectory,
   }), shallowEqual);
   const {
@@ -299,7 +394,6 @@ export default function ThreadsTab() {
     handleInjectConversationInstruction,
     handleQuickConversationReply,
     handleResolveConversationApproval,
-    handleSendConversationMessage,
     handleStopConversationTurn,
     loadOlderMessages,
     removeConversationSummary,
@@ -312,6 +406,7 @@ export default function ThreadsTab() {
     setNotice,
     setSelectedConversationId,
     setSelectedWorkspaceFilePath,
+    submitConversationMessage,
   } = useAppActions();
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -320,9 +415,66 @@ export default function ThreadsTab() {
   const [composerDropdownOpen, setComposerDropdownOpen] = useState(false);
   const [composerAction, setComposerAction] = useState<ComposerAction>("send");
   const dropdownRef = useRef<HTMLDivElement>(null);
-  const [pastedImages, setPastedImages] = useState<Array<{ id: string; dataUrl: string; name: string }>>([]);
+  const [attachedWorkspacePaths, setAttachedWorkspacePaths] = useState<AttachedWorkspacePath[]>([]);
+  const [pastedImages, setPastedImages] = useState<PastedImageAttachment[]>([]);
+  const [activeMention, setActiveMention] = useState<{
+    start: number;
+    end: number;
+    query: string;
+  } | null>(null);
+  const [workspacePathSuggestions, setWorkspacePathSuggestions] = useState<WorkspaceFileEntry[]>([]);
+  const [workspacePathSuggestionIndex, setWorkspacePathSuggestionIndex] = useState(0);
+  const [loadingWorkspacePathSuggestions, setLoadingWorkspacePathSuggestions] = useState(false);
   const [archivedTimelineVisibleCount, setArchivedTimelineVisibleCount] = useState(0);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const workspacePathSearchTokenRef = useRef(0);
+
+  const workspacePathOptions = useMemo<WorkspaceAttachmentOption[]>(() => {
+    const fetchedEntries = workspacePathSuggestions.filter((entry) => (
+      !isHiddenWorkspaceAttachmentPath(entry.path)
+    ));
+    return buildWorkspaceAttachmentOptions({
+      workspaceEntries: fetchedEntries,
+      recentArtifacts: workspaceArtifacts,
+    });
+  }, [workspaceArtifacts, workspacePathSuggestions]);
+
+  const visibleWorkspacePathSuggestions = useMemo(() => rankWorkspaceAttachmentSuggestions({
+    options: workspacePathOptions,
+    query: activeMention?.query || "",
+    selectedPaths: attachedWorkspacePaths.map((entry) => entry.path),
+    limit: (activeMention?.query || "").trim() ? 24 : 18,
+  }), [activeMention?.query, attachedWorkspacePaths, workspacePathOptions]);
+
+  const conversationAttachments = useMemo<ConversationMessageAttachments>(() => {
+    const workspacePaths = attachedWorkspacePaths.map((entry) => entry.path);
+    const workspaceFiles = attachedWorkspacePaths
+      .filter((entry) => !entry.is_dir)
+      .map((entry) => entry.path);
+    const workspaceDirectories = attachedWorkspacePaths
+      .filter((entry) => entry.is_dir)
+      .map((entry) => entry.path);
+    const contentBlocks: ConversationContentBlock[] = pastedImages.map((image) => ({
+      type: "image",
+      source_path: image.sourcePath,
+      media_type: image.mediaType,
+      width: image.width,
+      height: image.height,
+      size_bytes: image.sizeBytes,
+      text_fallback: `Attached image: ${image.name}`,
+    }));
+    return {
+      workspace_paths: workspacePaths,
+      workspace_files: workspaceFiles,
+      workspace_directories: workspaceDirectories,
+      content_blocks: contentBlocks,
+    };
+  }, [attachedWorkspacePaths, pastedImages]);
+
+  const openWorkspaceAttachment = useCallback((path: string) => {
+    setSelectedWorkspaceFilePath(path);
+    setActiveTab("files");
+  }, [setActiveTab, setSelectedWorkspaceFilePath]);
 
   // Build set of known workspace file paths for linkifying code elements
   const knownFilePaths = useMemo(() => {
@@ -335,8 +487,87 @@ export default function ThreadsTab() {
         if (name) paths.add(name);
       }
     }
+    for (const entry of attachedWorkspacePaths) {
+      paths.add(entry.path);
+      const name = entry.path.split("/").pop();
+      if (name) paths.add(name);
+    }
+    for (const event of visibleConversationEvents) {
+      const payload = event.payload as Record<string, unknown>;
+      const workspacePaths = Array.isArray(payload.workspace_paths) ? payload.workspace_paths : [];
+      for (const item of workspacePaths) {
+        const path = String(item || "").trim();
+        if (!path) continue;
+        paths.add(path);
+        const name = path.split("/").pop();
+        if (name) paths.add(name);
+      }
+    }
+    for (const message of visibleConversationMessages) {
+      const metadata = message.metadata && typeof message.metadata === "object"
+        ? message.metadata as Record<string, unknown>
+        : {};
+      const workspacePaths = Array.isArray(metadata.workspace_paths) ? metadata.workspace_paths : [];
+      for (const item of workspacePaths) {
+        const path = String(item || "").trim();
+        if (!path) continue;
+        paths.add(path);
+        const name = path.split("/").pop();
+        if (name) paths.add(name);
+      }
+    }
     return paths;
-  }, [workspaceFilesByDirectory]);
+  }, [attachedWorkspacePaths, visibleConversationEvents, visibleConversationMessages, workspaceFilesByDirectory]);
+
+  useEffect(() => {
+    if (!selectedConversationId) {
+      setAttachedWorkspacePaths([]);
+      setPastedImages([]);
+      setActiveMention(null);
+      setWorkspacePathSuggestions([]);
+      setWorkspacePathSuggestionIndex(0);
+    }
+  }, [selectedConversationId]);
+
+  useEffect(() => {
+    if (composerAction !== "send" || !activeMention || !selectedWorkspaceId) {
+      setWorkspacePathSuggestions([]);
+      setWorkspacePathSuggestionIndex(0);
+      setLoadingWorkspacePathSuggestions(false);
+      return;
+    }
+
+    const requestToken = workspacePathSearchTokenRef.current + 1;
+    workspacePathSearchTokenRef.current = requestToken;
+    setLoadingWorkspacePathSuggestions(true);
+
+    const timer = window.setTimeout(() => {
+      void fetchWorkspacePathSuggestions(
+        selectedWorkspaceId,
+        activeMention.query,
+        24,
+      ).then((results) => {
+        if (workspacePathSearchTokenRef.current !== requestToken) {
+          return;
+        }
+        setWorkspacePathSuggestions(results);
+        setWorkspacePathSuggestionIndex(0);
+      }).catch(() => {
+        if (workspacePathSearchTokenRef.current !== requestToken) {
+          return;
+        }
+        setWorkspacePathSuggestions([]);
+      }).finally(() => {
+        if (workspacePathSearchTokenRef.current === requestToken) {
+          setLoadingWorkspacePathSuggestions(false);
+        }
+      });
+    }, activeMention.query ? 80 : 0);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [activeMention, composerAction, selectedWorkspaceId]);
 
   const markdownComponents = useMemo(() => ({
     code: ({ children, className }: { children?: React.ReactNode; className?: string }) => {
@@ -349,10 +580,7 @@ export default function ThreadsTab() {
         return (
           <button
             type="button"
-            onClick={() => {
-              setSelectedWorkspaceFilePath(text);
-              setActiveTab("files");
-            }}
+            onClick={() => openWorkspaceAttachment(text)}
             className="inline-flex items-center gap-0.5 rounded bg-[#6b7a5e]/20 px-1.5 py-px text-[#a3b396] hover:bg-[#6b7a5e]/35 hover:text-[#bec8b4] transition-colors cursor-pointer font-mono text-[inherit]"
           >
             {text}
@@ -361,7 +589,7 @@ export default function ThreadsTab() {
       }
       return <code>{children}</code>;
     },
-  }), [knownFilePaths, setSelectedWorkspaceFilePath, setActiveTab]);
+  }), [knownFilePaths, openWorkspaceAttachment]);
 
   // Injected messages shown as user bubbles in the chat
   const [injectedMessages, setInjectedMessages] = useState<Array<{ id: string; text: string; type: "inject" | "redirect"; timestamp: string }>>([]);
@@ -823,8 +1051,62 @@ export default function ThreadsTab() {
     );
   }
 
+  function closePathMention() {
+    setActiveMention(null);
+    setWorkspacePathSuggestions([]);
+    setWorkspacePathSuggestionIndex(0);
+    setLoadingWorkspacePathSuggestions(false);
+  }
+
+  function syncActiveMention(text: string, caret: number) {
+    if (composerAction !== "send") {
+      closePathMention();
+      return;
+    }
+    const mention = detectPathMention(text, caret);
+    if (!mention) {
+      closePathMention();
+      return;
+    }
+    setActiveMention(mention);
+  }
+
+  function insertWorkspacePathSuggestion(entry: WorkspaceAttachmentOption) {
+    const mention = activeMention;
+    if (!mention) {
+      return;
+    }
+    const prefix = conversationComposerMessage.slice(0, mention.start);
+    const suffix = conversationComposerMessage.slice(mention.end);
+    const replacement = `\`${entry.path}\` `;
+    const nextValue = `${prefix}${replacement}${suffix}`;
+    const nextCaret = prefix.length + replacement.length;
+    setConversationComposerMessage(nextValue);
+    setAttachedWorkspacePaths((current) => (
+      current.some((item) => item.path === entry.path)
+        ? current
+        : [...current, {
+          path: entry.path,
+          name: workspaceAttachmentName(entry.path),
+          is_dir: entry.isDir,
+          size_bytes: 0,
+          modified_at: "",
+          extension: entry.isDir ? "" : "",
+        }]
+    ));
+    closePathMention();
+    requestAnimationFrame(() => {
+      composerRef.current?.focus();
+      composerRef.current?.setSelectionRange(nextCaret, nextCaret);
+    });
+  }
+
+  function removeAttachedWorkspacePath(path: string) {
+    setAttachedWorkspacePaths((current) => current.filter((entry) => entry.path !== path));
+  }
+
   /* ---- Composer submit handler ---- */
-  function handleComposerSubmit(e: FormEvent<HTMLFormElement>) {
+  async function handleComposerSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     // Always pin to bottom when user sends a message and clear old inject bubbles
     isPinnedRef.current = true;
@@ -833,17 +1115,29 @@ export default function ThreadsTab() {
     const el = scrollRef.current;
     if (el) requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
     if (composerAction === "stop") {
-      handleStopConversationTurn();
+      await handleStopConversationTurn();
       return;
     }
     if (composerAction === "inject" || composerAction === "redirect") {
+      if (attachmentHasPayload(conversationAttachments)) {
+        setError("Attachments are only supported when sending a new turn.");
+        return;
+      }
       // Use the inject pathway for both inject and redirect
       setConversationInjectMessage(conversationComposerMessage);
       // Build a synthetic form event for the inject handler
-      handleInjectConversationInstruction(e);
+      await handleInjectConversationInstruction(e);
       return;
     }
-    handleSendConversationMessage(e);
+    const sent = await submitConversationMessage(
+      conversationComposerMessage,
+      attachmentHasPayload(conversationAttachments) ? conversationAttachments : undefined,
+    );
+    if (sent) {
+      setAttachedWorkspacePaths([]);
+      setPastedImages([]);
+      closePathMention();
+    }
   }
 
   function handleComposerKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -851,6 +1145,37 @@ export default function ThreadsTab() {
     const atStart = textarea.selectionStart === 0 && textarea.selectionEnd === 0;
     const atEnd = textarea.selectionStart === textarea.value.length;
     const isSingleLine = !textarea.value.includes("\n");
+    const pathSuggestionCount = visibleWorkspacePathSuggestions.length;
+
+    if (activeMention && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      e.preventDefault();
+      if (pathSuggestionCount === 0) {
+        return;
+      }
+      setWorkspacePathSuggestionIndex((current) => {
+        if (e.key === "ArrowDown") {
+          return (current + 1) % pathSuggestionCount;
+        }
+        return (current - 1 + pathSuggestionCount) % pathSuggestionCount;
+      });
+      return;
+    }
+
+    if (activeMention && (e.key === "Enter" || e.key === "Tab")) {
+      if (pathSuggestionCount > 0) {
+        e.preventDefault();
+        insertWorkspacePathSuggestion(
+          visibleWorkspacePathSuggestions[Math.min(workspacePathSuggestionIndex, pathSuggestionCount - 1)],
+        );
+        return;
+      }
+    }
+
+    if (activeMention && e.key === "Escape") {
+      e.preventDefault();
+      closePathMention();
+      return;
+    }
 
     // ArrowUp at start of input = cycle back through history
     if (e.key === "ArrowUp" && atStart && isSingleLine) {
@@ -921,10 +1246,13 @@ export default function ThreadsTab() {
   function selectAction(action: ComposerAction) {
     setComposerAction(action);
     setComposerDropdownOpen(false);
+    if (action !== "send") {
+      closePathMention();
+    }
     composerRef.current?.focus();
   }
 
-  function handlePaste(e: React.ClipboardEvent) {
+  async function handlePaste(e: React.ClipboardEvent) {
     const items = e.clipboardData?.items;
     if (!items) return;
     for (const item of Array.from(items)) {
@@ -932,15 +1260,45 @@ export default function ThreadsTab() {
         e.preventDefault();
         const file = item.getAsFile();
         if (!file) continue;
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = reader.result as string;
-          setPastedImages((current) => [
-            ...current,
-            { id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, dataUrl, name: file.name || "pasted-image" },
-          ]);
-        };
-        reader.readAsDataURL(file);
+        if (!runtime?.scratch_dir) {
+          setError("Runtime scratch directory is unavailable for pasted images.");
+          continue;
+        }
+        void (async () => {
+          try {
+            const name = pastedImageFilename(file);
+            const dataUrlPromise = readFileAsDataUrl(file);
+            const [dataUrl, dimensions, buffer] = await Promise.all([
+              dataUrlPromise,
+              dataUrlPromise.then((url) => measureImageDimensions(url)),
+              file.arrayBuffer(),
+            ]);
+            const sourcePath = await writeScratchFile(
+              runtime.scratch_dir,
+              name,
+              new Uint8Array(buffer),
+            );
+            setPastedImages((current) => [
+              ...current,
+              {
+                id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                dataUrl,
+                name,
+                sourcePath,
+                mediaType: file.type || "image/png",
+                sizeBytes: file.size || buffer.byteLength,
+                width: dimensions.width,
+                height: dimensions.height,
+              },
+            ]);
+          } catch (error) {
+            setError(
+              error instanceof Error
+                ? error.message
+                : "Failed to attach pasted image.",
+            );
+          }
+        })();
       }
     }
   }
@@ -962,7 +1320,7 @@ export default function ThreadsTab() {
     composerAction === "stop"
       ? false
       : composerAction === "send"
-        ? sendingConversationMessage || !conversationComposerMessage.trim()
+        ? sendingConversationMessage || (!conversationComposerMessage.trim() && !attachmentHasPayload(conversationAttachments))
         : sendingConversationInject || !conversationComposerMessage.trim();
 
   const actionLabel =
@@ -1106,6 +1464,7 @@ export default function ThreadsTab() {
                 top={virtualItem.start}
                 reportSize={reportTimelineRowSize}
                 markdownComponents={markdownComponents}
+                onOpenWorkspaceAttachment={openWorkspaceAttachment}
                 conversationAwaitingApproval={conversationAwaitingApproval}
                 pendingConversationApproval={pendingConversationApproval}
                 activeApprovalToolTimelineId={activeApprovalToolTimelineId}
@@ -1282,9 +1641,25 @@ export default function ThreadsTab() {
           </p>
         )}
 
-        {/* Pasted image previews */}
+        {attachedWorkspacePaths.length > 0 && (
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            {attachedWorkspacePaths.map((entry) => (
+              <button
+                key={entry.path}
+                type="button"
+                onClick={() => removeAttachedWorkspacePath(entry.path)}
+                className="inline-flex items-center gap-1 rounded-full border border-[#8a9a7b]/30 bg-[#8a9a7b]/10 px-2.5 py-1 text-[11px] text-[#bec8b4] transition-colors hover:border-red-400/40 hover:text-red-300"
+              >
+                <span>{entry.is_dir ? "Dir" : "File"}</span>
+                <span className="max-w-[18rem] truncate">{entry.path}</span>
+                <span aria-hidden="true">×</span>
+              </button>
+            ))}
+          </div>
+        )}
+
         {pastedImages.length > 0 && (
-          <div className="flex items-center gap-2 mb-2 flex-wrap">
+          <div className="mb-2 flex items-center gap-2 flex-wrap">
             {pastedImages.map((img) => (
               <div key={img.id} className="relative group">
                 <img
@@ -1301,24 +1676,79 @@ export default function ThreadsTab() {
                 </button>
               </div>
             ))}
-            <span className="text-[10px] text-zinc-600">
+            <span className="text-[10px] text-zinc-500">
               {pastedImages.length} image{pastedImages.length !== 1 ? "s" : ""} attached
-              <span className="text-zinc-700 ml-1">(vision support pending)</span>
             </span>
           </div>
         )}
 
         <form onSubmit={handleComposerSubmit} className="flex items-center gap-2">
-          <textarea
-            ref={composerRef}
-            value={conversationComposerMessage}
-            onChange={(e) => setConversationComposerMessage(e.target.value)}
-            onPaste={handlePaste}
-            placeholder={composerPlaceholder}
-            rows={2}
-            onKeyDown={handleComposerKeyDown}
-            className="flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 resize-none focus:outline-none focus:ring-1 focus:ring-[#8a9a7b]"
-          />
+          <div className="relative flex-1">
+            {activeMention && (
+              <div className="absolute bottom-full left-0 right-0 z-50 mb-2 overflow-hidden rounded-xl border border-zinc-700 bg-zinc-950 shadow-2xl">
+                <div className="border-b border-zinc-800 px-3 py-2 text-[10px] uppercase tracking-[0.16em] text-zinc-500">
+                  Attach Workspace Path
+                </div>
+                <div className="max-h-64 overflow-y-auto py-1">
+                  {visibleWorkspacePathSuggestions.map((entry, index) => (
+                    <button
+                      key={`${entry.path}:${entry.isDir ? "dir" : "file"}`}
+                      type="button"
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        insertWorkspacePathSuggestion(entry);
+                      }}
+                      className={cn(
+                        "flex w-full items-center justify-between gap-3 px-3 py-2 text-left transition-colors",
+                        index === workspacePathSuggestionIndex
+                          ? "bg-[#8a9a7b]/15 text-zinc-100"
+                          : "text-zinc-300 hover:bg-zinc-900",
+                      )}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm">{workspaceAttachmentName(entry.path)}</div>
+                        <div className="truncate text-[11px] text-zinc-500">
+                          {entry.path}
+                        </div>
+                      </div>
+                      <span className="shrink-0 text-[10px] uppercase tracking-[0.16em] text-zinc-500">
+                        {entry.isDir ? "Dir" : "File"}
+                      </span>
+                    </button>
+                  ))}
+                  {!loadingWorkspacePathSuggestions && visibleWorkspacePathSuggestions.length === 0 && (
+                    <div className="px-3 py-3 text-sm text-zinc-500">
+                      No matching workspace paths.
+                    </div>
+                  )}
+                  {loadingWorkspacePathSuggestions && (
+                    <div className="px-3 py-3 text-sm text-zinc-500">
+                      Searching workspace paths...
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+            <textarea
+              ref={composerRef}
+              value={conversationComposerMessage}
+              onChange={(e) => {
+                setConversationComposerMessage(e.target.value);
+                syncActiveMention(e.target.value, e.target.selectionStart);
+              }}
+              onClick={(e) => {
+                syncActiveMention(e.currentTarget.value, e.currentTarget.selectionStart);
+              }}
+              onKeyUp={(e) => {
+                syncActiveMention(e.currentTarget.value, e.currentTarget.selectionStart);
+              }}
+              onPaste={handlePaste}
+              placeholder={composerPlaceholder}
+              rows={2}
+              onKeyDown={handleComposerKeyDown}
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 resize-none focus:outline-none focus:ring-1 focus:ring-[#8a9a7b]"
+            />
+          </div>
 
           {/* Composite action button */}
           <div className="relative flex" ref={dropdownRef}>
@@ -1433,6 +1863,7 @@ const TimelineVirtualRow = React.memo(function TimelineVirtualRow({
   top,
   reportSize,
   markdownComponents,
+  onOpenWorkspaceAttachment,
   conversationAwaitingApproval,
   pendingConversationApproval,
   activeApprovalToolTimelineId,
@@ -1447,6 +1878,7 @@ const TimelineVirtualRow = React.memo(function TimelineVirtualRow({
   top: number;
   reportSize: (id: string, size: number) => void;
   markdownComponents: React.ComponentProps<typeof Markdown>["components"];
+  onOpenWorkspaceAttachment: (path: string) => void;
   conversationAwaitingApproval: boolean;
   pendingConversationApproval: ConversationApproval | null;
   activeApprovalToolTimelineId: string;
@@ -1485,6 +1917,7 @@ const TimelineVirtualRow = React.memo(function TimelineVirtualRow({
         <TimelineRowContent
           item={item}
           markdownComponents={markdownComponents}
+          onOpenWorkspaceAttachment={onOpenWorkspaceAttachment}
           conversationAwaitingApproval={conversationAwaitingApproval}
           pendingConversationApproval={pendingConversationApproval}
           activeApprovalToolTimelineId={activeApprovalToolTimelineId}
@@ -1503,6 +1936,7 @@ const TimelineVirtualRow = React.memo(function TimelineVirtualRow({
 const TimelineRowContent = React.memo(function TimelineRowContent({
   item,
   markdownComponents,
+  onOpenWorkspaceAttachment,
   conversationAwaitingApproval,
   pendingConversationApproval,
   activeApprovalToolTimelineId,
@@ -1515,6 +1949,7 @@ const TimelineRowContent = React.memo(function TimelineRowContent({
 }: {
   item: ConversationTimelineItem;
   markdownComponents: React.ComponentProps<typeof Markdown>["components"];
+  onOpenWorkspaceAttachment: (path: string) => void;
   conversationAwaitingApproval: boolean;
   pendingConversationApproval: ConversationApproval | null;
   activeApprovalToolTimelineId: string;
@@ -1623,6 +2058,68 @@ const TimelineRowContent = React.memo(function TimelineRowContent({
             onReply={handleQuickConversationReply}
           />
         )}
+      </div>
+    );
+  }
+
+  if (item.kind === "attachment") {
+    const isSending = item.deliveryState === "sending";
+    const isTimedOut = item.deliveryState === "failed";
+    const directorySet = new Set(item.workspaceDirectories);
+    const imageCount = item.contentBlocks.filter((block) => String(block.type || "") === "image").length;
+    const documentCount = item.contentBlocks.filter((block) => String(block.type || "") === "document").length;
+
+    return (
+      <div className="pl-16">
+        <div
+          className={cn(
+            "rounded-xl border px-4 py-3",
+            "border-[#8a9a7b]/15 bg-[#8a9a7b]/5",
+            isSending && "border-[#a3b396]/30 bg-[#8a9a7b]/10",
+            isTimedOut && "border-red-400/30 bg-red-500/8",
+          )}
+        >
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-[11px] font-medium text-zinc-400">
+              <span>Explicit context</span>
+              {imageCount > 0 && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-zinc-950 px-2 py-0.5 text-[10px] text-zinc-400">
+                  <ImageIcon size={11} />
+                  {imageCount} image{imageCount !== 1 ? "s" : ""}
+                </span>
+              )}
+              {documentCount > 0 && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-zinc-950 px-2 py-0.5 text-[10px] text-zinc-400">
+                  <FileText size={11} />
+                  {documentCount} document{documentCount !== 1 ? "s" : ""}
+                </span>
+              )}
+            </div>
+            <span className="text-[10px] text-zinc-700">
+              {formatDate(item.createdAt)}
+            </span>
+          </div>
+          {item.workspacePaths.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {item.workspacePaths.map((path) => {
+                const isDirectory = directorySet.has(path);
+                return (
+                  <button
+                    key={path}
+                    type="button"
+                    onClick={() => onOpenWorkspaceAttachment(path)}
+                    aria-label={`Open ${isDirectory ? "folder" : "file"} ${path}`}
+                    className="inline-flex max-w-full items-center gap-1 rounded-full border border-[#8a9a7b]/25 bg-zinc-950/80 px-2.5 py-1 text-[11px] text-[#bec8b4] transition-colors hover:border-[#a3b396]/50 hover:text-zinc-100"
+                  >
+                    {isDirectory ? <FolderOpen size={11} /> : <FileText size={11} />}
+                    <span>{isDirectory ? "Dir" : "File"}</span>
+                    <span className="max-w-[22rem] truncate">{path}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
     );
   }

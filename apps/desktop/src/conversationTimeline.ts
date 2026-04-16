@@ -36,11 +36,54 @@ export type ConversationTimelineItem =
       completedPayload?: Record<string, unknown>;
     }
   | {
+      kind: "attachment";
+      id: string;
+      seq: number;
+      createdAt: string;
+      workspacePaths: string[];
+      workspaceFiles: string[];
+      workspaceDirectories: string[];
+      contentBlocks: Array<Record<string, unknown>>;
+      deliveryState: "queued" | "sending" | "accepted" | "failed" | null;
+    }
+  | {
       kind: "event";
       id: string;
       seq: number;
       event: ConversationStreamEvent;
     };
+
+function parseAttachmentPayload(payload: Record<string, unknown>): {
+  workspacePaths: string[];
+  workspaceFiles: string[];
+  workspaceDirectories: string[];
+  contentBlocks: Array<Record<string, unknown>>;
+} | null {
+  const normalizePaths = (value: unknown): string[] => (
+    Array.isArray(value)
+      ? value
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)
+      : []
+  );
+  const workspacePaths = normalizePaths(payload.workspace_paths);
+  const workspaceFiles = normalizePaths(payload.workspace_files);
+  const workspaceDirectories = normalizePaths(payload.workspace_directories);
+  const contentBlocks = Array.isArray(payload.content_blocks)
+    ? payload.content_blocks.filter((item): item is Record<string, unknown> => (
+        Boolean(item) && typeof item === "object" && !Array.isArray(item)
+      ))
+    : [];
+  if (
+    workspacePaths.length === 0
+    && workspaceFiles.length === 0
+    && workspaceDirectories.length === 0
+    && contentBlocks.length === 0
+  ) {
+    return null;
+  }
+  return { workspacePaths, workspaceFiles, workspaceDirectories, contentBlocks };
+}
 
 function parseMessageToolStartPayload(
   rawCall: Record<string, unknown>,
@@ -162,6 +205,32 @@ export function buildConversationMessageTimelineItems(
 
     if (role === "user" || role === "assistant") {
       appendTextItem(role, String(message.content || ""));
+    }
+
+    if (role === "user") {
+      const metadata = message.metadata && typeof message.metadata === "object"
+        ? message.metadata as Record<string, unknown>
+        : {};
+      const attachments = parseAttachmentPayload({
+        workspace_paths: metadata.workspace_paths,
+        workspace_files: metadata.workspace_files,
+        workspace_directories: metadata.workspace_directories,
+        content_blocks: metadata.content_blocks,
+      });
+      if (attachments) {
+        items.push({
+          kind: "attachment",
+          id: `message-attachment-${Number(message.id || 0) > 0 ? message.id : `${message.turn_number}-${createdAt}`}`,
+          seq: seqBase + seqOffset,
+          createdAt,
+          workspacePaths: attachments.workspacePaths,
+          workspaceFiles: attachments.workspaceFiles,
+          workspaceDirectories: attachments.workspaceDirectories,
+          contentBlocks: attachments.contentBlocks,
+          deliveryState: null,
+        });
+        seqOffset += 1;
+      }
     }
 
     if (role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
@@ -348,6 +417,25 @@ function appendConversationTimelineItem(
     return;
   }
 
+  if (event.event_type === "content_indicator") {
+    const attachments = parseAttachmentPayload(event.payload);
+    if (!attachments) {
+      return;
+    }
+    items.push({
+      kind: "attachment",
+      id: `attachment-${eventKey}`,
+      seq: event.seq,
+      createdAt: event.created_at,
+      workspacePaths: attachments.workspacePaths,
+      workspaceFiles: attachments.workspaceFiles,
+      workspaceDirectories: attachments.workspaceDirectories,
+      contentBlocks: attachments.contentBlocks,
+      deliveryState: event._delivery_state || (event._optimistic ? "sending" : null),
+    });
+    return;
+  }
+
   items.push({
     kind: "event",
     id: `event-${eventKey}`,
@@ -373,32 +461,9 @@ export function appendConversationTimelineItems(
 export function buildConversationMessageFallbackItems(
   messages: ConversationMessage[],
 ): ConversationTimelineItem[] {
-  const items: ConversationTimelineItem[] = [];
-
-  for (const message of messages) {
-    const role = String(message.role || "").trim().toLowerCase();
-    if (role !== "user" && role !== "assistant") {
-      continue;
-    }
-    const rawText = String(message.content || "");
-    const text = role === "assistant"
-      ? stripConversationToolCallPlaceholders(rawText)
-      : rawText;
-    if (!text || (role === "assistant" && !text.trim())) {
-      continue;
-    }
-    items.push({
-      kind: "text",
-      id: `message-${Number(message.id || 0) > 0 ? message.id : `${message.turn_number}-${role}-${message.created_at}`}`,
-      seq: Number(message.turn_number || 0) * 100,
-      role,
-      text,
-      createdAt: String(message.created_at || ""),
-      deliveryState: null,
-    });
-  }
-
-  return items;
+  return buildConversationMessageTimelineItems(messages).filter((item) => (
+    item.kind === "text" || item.kind === "attachment"
+  ));
 }
 
 function buildConversationSupplementalEventItems(
@@ -408,6 +473,7 @@ function buildConversationSupplementalEventItems(
     if (
       event.event_type === "user_message"
       || event.event_type === "assistant_text"
+      || event.event_type === "content_indicator"
       || event.event_type === "assistant_thinking"
       || event.event_type === "tool_call_started"
       || event.event_type === "tool_call_completed"
@@ -655,6 +721,11 @@ export function estimateConversationTimelineItemHeight(
 ): number {
   if (item.kind === "tool") {
     return item.completedPayload ? 88 : 72;
+  }
+  if (item.kind === "attachment") {
+    const chipRows = Math.ceil(Math.max(item.workspacePaths.length, 1) / 3);
+    const imageBlocks = item.contentBlocks.filter((block) => String(block.type || "") === "image").length;
+    return 72 + chipRows * 28 + imageBlocks * 8;
   }
   if (item.kind === "event") {
     return item.event.event_type === "turn_separator" ? 44 : 84;

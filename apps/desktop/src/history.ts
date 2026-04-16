@@ -718,7 +718,12 @@ function summarizeConversationEvent(event: ConversationStreamEvent): string {
   }
   if (event.event_type === "content_indicator") {
     const blocks = Array.isArray(payload.content_blocks) ? payload.content_blocks.length : 0;
-    return `Attached ${blocks} content block${blocks === 1 ? "" : "s"}`;
+    const paths = Array.isArray(payload.workspace_paths) ? payload.workspace_paths.length : 0;
+    const parts = [
+      paths > 0 ? `${paths} path${paths === 1 ? "" : "s"}` : "",
+      blocks > 0 ? `${blocks} content block${blocks === 1 ? "" : "s"}` : "",
+    ].filter(Boolean);
+    return parts.length > 0 ? `Attached ${parts.join(" and ")}` : "Attached context";
   }
   return event.event_type.replace(/_/g, " ");
 }
@@ -834,6 +839,15 @@ export function conversationEventDetail(event: ConversationStreamEvent): string 
     return String(payload.message || "").trim() || summarizeConversationEvent(event);
   }
   if (event.event_type === "content_indicator") {
+    const workspacePaths = Array.isArray(payload.workspace_paths)
+      ? payload.workspace_paths
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)
+          .slice(0, 3)
+      : [];
+    if (workspacePaths.length > 0) {
+      return workspacePaths.join(" · ");
+    }
     return summarizeConversationEvent(event);
   }
   return summarizeConversationEvent(event);
@@ -884,7 +898,13 @@ export function conversationEventPills(event: ConversationStreamEvent): string[]
   }
   if (event.event_type === "content_indicator") {
     const blocks = Array.isArray(payload.content_blocks) ? payload.content_blocks.length : 0;
-    pills.push(`${blocks} block${blocks === 1 ? "" : "s"}`);
+    const paths = Array.isArray(payload.workspace_paths) ? payload.workspace_paths.length : 0;
+    if (paths > 0) {
+      pills.push(`${paths} path${paths === 1 ? "" : "s"}`);
+    }
+    if (blocks > 0) {
+      pills.push(`${blocks} block${blocks === 1 ? "" : "s"}`);
+    }
   }
   return pills;
 }

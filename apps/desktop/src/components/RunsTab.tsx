@@ -50,6 +50,11 @@ import {
 } from "../history";
 import { displayRunStatus, normalizeRunStatus } from "../runStatus";
 import { cn } from "@/lib/utils";
+import {
+  buildWorkspaceAttachmentOptions,
+  rankWorkspaceAttachmentSuggestions,
+  workspaceAttachmentName,
+} from "@/workspacePathAttachments";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -521,30 +526,10 @@ function processBucketDescription(bucket: ProcessBucket): string {
   }
 }
 
-type LaunchPathOption = {
-  path: string;
-  isDir: boolean;
-  source: "artifact" | "workspace";
-  recency: number;
-};
-
-function pathOptionName(path: string): string {
-  const normalized = normalizePath(path);
-  const parts = normalized.split("/").filter(Boolean);
-  return parts[parts.length - 1] || normalized;
-}
-
 function pathOptionParent(path: string): string {
   const normalized = normalizePath(path);
   const parts = normalized.split("/").filter(Boolean);
   return parts.length > 1 ? parts.slice(0, -1).join("/") : "";
-}
-
-function isHiddenLaunchPath(path: string): boolean {
-  const normalized = normalizePath(path);
-  const parts = normalized.split("/").filter(Boolean);
-  if (parts.length === 0) return false;
-  return parts.some((part) => part.startsWith("."));
 }
 
 // ---------------------------------------------------------------------------
@@ -716,41 +701,10 @@ export default function RunsTab() {
   }, [normalizedProcessQuery, processes, runProcess]);
   const launchPlaceholder = processPromptHint(selectedProcessInfo);
   const attachablePathOptions = useMemo(() => {
-    const byPath = new Map<string, LaunchPathOption>();
-    for (const entry of loadedWorkspaceFileEntries) {
-      const cleanPath = normalizePath(entry.path);
-      if (!cleanPath || isHiddenLaunchPath(cleanPath)) continue;
-      byPath.set(cleanPath, {
-        path: cleanPath,
-        isDir: Boolean(entry.is_dir),
-        source: "workspace",
-        recency: Number.MAX_SAFE_INTEGER,
-      });
-    }
-    for (const [artifactIndex, artifact] of recentWorkspaceArtifacts.entries()) {
-      const cleanPath = normalizePath(artifact.path);
-      if (!cleanPath || isHiddenLaunchPath(cleanPath)) continue;
-      const existingArtifact = byPath.get(cleanPath);
-      byPath.set(cleanPath, {
-        path: cleanPath,
-        isDir: false,
-        source: "artifact",
-        recency: Math.min(existingArtifact?.recency ?? Number.MAX_SAFE_INTEGER, artifactIndex),
-      });
-      const parts = cleanPath.split("/").filter(Boolean);
-      for (let index = 1; index < parts.length; index += 1) {
-        const dirPath = parts.slice(0, index).join("/");
-        if (isHiddenLaunchPath(dirPath)) continue;
-        const existingDirectory = byPath.get(dirPath);
-        byPath.set(dirPath, {
-          path: dirPath,
-          isDir: true,
-          source: "artifact",
-          recency: Math.min(existingDirectory?.recency ?? Number.MAX_SAFE_INTEGER, artifactIndex + 0.5),
-        });
-      }
-    }
-    return Array.from(byPath.values());
+    return buildWorkspaceAttachmentOptions({
+      workspaceEntries: loadedWorkspaceFileEntries,
+      recentArtifacts: recentWorkspaceArtifacts,
+    });
   }, [loadedWorkspaceFileEntries, recentWorkspaceArtifacts]);
   const attachablePathLookup = useMemo(
     () => new Map(attachablePathOptions.map((option) => [option.path, option])),
@@ -767,41 +721,12 @@ export default function RunsTab() {
     };
   }, [attachablePathLookup, attachedPaths]);
   const visibleAttachSuggestions = useMemo(() => {
-    const query = normalizeProcessQuery(attachQuery);
-    const pathNameRank = (option: LaunchPathOption) => {
-      if (!query) return 3;
-      const name = normalizeProcessQuery(pathOptionName(option.path));
-      const path = normalizeProcessQuery(option.path);
-      if (name.startsWith(query)) return 0;
-      if (name.includes(query)) return 1;
-      if (path.includes(query)) return 2;
-      return 3;
-    };
-    return attachablePathOptions
-      .filter((option) => !attachedPaths.includes(option.path))
-      .filter((option) => {
-        if (!query) return true;
-        const haystack = `${normalizeProcessQuery(option.path)} ${normalizeProcessQuery(pathOptionName(option.path))}`;
-        return haystack.includes(query);
-      })
-      .sort((left, right) => {
-        const leftRank = pathNameRank(left);
-        const rightRank = pathNameRank(right);
-        if (leftRank !== rightRank) {
-          return leftRank - rightRank;
-        }
-        if (left.source !== right.source) {
-          return left.source === "artifact" ? -1 : 1;
-        }
-        if (left.isDir !== right.isDir) {
-          return left.isDir ? -1 : 1;
-        }
-        if (left.recency !== right.recency) {
-          return left.recency - right.recency;
-        }
-        return left.path.localeCompare(right.path);
-      })
-      .slice(0, query ? 24 : 18);
+    return rankWorkspaceAttachmentSuggestions({
+      options: attachablePathOptions,
+      query: attachQuery,
+      selectedPaths: attachedPaths,
+      limit: attachQuery.trim() ? 24 : 18,
+    });
   }, [attachQuery, attachedPaths, attachablePathOptions]);
 
   const refreshLauncherContext = useEffectEvent((force = false) => {
@@ -1060,7 +985,7 @@ export default function RunsTab() {
                       className="inline-flex items-center gap-1 rounded-full border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-400 hover:border-zinc-700 hover:text-zinc-200"
                     >
                       {option.isDir ? <FolderOpen size={11} /> : <FileText size={11} />}
-                      <span>{pathOptionName(option.path)}</span>
+                      <span>{workspaceAttachmentName(option.path)}</span>
                       {option.source === "artifact" && (
                         <span className="rounded-full bg-[#6b7a5e]/15 px-1.5 py-0.5 text-[9px] font-medium text-[#bec8b4]">
                           recent output

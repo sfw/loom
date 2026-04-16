@@ -10,10 +10,25 @@ class TestConversationMessageRequest:
         msg = ConversationMessageRequest(message="Hello")
         assert msg.message == "Hello"
         assert msg.role == "user"
+        assert msg.workspace_paths == []
+        assert msg.content_blocks == []
 
     def test_custom_role(self):
         msg = ConversationMessageRequest(message="Status update", role="system")
         assert msg.role == "system"
+
+    def test_attachment_fields(self):
+        msg = ConversationMessageRequest(
+            workspace_paths=["src/app.tsx"],
+            workspace_files=["src/app.tsx"],
+            workspace_directories=["src"],
+            content_blocks=[{"type": "image", "source_path": "/tmp/pasted.png"}],
+        )
+        assert msg.message == ""
+        assert msg.workspace_paths == ["src/app.tsx"]
+        assert msg.workspace_files == ["src/app.tsx"]
+        assert msg.workspace_directories == ["src"]
+        assert msg.content_blocks == [{"type": "image", "source_path": "/tmp/pasted.png"}]
 
 
 class TestFeedbackRequest:

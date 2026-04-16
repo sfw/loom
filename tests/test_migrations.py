@@ -90,3 +90,15 @@ class TestMigrationGuards:
             "workspace_settings",
             "workspaces",
         ]
+
+    async def test_fresh_schema_contains_conversation_turn_metadata(self, tmp_path):
+        db_path = tmp_path / "conversation-turn-metadata.db"
+        db = Database(db_path)
+        await db.initialize()
+
+        async with aiosqlite.connect(db_path) as conn:
+            cursor = await conn.execute("PRAGMA table_info(conversation_turns)")
+            rows = await cursor.fetchall()
+
+        column_names = {str(row[1]) for row in rows}
+        assert "metadata" in column_names

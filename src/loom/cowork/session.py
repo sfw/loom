@@ -420,8 +420,39 @@ def _estimate_message_tokens(msg: dict) -> int:
     content = msg.get("content") or ""
     total = _estimate_tokens(content)
 
+    workspace_paths = msg.get("workspace_paths")
+    if isinstance(workspace_paths, list) and workspace_paths:
+        total += _estimate_tokens("\n".join(str(path or "") for path in workspace_paths))
+
     if msg.get("tool_calls"):
         total += _estimate_tokens(json.dumps(msg["tool_calls"]))
+
+    content_blocks = msg.get("content_blocks")
+    if isinstance(content_blocks, list) and content_blocks:
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type", "") or "").strip().lower()
+            if btype == "text":
+                total += _estimate_tokens(str(block.get("text", "") or ""))
+            elif btype == "image":
+                w = int(block.get("width", 0) or 0)
+                h = int(block.get("height", 0) or 0)
+                if w > 0 and h > 0:
+                    total += min((w * h) // 750, 200_000)
+                else:
+                    total += max(1, _estimate_tokens(str(block.get("text_fallback", "") or "")))
+            elif btype == "document":
+                pages = int(block.get("page_count", 1) or 1)
+                pr = block.get("page_range")
+                if isinstance(pr, list) and len(pr) == 2:
+                    try:
+                        pages = max(0, int(pr[1]) - int(pr[0]))
+                    except (TypeError, ValueError):
+                        pages = max(1, pages)
+                total += min(max(1, pages) * 1500, 200_000)
+            else:
+                total += _estimate_tokens(str(block.get("text_fallback", "") or ""))
 
     # Account for multimodal content blocks in tool results
     if msg.get("role") == "tool" and content:
@@ -472,6 +503,32 @@ def _tokens_per_second(tokens_used: int, total_time_ms: int) -> float:
     if tokens_used <= 0 or total_time_ms <= 0:
         return 0.0
     return float(tokens_used) / (float(total_time_ms) / 1000.0)
+
+
+def _normalize_user_turn_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+
+    normalized: dict[str, Any] = {}
+    for key in ("workspace_paths", "workspace_files", "workspace_directories"):
+        value = metadata.get(key)
+        if not isinstance(value, list):
+            continue
+        cleaned = [
+            str(item or "").strip()
+            for item in value
+            if str(item or "").strip()
+        ]
+        if cleaned:
+            normalized[key] = cleaned
+
+    blocks = metadata.get("content_blocks")
+    if isinstance(blocks, list):
+        cleaned_blocks = [block for block in blocks if isinstance(block, dict)]
+        if cleaned_blocks:
+            normalized["content_blocks"] = cleaned_blocks
+
+    return normalized
 
 
 def _compact_preview(text: Any, limit: int) -> tuple[str, bool]:
@@ -793,7 +850,10 @@ class CoworkSession:
     # ------------------------------------------------------------------
 
     async def send(
-        self, user_message: str,
+        self,
+        user_message: str,
+        *,
+        message_metadata: dict[str, Any] | None = None,
     ) -> AsyncGenerator[CoworkTurn | ToolCallEvent | str, None]:
         """Send a user message and yield events as the model responds.
 
@@ -809,12 +869,15 @@ class CoworkSession:
         async with self._counter_lock:
             self._turn_counter += 1
         self._session_state.set_focus(user_message.split("\n")[0])
+        normalized_metadata = _normalize_user_turn_metadata(message_metadata)
 
         # Possibly inject a recall hint
         hint = self._maybe_recall_hint(user_message)
 
-        self._messages.append({"role": "user", "content": user_message})
-        await self._persist_turn("user", content=user_message)
+        user_turn: dict[str, Any] = {"role": "user", "content": user_message}
+        user_turn.update(normalized_metadata)
+        self._messages.append(user_turn)
+        await self._persist_turn("user", content=user_message, metadata=normalized_metadata)
 
         if hint:
             self._messages.append({"role": "system", "content": hint})
@@ -1020,7 +1083,10 @@ class CoworkSession:
         )
 
     async def send_streaming(
-        self, user_message: str,
+        self,
+        user_message: str,
+        *,
+        message_metadata: dict[str, Any] | None = None,
     ) -> AsyncGenerator[CoworkTurn | ToolCallEvent | str, None]:
         """Like send() but streams text tokens as they arrive.
 
@@ -1031,11 +1097,14 @@ class CoworkSession:
         async with self._counter_lock:
             self._turn_counter += 1
         self._session_state.set_focus(user_message.split("\n")[0])
+        normalized_metadata = _normalize_user_turn_metadata(message_metadata)
 
         hint = self._maybe_recall_hint(user_message)
 
-        self._messages.append({"role": "user", "content": user_message})
-        await self._persist_turn("user", content=user_message)
+        user_turn: dict[str, Any] = {"role": "user", "content": user_message}
+        user_turn.update(normalized_metadata)
+        self._messages.append(user_turn)
+        await self._persist_turn("user", content=user_message, metadata=normalized_metadata)
 
         if hint:
             self._messages.append({"role": "system", "content": hint})
@@ -2795,6 +2864,7 @@ class CoworkSession:
         self,
         role: str,
         content: str | None = None,
+        metadata: dict[str, Any] | None = None,
         tool_calls: list[dict] | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
@@ -2811,6 +2881,7 @@ class CoworkSession:
                 turn_number=counter,
                 role=role,
                 content=content,
+                metadata=metadata,
                 tool_calls=tool_calls,
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,

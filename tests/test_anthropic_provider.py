@@ -53,6 +53,25 @@ class TestMessageConversion:
         assert len(msgs) == 1
         assert msgs[0]["content"] == "Hello"
 
+    def test_user_message_with_explicit_context(self, provider):
+        messages = [{
+            "role": "user",
+            "content": "Please inspect this",
+            "workspace_paths": ["src/app.tsx"],
+            "content_blocks": [{
+                "type": "image",
+                "source_path": "/tmp/test.png",
+                "media_type": "image/png",
+                "text_fallback": "Screenshot",
+            }],
+        }]
+        system, msgs = provider._convert_messages(messages)
+        assert system is None
+        assert len(msgs) == 1
+        assert isinstance(msgs[0]["content"], list)
+        assert msgs[0]["content"][0]["type"] == "text"
+        assert "Attached workspace context" in msgs[0]["content"][0]["text"]
+
     def test_assistant_with_tool_calls(self, provider):
         messages = [
             {"role": "user", "content": "Read file"},

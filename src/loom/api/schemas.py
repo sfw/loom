@@ -36,8 +36,12 @@ class FeedbackRequest(BaseModel):
 
 
 class ConversationMessageRequest(BaseModel):
-    message: str
+    message: str = ""
     role: str = "user"
+    workspace_paths: list[str] = Field(default_factory=list)
+    workspace_files: list[str] = Field(default_factory=list)
+    workspace_directories: list[str] = Field(default_factory=list)
+    content_blocks: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ConversationApprovalDecisionRequest(BaseModel):

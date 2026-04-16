@@ -171,6 +171,52 @@ describe("conversationTimeline", () => {
     expect(items[1]).toMatchObject({ kind: "text", role: "assistant", text: "hi there" });
   });
 
+  it("preserves structured attachment rows from both persisted metadata and replay indicators", () => {
+    const fallbackItems = buildConversationMessageFallbackItems([
+      {
+        ...makeMessage(1, "user", "Please inspect this", "2026-03-29T00:00:01Z"),
+        metadata: {
+          workspace_paths: ["docs/spec.md", "screenshots"],
+          workspace_files: ["docs/spec.md"],
+          workspace_directories: ["screenshots"],
+          content_blocks: [{
+            type: "image",
+            source_path: "/tmp/shot.png",
+            media_type: "image/png",
+          }],
+        },
+      },
+      makeMessage(2, "assistant", "On it.", "2026-03-29T00:00:02Z"),
+    ]);
+    const replayItems = buildConversationTimelineItems([
+      makeEvent(1, "user_message", { text: "Please inspect this" }),
+      makeEvent(2, "content_indicator", {
+        workspace_paths: ["docs/spec.md", "screenshots"],
+        workspace_files: ["docs/spec.md"],
+        workspace_directories: ["screenshots"],
+        content_blocks: [{
+          type: "image",
+          source_path: "/tmp/shot.png",
+          media_type: "image/png",
+        }],
+      }),
+    ]);
+
+    expect(fallbackItems).toContainEqual(expect.objectContaining({
+      kind: "attachment",
+      workspacePaths: ["docs/spec.md", "screenshots"],
+      workspaceFiles: ["docs/spec.md"],
+      workspaceDirectories: ["screenshots"],
+    }));
+    expect(replayItems[1]).toMatchObject({
+      kind: "attachment",
+      workspacePaths: ["docs/spec.md", "screenshots"],
+      workspaceFiles: ["docs/spec.md"],
+      workspaceDirectories: ["screenshots"],
+      contentBlocks: [expect.objectContaining({ type: "image" })],
+    });
+  });
+
   it("filters internal tool-call placeholder text from assistant transcript rows", () => {
     const timelineItems = buildConversationTimelineItems([
       makeEvent(1, "assistant_text", { text: "Tool call context omitted." }),

@@ -300,6 +300,34 @@ class TestConversationStore:
         assert messages[0]["content"] == "Hello"
         assert messages[-1]["content"] == "Help me code"
 
+    async def test_resume_session_restores_attachment_metadata(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await store.append_turn(
+            sid,
+            1,
+            "user",
+            "See these files",
+            metadata={
+                "workspace_paths": ["src/app.tsx", "assets"],
+                "workspace_files": ["src/app.tsx"],
+                "workspace_directories": ["assets"],
+                "content_blocks": [
+                    {
+                        "type": "image",
+                        "source_path": "/tmp/pasted.png",
+                        "media_type": "image/png",
+                        "text_fallback": "Pasted image",
+                    },
+                ],
+            },
+        )
+
+        messages = await store.resume_session(sid)
+        assert messages[0]["workspace_paths"] == ["src/app.tsx", "assets"]
+        assert messages[0]["workspace_files"] == ["src/app.tsx"]
+        assert messages[0]["workspace_directories"] == ["assets"]
+        assert messages[0]["content_blocks"][0]["type"] == "image"
+
     async def test_tool_calls_persisted(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")
 
@@ -663,3 +691,35 @@ class TestConversationStore:
             (second_seq, "user_message"),
         ]
         assert all("turn_number" not in row for row in rows)
+
+    async def test_synthesized_user_attachment_events_include_content_indicator(
+        self,
+        store: ConversationStore,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await store.append_turn(
+            sid,
+            1,
+            "user",
+            "Review this",
+            metadata={
+                "workspace_paths": ["src/main.ts"],
+                "workspace_files": ["src/main.ts"],
+                "content_blocks": [
+                    {
+                        "type": "image",
+                        "source_path": "/tmp/review.png",
+                        "media_type": "image/png",
+                        "text_fallback": "Screenshot",
+                    },
+                ],
+            },
+        )
+
+        events = await store.synthesize_chat_events_from_turns(sid, limit=10)
+        assert [event["event_type"] for event in events] == [
+            "user_message",
+            "content_indicator",
+        ]
+        assert events[0]["payload"]["workspace_paths"] == ["src/main.ts"]
+        assert events[1]["payload"]["content_blocks"][0]["type"] == "image"

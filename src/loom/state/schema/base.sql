@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     turn_number INTEGER NOT NULL,
     role TEXT NOT NULL,                              -- user | assistant | tool | system
     content TEXT,                                    -- message text (verbatim, no truncation)
+    metadata TEXT,                                   -- JSON: user attachment/context metadata
     tool_calls TEXT,                                 -- JSON array of tool calls (nullable)
     tool_call_id TEXT,                               -- for role=tool, the call this responds to
     tool_name TEXT,                                  -- for role=tool, which tool was called

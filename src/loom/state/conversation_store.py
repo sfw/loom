@@ -69,6 +69,21 @@ class ConversationStore:
         self._db = db
 
     @staticmethod
+    def _decode_turn_metadata(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not isinstance(raw, str):
+            return {}
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+
+    @staticmethod
     def _decode_session_state_blob(raw: object) -> dict[str, Any]:
         if isinstance(raw, dict):
             return dict(raw)
@@ -357,25 +372,31 @@ class ConversationStore:
         turn_number: int,
         role: str,
         content: str | None = None,
+        metadata: dict[str, Any] | None = None,
         tool_calls: list[dict] | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
     ) -> int:
         """Append a conversation turn.  Returns the row ID."""
         token_count = _estimate_tokens(content or "")
+        if metadata:
+            token_count += _estimate_tokens(
+                json.dumps(metadata, ensure_ascii=False, default=str),
+            )
         if tool_calls:
             token_count += _estimate_tokens(json.dumps(tool_calls))
 
         row_id = await self._db.execute_returning_id(
             """INSERT INTO conversation_turns
-               (session_id, turn_number, role, content, tool_calls,
+               (session_id, turn_number, role, content, metadata, tool_calls,
                 tool_call_id, tool_name, token_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
                 turn_number,
                 role,
                 content,
+                json.dumps(metadata, ensure_ascii=False, default=str) if metadata else None,
                 json.dumps(tool_calls) if tool_calls else None,
                 tool_call_id,
                 tool_name,
@@ -1091,6 +1112,16 @@ class ConversationStore:
             msg: dict = {"role": row["role"]}
             if row["content"] is not None:
                 msg["content"] = row["content"]
+            metadata = self._decode_turn_metadata(row.get("metadata"))
+            for key in (
+                "workspace_paths",
+                "workspace_files",
+                "workspace_directories",
+                "content_blocks",
+            ):
+                value = metadata.get(key)
+                if isinstance(value, list) and value:
+                    msg[key] = value
             if row["tool_calls"]:
                 msg["tool_calls"] = json.loads(row["tool_calls"])
             if row["tool_call_id"]:
@@ -1549,7 +1580,22 @@ class ConversationStore:
 
             if role == "user":
                 text = str(row.get("content", "") or "")
-                _append("user_message", {"text": text})
+                metadata = self._decode_turn_metadata(row.get("metadata"))
+                payload: dict[str, Any] = {"text": text}
+                attachment_payload = {
+                    key: metadata.get(key)
+                    for key in (
+                        "workspace_paths",
+                        "workspace_files",
+                        "workspace_directories",
+                        "content_blocks",
+                    )
+                    if isinstance(metadata.get(key), list) and metadata.get(key)
+                }
+                payload.update(attachment_payload)
+                _append("user_message", payload)
+                if attachment_payload:
+                    _append("content_indicator", attachment_payload)
                 continue
 
             if role == "assistant":

@@ -3,7 +3,11 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import ThreadsTab from "./ThreadsTab";
-import { deleteConversation } from "@/api";
+import {
+  deleteConversation,
+  fetchWorkspacePathSuggestions,
+  writeScratchFile,
+} from "@/api";
 
 let mockApp: any;
 
@@ -16,6 +20,8 @@ vi.mock("@/context/AppContext", () => ({
 
 vi.mock("@/api", () => ({
   deleteConversation: vi.fn(),
+  fetchWorkspacePathSuggestions: vi.fn(),
+  writeScratchFile: vi.fn(),
 }));
 
 function makeEvent(seq: number, eventType: string, payload: Record<string, unknown>) {
@@ -33,7 +39,12 @@ function makeEvent(seq: number, eventType: string, payload: Record<string, unkno
 describe("ThreadsTab", () => {
   beforeEach(() => {
     vi.mocked(deleteConversation).mockResolvedValue(undefined as never);
+    vi.mocked(fetchWorkspacePathSuggestions).mockResolvedValue([]);
+    vi.mocked(writeScratchFile).mockResolvedValue("/tmp/pasted-image.png");
     mockApp = {
+      runtime: {
+        scratch_dir: "/tmp/loom-scratch",
+      },
       selectedConversationId: "conversation-1",
       overview: {
         recent_conversations: [
@@ -95,7 +106,7 @@ describe("ThreadsTab", () => {
       conversationInjectMessage: "",
       setConversationInjectMessage: vi.fn(),
       sendingConversationInject: false,
-      handleSendConversationMessage: vi.fn(async () => {}),
+      submitConversationMessage: vi.fn(async () => true),
       handleInjectConversationInstruction: vi.fn(async () => {}),
       handleResolveConversationApproval: vi.fn(async () => {}),
       handleQuickConversationReply: vi.fn(async () => {}),
@@ -114,6 +125,7 @@ describe("ThreadsTab", () => {
       refreshWorkspaceSurface: vi.fn(async () => {}),
       setSelectedWorkspaceFilePath: vi.fn(),
       setActiveTab: vi.fn(),
+      workspaceArtifacts: [],
       workspaceFilesByDirectory: {},
       hasOlderMessages: false,
       loadingOlderMessages: false,
@@ -999,6 +1011,106 @@ describe("ThreadsTab", () => {
     await waitFor(() => {
       expect(screen.queryByText(/older transcript rows archived/i)).not.toBeInTheDocument();
     });
+  });
+
+  it("attaches a workspace path from the @ picker and sends it as explicit context", async () => {
+    const user = userEvent.setup();
+    vi.mocked(fetchWorkspacePathSuggestions).mockResolvedValue([
+      {
+        path: "src/components/ThreadsTab.tsx",
+        name: "ThreadsTab.tsx",
+        is_dir: false,
+        size_bytes: 123,
+        modified_at: "2026-04-16T00:00:00Z",
+        extension: ".tsx",
+      },
+    ]);
+
+    let rerenderView: (() => void) | null = null;
+    mockApp.setConversationComposerMessage = vi.fn((next: string) => {
+      mockApp.conversationComposerMessage = next;
+      rerenderView?.();
+    });
+
+    const view = render(<ThreadsTab />);
+    rerenderView = () => view.rerender(<ThreadsTab />);
+
+    const composer = screen.getByPlaceholderText("Send a message...");
+    await user.click(composer);
+    await user.type(composer, "@thread");
+
+    await waitFor(() => {
+      expect(fetchWorkspacePathSuggestions).toHaveBeenCalledWith("workspace-1", "thread", 24);
+    });
+    await user.click(screen.getByRole("button", { name: /src\/components\/ThreadsTab\.tsx/i }));
+
+    expect(screen.getByRole("button", { name: /File src\/components\/ThreadsTab\.tsx/i })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /^Send$/i }));
+
+    await waitFor(() => {
+      expect(mockApp.submitConversationMessage).toHaveBeenCalledWith(
+        "`src/components/ThreadsTab.tsx` ",
+        expect.objectContaining({
+          workspace_paths: ["src/components/ThreadsTab.tsx"],
+          workspace_files: ["src/components/ThreadsTab.tsx"],
+          workspace_directories: [],
+        }),
+      );
+    });
+  });
+
+  it("renders persisted attachment chips that still open the files tab after reload", async () => {
+    const user = userEvent.setup();
+    mockApp.visibleConversationEvents = [];
+    mockApp.visibleConversationMessages = [
+      {
+        id: 1,
+        session_id: "conversation-1",
+        turn_number: 1,
+        role: "user",
+        content: "Please check `src/components/ThreadsTab.tsx`",
+        tool_calls: [],
+        tool_call_id: null,
+        tool_name: null,
+        token_count: 1,
+        created_at: "2026-03-27T00:00:00Z",
+        metadata: {
+          workspace_paths: ["src/components/ThreadsTab.tsx", "docs"],
+          workspace_files: ["src/components/ThreadsTab.tsx"],
+          workspace_directories: ["docs"],
+          content_blocks: [{
+            type: "image",
+            source_path: "/tmp/pasted-image.png",
+            media_type: "image/png",
+          }],
+        },
+      },
+      {
+        id: 2,
+        session_id: "conversation-1",
+        turn_number: 2,
+        role: "assistant",
+        content: "Reviewing those now.",
+        tool_calls: [],
+        tool_call_id: null,
+        tool_name: null,
+        token_count: 2,
+        created_at: "2026-03-27T00:01:00Z",
+      },
+    ];
+
+    render(<ThreadsTab />);
+
+    expect(screen.getByText("Explicit context")).toBeInTheDocument();
+    expect(screen.getByText("1 image")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /Open file src\/components\/ThreadsTab\.tsx/i }));
+    expect(mockApp.setSelectedWorkspaceFilePath).toHaveBeenCalledWith("src/components/ThreadsTab.tsx");
+    expect(mockApp.setActiveTab).toHaveBeenCalledWith("files");
+
+    await user.click(screen.getByRole("button", { name: /Open folder docs/i }));
+    expect(mockApp.setSelectedWorkspaceFilePath).toHaveBeenCalledWith("docs");
   });
 
   it("keeps very large transcripts bounded to an archived render window", () => {

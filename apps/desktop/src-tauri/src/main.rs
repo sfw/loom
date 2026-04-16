@@ -5,6 +5,7 @@ mod sidecar;
 use sidecar::{SidecarBootstrapResponse, SidecarState, SidecarStatusResponse};
 use std::path::{Component, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 #[derive(serde::Deserialize)]
@@ -92,6 +93,50 @@ fn resolve_workspace_target(workspace_path: &str, relative_path: &str) -> Result
     }
     let clean_relative = sanitize_workspace_relative_path(relative_path)?;
     Ok(workspace_root.join(clean_relative))
+}
+
+fn sanitize_scratch_filename(name: &str) -> String {
+    let trimmed = name.trim();
+    let raw = if trimmed.is_empty() { "attachment" } else { trimmed };
+    let candidate = PathBuf::from(raw);
+    let stem = candidate
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let extension = candidate
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+
+    let clean_stem: String = stem
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let final_stem = clean_stem.trim_matches('-');
+    let final_stem = if final_stem.is_empty() { "attachment" } else { final_stem };
+
+    let clean_ext: String = extension
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let final_ext = clean_ext.trim_matches('-');
+    if final_ext.is_empty() {
+        final_stem.to_string()
+    } else {
+        format!("{final_stem}.{final_ext}")
+    }
 }
 
 fn open_path_with_system(path: &PathBuf) -> Result<(), String> {
@@ -214,6 +259,60 @@ fn desktop_import_workspace_files(
 }
 
 #[tauri::command]
+fn desktop_write_scratch_file(
+    scratch_dir: String,
+    suggested_name: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    let scratch_root = PathBuf::from(scratch_dir.trim());
+    if scratch_root.as_os_str().is_empty() {
+        return Err("Scratch directory is required.".to_string());
+    }
+    std::fs::create_dir_all(&scratch_root)
+        .map_err(|error| format!("Failed to prepare scratch directory: {error}"))?;
+    if !scratch_root.is_dir() {
+        return Err(format!(
+            "Scratch directory is unavailable: {}",
+            scratch_root.display()
+        ));
+    }
+
+    let safe_name = sanitize_scratch_filename(&suggested_name);
+    let base_path = PathBuf::from(&safe_name);
+    let stem = base_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let extension = base_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+
+    for attempt in 0..100u32 {
+        let filename = if attempt == 0 {
+            safe_name.clone()
+        } else if extension.is_empty() {
+            format!("{stem}-{timestamp}-{attempt}")
+        } else {
+            format!("{stem}-{timestamp}-{attempt}.{extension}")
+        };
+        let target_path = scratch_root.join(filename);
+        if target_path.exists() {
+            continue;
+        }
+        std::fs::write(&target_path, &bytes)
+            .map_err(|error| format!("Failed to write scratch file: {error}"))?;
+        return Ok(target_path.to_string_lossy().into_owned());
+    }
+
+    Err("Failed to allocate a unique scratch filename.".to_string())
+}
+
+#[tauri::command]
 fn desktop_open_workspace_file(
     workspace_path: String,
     relative_path: String,
@@ -261,6 +360,7 @@ fn main() {
             desktop_create_workspace_directory,
             desktop_create_workspace_file,
             desktop_import_workspace_files,
+            desktop_write_scratch_file,
             desktop_open_workspace_file,
             desktop_reveal_workspace_file
         ])
@@ -282,7 +382,11 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_workspace_target, sanitize_workspace_relative_path};
+    use super::{
+        resolve_workspace_target,
+        sanitize_scratch_filename,
+        sanitize_workspace_relative_path,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -312,5 +416,12 @@ mod tests {
             resolve_workspace_target(temp.to_string_lossy().as_ref(), "docs/readme.md").unwrap();
         assert_eq!(resolved, temp.join("docs").join("readme.md"));
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn sanitizes_scratch_filenames() {
+        assert_eq!(sanitize_scratch_filename("Screenshot 2026-04-16.PNG"), "Screenshot-2026-04-16.png");
+        assert_eq!(sanitize_scratch_filename("../"), "attachment");
+        assert_eq!(sanitize_scratch_filename(""), "attachment");
     }
 }

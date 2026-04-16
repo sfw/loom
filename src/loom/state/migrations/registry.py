@@ -6,6 +6,7 @@ import hashlib
 
 from loom.state.migrations.runner import MigrationStep
 from loom.state.migrations.steps import (
+    conversation_turn_metadata_v1,
     data_authority_unification,
     events_v2,
     search_provider_state_v1,
@@ -61,5 +62,12 @@ MIGRATIONS: tuple[MigrationStep, ...] = (
         checksum=_checksum("20260403_006_search_provider_state_v1/search_provider_state_v1"),
         apply=search_provider_state_v1.apply,
         verify=search_provider_state_v1.verify,
+    ),
+    MigrationStep(
+        id="20260416_007_conversation_turn_metadata_v1",
+        description="Add durable attachment metadata to persisted conversation turns.",
+        checksum=_checksum("20260416_007_conversation_turn_metadata_v1/conversation_turn_metadata_v1"),
+        apply=conversation_turn_metadata_v1.apply,
+        verify=conversation_turn_metadata_v1.verify,
     ),
 )

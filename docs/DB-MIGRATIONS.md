@@ -34,6 +34,7 @@ Recent authority/freshness metadata added through migrations includes:
 - `tasks.state_snapshot_updated_at` for mirrored task-row freshness
 - `cowork_sessions.session_state_through_turn` for checkpoint trust boundaries
 - `cowork_sessions.chat_journal_through_turn` / `chat_journal_through_seq` for transcript coverage
+- `conversation_turns.metadata` for durable user attachment/context payloads
 - `search_provider_state.next_allowed_at` / `cooldown_until` / `lease_expires_at` for auth-free web search pacing authority
 
 `schema_migrations` stores:

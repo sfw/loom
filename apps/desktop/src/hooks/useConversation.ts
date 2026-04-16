@@ -22,6 +22,7 @@ import {
   subscribeConversationStream,
   type ConversationApproval,
   type ConversationDetail,
+  type ConversationMessageAttachments,
   type ConversationMessage,
   type ConversationPrompt,
   type ConversationSummary,
@@ -127,7 +128,10 @@ export interface ConversationActions {
   setActiveConversationMatchIndex: React.Dispatch<React.SetStateAction<number>>;
   handleCreateConversation: (event: FormEvent<HTMLFormElement>) => Promise<void>;
   handleSendConversationMessage: (event: FormEvent<HTMLFormElement>) => Promise<void>;
-  submitConversationMessage: (rawMessage: string) => Promise<void>;
+  submitConversationMessage: (
+    rawMessage: string,
+    attachments?: ConversationMessageAttachments,
+  ) => Promise<boolean>;
   handleQuickConversationReply: (optionLabel: string) => Promise<void>;
   handleInjectConversationInstruction: (event: FormEvent<HTMLFormElement>) => Promise<void>;
   handleResolveConversationApproval: (decision: "approve" | "approve_all" | "deny") => Promise<void>;
@@ -156,6 +160,36 @@ export function conversationEventKey(event: ConversationStreamEvent): string {
     return `synthetic:${event.turn_number}:${event.event_type}:${event.seq}`;
   }
   return `event:${event.seq}:${event.event_type}:${event.created_at}`;
+}
+
+function hasConversationAttachments(
+  attachments: ConversationMessageAttachments | undefined,
+): boolean {
+  if (!attachments) {
+    return false;
+  }
+  return Boolean(
+    attachments.workspace_paths?.length
+    || attachments.workspace_files?.length
+    || attachments.workspace_directories?.length
+    || attachments.content_blocks?.length,
+  );
+}
+
+function conversationAttachmentPayload(
+  attachments: ConversationMessageAttachments | undefined,
+): Record<string, unknown> {
+  if (!attachments) {
+    return {};
+  }
+  const payload: Record<string, unknown> = {};
+  if (attachments.workspace_paths?.length) payload.workspace_paths = attachments.workspace_paths;
+  if (attachments.workspace_files?.length) payload.workspace_files = attachments.workspace_files;
+  if (attachments.workspace_directories?.length) {
+    payload.workspace_directories = attachments.workspace_directories;
+  }
+  if (attachments.content_blocks?.length) payload.content_blocks = attachments.content_blocks;
+  return payload;
 }
 
 export function conversationMessageKey(message: ConversationMessage): string {
@@ -1774,15 +1808,19 @@ export function useConversation(deps: {
     await submitConversationMessage(conversationComposerMessage);
   }
 
-  async function submitConversationMessage(rawMessage: string) {
+  async function submitConversationMessage(
+    rawMessage: string,
+    attachments?: ConversationMessageAttachments,
+  ): Promise<boolean> {
     if (!selectedConversationId) {
       setError("Select a conversation before sending a message.");
-      return;
+      return false;
     }
     const message = rawMessage.trim();
-    if (!message) {
-      setError("Message is required.");
-      return;
+    const hasAttachments = hasConversationAttachments(attachments);
+    if (!message && !hasAttachments) {
+      setError("Message or attachment is required.");
+      return false;
     }
     // Check the live status from the server to avoid stale local state
     // causing messages to go to the inject path when they shouldn't.
@@ -1802,6 +1840,10 @@ export function useConversation(deps: {
         // If status check fails, trust local state
       }
     }
+    if (isProcessing && hasAttachments) {
+      setError("Attachments can only be sent when the current turn is idle.");
+      return false;
+    }
     setSendingConversationMessage(true);
     setError("");
     setNotice("");
@@ -1819,6 +1861,7 @@ export function useConversation(deps: {
         const createdAt = new Date().toISOString();
         const clientId = `local-user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         optimisticClientId = clientId;
+        const attachmentPayload = conversationAttachmentPayload(attachments);
         setOptimisticConversationEvents((current) => [
           ...current,
           {
@@ -1826,13 +1869,26 @@ export function useConversation(deps: {
             session_id: selectedConversationId,
             seq: -(current.length + 1),
             event_type: "user_message",
-            payload: { text: message },
+            payload: { text: message, ...attachmentPayload },
             payload_parse_error: false,
             created_at: createdAt,
             _optimistic: true,
             _client_id: clientId,
             _delivery_state: "sending",
           },
+          ...(hasAttachments
+            ? [{
+                id: -(Date.now() + 1),
+                session_id: selectedConversationId,
+                seq: -(current.length + 2),
+                event_type: "content_indicator" as const,
+                payload: attachmentPayload,
+                payload_parse_error: false,
+                created_at: createdAt,
+                _optimistic: true,
+                _client_id: `${clientId}:attachments`,
+              }]
+            : []),
         ]);
         setConversationComposerMessage("");
         setConversationTurnPending(true);
@@ -1853,13 +1909,17 @@ export function useConversation(deps: {
         await sendConversationMessage(
           selectedConversationId,
           message,
+          "user",
+          attachments,
         );
         setOptimisticConversationEvents((current) => current.map((event) => (
-          event._client_id === optimisticClientId
+          event._client_id === optimisticClientId || event._client_id === `${optimisticClientId}:attachments`
             ? { ...event, _delivery_state: "accepted" }
             : event
         )));
-        maybeApplyOptimisticConversationTitle(message);
+        if (message) {
+          maybeApplyOptimisticConversationTitle(message);
+        }
 
         // Safety timeout: if no assistant-side progress arrives within 120s,
         // reset the pending state so the UI doesn't freeze forever.
@@ -1885,10 +1945,14 @@ export function useConversation(deps: {
         // But we store the cleanup so it can be cleared on unmount.
         turnTimeoutCleanupRef.current = clearTurnTimeout;
       }
+      return true;
     } catch (err) {
       if (!isProcessing) {
         setOptimisticConversationEvents((current) =>
-          current.filter((event) => event._client_id !== optimisticClientId),
+          current.filter((event) =>
+            event._client_id !== optimisticClientId
+            && event._client_id !== `${optimisticClientId}:attachments`,
+          ),
         );
         setConversationTurnPending(false);
         setConversationStatus((current) => ({
@@ -1910,6 +1974,7 @@ export function useConversation(deps: {
           ? err.message
           : "Failed to send message.",
       );
+      return false;
     } finally {
       setSendingConversationMessage(false);
     }
